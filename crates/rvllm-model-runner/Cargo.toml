@@ -13,14 +13,13 @@ categories = ["science", "hardware-support"]
 
 [features]
 default = []
-cuda = ["rvllm-gpu/cuda", "rvllm-attention/cuda", "rvllm-model-loader/cuda"]
+cuda = ["rvllm-gpu/cuda", "rvllm-attention/cuda", "rvllm-model-loader/cuda", "rvllm-kv-cache/cuda"]
 
 [dependencies]
 rvllm-core.workspace = true
 rvllm-gpu.workspace = true
 rvllm-attention.workspace = true
-# rvllm-kv-cache omitted: broken upstream (gpu module deleted, engine/ops not updated)
-# TODO: re-add once rvllm-kv-cache compiles with rvllm-gpu buffer types
+rvllm-kv-cache.workspace = true
 rvllm-model-loader.workspace = true
 thiserror.workspace = true
 half.workspace = true

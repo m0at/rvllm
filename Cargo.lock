@@ -2619,6 +2619,7 @@ dependencies = [
  "rvllm-attention",
  "rvllm-core",
  "rvllm-gpu",
+ "rvllm-kv-cache",
  "rvllm-model-loader",
  "thiserror 2.0.18",
  "tracing",

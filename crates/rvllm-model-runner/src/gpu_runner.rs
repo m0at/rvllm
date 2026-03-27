@@ -7,55 +7,27 @@
 //! (the default), this module provides a compile-compatible stub that returns
 //! an error at runtime so existing Mac-side tests keep working.
 
-use std::collections::HashMap;
-
-use tracing::{debug, trace};
-
-use crate::bridge::{LLMError, Result};
-use crate::runner::ModelRunnerConfig;
-
-// ---------------------------------------------------------------------------
-// ModelRunnerConfig re-used from runner.rs -- already has all the fields we
-// need (num_layers, hidden_size, num_heads, etc.).
-// ---------------------------------------------------------------------------
-
 // =========================================================================
 //  CUDA implementation
 // =========================================================================
 #[cfg(feature = "cuda")]
 mod cuda_impl {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaDevice, CudaSlice, CudaStream};
     use tracing::{debug, trace};
 
     use crate::bridge::{LLMError, Result};
     use crate::runner::ModelRunnerConfig;
 
-    // -- Types from other agents (will be real once those agents land) ------
-    // Agent 1: KernelLoader
     use rvllm_gpu::kernel_loader::KernelLoader;
-    // Agent 11: GpuModelWeights
     use rvllm_model_loader::gpu_weights::GpuModelWeights;
-    // Agent 8: CudaCacheEngine
     use rvllm_kv_cache::engine_cuda::CudaCacheEngine;
-    // Agent 6: CudaLinearLayer
     use crate::layers::linear_cuda::CudaLinearLayer;
-    // Agent 2: CudaRMSNorm
     use crate::layers::norm_cuda::CudaRMSNorm;
-    // Agent 3: CudaRotaryEmbedding
-    use crate::layers::rotary_cuda::CudaRotaryEmbedding;
-    // Agent 12: GpuTransformerLayer
-    use crate::gpu_layer::GpuTransformerLayer;
-    // cuBLAS from rvllm-gpu
+    use crate::gpu_layer::{GpuLayerConfig, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer};
     use rvllm_gpu::prelude::CublasHandle;
 
-    /// GPU model runner -- orchestrates the full causal-LM forward pass on CUDA.
-    ///
-    /// Holds all GPU-resident weights, the KV cache engine, cuBLAS handle,
-    /// kernel loader, and per-layer transformer blocks. Created once at model
-    /// load time and reused for every forward call.
     pub struct GpuModelRunner {
         weights: GpuModelWeights,
         cache: CudaCacheEngine,
@@ -64,23 +36,14 @@ mod cuda_impl {
         config: ModelRunnerConfig,
         device: Arc<CudaDevice>,
         stream: CudaStream,
-        /// Per-layer transformer blocks, built at construction.
         layers: Vec<GpuTransformerLayer>,
-        /// Embedding table on GPU: [vocab_size, hidden_size] row-major f32.
         embed_tokens: CudaSlice<f32>,
-        /// Final RMSNorm weight on GPU: [hidden_size].
         final_norm_weight: CudaSlice<f32>,
-        /// LM head weight on GPU: [vocab_size, hidden_size] row-major f32.
         lm_head_weight: CudaSlice<f32>,
-        /// RMSNorm epsilon.
         rms_norm_eps: f32,
     }
 
     impl GpuModelRunner {
-        /// Build the runner from loaded GPU weights and pre-initialized components.
-        ///
-        /// # Errors
-        /// Returns `LLMError::GpuError` if any GPU allocation or weight lookup fails.
         pub fn new(
             weights: GpuModelWeights,
             cache: CudaCacheEngine,
@@ -96,11 +59,10 @@ mod cuda_impl {
                 "GpuModelRunner::new"
             );
 
-            let stream = CudaStream::new(Arc::clone(&device)).map_err(|e| {
-                LLMError::GpuError(format!("stream creation failed: {e}"))
-            })?;
+            // cudarc 0.12: streams are created via fork_default_stream()
+            let stream = device.fork_default_stream()
+                .map_err(|e| LLMError::GpuError(format!("stream creation failed: {e}")))?;
 
-            // Extract top-level weights from the weight container.
             let embed_tokens = weights
                 .get("model.embed_tokens.weight")
                 .ok_or_else(|| LLMError::GpuError("missing model.embed_tokens.weight".into()))?
@@ -116,21 +78,19 @@ mod cuda_impl {
                 .ok_or_else(|| LLMError::GpuError("missing lm_head.weight".into()))?
                 .clone();
 
-            // Build per-layer transformer blocks (Agent 12).
             let mut layers = Vec::with_capacity(config.num_layers);
             for i in 0..config.num_layers {
-                let layer = GpuTransformerLayer::new(
-                    i,
-                    &weights,
-                    &config,
-                    &blas,
-                    &loader,
-                    Arc::clone(&device),
-                )?;
-                layers.push(layer);
+                let layer_cfg = GpuLayerConfig {
+                    hidden_size: config.hidden_size,
+                    num_heads: config.num_heads,
+                    num_kv_heads: config.num_kv_heads,
+                    head_dim: config.head_dim,
+                    intermediate_size: config.intermediate_size,
+                    rms_norm_eps: 1e-5_f32,
+                    layer_idx: i,
+                };
+                layers.push(GpuTransformerLayer::new(layer_cfg, Arc::clone(&device)));
             }
-
-            let rms_norm_eps = 1e-5_f32; // standard for Llama-family
 
             Ok(Self {
                 weights,
@@ -144,18 +104,10 @@ mod cuda_impl {
                 embed_tokens,
                 final_norm_weight,
                 lm_head_weight,
-                rms_norm_eps,
+                rms_norm_eps: 1e-5_f32,
             })
         }
 
-        /// Execute a single forward pass, returning logits on CPU.
-        ///
-        /// * `token_ids`    -- token IDs for this step, len = num_tokens
-        /// * `positions`    -- position ID per token, len = num_tokens
-        /// * `block_tables` -- per-sequence block table for paged attention
-        /// * `context_lens` -- per-sequence context length
-        ///
-        /// Returns `Vec<f32>` of shape `[num_tokens, vocab_size]` in row-major order.
         pub fn forward(
             &self,
             token_ids: &[u32],
@@ -164,8 +116,10 @@ mod cuda_impl {
             context_lens: &[u32],
         ) -> Result<Vec<f32>> {
             let num_tokens = token_ids.len();
+            let num_seqs = context_lens.len();
             let hidden_size = self.config.hidden_size;
             let vocab_size = self.config.vocab_size;
+            let block_size = self.cache.block_size();
 
             if num_tokens == 0 {
                 return Err(LLMError::ModelError("empty input".into()));
@@ -173,38 +127,61 @@ mod cuda_impl {
 
             debug!(num_tokens, "GpuModelRunner::forward");
 
-            // ------------------------------------------------------------------
-            // Step 1: Token embedding lookup on GPU.
-            //
-            // embed_tokens is [vocab_size, hidden_size]. We gather rows indexed
-            // by token_ids to produce hidden_states [num_tokens, hidden_size].
-            // ------------------------------------------------------------------
+            // Upload positions to GPU (reused across all layers)
+            let positions_gpu: CudaSlice<u32> = self.device
+                .htod_sync_copy(positions)
+                .map_err(|e| LLMError::GpuError(format!("positions HtoD: {e}")))?;
+
+            // Upload context_lens to GPU
+            let context_lens_gpu: CudaSlice<u32> = self.device
+                .htod_sync_copy(context_lens)
+                .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
+
+            // Flatten block_tables to [num_seqs, max_blocks_per_seq] row-major
+            let max_blocks = block_tables.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+            let mut flat_bt = vec![0u32; num_seqs * max_blocks];
+            for (s, row) in block_tables.iter().enumerate() {
+                for (b, &blk) in row.iter().enumerate() {
+                    flat_bt[s * max_blocks + b] = blk;
+                }
+            }
+            let block_tables_gpu: CudaSlice<u32> = self.device
+                .htod_sync_copy(&flat_bt)
+                .map_err(|e| LLMError::GpuError(format!("block_tables HtoD: {e}")))?;
+
+            // Zero slot_mapping -- cache writes not yet wired, only decode path used
+            let slot_mapping_gpu: CudaSlice<u32> = self.device
+                .alloc_zeros(num_tokens)
+                .map_err(|e| LLMError::GpuError(format!("slot_mapping alloc: {e}")))?;
+
+            let max_context_len = context_lens.iter().copied().max().unwrap_or(0);
+
+            // Step 1: token embedding lookup
             let mut hidden_states = self.embedding_lookup(token_ids)?;
 
-            // ------------------------------------------------------------------
-            // Step 2: N transformer layers (Agent 12).
-            //
-            // Each layer takes hidden_states and returns updated hidden_states,
-            // writing K/V into the paged cache.
-            // ------------------------------------------------------------------
+            // Step 2: transformer layers
+            let gpu_cache = self.cache.gpu_cache();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 trace!(layer = layer_idx, "gpu transformer layer");
-                hidden_states = layer.forward(
-                    &hidden_states,
-                    positions,
-                    block_tables,
-                    context_lens,
-                    &self.cache,
-                    &self.blas,
-                    &self.loader,
-                    &self.stream,
-                    layer_idx,
-                )?;
+                let (key_cache, value_cache) = &gpu_cache[layer_idx];
+                let weights = self.layer_weights(layer_idx)?;
+                let input = GpuLayerInput {
+                    hidden_states: &hidden_states,
+                    positions: &positions_gpu,
+                    key_cache,
+                    value_cache,
+                    block_tables: &block_tables_gpu,
+                    context_lens: &context_lens_gpu,
+                    slot_mapping: &slot_mapping_gpu,
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
+                };
+                hidden_states = layer.forward(&input, &weights, &self.blas)?;
             }
 
-            // ------------------------------------------------------------------
-            // Step 3: Final RMSNorm.
-            // ------------------------------------------------------------------
+            // Step 3: final RMSNorm
             let normed = CudaRMSNorm::forward(
                 &hidden_states,
                 &self.final_norm_weight,
@@ -214,101 +191,75 @@ mod cuda_impl {
                 &self.stream,
             )?;
 
-            // ------------------------------------------------------------------
-            // Step 4: LM head projection -> logits [num_tokens, vocab_size].
-            //
-            // logits = normed @ lm_head_weight^T
-            // normed: [num_tokens, hidden_size]
-            // lm_head_weight: [vocab_size, hidden_size]
-            // output: [num_tokens, vocab_size]
-            // ------------------------------------------------------------------
-            let logits_gpu = CudaLinearLayer::forward(
+            // Step 4: LM head  normed [num_tokens, hidden] @ lm_head^T [hidden, vocab]
+            let logits_gpu = CudaLinearLayer::forward_once(
                 &normed,
                 &self.lm_head_weight,
-                None, // no bias on LM head
+                None,
                 num_tokens,
                 vocab_size,
                 hidden_size,
                 &self.blas,
             )?;
 
-            // ------------------------------------------------------------------
-            // Step 5: Transfer logits back to CPU.
-            // ------------------------------------------------------------------
-            // SAFETY: CudaSlice<f32>::copy_to_host performs a synchronous DtoH
-            // copy through cudarc, which handles the device synchronization.
-            let logits_cpu = self
-                .device
+            // Step 5: DtoH
+            let logits_cpu = self.device
                 .dtoh_sync_copy(&logits_gpu)
-                .map_err(|e| LLMError::GpuError(format!("logits DtoH failed: {e}")))?;
+                .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
 
-            debug!(
-                logits_len = logits_cpu.len(),
-                expected = num_tokens * vocab_size,
-                "forward complete"
-            );
-
+            debug!(logits_len = logits_cpu.len(), expected = num_tokens * vocab_size, "forward complete");
             Ok(logits_cpu)
         }
 
-        /// Gather embedding rows for the given token IDs.
-        ///
-        /// Copies token_ids to GPU, then launches a gather kernel (or falls
-        /// back to a host-side gather + HtoD copy).
+        /// Per-layer weight references into the GPU weight map.
+        fn layer_weights(&self, i: usize) -> Result<GpuLayerWeights<'_>> {
+            let g = |name: &str| -> Result<&CudaSlice<f32>> {
+                self.weights.get(name).ok_or_else(|| LLMError::GpuError(format!("missing weight: {name}")))
+            };
+            Ok(GpuLayerWeights {
+                input_layernorm:           g(&format!("model.layers.{i}.input_layernorm.weight"))?,
+                q_proj:                    g(&format!("model.layers.{i}.self_attn.q_proj.weight"))?,
+                k_proj:                    g(&format!("model.layers.{i}.self_attn.k_proj.weight"))?,
+                v_proj:                    g(&format!("model.layers.{i}.self_attn.v_proj.weight"))?,
+                o_proj:                    g(&format!("model.layers.{i}.self_attn.o_proj.weight"))?,
+                post_attention_layernorm:  g(&format!("model.layers.{i}.post_attention_layernorm.weight"))?,
+                gate_proj:                 g(&format!("model.layers.{i}.mlp.gate_proj.weight"))?,
+                up_proj:                   g(&format!("model.layers.{i}.mlp.up_proj.weight"))?,
+                down_proj:                 g(&format!("model.layers.{i}.mlp.down_proj.weight"))?,
+            })
+        }
+
         fn embedding_lookup(&self, token_ids: &[u32]) -> Result<CudaSlice<f32>> {
             let num_tokens = token_ids.len();
             let hidden_size = self.config.hidden_size;
-            let output_len = num_tokens * hidden_size;
 
-            // Upload token_ids to device.
-            let token_ids_gpu = self
-                .device
-                .htod_sync_copy(token_ids)
-                .map_err(|e| LLMError::GpuError(format!("token_ids HtoD failed: {e}")))?;
-
-            // Try launching the embedding gather kernel if the kernel loader has it.
-            // Fallback: do embedding lookup on CPU and upload.
-            // The dedicated kernel avoids a full embedding table DtoH round-trip.
-            //
-            // For now we use the fallback path which is correct and simple.
-            // A dedicated CUDA kernel (embedding_gather.cu) can be added later
-            // for better throughput on large batch sizes.
-            let embed_host = self
-                .device
+            // CPU gather fallback -- embed_gather.cu kernel can replace this later
+            let embed_host = self.device
                 .dtoh_sync_copy(&self.embed_tokens)
-                .map_err(|e| LLMError::GpuError(format!("embed DtoH failed: {e}")))?;
+                .map_err(|e| LLMError::GpuError(format!("embed DtoH: {e}")))?;
 
-            let mut output = vec![0.0f32; output_len];
+            let mut output = vec![0.0f32; num_tokens * hidden_size];
             for (t, &tid) in token_ids.iter().enumerate() {
-                let src_start = tid as usize * hidden_size;
-                let src_end = src_start + hidden_size;
-                let dst_start = t * hidden_size;
-                if src_end <= embed_host.len() {
-                    output[dst_start..dst_start + hidden_size]
-                        .copy_from_slice(&embed_host[src_start..src_end]);
+                let src = tid as usize * hidden_size;
+                if src + hidden_size <= embed_host.len() {
+                    output[t * hidden_size..t * hidden_size + hidden_size]
+                        .copy_from_slice(&embed_host[src..src + hidden_size]);
                 }
-                // Out-of-range tokens stay as zeros (same behavior as CPU path).
             }
 
-            let output_gpu = self
-                .device
+            self.device
                 .htod_sync_copy(&output)
-                .map_err(|e| LLMError::GpuError(format!("embed output HtoD failed: {e}")))?;
-
-            Ok(output_gpu)
+                .map_err(|e| LLMError::GpuError(format!("embed HtoD: {e}")))
         }
 
-        /// Access the underlying model config.
         pub fn config(&self) -> &ModelRunnerConfig {
             &self.config
         }
 
-        /// Access the cache engine (for external cache management).
         pub fn cache(&self) -> &CudaCacheEngine {
             &self.cache
         }
 
-        /// Access the cache engine mutably (for swap/copy ops).
         pub fn cache_mut(&mut self) -> &mut CudaCacheEngine {
             &mut self.cache
         }
