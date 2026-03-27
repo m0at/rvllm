@@ -1,0 +1,20 @@
+[package]
+name = "rvllm-block-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "PagedAttention block allocation for the rvLLM inference engine"
+keywords = ["llm", "inference", "paged-attention", "block", "vllm"]
+categories = ["memory-management", "science"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-memory.workspace = true
+rvllm-sequence.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true

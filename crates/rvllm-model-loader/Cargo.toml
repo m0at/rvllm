@@ -1,0 +1,29 @@
+[package]
+name = "rvllm-model-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "SafeTensors model loading for the rvLLM inference engine"
+keywords = ["llm", "inference", "safetensors", "model", "vllm"]
+categories = ["science", "encoding"]
+
+[features]
+default = []
+cuda = ["rvllm-gpu/cuda"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-gpu.workspace = true
+safetensors.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

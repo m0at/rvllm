@@ -1,0 +1,26 @@
+[package]
+name = "rvllm-speculative"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Speculative decoding for accelerated inference in rvLLM"
+keywords = ["llm", "inference", "speculative-decoding", "draft-model", "vllm"]
+categories = ["algorithms", "science"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-sequence.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+rand.workspace = true
+
+# These deps are used via type imports but may not compile yet in the workspace.
+# Uncomment when upstream crates stabilize:
+# rvllm-engine.workspace = true
+# rvllm-model-runner.workspace = true
+# rvllm-sampling.workspace = true

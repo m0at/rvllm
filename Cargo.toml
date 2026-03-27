@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rvllm-core",
+    "crates/rvllm-config",
+    "crates/rvllm-gpu",
+    "crates/rvllm-memory",
+    "crates/rvllm-block-manager",
+    "crates/rvllm-kv-cache",
+    "crates/rvllm-attention",
+    "crates/rvllm-tokenizer",
+    "crates/rvllm-model-loader",
+    "crates/rvllm-model-runner",
+    "crates/rvllm-sampling",
+    "crates/rvllm-scheduler",
+    "crates/rvllm-sequence",
+    "crates/rvllm-worker",
+    "crates/rvllm-executor",
+    "crates/rvllm-engine",
+    "crates/rvllm-api",
+    "crates/rvllm-quant",
+    "crates/rvllm-speculative",
+    "crates/rvllm-telemetry",
+    "crates/rvllm-bench",
+    "crates/rvllm-server",
+    "crates/rvllm-python",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "rvLLM: 3.3x faster LLM inference in Rust"
+repository = "https://github.com/m0at/rvllm"
+homepage = "https://github.com/m0at/rvllm"
+authors = ["m0at"]
+readme = "README.md"
+keywords = ["llm", "inference", "vllm", "gpu", "transformer"]
+categories = ["science", "concurrency", "hardware-support"]
+
+[workspace.dependencies]
+# Internal crates
+rvllm-core = { path = "crates/rvllm-core" }
+rvllm-config = { path = "crates/rvllm-config" }
+rvllm-gpu = { path = "crates/rvllm-gpu" }
+rvllm-memory = { path = "crates/rvllm-memory" }
+rvllm-block-manager = { path = "crates/rvllm-block-manager" }
+rvllm-kv-cache = { path = "crates/rvllm-kv-cache" }
+rvllm-attention = { path = "crates/rvllm-attention" }
+rvllm-tokenizer = { path = "crates/rvllm-tokenizer" }
+rvllm-model-loader = { path = "crates/rvllm-model-loader" }
+rvllm-model-runner = { path = "crates/rvllm-model-runner" }
+rvllm-sampling = { path = "crates/rvllm-sampling" }
+rvllm-scheduler = { path = "crates/rvllm-scheduler" }
+rvllm-sequence = { path = "crates/rvllm-sequence" }
+rvllm-worker = { path = "crates/rvllm-worker" }
+rvllm-executor = { path = "crates/rvllm-executor" }
+rvllm-engine = { path = "crates/rvllm-engine" }
+rvllm-api = { path = "crates/rvllm-api" }
+rvllm-quant = { path = "crates/rvllm-quant" }
+rvllm-speculative = { path = "crates/rvllm-speculative" }
+rvllm-telemetry = { path = "crates/rvllm-telemetry" }
+
+# External dependencies
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+derive_more = { version = "1", features = ["display", "from", "into"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+config = "0.14"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+rayon = "1.10"
+rand = "0.8"
+rand_chacha = "0.3"
+half = { version = "2", features = ["serde", "bytemuck"] }
+safetensors = "0.4"
+tokenizers = "0.20"
+criterion = "0.5"
+utoipa = { version = "4", features = ["axum_extras"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+async-trait = "0.1"
+parking_lot = "0.12"
+dashmap = "6"
+bytemuck = { version = "1", features = ["derive"] }
+memmap2 = "0.9"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+anyhow = "1"
+pyo3 = { version = "0.25", features = ["extension-module"] }
+

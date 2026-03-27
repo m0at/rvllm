@@ -1,0 +1,35 @@
+[package]
+name = "rvllm-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "GPU worker processes for distributed inference in rvLLM"
+keywords = ["llm", "inference", "worker", "distributed", "vllm"]
+categories = ["concurrency", "hardware-support"]
+
+[features]
+default = []
+cuda = ["dep:cudarc", "rvllm-gpu/cuda", "rvllm-model-runner/cuda", "rvllm-kv-cache/cuda", "rvllm-sampling/cuda", "rvllm-model-loader/cuda"]
+
+[dependencies]
+cudarc = { version = "0.12", features = ["driver", "cublas", "f16"], optional = true }
+rvllm-core.workspace = true
+rvllm-config.workspace = true
+rvllm-gpu.workspace = true
+rvllm-model-runner.workspace = true
+rvllm-kv-cache.workspace = true
+rvllm-sampling.workspace = true
+rvllm-model-loader.workspace = true
+rvllm-sequence.workspace = true
+rvllm-telemetry.workspace = true
+hf-hub = "0.3"
+memmap2.workspace = true
+metrics-exporter-prometheus.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true

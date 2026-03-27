@@ -1,0 +1,14 @@
+[package]
+name = "rvllm-bench"
+version.workspace = true
+edition.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rayon.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+[[bench]]
+name = "sampling_bench"
+harness = false

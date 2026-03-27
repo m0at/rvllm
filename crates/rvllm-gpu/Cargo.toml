@@ -1,0 +1,26 @@
+[package]
+name = "rvllm-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "GPU abstraction layer for the rvLLM inference engine"
+keywords = ["llm", "inference", "gpu", "cuda", "accelerator"]
+categories = ["hardware-support", "science"]
+
+[features]
+default = ["mock-gpu"]
+mock-gpu = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+rvllm-core.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+half.workspace = true
+cudarc = { version = "0.12", features = ["driver", "cublas", "cuda-version-from-build-system"], optional = true }

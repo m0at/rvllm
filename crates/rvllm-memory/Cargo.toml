@@ -1,0 +1,23 @@
+[package]
+name = "rvllm-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "GPU and host memory management for the rvLLM inference engine"
+keywords = ["llm", "inference", "memory", "gpu", "allocator"]
+categories = ["memory-management", "hardware-support"]
+
+[features]
+default = []
+cuda = ["rvllm-gpu/cuda"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-gpu.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true

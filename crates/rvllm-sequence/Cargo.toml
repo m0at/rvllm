@@ -1,0 +1,21 @@
+[package]
+name = "rvllm-sequence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Sequence and request management for the rvLLM inference engine"
+keywords = ["llm", "inference", "sequence", "vllm", "request"]
+categories = ["science", "data-structures"]
+
+[dependencies]
+rvllm-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "rvllm-sampling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Token sampling strategies (top-k, top-p, beam search) for rvLLM"
+keywords = ["llm", "inference", "sampling", "top-k", "vllm"]
+categories = ["algorithms", "science"]
+
+[features]
+default = []
+cuda = ["rvllm-gpu/cuda"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-gpu.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "rvllm-model-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Model execution and forward pass orchestration for the rvLLM inference engine"
+keywords = ["llm", "inference", "model-runner", "forward-pass", "vllm"]
+categories = ["science", "hardware-support"]
+
+[features]
+default = []
+cuda = ["rvllm-gpu/cuda", "rvllm-attention/cuda", "rvllm-model-loader/cuda"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-gpu.workspace = true
+rvllm-attention.workspace = true
+# rvllm-kv-cache omitted: broken upstream (gpu module deleted, engine/ops not updated)
+# TODO: re-add once rvllm-kv-cache compiles with rvllm-gpu buffer types
+rvllm-model-loader.workspace = true
+thiserror.workspace = true
+half.workspace = true
+tracing.workspace = true

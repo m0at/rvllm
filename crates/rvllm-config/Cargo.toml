@@ -1,0 +1,25 @@
+[package]
+name = "rvllm-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Configuration management for the rvLLM inference engine"
+keywords = ["llm", "inference", "vllm", "config", "configuration"]
+categories = ["config"]
+
+[dependencies]
+rvllm-core.workspace = true
+clap.workspace = true
+config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

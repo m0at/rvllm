@@ -1,0 +1,20 @@
+[package]
+name = "rvllm-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Request scheduling and batching for the rvLLM inference engine"
+keywords = ["llm", "inference", "scheduler", "batching", "vllm"]
+categories = ["concurrency", "science"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-block-manager.workspace = true
+rvllm-sequence.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true

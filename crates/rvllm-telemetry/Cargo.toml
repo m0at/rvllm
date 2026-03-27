@@ -1,0 +1,27 @@
+[package]
+name = "rvllm-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Metrics, tracing, and observability for the rvLLM inference engine"
+keywords = ["llm", "inference", "telemetry", "metrics", "tracing"]
+categories = ["development-tools::profiling"]
+
+[dependencies]
+rvllm-core.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

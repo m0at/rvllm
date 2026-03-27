@@ -1,0 +1,41 @@
+[package]
+name = "rvllm-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "OpenAI-compatible REST API layer for the rvLLM inference engine"
+keywords = ["llm", "inference", "openai", "api", "vllm"]
+categories = ["web-programming::http-server", "science"]
+
+[features]
+default = []
+cuda = ["rvllm-gpu/cuda", "rvllm-engine/cuda"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-config.workspace = true
+rvllm-engine.workspace = true
+rvllm-executor.workspace = true
+rvllm-gpu.workspace = true
+rvllm-sequence.workspace = true
+rvllm-tokenizer.workspace = true
+rvllm-telemetry.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+utoipa.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+axum-test = "16"

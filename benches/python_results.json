@@ -1,0 +1,338 @@
+[
+  {
+    "name": "softmax/python/1000",
+    "median_ns": 4250,
+    "mean_ns": 4251,
+    "p5_ns": 4166,
+    "p95_ns": 4375,
+    "iterations": 200
+  },
+  {
+    "name": "softmax/python/32000",
+    "median_ns": 49625,
+    "mean_ns": 50315,
+    "p5_ns": 49333,
+    "p95_ns": 51875,
+    "iterations": 200
+  },
+  {
+    "name": "softmax/python/128000",
+    "median_ns": 172209,
+    "mean_ns": 174112,
+    "p5_ns": 171916,
+    "p95_ns": 185458,
+    "iterations": 200
+  },
+  {
+    "name": "softmax_inplace/python/32000",
+    "median_ns": 47250,
+    "mean_ns": 47530,
+    "p5_ns": 46458,
+    "p95_ns": 49750,
+    "iterations": 200
+  },
+  {
+    "name": "softmax_inplace/python/128000",
+    "median_ns": 175667,
+    "mean_ns": 176763,
+    "p5_ns": 175375,
+    "p95_ns": 183833,
+    "iterations": 200
+  },
+  {
+    "name": "log_softmax/python/32000",
+    "median_ns": 46209,
+    "mean_ns": 46509,
+    "p5_ns": 45958,
+    "p95_ns": 47083,
+    "iterations": 200
+  },
+  {
+    "name": "log_softmax/python/128000",
+    "median_ns": 172791,
+    "mean_ns": 176024,
+    "p5_ns": 171750,
+    "p95_ns": 190417,
+    "iterations": 200
+  },
+  {
+    "name": "multinomial/python/32000",
+    "median_ns": 65708,
+    "mean_ns": 66805,
+    "p5_ns": 65208,
+    "p95_ns": 74500,
+    "iterations": 200
+  },
+  {
+    "name": "multinomial/python/128000",
+    "median_ns": 258375,
+    "mean_ns": 261462,
+    "p5_ns": 253500,
+    "p95_ns": 282125,
+    "iterations": 200
+  },
+  {
+    "name": "temperature/python/32000",
+    "median_ns": 2750,
+    "mean_ns": 2756,
+    "p5_ns": 2708,
+    "p95_ns": 2875,
+    "iterations": 200
+  },
+  {
+    "name": "temperature/python/128000",
+    "median_ns": 8916,
+    "mean_ns": 9030,
+    "p5_ns": 8833,
+    "p95_ns": 9125,
+    "iterations": 200
+  },
+  {
+    "name": "top_k/python_k50/32000",
+    "median_ns": 75083,
+    "mean_ns": 75844,
+    "p5_ns": 57417,
+    "p95_ns": 97167,
+    "iterations": 200
+  },
+  {
+    "name": "top_k/python_k50/128000",
+    "median_ns": 477792,
+    "mean_ns": 488199,
+    "p5_ns": 441083,
+    "p95_ns": 568958,
+    "iterations": 200
+  },
+  {
+    "name": "top_p/python_p0.9/32000",
+    "median_ns": 1453875,
+    "mean_ns": 1469054,
+    "p5_ns": 1354583,
+    "p95_ns": 1614792,
+    "iterations": 200
+  },
+  {
+    "name": "top_p/python_p0.9/128000",
+    "median_ns": 6935750,
+    "mean_ns": 7018085,
+    "p5_ns": 6797958,
+    "p95_ns": 7483125,
+    "iterations": 200
+  },
+  {
+    "name": "min_p/python_32k",
+    "median_ns": 78667,
+    "mean_ns": 79516,
+    "p5_ns": 78208,
+    "p95_ns": 82292,
+    "iterations": 200
+  },
+  {
+    "name": "repetition_penalty/python_32k_500past",
+    "median_ns": 11833,
+    "mean_ns": 11864,
+    "p5_ns": 11708,
+    "p95_ns": 12000,
+    "iterations": 200
+  },
+  {
+    "name": "repetition_penalty_large/python_32k_2000past",
+    "median_ns": 33084,
+    "mean_ns": 33477,
+    "p5_ns": 32833,
+    "p95_ns": 34459,
+    "iterations": 200
+  },
+  {
+    "name": "combined_penalties/python_32k_freq_pres_rep",
+    "median_ns": 63417,
+    "mean_ns": 63952,
+    "p5_ns": 62792,
+    "p95_ns": 66250,
+    "iterations": 200
+  },
+  {
+    "name": "full_pipeline/python/32000",
+    "median_ns": 435000,
+    "mean_ns": 441505,
+    "p5_ns": 415125,
+    "p95_ns": 484542,
+    "iterations": 200
+  },
+  {
+    "name": "full_pipeline/python/128000",
+    "median_ns": 1882583,
+    "mean_ns": 1888239,
+    "p5_ns": 1812833,
+    "p95_ns": 1958833,
+    "iterations": 200
+  },
+  {
+    "name": "greedy_sample/python/32000",
+    "median_ns": 10333,
+    "mean_ns": 10369,
+    "p5_ns": 10292,
+    "p95_ns": 10416,
+    "iterations": 500
+  },
+  {
+    "name": "greedy_sample/python/128000",
+    "median_ns": 39500,
+    "mean_ns": 39659,
+    "p5_ns": 39417,
+    "p95_ns": 39584,
+    "iterations": 500
+  },
+  {
+    "name": "top_logprobs/python_top5/32000",
+    "median_ns": 270584,
+    "mean_ns": 241575,
+    "p5_ns": 171292,
+    "p95_ns": 282708,
+    "iterations": 200
+  },
+  {
+    "name": "top_logprobs/python_top5/128000",
+    "median_ns": 561625,
+    "mean_ns": 558737,
+    "p5_ns": 504833,
+    "p95_ns": 636875,
+    "iterations": 200
+  },
+  {
+    "name": "dequant_q4_0/python_loop/1000000",
+    "median_ns": 121144167,
+    "mean_ns": 121287245,
+    "p5_ns": 118581875,
+    "p95_ns": 127062958,
+    "iterations": 20
+  },
+  {
+    "name": "dequant_q4_0/python_loop/10000000",
+    "median_ns": 1239306708,
+    "mean_ns": 1245238750,
+    "p5_ns": 1224612666,
+    "p95_ns": 1271610417,
+    "iterations": 5
+  },
+  {
+    "name": "dequant_q4_0/python_vectorized/1000000",
+    "median_ns": 919458,
+    "mean_ns": 922656,
+    "p5_ns": 915708,
+    "p95_ns": 945958,
+    "iterations": 100
+  },
+  {
+    "name": "dequant_q4_0/python_vectorized/10000000",
+    "median_ns": 9671250,
+    "mean_ns": 9722575,
+    "p5_ns": 9583333,
+    "p95_ns": 10109708,
+    "iterations": 100
+  },
+  {
+    "name": "batch_sampling/python/8",
+    "median_ns": 4352083,
+    "mean_ns": 4399972,
+    "p5_ns": 4190083,
+    "p95_ns": 4813083,
+    "iterations": 50
+  },
+  {
+    "name": "batch_sampling/python/32",
+    "median_ns": 17891959,
+    "mean_ns": 17851483,
+    "p5_ns": 17517334,
+    "p95_ns": 18075500,
+    "iterations": 50
+  },
+  {
+    "name": "batch_sampling/python/64",
+    "median_ns": 36441209,
+    "mean_ns": 36982531,
+    "p5_ns": 35731667,
+    "p95_ns": 41197833,
+    "iterations": 50
+  },
+  {
+    "name": "softmax/torch/32000",
+    "median_ns": 26792,
+    "mean_ns": 26879,
+    "p5_ns": 26666,
+    "p95_ns": 27125,
+    "iterations": 200
+  },
+  {
+    "name": "softmax/torch/128000",
+    "median_ns": 103833,
+    "mean_ns": 104225,
+    "p5_ns": 103042,
+    "p95_ns": 106708,
+    "iterations": 200
+  },
+  {
+    "name": "log_softmax/torch/32000",
+    "median_ns": 23166,
+    "mean_ns": 23279,
+    "p5_ns": 23083,
+    "p95_ns": 23291,
+    "iterations": 200
+  },
+  {
+    "name": "log_softmax/torch/128000",
+    "median_ns": 89500,
+    "mean_ns": 89984,
+    "p5_ns": 89125,
+    "p95_ns": 92750,
+    "iterations": 200
+  },
+  {
+    "name": "top_k/torch_k50/32000",
+    "median_ns": 40000,
+    "mean_ns": 40328,
+    "p5_ns": 39750,
+    "p95_ns": 42708,
+    "iterations": 200
+  },
+  {
+    "name": "top_k/torch_k50/128000",
+    "median_ns": 153708,
+    "mean_ns": 154303,
+    "p5_ns": 150625,
+    "p95_ns": 161750,
+    "iterations": 200
+  },
+  {
+    "name": "temperature/torch/32000",
+    "median_ns": 3541,
+    "mean_ns": 3529,
+    "p5_ns": 3458,
+    "p95_ns": 3584,
+    "iterations": 200
+  },
+  {
+    "name": "temperature/torch/128000",
+    "median_ns": 13583,
+    "mean_ns": 13782,
+    "p5_ns": 11959,
+    "p95_ns": 16542,
+    "iterations": 200
+  },
+  {
+    "name": "multinomial/torch/32000",
+    "median_ns": 259875,
+    "mean_ns": 261964,
+    "p5_ns": 256333,
+    "p95_ns": 277958,
+    "iterations": 200
+  },
+  {
+    "name": "multinomial/torch/128000",
+    "median_ns": 1049417,
+    "mean_ns": 1051732,
+    "p5_ns": 1040500,
+    "p95_ns": 1075334,
+    "iterations": 200
+  }
+]

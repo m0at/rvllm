@@ -1,0 +1,22 @@
+[package]
+name = "rvllm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Core types, error handling, and traits for the rvLLM inference engine"
+keywords = ["llm", "inference", "vllm", "core", "types"]
+categories = ["science", "data-structures"]
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+derive_more.workspace = true
+half.workspace = true
+
+serde_json.workspace = true
+
+[dev-dependencies]

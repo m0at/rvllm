@@ -1,0 +1,23 @@
+[package]
+name = "rvllm-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Async execution layer for the rvLLM inference engine"
+keywords = ["llm", "inference", "executor", "async", "vllm"]
+categories = ["asynchronous", "science"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-sequence.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

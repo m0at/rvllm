@@ -1,0 +1,41 @@
+[package]
+name = "rvllm-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "HTTP server binary for the rvLLM inference engine"
+keywords = ["llm", "inference", "server", "http", "vllm"]
+categories = ["web-programming::http-server", "science"]
+
+[[bin]]
+name = "rvllm"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["rvllm-gpu/cuda", "rvllm-api/cuda", "rvllm-engine/cuda"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-config.workspace = true
+rvllm-gpu.workspace = true
+rvllm-api.workspace = true
+rvllm-engine.workspace = true
+rvllm-sequence.workspace = true
+rvllm-telemetry.workspace = true
+rvllm-tokenizer.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokenizers = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+serde_json.workspace = true

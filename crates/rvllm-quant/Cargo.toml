@@ -1,0 +1,29 @@
+[package]
+name = "rvllm-quant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Weight quantization (GPTQ, AWQ, SqueezeLLM) for the rvLLM inference engine"
+keywords = ["llm", "inference", "quantization", "gptq", "vllm"]
+categories = ["science", "compression"]
+
+[features]
+default = []
+cuda = ["rvllm-gpu/cuda"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-gpu.workspace = true
+thiserror.workspace = true
+half.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

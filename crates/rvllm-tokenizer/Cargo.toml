@@ -1,0 +1,21 @@
+[package]
+name = "rvllm-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Tokenizer integration (HuggingFace) for the rvLLM inference engine"
+keywords = ["llm", "inference", "tokenizer", "huggingface", "vllm"]
+categories = ["text-processing", "science"]
+
+[dependencies]
+rvllm-core.workspace = true
+tokenizers.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hf-hub = "0.3"

@@ -1,0 +1,42 @@
+[package]
+name = "rvllm-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Core inference engine orchestrating scheduling, execution, and streaming for rvLLM"
+keywords = ["llm", "inference", "engine", "streaming", "vllm"]
+categories = ["science", "asynchronous"]
+
+[dependencies]
+cudarc = { version = "0.12", features = ["driver", "cublas", "f16"], optional = true }
+rvllm-core.workspace = true
+rvllm-config.workspace = true
+rvllm-tokenizer.workspace = true
+rvllm-sequence.workspace = true
+rvllm-executor.workspace = true
+rvllm-telemetry.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+hf-hub = "0.3"
+metrics-exporter-prometheus.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+rvllm-worker = { workspace = true, optional = true }
+rvllm-block-manager = { workspace = true, optional = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc", "dep:rvllm-worker", "dep:rvllm-block-manager", "rvllm-worker?/cuda"]
+
+[dev-dependencies]
+tempfile = "3"
+tokenizers = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+serde_json.workspace = true
