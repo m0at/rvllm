@@ -9,15 +9,8 @@ target/
 *.swo
 *~
 .env
-.env.local
-.env.production
-*.pem
-*.key
-credentials.json
-secrets.yaml
 .instance_id
 results_*.json
-*.api_key
 __pycache__/
 *.pyc
 .mypy_cache/

@@ -94,22 +94,6 @@ Python objects carry ~50 bytes of overhead each. A running vLLM server with thou
 
 ## Quick Start
 
-### Development setup
-
-```bash
-# Install dependencies (Rust, Python, maturin)
-# NOTE: Always review shell scripts before running them.
-# Read install.sh in full first -- it installs packages on your system.
-cat install.sh    # review first
-./install.sh      # then run
-```
-
-Copy the example env file and configure:
-```bash
-cp .env.example .env
-# Edit .env with your HuggingFace token, GPU settings, etc.
-```
-
 ### Build from source
 
 ```bash
