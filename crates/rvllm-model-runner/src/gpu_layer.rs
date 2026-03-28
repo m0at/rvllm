@@ -63,16 +63,22 @@ mod inner {
     }
 
     /// FP16 weight references for a single transformer layer (f16 GEMM path).
+    ///
+    /// Projection weights are f16 (used with hgemm). Norm weights and biases
+    /// remain f32 since RMSNorm and bias-add operate in f32.
     pub struct GpuLayerWeightsF16<'a> {
-        pub q_proj: &'a CudaSlice<f32>,
-        pub k_proj: &'a CudaSlice<f32>,
-        pub v_proj: &'a CudaSlice<f32>,
-        pub o_proj: &'a CudaSlice<f32>,
         pub input_layernorm: &'a CudaSlice<f32>,
+        pub q_proj: &'a CudaSlice<f16>,
+        pub k_proj: &'a CudaSlice<f16>,
+        pub v_proj: &'a CudaSlice<f16>,
+        pub o_proj: &'a CudaSlice<f16>,
+        pub q_proj_bias: Option<&'a CudaSlice<f32>>,
+        pub k_proj_bias: Option<&'a CudaSlice<f32>>,
+        pub v_proj_bias: Option<&'a CudaSlice<f32>>,
         pub post_attention_layernorm: &'a CudaSlice<f32>,
-        pub gate_proj: &'a CudaSlice<f32>,
-        pub up_proj: &'a CudaSlice<f32>,
-        pub down_proj: &'a CudaSlice<f32>,
+        pub gate_proj: &'a CudaSlice<f16>,
+        pub up_proj: &'a CudaSlice<f16>,
+        pub down_proj: &'a CudaSlice<f16>,
     }
 
     /// Metadata needed for a single layer forward pass.
@@ -129,27 +135,158 @@ mod inner {
         /// Returns the output hidden states as a new CudaSlice<f32> of shape
         /// [num_tokens, hidden_size]. The caller is responsible for using this
         /// as input to the next layer.
-        /// FP16 forward pass -- currently delegates to f32 forward (f16 KV cache is handled inside).
+        /// FP16 forward pass -- uses hgemm for projection weights (f16), while
+        /// norms, biases, RoPE, and attention remain in f32.
         pub fn forward_f16(
             &self,
             input: &GpuLayerInput<'_>,
-            _weights_f16: &GpuLayerWeightsF16<'_>,
+            weights: &GpuLayerWeightsF16<'_>,
             blas: &CublasHandle,
         ) -> Result<CudaSlice<f32>> {
-            // TODO: use hgemm with f16 weights. For now, reuse f32 weights via the standard path.
-            // The f16 KV cache write/read is already active in cache_write() and attention().
-            let weights = GpuLayerWeights {
-                q_proj: _weights_f16.q_proj,
-                k_proj: _weights_f16.k_proj,
-                v_proj: _weights_f16.v_proj,
-                o_proj: _weights_f16.o_proj,
-                input_layernorm: _weights_f16.input_layernorm,
-                post_attention_layernorm: _weights_f16.post_attention_layernorm,
-                gate_proj: _weights_f16.gate_proj,
-                up_proj: _weights_f16.up_proj,
-                down_proj: _weights_f16.down_proj,
+            use crate::layers::linear_cuda::CudaLinearLayer;
+
+            let cfg = &self.config;
+            let num_tokens = input.num_tokens;
+            let hidden = cfg.hidden_size;
+            let num_heads = cfg.num_heads;
+            let num_kv_heads = cfg.num_kv_heads;
+            let head_dim = cfg.head_dim;
+            let intermediate = cfg.intermediate_size;
+
+            // 1. Pre-attention RMSNorm (f32)
+            let normed = Self::rms_norm(
+                &self.device,
+                input.hidden_states,
+                weights.input_layernorm,
+                cfg.rms_norm_eps,
+                num_tokens,
+                hidden,
+            )?;
+
+            // 2. QKV projections via hgemm (f16 weights)
+            let q_dim = num_heads * head_dim;
+            let kv_dim = num_kv_heads * head_dim;
+
+            let mut q = CudaLinearLayer::forward_once_f16(
+                &normed, weights.q_proj, num_tokens, q_dim, hidden, blas,
+            )?;
+            let mut k = CudaLinearLayer::forward_once_f16(
+                &normed, weights.k_proj, num_tokens, kv_dim, hidden, blas,
+            )?;
+            let mut v = CudaLinearLayer::forward_once_f16(
+                &normed, weights.v_proj, num_tokens, kv_dim, hidden, blas,
+            )?;
+
+            // QKV biases (f32)
+            if let Some(bias) = weights.q_proj_bias {
+                Self::add_bias(&self.device, &mut q, bias, num_tokens, q_dim)?;
+            }
+            if let Some(bias) = weights.k_proj_bias {
+                Self::add_bias(&self.device, &mut k, bias, num_tokens, kv_dim)?;
+            }
+            if let Some(bias) = weights.v_proj_bias {
+                Self::add_bias(&self.device, &mut v, bias, num_tokens, kv_dim)?;
+            }
+
+            // 3. RoPE
+            let (q_rot, k_rot) = Self::apply_rotary_embedding(
+                &self.device,
+                &q,
+                &k,
+                input.positions,
+                input.rope_cos,
+                input.rope_sin,
+                num_tokens,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            )?;
+
+            // 4. KV cache write + attention
+            Self::cache_write(
+                &self.device,
+                &k_rot,
+                &v,
+                input.key_cache,
+                input.value_cache,
+                input.slot_mapping,
+                num_tokens,
+                num_kv_heads,
+                head_dim,
+            )?;
+
+            let attn_out = if input.is_prefill {
+                Self::prefill_attention(
+                    &self.device,
+                    &q_rot,
+                    input.key_cache,
+                    input.value_cache,
+                    input.block_tables,
+                    input.context_lens,
+                    input.seq_start_pos,
+                    num_tokens,
+                    input.num_seqs,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    input.max_context_len,
+                    input.block_size,
+                )?
+            } else {
+                Self::decode_attention(
+                    &self.device,
+                    &q_rot,
+                    input.key_cache,
+                    input.value_cache,
+                    input.block_tables,
+                    input.context_lens,
+                    num_tokens,
+                    input.num_seqs,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    input.max_context_len,
+                    input.block_size,
+                )?
             };
-            self.forward(input, &weights, blas)
+
+            // 5. Output projection (f16 weight)
+            let attn_proj = CudaLinearLayer::forward_once_f16(
+                &attn_out, weights.o_proj, num_tokens, hidden, q_dim, blas,
+            )?;
+
+            // Residual
+            let residual = Self::add_tensors(
+                &self.device,
+                input.hidden_states,
+                &attn_proj,
+                num_tokens * hidden,
+            )?;
+
+            // 6. Post-attention RMSNorm (f32)
+            let normed2 = Self::rms_norm(
+                &self.device,
+                &residual,
+                weights.post_attention_layernorm,
+                cfg.rms_norm_eps,
+                num_tokens,
+                hidden,
+            )?;
+
+            // 7. MLP (f16 weights)
+            let gate = CudaLinearLayer::forward_once_f16(
+                &normed2, weights.gate_proj, num_tokens, intermediate, hidden, blas,
+            )?;
+            let up = CudaLinearLayer::forward_once_f16(
+                &normed2, weights.up_proj, num_tokens, intermediate, hidden, blas,
+            )?;
+            let fused = Self::fused_silu_mul(&self.device, &gate, &up, num_tokens * intermediate)?;
+            let mlp_out = CudaLinearLayer::forward_once_f16(
+                &fused, weights.down_proj, num_tokens, hidden, intermediate, blas,
+            )?;
+
+            // 8. Residual
+            Self::add_tensors(&self.device, &residual, &mlp_out, num_tokens * hidden)
         }
 
         pub fn forward(
