@@ -56,19 +56,21 @@ impl CublasHandle {
                 format!("cuBLAS workspace alloc: {e}")
             ))?;
 
-        // Get raw device pointer for cublasSetWorkspace_v2
-        let (raw_ptr, _guard) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
-
-        unsafe {
-            let status = cudarc::cublas::sys::cublasSetWorkspace_v2(
-                *self.blas.handle(),
-                raw_ptr as *mut std::ffi::c_void,
-                CUBLAS_GRAPH_WORKSPACE_BYTES,
-            );
-            if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                return Err(crate::LLMError::GpuError(
-                    format!("cublasSetWorkspace_v2 failed: {status:?}")
-                ));
+        // Get raw device pointer and call cublasSetWorkspace_v2 in a scoped
+        // borrow so we can move `ws` into self.graph_workspace afterwards.
+        {
+            let (raw_ptr, _guard) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+            unsafe {
+                let status = cudarc::cublas::sys::cublasSetWorkspace_v2(
+                    *self.blas.handle(),
+                    raw_ptr as *mut std::ffi::c_void,
+                    CUBLAS_GRAPH_WORKSPACE_BYTES,
+                );
+                if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    return Err(crate::LLMError::GpuError(
+                        format!("cublasSetWorkspace_v2 failed: {status:?}")
+                    ));
+                }
             }
         }
 

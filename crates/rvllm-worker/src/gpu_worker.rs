@@ -353,7 +353,19 @@ impl GpuWorker {
             LLMError::GpuError(format!("failed to init CUDA device {}: {}", device_id, e))
         })?;
 
-        let stream = context.default_stream();
+        // Disable cudarc's per-CudaSlice event tracking. Event tracking records
+        // read/write CudaEvents on every allocation, which causes
+        // CUDA_ERROR_STREAM_CAPTURE_ISOLATION during graph capture (events from
+        // pre-capture work create illegal cross-phase dependencies). Since we use
+        // a single stream, event-based multi-stream sync is unnecessary.
+        #[cfg(feature = "cuda")]
+        unsafe { context.disable_event_tracking(); }
+
+        // Use a non-default stream for all GPU operations. The legacy default
+        // stream (stream 0) does NOT support cuStreamBeginCapture, which is
+        // required for CUDA graph capture/replay.
+        let stream = context.new_stream()
+            .map_err(|e| LLMError::GpuError(format!("failed to create CUDA stream: {e}")))?;
 
         let cublas = CublasHandle::new(stream.clone())
             .map_err(|e| LLMError::GpuError(format!("failed to create CublasHandle: {}", e)))?;
@@ -639,6 +651,7 @@ impl GpuWorker {
                 warn!("cuBLAS graph workspace setup failed: {e} -- graph capture disabled");
                 self.graph_runner.pool_mut().disable();
             }
+
 
             self.gpu_model_runner = Some(runner);
             info!(

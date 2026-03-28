@@ -674,6 +674,7 @@ mod cuda_impl {
             &self.stream
         }
 
+
         /// Prepare the runner for CUDA graph capture.
         ///
         /// Pre-allocates the cuBLAS workspace (required by cuBLAS for graph
