@@ -19,4 +19,7 @@ pub mod routes;
 pub mod server;
 pub mod types;
 
+#[cfg(test)]
+mod test_support;
+
 pub use server::{build_router, serve, AppState};

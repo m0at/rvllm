@@ -255,3 +255,66 @@ pub async fn create_chat_completion(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum_test::TestServer;
+
+    use super::*;
+    use crate::test_support::{make_finished_output, make_test_tokenizer, RecordingEngine};
+    use crate::types::request::ChatMessage;
+
+    #[tokio::test]
+    async fn route_accepts_beam_search_chat_request() {
+        let engine = RecordingEngine::new(make_finished_output(&["chat beam"], true), true);
+        let state = Arc::new(crate::server::AppState::new(
+            engine.clone(),
+            "m".to_string(),
+            make_test_tokenizer(),
+        ));
+        let server = TestServer::new(crate::server::build_router(state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&ChatCompletionRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "Explain beam search".into(),
+                }],
+                max_tokens: 16,
+                temperature: 0.0,
+                top_p: 1.0,
+                n: 2,
+                stream: false,
+                stop: None,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                user: None,
+                seed: None,
+                best_of: Some(3),
+                use_beam_search: true,
+                length_penalty: 0.4,
+                early_stopping: true,
+                tools: None,
+                tool_choice: None,
+            })
+            .await;
+
+        response.assert_status_ok();
+        assert_eq!(
+            response.json::<serde_json::Value>()["choices"][0]["message"]["content"],
+            "chat beam"
+        );
+
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].prompt.contains("Explain beam search"));
+        assert_eq!(calls[0].params.best_of, 3);
+        assert!(calls[0].params.use_beam_search);
+        assert_eq!(calls[0].params.length_penalty, 0.4);
+        assert!(calls[0].params.early_stopping);
+    }
+}

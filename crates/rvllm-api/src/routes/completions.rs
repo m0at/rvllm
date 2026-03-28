@@ -104,3 +104,111 @@ pub async fn create_completion(
         Ok(Json(resp).into_response())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum_test::TestServer;
+
+    use super::*;
+    use crate::test_support::{make_finished_output, make_test_tokenizer, RecordingEngine};
+
+    #[tokio::test]
+    async fn route_accepts_beam_search_completion_request() {
+        let engine = RecordingEngine::new(make_finished_output(&["beam result"], true), true);
+        let state = Arc::new(crate::server::AppState::new(
+            engine.clone(),
+            "m".to_string(),
+            make_test_tokenizer(),
+        ));
+        let server = TestServer::new(crate::server::build_router(state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&CompletionRequest {
+                model: "m".into(),
+                prompt: "hello".into(),
+                max_tokens: 16,
+                temperature: 0.0,
+                top_p: 1.0,
+                n: 2,
+                stream: false,
+                stop: None,
+                logprobs: None,
+                echo: false,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                user: None,
+                seed: None,
+                best_of: Some(3),
+                use_beam_search: true,
+                length_penalty: 0.5,
+                early_stopping: true,
+            })
+            .await;
+
+        response.assert_status_ok();
+        assert_eq!(
+            response.json::<serde_json::Value>()["choices"][0]["text"],
+            "beam result"
+        );
+
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].prompt, "hello");
+        assert_eq!(calls[0].params.best_of, 3);
+        assert!(calls[0].params.use_beam_search);
+        assert_eq!(calls[0].params.length_penalty, 0.5);
+        assert!(calls[0].params.early_stopping);
+    }
+
+    #[tokio::test]
+    async fn route_keeps_best_of_n_distinct_from_beam_search() {
+        let engine = RecordingEngine::new(make_finished_output(&["first", "second"], true), true);
+        let state = Arc::new(crate::server::AppState::new(
+            engine.clone(),
+            "m".to_string(),
+            make_test_tokenizer(),
+        ));
+        let server = TestServer::new(crate::server::build_router(state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&CompletionRequest {
+                model: "m".into(),
+                prompt: "hello".into(),
+                max_tokens: 16,
+                temperature: 0.8,
+                top_p: 0.9,
+                n: 2,
+                stream: false,
+                stop: None,
+                logprobs: None,
+                echo: false,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                user: None,
+                seed: None,
+                best_of: None,
+                use_beam_search: false,
+                length_penalty: 1.0,
+                early_stopping: false,
+            })
+            .await;
+
+        response.assert_status_ok();
+        assert_eq!(
+            response.json::<serde_json::Value>()["choices"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].params.best_of, 2);
+        assert!(!calls[0].params.use_beam_search);
+    }
+}

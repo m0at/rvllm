@@ -296,6 +296,50 @@ All standard OpenAI parameters work:
 | `seed` | int | null | Deterministic generation |
 | `n` | int | 1 | Number of completions |
 
+### Beam search controls
+
+rvLLM also accepts the beam-search controls used by vLLM:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `use_beam_search` | bool | false | Enable beam search instead of independent sampling |
+| `best_of` | int | `n` | Beam width when beam search is enabled |
+| `length_penalty` | float | 1.0 | Length normalization factor for beam ranking |
+| `early_stopping` | bool | false | Stop once completed beams dominate active beams |
+
+Notes:
+- Beam width is `best_of.unwrap_or(n)`.
+- Beam search is non-streaming only.
+- Non-beam `best_of` remains best-of-N sampling, not beam search.
+
+```bash
+# Beam-search completion
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"Qwen/Qwen2.5-1.5B",
+    "prompt":"Summarize Rust ownership in one sentence.",
+    "max_tokens":64,
+    "n":2,
+    "best_of":4,
+    "use_beam_search":true,
+    "length_penalty":0.6,
+    "early_stopping":true
+  }'
+
+# Beam-search chat
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"Qwen/Qwen2.5-1.5B",
+    "messages":[{"role":"user","content":"Explain beam search in plain English."}],
+    "max_tokens":96,
+    "n":2,
+    "use_beam_search":true,
+    "length_penalty":0.8
+  }'
+```
+
 ## Reproducible Benchmarking
 
 ### Fresh-instance benchmark script
@@ -363,7 +407,15 @@ bash scripts/benchmark.sh
 
 ```bash
 # Start server, then:
-VLLM_RS_URL=http://localhost:8000 python3 -m pytest tests/api_compat/ -v
+RVLLM_URL=http://localhost:8000 python3 -m pytest tests/api_compat/ -v
+```
+
+### Beam-search smoke test on CUDA
+
+After starting a CUDA-backed server, run:
+
+```bash
+RVLLM_URL=http://localhost:8000 bash tests/api_compat/run_beam_search_smoke.sh
 ```
 
 ## Video Demo

@@ -345,6 +345,48 @@ class TestResponsesSdk:
         assert response.tool_choice == "auto"
         assert response.tools[0].type == "function"
 
+class TestBeamSearch:
+    def test_beam_search_completion(self):
+        """Beam search completion works end to end"""
+        r = requests.post(f"{BASE_URL}/v1/completions", json={
+            "model": "test",
+            "prompt": "Summarize beam search in one sentence.",
+            "max_tokens": 8,
+            "n": 2,
+            "best_of": 3,
+            "use_beam_search": True,
+            "length_penalty": 0.6,
+            "early_stopping": True,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert "choices" in data
+        assert len(data["choices"]) == 1
+
+    def test_beam_search_streaming_rejected(self):
+        """Beam search rejects streaming requests"""
+        r = requests.post(f"{BASE_URL}/v1/completions", json={
+            "model": "test",
+            "prompt": "Hello",
+            "max_tokens": 5,
+            "n": 2,
+            "use_beam_search": True,
+            "stream": True,
+        })
+        assert r.status_code == 400
+
+    def test_beam_search_invalid_length_penalty_rejected(self):
+        """Invalid beam search controls are rejected"""
+        r = requests.post(f"{BASE_URL}/v1/completions", json={
+            "model": "test",
+            "prompt": "Hello",
+            "max_tokens": 5,
+            "n": 2,
+            "use_beam_search": True,
+            "length_penalty": -1.0,
+        })
+        assert r.status_code == 400
+
 class TestModels:
     def test_list_models(self):
         """GET /v1/models"""

@@ -1139,4 +1139,67 @@ mod tests {
         response.assert_status_bad_request();
         assert!(response.text().contains("beam search is not supported"));
     }
+
+    #[tokio::test]
+    async fn route_accepts_beam_search_on_supported_backend() {
+        let engine = crate::test_support::RecordingEngine::new(
+            crate::test_support::make_finished_output(&["tool beam"], true),
+            true,
+        );
+        let state = Arc::new(crate::server::AppState::new(
+            engine.clone(),
+            "m".to_string(),
+            crate::test_support::make_test_tokenizer(),
+        ));
+        let app = crate::server::build_router(state);
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions/tools")
+            .json(&ChatCompletionToolRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "call the weather tool".into(),
+                }],
+                max_tokens: 16,
+                temperature: 0.0,
+                top_p: 1.0,
+                n: 2,
+                stream: false,
+                stop: None,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                user: None,
+                seed: None,
+                best_of: Some(3),
+                use_beam_search: true,
+                length_penalty: 0.6,
+                early_stopping: true,
+                tools: Some(vec![RequestTool {
+                    tool_type: "function".into(),
+                    function: RequestFunction {
+                        name: "get_weather".into(),
+                        description: Some("Get weather".into()),
+                        parameters: None,
+                    },
+                }]),
+                tool_choice: Some(ToolChoice::Mode("auto".into())),
+            })
+            .await;
+
+        response.assert_status_ok();
+        assert_eq!(
+            response.json::<serde_json::Value>()["choices"][0]["message"]["content"],
+            "tool beam"
+        );
+
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].prompt.contains("get_weather"));
+        assert!(calls[0].params.use_beam_search);
+        assert_eq!(calls[0].params.best_of, 3);
+        assert_eq!(calls[0].params.length_penalty, 0.6);
+        assert!(calls[0].params.early_stopping);
+    }
 }
