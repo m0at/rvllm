@@ -466,6 +466,7 @@ mod tests {
             max_position: 128,
             dtype: "float16".into(),
             rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
             architecture: "GPTNeoXForCausalLM".into(),
         }
     }

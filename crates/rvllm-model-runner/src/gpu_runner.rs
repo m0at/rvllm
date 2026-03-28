@@ -91,7 +91,7 @@ mod cuda_impl {
                     num_kv_heads: config.num_kv_heads,
                     head_dim: config.head_dim,
                     intermediate_size: config.intermediate_size,
-                    rms_norm_eps: 1e-5_f32,
+                    rms_norm_eps: config.rms_norm_eps,
                     layer_idx: i,
                 };
                 layers.push(GpuTransformerLayer::new(layer_cfg, Arc::clone(&device)));
@@ -118,6 +118,7 @@ mod cuda_impl {
                 .map_err(|e| LLMError::GpuError(format!("rope sin HtoD: {e}")))?;
             info!(max_pos, half_dim, "RoPE tables uploaded to GPU");
 
+            let rms_eps = config.rms_norm_eps;
             Ok(Self {
                 weights,
                 cache,
@@ -130,7 +131,7 @@ mod cuda_impl {
                 embed_tokens,
                 final_norm_weight,
                 lm_head_weight,
-                rms_norm_eps: 1e-5_f32,
+                rms_norm_eps: rms_eps,
                 rope_cos,
                 rope_sin,
             })
@@ -187,68 +188,12 @@ mod cuda_impl {
 
             let max_context_len = attn_meta.max_context_len;
 
-            // Metadata dump (first 5 calls)
-            static CALL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let call_num = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let probe = call_num < 25;
-            if probe {
-                eprintln!("STEP {} prefill={} toks={:?} pos={:?} slots={:?} ctx={:?} maxctx={}",
-                    call_num, is_prefill, token_ids, positions,
-                    &attn_meta.slot_mapping[..8.min(attn_meta.slot_mapping.len())],
-                    &attn_meta.context_lens, max_context_len);
-            }
-
-            // Decode-specific probe (first decode call only)
-            static DECODE_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            let decode_probe = !is_prefill && !DECODE_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed);
-            // Reset if this was a prefill call (only arm on actual decode)
-            if is_prefill { DECODE_PROBED.store(false, std::sync::atomic::Ordering::Relaxed); }
-            if probe {
-                info!(
-                    ?token_ids,
-                    ?positions,
-                    slot_mapping = ?&attn_meta.slot_mapping[..8.min(attn_meta.slot_mapping.len())],
-                    context_lens = ?&attn_meta.context_lens,
-                    block_tables = ?&attn_meta.block_tables,
-                    max_context_len,
-                    max_blocks,
-                    is_prefill,
-                    "PROBE metadata"
-                );
-            }
-            if decode_probe {
-                info!(
-                    ?token_ids,
-                    ?positions,
-                    slot_mapping = ?&attn_meta.slot_mapping,
-                    context_lens = ?&attn_meta.context_lens,
-                    block_tables = ?&attn_meta.block_tables,
-                    max_context_len,
-                    max_blocks,
-                    is_prefill,
-                    "DECODE_PROBE metadata"
-                );
-            }
-
             // Step 1: token embedding lookup
-            info!("gpu_runner: embedding lookup");
             let mut hidden_states = self.embedding_lookup(token_ids)?;
-            if probe {
-                let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
-                info!(len = h.len(), first5 = ?&h[..5.min(h.len())], "PROBE embed");
-            }
-            if decode_probe {
-                let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
-                info!(len = h.len(), first5 = ?&h[..5.min(h.len())], "DECODE_PROBE embed");
-            }
 
             // Step 2: transformer layers
             let gpu_cache = self.cache.gpu_cache();
-            let num_layers = self.layers.len();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                if layer_idx == 0 || layer_idx == num_layers - 1 {
-                    info!(layer = layer_idx, "gpu_runner: layer start");
-                }
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let weights = self.layer_weights(layer_idx)?;
                 let input = GpuLayerInput {
@@ -268,50 +213,6 @@ mod cuda_impl {
                     rope_sin: &self.rope_sin,
                 };
                 hidden_states = layer.forward(&input, &weights, &self.blas)?;
-                if probe && layer_idx == 0 {
-                    let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
-                    let nan = h.iter().any(|v| v.is_nan());
-                    let mx = h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    info!(nan, max = mx, first5 = ?&h[..5.min(h.len())], "PROBE layer0 output");
-
-                    // Read back cache block 0 for layer 0 to verify reshape_and_cache
-                    let (kc, vc) = &gpu_cache[0];
-                    let kc_host: Vec<f32> = self.device.dtoh_sync_copy(kc).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
-                    let vc_host: Vec<f32> = self.device.dtoh_sync_copy(vc).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
-                    // Cache layout: [num_blocks, block_size, num_kv_heads, head_dim]
-                    // Block 0, offset 0, kv_head 0: first head_dim elements
-                    let head_dim = self.config.head_dim;
-                    let kv_heads = self.config.num_kv_heads;
-                    // slot 0 -> offset 0 -> kc_host[0 .. kv_heads*head_dim]
-                    info!(
-                        k_cache_first5 = ?&kc_host[..5.min(kc_host.len())],
-                        v_cache_first5 = ?&vc_host[..5.min(vc_host.len())],
-                        cache_total_len = kc_host.len(),
-                        "PROBE cache block0"
-                    );
-                }
-                if decode_probe && layer_idx == 0 {
-                    let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
-                    let nan = h.iter().any(|v| v.is_nan());
-                    let mx = h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    info!(nan, max = mx, first5 = ?&h[..5.min(h.len())], "DECODE_PROBE layer0 output");
-                }
-                if probe && layer_idx == num_layers - 1 {
-                    // Dump last token's hidden state after final layer
-                    let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
-                    let last_start = (num_tokens - 1) * hidden_size;
-                    let last_h = &h[last_start..last_start + hidden_size];
-                    let mx = last_h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mn = last_h.iter().cloned().fold(f32::INFINITY, f32::min);
-                    info!(layer = layer_idx, last_max = mx, last_min = mn, first5 = ?&last_h[..5.min(last_h.len())], "PROBE last-layer last-token hidden");
-                }
-                if layer_idx == 0 || layer_idx == num_layers - 1 {
-                    info!(layer = layer_idx, "gpu_runner: layer done");
-                }
-            }
-            if decode_probe {
-                let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
-                info!(first5 = ?&h[..5.min(h.len())], "DECODE_PROBE final hidden state");
             }
 
             // Step 3: final RMSNorm
@@ -344,34 +245,6 @@ mod cuda_impl {
                 .dtoh_sync_copy(&logits_gpu)
                 .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
 
-            if decode_probe {
-                let argmax = logits_cpu.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(0);
-                let mut top5: Vec<(usize, f32)> = logits_cpu.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                top5.truncate(5);
-                info!(
-                    logits_len = logits_cpu.len(),
-                    argmax_token = argmax,
-                    top5 = ?top5,
-                    "DECODE_PROBE logits"
-                );
-            }
-
-            if probe {
-                // Last token's logits (what sampler uses)
-                let last_start = (num_tokens - 1) * vocab_size;
-                let last_logits = &logits_cpu[last_start..last_start + vocab_size];
-                let local_argmax = last_logits.iter().enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i).unwrap_or(0);
-                let mut top5: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-                top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                top5.truncate(5);
-                let last_max = last_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let last_min = last_logits.iter().cloned().fold(f32::INFINITY, f32::min);
-                let nan = last_logits.iter().any(|v| v.is_nan());
-                info!(num_tokens, vocab_size, local_argmax, nan, last_min, last_max, top5 = ?top5, "PROBE prefill last-token logits");
-            }
             debug!(logits_len = logits_cpu.len(), expected = num_tokens * vocab_size, "forward complete");
             Ok(logits_cpu)
         }

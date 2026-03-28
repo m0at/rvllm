@@ -19,11 +19,10 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
-    use tracing::{info, trace};
+    use tracing::trace;
 
     use rvllm_core::error::{LLMError, Result};
     use rvllm_gpu::cublas::CublasHandle;
-    use rvllm_gpu::stream::GpuStream;
 
     /// Configuration for a single transformer layer.
     #[derive(Debug, Clone)]
@@ -144,7 +143,7 @@ mod inner {
                 hidden,
             )?;
 
-            // Sync: RMSNorm kernel on default stream, cuBLAS may use different stream
+            // Sync: RMSNorm runs on default stream, cuBLAS may use a different stream
             self.device.synchronize()
                 .map_err(|e| LLMError::GpuError(format!("post-rmsnorm sync: {e}")))?;
 
@@ -194,7 +193,6 @@ mod inner {
             // 4. KV cache write + Attention (prefill vs decode)
             // ---------------------------------------------------------------
             // Always write K/V into paged cache via slot_mapping
-            info!(layer = cfg.layer_idx, "gpu_layer: cache_write start");
             Self::cache_write(
                 &self.device,
                 &k_rot, &v,
@@ -203,16 +201,12 @@ mod inner {
                 num_tokens, num_kv_heads, head_dim,
             )?;
 
-            info!(layer = cfg.layer_idx, "gpu_layer: cache_write done");
-
             // Sync: cache_write kernel must finish before FA2 reads cache
             self.device.synchronize()
                 .map_err(|e| LLMError::GpuError(format!("post-cache-write sync: {e}")))?;
 
             let attn_out = if input.is_prefill {
-                // Prefill: use naive cuBLAS attention (Q@K^T -> softmax -> @V)
-                // FA2 prefill kernel has a multi-token bug; bypass it.
-                info!(layer = cfg.layer_idx, "gpu_layer: naive_prefill_attention start");
+                // Prefill: naive cuBLAS attention (Q@K^T -> softmax -> @V)
                 Self::naive_prefill_attention(
                     &self.device, blas,
                     &q_rot, &k_rot, &v,
@@ -220,7 +214,6 @@ mod inner {
                 )?
             } else {
                 // Decode: read from paged cache
-                info!(layer = cfg.layer_idx, "gpu_layer: decode_attention start");
                 Self::decode_attention(
                     &self.device,
                     &q_rot,
@@ -652,14 +645,6 @@ mod inner {
             let kernel = device
                 .get_func("flash_attention", "flash_attention_2_kernel")
                 .ok_or_else(|| LLMError::GpuError("flash_attention_2_kernel not loaded".into()))?;
-
-            let bt_len = DeviceSlice::len(block_tables);
-            info!(
-                num_tokens, num_seqs, num_heads, num_kv_heads, head_dim,
-                block_size, max_context_len, bt_len,
-                shared_mem_bytes,
-                "prefill_attention: dimensions"
-            );
 
             if num_seqs == 0 {
                 return Err(LLMError::GpuError("prefill_attention: num_seqs == 0".into()));

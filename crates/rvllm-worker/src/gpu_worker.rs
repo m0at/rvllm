@@ -562,6 +562,13 @@ impl GpuWorker {
         if let Some(ref mut cache) = self.fp8_kv_cache {
             cache.clear();
         }
+        // Zero GPU KV cache to prevent stale data between requests
+        #[cfg(feature = "cuda")]
+        if let Some(ref mut runner) = self.gpu_model_runner {
+            if let Err(e) = runner.cache_mut().zero_cache() {
+                tracing::warn!("failed to zero GPU KV cache: {e}");
+            }
+        }
     }
 
     /// Execute one inference step with real GPU matmuls.

@@ -415,6 +415,7 @@ mod tests {
             max_position: 32,
             dtype: "float16".into(),
             rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
             architecture: "CohereForCausalLM".into(),
         }
     }

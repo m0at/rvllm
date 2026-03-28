@@ -602,6 +602,12 @@ mod inner {
                         }
                     }
                 }
+                // Zero GPU KV cache only when no live sequences remain
+                if !self.scheduler.has_unfinished_seqs() {
+                    self.worker.clear_kv_cache();
+                    self.next_block_id = 0;
+                    self.free_blocks.clear();
+                }
             }
 
             debug!(num_outputs = results.len(), "GpuLLMEngine: step complete");

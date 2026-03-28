@@ -153,6 +153,27 @@ impl CudaCacheEngine {
         &mut self.gpu_cache
     }
 
+    /// Zero all GPU KV cache buffers. Call between requests to prevent stale data.
+    pub fn zero_cache(&mut self) -> Result<()> {
+        for (key, val) in &mut self.gpu_cache {
+            let k_len = cudarc::driver::DeviceSlice::len(&*key);
+            let v_len = cudarc::driver::DeviceSlice::len(&*val);
+            unsafe {
+                cudarc::driver::result::memset_d8_sync(
+                    *cudarc::driver::DevicePtrMut::device_ptr_mut(key),
+                    0,
+                    k_len * std::mem::size_of::<f32>(),
+                ).map_err(|e| LLMError::GpuError(format!("zero key cache: {e}")))?;
+                cudarc::driver::result::memset_d8_sync(
+                    *cudarc::driver::DevicePtrMut::device_ptr_mut(val),
+                    0,
+                    v_len * std::mem::size_of::<f32>(),
+                ).map_err(|e| LLMError::GpuError(format!("zero val cache: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Copy blocks within GPU cache. Each `(src, dst)` pair copies a full
     /// block across all layers by round-tripping through the host.
     ///

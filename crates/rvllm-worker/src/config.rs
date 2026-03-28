@@ -66,6 +66,7 @@ impl WorkerConfig {
             dtype: self.dtype.clone(),
             architecture: self.architecture.clone(),
             rope_theta: self.rope_theta,
+            rms_norm_eps: 1e-6, // TODO: read from model config.json
         }
     }
 
