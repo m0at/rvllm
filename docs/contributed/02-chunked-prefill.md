@@ -11,7 +11,7 @@ rvLLM's **standalone** scheduler crate (`rvllm-scheduler`) has chunked prefill s
 The codebase has TWO independent schedulers (same pattern as prefix caching in Spec 01):
 
 1. **`rvllm-scheduler::Scheduler`** — full-featured with chunked prefill, preemption, swap. Uses its own local `SequenceGroup` type with `num_prompt_tokens_processed`.
-2. **`GpuLLMEngine::FifoScheduler`** — simple inline FIFO (~50 lines in `gpu_engine.rs`). No chunked prefill, no preemption. Uses `rvllm_sequence::SequenceGroup` which does NOT have `num_prompt_tokens_processed`.
+2. **`GpuLLMEngine::FifoScheduler`** — simple inline FIFO (~150 lines including struct + impl in `gpu_engine.rs`). No chunked prefill, no preemption. Uses `rvllm_sequence::SequenceGroup` which does NOT have `num_prompt_tokens_processed`.
 
 The CUDA engine uses path (2). Implementation must either extend `FifoScheduler` with chunked prefill or wire the engine to use the standalone scheduler (which has API mismatches — see `crates/rvllm-engine/src/engine.rs` comment: "rvllm_scheduler uses a different SequenceGroup type").
 
@@ -86,7 +86,7 @@ fn tokens_for_group(&self, group: &SequenceGroup) -> usize {
 7. **Mixed batch attention kernel path**: The FlashAttention CUDA implementation uses `is_decode = (num_tokens == num_seqs)` to choose kernel paths. In a mixed batch with chunked prefill, this heuristic fails — some sequences have `query_len > 1` (prefill chunk) while others have `query_len = 1` (decode).
 8. **`SequenceGroupMetadata` lacks chunk fields**: The struct in `crates/rvllm-sequence/src/metadata.rs` needs `num_computed_tokens` and `token_chunk_size` fields.
 
-**Partial existing infrastructure**: `crates/rvllm-worker/src/input.rs` already has `prepare_prefill_refs()` / `prepare_decode_refs()` / `merge_inputs()` for splitting mixed batches by the `is_prompt` flag. This handles the basic split but not partially-prefilled sequences. Also, `seq_start_pos` is already computed in `crates/rvllm-model-runner/src/gpu_runner.rs` from `query_lens` and uploaded to GPU.
+**Partial existing infrastructure**: `crates/rvllm-worker/src/input.rs` already has `prepare_prefill_refs()` / `prepare_decode_refs()` / `merge_inputs()` for splitting mixed batches by the `is_prompt` flag. Note: `merge_inputs()` currently puts **prefill tokens first, then decode tokens** — this is the opposite of vLLM's convention (decode first). The ordering may need to change depending on kernel requirements. This handles the basic split but not partially-prefilled sequences. Also, `seq_start_pos` is already computed in `crates/rvllm-model-runner/src/gpu_runner.rs` from `query_lens` and uploaded to GPU.
 
 ## Implementation Plan
 

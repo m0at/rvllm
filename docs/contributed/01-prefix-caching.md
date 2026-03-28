@@ -51,9 +51,9 @@ Freed blocks go onto an LRU free list (doubly-linked list for O(1) operations). 
 **This is critical for implementers.** The codebase has TWO independent block management systems:
 
 1. **`BlockManager`** in `rvllm-block-manager/src/manager.rs` — full-featured with prefix cache integration, CoW, swap-in/swap-out. Used by `rvllm-scheduler/src/scheduler.rs`.
-2. **Inline allocator** in `GpuLLMEngine::build_metadata()` at `gpu_engine.rs:810-890` — simple allocator using `self.seq_block_tables`, `self.free_blocks`, `self.next_block_id`. Used by the CUDA inference path.
+2. **Inline allocator** in `GpuLLMEngine::build_metadata()` at `gpu_engine.rs:~802-895` — simple allocator using `self.seq_block_tables`, `self.free_blocks`, `self.next_block_id`. Used by the CUDA inference path.
 
-The CUDA engine path (`GpuLLMEngine`) uses path (2) exclusively. It also has its own inline `FifoScheduler` (defined in `gpu_engine.rs`, ~50 lines) that does NOT use `rvllm-scheduler`. Changes to `BlockManager` or `rvllm-scheduler::Scheduler` have **no effect** on the CUDA inference path.
+The CUDA engine path (`GpuLLMEngine`) uses path (2) exclusively. It also has its own inline `FifoScheduler` (defined in `gpu_engine.rs`, ~150 lines including struct + impl) that does NOT use `rvllm-scheduler`. Changes to `BlockManager` or `rvllm-scheduler::Scheduler` have **no effect** on the CUDA inference path.
 
 **All implementation work must target `GpuLLMEngine` and its inline allocator/scheduler.** Changes to `BlockManager` are useful for correctness but won't be exercised until the engine is refactored to use it.
 
@@ -62,7 +62,7 @@ The CUDA engine path (`GpuLLMEngine`) uses path (2) exclusively. It also has its
 1. **Wrong hash algorithm**: `hash_prefix()` hashes `tokens[0..(block_idx+1)*block_size]` (entire prefix up to each block boundary). For block 0 it hashes `bs` tokens, for block 1 it hashes `2*bs`, etc. Computing all N block hashes costs `bs + 2*bs + ... + N*bs = O(N^2 * bs)`. Should chain-hash each block independently in O(block_size) per block.
 2. **Cache hits are decoration**: `count_hits()` result at `gpu_engine.rs:621` is only logged via `debug!()` and never used to set `num_computed_tokens` or skip computation. The model runner always recomputes the full prefill.
 3. **Wrong block IDs on registration (engine path only)**: `GpuLLMEngine` at `gpu_engine.rs:543-545` builds placeholder `BlockId(i as u32)` sequential IDs instead of using `self.seq_block_tables`. Note: `BlockManager.register_prefix()` correctly passes actual block IDs — this bug is only in the engine's inline path.
-4. **O(n) eviction**: `evict_one()` at `prefix_cache.rs:134` scans `self.cache.iter().filter(...).min_by_key(...)` — O(n) scan of the HashMap instead of O(1) LRU list.
+4. **O(n) eviction**: `evict_one()` at `prefix_cache.rs:~154` scans `self.cache.iter().filter(...).min_by_key(...)` — O(n) scan of the HashMap instead of O(1) LRU list.
 5. **No scheduler integration**: Neither the `FifoScheduler` in `gpu_engine.rs` nor `rvllm-scheduler::Scheduler` has prefix cache awareness.
 
 ## Implementation Plan

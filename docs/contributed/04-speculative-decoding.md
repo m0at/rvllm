@@ -167,7 +167,7 @@ This requires a second model runner instance. It's a significant effort and shou
 ## Testing Strategy
 
 1. **N-gram proposer unit tests**: Test with known token histories. Pattern `[1, 2, 3, 4, 1, 2, 3]` with ngram_size=3 should propose `[4]` (the tokens after the first occurrence of `[1, 2, 3]`).
-2. **Verification tests**: Already exist (7 tests). Extend for the n-gram case where draft_prob is approximated.
+2. **Verification tests**: Already exist (6 tests). Extend for the n-gram case where draft_prob is approximated.
 3. **End-to-end**: Run speculative decoding with n-gram proposer on a model. Verify output is identical to non-speculative decoding with greedy sampling.
 4. **Acceptance rate**: Log the acceptance rate. For repetitive text (code, JSON), n-gram should achieve 50-70% acceptance. For novel text, expect 10-30%.
 5. **Throughput**: Verify speculative decoding improves tokens/second vs non-speculative for repetitive workloads.

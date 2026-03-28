@@ -2,7 +2,7 @@
 
 ## Summary
 
-rvLLM supports 10 causal LM architectures plus embedding models (~12 registered architecture strings total). vLLM supports ~260. This spec identifies the highest-priority models to add based on popularity and implementation complexity, and provides per-model architectural analysis against the existing rvLLM layer library.
+rvLLM supports 10 causal LM architecture groups plus embedding models (23 registered architecture strings total mapping to 12 distinct structs). vLLM supports ~260. This spec identifies the highest-priority models to add based on popularity and implementation complexity, and provides per-model architectural analysis against the existing rvLLM layer library.
 
 rvLLM's architecture pattern is well-established: implement the `Architecture` trait (`pub trait Architecture: Send + Sync` with a single `forward()` method returning `Result<GpuBuffer<f32>>`), register the HuggingFace architecture string in `create_model()`, and reuse shared layers (RMSNorm, LinearLayer, RotaryEmbedding, MoELayer, etc.).
 
@@ -14,7 +14,7 @@ rvLLM's architecture pattern is well-established: implement the `Architecture` t
 | `MistralForCausalLM` | `mistral.rs` | Llama variant with sliding window |
 | `Qwen2ForCausalLM` | `qwen2.rs` | Llama variant with optional QKV bias |
 | `GemmaForCausalLM` | `gemma.rs` | +1 norm offset, GeGLU, embedding scaling |
-| `Gemma2ForCausalLM` | `gemma.rs` | Gemma + logit softcap + sliding window alternation (even layers) |
+| `Gemma2ForCausalLM` | `gemma.rs` | Gemma + logit softcap + sliding window alternation (even layers, currently computed but unused in forward pass) |
 | `PhiForCausalLM` / `Phi3ForCausalLM` / `Phi3SmallForCausalLM` | `phi.rs` | Parallel attn+MLP (Phi2), sequential (Phi3) with QK LayerNorm |
 | `MixtralForCausalLM` | `mixtral.rs` | Sparse MoE |
 | `DeepSeekV2ForCausalLM` / `DeepseekV2ForCausalLM` | `deepseek.rs` | MLA + MoE + shared expert |
