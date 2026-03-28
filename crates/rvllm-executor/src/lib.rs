@@ -41,6 +41,7 @@ pub use rvllm_sequence::SequenceGroupMetadata;
 pub struct SamplerOutput {
     pub token_ids: Vec<u32>,
     pub logprobs: Vec<f32>,
+    pub top_logprobs: Vec<Vec<(u32, f32)>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +109,7 @@ impl Worker {
             sampler_outputs: vec![SamplerOutput {
                 token_ids: vec![0; input.seq_group_metadata_list.len()],
                 logprobs: vec![0.0; input.seq_group_metadata_list.len()],
+                top_logprobs: vec![Vec::new(); input.seq_group_metadata_list.len()],
             }],
         })
     }

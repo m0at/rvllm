@@ -29,6 +29,12 @@ pub async fn create_completion(
         )));
     }
 
+    if req.use_beam_search && !state.engine.supports_beam_search() {
+        return Err(ApiError::InvalidRequest(
+            "beam search is not supported by the active inference backend".into(),
+        ));
+    }
+
     let sampling_params = req.to_sampling_params();
 
     info!(

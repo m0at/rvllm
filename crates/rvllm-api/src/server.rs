@@ -39,6 +39,8 @@ pub trait InferenceEngine: Send + Sync {
         RequestId,
         tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
     )>;
+
+    fn supports_beam_search(&self) -> bool;
 }
 
 #[async_trait::async_trait]
@@ -52,6 +54,10 @@ impl InferenceEngine for AsyncLLMEngine {
         tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
     )> {
         self.generate(prompt, params).await
+    }
+
+    fn supports_beam_search(&self) -> bool {
+        true
     }
 }
 
@@ -67,6 +73,10 @@ impl InferenceEngine for rvllm_engine::AsyncGpuLLMEngine {
         tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
     )> {
         self.generate(prompt, params).await
+    }
+
+    fn supports_beam_search(&self) -> bool {
+        false
     }
 }
 

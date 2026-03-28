@@ -26,6 +26,7 @@ use rvllm_core::prelude::{
 use rvllm_sequence::{Sequence, SequenceGroup, SequenceGroupMetadata};
 use rvllm_tokenizer::Tokenizer;
 
+use crate::beam_search::{top_k_from_logprobs, BeamSearchState};
 use crate::output::{OutputProcessor, SequenceOutputState};
 
 // ---------------------------------------------------------------------------
@@ -186,7 +187,7 @@ impl Executor for ExecutorAdapter {
                     seq_id,
                     token_id: tid,
                     logprob: lp,
-                    top_logprobs: None,
+                    top_logprobs: real_out.top_logprobs.get(idx).cloned(),
                 });
             }
         }
@@ -207,6 +208,7 @@ struct EngineRequest {
     prompt_token_ids: Vec<TokenId>,
     sampling_params: SamplingParams,
     seq_states: Vec<SequenceOutputState>,
+    beam_search: Option<BeamSearchState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +290,7 @@ impl LLMEngine {
             seqs.push(Sequence::new(seq_id, prompt_token_ids.clone()));
             seq_states.push(SequenceOutputState::new());
         }
+        let initial_seq_ids: Vec<SequenceId> = seqs.iter().map(|s| s.seq_id).collect();
 
         let seq_group = SequenceGroup::new(
             request_id,
@@ -305,6 +308,18 @@ impl LLMEngine {
                 request_id,
                 prompt,
                 prompt_token_ids,
+                beam_search: if sampling_params.use_beam_search {
+                    Some(BeamSearchState::new(
+                        request_id,
+                        num_seqs,
+                        sampling_params.max_tokens,
+                        1.0,
+                        false,
+                        &initial_seq_ids,
+                    ))
+                } else {
+                    None
+                },
                 sampling_params,
                 seq_states,
             },
@@ -346,7 +361,7 @@ impl LLMEngine {
         }
 
         // 2. Build executor input
-        let input = Self::build_executor_input(&sched_out);
+        let input = self.build_executor_input(&sched_out);
 
         // 3. Execute model forward pass
         let sampler_outputs = self.executor.execute_model(input)?;
@@ -367,48 +382,50 @@ impl LLMEngine {
                 None => continue,
             };
 
-            for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
-                if seq.is_finished() {
-                    continue;
-                }
+            let output = if req.sampling_params.use_beam_search {
+                Self::process_beam_search_group(&self.tokenizer, req, &output_map, eos)
+            } else {
+                for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
+                    if seq.is_finished() {
+                        continue;
+                    }
 
-                if let Some(sampled) = output_map.get(&seq.seq_id) {
-                    // Detokenize the new token
-                    let decoded = self
-                        .tokenizer
-                        .decode(&[sampled.token_id])
-                        .unwrap_or_default();
+                    if let Some(sampled) = output_map.get(&seq.seq_id) {
+                        let decoded = self
+                            .tokenizer
+                            .decode(&[sampled.token_id])
+                            .unwrap_or_default();
 
-                    if let Some(state) = req.seq_states.get_mut(seq_idx) {
-                        OutputProcessor::process_token(
-                            state,
-                            sampled.token_id,
-                            sampled.logprob,
-                            sampled.top_logprobs.clone(),
-                            &decoded,
-                            &req.sampling_params,
-                            eos,
-                        );
+                        if let Some(state) = req.seq_states.get_mut(seq_idx) {
+                            OutputProcessor::process_token(
+                                state,
+                                sampled.token_id,
+                                sampled.logprob,
+                                sampled.top_logprobs.clone(),
+                                &decoded,
+                                &req.sampling_params,
+                                eos,
+                            );
+                        }
                     }
                 }
-            }
 
-            // Build RequestOutput for this group
-            let mut output = OutputProcessor::build_request_output(
-                request_id,
-                &req.prompt,
-                &req.prompt_token_ids,
-                &req.seq_states,
-            );
+                let mut output = OutputProcessor::build_request_output(
+                    request_id,
+                    &req.prompt,
+                    &req.prompt_token_ids,
+                    &req.seq_states,
+                );
 
-            // Apply best-of-N selection when all sequences are done
-            // and we have multiple independent samples (not beam search).
-            if output.finished
-                && req.sampling_params.best_of > 1
-                && !req.sampling_params.use_beam_search
-            {
-                output = crate::best_of_n::build_best_of_n_output(output, &req.seq_states);
-            }
+                if output.finished
+                    && req.sampling_params.best_of > 1
+                    && !req.sampling_params.use_beam_search
+                {
+                    output = crate::best_of_n::build_best_of_n_output(output, &req.seq_states);
+                }
+
+                output
+            };
 
             results.push(output);
         }
@@ -417,7 +434,13 @@ impl LLMEngine {
         let finished_ids: Vec<RequestId> = self
             .requests
             .iter()
-            .filter(|(_, req)| req.seq_states.iter().all(|s| s.is_finished()))
+            .filter(|(_, req)| {
+                if let Some(beam) = &req.beam_search {
+                    beam.is_finished()
+                } else {
+                    req.seq_states.iter().all(|s| s.is_finished())
+                }
+            })
             .map(|(&id, _)| id)
             .collect();
 
@@ -463,26 +486,100 @@ impl LLMEngine {
 
     // -- private helpers --
 
-    fn build_executor_input(sched_out: &SchedulerOutputs) -> ExecutorInput {
+    fn process_beam_search_group(
+        tokenizer: &Tokenizer,
+        req: &mut EngineRequest,
+        output_map: &HashMap<SequenceId, &SamplerOutput>,
+        eos: Option<TokenId>,
+    ) -> RequestOutput {
+        let beam = req
+            .beam_search
+            .as_mut()
+            .expect("beam search state missing for beam request");
+
+        let mut expansions = HashMap::new();
+        for active in &beam.active_beams {
+            let Some(sampled) = output_map.get(&active.seq_id) else {
+                continue;
+            };
+
+            let candidates = sampled
+                .top_logprobs
+                .as_ref()
+                .filter(|top| !top.is_empty())
+                .map(|top| top_k_from_logprobs(top, beam.num_beams))
+                .unwrap_or_else(|| vec![(sampled.token_id, sampled.logprob)]);
+
+            let decoded_candidates = candidates
+                .into_iter()
+                .map(|(token_id, logprob)| {
+                    let decoded = tokenizer.decode(&[token_id]).unwrap_or_default();
+                    (token_id, logprob, decoded, eos == Some(token_id))
+                })
+                .collect::<Vec<_>>();
+            expansions.insert(active.seq_id, decoded_candidates);
+        }
+
+        let step_result = beam.step(&expansions);
+        let mut recycled = step_result.seqs_to_free.into_iter();
+        for op in step_result.fork_ops {
+            let seq_id = recycled.next().unwrap_or(op.parent_seq_id);
+            beam.set_beam_seq_id(op.new_beam_idx, seq_id);
+        }
+
+        beam.build_output(&req.prompt, &req.prompt_token_ids, 1)
+    }
+
+    fn build_executor_input(&self, sched_out: &SchedulerOutputs) -> ExecutorInput {
         let mut metadata = Vec::with_capacity(sched_out.scheduled_seq_groups.len());
 
         for group in &sched_out.scheduled_seq_groups {
-            let is_prompt = group.get_seqs().iter().any(|s| s.get_output_len() == 0);
+            let Some(req) = self.requests.get(&group.request_id) else {
+                continue;
+            };
+            let is_prompt = if let Some(beam) = &req.beam_search {
+                beam.active_beams.iter().all(|b| b.token_ids.is_empty())
+            } else {
+                group.get_seqs().iter().any(|s| s.get_output_len() == 0)
+            };
 
             let mut seq_data = HashMap::new();
             let block_tables = HashMap::new();
 
-            for seq in group.get_seqs() {
-                if seq.is_finished() {
-                    continue;
+            if let Some(beam) = &req.beam_search {
+                for active in &beam.active_beams {
+                    seq_data.insert(
+                        active.seq_id,
+                        rvllm_sequence::SequenceData {
+                            prompt_token_ids: req.prompt_token_ids.clone(),
+                            output_token_ids: active.token_ids.clone(),
+                            cumulative_logprob: active.cumulative_logprob,
+                        },
+                    );
                 }
-                seq_data.insert(
-                    seq.seq_id,
-                    rvllm_sequence::SequenceData {
-                        prompt_token_ids: seq.prompt_token_ids.clone(),
-                        output_token_ids: seq.output_token_ids.clone(),
-                        cumulative_logprob: seq.cumulative_logprob,
-                    },
+            } else {
+                for seq in group.get_seqs() {
+                    if seq.is_finished() {
+                        continue;
+                    }
+                    seq_data.insert(
+                        seq.seq_id,
+                        rvllm_sequence::SequenceData {
+                            prompt_token_ids: seq.prompt_token_ids.clone(),
+                            output_token_ids: seq.output_token_ids.clone(),
+                            cumulative_logprob: seq.cumulative_logprob,
+                        },
+                    );
+                }
+            }
+
+            let mut sampling_params = group.sampling_params.clone();
+            if sampling_params.use_beam_search {
+                sampling_params.logprobs = Some(
+                    sampling_params
+                        .logprobs
+                        .unwrap_or(0)
+                        .max(sampling_params.best_of),
                 );
             }
 
@@ -490,7 +587,7 @@ impl LLMEngine {
                 request_id: group.request_id,
                 is_prompt,
                 seq_data,
-                sampling_params: group.sampling_params.clone(),
+                sampling_params,
                 block_tables,
             });
         }
@@ -574,6 +671,35 @@ mod tests {
         }
     }
 
+    struct BeamExecutor;
+
+    impl Executor for BeamExecutor {
+        fn execute_model(&mut self, input: ExecutorInput) -> Result<Vec<SamplerOutput>> {
+            let mut outputs = Vec::new();
+            for meta in &input.seq_group_metadata {
+                for (&seq_id, seq_data) in &meta.seq_data {
+                    let (token_id, logprob, top_logprobs) =
+                        match seq_data.output_token_ids.as_slice() {
+                            [] if seq_id == SequenceId(0) => {
+                                (1, -0.1, Some(vec![(1, -0.1), (2, -0.2)]))
+                            }
+                            [] => (3, -5.0, Some(vec![(3, -5.0), (4, -6.0)])),
+                            [1] => (0, -0.1, Some(vec![(0, -0.1)])),
+                            [2] => (0, -1.0, Some(vec![(0, -1.0)])),
+                            _ => (0, -10.0, Some(vec![(0, -10.0)])),
+                        };
+                    outputs.push(SamplerOutput {
+                        seq_id,
+                        token_id,
+                        logprob,
+                        top_logprobs,
+                    });
+                }
+            }
+            Ok(outputs)
+        }
+    }
+
     impl Executor for MockExecutor {
         fn execute_model(&mut self, input: ExecutorInput) -> Result<Vec<SamplerOutput>> {
             self.calls += 1;
@@ -630,6 +756,14 @@ mod tests {
         let tokenizer = make_test_tokenizer();
         let scheduler = Box::new(MockScheduler::new());
         let executor = Box::new(MockExecutor::new(1, max_executor_calls));
+        LLMEngine::new(config, executor, scheduler, tokenizer).unwrap()
+    }
+
+    fn make_beam_engine() -> LLMEngine {
+        let config = EngineConfig::default();
+        let tokenizer = make_test_tokenizer();
+        let scheduler = Box::new(MockScheduler::new());
+        let executor = Box::new(BeamExecutor);
         LLMEngine::new(config, executor, scheduler, tokenizer).unwrap()
     }
 
@@ -692,6 +826,10 @@ mod tests {
 
     #[test]
     fn build_executor_input_from_scheduler_outputs() {
+        let mut engine = make_engine(5);
+        engine
+            .add_request(RequestId(0), "hello".to_string(), SamplingParams::default())
+            .unwrap();
         let seq = Sequence::new(SequenceId(0), vec![1, 2, 3]);
         let group = SequenceGroup::new(
             RequestId(0),
@@ -705,10 +843,28 @@ mod tests {
             num_batched_tokens: 3,
             preempted: false,
         };
-        let input = LLMEngine::build_executor_input(&sched_out);
+        let input = engine.build_executor_input(&sched_out);
         assert_eq!(input.seq_group_metadata.len(), 1);
         assert_eq!(input.seq_group_metadata[0].request_id, RequestId(0));
         assert!(input.seq_group_metadata[0].is_prompt);
+    }
+
+    #[test]
+    fn run_beam_search_selects_single_best_output() {
+        let mut engine = make_beam_engine();
+        let mut params = SamplingParams::default();
+        params.max_tokens = 2;
+        params.best_of = 2;
+        params.use_beam_search = true;
+        engine
+            .add_request(RequestId(7), "hello".to_string(), params)
+            .unwrap();
+
+        let outputs = engine.run().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].finished);
+        assert_eq!(outputs[0].outputs.len(), 1);
+        assert_eq!(outputs[0].outputs[0].token_ids, vec![1, 0]);
     }
 
     // -- Test ExecutorAdapter type-level wiring --

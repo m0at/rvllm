@@ -30,6 +30,12 @@ pub async fn create_chat_completion(
         )));
     }
 
+    if req.use_beam_search && !state.engine.supports_beam_search() {
+        return Err(ApiError::InvalidRequest(
+            "beam search is not supported by the active inference backend".into(),
+        ));
+    }
+
     let sampling_params = req.to_sampling_params();
 
     // Check if tools are active

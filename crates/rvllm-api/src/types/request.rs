@@ -41,6 +41,10 @@ pub struct CompletionRequest {
     pub user: Option<String>,
     #[serde(default)]
     pub seed: Option<u64>,
+    #[serde(default)]
+    pub best_of: Option<usize>,
+    #[serde(default)]
+    pub use_beam_search: bool,
 }
 
 /// POST /v1/chat/completions request body.
@@ -69,6 +73,10 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub seed: Option<u64>,
     #[serde(default)]
+    pub best_of: Option<usize>,
+    #[serde(default)]
+    pub use_beam_search: bool,
+    #[serde(default)]
     pub tools: Option<Vec<crate::routes::tools::RequestTool>>,
     #[serde(default)]
     pub tool_choice: Option<crate::routes::tools::ToolChoice>,
@@ -88,6 +96,10 @@ fn default_n() -> usize {
 }
 
 impl CompletionRequest {
+    pub fn beam_width(&self) -> usize {
+        self.best_of.unwrap_or(self.n).max(1)
+    }
+
     pub fn validate(&self) -> Result<(), ApiError> {
         if self.model.is_empty() {
             return Err(ApiError::InvalidRequest("model is required".into()));
@@ -113,6 +125,25 @@ impl CompletionRequest {
         if self.n == 0 {
             return Err(ApiError::InvalidRequest("n must be greater than 0".into()));
         }
+        if let Some(best_of) = self.best_of {
+            if best_of == 0 {
+                return Err(ApiError::InvalidRequest(
+                    "best_of must be greater than 0".into(),
+                ));
+            }
+        }
+        if self.use_beam_search {
+            if self.stream {
+                return Err(ApiError::InvalidRequest(
+                    "beam search does not support streaming".into(),
+                ));
+            }
+            if self.beam_width() < 2 {
+                return Err(ApiError::InvalidRequest(
+                    "beam search requires best_of or n to be at least 2".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -127,13 +158,18 @@ impl CompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             seed: self.seed,
-            best_of: self.n,
+            best_of: self.beam_width(),
+            use_beam_search: self.use_beam_search,
             ..Default::default()
         }
     }
 }
 
 impl ChatCompletionRequest {
+    pub fn beam_width(&self) -> usize {
+        self.best_of.unwrap_or(self.n).max(1)
+    }
+
     pub fn validate(&self) -> Result<(), ApiError> {
         if self.model.is_empty() {
             return Err(ApiError::InvalidRequest("model is required".into()));
@@ -169,6 +205,25 @@ impl ChatCompletionRequest {
         if self.n == 0 {
             return Err(ApiError::InvalidRequest("n must be greater than 0".into()));
         }
+        if let Some(best_of) = self.best_of {
+            if best_of == 0 {
+                return Err(ApiError::InvalidRequest(
+                    "best_of must be greater than 0".into(),
+                ));
+            }
+        }
+        if self.use_beam_search {
+            if self.stream {
+                return Err(ApiError::InvalidRequest(
+                    "beam search does not support streaming".into(),
+                ));
+            }
+            if self.beam_width() < 2 {
+                return Err(ApiError::InvalidRequest(
+                    "beam search requires best_of or n to be at least 2".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -181,7 +236,8 @@ impl ChatCompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             seed: self.seed,
-            best_of: self.n,
+            best_of: self.beam_width(),
+            use_beam_search: self.use_beam_search,
             ..Default::default()
         }
     }
@@ -208,6 +264,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            best_of: None,
+            use_beam_search: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: CompletionRequest = serde_json::from_str(&json).unwrap();
@@ -239,6 +297,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            best_of: None,
+            use_beam_search: false,
             tools: None,
             tool_choice: None,
         };
@@ -258,6 +318,8 @@ mod tests {
         assert_eq!(req.top_p, 1.0);
         assert_eq!(req.n, 1);
         assert!(!req.stream);
+        assert_eq!(req.best_of, None);
+        assert!(!req.use_beam_search);
     }
 
     #[test]
@@ -277,6 +339,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            best_of: None,
+            use_beam_search: false,
         };
         assert!(req.validate().is_ok());
     }
@@ -298,6 +362,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            best_of: None,
+            use_beam_search: false,
         };
         assert!(req.validate().is_err());
     }
@@ -319,6 +385,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            best_of: None,
+            use_beam_search: false,
         };
         assert!(req.validate().is_err());
     }
@@ -338,6 +406,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            best_of: None,
+            use_beam_search: false,
             tools: None,
             tool_choice: None,
         };
@@ -362,6 +432,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            best_of: None,
+            use_beam_search: false,
             tools: None,
             tool_choice: None,
         };
@@ -385,6 +457,8 @@ mod tests {
             frequency_penalty: 0.2,
             user: None,
             seed: Some(123),
+            best_of: None,
+            use_beam_search: false,
         };
         let sp = req.to_sampling_params();
         assert_eq!(sp.max_tokens, 42);
@@ -395,6 +469,106 @@ mod tests {
         assert!(sp.echo);
         assert_eq!(sp.seed, Some(123));
         assert_eq!(sp.best_of, 2);
+        assert!(!sp.use_beam_search);
+    }
+
+    #[test]
+    fn completion_beam_search_rejects_streaming() {
+        let req = CompletionRequest {
+            model: "m".into(),
+            prompt: "p".into(),
+            max_tokens: 10,
+            temperature: 0.0,
+            top_p: 1.0,
+            n: 2,
+            stream: true,
+            stop: None,
+            logprobs: None,
+            echo: false,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: None,
+            use_beam_search: true,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn completion_beam_search_requires_multiple_beams() {
+        let req = CompletionRequest {
+            model: "m".into(),
+            prompt: "p".into(),
+            max_tokens: 10,
+            temperature: 0.0,
+            top_p: 1.0,
+            n: 1,
+            stream: false,
+            stop: None,
+            logprobs: None,
+            echo: false,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: None,
+            use_beam_search: true,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn completion_beam_search_uses_best_of_override() {
+        let req = CompletionRequest {
+            model: "m".into(),
+            prompt: "p".into(),
+            max_tokens: 10,
+            temperature: 0.0,
+            top_p: 1.0,
+            n: 1,
+            stream: false,
+            stop: None,
+            logprobs: None,
+            echo: false,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: Some(4),
+            use_beam_search: true,
+        };
+        assert!(req.validate().is_ok());
+        assert_eq!(req.beam_width(), 4);
+        let sp = req.to_sampling_params();
+        assert_eq!(sp.best_of, 4);
+        assert!(sp.use_beam_search);
+    }
+
+    #[test]
+    fn chat_beam_search_requires_multiple_beams() {
+        let req = ChatCompletionRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+            max_tokens: 10,
+            temperature: 0.0,
+            top_p: 1.0,
+            n: 1,
+            stream: false,
+            stop: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: None,
+            use_beam_search: true,
+            tools: None,
+            tool_choice: None,
+        };
+        assert!(req.validate().is_err());
     }
 
     #[test]

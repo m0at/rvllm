@@ -301,23 +301,27 @@ impl BeamSearchState {
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let take = n_best.min(sorted.len()).max(1);
-        let outputs: Vec<CompletionOutput> = sorted[..take]
-            .iter()
-            .enumerate()
-            .map(|(i, hyp)| CompletionOutput {
-                index: i,
-                text: hyp.text.clone(),
-                token_ids: hyp.token_ids.clone(),
-                cumulative_logprob: hyp.cumulative_logprob,
-                logprobs: if hyp.logprobs.is_empty() {
-                    None
-                } else {
-                    Some(hyp.logprobs.clone())
-                },
-                finish_reason: hyp.finish_reason,
-            })
-            .collect();
+        let outputs: Vec<CompletionOutput> = if sorted.is_empty() {
+            Vec::new()
+        } else {
+            let take = n_best.min(sorted.len()).max(1);
+            sorted[..take]
+                .iter()
+                .enumerate()
+                .map(|(i, hyp)| CompletionOutput {
+                    index: i,
+                    text: hyp.text.clone(),
+                    token_ids: hyp.token_ids.clone(),
+                    cumulative_logprob: hyp.cumulative_logprob,
+                    logprobs: if hyp.logprobs.is_empty() {
+                        None
+                    } else {
+                        Some(hyp.logprobs.clone())
+                    },
+                    finish_reason: hyp.finish_reason,
+                })
+                .collect()
+        };
 
         // If no completed beams, fall back to best active beam.
         let outputs = if outputs.is_empty() && !self.active_beams.is_empty() {
@@ -348,7 +352,7 @@ impl BeamSearchState {
             prompt_token_ids: prompt_token_ids.to_vec(),
             prompt_logprobs: None,
             outputs,
-            finished: self.is_finished() || !self.completed.is_empty(),
+            finished: self.is_finished(),
         }
     }
 }
@@ -555,6 +559,7 @@ mod tests {
     #[test]
     fn build_output_returns_best() {
         let mut state = make_state(2);
+        state.active_beams.clear();
 
         // Simulate two completed beams.
         state.completed.push(BeamHypothesis {
