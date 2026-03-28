@@ -438,6 +438,19 @@ mod tests {
     }
 
     #[test]
+    fn beam_hypothesis_score_can_favor_longer_sequence_with_positive_penalty() {
+        let mut shorter = BeamHypothesis::new(SequenceId(0));
+        shorter.cumulative_logprob = -4.2;
+        shorter.token_ids = vec![1];
+
+        let mut longer = BeamHypothesis::new(SequenceId(1));
+        longer.cumulative_logprob = -4.4;
+        longer.token_ids = vec![1, 2, 3, 4];
+
+        assert!(longer.score(2.0) > shorter.score(2.0));
+    }
+
+    #[test]
     fn new_state_has_active_beams() {
         let state = make_state(3);
         assert_eq!(state.active_beams.len(), 3);
@@ -691,5 +704,39 @@ mod tests {
         assert!(state.active_beams.is_empty());
         assert_eq!(state.completed.len(), 1);
         assert_eq!(state.completed[0].finish_reason, Some(FinishReason::Length));
+    }
+
+    #[test]
+    fn early_stopping_finishes_when_completed_beams_dominate() {
+        let mut state = BeamSearchState::new(
+            RequestId(1),
+            2,
+            10,
+            1.0,
+            true,
+            &[SequenceId(0), SequenceId(1)],
+        );
+        state.completed.push(BeamHypothesis {
+            seq_id: SequenceId(2),
+            token_ids: vec![10, 11],
+            text: "done-a".into(),
+            cumulative_logprob: -0.2,
+            logprobs: vec![],
+            finished: true,
+            finish_reason: Some(FinishReason::Stop),
+        });
+        state.completed.push(BeamHypothesis {
+            seq_id: SequenceId(3),
+            token_ids: vec![12, 13],
+            text: "done-b".into(),
+            cumulative_logprob: -0.3,
+            logprobs: vec![],
+            finished: true,
+            finish_reason: Some(FinishReason::Stop),
+        });
+        state.active_beams[0].cumulative_logprob = -0.4;
+        state.active_beams[1].cumulative_logprob = -0.5;
+
+        assert!(state.is_finished());
     }
 }

@@ -313,8 +313,8 @@ impl LLMEngine {
                         request_id,
                         num_seqs,
                         sampling_params.max_tokens,
-                        1.0,
-                        false,
+                        sampling_params.length_penalty,
+                        sampling_params.early_stopping,
                         &initial_seq_ids,
                     ))
                 } else {
@@ -775,6 +775,28 @@ mod tests {
         assert!(result.is_ok());
         assert!(engine.has_unfinished());
         assert!(engine.requests.contains_key(&RequestId(1)));
+    }
+
+    #[test]
+    fn add_request_uses_beam_controls_from_sampling_params() {
+        let mut engine = make_engine(5);
+        let mut params = SamplingParams::default();
+        params.best_of = 2;
+        params.use_beam_search = true;
+        params.length_penalty = 0.5;
+        params.early_stopping = true;
+
+        engine
+            .add_request(RequestId(2), "hello".to_string(), params)
+            .unwrap();
+
+        let beam = engine
+            .requests
+            .get(&RequestId(2))
+            .and_then(|req| req.beam_search.as_ref())
+            .unwrap();
+        assert_eq!(beam.length_penalty, 0.5);
+        assert!(beam.early_stopping);
     }
 
     #[test]

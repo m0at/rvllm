@@ -9,8 +9,8 @@
 mod inner {
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use tracing::{debug, info, trace, warn};
@@ -28,7 +28,7 @@ mod inner {
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::{GpuWorker, GpuWorkerOutput};
 
-    use crate::beam_search::{BeamHypothesis, BeamSearchState, top_k_from_logprobs};
+    use crate::beam_search::{top_k_from_logprobs, BeamHypothesis, BeamSearchState};
     use crate::hf_snapshot;
     use crate::output::{OutputProcessor, SequenceOutputState};
 
@@ -63,7 +63,10 @@ mod inner {
         }
 
         fn free_blocks(&self) -> usize {
-            self.free_list.lock().map(|free_list| free_list.len()).unwrap_or(0)
+            self.free_list
+                .lock()
+                .map(|free_list| free_list.len())
+                .unwrap_or(0)
         }
 
         fn total_blocks(&self) -> usize {
@@ -513,8 +516,7 @@ mod inner {
             );
             let gpu_block_pool = Arc::new(EngineBlockPool::new(num_gpu_blocks));
             let beam_gpu_pool: Arc<dyn MemoryPool> = gpu_block_pool.clone();
-            let beam_cpu_pool: Arc<dyn MemoryPool> =
-                Arc::new(EngineBlockPool::new(num_cpu_blocks));
+            let beam_cpu_pool: Arc<dyn MemoryPool> = Arc::new(EngineBlockPool::new(num_cpu_blocks));
             let mut beam_block_manager =
                 BlockManager::new(beam_gpu_pool, beam_cpu_pool, config.cache.block_size);
             beam_block_manager.set_watermark(0.0);
@@ -604,8 +606,8 @@ mod inner {
                     request_id,
                     num_seqs,
                     params.max_tokens,
-                    1.0,
-                    false,
+                    params.length_penalty,
+                    params.early_stopping,
                     &initial_seq_ids,
                 ))
             } else {
@@ -1033,8 +1035,10 @@ mod inner {
                 .map(|(_, child_seq_id)| *child_seq_id)
                 .collect();
             for child_seq_id in &child_seq_ids {
-                if let Some(old_child_seq) =
-                    group.get_seqs().iter().find(|seq| seq.seq_id == *child_seq_id)
+                if let Some(old_child_seq) = group
+                    .get_seqs()
+                    .iter()
+                    .find(|seq| seq.seq_id == *child_seq_id)
                 {
                     self.beam_block_manager.free(old_child_seq);
                 }
@@ -1247,7 +1251,11 @@ mod inner {
                 .collect();
             for sid in dead_sids {
                 if let Some(blocks) = self.seq_block_tables.remove(&sid) {
-                    debug!(seq_id = sid.0, num_blocks = blocks.len(), "recycling blocks from finished sequence");
+                    debug!(
+                        seq_id = sid.0,
+                        num_blocks = blocks.len(),
+                        "recycling blocks from finished sequence"
+                    );
                     for b in blocks {
                         self.gpu_block_pool.free(b);
                     }

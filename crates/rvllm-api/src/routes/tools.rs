@@ -101,6 +101,10 @@ pub struct ChatCompletionToolRequest {
     pub best_of: Option<usize>,
     #[serde(default)]
     pub use_beam_search: bool,
+    #[serde(default = "default_length_penalty")]
+    pub length_penalty: f32,
+    #[serde(default)]
+    pub early_stopping: bool,
     /// Tool definitions available to the model.
     #[serde(default)]
     pub tools: Option<Vec<RequestTool>>,
@@ -120,6 +124,18 @@ fn default_top_p() -> f32 {
 }
 fn default_n() -> usize {
     1
+}
+fn default_length_penalty() -> f32 {
+    1.0
+}
+
+fn validate_length_penalty(length_penalty: f32) -> Result<(), ApiError> {
+    if !length_penalty.is_finite() || length_penalty < 0.0 {
+        return Err(ApiError::InvalidRequest(
+            "length_penalty must be a finite number greater than or equal to 0.0".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +224,7 @@ impl ChatCompletionToolRequest {
         if self.n == 0 {
             return Err(ApiError::InvalidRequest("n must be greater than 0".into()));
         }
+        validate_length_penalty(self.length_penalty)?;
         if let Some(best_of) = self.best_of {
             if best_of == 0 {
                 return Err(ApiError::InvalidRequest(
@@ -251,6 +268,8 @@ impl ChatCompletionToolRequest {
             seed: self.seed,
             best_of: self.beam_width(),
             use_beam_search: self.use_beam_search,
+            length_penalty: self.length_penalty,
+            early_stopping: self.early_stopping,
             ..Default::default()
         }
     }
@@ -735,6 +754,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
             tools: None,
             tool_choice: None,
         };
@@ -842,6 +863,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
             tools: None,
             tool_choice: Some(ToolChoice::Mode("banana".to_string())),
         };
@@ -877,6 +900,8 @@ mod tests {
         assert_eq!(req.model, "hermes-3");
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
         assert_eq!(req.tool_choice, Some(ToolChoice::Mode("auto".to_string())));
+        assert_eq!(req.length_penalty, 1.0);
+        assert!(!req.early_stopping);
         assert!(req.validate().is_ok());
         assert!(req.tools_enabled());
     }
@@ -939,6 +964,8 @@ mod tests {
             seed: Some(123),
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.5,
+            early_stopping: true,
             tools: None,
             tool_choice: None,
         };
@@ -950,6 +977,8 @@ mod tests {
         assert_eq!(sp.seed, Some(123));
         assert_eq!(sp.best_of, 2);
         assert!(!sp.use_beam_search);
+        assert_eq!(sp.length_penalty, 1.5);
+        assert!(sp.early_stopping);
     }
 
     #[test]
@@ -972,6 +1001,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: true,
+            length_penalty: 1.0,
+            early_stopping: false,
             tools: None,
             tool_choice: None,
         };
@@ -998,6 +1029,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: true,
+            length_penalty: 1.0,
+            early_stopping: false,
             tools: None,
             tool_choice: None,
         };
@@ -1024,6 +1057,8 @@ mod tests {
             seed: None,
             best_of: Some(4),
             use_beam_search: true,
+            length_penalty: 0.25,
+            early_stopping: true,
             tools: None,
             tool_choice: None,
         };
@@ -1032,6 +1067,36 @@ mod tests {
         let sp = req.to_sampling_params();
         assert_eq!(sp.best_of, 4);
         assert!(sp.use_beam_search);
+        assert_eq!(sp.length_penalty, 0.25);
+        assert!(sp.early_stopping);
+    }
+
+    #[test]
+    fn beam_search_validation_rejects_negative_length_penalty() {
+        let req = ChatCompletionToolRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            max_tokens: 16,
+            temperature: 0.0,
+            top_p: 1.0,
+            n: 2,
+            stream: false,
+            stop: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: None,
+            use_beam_search: true,
+            length_penalty: -1.0,
+            early_stopping: false,
+            tools: None,
+            tool_choice: None,
+        };
+        assert!(req.validate().is_err());
     }
 
     #[tokio::test]
@@ -1064,6 +1129,8 @@ mod tests {
                 seed: None,
                 best_of: None,
                 use_beam_search: true,
+                length_penalty: 1.0,
+                early_stopping: false,
                 tools: None,
                 tool_choice: None,
             })

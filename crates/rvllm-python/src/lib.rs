@@ -72,6 +72,10 @@ struct PySamplingParams {
     seed: Option<u64>,
     #[pyo3(get, set)]
     logprobs: Option<usize>,
+    #[pyo3(get, set)]
+    length_penalty: f32,
+    #[pyo3(get, set)]
+    early_stopping: bool,
 }
 
 #[pymethods]
@@ -88,6 +92,8 @@ impl PySamplingParams {
         max_tokens = 256,
         seed = None,
         logprobs = None,
+        length_penalty = 1.0,
+        early_stopping = false,
     ))]
     fn new(
         temperature: f32,
@@ -100,6 +106,8 @@ impl PySamplingParams {
         max_tokens: usize,
         seed: Option<u64>,
         logprobs: Option<usize>,
+        length_penalty: f32,
+        early_stopping: bool,
     ) -> Self {
         Self {
             temperature,
@@ -112,6 +120,8 @@ impl PySamplingParams {
             max_tokens,
             seed,
             logprobs,
+            length_penalty,
+            early_stopping,
         }
     }
 
@@ -136,6 +146,8 @@ impl PySamplingParams {
             max_tokens: self.max_tokens,
             seed: self.seed,
             logprobs: self.logprobs,
+            length_penalty: self.length_penalty,
+            early_stopping: self.early_stopping,
             ..Default::default()
         }
     }
@@ -309,7 +321,11 @@ impl PyEngineConfig {
             .model(
                 rvllm_config::ModelConfigImpl::builder()
                     .model_path(&self.model)
-                    .dtype(self.dtype.parse::<rvllm_core::types::Dtype>().unwrap_or_default())
+                    .dtype(
+                        self.dtype
+                            .parse::<rvllm_core::types::Dtype>()
+                            .unwrap_or_default(),
+                    )
                     .max_model_len(self.max_model_len)
                     .build(),
             )
@@ -404,4 +420,41 @@ fn rvllm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sample_batch, m)?)?;
     m.add_function(wrap_pyfunction!(system_info, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn py_sampling_params_defaults_match_rust_defaults() {
+        let params =
+            PySamplingParams::new(1.0, 1.0, 0, 0.0, 1.0, 0.0, 0.0, 256, None, None, 1.0, false);
+        let rust = params.to_rust();
+        assert_eq!(rust.length_penalty, 1.0);
+        assert!(!rust.early_stopping);
+    }
+
+    #[test]
+    fn py_sampling_params_to_rust_copies_beam_controls() {
+        let params = PySamplingParams::new(
+            0.8,
+            0.9,
+            10,
+            0.1,
+            1.1,
+            0.2,
+            0.3,
+            42,
+            Some(7),
+            Some(4),
+            0.5,
+            true,
+        );
+        let rust = params.to_rust();
+        assert_eq!(rust.length_penalty, 0.5);
+        assert!(rust.early_stopping);
+        assert_eq!(rust.max_tokens, 42);
+        assert_eq!(rust.logprobs, Some(4));
+    }
 }

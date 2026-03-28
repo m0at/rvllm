@@ -45,6 +45,10 @@ pub struct CompletionRequest {
     pub best_of: Option<usize>,
     #[serde(default)]
     pub use_beam_search: bool,
+    #[serde(default = "default_length_penalty")]
+    pub length_penalty: f32,
+    #[serde(default)]
+    pub early_stopping: bool,
 }
 
 /// POST /v1/chat/completions request body.
@@ -76,6 +80,10 @@ pub struct ChatCompletionRequest {
     pub best_of: Option<usize>,
     #[serde(default)]
     pub use_beam_search: bool,
+    #[serde(default = "default_length_penalty")]
+    pub length_penalty: f32,
+    #[serde(default)]
+    pub early_stopping: bool,
     #[serde(default)]
     pub tools: Option<Vec<crate::routes::tools::RequestTool>>,
     #[serde(default)]
@@ -93,6 +101,18 @@ fn default_top_p() -> f32 {
 }
 fn default_n() -> usize {
     1
+}
+fn default_length_penalty() -> f32 {
+    1.0
+}
+
+fn validate_length_penalty(length_penalty: f32) -> Result<(), ApiError> {
+    if !length_penalty.is_finite() || length_penalty < 0.0 {
+        return Err(ApiError::InvalidRequest(
+            "length_penalty must be a finite number greater than or equal to 0.0".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl CompletionRequest {
@@ -125,6 +145,7 @@ impl CompletionRequest {
         if self.n == 0 {
             return Err(ApiError::InvalidRequest("n must be greater than 0".into()));
         }
+        validate_length_penalty(self.length_penalty)?;
         if let Some(best_of) = self.best_of {
             if best_of == 0 {
                 return Err(ApiError::InvalidRequest(
@@ -160,6 +181,8 @@ impl CompletionRequest {
             seed: self.seed,
             best_of: self.beam_width(),
             use_beam_search: self.use_beam_search,
+            length_penalty: self.length_penalty,
+            early_stopping: self.early_stopping,
             ..Default::default()
         }
     }
@@ -205,6 +228,7 @@ impl ChatCompletionRequest {
         if self.n == 0 {
             return Err(ApiError::InvalidRequest("n must be greater than 0".into()));
         }
+        validate_length_penalty(self.length_penalty)?;
         if let Some(best_of) = self.best_of {
             if best_of == 0 {
                 return Err(ApiError::InvalidRequest(
@@ -238,6 +262,8 @@ impl ChatCompletionRequest {
             seed: self.seed,
             best_of: self.beam_width(),
             use_beam_search: self.use_beam_search,
+            length_penalty: self.length_penalty,
+            early_stopping: self.early_stopping,
             ..Default::default()
         }
     }
@@ -266,6 +292,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: CompletionRequest = serde_json::from_str(&json).unwrap();
@@ -299,6 +327,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
             tools: None,
             tool_choice: None,
         };
@@ -320,6 +350,8 @@ mod tests {
         assert!(!req.stream);
         assert_eq!(req.best_of, None);
         assert!(!req.use_beam_search);
+        assert_eq!(req.length_penalty, 1.0);
+        assert!(!req.early_stopping);
     }
 
     #[test]
@@ -341,6 +373,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
         };
         assert!(req.validate().is_ok());
     }
@@ -364,6 +398,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
         };
         assert!(req.validate().is_err());
     }
@@ -387,6 +423,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
         };
         assert!(req.validate().is_err());
     }
@@ -408,6 +446,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
             tools: None,
             tool_choice: None,
         };
@@ -434,6 +474,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
             tools: None,
             tool_choice: None,
         };
@@ -459,6 +501,8 @@ mod tests {
             seed: Some(123),
             best_of: None,
             use_beam_search: false,
+            length_penalty: 1.5,
+            early_stopping: true,
         };
         let sp = req.to_sampling_params();
         assert_eq!(sp.max_tokens, 42);
@@ -470,6 +514,8 @@ mod tests {
         assert_eq!(sp.seed, Some(123));
         assert_eq!(sp.best_of, 2);
         assert!(!sp.use_beam_search);
+        assert_eq!(sp.length_penalty, 1.5);
+        assert!(sp.early_stopping);
     }
 
     #[test]
@@ -491,6 +537,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: true,
+            length_penalty: 1.0,
+            early_stopping: false,
         };
         assert!(req.validate().is_err());
     }
@@ -514,6 +562,8 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: true,
+            length_penalty: 1.0,
+            early_stopping: false,
         };
         assert!(req.validate().is_err());
     }
@@ -537,12 +587,16 @@ mod tests {
             seed: None,
             best_of: Some(4),
             use_beam_search: true,
+            length_penalty: 0.5,
+            early_stopping: true,
         };
         assert!(req.validate().is_ok());
         assert_eq!(req.beam_width(), 4);
         let sp = req.to_sampling_params();
         assert_eq!(sp.best_of, 4);
         assert!(sp.use_beam_search);
+        assert_eq!(sp.length_penalty, 0.5);
+        assert!(sp.early_stopping);
     }
 
     #[test]
@@ -565,6 +619,61 @@ mod tests {
             seed: None,
             best_of: None,
             use_beam_search: true,
+            length_penalty: 1.0,
+            early_stopping: false,
+            tools: None,
+            tool_choice: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn completion_validate_rejects_negative_length_penalty() {
+        let req = CompletionRequest {
+            model: "m".into(),
+            prompt: "p".into(),
+            max_tokens: 10,
+            temperature: 0.5,
+            top_p: 0.9,
+            n: 1,
+            stream: false,
+            stop: None,
+            logprobs: None,
+            echo: false,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: None,
+            use_beam_search: false,
+            length_penalty: -0.1,
+            early_stopping: false,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn chat_validate_rejects_non_finite_length_penalty() {
+        let req = ChatCompletionRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+            max_tokens: 10,
+            temperature: 0.0,
+            top_p: 1.0,
+            n: 2,
+            stream: false,
+            stop: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: None,
+            use_beam_search: true,
+            length_penalty: f32::NAN,
+            early_stopping: false,
             tools: None,
             tool_choice: None,
         };

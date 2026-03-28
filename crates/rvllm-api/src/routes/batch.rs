@@ -582,6 +582,55 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use rvllm_core::prelude::{
+        CompletionOutput, FinishReason, RequestId, RequestOutput, SamplingParams,
+    };
+
+    struct RecordingEngine {
+        last_params: Mutex<Option<SamplingParams>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::server::InferenceEngine for RecordingEngine {
+        async fn generate(
+            &self,
+            _prompt: String,
+            params: SamplingParams,
+        ) -> rvllm_core::prelude::Result<(
+            RequestId,
+            tokio_stream::wrappers::ReceiverStream<RequestOutput>,
+        )> {
+            *self.last_params.lock().unwrap() = Some(params);
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(RequestOutput {
+                request_id: RequestId(1),
+                prompt: "prompt".into(),
+                prompt_token_ids: vec![1],
+                prompt_logprobs: None,
+                outputs: vec![CompletionOutput {
+                    index: 0,
+                    text: "done".into(),
+                    token_ids: vec![2],
+                    cumulative_logprob: -0.1,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                }],
+                finished: true,
+            })
+            .await
+            .unwrap();
+            Ok((
+                RequestId(1),
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+        }
+
+        fn supports_beam_search(&self) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn batch_status_serde() {
@@ -696,5 +745,34 @@ mod tests {
         assert!(store.batches.is_empty());
         assert!(store.results.is_empty());
         assert_eq!(store.output_dir, PathBuf::from("/tmp/test-batches"));
+    }
+
+    #[tokio::test]
+    async fn process_single_request_forwards_beam_controls() {
+        let engine_impl = Arc::new(RecordingEngine {
+            last_params: Mutex::new(None),
+        });
+        let engine: Arc<dyn crate::server::InferenceEngine> = engine_impl.clone();
+        let line = BatchRequestLine {
+            custom_id: "req-1".into(),
+            method: "POST".into(),
+            url: "/v1/completions".into(),
+            body: serde_json::json!({
+                "model": "m",
+                "prompt": "hello",
+                "max_tokens": 10,
+                "n": 2,
+                "use_beam_search": true,
+                "length_penalty": 0.5,
+                "early_stopping": true
+            }),
+        };
+
+        let response = process_single_request(&engine, "m", &line).await.unwrap();
+        let params = engine_impl.last_params.lock().unwrap().clone().unwrap();
+        assert_eq!(params.length_penalty, 0.5);
+        assert!(params.early_stopping);
+        assert_eq!(params.best_of, 2);
+        assert_eq!(response["choices"][0]["text"], "done");
     }
 }

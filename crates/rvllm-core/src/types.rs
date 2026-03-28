@@ -180,6 +180,10 @@ pub struct SamplingParams {
     pub best_of: usize,
     /// Enable beam search decoding with `best_of` beams.
     pub use_beam_search: bool,
+    /// Length penalty alpha used by beam search ranking.
+    pub length_penalty: f32,
+    /// Stop beam search once finished hypotheses dominate active beams.
+    pub early_stopping: bool,
     /// Guided decoding response format constraint.
     #[serde(default)]
     pub response_format: ResponseFormat,
@@ -204,6 +208,8 @@ impl Default for SamplingParams {
             seed: None,
             best_of: 1,
             use_beam_search: false,
+            length_penalty: 1.0,
+            early_stopping: false,
             response_format: ResponseFormat::default(),
             echo: false,
         }
@@ -265,6 +271,8 @@ mod tests {
         assert_eq!(p.top_k, 0);
         assert_eq!(p.max_tokens, 256);
         assert_eq!(p.best_of, 1);
+        assert_eq!(p.length_penalty, 1.0);
+        assert!(!p.early_stopping);
     }
 
     #[test]
