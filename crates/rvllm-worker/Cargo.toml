@@ -17,6 +17,7 @@ cuda = ["dep:cudarc", "rvllm-gpu/cuda", "rvllm-model-runner/cuda", "rvllm-kv-cac
 
 [dependencies]
 cudarc = { version = "0.12", features = ["driver", "cublas", "f16"], optional = true }
+half = "2"
 rvllm-core.workspace = true
 rvllm-config.workspace = true
 rvllm-gpu.workspace = true

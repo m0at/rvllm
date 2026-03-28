@@ -2767,6 +2767,7 @@ name = "rvllm-worker"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "half",
  "hf-hub",
  "memmap2",
  "metrics-exporter-prometheus",
