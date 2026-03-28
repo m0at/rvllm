@@ -76,7 +76,7 @@ impl InferenceEngine for rvllm_engine::AsyncGpuLLMEngine {
     }
 
     fn supports_beam_search(&self) -> bool {
-        false
+        true
     }
 }
 

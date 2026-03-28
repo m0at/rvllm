@@ -363,12 +363,15 @@ impl GpuWorker {
         // pre-capture work create illegal cross-phase dependencies). Since we use
         // a single stream, event-based multi-stream sync is unnecessary.
         #[cfg(feature = "cuda")]
-        unsafe { context.disable_event_tracking(); }
+        unsafe {
+            context.disable_event_tracking();
+        }
 
         // Use a non-default stream for all GPU operations. The legacy default
         // stream (stream 0) does NOT support cuStreamBeginCapture, which is
         // required for CUDA graph capture/replay.
-        let stream = context.new_stream()
+        let stream = context
+            .new_stream()
             .map_err(|e| LLMError::GpuError(format!("failed to create CUDA stream: {e}")))?;
 
         // Set memory pool to never release freed memory (instant reuse).
@@ -601,7 +604,6 @@ impl GpuWorker {
                 self.graph_runner.pool_mut().disable();
             }
 
-
             self.gpu_model_runner = Some(runner);
             info!(
                 "GPU model runner initialized with {} GPU blocks (block_size={})",
@@ -797,7 +799,9 @@ impl GpuWorker {
         &self,
         gpu_memory_utilization: f32,
     ) -> Result<(usize, usize)> {
-        let (free, _total) = self.context.mem_get_info()
+        let (free, _total) = self
+            .context
+            .mem_get_info()
             .map_err(|e| LLMError::GpuError(format!("mem_get_info failed: {e}")))?;
         let available = (free as f32 * gpu_memory_utilization) as usize;
 
@@ -835,6 +839,8 @@ impl GpuWorker {
         metadata.iter().all(|g| {
             let p = &g.sampling_params;
             p.temperature == 0.0
+                && !p.use_beam_search
+                && p.logprobs.unwrap_or(0) == 0
                 && matches!(p.response_format, ResponseFormat::Text)
                 && p.repetition_penalty == 1.0
                 && p.frequency_penalty == 0.0
@@ -949,9 +955,7 @@ impl GpuWorker {
                 let token_ids = self.collect_pending_tokens(actual_batch)?;
                 self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?
             }
-            ForwardOutput::Logits(ref logits) => {
-                self.sample_tokens(logits, metadata)?
-            }
+            ForwardOutput::Logits(ref logits) => self.sample_tokens(logits, metadata)?,
         };
         let t_sample = t_start.elapsed();
 
@@ -1024,10 +1028,22 @@ impl GpuWorker {
     pub fn execute_with_cache_ops(
         &mut self,
         metadata: &[SequenceGroupMetadata],
-        _blocks_to_swap_in: &[(BlockId, BlockId)],
-        _blocks_to_swap_out: &[(BlockId, BlockId)],
-        _blocks_to_copy: &[(BlockId, BlockId)],
+        blocks_to_swap_in: &[(BlockId, BlockId)],
+        blocks_to_swap_out: &[(BlockId, BlockId)],
+        blocks_to_copy: &[(BlockId, BlockId)],
     ) -> Result<GpuWorkerOutput> {
+        if let Some(runner) = self.gpu_model_runner.as_mut() {
+            let cache = runner.cache_mut();
+            if !blocks_to_swap_in.is_empty() {
+                cache.swap_in(blocks_to_swap_in)?;
+            }
+            if !blocks_to_swap_out.is_empty() {
+                cache.swap_out(blocks_to_swap_out)?;
+            }
+            if !blocks_to_copy.is_empty() {
+                cache.copy_blocks(blocks_to_copy)?;
+            }
+        }
         self.execute(metadata)
     }
 
@@ -1138,7 +1154,11 @@ impl GpuWorker {
 
         // Only use graphs for pure decode steps with greedy sampling
         let is_decode = !model_input.is_prefill
-            && model_input.attention_metadata.query_lens.iter().all(|&q| q == 1);
+            && model_input
+                .attention_metadata
+                .query_lens
+                .iter()
+                .all(|&q| q == 1);
 
         if !is_decode || !greedy_only || !self.graph_runner.is_enabled() {
             return self.raw_gpu_forward_ex(model_input, greedy_only);
@@ -1298,9 +1318,10 @@ impl GpuWorker {
         let num_seqs = padded_input.attention_metadata.context_lens.len();
         let max_context_len = padded_input.attention_metadata.max_context_len;
 
-        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
-            LLMError::GpuError("GPU model runner not initialized".into())
-        })?;
+        let runner = self
+            .gpu_model_runner
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
 
         let t0 = std::time::Instant::now();
 
@@ -1361,7 +1382,8 @@ impl GpuWorker {
             // Synchronize to drain all pending async ops (allocs, frees,
             // kernel completions) before starting graph capture.
             let cuda_stream = runner.cuda_stream().clone();
-            cuda_stream.synchronize()
+            cuda_stream
+                .synchronize()
                 .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
 
             // Re-upload metadata (warmup consumed the stream state).
@@ -1410,9 +1432,8 @@ impl GpuWorker {
 
         // -- NORMAL path (pre-warmup or capture failure) --
         // Metadata already uploaded. Use forward_graph_body which includes DtoH.
-        let fwd_output = runner.forward_graph_body(
-            num_tokens, num_seqs, max_context_len, false, true,
-        )?;
+        let fwd_output =
+            runner.forward_graph_body(num_tokens, num_seqs, max_context_len, false, true)?;
 
         // Strip padding from output
         match fwd_output {

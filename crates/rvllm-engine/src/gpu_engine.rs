@@ -7,25 +7,76 @@
 
 #[cfg(feature = "cuda")]
 mod inner {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     use tracing::{debug, info, trace, warn};
 
     use rvllm_block_manager::prefix_cache::{self, PrefixCache};
+    use rvllm_block_manager::{BlockManager, MemoryPool};
     use rvllm_config::EngineConfig;
     use rvllm_core::prelude::{
         BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
         SequenceId, TokenId,
     };
-    use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus};
+    use rvllm_sequence::{
+        Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus,
+    };
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::{GpuWorker, GpuWorkerOutput};
 
+    use crate::beam_search::{BeamHypothesis, BeamSearchState, top_k_from_logprobs};
     use crate::hf_snapshot;
     use crate::output::{OutputProcessor, SequenceOutputState};
+
+    #[derive(Debug)]
+    struct EngineBlockPool {
+        free_list: Mutex<VecDeque<BlockId>>,
+        total: usize,
+    }
+
+    impl EngineBlockPool {
+        fn new(total: usize) -> Self {
+            let mut free_list = VecDeque::with_capacity(total);
+            for idx in 0..total {
+                free_list.push_back(BlockId(idx as u32));
+            }
+            Self {
+                free_list: Mutex::new(free_list),
+                total,
+            }
+        }
+    }
+
+    impl MemoryPool for EngineBlockPool {
+        fn allocate(&self) -> Option<BlockId> {
+            self.free_list.lock().ok()?.pop_front()
+        }
+
+        fn free(&self, block_id: BlockId) {
+            if let Ok(mut free_list) = self.free_list.lock() {
+                free_list.push_back(block_id);
+            }
+        }
+
+        fn free_blocks(&self) -> usize {
+            self.free_list.lock().map(|free_list| free_list.len()).unwrap_or(0)
+        }
+
+        fn total_blocks(&self) -> usize {
+            self.total
+        }
+    }
+
+    #[derive(Debug)]
+    struct BeamGroupUpdate {
+        output: RequestOutput,
+        active_beams: Vec<BeamHypothesis>,
+        fork_pairs: Vec<(SequenceId, SequenceId)>,
+    }
 
     // ------------------------------------------------------------------
     // HuggingFace model config reading
@@ -120,6 +171,7 @@ mod inner {
         prompt_token_ids: Vec<TokenId>,
         sampling_params: SamplingParams,
         seq_states: Vec<SequenceOutputState>,
+        beam_search: Option<BeamSearchState>,
     }
 
     // ------------------------------------------------------------------
@@ -167,6 +219,15 @@ mod inner {
             self.running.retain(|g| g.request_id != *request_id);
         }
 
+        fn cloned_seqs_for_request(&self, request_id: &RequestId) -> Vec<Sequence> {
+            self.waiting
+                .iter()
+                .chain(self.running.iter())
+                .find(|group| group.request_id == *request_id)
+                .map(|group| group.get_seqs().to_vec())
+                .unwrap_or_default()
+        }
+
         fn has_unfinished_seqs(&self) -> bool {
             !self.waiting.is_empty() || !self.running.is_empty()
         }
@@ -185,6 +246,30 @@ mod inner {
                 for seq in group.get_seqs_mut() {
                     if seq.seq_id == seq_id {
                         seq.append_token(token_id, logprob);
+                        return;
+                    }
+                }
+            }
+        }
+
+        /// Replace a sequence's tracked state wholesale.
+        fn replace_seq_state(
+            &mut self,
+            seq_id: SequenceId,
+            prompt_token_ids: Vec<TokenId>,
+            output_token_ids: Vec<TokenId>,
+            cumulative_logprob: f32,
+            status: SequenceStatus,
+        ) {
+            for group in self.running.iter_mut().chain(self.waiting.iter_mut()) {
+                for seq in group.get_seqs_mut() {
+                    if seq.seq_id == seq_id {
+                        seq.prompt_token_ids = prompt_token_ids;
+                        seq.output_token_ids = output_token_ids;
+                        seq.cumulative_logprob = cumulative_logprob;
+                        seq.logprobs.clear();
+                        seq.num_computed_tokens = 0;
+                        seq.status = status;
                         return;
                     }
                 }
@@ -309,16 +394,18 @@ mod inner {
         prefix_cache: Option<PrefixCache>,
         /// Total number of GPU KV-cache blocks available.
         num_gpu_blocks: u32,
-        /// Persistent block allocation with recycling.
-        next_block_id: u32,
-        /// Free list of recycled block IDs.
-        free_blocks: Vec<u32>,
+        /// Shared GPU block ID pool used by both beam and non-beam paths.
+        gpu_block_pool: Arc<EngineBlockPool>,
         /// Per-sequence block tables that persist across step() calls.
         seq_block_tables: HashMap<SequenceId, Vec<BlockId>>,
         /// Shared queue for new requests arriving during GPU compute.
         request_queue: Option<RequestQueue>,
         /// Shared queue for abort requests arriving during GPU compute.
         abort_queue: Option<AbortQueue>,
+        /// Beam-search-only block manager for CoW KV cache sharing.
+        beam_block_manager: BlockManager,
+        /// Cache block copy operations to apply before the next worker step.
+        pending_beam_copy_blocks: Vec<(BlockId, BlockId)>,
     }
 
     /// Pending state from step_launch, consumed by step_collect.
@@ -424,6 +511,16 @@ mod inner {
                 max_num_seqs = config.scheduler.max_num_seqs,
                 "GpuLLMEngine: ready for inference"
             );
+            let gpu_block_pool = Arc::new(EngineBlockPool::new(num_gpu_blocks));
+            let beam_gpu_pool: Arc<dyn MemoryPool> = gpu_block_pool.clone();
+            let beam_cpu_pool: Arc<dyn MemoryPool> =
+                Arc::new(EngineBlockPool::new(num_cpu_blocks));
+            let mut beam_block_manager =
+                BlockManager::new(beam_gpu_pool, beam_cpu_pool, config.cache.block_size);
+            beam_block_manager.set_watermark(0.0);
+            if config.cache.enable_prefix_caching {
+                beam_block_manager.enable_prefix_caching(1024);
+            }
             Ok(Self {
                 config,
                 scheduler,
@@ -434,11 +531,12 @@ mod inner {
                 next_seq_id: 0,
                 prefix_cache,
                 num_gpu_blocks: num_gpu_blocks as u32,
-                next_block_id: 0,
-                free_blocks: Vec::new(),
+                gpu_block_pool,
                 seq_block_tables: HashMap::new(),
                 request_queue: None,
                 abort_queue: None,
+                beam_block_manager,
+                pending_beam_copy_blocks: Vec::new(),
             })
         }
 
@@ -482,12 +580,14 @@ mod inner {
             let num_seqs = params.best_of.max(1);
             let mut seqs = Vec::with_capacity(num_seqs);
             let mut seq_states = Vec::with_capacity(num_seqs);
+            let mut initial_seq_ids = Vec::with_capacity(num_seqs);
 
             for _ in 0..num_seqs {
                 let seq_id = SequenceId(self.next_seq_id);
                 self.next_seq_id += 1;
                 seqs.push(Sequence::new(seq_id, prompt_token_ids.clone()));
                 seq_states.push(SequenceOutputState::new());
+                initial_seq_ids.push(seq_id);
             }
 
             let seq_group = SequenceGroup::new(
@@ -499,6 +599,19 @@ mod inner {
             );
             self.scheduler.add_seq_group(seq_group);
 
+            let beam_search = if params.use_beam_search {
+                Some(BeamSearchState::new(
+                    request_id,
+                    num_seqs,
+                    params.max_tokens,
+                    1.0,
+                    false,
+                    &initial_seq_ids,
+                ))
+            } else {
+                None
+            };
+
             self.requests.insert(
                 request_id,
                 EngineRequest {
@@ -507,6 +620,7 @@ mod inner {
                     prompt_token_ids,
                     sampling_params: params,
                     seq_states,
+                    beam_search,
                 },
             );
 
@@ -515,8 +629,14 @@ mod inner {
 
         pub fn abort_request(&mut self, request_id: &RequestId) {
             info!(%request_id, "GpuLLMEngine: aborting request");
+            let seqs = self.scheduler.cloned_seqs_for_request(request_id);
             self.scheduler.abort_seq_group(request_id);
             if let Some(req) = self.requests.get_mut(request_id) {
+                if req.sampling_params.use_beam_search {
+                    for seq in &seqs {
+                        self.beam_block_manager.free(seq);
+                    }
+                }
                 for state in &mut req.seq_states {
                     if state.finish_reason.is_none() {
                         state.finish_reason = Some(FinishReason::Abort);
@@ -584,7 +704,7 @@ mod inner {
                 }
             }
 
-            let results = self.process_worker_outputs(&pending.scheduled_groups, &worker_outputs);
+            let results = self.process_worker_outputs(&pending.scheduled_groups, &worker_outputs)?;
             self.recycle_dead_blocks();
             Ok(results)
         }
@@ -645,9 +765,23 @@ mod inner {
                 }
             }
 
-            let worker_outputs = self.worker
-                .execute_with_overlap(&metadata, during_gpu)
-                .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
+            let requires_cache_ops = !self.pending_beam_copy_blocks.is_empty()
+                || metadata
+                    .iter()
+                    .any(|meta| meta.sampling_params.use_beam_search);
+            let worker_outputs = if requires_cache_ops {
+                let blocks_to_copy = std::mem::take(&mut self.pending_beam_copy_blocks);
+                let outputs = self
+                    .worker
+                    .execute_with_cache_ops(&metadata, &[], &[], &blocks_to_copy)
+                    .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
+                during_gpu();
+                outputs
+            } else {
+                self.worker
+                    .execute_with_overlap(&metadata, during_gpu)
+                    .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?
+            };
 
             // Prefix caching
             if let Some(ref mut pc) = self.prefix_cache {
@@ -667,7 +801,7 @@ mod inner {
                 }
             }
 
-            let results = self.process_worker_outputs(&scheduled_groups, &worker_outputs);
+            let results = self.process_worker_outputs(&scheduled_groups, &worker_outputs)?;
             self.recycle_dead_blocks();
             Ok(results)
         }
@@ -706,9 +840,14 @@ mod inner {
                 }
             }
 
+            info!(
+                num_groups = metadata.len(),
+                "gpu_engine: calling worker.execute"
+            );
+            let blocks_to_copy = std::mem::take(&mut self.pending_beam_copy_blocks);
             let worker_outputs = self
                 .worker
-                .execute(&metadata)
+                .execute_with_cache_ops(&metadata, &[], &[], &blocks_to_copy)
                 .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
             trace!(
                 num_outputs = worker_outputs.outputs.len(),
@@ -742,7 +881,7 @@ mod inner {
                 }
             }
 
-            let results = self.process_worker_outputs(&scheduled_groups, &worker_outputs);
+            let results = self.process_worker_outputs(&scheduled_groups, &worker_outputs)?;
             self.recycle_dead_blocks();
 
             debug!(num_outputs = results.len(), "GpuLLMEngine: step complete");
@@ -760,7 +899,10 @@ mod inner {
                     }
                 }
             }
-            info!(num_completed = all_outputs.len(), "GpuLLMEngine: run loop finished");
+            info!(
+                num_completed = all_outputs.len(),
+                "GpuLLMEngine: run loop finished"
+            );
             Ok(all_outputs)
         }
 
@@ -773,8 +915,7 @@ mod inner {
             Vec<SequenceGroupMetadata>,
             std::collections::HashSet<SequenceId>,
         )> {
-            let free_count = self.free_blocks.len()
-                + (self.num_gpu_blocks.saturating_sub(self.next_block_id)) as usize;
+            let free_count = self.gpu_block_pool.free_blocks();
             let watermark = (self.num_gpu_blocks as usize / 25).max(1);
             self.scheduler.set_block_budget(free_count, watermark);
 
@@ -820,20 +961,151 @@ mod inner {
             Some((scheduled_groups, metadata, aborted_seqs))
         }
 
+        fn build_beam_group_update(
+            tokenizer: &Tokenizer,
+            req: &mut EngineRequest,
+            output_map: &HashMap<u64, (TokenId, LogProb, Vec<(TokenId, LogProb)>)>,
+            eos: Option<TokenId>,
+        ) -> BeamGroupUpdate {
+            let beam = req
+                .beam_search
+                .as_mut()
+                .expect("beam search state missing for beam request");
+            let mut expansions = HashMap::new();
+
+            for active in &beam.active_beams {
+                let Some((token_id, logprob, top_lps)) = output_map.get(&active.seq_id.0) else {
+                    continue;
+                };
+
+                let candidates = if top_lps.is_empty() {
+                    vec![(*token_id, *logprob)]
+                } else {
+                    top_k_from_logprobs(top_lps, beam.num_beams)
+                };
+
+                let decoded_candidates = candidates
+                    .into_iter()
+                    .map(|(candidate_token_id, candidate_logprob)| {
+                        let decoded = tokenizer.decode(&[candidate_token_id]).unwrap_or_default();
+                        (
+                            candidate_token_id,
+                            candidate_logprob,
+                            decoded,
+                            eos == Some(candidate_token_id),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                expansions.insert(active.seq_id, decoded_candidates);
+            }
+
+            let step_result = beam.step(&expansions);
+            let mut recycled = step_result.seqs_to_free.iter().copied();
+            let mut fork_pairs = Vec::with_capacity(step_result.fork_ops.len());
+            for op in step_result.fork_ops {
+                let seq_id = recycled.next().unwrap_or(op.parent_seq_id);
+                beam.set_beam_seq_id(op.new_beam_idx, seq_id);
+                fork_pairs.push((op.parent_seq_id, seq_id));
+            }
+
+            BeamGroupUpdate {
+                output: beam.build_output(&req.prompt, &req.prompt_token_ids, 1),
+                active_beams: beam.active_beams.clone(),
+                fork_pairs,
+            }
+        }
+
+        fn apply_beam_group_update(
+            &mut self,
+            request_id: RequestId,
+            group: &SequenceGroup,
+            update: &BeamGroupUpdate,
+        ) -> Result<()> {
+            let prompt_token_ids = self
+                .requests
+                .get(&request_id)
+                .map(|req| req.prompt_token_ids.clone())
+                .ok_or_else(|| LLMError::SchedulerError("beam request disappeared".into()))?;
+
+            let child_seq_ids: std::collections::HashSet<SequenceId> = update
+                .fork_pairs
+                .iter()
+                .map(|(_, child_seq_id)| *child_seq_id)
+                .collect();
+            for child_seq_id in &child_seq_ids {
+                if let Some(old_child_seq) =
+                    group.get_seqs().iter().find(|seq| seq.seq_id == *child_seq_id)
+                {
+                    self.beam_block_manager.free(old_child_seq);
+                }
+            }
+
+            for (parent_seq_id, child_seq_id) in &update.fork_pairs {
+                let parent_seq = group
+                    .get_seqs()
+                    .iter()
+                    .find(|seq| seq.seq_id == *parent_seq_id)
+                    .ok_or_else(|| {
+                        LLMError::SchedulerError(format!(
+                            "missing parent sequence {} for beam fork",
+                            parent_seq_id.0
+                        ))
+                    })?;
+                let mut child_seq = Sequence::new(*child_seq_id, prompt_token_ids.clone());
+                child_seq.status = SequenceStatus::Running;
+                self.beam_block_manager.fork(parent_seq, &mut child_seq)?;
+            }
+
+            let active_seq_ids: std::collections::HashSet<SequenceId> = update
+                .active_beams
+                .iter()
+                .map(|active| active.seq_id)
+                .collect();
+
+            for active in &update.active_beams {
+                self.scheduler.replace_seq_state(
+                    active.seq_id,
+                    prompt_token_ids.clone(),
+                    active.token_ids.clone(),
+                    active.cumulative_logprob,
+                    SequenceStatus::Running,
+                );
+
+                let mut seq = Sequence::new(active.seq_id, prompt_token_ids.clone());
+                seq.output_token_ids = active.token_ids.clone();
+                seq.cumulative_logprob = active.cumulative_logprob;
+                seq.status = SequenceStatus::Running;
+                self.beam_block_manager.allocate(&seq)?;
+                let _ = self.beam_block_manager.cow_if_needed(&seq)?;
+            }
+
+            self.pending_beam_copy_blocks
+                .extend(self.beam_block_manager.get_copy_on_write_blocks());
+
+            for seq in group.get_seqs() {
+                if !active_seq_ids.contains(&seq.seq_id) {
+                    self.scheduler
+                        .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                    if !child_seq_ids.contains(&seq.seq_id) {
+                        self.beam_block_manager.free(seq);
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
         /// Process worker outputs: update scheduler, build request outputs,
         /// clean up finished requests.
         fn process_worker_outputs(
             &mut self,
             scheduled_groups: &[SequenceGroup],
             worker_outputs: &GpuWorkerOutput,
-        ) -> Vec<RequestOutput> {
-            let mut output_map: HashMap<u64, (TokenId, LogProb, &[(TokenId, LogProb)])> =
-                HashMap::with_capacity(worker_outputs.outputs.len());
+        ) -> Result<Vec<RequestOutput>> {
+            let mut output_map: HashMap<u64, (TokenId, LogProb, Vec<(TokenId, LogProb)>)> =
+                HashMap::new();
             for wo in &worker_outputs.outputs {
-                output_map.insert(
-                    wo.seq_id,
-                    (wo.token_id, wo.logprob, &wo.top_logprobs),
-                );
+                output_map.insert(wo.seq_id, (wo.token_id, wo.logprob, wo.top_logprobs.clone()));
             }
 
             let mut results = Vec::with_capacity(scheduled_groups.len());
@@ -841,86 +1113,94 @@ mod inner {
 
             for group in scheduled_groups {
                 let request_id = group.request_id;
-                let req = match self.requests.get_mut(&request_id) {
-                    Some(r) => r,
-                    None => continue,
+                let use_beam_search = self
+                    .requests
+                    .get(&request_id)
+                    .map(|req| req.sampling_params.use_beam_search)
+                    .unwrap_or(false);
+
+                let output = if use_beam_search {
+                    let update = {
+                        let req = match self.requests.get_mut(&request_id) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        Self::build_beam_group_update(&self.tokenizer, req, &output_map, eos)
+                    };
+                    self.apply_beam_group_update(request_id, group, &update)?;
+                    update.output
+                } else {
+                    let req = match self.requests.get_mut(&request_id) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let logprobs_requested =
+                        req.sampling_params.logprobs.map(|n| n > 0).unwrap_or(false);
+                    let needs_text = !req.sampling_params.stop_strings.is_empty();
+
+                    for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
+                        if seq.is_finished() {
+                            continue;
+                        }
+
+                        if let Some((token_id, logprob, top_lps)) = output_map.get(&seq.seq_id.0) {
+                            let decoded = if needs_text {
+                                self.tokenizer.decode(&[*token_id]).unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            self.scheduler
+                                .update_seq_token(seq.seq_id, *token_id, *logprob);
+
+                            let top_logprobs = if logprobs_requested && !top_lps.is_empty() {
+                                Some(top_lps.clone())
+                            } else {
+                                None
+                            };
+
+                            if let Some(state) = req.seq_states.get_mut(seq_idx) {
+                                OutputProcessor::process_token(
+                                    state,
+                                    *token_id,
+                                    *logprob,
+                                    top_logprobs,
+                                    &decoded,
+                                    &req.sampling_params,
+                                    eos,
+                                );
+                                if let Some(reason) = state.finish_reason {
+                                    let status = match reason {
+                                        FinishReason::Stop => SequenceStatus::FinishedStopped,
+                                        FinishReason::Length => SequenceStatus::FinishedLength,
+                                        FinishReason::Abort => SequenceStatus::FinishedAborted,
+                                    };
+                                    self.scheduler.finish_seq(seq.seq_id, status);
+                                }
+                            }
+                        }
+                    }
+
+                    if !needs_text {
+                        let all_finished = req.seq_states.iter().all(|s| s.is_finished());
+                        if all_finished {
+                            for state in &mut req.seq_states {
+                                if !state.token_ids.is_empty() && state.text.is_empty() {
+                                    state.text = self
+                                        .tokenizer
+                                        .decode(&state.token_ids)
+                                        .unwrap_or_default();
+                                }
+                            }
+                        }
+                    }
+
+                    OutputProcessor::build_request_output(
+                        request_id,
+                        &req.prompt,
+                        &req.prompt_token_ids,
+                        &req.seq_states,
+                    )
                 };
-
-                let logprobs_requested =
-                    req.sampling_params.logprobs.map(|n| n > 0).unwrap_or(false);
-
-                // Only decode token text when stop_strings require it;
-                // EOS and max_tokens checks only need token IDs.
-                let needs_text = !req.sampling_params.stop_strings.is_empty();
-
-                for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
-                    if seq.is_finished() {
-                        continue;
-                    }
-
-                    if let Some((token_id, logprob, top_lps)) = output_map.get(&seq.seq_id.0) {
-                        // Defer tokenizer.decode() when no stop_strings are configured.
-                        // For greedy decode the token ID is sufficient for the scheduler;
-                        // full text is reconstructed when the response is sent to the client.
-                        let decoded = if needs_text {
-                            self.tokenizer.decode(&[*token_id]).unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
-                        self.scheduler
-                            .update_seq_token(seq.seq_id, *token_id, *logprob);
-
-                        let top_logprobs = if logprobs_requested && !top_lps.is_empty() {
-                            Some(top_lps.to_vec())
-                        } else {
-                            None
-                        };
-
-                        if let Some(state) = req.seq_states.get_mut(seq_idx) {
-                            OutputProcessor::process_token(
-                                state,
-                                *token_id,
-                                *logprob,
-                                top_logprobs,
-                                &decoded,
-                                &req.sampling_params,
-                                eos,
-                            );
-                            if let Some(reason) = state.finish_reason {
-                                let status = match reason {
-                                    FinishReason::Stop => SequenceStatus::FinishedStopped,
-                                    FinishReason::Length => SequenceStatus::FinishedLength,
-                                    FinishReason::Abort => SequenceStatus::FinishedAborted,
-                                };
-                                self.scheduler.finish_seq(seq.seq_id, status);
-                            }
-                        }
-                    }
-                }
-
-                // Lazy text reconstruction: when decode was deferred (no stop_strings),
-                // batch-decode accumulated token_ids into text for finished sequences
-                // or for any output that will be returned to the client.
-                if !needs_text {
-                    let all_finished = req.seq_states.iter().all(|s| s.is_finished());
-                    if all_finished {
-                        for state in &mut req.seq_states {
-                            if !state.token_ids.is_empty() && state.text.is_empty() {
-                                state.text = self
-                                    .tokenizer
-                                    .decode(&state.token_ids)
-                                    .unwrap_or_default();
-                            }
-                        }
-                    }
-                }
-
-                let output = OutputProcessor::build_request_output(
-                    request_id,
-                    &req.prompt,
-                    &req.prompt_token_ids,
-                    &req.seq_states,
-                );
                 results.push(output);
             }
 
@@ -928,21 +1208,37 @@ mod inner {
             let finished_ids: Vec<RequestId> = self
                 .requests
                 .iter()
-                .filter(|(_, req)| req.seq_states.iter().all(|s| s.is_finished()))
+                .filter(|(_, req)| {
+                    if let Some(beam) = &req.beam_search {
+                        beam.is_finished()
+                    } else {
+                        req.seq_states.iter().all(|s| s.is_finished())
+                    }
+                })
                 .map(|(&id, _)| id)
                 .collect();
             for id in &finished_ids {
+                let seqs = self.scheduler.cloned_seqs_for_request(id);
+                if self
+                    .requests
+                    .get(id)
+                    .map(|req| req.sampling_params.use_beam_search)
+                    .unwrap_or(false)
+                {
+                    for seq in &seqs {
+                        self.beam_block_manager.free(seq);
+                    }
+                }
                 self.requests.remove(id);
                 self.scheduler.abort_seq_group(id);
             }
 
-            results
+            Ok(results)
         }
 
         /// Recycle KV cache blocks from sequences no longer tracked by scheduler.
         fn recycle_dead_blocks(&mut self) {
-            let live_seq_ids: std::collections::HashSet<SequenceId> =
-                self.scheduler.live_seq_ids();
+            let live_seq_ids: std::collections::HashSet<SequenceId> = self.scheduler.live_seq_ids();
             let dead_sids: Vec<SequenceId> = self
                 .seq_block_tables
                 .keys()
@@ -951,13 +1247,9 @@ mod inner {
                 .collect();
             for sid in dead_sids {
                 if let Some(blocks) = self.seq_block_tables.remove(&sid) {
-                    debug!(
-                        seq_id = sid.0,
-                        num_blocks = blocks.len(),
-                        "recycling blocks from finished sequence"
-                    );
+                    debug!(seq_id = sid.0, num_blocks = blocks.len(), "recycling blocks from finished sequence");
                     for b in blocks {
-                        self.free_blocks.push(b.0);
+                        self.gpu_block_pool.free(b);
                     }
                 }
             }
@@ -992,13 +1284,21 @@ mod inner {
         fn build_metadata(
             &mut self,
             groups: &[SequenceGroup],
-        ) -> (Vec<SequenceGroupMetadata>, std::collections::HashSet<SequenceId>) {
+        ) -> (
+            Vec<SequenceGroupMetadata>,
+            std::collections::HashSet<SequenceId>,
+        ) {
             let block_size = self.config.cache.block_size;
             let mut metadata = Vec::with_capacity(groups.len());
             let mut aborted_seqs: std::collections::HashSet<SequenceId> =
                 std::collections::HashSet::new();
 
             for group in groups {
+                let use_beam_search = self
+                    .requests
+                    .get(&group.request_id)
+                    .map(|req| req.sampling_params.use_beam_search)
+                    .unwrap_or(false);
                 let is_prompt = group.get_seqs().iter().any(|s| s.get_output_len() == 0);
                 let mut seq_data = HashMap::new();
                 let mut block_tables = HashMap::new();
@@ -1007,50 +1307,74 @@ mod inner {
                     if seq.is_finished() {
                         continue;
                     }
-                    let total_tokens = seq.prompt_token_ids.len() + seq.output_token_ids.len();
-                    // +1 headroom: pre-allocate for the token about to be generated this step
-                    let needed_blocks = (total_tokens + 1 + block_size - 1) / block_size;
-
-                    // Reuse existing blocks, append new ones if needed
-                    let existing = self.seq_block_tables.entry(seq.seq_id).or_default();
-                    let mut alloc_failed = false;
-                    while existing.len() < needed_blocks {
-                        let block_id = if let Some(recycled) = self.free_blocks.pop() {
-                            recycled
-                        } else if self.next_block_id < self.num_gpu_blocks {
-                            let id = self.next_block_id;
-                            self.next_block_id += 1;
-                            id
-                        } else {
+                    if use_beam_search {
+                        let beam_alloc = self.beam_block_manager.allocate(seq);
+                        if beam_alloc.is_err() {
                             warn!(
                                 seq_id = seq.seq_id.0,
-                                needed = needed_blocks,
-                                have = existing.len(),
-                                num_gpu_blocks = self.num_gpu_blocks,
-                                free_blocks = self.free_blocks.len(),
-                                "block allocation failed: no free GPU KV-cache blocks, aborting sequence"
+                                "beam block allocation failed: aborting sequence"
                             );
-                            alloc_failed = true;
-                            break;
-                        };
-                        existing.push(BlockId(block_id));
-                    }
-
-                    if alloc_failed {
-                        // Recycle whatever blocks this sequence had -- it cannot
-                        // proceed without its full allocation.
-                        if let Some(blocks) = self.seq_block_tables.remove(&seq.seq_id) {
-                            for b in blocks {
-                                self.free_blocks.push(b.0);
-                            }
+                            self.scheduler
+                                .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                            self.beam_block_manager.free(seq);
+                            aborted_seqs.insert(seq.seq_id);
+                            continue;
                         }
-                        // Mark finished so the scheduler drops it next round.
-                        self.scheduler.finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
-                        aborted_seqs.insert(seq.seq_id);
-                        continue;
-                    }
 
-                    block_tables.insert(seq.seq_id, existing.clone());
+                        let table = match self.beam_block_manager.get_block_table(seq.seq_id) {
+                            Some(table) => table.iter().map(|block| block.block_id).collect(),
+                            None => {
+                                self.scheduler
+                                    .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                                self.beam_block_manager.free(seq);
+                                aborted_seqs.insert(seq.seq_id);
+                                continue;
+                            }
+                        };
+                        block_tables.insert(seq.seq_id, table);
+                    } else {
+                        let total_tokens = seq.prompt_token_ids.len() + seq.output_token_ids.len();
+                        // +1 headroom: pre-allocate for the token about to be generated this step
+                        let needed_blocks = (total_tokens + 1 + block_size - 1) / block_size;
+
+                        // Reuse existing blocks, append new ones if needed
+                        let existing = self.seq_block_tables.entry(seq.seq_id).or_default();
+                        let mut alloc_failed = false;
+                        while existing.len() < needed_blocks {
+                            let block_id = if let Some(block_id) = self.gpu_block_pool.allocate() {
+                                block_id.0
+                            } else {
+                                warn!(
+                                    seq_id = seq.seq_id.0,
+                                    needed = needed_blocks,
+                                    have = existing.len(),
+                                    num_gpu_blocks = self.num_gpu_blocks,
+                                    free_blocks = self.gpu_block_pool.free_blocks(),
+                                    "block allocation failed: no free GPU KV-cache blocks, aborting sequence"
+                                );
+                                alloc_failed = true;
+                                break;
+                            };
+                            existing.push(BlockId(block_id));
+                        }
+
+                        if alloc_failed {
+                            // Recycle whatever blocks this sequence had -- it cannot
+                            // proceed without its full allocation.
+                            if let Some(blocks) = self.seq_block_tables.remove(&seq.seq_id) {
+                                for b in blocks {
+                                    self.gpu_block_pool.free(b);
+                                }
+                            }
+                            // Mark finished so the scheduler drops it next round.
+                            self.scheduler
+                                .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                            aborted_seqs.insert(seq.seq_id);
+                            continue;
+                        }
+
+                        block_tables.insert(seq.seq_id, existing.clone());
+                    }
 
                     seq_data.insert(
                         seq.seq_id,
@@ -1064,11 +1388,20 @@ mod inner {
 
                 // Only emit metadata if the group still has live sequences.
                 if !seq_data.is_empty() {
+                    let mut sampling_params = group.sampling_params.clone();
+                    if sampling_params.use_beam_search {
+                        sampling_params.logprobs = Some(
+                            sampling_params
+                                .logprobs
+                                .unwrap_or(0)
+                                .max(sampling_params.best_of),
+                        );
+                    }
                     metadata.push(SequenceGroupMetadata {
                         request_id: group.request_id,
                         is_prompt,
                         seq_data,
-                        sampling_params: group.sampling_params.clone(),
+                        sampling_params,
                         block_tables,
                     });
                 }
