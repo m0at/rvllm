@@ -7,6 +7,20 @@
 //! Only decode steps are graphed -- prefill varies in sequence length and cannot
 //! be captured into a fixed graph. Input tensors are padded to the nearest
 //! cached batch size so the same graph can serve multiple actual batch sizes.
+//!
+//! ## Capture/Replay Protocol
+//!
+//! On capture, the padded ModelInput is stored persistently so that the host
+//! buffers referenced by CUDA graph memcpy nodes remain valid. On replay:
+//!
+//! 1. The persistent input buffers are updated in-place (same heap addresses).
+//! 2. The CUDA graph is replayed -- memcpy nodes re-read from the persistent
+//!    host buffers, picking up the new token/position/metadata values.
+//! 3. The cached logits from the last forward are returned (the graph replays
+//!    the full pipeline including the DtoH copy into a persistent output).
+//!
+//! For the mock (non `cuda-graphs`) build, capture/replay are no-ops so the
+//! normal forward path runs unconditionally and the output is cached.
 
 use std::collections::HashMap;
 
@@ -42,6 +56,85 @@ impl Default for GraphRunnerConfig {
     }
 }
 
+/// Persistent input buffers for a captured CUDA graph.
+///
+/// These are heap-allocated Vecs whose backing storage addresses are baked into
+/// the CUDA graph's memcpy nodes during capture. On replay, we mutate the
+/// contents in-place (same capacity, same pointer) so the graph reads fresh
+/// data from the same host addresses.
+struct GraphInputBuffers {
+    /// Padded ModelInput whose Vec fields are at stable heap addresses.
+    input: ModelInput,
+    /// The padded batch size this was captured for.
+    padded_batch_size: usize,
+}
+
+impl GraphInputBuffers {
+    fn new(padded_input: ModelInput, padded_bs: usize) -> Self {
+        Self {
+            input: padded_input,
+            padded_batch_size: padded_bs,
+        }
+    }
+
+    /// Update the persistent buffers with new decode data, keeping Vec
+    /// allocations (and therefore heap pointers) stable.
+    ///
+    /// `actual` is the real batch size; entries beyond `actual` keep their
+    /// padding values (zeros).
+    fn update_in_place(&mut self, new_input: &ModelInput, actual: usize) {
+        let padded = self.padded_batch_size;
+        debug_assert!(actual <= padded);
+
+        // Copy real token data into the persistent buffer
+        self.input.token_ids[..actual].copy_from_slice(&new_input.token_ids[..actual]);
+        self.input.position_ids[..actual].copy_from_slice(&new_input.position_ids[..actual]);
+        self.input.attention_metadata.slot_mapping[..actual]
+            .copy_from_slice(&new_input.attention_metadata.slot_mapping[..actual]);
+        self.input.attention_metadata.context_lens[..actual]
+            .copy_from_slice(&new_input.attention_metadata.context_lens[..actual]);
+
+        // query_lens are always 1 for decode, already set
+        // block_tables: copy row by row
+        for i in 0..actual {
+            let src = &new_input.attention_metadata.block_tables[i];
+            let dst = &mut self.input.attention_metadata.block_tables[i];
+            let copy_len = src.len().min(dst.len());
+            dst[..copy_len].copy_from_slice(&src[..copy_len]);
+            // Extend dst if src is longer
+            if src.len() > dst.len() {
+                dst.extend_from_slice(&src[dst.len()..]);
+            }
+        }
+
+        // Update max_context_len
+        self.input.attention_metadata.max_context_len = self
+            .input
+            .attention_metadata
+            .context_lens
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+
+        // Zero padding entries (keep them as benign values)
+        for i in actual..padded {
+            self.input.token_ids[i] = 0;
+            self.input.position_ids[i] = 0;
+            self.input.attention_metadata.slot_mapping[i] = 0;
+            self.input.attention_metadata.context_lens[i] = 1;
+        }
+
+        trace!(actual, padded, "graph input buffers updated in-place");
+    }
+}
+
+/// Cached output from the last forward pass through a captured graph.
+struct GraphOutputCache {
+    /// The logits from the last forward (padded batch size * vocab_size).
+    logits: Vec<f32>,
+}
+
 /// Manages CUDA graph capture and replay for decode steps.
 ///
 /// Sits between the scheduler and the actual model forward pass. For decode
@@ -53,6 +146,11 @@ pub struct GraphRunner {
     config: GraphRunnerConfig,
     /// Tracks which batch sizes have been captured.
     captured: HashMap<usize, bool>,
+    /// Persistent input buffers per padded batch size, kept at stable heap
+    /// addresses so CUDA graph memcpy nodes can re-read from them on replay.
+    input_buffers: HashMap<usize, GraphInputBuffers>,
+    /// Cached logits output per padded batch size from the last forward/replay.
+    output_cache: HashMap<usize, GraphOutputCache>,
 }
 
 impl GraphRunner {
@@ -68,6 +166,8 @@ impl GraphRunner {
             pool,
             config,
             captured: HashMap::new(),
+            input_buffers: HashMap::new(),
+            output_cache: HashMap::new(),
         }
     }
 
@@ -191,10 +291,66 @@ impl GraphRunner {
             .unwrap_or(false)
     }
 
+    /// Store a padded ModelInput as the persistent input buffer for a batch
+    /// size. Must be called before `capture_decode_graph` so the buffer is
+    /// allocated at a stable heap address before capture begins.
+    pub fn store_input_buffer(&mut self, padded_input: ModelInput, padded_bs: usize) {
+        debug!(padded_bs, "storing persistent graph input buffer");
+        self.input_buffers
+            .insert(padded_bs, GraphInputBuffers::new(padded_input, padded_bs));
+    }
+
+    /// Get a reference to the persistent input for a padded batch size.
+    pub fn get_input_buffer(&self, padded_bs: usize) -> Option<&ModelInput> {
+        self.input_buffers.get(&padded_bs).map(|b| &b.input)
+    }
+
+    /// Update the persistent input buffer in-place for graph replay.
+    /// The Vec backing stores keep their heap addresses so CUDA graph memcpy
+    /// nodes read fresh data from the same pointers on replay.
+    pub fn update_input_buffer(
+        &mut self,
+        padded_bs: usize,
+        new_input: &ModelInput,
+        actual_batch: usize,
+    ) -> Result<()> {
+        let buf = self.input_buffers.get_mut(&padded_bs).ok_or_else(|| {
+            LLMError::GpuError(format!(
+                "no persistent input buffer for padded_bs={}",
+                padded_bs
+            ))
+        })?;
+        buf.update_in_place(new_input, actual_batch);
+        Ok(())
+    }
+
+    /// Cache the logits output from a forward pass for a padded batch size.
+    pub fn cache_output(&mut self, padded_bs: usize, logits: Vec<f32>) {
+        trace!(
+            padded_bs,
+            logits_len = logits.len(),
+            "caching graph output"
+        );
+        self.output_cache.insert(
+            padded_bs,
+            GraphOutputCache { logits },
+        );
+    }
+
+    /// Retrieve cached logits for a padded batch size, unpadded to actual_batch.
+    pub fn get_cached_output(&self, padded_bs: usize, actual_batch: usize) -> Option<Vec<f32>> {
+        self.output_cache.get(&padded_bs).map(|cache| {
+            self.unpad_logits(&cache.logits, actual_batch)
+        })
+    }
+
     /// Capture a graph by running a forward pass on `stream`, then store it.
     ///
     /// `forward_fn` should execute the full decode forward pass for the given
     /// padded input. All kernel launches during `forward_fn` are captured.
+    /// The forward_fn must use the persistent input buffers (from
+    /// `get_input_buffer`) so that CUDA graph memcpy nodes reference stable
+    /// host addresses.
     pub fn capture_graph<F>(
         &mut self,
         stream: &GpuStream,
@@ -229,6 +385,55 @@ impl GraphRunner {
         Ok(())
     }
 
+    /// Capture a CUDA graph for decode, returning the logits from the capture
+    /// forward pass. This variant stores the output in the cache.
+    ///
+    /// `forward_fn` must return the full logits Vec from the forward pass.
+    pub fn capture_decode_graph<F>(
+        &mut self,
+        stream: &GpuStream,
+        padded_batch_size: usize,
+        forward_fn: F,
+    ) -> Result<Vec<f32>>
+    where
+        F: Fn() -> Result<Vec<f32>>,
+    {
+        if self.was_capture_attempted(padded_batch_size) {
+            trace!(
+                padded_batch_size,
+                "graph capture already attempted, skipping"
+            );
+            // Return cached output if available
+            if let Some(cache) = self.output_cache.get(&padded_batch_size) {
+                return Ok(cache.logits.clone());
+            }
+            return Err(LLMError::GpuError(
+                "capture attempted but no cached output".into(),
+            ));
+        }
+
+        info!(padded_batch_size, "capturing CUDA graph for decode");
+
+        // Warm up: run forward once without capture to JIT-compile kernels.
+        let warmup_logits = forward_fn()?;
+        stream.synchronize()?;
+
+        // Capture: run forward again under stream capture.
+        self.pool.begin_capture(stream)?;
+        let capture_logits = forward_fn()?;
+        let graph = self.pool.end_capture(stream, padded_batch_size)?;
+        self.pool.insert(graph);
+        self.mark_captured(padded_batch_size);
+
+        // Cache the output from the capture run.
+        self.cache_output(padded_batch_size, capture_logits.clone());
+
+        info!(padded_batch_size, "CUDA graph captured successfully");
+        // Return the warmup logits (capture logits may have stale data from
+        // the graph instantiation, warmup is the real result).
+        Ok(warmup_logits)
+    }
+
     /// Replay a cached graph for the given decode step.
     ///
     /// Returns `true` if a graph was replayed, `false` if the caller should
@@ -245,6 +450,71 @@ impl GraphRunner {
                 Ok(true)
             }
             None => Ok(false),
+        }
+    }
+
+    /// Full replay cycle: update persistent inputs, replay the graph, return
+    /// unpadded logits from the output cache.
+    ///
+    /// Returns `Some(logits)` if replay succeeded with cached output available,
+    /// `None` if the caller should fall back to the normal forward path.
+    ///
+    /// On mock/no-op builds where the pool does not do real capture, the output
+    /// cache will be empty (no logits cached) so this returns `None` and the
+    /// caller runs the real forward. On real `cuda-graphs` builds, the output
+    /// cache is populated during capture and refreshed on replay.
+    pub fn try_replay_decode(
+        &mut self,
+        stream: &GpuStream,
+        model_input: &ModelInput,
+        actual_batch: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let padded_bs = match padded_batch_size(actual_batch) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Must have both a captured graph and cached output to replay.
+        if !self.pool.has_graph(padded_bs) {
+            return Ok(None);
+        }
+        if !self.output_cache.contains_key(&padded_bs) {
+            // Graph exists but no output cache -- mock build or capture that
+            // didn't produce cacheable output. Fall through to real forward.
+            return Ok(None);
+        }
+
+        // Update persistent input buffers so the graph's memcpy nodes
+        // pick up fresh data from the same host addresses on replay.
+        if self.input_buffers.contains_key(&padded_bs) {
+            self.update_input_buffer(padded_bs, model_input, actual_batch)?;
+        }
+
+        // Replay the CUDA graph (re-executes all captured kernels).
+        let replayed = self.try_replay(stream, actual_batch)?;
+        if !replayed {
+            return Ok(None);
+        }
+
+        // Synchronize to ensure the replayed graph (including any DtoH of
+        // logits) has completed before reading the output.
+        stream.synchronize()?;
+
+        // Return the cached output unpadded to actual batch size.
+        match self.get_cached_output(padded_bs, actual_batch) {
+            Some(logits) => {
+                debug!(
+                    actual_batch,
+                    padded_bs,
+                    logits_len = logits.len(),
+                    "graph replay complete, returning logits"
+                );
+                Ok(Some(logits))
+            }
+            None => {
+                warn!(padded_bs, "graph replayed but output cache miss");
+                Ok(None)
+            }
         }
     }
 
@@ -265,10 +535,17 @@ impl GraphRunner {
         self.config.enabled
     }
 
+    /// Access the configuration.
+    pub fn config(&self) -> &GraphRunnerConfig {
+        &self.config
+    }
+
     /// Clear all cached graphs (e.g., after model reload).
     pub fn clear(&mut self) {
         self.pool.clear();
         self.captured.clear();
+        self.input_buffers.clear();
+        self.output_cache.clear();
     }
 }
 
@@ -472,5 +749,147 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.vocab_size, 32000);
         assert_eq!(cfg.hidden_size, 4096);
+    }
+
+    #[test]
+    fn store_and_retrieve_input_buffer() {
+        let mut runner = GraphRunner::new(GraphRunnerConfig::default());
+        let input = make_decode_input(4);
+
+        runner.store_input_buffer(input.clone(), 4);
+
+        let stored = runner.get_input_buffer(4).unwrap();
+        assert_eq!(stored.token_ids, input.token_ids);
+        assert_eq!(stored.position_ids, input.position_ids);
+
+        assert!(runner.get_input_buffer(8).is_none());
+    }
+
+    #[test]
+    fn update_input_buffer_in_place() {
+        let mut runner = GraphRunner::new(GraphRunnerConfig::default());
+        let input = make_decode_input(4);
+        runner.store_input_buffer(input, 4);
+
+        // Create new input with different values
+        let mut new_input = make_decode_input(3);
+        new_input.token_ids = vec![99, 100, 101];
+        new_input.position_ids = vec![20, 21, 22];
+
+        runner.update_input_buffer(4, &new_input, 3).unwrap();
+
+        let stored = runner.get_input_buffer(4).unwrap();
+        // First 3 entries updated
+        assert_eq!(stored.token_ids[0], 99);
+        assert_eq!(stored.token_ids[1], 100);
+        assert_eq!(stored.token_ids[2], 101);
+        // Fourth entry is padding (zero)
+        assert_eq!(stored.token_ids[3], 0);
+        assert_eq!(stored.position_ids[0], 20);
+        assert_eq!(stored.position_ids[3], 0);
+    }
+
+    #[test]
+    fn cache_and_retrieve_output() {
+        let mut runner = GraphRunner::new(GraphRunnerConfig {
+            vocab_size: 4,
+            ..Default::default()
+        });
+
+        let logits: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        runner.cache_output(4, logits.clone());
+
+        // Retrieve unpadded for actual_batch=3
+        let unpadded = runner.get_cached_output(4, 3).unwrap();
+        assert_eq!(unpadded.len(), 12); // 3 * vocab_size(4)
+        assert_eq!(unpadded, &logits[..12]);
+
+        // Retrieve full for actual_batch=4
+        let full = runner.get_cached_output(4, 4).unwrap();
+        assert_eq!(full.len(), 16);
+
+        // Non-existent batch size
+        assert!(runner.get_cached_output(8, 3).is_none());
+    }
+
+    #[test]
+    fn capture_decode_graph_caches_output() {
+        let stream = GpuStream::new(0).unwrap();
+        let mut runner = GraphRunner::new(GraphRunnerConfig {
+            vocab_size: 4,
+            ..Default::default()
+        });
+
+        let logits: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let logits_clone = logits.clone();
+
+        let result = runner
+            .capture_decode_graph(&stream, 4, || Ok(logits_clone.clone()))
+            .unwrap();
+
+        // Returns warmup logits
+        assert_eq!(result.len(), 16);
+
+        // Output is cached
+        assert!(runner.get_cached_output(4, 4).is_some());
+        assert!(runner.was_capture_attempted(4));
+        assert!(runner.has_graph_for(4));
+    }
+
+    #[test]
+    fn try_replay_decode_no_graph_returns_none() {
+        let stream = GpuStream::new(0).unwrap();
+        let mut runner = GraphRunner::new(GraphRunnerConfig::default());
+        let input = make_decode_input(4);
+
+        let result = runner.try_replay_decode(&stream, &input, 4).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_replay_decode_no_output_cache_returns_none() {
+        let stream = GpuStream::new(0).unwrap();
+        let mut runner = GraphRunner::new(GraphRunnerConfig::default());
+
+        // Capture with old API (no output caching)
+        runner.capture_graph(&stream, 4, || Ok(())).unwrap();
+        assert!(runner.has_graph_for(4));
+
+        let input = make_decode_input(4);
+        let result = runner.try_replay_decode(&stream, &input, 4).unwrap();
+        // No cached output, so returns None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn clear_removes_input_and_output_caches() {
+        let stream = GpuStream::new(0).unwrap();
+        let mut runner = GraphRunner::new(GraphRunnerConfig {
+            vocab_size: 4,
+            ..Default::default()
+        });
+
+        let input = make_decode_input(4);
+        runner.store_input_buffer(input, 4);
+        runner.cache_output(4, vec![0.0; 16]);
+        runner.capture_graph(&stream, 4, || Ok(())).unwrap();
+
+        runner.clear();
+
+        assert!(runner.get_input_buffer(4).is_none());
+        assert!(runner.get_cached_output(4, 4).is_none());
+        assert!(!runner.has_graph_for(4));
+        assert!(!runner.was_capture_attempted(4));
+    }
+
+    #[test]
+    fn config_accessor() {
+        let runner = GraphRunner::new(GraphRunnerConfig {
+            vocab_size: 128,
+            hidden_size: 256,
+            ..Default::default()
+        });
+        assert_eq!(runner.config().vocab_size, 128);
+        assert_eq!(runner.config().hidden_size, 256);
     }
 }

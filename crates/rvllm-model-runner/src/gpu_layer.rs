@@ -18,13 +18,66 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaSlice, CudaStream, DeviceSlice, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DeviceSlice, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{info, trace};
 
     use rvllm_core::error::{LLMError, Result};
     use rvllm_gpu::cublas::CublasHandle;
     use rvllm_gpu::kernel_loader::KernelLoader;
+
+    // ===================================================================
+    // CUDA event profiling (RVLLM_PROFILE=1)
+    // ===================================================================
+
+    /// Per-layer timing breakdown in milliseconds.
+    #[derive(Debug, Clone, Default)]
+    pub struct LayerProfileMs {
+        pub norm: f32,
+        pub qkv: f32,
+        pub attn: f32,
+        pub o_proj: f32,
+        pub norm2: f32,
+        pub mlp: f32,
+    }
+
+    /// Per-layer CUDA event pairs collected during a profiled forward pass.
+    pub struct LayerProfileEvents {
+        pub norm: (CudaEvent, CudaEvent),
+        pub qkv: (CudaEvent, CudaEvent),
+        pub attn: (CudaEvent, CudaEvent),
+        pub o_proj: (CudaEvent, CudaEvent),
+        pub norm2: (CudaEvent, CudaEvent),
+        pub mlp: (CudaEvent, CudaEvent),
+    }
+
+    impl LayerProfileEvents {
+        pub fn elapsed_ms(&self) -> Result<LayerProfileMs> {
+            let ms = |pair: &(CudaEvent, CudaEvent)| -> Result<f32> {
+                pair.0
+                    .elapsed_ms(&pair.1)
+                    .map_err(|e| LLMError::GpuError(format!("event elapsed: {e}")))
+            };
+            Ok(LayerProfileMs {
+                norm: ms(&self.norm)?,
+                qkv: ms(&self.qkv)?,
+                attn: ms(&self.attn)?,
+                o_proj: ms(&self.o_proj)?,
+                norm2: ms(&self.norm2)?,
+                mlp: ms(&self.mlp)?,
+            })
+        }
+    }
+
+    /// Record a timing-enabled CUDA event on the given stream.
+    pub fn record_event(device: &Arc<CudaContext>, stream: &CudaStream) -> Result<CudaEvent> {
+        let ev = device
+            .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(|e| LLMError::GpuError(format!("event create: {e}")))?;
+        ev.record(stream)
+            .map_err(|e| LLMError::GpuError(format!("event record: {e}")))?;
+        Ok(ev)
+    }
 
     /// Configuration for a single transformer layer.
     #[derive(Debug, Clone)]
@@ -533,6 +586,221 @@ mod inner {
             let output = Self::add_tensors(&self.stream, &self.loader, &residual, &mlp_out, num_tokens * hidden)?;
 
             Ok(output)
+        }
+
+        /// Profiled f32 forward: identical to `forward` but records CUDA events
+        /// around each phase. Returns (hidden_states, LayerProfileEvents).
+        pub fn forward_profiled(
+            &self,
+            input: &GpuLayerInput<'_>,
+            weights: &GpuLayerWeights<'_>,
+            blas: &CublasHandle,
+            device: &Arc<CudaContext>,
+        ) -> Result<(CudaSlice<f32>, LayerProfileEvents)> {
+            let cfg = &self.config;
+            let num_tokens = input.num_tokens;
+            let hidden = cfg.hidden_size;
+            let num_heads = cfg.num_heads;
+            let num_kv_heads = cfg.num_kv_heads;
+            let head_dim = cfg.head_dim;
+            let intermediate = cfg.intermediate_size;
+            let q_dim = num_heads * head_dim;
+            let kv_dim = num_kv_heads * head_dim;
+
+            // 1. Pre-attention RMSNorm
+            let ev_norm_start = record_event(device, &self.stream)?;
+            let normed = Self::rms_norm(
+                &self.stream, &self.loader, input.hidden_states,
+                weights.input_layernorm, cfg.rms_norm_eps, num_tokens, hidden,
+            )?;
+            let ev_norm_end = record_event(device, &self.stream)?;
+
+            // 2. QKV projections + biases + RoPE
+            let ev_qkv_start = record_event(device, &self.stream)?;
+            let mut q = Self::linear(&self.stream, blas, &normed, weights.q_proj, num_tokens, q_dim, hidden)?;
+            let mut k = Self::linear(&self.stream, blas, &normed, weights.k_proj, num_tokens, kv_dim, hidden)?;
+            let mut v = Self::linear(&self.stream, blas, &normed, weights.v_proj, num_tokens, kv_dim, hidden)?;
+            if let Some(bias) = weights.q_proj_bias {
+                Self::add_bias(&self.stream, &self.loader, &mut q, bias, num_tokens, q_dim)?;
+            }
+            if let Some(bias) = weights.k_proj_bias {
+                Self::add_bias(&self.stream, &self.loader, &mut k, bias, num_tokens, kv_dim)?;
+            }
+            if let Some(bias) = weights.v_proj_bias {
+                Self::add_bias(&self.stream, &self.loader, &mut v, bias, num_tokens, kv_dim)?;
+            }
+            let (q_rot, k_rot) = Self::apply_rotary_embedding(
+                &self.stream, &self.loader, &q, &k, input.positions,
+                input.rope_cos, input.rope_sin, num_tokens, num_heads, num_kv_heads, head_dim,
+            )?;
+            let ev_qkv_end = record_event(device, &self.stream)?;
+
+            // 3. Attention (cache write + prefill/decode)
+            let ev_attn_start = record_event(device, &self.stream)?;
+            Self::cache_write(
+                &self.stream, &self.loader, &k_rot, &v,
+                input.key_cache, input.value_cache, input.slot_mapping,
+                num_tokens, num_kv_heads, head_dim,
+            )?;
+            let attn_out = if input.is_prefill {
+                Self::prefill_attention(
+                    &self.stream, &self.loader, &q_rot,
+                    input.key_cache, input.value_cache, input.block_tables,
+                    input.context_lens, input.seq_start_pos,
+                    num_tokens, input.num_seqs, num_heads, num_kv_heads, head_dim,
+                    input.max_context_len, input.block_size,
+                )?
+            } else {
+                Self::decode_attention(
+                    &self.stream, &self.loader, &q_rot,
+                    input.key_cache, input.value_cache, input.block_tables,
+                    input.context_lens, num_tokens, input.num_seqs,
+                    num_heads, num_kv_heads, head_dim, input.max_context_len, input.block_size,
+                )?
+            };
+            let ev_attn_end = record_event(device, &self.stream)?;
+
+            // 4. Output projection + residual
+            let ev_oproj_start = record_event(device, &self.stream)?;
+            let attn_proj = Self::linear(&self.stream, blas, &attn_out, weights.o_proj, num_tokens, hidden, q_dim)?;
+            let residual = Self::add_tensors(&self.stream, &self.loader, input.hidden_states, &attn_proj, num_tokens * hidden)?;
+            let ev_oproj_end = record_event(device, &self.stream)?;
+
+            // 5. Post-attention RMSNorm
+            let ev_norm2_start = record_event(device, &self.stream)?;
+            let normed2 = Self::rms_norm(
+                &self.stream, &self.loader, &residual,
+                weights.post_attention_layernorm, cfg.rms_norm_eps, num_tokens, hidden,
+            )?;
+            let ev_norm2_end = record_event(device, &self.stream)?;
+
+            // 6. MLP
+            let ev_mlp_start = record_event(device, &self.stream)?;
+            let gate = Self::linear(&self.stream, blas, &normed2, weights.gate_proj, num_tokens, intermediate, hidden)?;
+            let up = Self::linear(&self.stream, blas, &normed2, weights.up_proj, num_tokens, intermediate, hidden)?;
+            let fused = Self::fused_silu_mul(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
+            let mlp_out = Self::linear(&self.stream, blas, &fused, weights.down_proj, num_tokens, hidden, intermediate)?;
+            let output = Self::add_tensors(&self.stream, &self.loader, &residual, &mlp_out, num_tokens * hidden)?;
+            let ev_mlp_end = record_event(device, &self.stream)?;
+
+            let events = LayerProfileEvents {
+                norm: (ev_norm_start, ev_norm_end),
+                qkv: (ev_qkv_start, ev_qkv_end),
+                attn: (ev_attn_start, ev_attn_end),
+                o_proj: (ev_oproj_start, ev_oproj_end),
+                norm2: (ev_norm2_start, ev_norm2_end),
+                mlp: (ev_mlp_start, ev_mlp_end),
+            };
+
+            Ok((output, events))
+        }
+
+        /// Profiled f16 forward: identical to `forward_f16` but records CUDA events.
+        pub fn forward_f16_profiled(
+            &self,
+            input: &GpuLayerInput<'_>,
+            weights: &GpuLayerWeightsF16<'_>,
+            blas: &CublasHandle,
+            device: &Arc<CudaContext>,
+        ) -> Result<(CudaSlice<f32>, LayerProfileEvents)> {
+            use crate::layers::linear_cuda::CudaLinearLayer;
+
+            let cfg = &self.config;
+            let num_tokens = input.num_tokens;
+            let hidden = cfg.hidden_size;
+            let num_heads = cfg.num_heads;
+            let num_kv_heads = cfg.num_kv_heads;
+            let head_dim = cfg.head_dim;
+            let intermediate = cfg.intermediate_size;
+            let q_dim = num_heads * head_dim;
+            let kv_dim = num_kv_heads * head_dim;
+
+            // 1. Pre-attention RMSNorm
+            let ev_norm_start = record_event(device, &self.stream)?;
+            let normed = Self::rms_norm(
+                &self.stream, &self.loader, input.hidden_states,
+                weights.input_layernorm, cfg.rms_norm_eps, num_tokens, hidden,
+            )?;
+            let ev_norm_end = record_event(device, &self.stream)?;
+
+            // 2. QKV projections + biases + RoPE (f16 weights)
+            let ev_qkv_start = record_event(device, &self.stream)?;
+            let mut q = CudaLinearLayer::forward_once_f16(&normed, weights.q_proj, num_tokens, q_dim, hidden, blas, &self.loader)?;
+            let mut k = CudaLinearLayer::forward_once_f16(&normed, weights.k_proj, num_tokens, kv_dim, hidden, blas, &self.loader)?;
+            let mut v = CudaLinearLayer::forward_once_f16(&normed, weights.v_proj, num_tokens, kv_dim, hidden, blas, &self.loader)?;
+            if let Some(bias) = weights.q_proj_bias {
+                Self::add_bias(&self.stream, &self.loader, &mut q, bias, num_tokens, q_dim)?;
+            }
+            if let Some(bias) = weights.k_proj_bias {
+                Self::add_bias(&self.stream, &self.loader, &mut k, bias, num_tokens, kv_dim)?;
+            }
+            if let Some(bias) = weights.v_proj_bias {
+                Self::add_bias(&self.stream, &self.loader, &mut v, bias, num_tokens, kv_dim)?;
+            }
+            let (q_rot, k_rot) = Self::apply_rotary_embedding(
+                &self.stream, &self.loader, &q, &k, input.positions,
+                input.rope_cos, input.rope_sin, num_tokens, num_heads, num_kv_heads, head_dim,
+            )?;
+            let ev_qkv_end = record_event(device, &self.stream)?;
+
+            // 3. Attention
+            let ev_attn_start = record_event(device, &self.stream)?;
+            Self::cache_write(
+                &self.stream, &self.loader, &k_rot, &v,
+                input.key_cache, input.value_cache, input.slot_mapping,
+                num_tokens, num_kv_heads, head_dim,
+            )?;
+            let attn_out = if input.is_prefill {
+                Self::prefill_attention(
+                    &self.stream, &self.loader, &q_rot,
+                    input.key_cache, input.value_cache, input.block_tables,
+                    input.context_lens, input.seq_start_pos,
+                    num_tokens, input.num_seqs, num_heads, num_kv_heads, head_dim,
+                    input.max_context_len, input.block_size,
+                )?
+            } else {
+                Self::decode_attention(
+                    &self.stream, &self.loader, &q_rot,
+                    input.key_cache, input.value_cache, input.block_tables,
+                    input.context_lens, num_tokens, input.num_seqs,
+                    num_heads, num_kv_heads, head_dim, input.max_context_len, input.block_size,
+                )?
+            };
+            let ev_attn_end = record_event(device, &self.stream)?;
+
+            // 4. Output projection + residual (f16 weight)
+            let ev_oproj_start = record_event(device, &self.stream)?;
+            let attn_proj = CudaLinearLayer::forward_once_f16(&attn_out, weights.o_proj, num_tokens, hidden, q_dim, blas, &self.loader)?;
+            let residual = Self::add_tensors(&self.stream, &self.loader, input.hidden_states, &attn_proj, num_tokens * hidden)?;
+            let ev_oproj_end = record_event(device, &self.stream)?;
+
+            // 5. Post-attention RMSNorm
+            let ev_norm2_start = record_event(device, &self.stream)?;
+            let normed2 = Self::rms_norm(
+                &self.stream, &self.loader, &residual,
+                weights.post_attention_layernorm, cfg.rms_norm_eps, num_tokens, hidden,
+            )?;
+            let ev_norm2_end = record_event(device, &self.stream)?;
+
+            // 6. MLP (f16 weights)
+            let ev_mlp_start = record_event(device, &self.stream)?;
+            let gate = CudaLinearLayer::forward_once_f16(&normed2, weights.gate_proj, num_tokens, intermediate, hidden, blas, &self.loader)?;
+            let up = CudaLinearLayer::forward_once_f16(&normed2, weights.up_proj, num_tokens, intermediate, hidden, blas, &self.loader)?;
+            let fused = Self::fused_silu_mul(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
+            let mlp_out = CudaLinearLayer::forward_once_f16(&fused, weights.down_proj, num_tokens, hidden, intermediate, blas, &self.loader)?;
+            let output = Self::add_tensors(&self.stream, &self.loader, &residual, &mlp_out, num_tokens * hidden)?;
+            let ev_mlp_end = record_event(device, &self.stream)?;
+
+            let events = LayerProfileEvents {
+                norm: (ev_norm_start, ev_norm_end),
+                qkv: (ev_qkv_start, ev_qkv_end),
+                attn: (ev_attn_start, ev_attn_end),
+                o_proj: (ev_oproj_start, ev_oproj_end),
+                norm2: (ev_norm2_start, ev_norm2_end),
+                mlp: (ev_mlp_start, ev_mlp_end),
+            };
+
+            Ok((output, events))
         }
 
         // ===================================================================

@@ -22,7 +22,7 @@ mod inner {
     };
     use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus};
     use rvllm_tokenizer::Tokenizer;
-    use rvllm_worker::gpu_worker::GpuWorker;
+    use rvllm_worker::gpu_worker::{GpuWorker, GpuWorkerOutput};
 
     use crate::hf_snapshot;
     use crate::output::{OutputProcessor, SequenceOutputState};
@@ -498,29 +498,12 @@ mod inner {
         pub fn step(&mut self) -> Result<Vec<RequestOutput>> {
             debug!("GpuLLMEngine: step begin");
 
-            // Tell the scheduler how many blocks are available so it can gate
-            // admission of new sequences from the waiting queue.
-            let free_count = self.free_blocks.len()
-                + (self.num_gpu_blocks.saturating_sub(self.next_block_id)) as usize;
-            // Watermark: keep 4% of total blocks free so running sequences can
-            // grow into new blocks during decode without hitting OOM.
-            let watermark = (self.num_gpu_blocks as usize / 25).max(1);
-            self.scheduler.set_block_budget(free_count, watermark);
+            let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
+                Some(v) => v,
+                None => return Ok(Vec::new()),
+            };
 
-            let (scheduled_groups, num_tokens) = self.scheduler.schedule();
-            debug!(
-                num_groups = scheduled_groups.len(),
-                num_tokens, "scheduler output"
-            );
-
-            if scheduled_groups.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            let (metadata, aborted_seqs) = self.build_metadata(&scheduled_groups);
-
-            // Propagate block-allocation aborts to request output states so
-            // finished-request cleanup picks them up.
+            // Propagate block-allocation aborts to request output states.
             if !aborted_seqs.is_empty() {
                 for group in &scheduled_groups {
                     for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
@@ -529,31 +512,6 @@ mod inner {
                                 if let Some(state) = req.seq_states.get_mut(seq_idx) {
                                     state.finish_reason = Some(FinishReason::Abort);
                                 }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if metadata.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            // Prefix caching: before prefill, check for matching prefix blocks
-            if let Some(ref mut pc) = self.prefix_cache {
-                for meta in &metadata {
-                    if meta.is_prompt {
-                        for (_seq_id, seq_data) in &meta.seq_data {
-                            let hits = pc.count_hits(&seq_data.prompt_token_ids);
-                            if hits > 0 {
-                                let block_size = self.config.cache.block_size;
-                                let cached_tokens = hits * block_size;
-                                debug!(
-                                    hits,
-                                    cached_tokens,
-                                    prompt_len = seq_data.prompt_token_ids.len(),
-                                    "prefix cache hit: reusing cached KV blocks"
-                                );
                             }
                         }
                     }
@@ -573,7 +531,7 @@ mod inner {
                 "gpu_engine: worker.execute returned"
             );
 
-            // Prefix caching: after prefill, register new prefix blocks
+            // Prefix caching: after prefill, register new prefix blocks.
             if let Some(ref mut pc) = self.prefix_cache {
                 let block_size = self.config.cache.block_size;
                 for meta in &metadata {
@@ -600,6 +558,245 @@ mod inner {
                 }
             }
 
+            let results = self.process_worker_outputs(&scheduled_groups, &worker_outputs);
+            self.recycle_dead_blocks();
+
+            debug!(num_outputs = results.len(), "GpuLLMEngine: step complete");
+            Ok(results)
+        }
+
+        pub fn run(&mut self) -> Result<Vec<RequestOutput>> {
+            info!("GpuLLMEngine: run loop starting (pipelined async step)");
+            let mut all_outputs = Vec::new();
+
+            // -- Pipelined run loop --
+            // Overlap CPU scheduling/output-processing with GPU execution.
+            //
+            // Pipeline stages per iteration:
+            //   1. Process outputs from the PREVIOUS GPU step (CPU work)
+            //   2. Schedule + build metadata for the NEXT step (CPU work)
+            //   3. Submit metadata to GPU worker thread (non-blocking)
+            //   4. While GPU computes, loop back to (1) for the next iteration
+            //
+            // This ensures CPU and GPU are never both idle at the same time
+            // during the steady-state decode loop.
+
+            use std::sync::mpsc;
+
+            type MetaBuf = Vec<SequenceGroupMetadata>;
+            type GpuResult = std::result::Result<GpuWorkerOutput, String>;
+
+            // Channel from main -> GPU thread: send metadata to execute.
+            let (meta_tx, meta_rx) = mpsc::sync_channel::<MetaBuf>(1);
+            // Channel from GPU thread -> main: receive execution results.
+            let (result_tx, result_rx) = mpsc::sync_channel::<GpuResult>(1);
+
+            // The worker lives in self, but we need to lend &mut worker to the
+            // GPU thread for the duration of the run loop.  Use a raw pointer
+            // (safe because std::thread::scope guarantees the thread joins
+            // before the borrow ends, and only the GPU thread touches worker).
+            let worker_ptr = &mut self.worker as *mut GpuWorker;
+
+            std::thread::scope(|scope| -> Result<()> {
+                // Spawn dedicated GPU execution thread.
+                let gpu_thread = scope.spawn(move || {
+                    let worker = unsafe { &mut *worker_ptr };
+                    while let Ok(metadata) = meta_rx.recv() {
+                        let res = worker
+                            .execute(&metadata)
+                            .map_err(|e| format!("worker execute failed: {e}"));
+                        if result_tx.send(res).is_err() {
+                            break; // main thread dropped its receiver
+                        }
+                    }
+                });
+
+                // State for the pipelined loop:
+                // - pending_groups: the scheduled groups whose GPU results we are waiting for
+                // - pending_metadata: the metadata we sent (needed for prefix cache registration)
+                // - pending_aborted: aborted seq IDs from block allocation
+                let mut pending_groups: Option<Vec<SequenceGroup>> = None;
+                let mut pending_metadata: Option<Vec<SequenceGroupMetadata>> = None;
+                let mut pending_aborted: Option<std::collections::HashSet<SequenceId>> = None;
+
+                // -- Kick off the first step if there is work --
+                if self.has_unfinished_excluding_worker() {
+                    if let Some((groups, metadata, aborted)) = self.prepare_step() {
+                        if !metadata.is_empty() {
+                            let _ = meta_tx.send(metadata.clone());
+                            pending_groups = Some(groups);
+                            pending_metadata = Some(metadata);
+                            pending_aborted = Some(aborted);
+                        }
+                    }
+                }
+
+                loop {
+                    // If nothing is pending and nothing is unfinished, we're done.
+                    if pending_groups.is_none() && !self.has_unfinished_excluding_worker() {
+                        break;
+                    }
+
+                    // Wait for GPU results from the in-flight step.
+                    if let Some(groups) = pending_groups.take() {
+                        let metadata = pending_metadata.take().unwrap_or_default();
+                        let aborted = pending_aborted.take().unwrap_or_default();
+
+                        let gpu_result = result_rx
+                            .recv()
+                            .map_err(|_| LLMError::GpuError("GPU thread died".into()))?;
+                        let worker_outputs = gpu_result
+                            .map_err(|e| LLMError::GpuError(e))?;
+
+                        // Propagate block-allocation aborts.
+                        if !aborted.is_empty() {
+                            for group in &groups {
+                                for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
+                                    if aborted.contains(&seq.seq_id) {
+                                        if let Some(req) = self.requests.get_mut(&group.request_id) {
+                                            if let Some(state) = req.seq_states.get_mut(seq_idx) {
+                                                state.finish_reason = Some(FinishReason::Abort);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Prefix caching: register new prefix blocks after prefill.
+                        if let Some(ref mut pc) = self.prefix_cache {
+                            let block_size = self.config.cache.block_size;
+                            for meta in &metadata {
+                                if meta.is_prompt {
+                                    for (_seq_id, seq_data) in &meta.seq_data {
+                                        let num_full_blocks =
+                                            seq_data.prompt_token_ids.len() / block_size;
+                                        let block_ids: Vec<rvllm_core::prelude::BlockId> =
+                                            (0..num_full_blocks)
+                                                .map(|i| rvllm_core::prelude::BlockId(i as u32))
+                                                .collect();
+                                        let newly_cached = prefix_cache::register_prefix_blocks(
+                                            pc,
+                                            &seq_data.prompt_token_ids,
+                                            &block_ids,
+                                            block_size,
+                                        );
+                                        if !newly_cached.is_empty() {
+                                            debug!(
+                                                newly_cached = newly_cached.len(),
+                                                "registered prefix blocks in cache"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Build output map and process tokens.
+                        let step_results =
+                            self.process_worker_outputs(&groups, &worker_outputs);
+                        for output in step_results {
+                            if output.finished {
+                                all_outputs.push(output);
+                            }
+                        }
+
+                        // Recycle blocks from dead sequences.
+                        self.recycle_dead_blocks();
+                    }
+
+                    // Prepare and submit the next step to GPU.
+                    if self.has_unfinished_excluding_worker() {
+                        if let Some((groups, metadata, aborted)) = self.prepare_step() {
+                            if !metadata.is_empty() {
+                                let _ = meta_tx.send(metadata.clone());
+                                pending_groups = Some(groups);
+                                pending_metadata = Some(metadata);
+                                pending_aborted = Some(aborted);
+                                continue;
+                            }
+                        }
+                    }
+                    // No more work to submit.
+                    break;
+                }
+
+                // Signal GPU thread to exit by dropping the sender.
+                drop(meta_tx);
+                let _ = gpu_thread.join();
+                Ok(())
+            })?;
+
+            info!(
+                num_completed = all_outputs.len(),
+                "GpuLLMEngine: run loop finished (pipelined)"
+            );
+            Ok(all_outputs)
+        }
+
+        /// Prepare one step: schedule, build metadata, handle prefix cache lookups.
+        /// Returns None if there's nothing to schedule.
+        fn prepare_step(
+            &mut self,
+        ) -> Option<(
+            Vec<SequenceGroup>,
+            Vec<SequenceGroupMetadata>,
+            std::collections::HashSet<SequenceId>,
+        )> {
+            let free_count = self.free_blocks.len()
+                + (self.num_gpu_blocks.saturating_sub(self.next_block_id)) as usize;
+            let watermark = (self.num_gpu_blocks as usize / 25).max(1);
+            self.scheduler.set_block_budget(free_count, watermark);
+
+            let (scheduled_groups, num_tokens) = self.scheduler.schedule();
+            debug!(
+                num_groups = scheduled_groups.len(),
+                num_tokens, "pipelined scheduler output"
+            );
+            if scheduled_groups.is_empty() {
+                return None;
+            }
+
+            let (metadata, aborted_seqs) = self.build_metadata(&scheduled_groups);
+            if metadata.is_empty() {
+                return None;
+            }
+
+            // Prefix caching: check for matching prefix blocks before prefill.
+            if let Some(ref mut pc) = self.prefix_cache {
+                for meta in &metadata {
+                    if meta.is_prompt {
+                        for (_seq_id, seq_data) in &meta.seq_data {
+                            let hits = pc.count_hits(&seq_data.prompt_token_ids);
+                            if hits > 0 {
+                                let block_size = self.config.cache.block_size;
+                                let cached_tokens = hits * block_size;
+                                debug!(
+                                    hits,
+                                    cached_tokens,
+                                    prompt_len = seq_data.prompt_token_ids.len(),
+                                    "prefix cache hit: reusing cached KV blocks"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            info!(
+                num_groups = metadata.len(),
+                "pipelined: submitting to GPU thread"
+            );
+            Some((scheduled_groups, metadata, aborted_seqs))
+        }
+
+        /// Process worker outputs: update scheduler, build request outputs,
+        /// clean up finished requests.
+        fn process_worker_outputs(
+            &mut self,
+            scheduled_groups: &[SequenceGroup],
+            worker_outputs: &GpuWorkerOutput,
+        ) -> Vec<RequestOutput> {
             let mut output_map: HashMap<u64, (TokenId, LogProb, Vec<(TokenId, LogProb)>)> =
                 HashMap::new();
             for wo in &worker_outputs.outputs {
@@ -612,7 +809,7 @@ mod inner {
             let mut results = Vec::new();
             let eos = self.tokenizer.eos_token_id();
 
-            for group in &scheduled_groups {
+            for group in scheduled_groups {
                 let request_id = group.request_id;
                 let req = match self.requests.get_mut(&request_id) {
                     Some(r) => r,
@@ -629,8 +826,6 @@ mod inner {
 
                     if let Some((token_id, logprob, top_lps)) = output_map.get(&seq.seq_id.0) {
                         let decoded = self.tokenizer.decode(&[*token_id]).unwrap_or_default();
-
-                        // Update the scheduler's sequence with the new token
                         self.scheduler
                             .update_seq_token(seq.seq_id, *token_id, *logprob);
 
@@ -650,8 +845,6 @@ mod inner {
                                 &req.sampling_params,
                                 eos,
                             );
-                            // Sync finish status back to the scheduler so
-                            // schedule() purges the group and blocks get recycled.
                             if let Some(reason) = state.finish_reason {
                                 let status = match reason {
                                     FinishReason::Stop => SequenceStatus::FinishedStopped,
@@ -673,7 +866,7 @@ mod inner {
                 results.push(output);
             }
 
-            // Clean up finished requests
+            // Clean up finished requests.
             let finished_ids: Vec<RequestId> = self
                 .requests
                 .iter()
@@ -684,49 +877,38 @@ mod inner {
                 self.requests.remove(id);
                 self.scheduler.abort_seq_group(id);
             }
-            // Recycle blocks from dead sequences every step, not just when
-            // requests finish.  With continuous batching there are always
-            // unfinished seqs, so gating on finished_ids caused blocks to
-            // leak and next_block_id to grow past num_gpu_blocks.
-            {
-                let live_seq_ids: std::collections::HashSet<SequenceId> =
-                    self.scheduler.live_seq_ids();
-                let dead_sids: Vec<SequenceId> = self
-                    .seq_block_tables
-                    .keys()
-                    .filter(|sid| !live_seq_ids.contains(sid))
-                    .copied()
-                    .collect();
-                for sid in dead_sids {
-                    if let Some(blocks) = self.seq_block_tables.remove(&sid) {
-                        debug!(seq_id = sid.0, num_blocks = blocks.len(), "recycling blocks from finished sequence");
-                        for b in blocks {
-                            self.free_blocks.push(b.0);
-                        }
-                    }
-                }
-            }
 
-            debug!(num_outputs = results.len(), "GpuLLMEngine: step complete");
-            Ok(results)
+            results
         }
 
-        pub fn run(&mut self) -> Result<Vec<RequestOutput>> {
-            info!("GpuLLMEngine: run loop starting");
-            let mut all_outputs = Vec::new();
-            while self.has_unfinished() {
-                let step_outputs = self.step()?;
-                for output in step_outputs {
-                    if output.finished {
-                        all_outputs.push(output);
+        /// Recycle KV cache blocks from sequences no longer tracked by scheduler.
+        fn recycle_dead_blocks(&mut self) {
+            let live_seq_ids: std::collections::HashSet<SequenceId> =
+                self.scheduler.live_seq_ids();
+            let dead_sids: Vec<SequenceId> = self
+                .seq_block_tables
+                .keys()
+                .filter(|sid| !live_seq_ids.contains(sid))
+                .copied()
+                .collect();
+            for sid in dead_sids {
+                if let Some(blocks) = self.seq_block_tables.remove(&sid) {
+                    debug!(
+                        seq_id = sid.0,
+                        num_blocks = blocks.len(),
+                        "recycling blocks from finished sequence"
+                    );
+                    for b in blocks {
+                        self.free_blocks.push(b.0);
                     }
                 }
             }
-            info!(
-                num_completed = all_outputs.len(),
-                "GpuLLMEngine: run loop finished"
-            );
-            Ok(all_outputs)
+        }
+
+        /// Check for unfinished sequences (scheduler-side only, doesn't
+        /// account for in-flight GPU work).
+        fn has_unfinished_excluding_worker(&self) -> bool {
+            self.scheduler.has_unfinished_seqs() || !self.requests.is_empty()
         }
 
         pub fn has_unfinished(&self) -> bool {

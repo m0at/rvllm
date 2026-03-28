@@ -108,6 +108,53 @@ __device__ float block_reduce_sum(float val, float* smem_reduce, int tid, int nu
     return val; // valid in lane 0 of warp 0
 }
 
+// Block-level sum reduction that broadcasts result to ALL threads.
+// Eliminates the extra __syncthreads() needed when only thread 0 gets the result.
+__device__ float block_reduce_sum_broadcast(float val, float* smem_reduce, int tid, int num_threads) {
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int num_warps = (num_threads + 31) / 32;
+
+    val = warp_reduce_sum(val);
+    if (lane_id == 0) {
+        smem_reduce[warp_id] = val;
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        float v = (tid < num_warps) ? smem_reduce[tid] : 0.0f;
+        v = warp_reduce_sum(v);
+        if (tid == 0) {
+            smem_reduce[0] = v;
+        }
+    }
+    __syncthreads();
+    return smem_reduce[0];
+}
+
+// Block-level max reduction that broadcasts result to ALL threads.
+__device__ float block_reduce_max_broadcast(float val, float* smem_reduce, int tid, int num_threads) {
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int num_warps = (num_threads + 31) / 32;
+
+    val = warp_reduce_max(val);
+    if (lane_id == 0) {
+        smem_reduce[warp_id] = val;
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        float v = (tid < num_warps) ? smem_reduce[tid] : -FLT_MAX;
+        v = warp_reduce_max(v);
+        if (tid == 0) {
+            smem_reduce[0] = v;
+        }
+    }
+    __syncthreads();
+    return smem_reduce[0];
+}
+
 // ============================================================================
 // FlashAttention-2 forward kernel with paged KV cache
 // ============================================================================
@@ -208,20 +255,29 @@ __global__ void flash_attention_2_kernel(
             const int tile_start = tile * FA2_BC;
             const int tile_len = min(FA2_BC, context_len - tile_start);
 
-            // ---- Load K tile from paged cache into shared memory ----
-            // Each thread cooperatively loads elements
-            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-                int t = idx / head_dim;
-                int d = idx % head_dim;
-                int kv_pos = tile_start + t;
+            // ---- Load K tile from paged cache into shared memory (float4 vectorized) ----
+            // Each thread loads 4 floats at once (128-bit) for better memory bandwidth.
+            // head_dim is always divisible by 4 (64/96/128).
+            {
+                const int hd4 = head_dim >> 2; // head_dim / 4
+                const int total_vec = tile_len * hd4;
+                for (int idx = tid; idx < total_vec; idx += FA2_THREADS) {
+                    int t = idx / hd4;
+                    int v = idx % hd4; // which float4 chunk within head_dim
+                    int kv_pos = tile_start + t;
 
-                // Resolve paged address
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                int k_offset = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
+                    int page_idx = kv_pos / block_size;
+                    int page_off = kv_pos % block_size;
+                    int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
+                    int k_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
 
-                s_key[t * head_dim + d] = key_cache[k_offset];
+                    float4 kv4 = __ldg(reinterpret_cast<const float4*>(&key_cache[k_base]));
+                    int s_base = t * head_dim + v * 4;
+                    s_key[s_base]     = kv4.x;
+                    s_key[s_base + 1] = kv4.y;
+                    s_key[s_base + 2] = kv4.z;
+                    s_key[s_base + 3] = kv4.w;
+                }
             }
             __syncthreads();
 
@@ -297,18 +353,27 @@ __global__ void flash_attention_2_kernel(
             row_sum += tile_sum;
             __syncthreads();
 
-            // ---- Load V tile from paged cache into shared memory ----
-            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-                int t = idx / head_dim;
-                int d = idx % head_dim;
-                int kv_pos = tile_start + t;
+            // ---- Load V tile from paged cache into shared memory (float4 vectorized) ----
+            {
+                const int hd4 = head_dim >> 2;
+                const int total_vec = tile_len * hd4;
+                for (int idx = tid; idx < total_vec; idx += FA2_THREADS) {
+                    int t = idx / hd4;
+                    int v = idx % hd4;
+                    int kv_pos = tile_start + t;
 
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                int v_offset = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
+                    int page_idx = kv_pos / block_size;
+                    int page_off = kv_pos % block_size;
+                    int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
+                    int v_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
 
-                s_val[t * head_dim + d] = value_cache[v_offset];
+                    float4 vv4 = __ldg(reinterpret_cast<const float4*>(&value_cache[v_base]));
+                    int s_base = t * head_dim + v * 4;
+                    s_val[s_base]     = vv4.x;
+                    s_val[s_base + 1] = vv4.y;
+                    s_val[s_base + 2] = vv4.z;
+                    s_val[s_base + 3] = vv4.w;
+                }
             }
             __syncthreads();
 
@@ -400,19 +465,31 @@ __global__ void flash_attention_2_decode_kernel(
         const int tile_start = tile * FA2_BC;
         const int tile_len = min(FA2_BC, context_len - tile_start);
 
-        // Load K tile
-        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-            int t = idx / head_dim;
-            int d = idx % head_dim;
-            int kv_pos = tile_start + t;
-            int page_idx = kv_pos / block_size;
-            int page_off = kv_pos % block_size;
-            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            s_key[t * head_dim + d] = key_cache[((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d];
+        // Load K tile (float4 vectorized)
+        {
+            const int hd4 = head_dim >> 2;
+            const int total_vec = tile_len * hd4;
+            for (int idx = tid; idx < total_vec; idx += FA2_THREADS) {
+                int t = idx / hd4;
+                int v = idx % hd4;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
+                int k_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
+                float4 kv4 = __ldg(reinterpret_cast<const float4*>(&key_cache[k_base]));
+                int s_base = t * head_dim + v * 4;
+                s_key[s_base]     = kv4.x;
+                s_key[s_base + 1] = kv4.y;
+                s_key[s_base + 2] = kv4.z;
+                s_key[s_base + 3] = kv4.w;
+            }
         }
         __syncthreads();
 
-        // Q * K^T
+        // Q * K^T -- warp shuffle broadcast reduction
+        // block_reduce_sum_broadcast returns result to ALL threads,
+        // eliminating per-position __syncthreads() overhead
         for (int t = 0; t < tile_len; t++) {
             float dot = 0.0f;
             for (int r = 0; r < dims_per_thread && r < 8; r++) {
@@ -421,58 +498,63 @@ __global__ void flash_attention_2_decode_kernel(
                     dot += q_reg[r] * s_key[t * head_dim + d];
                 }
             }
-            dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
+            dot = block_reduce_sum_broadcast(dot, s_reduce, tid, FA2_THREADS);
             if (tid == 0) {
                 s_score[t] = dot;
             }
-            __syncthreads();
         }
+        __syncthreads(); // single sync after all scores written
 
-        // Online softmax update
-        float tile_max = -FLT_MAX;
-        if (tid == 0) {
-            for (int t = 0; t < tile_len; t++) {
-                tile_max = fmaxf(tile_max, s_score[t]);
+        // Online softmax -- parallel tile_max via warp shuffle reduction
+        {
+            float local_max = -FLT_MAX;
+            for (int t = tid; t < tile_len; t += FA2_THREADS) {
+                local_max = fmaxf(local_max, s_score[t]);
             }
-            s_reduce[0] = tile_max;
-        }
-        __syncthreads();
-        tile_max = s_reduce[0];
-        __syncthreads();
+            float tile_max = block_reduce_max_broadcast(local_max, s_reduce, tid, FA2_THREADS);
 
-        float prev_max = row_max;
-        float new_max = fmaxf(row_max, tile_max);
-        if (new_max > prev_max && prev_max > -FLT_MAX) {
-            float correction = expf(prev_max - new_max);
-            for (int r = 0; r < dims_per_thread && r < 8; r++) {
-                acc[r] *= correction;
+            float prev_max = row_max;
+            float new_max = fmaxf(row_max, tile_max);
+            if (new_max > prev_max && prev_max > -FLT_MAX) {
+                float correction = expf(prev_max - new_max);
+                for (int r = 0; r < dims_per_thread && r < 8; r++) {
+                    acc[r] *= correction;
+                }
+                row_sum *= correction;
             }
-            row_sum *= correction;
-        }
-        row_max = new_max;
+            row_max = new_max;
 
-        if (tid == 0) {
-            float tsum = 0.0f;
-            for (int t = 0; t < tile_len; t++) {
+            // Parallel exp + sum across all threads
+            float local_sum = 0.0f;
+            for (int t = tid; t < tile_len; t += FA2_THREADS) {
                 float val = expf(s_score[t] - row_max);
                 s_score[t] = val;
-                tsum += val;
+                local_sum += val;
             }
-            s_reduce[0] = tsum;
+            __syncthreads(); // ensure s_score[] writes visible before P*V
+            float tile_sum = block_reduce_sum_broadcast(local_sum, s_reduce, tid, FA2_THREADS);
+            row_sum += tile_sum;
         }
-        __syncthreads();
-        row_sum += s_reduce[0];
-        __syncthreads();
 
-        // Load V tile
-        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-            int t = idx / head_dim;
-            int d = idx % head_dim;
-            int kv_pos = tile_start + t;
-            int page_idx = kv_pos / block_size;
-            int page_off = kv_pos % block_size;
-            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            s_val[t * head_dim + d] = value_cache[((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d];
+        // Load V tile (float4 vectorized)
+        {
+            const int hd4 = head_dim >> 2;
+            const int total_vec = tile_len * hd4;
+            for (int idx = tid; idx < total_vec; idx += FA2_THREADS) {
+                int t = idx / hd4;
+                int v = idx % hd4;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
+                int v_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
+                float4 vv4 = __ldg(reinterpret_cast<const float4*>(&value_cache[v_base]));
+                int s_base = t * head_dim + v * 4;
+                s_val[s_base]     = vv4.x;
+                s_val[s_base + 1] = vv4.y;
+                s_val[s_base + 2] = vv4.z;
+                s_val[s_base + 3] = vv4.w;
+            }
         }
         __syncthreads();
 
@@ -576,16 +658,26 @@ __global__ void flash_attention_2_f16kv_kernel(
             const int tile_start = tile * FA2_BC;
             const int tile_len = min(FA2_BC, context_len - tile_start);
 
-            // Load K tile from f16 paged cache -> f32 shared memory
-            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-                int t = idx / head_dim;
-                int d = idx % head_dim;
-                int kv_pos = tile_start + t;
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                int k_offset = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
-                s_key[t * head_dim + d] = __half2float(key_cache[k_offset]);
+            // Load K tile from f16 paged cache -> f32 shared memory (half2 vectorized)
+            {
+                const int hd4 = head_dim >> 2;
+                const int total_vec = tile_len * hd4;
+                for (int idx = tid; idx < total_vec; idx += FA2_THREADS) {
+                    int t = idx / hd4;
+                    int v = idx % hd4;
+                    int kv_pos = tile_start + t;
+                    int page_idx = kv_pos / block_size;
+                    int page_off = kv_pos % block_size;
+                    int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
+                    int k_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
+                    half2 h01 = __ldg(reinterpret_cast<const half2*>(&key_cache[k_base]));
+                    half2 h23 = __ldg(reinterpret_cast<const half2*>(&key_cache[k_base + 2]));
+                    int s_base = t * head_dim + v * 4;
+                    s_key[s_base]     = __half2float(h01.x);
+                    s_key[s_base + 1] = __half2float(h01.y);
+                    s_key[s_base + 2] = __half2float(h23.x);
+                    s_key[s_base + 3] = __half2float(h23.y);
+                }
             }
             __syncthreads();
 
@@ -648,16 +740,26 @@ __global__ void flash_attention_2_f16kv_kernel(
             row_sum += tile_sum;
             __syncthreads();
 
-            // Load V tile from f16 paged cache -> f32 shared memory
-            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-                int t = idx / head_dim;
-                int d = idx % head_dim;
-                int kv_pos = tile_start + t;
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                int v_offset = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
-                s_val[t * head_dim + d] = __half2float(value_cache[v_offset]);
+            // Load V tile from f16 paged cache -> f32 shared memory (half2 vectorized)
+            {
+                const int hd4 = head_dim >> 2;
+                const int total_vec = tile_len * hd4;
+                for (int idx = tid; idx < total_vec; idx += FA2_THREADS) {
+                    int t = idx / hd4;
+                    int v = idx % hd4;
+                    int kv_pos = tile_start + t;
+                    int page_idx = kv_pos / block_size;
+                    int page_off = kv_pos % block_size;
+                    int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
+                    int v_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
+                    half2 h01 = __ldg(reinterpret_cast<const half2*>(&value_cache[v_base]));
+                    half2 h23 = __ldg(reinterpret_cast<const half2*>(&value_cache[v_base + 2]));
+                    int s_base = t * head_dim + v * 4;
+                    s_val[s_base]     = __half2float(h01.x);
+                    s_val[s_base + 1] = __half2float(h01.y);
+                    s_val[s_base + 2] = __half2float(h23.x);
+                    s_val[s_base + 3] = __half2float(h23.y);
+                }
             }
             __syncthreads();
 
@@ -745,19 +847,30 @@ __global__ void flash_attention_2_decode_f16kv_kernel(
         const int tile_start = tile * FA2_BC;
         const int tile_len = min(FA2_BC, context_len - tile_start);
 
-        // Load K tile: f16 cache -> f32 shared memory
-        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-            int t = idx / head_dim;
-            int d = idx % head_dim;
-            int kv_pos = tile_start + t;
-            int page_idx = kv_pos / block_size;
-            int page_off = kv_pos % block_size;
-            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            s_key[t * head_dim + d] = __half2float(key_cache[((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d]);
+        // Load K tile: f16 cache -> f32 shared memory (half2 vectorized)
+        {
+            const int hd4 = head_dim >> 2;
+            const int total_vec = tile_len * hd4;
+            for (int idx = tid; idx < total_vec; idx += FA2_THREADS) {
+                int t = idx / hd4;
+                int v = idx % hd4;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
+                int k_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
+                half2 h01 = __ldg(reinterpret_cast<const half2*>(&key_cache[k_base]));
+                half2 h23 = __ldg(reinterpret_cast<const half2*>(&key_cache[k_base + 2]));
+                int s_base = t * head_dim + v * 4;
+                s_key[s_base]     = __half2float(h01.x);
+                s_key[s_base + 1] = __half2float(h01.y);
+                s_key[s_base + 2] = __half2float(h23.x);
+                s_key[s_base + 3] = __half2float(h23.y);
+            }
         }
         __syncthreads();
 
-        // Q * K^T
+        // Q * K^T -- warp shuffle broadcast reduction
         for (int t = 0; t < tile_len; t++) {
             float dot = 0.0f;
             for (int r = 0; r < dims_per_thread && r < 8; r++) {
@@ -766,58 +879,64 @@ __global__ void flash_attention_2_decode_f16kv_kernel(
                     dot += q_reg[r] * s_key[t * head_dim + d];
                 }
             }
-            dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
+            dot = block_reduce_sum_broadcast(dot, s_reduce, tid, FA2_THREADS);
             if (tid == 0) {
                 s_score[t] = dot;
             }
-            __syncthreads();
         }
+        __syncthreads(); // single sync after all scores written
 
-        // Online softmax update
-        float tile_max = -FLT_MAX;
-        if (tid == 0) {
-            for (int t = 0; t < tile_len; t++) {
-                tile_max = fmaxf(tile_max, s_score[t]);
+        // Online softmax -- parallel tile_max via warp shuffle reduction
+        {
+            float local_max = -FLT_MAX;
+            for (int t = tid; t < tile_len; t += FA2_THREADS) {
+                local_max = fmaxf(local_max, s_score[t]);
             }
-            s_reduce[0] = tile_max;
-        }
-        __syncthreads();
-        tile_max = s_reduce[0];
-        __syncthreads();
+            float tile_max = block_reduce_max_broadcast(local_max, s_reduce, tid, FA2_THREADS);
 
-        float prev_max = row_max;
-        float new_max = fmaxf(row_max, tile_max);
-        if (new_max > prev_max && prev_max > -FLT_MAX) {
-            float correction = expf(prev_max - new_max);
-            for (int r = 0; r < dims_per_thread && r < 8; r++) {
-                acc[r] *= correction;
+            float prev_max = row_max;
+            float new_max = fmaxf(row_max, tile_max);
+            if (new_max > prev_max && prev_max > -FLT_MAX) {
+                float correction = expf(prev_max - new_max);
+                for (int r = 0; r < dims_per_thread && r < 8; r++) {
+                    acc[r] *= correction;
+                }
+                row_sum *= correction;
             }
-            row_sum *= correction;
-        }
-        row_max = new_max;
+            row_max = new_max;
 
-        if (tid == 0) {
-            float tsum = 0.0f;
-            for (int t = 0; t < tile_len; t++) {
+            // Parallel exp + sum across all threads
+            float local_sum = 0.0f;
+            for (int t = tid; t < tile_len; t += FA2_THREADS) {
                 float val = expf(s_score[t] - row_max);
                 s_score[t] = val;
-                tsum += val;
+                local_sum += val;
             }
-            s_reduce[0] = tsum;
+            __syncthreads(); // ensure s_score[] writes visible before P*V
+            float tile_sum = block_reduce_sum_broadcast(local_sum, s_reduce, tid, FA2_THREADS);
+            row_sum += tile_sum;
         }
-        __syncthreads();
-        row_sum += s_reduce[0];
-        __syncthreads();
 
-        // Load V tile: f16 cache -> f32 shared memory
-        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-            int t = idx / head_dim;
-            int d = idx % head_dim;
-            int kv_pos = tile_start + t;
-            int page_idx = kv_pos / block_size;
-            int page_off = kv_pos % block_size;
-            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            s_val[t * head_dim + d] = __half2float(value_cache[((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d]);
+        // Load V tile: f16 cache -> f32 shared memory (half2 vectorized)
+        {
+            const int hd4 = head_dim >> 2;
+            const int total_vec = tile_len * hd4;
+            for (int idx = tid; idx < total_vec; idx += FA2_THREADS) {
+                int t = idx / hd4;
+                int v = idx % hd4;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
+                int v_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
+                half2 h01 = __ldg(reinterpret_cast<const half2*>(&value_cache[v_base]));
+                half2 h23 = __ldg(reinterpret_cast<const half2*>(&value_cache[v_base + 2]));
+                int s_base = t * head_dim + v * 4;
+                s_val[s_base]     = __half2float(h01.x);
+                s_val[s_base + 1] = __half2float(h01.y);
+                s_val[s_base + 2] = __half2float(h23.x);
+                s_val[s_base + 3] = __half2float(h23.y);
+            }
         }
         __syncthreads();
 
