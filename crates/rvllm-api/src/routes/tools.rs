@@ -97,6 +97,10 @@ pub struct ChatCompletionToolRequest {
     pub user: Option<String>,
     #[serde(default)]
     pub seed: Option<u64>,
+    #[serde(default)]
+    pub best_of: Option<usize>,
+    #[serde(default)]
+    pub use_beam_search: bool,
     /// Tool definitions available to the model.
     #[serde(default)]
     pub tools: Option<Vec<RequestTool>>,
@@ -172,6 +176,10 @@ pub struct ChatCompletionToolResponse {
 // ---------------------------------------------------------------------------
 
 impl ChatCompletionToolRequest {
+    pub fn beam_width(&self) -> usize {
+        self.best_of.unwrap_or(self.n).max(1)
+    }
+
     /// Validate the request.
     pub fn validate(&self) -> Result<(), ApiError> {
         if self.model.is_empty() {
@@ -197,6 +205,28 @@ impl ChatCompletionToolRequest {
                 "top_p must be between 0.0 and 1.0".into(),
             ));
         }
+        if self.n == 0 {
+            return Err(ApiError::InvalidRequest("n must be greater than 0".into()));
+        }
+        if let Some(best_of) = self.best_of {
+            if best_of == 0 {
+                return Err(ApiError::InvalidRequest(
+                    "best_of must be greater than 0".into(),
+                ));
+            }
+        }
+        if self.use_beam_search {
+            if self.stream {
+                return Err(ApiError::InvalidRequest(
+                    "beam search does not support streaming".into(),
+                ));
+            }
+            if self.beam_width() < 2 {
+                return Err(ApiError::InvalidRequest(
+                    "beam search requires best_of or n to be at least 2".into(),
+                ));
+            }
+        }
         // Validate tool_choice value
         if let Some(ToolChoice::Mode(ref mode)) = self.tool_choice {
             if !["auto", "none", "required"].contains(&mode.as_str()) {
@@ -219,7 +249,8 @@ impl ChatCompletionToolRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             seed: self.seed,
-            best_of: self.n,
+            best_of: self.beam_width(),
+            use_beam_search: self.use_beam_search,
             ..Default::default()
         }
     }
@@ -322,6 +353,11 @@ pub async fn create_chat_completion_with_tools(
             "model '{}' not found, available: {}",
             req.model, state.model_name
         )));
+    }
+    if req.use_beam_search && !state.engine.supports_beam_search() {
+        return Err(ApiError::InvalidRequest(
+            "beam search is not supported by the active inference backend".into(),
+        ));
     }
 
     let sampling_params = req.to_sampling_params();
@@ -539,6 +575,57 @@ pub async fn create_chat_completion_with_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use axum_test::TestServer;
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+    use tokenizers::Tokenizer as HfTokenizer;
+
+    use crate::server::InferenceEngine;
+
+    struct UnsupportedBeamEngine;
+
+    #[async_trait::async_trait]
+    impl InferenceEngine for UnsupportedBeamEngine {
+        async fn generate(
+            &self,
+            _prompt: String,
+            _params: rvllm_core::prelude::SamplingParams,
+        ) -> rvllm_core::prelude::Result<(
+            rvllm_core::prelude::RequestId,
+            tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
+        )> {
+            panic!("generate should not be called when beam search is rejected");
+        }
+
+        fn supports_beam_search(&self) -> bool {
+            false
+        }
+    }
+
+    fn make_test_tokenizer() -> rvllm_tokenizer::Tokenizer {
+        let mut vocab = std::collections::HashMap::new();
+        vocab.insert("hello".to_string(), 0);
+        vocab.insert("world".to_string(), 1);
+        vocab.insert(" ".to_string(), 2);
+        vocab.insert("!".to_string(), 3);
+        vocab.insert("[UNK]".to_string(), 4);
+
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+
+        let mut hf = HfTokenizer::new(bpe);
+        hf.with_pre_tokenizer(Some(Whitespace {}));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        hf.save(&path, false).unwrap();
+        rvllm_tokenizer::Tokenizer::from_file(&path).unwrap()
+    }
 
     #[test]
     fn tool_choice_deserialize_string() {
@@ -646,6 +733,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            best_of: None,
+            use_beam_search: false,
             tools: None,
             tool_choice: None,
         };
@@ -751,6 +840,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            best_of: None,
+            use_beam_search: false,
             tools: None,
             tool_choice: Some(ToolChoice::Mode("banana".to_string())),
         };
@@ -846,6 +937,8 @@ mod tests {
             frequency_penalty: 0.2,
             user: None,
             seed: Some(123),
+            best_of: None,
+            use_beam_search: false,
             tools: None,
             tool_choice: None,
         };
@@ -855,5 +948,128 @@ mod tests {
         assert_eq!(sp.top_p, 0.95);
         assert_eq!(sp.stop_strings, vec!["END".to_string()]);
         assert_eq!(sp.seed, Some(123));
+        assert_eq!(sp.best_of, 2);
+        assert!(!sp.use_beam_search);
+    }
+
+    #[test]
+    fn beam_search_validation_rejects_streaming() {
+        let req = ChatCompletionToolRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            max_tokens: 16,
+            temperature: 0.0,
+            top_p: 1.0,
+            n: 2,
+            stream: true,
+            stop: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: None,
+            use_beam_search: true,
+            tools: None,
+            tool_choice: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn beam_search_validation_requires_multiple_beams() {
+        let req = ChatCompletionToolRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            max_tokens: 16,
+            temperature: 0.0,
+            top_p: 1.0,
+            n: 1,
+            stream: false,
+            stop: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: None,
+            use_beam_search: true,
+            tools: None,
+            tool_choice: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn beam_search_uses_best_of_override() {
+        let req = ChatCompletionToolRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            max_tokens: 16,
+            temperature: 0.0,
+            top_p: 1.0,
+            n: 1,
+            stream: false,
+            stop: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            user: None,
+            seed: None,
+            best_of: Some(4),
+            use_beam_search: true,
+            tools: None,
+            tool_choice: None,
+        };
+        assert!(req.validate().is_ok());
+        assert_eq!(req.beam_width(), 4);
+        let sp = req.to_sampling_params();
+        assert_eq!(sp.best_of, 4);
+        assert!(sp.use_beam_search);
+    }
+
+    #[tokio::test]
+    async fn route_rejects_beam_search_on_unsupported_backend() {
+        let state = Arc::new(crate::server::AppState::new(
+            Arc::new(UnsupportedBeamEngine),
+            "m".to_string(),
+            make_test_tokenizer(),
+        ));
+        let app = crate::server::build_router(state);
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions/tools")
+            .json(&ChatCompletionToolRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                max_tokens: 16,
+                temperature: 0.0,
+                top_p: 1.0,
+                n: 2,
+                stream: false,
+                stop: None,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                user: None,
+                seed: None,
+                best_of: None,
+                use_beam_search: true,
+                tools: None,
+                tool_choice: None,
+            })
+            .await;
+
+        response.assert_status_bad_request();
+        assert!(response.text().contains("beam search is not supported"));
     }
 }
