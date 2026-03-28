@@ -215,14 +215,14 @@ mod cuda_impl {
             // Upload positions to GPU as i32 (CUDA kernels expect int*)
             let pos_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
             let positions_gpu: CudaSlice<i32> = self
-                .copy_stream
+                .stream
                 .clone_htod(&pos_i32)
                 .map_err(|e| LLMError::GpuError(format!("positions HtoD: {e}")))?;
 
             // Upload context_lens as i32
             let cl_i32: Vec<i32> = attn_meta.context_lens.iter().map(|&c| c as i32).collect();
             let context_lens_gpu: CudaSlice<i32> = self
-                .copy_stream
+                .stream
                 .clone_htod(&cl_i32)
                 .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
 
@@ -241,14 +241,14 @@ mod cuda_impl {
                 }
             }
             let block_tables_gpu: CudaSlice<i32> = self
-                .copy_stream
+                .stream
                 .clone_htod(&flat_bt)
                 .map_err(|e| LLMError::GpuError(format!("block_tables HtoD: {e}")))?;
 
             // Upload slot_mapping as i32
             let sm_i32: Vec<i32> = attn_meta.slot_mapping.iter().map(|&s| s as i32).collect();
             let slot_mapping_gpu: CudaSlice<i32> = self
-                .copy_stream
+                .stream
                 .clone_htod(&sm_i32)
                 .map_err(|e| LLMError::GpuError(format!("slot_mapping HtoD: {e}")))?;
 
@@ -264,7 +264,7 @@ mod cuda_impl {
             }
             seq_starts_host.push(num_tokens as i32); // sentinel
             let seq_start_pos_gpu: CudaSlice<i32> = self
-                .copy_stream
+                .stream
                 .clone_htod(&seq_starts_host)
                 .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
 
@@ -272,7 +272,7 @@ mod cuda_impl {
             // Ensure all metadata is resident on GPU before embedding lookup
             // and subsequent layer compute that reads these buffers.
             self.stream
-                .join(&self.copy_stream)
+                .join(&self.stream)
                 .map_err(|e| LLMError::GpuError(format!("stream join copy_stream: {e}")))?;
 
             // Step 1: token embedding lookup
