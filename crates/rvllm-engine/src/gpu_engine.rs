@@ -595,12 +595,14 @@ mod inner {
             // GPU thread for the duration of the run loop.  Use a raw pointer
             // (safe because std::thread::scope guarantees the thread joins
             // before the borrow ends, and only the GPU thread touches worker).
-            let worker_ptr = &mut self.worker as *mut GpuWorker;
+            struct SendPtr(*mut GpuWorker);
+            unsafe impl Send for SendPtr {}
+            let worker_ptr = SendPtr(&mut self.worker as *mut GpuWorker);
 
             std::thread::scope(|scope| -> Result<()> {
                 // Spawn dedicated GPU execution thread.
                 let gpu_thread = scope.spawn(move || {
-                    let worker = unsafe { &mut *worker_ptr };
+                    let worker = unsafe { &mut *worker_ptr.0 };
                     while let Ok(metadata) = meta_rx.recv() {
                         let res = worker
                             .execute(&metadata)

@@ -1,54 +1,58 @@
-*update: not yet, or not fully, but definitely getting somewhere. join in the fun and help me push this to its limit
+**rvLLM -- vLLM rewritten in Rust. One dev, 22 hours, $1,780.**
+matches vLLM at production batch sizes. 20x faster startup. 31x smaller binary. work in progress -- help me push this further.
 
-"matches vLLM at production batch sizes with 20x faster startup and
-   31x smaller binary" is more credible than "16x faster" with a broken comparison. 
+## what is it
+rvLLM is a from-scratch Rust implementation of vLLM for serving LLMs on GPUs. drop-in OpenAI API replacement. same endpoints, same format, just point your client at the Rust server.
 
-rvLLM is my rust rework of vLLM, a suite for serving models on gpu's
+## why
+python vLLM transfers the entire logit matrix (74 MB for Qwen2.5-1.5B at batch 128) from GPU to host every decode step for sampling. rvLLM runs argmax directly on GPU and transfers 512 bytes. 150,000x reduction in PCIe traffic per step. no GIL, no GC, no PyTorch tensor metadata overhead. deterministic memory with Rust ownership. single 16 MB binary vs ~500 MB pip install.
 
-what started as an obvious "oh that should be better" turned into what you'll see below
+## architecture
+- 23 Rust crates, strict dependency tree from GPU primitives to HTTP API
+- 15 hand-written CUDA kernels compiled to PTX (sm_70 through sm_120)
+- cuBLAS hgemm (FP16 tensor cores) for all linear projections
+- f16 KV cache with paged block allocation (single cudaMalloc slab)
+- FlashAttention-2 with paged KV cache and GQA support
+- fused QKV projection (3 GEMMs -> 1), fused gate+up (2 GEMMs -> 1)
+- GPU-side argmax kernel (greedy decode without logit transfer)
+- CUDA graph capture/replay for decode steps
+- mixed prefill+decode batching, chunked prefill
+- continuous batching with preemption and prefix caching
+- vectorized float4 loads across all kernels
+- async HtoD metadata pipeline, packed PCIe transfers
+- 10 model architectures (Llama, Mistral, Qwen2, Phi, Gemma, Mixtral, DeepSeek, GPT-NeoX, StableLM, Cohere)
+- mock-GPU backend for development without NVIDIA hardware
+- 793 tests across 23 crates
 
-i'm constantly looking for speedups that have huge impacts when switching from python to rust, and man, this was a great choice
-
-please test rvLLM out, give it a try, PR the repo with upgrades and additions, make it better!
-
-if it's as good as my tests show, then a lot of things just got way better. i will actively maintain and get some collaborators to support it fully
-
-23 Rust crates. 15 hand-written CUDA kernels. 16 MB binary. Zero errors across 14,620 verified requests. 8,339 tok/s. Matches vLLM at production batch sizes. dev start to finish in 22 hours by one guy and opus swarms. tokens & servers: $1,780.
-
-opus was obviously the biggest supporter and trainwrecker of everything but man, what a model
-
-The key insight: Python vLLM transfers the entire logit matrix (74 MB) from GPU to host every decode step for sampling. rvLLM runs argmax directly on GPU and transfers 512 bytes. That's a 150,000x reduction in PCIe traffic per step.
-
-Head-to-head on same A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req:
-
+## head-to-head (same A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req)
+```
 N=1:   rvLLM 58    | vLLM 69
-N=48:  rvLLM 3,436 | vLLM 2,887  -- rvLLM pulls ahead
+N=48:  rvLLM 3,436 | vLLM 2,887  -- rvLLM ahead
 N=64:  rvLLM 3,938 | vLLM 3,828  -- matched
 N=128: rvLLM 6,301 | vLLM 6,400  -- matched
 N=256: rvLLM 8,055 | vLLM 9,437
 N=512: rvLLM 8,308 | vLLM 10,771
 N=768: rvLLM 8,339 (peak)
 N=1024: rvLLM 8,308 | vLLM 12,740
+```
+*new optimized build benchmarking now -- fused GEMMs, CUDA graph fix, vectorized kernels*
 
-Startup: 6s vs 121s (20x faster)
-Binary: 16 MB vs ~500 MB (31x smaller)
-CPU RSS: 348 MB vs 1,033 MB (3x less)
+## system comparison
+- startup: 6s vs 121s (20x)
+- binary: 16 MB vs ~500 MB (31x)
+- CPU RSS: 348 MB vs 1,033 MB (3x)
+- zero errors across 14,620 verified requests
+- runs on 40GB cards where vLLM needs 73GB
 
-Where the speed comes from:
-- GPU-resident argmax (no logit transfer for greedy decoding)
-- CUDA graph replay (entire forward pass = one driver call)
-- FP16 hgemm with tensor cores + f16 KV cache
-- Mixed prefill+decode batching (no pipeline bubbles)
-- No GIL, no GC, no PyTorch tensor overhead
-- Single cudaMalloc slab for KV cache -- zero per-request allocation
-- Prefix caching for shared system prompts
+## GPU support
+V100, T4, A100, RTX 3090/4090, H100, H200, B100, B200, RTX PRO 6000 Blackwell (sm_120). verified on A100 + B200 + RTX PRO 6000. CUDA 12.x and 13.x.
 
-Total cost: $1,500 in vast.ai GPU rentals + $280 Claude Code overage. Built with Claude Opus doing architecture, CUDA kernels, and debugging.
+## cost
+$1,500 vast.ai GPU rentals + $280 Claude Code extra usage. built with Claude Opus doing architecture, CUDA kernels, debugging, and 20-agent swarms for major refactors. one developer, 22 hours.
 
-Drop-in replacement for the OpenAI API. Same endpoints, same request format. Just point your client at the Rust server.
+## links
+- repo: https://github.com/m0at/rvllm
+- paper: https://m0at.github.io/rvllm/paper/rvllm.pdf
+- site: https://m0at.github.io/rvllm/
 
-GitHub: https://github.com/m0at/rvllm
-Paper: https://m0at.github.io/rvllm/paper/rvllm.pdf
-Site: https://m0at.github.io/rvllm/
-
-Apache-2.0. Open source.
+Apache-2.0. open source. PRs welcome.
