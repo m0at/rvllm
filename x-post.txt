@@ -1,5 +1,7 @@
+*update 15:17 mar28 -- corrected numbers to match verified benchmarks. previous post overstated some optimizations that were planned but not landed. current verified numbers below.
+
 rvLLM -- vLLM rewritten in Rust. One dev, 22 hours, $1,780.
-10,291 tok/s. Beats Python vLLM up to N=256. 20x faster startup. 31x smaller. work in progress -- help me push this further.
+3,467 tok/s (N=32) on A100. 128 tok/s single-sequence. CUDA graph capture/replay working. 20x faster startup. 31x smaller. actively optimizing -- help me push this further.
 
 what is it
 rvLLM is a from-scratch Rust implementation of vLLM for serving LLMs on GPUs. drop-in OpenAI API replacement. same endpoints, same format, just point your client at the Rust server.
@@ -12,48 +14,40 @@ architecture
 - 15 hand-written CUDA kernels compiled to PTX (sm_70 through sm_120)
 - cuBLAS hgemm (FP16 tensor cores) for all linear projections
 - f16 KV cache with paged block allocation (single cudaMalloc slab)
-- FlashAttention-2 with paged KV cache and GQA support
-- fused QKV projection (3 GEMMs -> 1), fused gate+up (2 GEMMs -> 1)
+- FlashAttention-2 with paged KV cache and GQA support (decode + prefill)
+- Split-KV attention for long contexts (>1024 tokens)
 - GPU-side argmax kernel (greedy decode without logit transfer)
-- CUDA graph capture/replay for decode steps
-- mixed prefill+decode batching, chunked prefill
+- CUDA graph capture/replay for decode steps (working end-to-end on A100)
+- fused SiLU*mul activation kernel
 - continuous batching with preemption and prefix caching
-- vectorized float4 loads across all kernels
-- async HtoD metadata pipeline, packed PCIe transfers
 - 10 model architectures (Llama, Mistral, Qwen2, Phi, Gemma, Mixtral, DeepSeek, GPT-NeoX, StableLM, Cohere)
 - mock-GPU backend for development without NVIDIA hardware
-- 793 tests across 23 crates
+- 790 tests across 23 crates
 
-head-to-head (same A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req)
+verified throughput (A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req, 2026-03-28)
 
-N=1:    rvLLM 117   | vLLM 69     -- rvLLM 1.7x faster
-N=4:    rvLLM 882   | vLLM 256
-N=8:    rvLLM 1,213 | vLLM 517
-N=16:   rvLLM 1,391 | vLLM 1,060
-N=32:   rvLLM 1,434 | vLLM 1,943
-N=48:   rvLLM 3,918 | vLLM 2,887  -- rvLLM ahead
-N=64:   rvLLM 4,796 | vLLM 3,828  -- rvLLM 1.25x
-N=96:   rvLLM 5,965 | vLLM 5,197  -- rvLLM 1.15x
-N=128:  rvLLM 7,380 | vLLM 6,400  -- rvLLM 1.15x
-N=256:  rvLLM 9,905 | vLLM 9,437  -- rvLLM 1.05x
-N=512:  rvLLM 10,291 | vLLM 10,771 -- near parity
-N=768:  rvLLM 10,235 (peak)
-N=1024: rvLLM 10,051 | vLLM 12,740
+N=1:    128 tok/s   (7.7ms/tok, 22.7% mem BW utilization)
+N=4:    540 tok/s
+N=8:    1,091 tok/s
+N=16:   2,118 tok/s
+N=32:   3,467 tok/s
+
+bottleneck: 77% of per-token time is overhead (kernel launch, alloc, metadata HtoD, CPU scheduling), not compute. theoretical peak at N=1 is 574 tok/s. actively working on closing this gap.
 
 system comparison
-- startup: 6s vs 121s (20x)
-- binary: 16 MB vs ~500 MB (31x)
-- CPU RSS: 348 MB vs 1,033 MB (3x)
-- zero errors across 14,620 verified requests
-- runs on 40GB cards where vLLM needs 73GB
+- startup: 6s vs ~120s (20x faster)
+- binary: 16 MB vs ~500 MB (31x smaller)
+- CPU RSS: 348 MB vs ~1 GB (3x less)
 
 GPU support
 V100, T4, A100, RTX 3090/4090, H100, H200, B100, B200, RTX PRO 6000 Blackwell (sm_120). verified on A100 + B200 + RTX PRO 6000. CUDA 12.x and 13.x.
 
 optimization phases
-phase 1 (FP32): 3,191 tok/s -- baseline
-phase 2 (FP16 hgemm + f16 KV cache): 8,339 tok/s -- 2.6x
-phase 3 (fused GEMMs, CUDA graph fix, vectorized kernels, pre-alloc buffers): 10,291 tok/s -- 3.2x total
+phase 1 (FP32): 3,191 tok/s peak -- baseline
+phase 2 (FP16 hgemm + f16 KV cache): batched throughput improvement
+phase 3 (FA2 decode, fused SiLU, GPU argmax): sampling + attention path
+phase 4 (CUDA graph capture/replay): fixed 3 root causes, graph working end-to-end
+phase 5 (in progress): overhead reduction -- mixed GEMM, fused ops, packed metadata, alloc elimination
 
 cost
 $1,500 vast.ai GPU rentals + $280 Claude Code extra usage. built with Claude Opus doing architecture, CUDA kernels, debugging, and 20-agent swarms for major refactors. one developer, 22 hours.

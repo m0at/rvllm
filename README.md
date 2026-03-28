@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**23 Rust crates. 15 CUDA kernels. 10,291 tok/s on A100 (FP16). Beats Python vLLM up to N=256. 20x faster startup. 31x smaller. Zero errors across 14,620 verified requests.**
+**23 Rust crates. 15 CUDA kernels. ~3,500 tok/s on A100 (FP16, N=32). FlashAttention-2 + CUDA graph capture/replay. 20x faster startup. 31x smaller.**
 
 ## Install
 
@@ -20,27 +20,19 @@ Or build from source -- see [Quick Start](#quick-start) below.
 
 All measurements verified with coherent text output at every batch size. Zero errors across thousands of requests. See `bench/run.sh` to reproduce.
 
-### Head-to-head: rvLLM vs Python vLLM on A100 80GB SXM4
+### Verified throughput: A100 80GB SXM4
 
-Same hardware, same model (Qwen2.5-1.5B), greedy decoding, 32 tokens/request. rvLLM FP16 with tensor cores vs Python vLLM 0.18.
+Same hardware, same model (Qwen2.5-1.5B), greedy decoding, 32 tokens/request. rvLLM FP16 with tensor cores. Measured 2026-03-28 with concurrent HTTP requests.
 
-| Concurrent (N) | rvLLM (tok/s) | vLLM 0.18 (tok/s) | Notes |
-|---:|---:|---:|---|
-| 1 | 117 | 69 | **rvLLM 1.7x faster** |
-| 4 | 882 | 256 | rvLLM ahead |
-| 8 | 1,213 | 517 | |
-| 16 | 1,391 | 1,060 | |
-| 32 | 1,434 | 1,943 | |
-| 48 | 3,918 | 2,887 | **rvLLM pulls ahead** |
-| 64 | 4,796 | 3,828 | **rvLLM 1.25x** |
-| 96 | 5,965 | 5,197 | **rvLLM 1.15x** |
-| 128 | 7,380 | 6,400 | **rvLLM 1.15x** |
-| 256 | 9,905 | 9,437 | **rvLLM 1.05x** |
-| 512 | 10,291 | 10,771 | Near parity (0.96x) |
-| **768** | **10,235** | -- | **rvLLM peak** |
-| 1,024 | 10,051 | 12,740 | |
+| Concurrent (N) | rvLLM (tok/s) | Notes |
+|---:|---:|---|
+| 1 | 128 | 7.7ms/tok (22.7% mem BW utilization) |
+| 4 | 540 | |
+| 8 | 1,091 | |
+| 16 | 2,118 | |
+| 32 | 3,467 | |
 
-rvLLM **beats Python vLLM up to N=256** and peaks at **10,291 tok/s** (FP16, tensor cores, f16 KV cache, fused GEMMs, vectorized kernels). vLLM scales further at very high concurrency (N>512) due to its mature continuous batching optimizations.
+Per-token overhead analysis (N=1): 1.74ms theoretical (memory-bandwidth-bound), 7.7ms actual. **77% overhead** from kernel launch, memory allocation, metadata HtoD, and CPU scheduling. Optimization work in progress to close this gap.
 
 ### B200 (180GB VRAM, FP32 -- earlier results)
 
@@ -73,14 +65,14 @@ Prompt: "Explain quantum computing..."   -> "Quantum computing is a new type of 
 
 ### Summary
 
-| Metric | rvLLM | Python vLLM 0.18 | Comparison |
-|---|---:|---:|---|
-| Peak throughput (A100, FP16) | 10,291 tok/s | 12,740 tok/s | **Beats vLLM up to N=256** |
-| Peak throughput (B200, FP32) | 3,946 tok/s | -- | Earlier result |
-| Startup time | 6 sec | 121 sec | **20x faster** |
-| Binary / install size | 16 MB | ~500 MB | **31x smaller** |
-| CPU memory (RSS) | 348 MB | 1,033 MB | **3x less** |
-| Total requests verified | 14,620 | -- | **0 errors** |
+| Metric | rvLLM | Notes |
+|---|---:|---|
+| Throughput (A100, FP16, N=32) | 3,467 tok/s | Verified 2026-03-28 |
+| Throughput (A100, FP16, N=1) | 128 tok/s | Memory-bandwidth utilization: 22.7% |
+| Throughput (B200, FP32, N=768) | 3,946 tok/s | Earlier FP32 result |
+| Startup time | 6 sec | vs ~120 sec for Python vLLM |
+| Binary / install size | 16 MB | vs ~500 MB for Python vLLM |
+| CPU memory (RSS) | 348 MB | vs ~1 GB for Python vLLM |
 
 ### CPU Component Benchmarks (sampling, logit processing)
 
@@ -578,10 +570,20 @@ rvLLM benchmark --model <MODEL>   Run offline throughput benchmark
 - Token-level parity test suite
 - 790 tests across 23 crates
 
-### Roadmap
+### Roadmap (Phase 5: overhead reduction)
+- Mixed-precision cuBLAS GEMM (f32 x f16 -> f32, eliminate 392 cast kernels per forward)
+- Wire up fused residual+RMSNorm in forward path (kernel exists, not yet used)
+- In-place RoPE (eliminate 56 allocs + 56 memcpy per forward)
+- Packed metadata HtoD (6 transfers -> 1)
+- Pre-allocated layer scratch buffers (eliminate ~588 allocs per forward)
+- Engine loop optimization (reduce CPU scheduling overhead)
+
+### Future
 - LoRA adapter hot-swapping (see [CONTRIBUTING.md](CONTRIBUTING.md))
 - Vision-language models (see [docs/VISION_MODELS.md](docs/VISION_MODELS.md))
 - Pipeline parallelism
+- Fused QKV projection (3 GEMMs -> 1)
+- Vectorized float4 loads in kernels
 - Production hardening (fuzz testing, load testing at 1000 concurrent)
 
 ## Development Cost
@@ -603,7 +605,7 @@ Heavy use of Claude Code with Claude Opus for architecture design, CUDA kernel w
 
 ### Total
 
-Roughly **$1,780** in compute and AI overage costs to go from zero to 10,291 tok/s (beating Python vLLM up to N=256). No salaries, no team -- one developer (Andy Norris, San Francisco) with Claude and rented GPUs over 22 hours.
+Roughly **$1,780** in compute and AI overage costs to go from zero to a working Rust LLM server with verified **3,467 tok/s at N=32 on A100 FP16**, CUDA graph capture/replay, and end-to-end benchmark coverage. No salaries, no team -- one developer (Andy Norris, San Francisco) with Claude and rented GPUs over 22 hours.
 
 ## Optimization Log
 
@@ -615,16 +617,12 @@ Roughly **$1,780** in compute and AI overage costs to go from zero to 10,291 tok
 - 8,339 tok/s peak at N=768
 - Matches vLLM at N=48-128
 
-### Phase 3: Kernel optimizations (17-agent swarm)
-- Fused QKV (3 GEMMs -> 1), fused gate+up (2 GEMMs -> 1)
-- Fixed CUDA graph replay (was doing redundant forward pass!)
-- Vectorized float4 loads in FA2, RMSNorm, embedding, reshape_and_cache
-- Warp shuffle reductions in FA2 decode
-- Pre-allocated activation + layer scratch buffers
-- Async HtoD on separate stream, packed metadata transfers
-- Fused residual+RMSNorm kernel
-- Scheduler: decode-first batching, cached sort
-- Result: **10,291 tok/s peak** -- beats vLLM up to N=256
+### Phase 3: Sampling + attention backend selection
+- Context-aware attention: FlashAttention-2 for short contexts, Split-KV for long
+- Fused SiLU*mul activation kernel (gate + up in one kernel launch)
+- GPU-side argmax for greedy decode (no logit DtoH transfer)
+- Fused residual+RMSNorm kernel written (wired up in Phase 5)
+- Fixed CUDA graph replay (was doing redundant forward pass)
 
 ### Phase 4: CUDA graph capture/replay
 - Fixed 3 root causes: default stream (no capture support), cuBLAS workspace (internal malloc during capture), cudarc event tracking (cross-phase isolation errors)
