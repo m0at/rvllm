@@ -26,7 +26,11 @@ impl CublasHandle {
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS init failed: {e}")))?;
-        Ok(Self { blas, stream, graph_workspace: None })
+        Ok(Self {
+            blas,
+            stream,
+            graph_workspace: None,
+        })
     }
 
     /// Returns a reference to the underlying stream.
@@ -50,11 +54,10 @@ impl CublasHandle {
             "allocating cuBLAS graph workspace"
         );
 
-        let mut ws = self.stream
+        let mut ws = self
+            .stream
             .alloc_zeros::<u8>(CUBLAS_GRAPH_WORKSPACE_BYTES)
-            .map_err(|e| crate::LLMError::GpuError(
-                format!("cuBLAS workspace alloc: {e}")
-            ))?;
+            .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS workspace alloc: {e}")))?;
 
         // Get raw device pointer and call cublasSetWorkspace_v2 in a scoped
         // borrow so we can move `ws` into self.graph_workspace afterwards.
@@ -67,9 +70,9 @@ impl CublasHandle {
                     CUBLAS_GRAPH_WORKSPACE_BYTES,
                 );
                 if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                    return Err(crate::LLMError::GpuError(
-                        format!("cublasSetWorkspace_v2 failed: {status:?}")
-                    ));
+                    return Err(crate::LLMError::GpuError(format!(
+                        "cublasSetWorkspace_v2 failed: {status:?}"
+                    )));
                 }
             }
         }
@@ -260,9 +263,9 @@ impl CublasHandle {
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP,
             );
             if status != CUBLAS_STATUS_SUCCESS {
-                return Err(crate::LLMError::GpuError(
-                    format!("cublasGemmEx (f16xf16->f32) failed: {status:?}")
-                ));
+                return Err(crate::LLMError::GpuError(format!(
+                    "cublasGemmEx (f16xf16->f32) failed: {status:?}"
+                )));
             }
         }
         Ok(())
@@ -293,17 +296,22 @@ impl CublasHandle {
     /// This halves memory bandwidth for weight-bound operations (all linear
     /// projections in the transformer), which is the primary bottleneck for
     /// inference at moderate batch sizes.
-    pub fn hgemm(
+    pub fn hgemm<A, B, C>(
         &self,
         m: usize,
         n: usize,
         k: usize,
         alpha: half::f16,
-        a: &CudaSlice<half::f16>,
-        b: &CudaSlice<half::f16>,
+        a: &A,
+        b: &B,
         beta: half::f16,
-        c: &mut CudaSlice<half::f16>,
-    ) -> Result<()> {
+        c: &mut C,
+    ) -> Result<()>
+    where
+        A: DevicePtr<half::f16>,
+        B: DevicePtr<half::f16>,
+        C: DevicePtrMut<half::f16>,
+    {
         // Same mapping as sgemm: C[m,n] = A[m,k] @ B[n,k]^T
         unsafe {
             self.blas
