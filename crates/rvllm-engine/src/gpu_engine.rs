@@ -420,6 +420,17 @@ mod inner {
     }
 
     impl GpuLLMEngine {
+        fn finalize_non_beam_output(req: &EngineRequest, output: RequestOutput) -> RequestOutput {
+            if output.finished
+                && req.sampling_params.best_of > 1
+                && !req.sampling_params.use_beam_search
+            {
+                crate::best_of_n::build_best_of_n_output(output, &req.seq_states)
+            } else {
+                output
+            }
+        }
+
         pub fn new(config: EngineConfig) -> Result<Self> {
             let model_name = &config.model.model_path;
             info!(model = %model_name, "GpuLLMEngine: initializing");
@@ -1209,12 +1220,13 @@ mod inner {
                         }
                     }
 
-                    OutputProcessor::build_request_output(
+                    let output = OutputProcessor::build_request_output(
                         request_id,
                         &req.prompt,
                         &req.prompt_token_ids,
                         &req.seq_states,
-                    )
+                    );
+                    Self::finalize_non_beam_output(req, output)
                 };
                 results.push(output);
             }
@@ -1457,6 +1469,80 @@ mod inner {
     }
 
     unsafe impl Send for GpuLLMEngine {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn make_state(
+            text: &str,
+            token_ids: &[TokenId],
+            cumulative_logprob: f32,
+        ) -> SequenceOutputState {
+            SequenceOutputState {
+                text: text.to_string(),
+                token_ids: token_ids.to_vec(),
+                cumulative_logprob,
+                logprobs: Vec::new(),
+                finish_reason: Some(FinishReason::Stop),
+            }
+        }
+
+        fn make_request(best_of: usize, use_beam_search: bool) -> EngineRequest {
+            let mut sampling_params = SamplingParams::default();
+            sampling_params.best_of = best_of;
+            sampling_params.use_beam_search = use_beam_search;
+
+            EngineRequest {
+                request_id: RequestId(1),
+                prompt: "prompt".into(),
+                prompt_token_ids: vec![1, 2, 3],
+                sampling_params,
+                seq_states: vec![
+                    make_state("first", &[10], -2.0),
+                    make_state("second", &[11], -1.0),
+                ],
+                beam_search: None,
+            }
+        }
+
+        #[test]
+        fn finalize_non_beam_output_selects_best_of_winner() {
+            let req = make_request(2, false);
+            let output = OutputProcessor::build_request_output(
+                req.request_id,
+                &req.prompt,
+                &req.prompt_token_ids,
+                &req.seq_states,
+            );
+
+            let finalized = GpuLLMEngine::finalize_non_beam_output(&req, output);
+
+            assert!(finalized.finished);
+            assert_eq!(finalized.outputs.len(), 1);
+            assert_eq!(finalized.outputs[0].index, 0);
+            assert_eq!(finalized.outputs[0].text, "second");
+            assert_eq!(finalized.outputs[0].token_ids, vec![11]);
+            assert_eq!(finalized.outputs[0].cumulative_logprob, -1.0);
+        }
+
+        #[test]
+        fn finalize_non_beam_output_leaves_beam_requests_unchanged() {
+            let req = make_request(2, true);
+            let output = OutputProcessor::build_request_output(
+                req.request_id,
+                &req.prompt,
+                &req.prompt_token_ids,
+                &req.seq_states,
+            );
+
+            let finalized = GpuLLMEngine::finalize_non_beam_output(&req, output);
+
+            assert_eq!(finalized.outputs.len(), 2);
+            assert_eq!(finalized.outputs[0].text, "first");
+            assert_eq!(finalized.outputs[1].text, "second");
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
