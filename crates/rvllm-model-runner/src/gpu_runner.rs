@@ -1744,8 +1744,12 @@ mod cuda_impl {
                     .get(name)
                     .ok_or_else(|| LLMError::GpuError(format!("missing weight: {name}")))
             };
+            // When f32 weights are dropped (f16 path active), use embed_tokens as a
+            // dummy for the f32 norm fields. The f16 forward path uses the _f16 variants.
+            let dummy_f32 = &self.embed_tokens;
             Ok(GpuLayerWeightsF16 {
-                input_layernorm: g_f32(&format!("model.layers.{i}.input_layernorm.weight"))?,
+                input_layernorm: g_f32(&format!("model.layers.{i}.input_layernorm.weight"))
+                    .unwrap_or(dummy_f32),
                 q_proj: g_f16(&format!("model.layers.{i}.self_attn.q_proj.weight"))?,
                 k_proj: g_f16(&format!("model.layers.{i}.self_attn.k_proj.weight"))?,
                 v_proj: g_f16(&format!("model.layers.{i}.self_attn.v_proj.weight"))?,
@@ -1761,7 +1765,7 @@ mod cuda_impl {
                     .get(&format!("model.layers.{i}.self_attn.v_proj.bias")),
                 post_attention_layernorm: g_f32(&format!(
                     "model.layers.{i}.post_attention_layernorm.weight"
-                ))?,
+                )).unwrap_or(dummy_f32),
                 gate_proj: g_f16(&format!("model.layers.{i}.mlp.gate_proj.weight"))?,
                 up_proj: g_f16(&format!("model.layers.{i}.mlp.up_proj.weight"))?,
                 down_proj: g_f16(&format!("model.layers.{i}.mlp.down_proj.weight"))?,
