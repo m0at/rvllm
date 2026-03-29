@@ -348,6 +348,33 @@ pub struct GpuWorker {
     pending_sync_output: Option<(ForwardOutput, Vec<SequenceGroupMetadata>)>,
 }
 
+fn uses_compact_logits(
+    logits_len: usize,
+    metadata: &[SequenceGroupMetadata],
+    vocab_size: usize,
+) -> bool {
+    logits_len
+        == metadata
+            .iter()
+            .map(|group| group.seq_data.len())
+            .sum::<usize>()
+            * vocab_size
+}
+
+fn logits_rows_for_sequence(
+    is_prompt: bool,
+    seq_data: &SequenceData,
+    compact_logits: bool,
+) -> usize {
+    if compact_logits {
+        1
+    } else if is_prompt {
+        seq_data.prompt_token_ids.len()
+    } else {
+        1
+    }
+}
+
 impl GpuWorker {
     pub fn new(config: WorkerConfig) -> Result<Self> {
         let device_id = config.device_id;
@@ -1479,16 +1506,14 @@ impl GpuWorker {
         let vocab_size = self.vocab_size;
         let mut results = Vec::new();
         let mut offset = 0;
+        let compact_logits = uses_compact_logits(logits.len(), metadata, vocab_size);
 
         for group in metadata {
             for (seq_id, seq_data) in &group.seq_data {
-                let num_tokens = if group.is_prompt {
-                    seq_data.prompt_token_ids.len()
-                } else {
-                    1
-                };
+                let num_logits_rows =
+                    logits_rows_for_sequence(group.is_prompt, seq_data, compact_logits);
 
-                let last_logit_start = offset + (num_tokens - 1) * vocab_size;
+                let last_logit_start = offset + (num_logits_rows - 1) * vocab_size;
                 let last_logit_end = last_logit_start + vocab_size;
 
                 let (token_id, logprob, top_logprobs) = if last_logit_end <= logits.len() {
@@ -1552,7 +1577,7 @@ impl GpuWorker {
                     top_logprobs,
                 });
 
-                offset += num_tokens * vocab_size;
+                offset += num_logits_rows * vocab_size;
             }
         }
 
@@ -1688,6 +1713,9 @@ fn gpu_err(e: impl std::fmt::Display) -> LLMError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    use rvllm_core::prelude::SamplingParams;
     use rvllm_core::prelude::{RequestId, SequenceId};
 
     fn make_seq_data(prompt: Vec<TokenId>, output: Vec<TokenId>) -> SequenceData {
@@ -1774,5 +1802,29 @@ mod tests {
 
         // Layer 1 should still be empty
         assert_eq!(cache.keys(1).len(), 0);
+    }
+
+    #[test]
+    fn compact_logits_detection_matches_one_row_per_sequence() {
+        let group = SequenceGroupMetadata {
+            request_id: RequestId(1),
+            is_prompt: true,
+            seq_data: HashMap::from([
+                (SequenceId(10), make_seq_data(vec![1, 2, 3], vec![])),
+                (SequenceId(11), make_seq_data(vec![4, 5], vec![])),
+            ]),
+            sampling_params: SamplingParams::default(),
+            block_tables: HashMap::new(),
+        };
+
+        assert!(uses_compact_logits(2 * 32, &[group], 32));
+    }
+
+    #[test]
+    fn compact_logits_prefill_uses_single_row() {
+        let seq = make_seq_data(vec![1, 2, 3, 4], vec![]);
+        assert_eq!(logits_rows_for_sequence(true, &seq, true), 1);
+        assert_eq!(logits_rows_for_sequence(true, &seq, false), 4);
+        assert_eq!(logits_rows_for_sequence(false, &seq, false), 1);
     }
 }

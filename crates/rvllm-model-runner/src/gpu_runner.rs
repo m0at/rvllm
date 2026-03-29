@@ -10,10 +10,13 @@
 // =========================================================================
 //  CUDA implementation
 // =========================================================================
-/// Output of a forward pass -- either full logits or just argmax token IDs.
+/// Output of a forward pass -- either logits or just argmax token IDs.
 #[derive(Debug, Clone)]
 pub enum ForwardOutput {
-    /// Full logits buffer: [num_tokens * vocab_size] f32.
+    /// Logits buffer: [num_rows * vocab_size] f32.
+    ///
+    /// For prefill, this contains only the final-token logits for each
+    /// sequence.
     Logits(Vec<f32>),
     /// GPU-side argmax token IDs: [num_tokens] i32 (greedy fast path).
     TokenIds(Vec<i32>),
@@ -22,6 +25,17 @@ pub enum ForwardOutput {
     /// `sync_stream()` + read from the pinned buffer before using the data.
     /// Fields: (actual_batch_size,) -- the pinned buffer lives on the worker.
     TokenIdsPending { actual_batch: usize },
+}
+
+fn final_token_rows(query_lens: &[u32]) -> Vec<u32> {
+    query_lens
+        .iter()
+        .scan(0u32, |offset, &query_len| {
+            let last_row = *offset + query_len.saturating_sub(1);
+            *offset += query_len;
+            Some(last_row)
+        })
+        .collect()
 }
 
 #[cfg(feature = "cuda")]
@@ -48,7 +62,7 @@ mod cuda_impl {
     use rvllm_kv_cache::engine_cuda::CudaCacheEngine;
     use rvllm_model_loader::gpu_weights::GpuModelWeights;
 
-    use super::ForwardOutput;
+    use super::{final_token_rows, ForwardOutput};
 
     /// Reusable GPU buffer that grows as needed, eliminating per-step CUDA
     /// allocations on the hot decode path.
@@ -568,16 +582,67 @@ mod cuda_impl {
                 &self.blas,
             )?;
 
+            let selected_rows = final_token_rows(&attn_meta.query_lens);
+            let logits_rows = selected_rows.len().max(1);
+            let sampled_logits = if selected_rows.len() == num_tokens {
+                logits_gpu
+            } else {
+                self.gather_rows(&logits_gpu, &selected_rows, vocab_size, num_tokens)?
+            };
+
             if greedy_only {
-                let token_ids_gpu = self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?;
+                let token_ids_gpu = self.gpu_argmax(&sampled_logits, logits_rows, vocab_size)?;
                 let token_ids_cpu = self.stream.clone_dtoh(&token_ids_gpu)
                     .map_err(|e| LLMError::GpuError(format!("argmax DtoH: {e}")))?;
                 return Ok(ForwardOutput::TokenIds(token_ids_cpu));
             }
 
-            let logits_cpu = self.stream.clone_dtoh(&logits_gpu)
+            let logits_cpu = self.stream.clone_dtoh(&sampled_logits)
                 .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
             Ok(ForwardOutput::Logits(logits_cpu))
+        }
+
+        fn gather_rows(
+            &self,
+            table: &CudaSlice<f32>,
+            row_ids: &[u32],
+            row_width: usize,
+            num_rows: usize,
+        ) -> Result<CudaSlice<f32>> {
+            let row_ids_i32: Vec<i32> = row_ids.iter().map(|&row_id| row_id as i32).collect();
+            let row_ids_gpu = self
+                .stream
+                .clone_htod(&row_ids_i32)
+                .map_err(|e| LLMError::GpuError(format!("row_ids HtoD: {e}")))?;
+
+            let kernel = self
+                .loader
+                .get_func("embedding_gather", "embedding_gather_kernel")?;
+            let output = self
+                .stream
+                .alloc_zeros::<f32>(row_ids.len() * row_width)
+                .map_err(|e| LLMError::GpuError(format!("row gather alloc: {e}")))?;
+
+            let block_dim = row_width.min(1024) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (row_ids.len() as u32, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                self.stream
+                    .launch_builder(&kernel)
+                    .arg(&output)
+                    .arg(table)
+                    .arg(&row_ids_gpu)
+                    .arg(&(row_width as i32))
+                    .arg(&(num_rows as i32))
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("row gather launch: {e}")))?;
+            }
+
+            Ok(output)
         }
 
         /// Upload all per-step metadata into persistent GPU buffers.
@@ -1493,5 +1558,11 @@ mod tests {
             assert_eq!(runner.config().num_layers, 4);
             assert_eq!(runner.config().vocab_size, 32000);
         }
+    }
+
+    #[test]
+    fn final_token_rows_selects_last_row_per_sequence() {
+        assert_eq!(final_token_rows(&[3, 1, 4]), vec![2, 3, 7]);
+        assert_eq!(final_token_rows(&[1]), vec![0]);
     }
 }
