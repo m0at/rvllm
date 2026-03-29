@@ -45,29 +45,7 @@ These are well-scoped features with clear specs. Each one is a meaningful contri
 
 ---
 
-### 2. Beam Search and Best-of-N
-
-**Crate:** `rvllm-engine`, `rvllm-block-manager`, `rvllm-sequence`
-**Difficulty:** Medium
-**Impact:** Medium -- needed for summarization, translation, and quality-sensitive applications
-
-**What to build:**
-- `crates/rvllm-engine/src/beam_search.rs` -- maintain K beams per request
-- Each beam is a `Sequence` that shares prompt KV cache blocks via copy-on-write
-- At each step: expand each beam by top-K tokens, score, prune to K best
-- Best-of-N: run N independent samples, return highest cumulative logprob
-- Use `BlockManager::fork()` for CoW KV cache sharing between beams
-
-**The data structures already exist:**
-- `SequenceGroup` supports multiple `Sequence` objects (beam candidates)
-- `BlockManager` has `fork()` and reference counting on physical blocks
-- `SamplingParams` has `best_of` and `use_beam_search` fields
-
-**What's missing:** wiring these into the `GpuLLMEngine::step()` loop.
-
----
-
-### 3. Batch Processing API
+### 2. Batch Processing API
 
 **Crate:** `rvllm-api`, `rvllm-engine`
 **Difficulty:** Medium
@@ -85,7 +63,7 @@ These are well-scoped features with clear specs. Each one is a meaningful contri
 
 ---
 
-### 4. Embedding Model Support
+### 3. Embedding Model Support
 
 **Crate:** `rvllm-model-runner`, `rvllm-api`
 **Difficulty:** Medium
@@ -103,7 +81,7 @@ These are well-scoped features with clear specs. Each one is a meaningful contri
 
 ---
 
-### 5. Vision-Language Models
+### 4. Vision-Language Models
 
 **Crate:** `rvllm-model-runner`, `rvllm-tokenizer`, `rvllm-api`
 **Difficulty:** Very Hard
@@ -121,7 +99,7 @@ These are well-scoped features with clear specs. Each one is a meaningful contri
 
 ---
 
-### 6. Pipeline Parallelism
+### 5. Pipeline Parallelism
 
 **Crate:** `rvllm-executor`, `rvllm-worker`
 **Difficulty:** Hard
