@@ -123,6 +123,12 @@ impl CudaGraphPool {
         self.graphs.get(&padded)
     }
 
+    /// Get graph for exact batch size (no padding).
+    pub fn get_exact(&self, batch_size: usize) -> Option<&CudaGraph> {
+        if !self.enabled { return None; }
+        self.graphs.get(&batch_size)
+    }
+
     pub fn has_graph(&self, actual_batch_size: usize) -> bool {
         padded_batch_size(actual_batch_size)
             .map(|p| self.graphs.contains_key(&p))

@@ -1062,8 +1062,130 @@ impl GpuWorker {
     ) -> Result<ForwardOutput> {
         self.forward_count += 1;
 
-        // Use raw forward for everything. No padding. No graphs.
+        // Only use graphs for pure decode steps with greedy sampling
+        let is_decode = !model_input.is_prefill
+            && model_input.attention_metadata.query_lens.iter().all(|&q| q == 1);
+
+        if !is_decode || !greedy_only || !self.graph_runner.is_enabled() {
+            return self.raw_gpu_forward_ex(model_input, greedy_only);
+        }
+
+        let batch = model_input.num_tokens();
+
+        // Graph replay: exact batch size match only. No padding.
+        if self.graph_runner.has_graph_for_exact(batch) {
+            return self.gpu_forward_ex_graphed_exact(model_input, batch, greedy_only);
+        }
+
+        // Graph capture: only after seeing this exact batch size N times.
+        // No padding. If capture fails, mark as uncapturable, never retry.
+        if self.forward_count > Self::GRAPH_WARMUP_CALLS
+            && !self.graph_runner.was_capture_attempted(batch)
+            && batch <= 32  // only capture for small batches (larger ones OOM)
+        {
+            match self.try_capture_graph_exact(model_input, batch, greedy_only) {
+                Ok(output) => return Ok(output),
+                Err(_) => {} // fall through to raw
+            }
+        }
+
+        // Default: raw forward, no padding, no graphs
         self.raw_gpu_forward_ex(model_input, greedy_only)
+    }
+
+    /// Replay a captured graph for an exact batch size. No padding.
+    #[cfg(feature = "cuda")]
+    fn gpu_forward_ex_graphed_exact(
+        &mut self,
+        model_input: &ModelInput,
+        batch: usize,
+        _greedy_only: bool,
+    ) -> Result<ForwardOutput> {
+        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
+            LLMError::GpuError("GPU model runner not initialized".into())
+        })?;
+
+        runner.upload_metadata(
+            &model_input.token_ids,
+            &model_input.position_ids,
+            &model_input.attention_metadata,
+        )?;
+
+        let graph = self.graph_runner.pool().get_exact(batch).ok_or_else(|| {
+            LLMError::GpuError(format!("no graph for exact batch {batch}"))
+        })?;
+        graph.replay(&self.compute_stream)?;
+
+        let ids = runner.read_graph_output(batch)?;
+        Ok(ForwardOutput::TokenIds(ids))
+    }
+
+    /// Try to capture a graph for an exact batch size. No padding.
+    /// Returns Ok(output) if capture + first replay succeeded.
+    /// Returns Err if capture failed (OOM, etc). Marks as attempted either way.
+    #[cfg(feature = "cuda")]
+    fn try_capture_graph_exact(
+        &mut self,
+        model_input: &ModelInput,
+        batch: usize,
+        _greedy_only: bool,
+    ) -> Result<ForwardOutput> {
+        let num_seqs = model_input.attention_metadata.context_lens.len();
+        let max_context_len = model_input.attention_metadata.max_context_len;
+
+        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
+            LLMError::GpuError("GPU model runner not initialized".into())
+        })?;
+
+        info!(batch, "capturing CUDA graph for exact batch size");
+
+        // Warmup forward (outside capture)
+        runner.upload_metadata(
+            &model_input.token_ids,
+            &model_input.position_ids,
+            &model_input.attention_metadata,
+        )?;
+        runner.forward_gpu_only(batch, num_seqs, max_context_len, false)?;
+
+        // Sync before capture
+        let cuda_stream = runner.cuda_stream().clone();
+        cuda_stream.synchronize()
+            .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
+
+        // Re-upload metadata
+        runner.upload_metadata(
+            &model_input.token_ids,
+            &model_input.position_ids,
+            &model_input.attention_metadata,
+        )?;
+
+        // Capture
+        let capture_result = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream);
+        if let Err(e) = capture_result {
+            warn!(batch, "graph capture begin failed: {e}");
+            self.graph_runner.mark_captured(batch);
+            return Err(LLMError::GpuError(format!("graph capture failed: {e}")));
+        }
+
+        let fwd_result = runner.forward_gpu_only(batch, num_seqs, max_context_len, false);
+
+        match fwd_result {
+            Ok(()) => {
+                let graph = self.graph_runner.pool_mut().end_capture_on(&cuda_stream, batch)?;
+                self.graph_runner.pool_mut().insert(graph);
+                self.graph_runner.mark_captured(batch);
+                info!(batch, "CUDA graph captured for exact batch size");
+
+                let ids = runner.read_graph_output(batch)?;
+                Ok(ForwardOutput::TokenIds(ids))
+            }
+            Err(e) => {
+                warn!(batch, "graph capture forward failed: {e}");
+                let _ = self.graph_runner.pool_mut().end_capture_on(&cuda_stream, batch);
+                self.graph_runner.mark_captured(batch);
+                Err(e)
+            }
+        }
     }
 
     /// Run a padded decode forward with CUDA graph capture or replay.

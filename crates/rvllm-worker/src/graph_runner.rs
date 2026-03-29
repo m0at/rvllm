@@ -179,6 +179,11 @@ impl GraphRunner {
         self.pool.has_graph(batch_size)
     }
 
+    /// Check if a graph exists for this EXACT batch size (no padding lookup).
+    pub fn has_graph_for_exact(&self, batch_size: usize) -> bool {
+        self.pool.get_exact(batch_size).is_some()
+    }
+
     /// Record that a graph capture was attempted for a batch size.
     pub fn mark_captured(&mut self, padded_batch_size: usize) {
         self.captured.insert(padded_batch_size, true);
