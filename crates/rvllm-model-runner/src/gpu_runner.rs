@@ -827,8 +827,8 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            let profile = std::env::var("RVLLM_PROFILE").is_ok();
-            let profile_t0 = if profile { self.stream.synchronize().ok(); Some(std::time::Instant::now()) } else { None };
+            // NOTE: No profiling in forward_gpu_only -- this is captured into CUDA graphs.
+            // stream.synchronize() during capture would invalidate the graph.
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
@@ -851,18 +851,8 @@ mod cuda_impl {
                 };
                 let weights = self.layer_weights(layer_idx)?;
                 let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
-                if profile && layer_idx == 0 {
-                    self.stream.synchronize().ok();
-                    let el = profile_t0.unwrap().elapsed();
-                    info!("PROFILE layer0 N={num_tokens} {:.3}ms", el.as_secs_f64() * 1000.0);
-                }
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
-            }
-            if let Some(t0) = profile_t0 {
-                self.stream.synchronize().ok();
-                let el = t0.elapsed();
-                info!("PROFILE all_layers N={num_tokens} {:.3}ms ({:.3}ms/layer)", el.as_secs_f64() * 1000.0, el.as_secs_f64() * 1000.0 / num_layers as f64);
             }
 
             // Final: fuse last layer's residual add with final RMSNorm
