@@ -412,10 +412,10 @@ mod cuda_impl {
         }
 
         /// Pre-allocate a reusable set of f16 scratch buffers for the forward pass.
-        /// Sized for max_batch_tokens (32). Since all layers are processed
+        /// Sized for max padded batch (256). Since all layers are processed
         /// sequentially, one set of buffers covers every layer.
         fn alloc_scratch(&mut self) -> Result<()> {
-            let max_tokens: usize = 32; // max padded batch
+            let max_tokens: usize = 256; // match GRAPH_BATCH_SIZES max
             let hidden = self.config.hidden_size;
             let q_dim = self.config.num_heads * self.config.head_dim;
             let kv_dim = self.config.num_kv_heads * self.config.head_dim;

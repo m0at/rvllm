@@ -27,7 +27,9 @@ Head-to-head on the same hardware, same model, greedy decoding, 32 tokens/reques
 | 4 | 825 | 842 | 0.98x |
 | 8 | 1,774 | 1,703 | **1.04x** |
 | 16 | 3,303 | 2,981 | **1.11x** |
-| 32 | **6,098** | 4,810 | **1.27x** |
+| 32 | **6,385** | 5,405 | **1.18x** |
+| 48 | 6,594 | 6,416 | **1.03x** |
+| 64+ | -- | scales to 15,414 (N=1024) | N>48 WIP |
 
 | Metric | rvLLM | Python vLLM |
 |---|---|---|
@@ -35,7 +37,7 @@ Head-to-head on the same hardware, same model, greedy decoding, 32 tokens/reques
 | Binary size | 16 MB | ~500 MB |
 | CPU memory | 348 MB | ~1 GB |
 
-rvLLM matches or beats Python vLLM across the board. 27% faster at N=32. Near-linear scaling to N=16. See [docs/update-log.md](docs/update-log.md) for the full optimization history.
+rvLLM matches or beats Python vLLM from N=1 through N=48. vLLM scales further at N>64 due to mature continuous batching. Closing this gap is the active priority. See [docs/update-log.md](docs/update-log.md) for the full optimization history.
 
 ### CPU Component Benchmarks (sampling, logit processing)
 
