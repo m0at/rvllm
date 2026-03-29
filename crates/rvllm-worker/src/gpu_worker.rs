@@ -1040,7 +1040,8 @@ impl GpuWorker {
 
             // Enqueue async DtoH into pinned buffer (returns immediately).
             let pinned = self.pinned_output.as_mut().unwrap();
-            runner.read_graph_output_async(pinned)?;
+            runner.read_graph_output_async(actual_batch, pinned.as_mut_slice()
+                .map_err(|e| LLMError::GpuError(format!("pinned slice: {e}")))?)?;
 
             if self.forward_count % 64 == 0 {
                 let upload_us = t_upload.as_micros();

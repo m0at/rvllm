@@ -1248,15 +1248,18 @@ mod cuda_impl {
         /// The caller must call `sync_stream()` before reading from `dst`.
         /// `dst` MUST be pinned host memory for truly async behavior; with
         /// pageable memory cuMemcpyDtoHAsync degrades to synchronous.
-        pub fn read_graph_output_async<Dst: cudarc::driver::HostSlice<i32> + ?Sized>(
+        pub fn read_graph_output_async(
             &self,
-            dst: &mut Dst,
+            num_tokens: usize,
+            dst: &mut [i32],
         ) -> Result<()> {
             let out = self.graph_output.borrow();
             let buf = out.as_ref().ok_or_else(|| {
                 LLMError::GpuError("graph_output not populated -- call forward_gpu_only first".into())
             })?;
-            self.stream.memcpy_dtoh(buf, dst)
+            // Only copy num_tokens elements (not the full padded buffer)
+            let src_view = buf.slice(..num_tokens);
+            self.stream.memcpy_dtoh(&src_view, &mut dst[..num_tokens])
                 .map_err(|e| LLMError::GpuError(format!("graph_output async DtoH: {e}")))?;
             Ok(())
         }
