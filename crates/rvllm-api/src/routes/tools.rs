@@ -385,10 +385,15 @@ pub async fn create_chat_completion_with_tools(
     // Build messages, optionally augmented with tool definitions
     let messages = if tools_active {
         let tool_defs = req.to_tool_definitions();
+        let tool_prompt_style = if req.use_beam_search {
+            rvllm_tokenizer::ToolPromptStyle::GenericJson
+        } else {
+            rvllm_tokenizer::ToolPromptStyle::Hermes
+        };
         augment_messages_with_tools(
             &req.messages,
             &tool_defs,
-            rvllm_tokenizer::ToolPromptStyle::Hermes,
+            tool_prompt_style,
         )
     } else {
         req.messages.clone()

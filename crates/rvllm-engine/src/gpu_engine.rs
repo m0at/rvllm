@@ -591,6 +591,11 @@ mod inner {
                 seq_states.push(SequenceOutputState::new());
                 initial_seq_ids.push(seq_id);
             }
+            if params.use_beam_search {
+                for seq in seqs.iter_mut().skip(1) {
+                    let _ = seq.set_status(SequenceStatus::FinishedAborted);
+                }
+            }
 
             let seq_group = SequenceGroup::new(
                 request_id,
@@ -1002,12 +1007,18 @@ mod inner {
             }
 
             let step_result = beam.step(&expansions);
-            let mut recycled = step_result.seqs_to_free.iter().copied();
+            let mut recycled = step_result.seqs_to_free.into_iter();
             let mut fork_pairs = Vec::with_capacity(step_result.fork_ops.len());
             for op in step_result.fork_ops {
-                let seq_id = recycled.next().unwrap_or(op.parent_seq_id);
+                let seq_id = recycled
+                    .next()
+                    .or_else(|| beam.take_available_seq_id())
+                    .unwrap_or(op.parent_seq_id);
                 beam.set_beam_seq_id(op.new_beam_idx, seq_id);
                 fork_pairs.push((op.parent_seq_id, seq_id));
+            }
+            for seq_id in recycled {
+                beam.recycle_seq_id(seq_id);
             }
 
             BeamGroupUpdate {
@@ -1302,21 +1313,35 @@ mod inner {
                 std::collections::HashSet::new();
 
             for group in groups {
-                let use_beam_search = self
-                    .requests
-                    .get(&group.request_id)
-                    .map(|req| req.sampling_params.use_beam_search)
-                    .unwrap_or(false);
-                let is_prompt = group.get_seqs().iter().any(|s| s.get_output_len() == 0);
+                let Some(req) = self.requests.get(&group.request_id) else {
+                    continue;
+                };
+                let use_beam_search = req.sampling_params.use_beam_search;
+                let beam_prompt_token_ids = req.prompt_token_ids.clone();
+                let beam_active_beams = req
+                    .beam_search
+                    .as_ref()
+                    .map(|beam| beam.active_beams.clone())
+                    .unwrap_or_default();
+                let is_prompt = if use_beam_search {
+                    beam_active_beams.iter().all(|beam| beam.token_ids.is_empty())
+                } else {
+                    group.get_seqs()
+                        .iter()
+                        .filter(|seq| !seq.is_finished())
+                        .any(|seq| seq.get_output_len() == 0)
+                };
                 let mut seq_data = HashMap::new();
                 let mut block_tables = HashMap::new();
 
-                for seq in group.get_seqs() {
-                    if seq.is_finished() {
-                        continue;
-                    }
-                    if use_beam_search {
-                        let beam_alloc = self.beam_block_manager.allocate(seq);
+                if use_beam_search {
+                    for active in &beam_active_beams {
+                        let mut seq = Sequence::new(active.seq_id, beam_prompt_token_ids.clone());
+                        seq.output_token_ids = active.token_ids.clone();
+                        seq.cumulative_logprob = active.cumulative_logprob;
+                        seq.status = SequenceStatus::Running;
+
+                        let beam_alloc = self.beam_block_manager.allocate(&seq);
                         if beam_alloc.is_err() {
                             warn!(
                                 seq_id = seq.seq_id.0,
@@ -1324,7 +1349,7 @@ mod inner {
                             );
                             self.scheduler
                                 .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
-                            self.beam_block_manager.free(seq);
+                            self.beam_block_manager.free(&seq);
                             aborted_seqs.insert(seq.seq_id);
                             continue;
                         }
@@ -1334,13 +1359,27 @@ mod inner {
                             None => {
                                 self.scheduler
                                     .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
-                                self.beam_block_manager.free(seq);
+                                self.beam_block_manager.free(&seq);
                                 aborted_seqs.insert(seq.seq_id);
                                 continue;
                             }
                         };
                         block_tables.insert(seq.seq_id, table);
-                    } else {
+                        seq_data.insert(
+                            seq.seq_id,
+                            SequenceData {
+                                prompt_token_ids: beam_prompt_token_ids.clone(),
+                                output_token_ids: active.token_ids.clone(),
+                                cumulative_logprob: active.cumulative_logprob,
+                            },
+                        );
+                    }
+                } else {
+                    for seq in group.get_seqs() {
+                        if seq.is_finished() {
+                            continue;
+                        }
+
                         let total_tokens = seq.prompt_token_ids.len() + seq.output_token_ids.len();
                         // +1 headroom: pre-allocate for the token about to be generated this step
                         let needed_blocks = (total_tokens + 1 + block_size - 1) / block_size;
@@ -1382,16 +1421,15 @@ mod inner {
                         }
 
                         block_tables.insert(seq.seq_id, existing.clone());
+                        seq_data.insert(
+                            seq.seq_id,
+                            SequenceData {
+                                prompt_token_ids: seq.prompt_token_ids.clone(),
+                                output_token_ids: seq.output_token_ids.clone(),
+                                cumulative_logprob: seq.cumulative_logprob,
+                            },
+                        );
                     }
-
-                    seq_data.insert(
-                        seq.seq_id,
-                        SequenceData {
-                            prompt_token_ids: seq.prompt_token_ids.clone(),
-                            output_token_ids: seq.output_token_ids.clone(),
-                            cumulative_logprob: seq.cumulative_logprob,
-                        },
-                    );
                 }
 
                 // Only emit metadata if the group still has live sequences.

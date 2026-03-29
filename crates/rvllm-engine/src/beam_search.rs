@@ -93,6 +93,8 @@ pub struct BeamSearchState {
     pub early_stopping: bool,
     /// Active beams being expanded.
     pub active_beams: Vec<BeamHypothesis>,
+    /// Preallocated sequence IDs that can be used for future forks.
+    pub available_seq_ids: Vec<SequenceId>,
     /// Completed hypotheses (finished beams).
     pub completed: Vec<BeamHypothesis>,
     /// Maximum output tokens.
@@ -109,10 +111,15 @@ impl BeamSearchState {
         early_stopping: bool,
         initial_seq_ids: &[SequenceId],
     ) -> Self {
-        let active_beams = initial_seq_ids
-            .iter()
-            .map(|&sid| BeamHypothesis::new(sid))
-            .collect();
+        let (active_beams, available_seq_ids) =
+            if let Some((first_seq_id, remaining_seq_ids)) = initial_seq_ids.split_first() {
+                (
+                    vec![BeamHypothesis::new(*first_seq_id)],
+                    remaining_seq_ids.to_vec(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
 
         Self {
             request_id,
@@ -120,6 +127,7 @@ impl BeamSearchState {
             length_penalty,
             early_stopping,
             active_beams,
+            available_seq_ids,
             completed: Vec::new(),
             max_tokens,
         }
@@ -285,6 +293,18 @@ impl BeamSearchState {
         }
     }
 
+    /// Consume one parked sequence ID for a new forked beam.
+    pub fn take_available_seq_id(&mut self) -> Option<SequenceId> {
+        self.available_seq_ids.pop()
+    }
+
+    /// Return an unused sequence ID to the parked pool.
+    pub fn recycle_seq_id(&mut self, seq_id: SequenceId) {
+        if !self.available_seq_ids.contains(&seq_id) {
+            self.available_seq_ids.push(seq_id);
+        }
+    }
+
     /// Build the final `RequestOutput` from the best completed hypothesis.
     ///
     /// If `n_best` > 1, returns the top N completed hypotheses sorted by score.
@@ -417,6 +437,15 @@ mod tests {
         BeamSearchState::new(RequestId(1), num_beams, 10, 1.0, false, &seq_ids)
     }
 
+    fn make_multi_active_state(num_beams: usize) -> BeamSearchState {
+        let mut state = make_state(num_beams);
+        state.active_beams = (0..num_beams)
+            .map(|i| BeamHypothesis::new(SequenceId(i as u64)))
+            .collect();
+        state.available_seq_ids.clear();
+        state
+    }
+
     #[test]
     fn beam_hypothesis_score() {
         let mut h = BeamHypothesis::new(SequenceId(0));
@@ -453,14 +482,16 @@ mod tests {
     #[test]
     fn new_state_has_active_beams() {
         let state = make_state(3);
-        assert_eq!(state.active_beams.len(), 3);
+        assert_eq!(state.active_beams.len(), 1);
+        assert_eq!(state.active_beams[0].seq_id, SequenceId(0));
+        assert_eq!(state.available_seq_ids, vec![SequenceId(1), SequenceId(2)]);
         assert!(state.completed.is_empty());
         assert!(!state.is_finished());
     }
 
     #[test]
     fn step_prunes_to_num_beams() {
-        let mut state = make_state(2);
+        let mut state = make_multi_active_state(2);
 
         let mut expansions = HashMap::new();
         // Beam 0: two expansions
@@ -495,7 +526,7 @@ mod tests {
 
     #[test]
     fn step_forks_when_same_parent_reused() {
-        let mut state = make_state(2);
+        let mut state = make_multi_active_state(2);
 
         let mut expansions = HashMap::new();
         // Beam 0: both top-2 candidates come from here
@@ -527,7 +558,7 @@ mod tests {
 
     #[test]
     fn step_moves_terminal_to_completed() {
-        let mut state = make_state(2);
+        let mut state = make_multi_active_state(2);
 
         let mut expansions = HashMap::new();
         expansions.insert(
@@ -716,6 +747,11 @@ mod tests {
             true,
             &[SequenceId(0), SequenceId(1)],
         );
+        state.active_beams = vec![
+            BeamHypothesis::new(SequenceId(0)),
+            BeamHypothesis::new(SequenceId(1)),
+        ];
+        state.available_seq_ids.clear();
         state.completed.push(BeamHypothesis {
             seq_id: SequenceId(2),
             token_ids: vec![10, 11],

@@ -13,12 +13,13 @@ import os, json, requests, pytest
 
 BASE_URL = os.environ.get("RVLLM_URL", "http://localhost:8000")
 OPENAI_BASE_URL = f"{BASE_URL}/v1"
+MODEL_NAME = os.environ.get("RVLLM_MODEL", "test")
 
 class TestCompletions:
     def test_basic_completion(self):
         """POST /v1/completions with minimal params"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test", "prompt": "Hello", "max_tokens": 5
+            "model": MODEL_NAME, "prompt": "Hello", "max_tokens": 5
         })
         assert r.status_code == 200
         data = r.json()
@@ -30,7 +31,7 @@ class TestCompletions:
     def test_completion_with_params(self):
         """All sampling params work"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test", "prompt": "The sky is",
+            "model": MODEL_NAME, "prompt": "The sky is",
             "max_tokens": 10, "temperature": 0.8,
             "top_p": 0.9, "top_k": 50,
             "presence_penalty": 0.1, "frequency_penalty": 0.1,
@@ -40,7 +41,7 @@ class TestCompletions:
     def test_completion_n(self):
         """n parameter generates multiple choices"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test", "prompt": "Hello", "max_tokens": 5, "n": 2
+            "model": MODEL_NAME, "prompt": "Hello", "max_tokens": 5, "n": 2
         })
         assert r.status_code == 200
         # Should have 2 choices (or 1 if n>1 not yet supported)
@@ -48,7 +49,7 @@ class TestCompletions:
     def test_completion_stream(self):
         """Streaming via SSE works"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test", "prompt": "Hello", "max_tokens": 5, "stream": True
+            "model": MODEL_NAME, "prompt": "Hello", "max_tokens": 5, "stream": True
         }, stream=True)
         assert r.status_code == 200
         chunks = []
@@ -61,7 +62,7 @@ class TestCompletions:
     def test_completion_stop(self):
         """Stop strings work"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test", "prompt": "Count: 1, 2, 3,",
+            "model": MODEL_NAME, "prompt": "Count: 1, 2, 3,",
             "max_tokens": 20, "stop": ["\n"]
         })
         assert r.status_code == 200
@@ -70,7 +71,7 @@ class TestChat:
     def test_basic_chat(self):
         """POST /v1/chat/completions"""
         r = requests.post(f"{BASE_URL}/v1/chat/completions", json={
-            "model": "test",
+            "model": MODEL_NAME,
             "messages": [{"role": "user", "content": "Hi"}],
             "max_tokens": 5
         })
@@ -82,7 +83,7 @@ class TestChat:
     def test_chat_system_message(self):
         """System messages work"""
         r = requests.post(f"{BASE_URL}/v1/chat/completions", json={
-            "model": "test",
+            "model": MODEL_NAME,
             "messages": [
                 {"role": "system", "content": "You are helpful"},
                 {"role": "user", "content": "Hi"}
@@ -94,7 +95,7 @@ class TestChat:
     def test_chat_stream(self):
         """Chat streaming works"""
         r = requests.post(f"{BASE_URL}/v1/chat/completions", json={
-            "model": "test",
+            "model": MODEL_NAME,
             "messages": [{"role": "user", "content": "Hi"}],
             "max_tokens": 5, "stream": True
         }, stream=True)
@@ -349,7 +350,7 @@ class TestBeamSearch:
     def test_beam_search_completion(self):
         """Beam search completion works end to end"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test",
+            "model": MODEL_NAME,
             "prompt": "Summarize beam search in one sentence.",
             "max_tokens": 8,
             "n": 2,
@@ -366,7 +367,7 @@ class TestBeamSearch:
     def test_beam_search_streaming_rejected(self):
         """Beam search rejects streaming requests"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test",
+            "model": MODEL_NAME,
             "prompt": "Hello",
             "max_tokens": 5,
             "n": 2,
@@ -378,7 +379,7 @@ class TestBeamSearch:
     def test_beam_search_invalid_length_penalty_rejected(self):
         """Invalid beam search controls are rejected"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test",
+            "model": MODEL_NAME,
             "prompt": "Hello",
             "max_tokens": 5,
             "n": 2,
@@ -405,7 +406,7 @@ class TestResponseFormat:
     def test_completion_response_format(self):
         """Response matches OpenAI format exactly"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test", "prompt": "Hi", "max_tokens": 3
+            "model": MODEL_NAME, "prompt": "Hi", "max_tokens": 3
         })
         data = r.json()
         # Required fields per OpenAI spec
@@ -422,7 +423,7 @@ class TestResponseFormat:
     def test_chat_response_format(self):
         """Chat response matches OpenAI format"""
         r = requests.post(f"{BASE_URL}/v1/chat/completions", json={
-            "model": "test",
+            "model": MODEL_NAME,
             "messages": [{"role": "user", "content": "Hi"}],
             "max_tokens": 3
         })
@@ -455,14 +456,14 @@ class TestErrorHandling:
     def test_missing_prompt(self):
         """Error on missing required field"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test", "max_tokens": 5
+            "model": MODEL_NAME, "max_tokens": 5
         })
         assert r.status_code in [400, 422]
 
     def test_invalid_temperature(self):
         """Error on invalid temperature"""
         r = requests.post(f"{BASE_URL}/v1/completions", json={
-            "model": "test", "prompt": "Hi", "max_tokens": 5,
+            "model": MODEL_NAME, "prompt": "Hi", "max_tokens": 5,
             "temperature": -1.0
         })
         # Should either reject or clamp

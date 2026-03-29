@@ -23,7 +23,7 @@ use rvllm_core::prelude::{
     FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams, SequenceId,
     TokenId,
 };
-use rvllm_sequence::{Sequence, SequenceGroup, SequenceGroupMetadata};
+use rvllm_sequence::{Sequence, SequenceGroup, SequenceGroupMetadata, SequenceStatus};
 use rvllm_tokenizer::Tokenizer;
 
 use crate::beam_search::{top_k_from_logprobs, BeamSearchState};
@@ -290,6 +290,11 @@ impl LLMEngine {
             seqs.push(Sequence::new(seq_id, prompt_token_ids.clone()));
             seq_states.push(SequenceOutputState::new());
         }
+        if sampling_params.use_beam_search {
+            for seq in seqs.iter_mut().skip(1) {
+                let _ = seq.set_status(SequenceStatus::FinishedAborted);
+            }
+        }
         let initial_seq_ids: Vec<SequenceId> = seqs.iter().map(|s| s.seq_id).collect();
 
         let seq_group = SequenceGroup::new(
@@ -523,8 +528,14 @@ impl LLMEngine {
         let step_result = beam.step(&expansions);
         let mut recycled = step_result.seqs_to_free.into_iter();
         for op in step_result.fork_ops {
-            let seq_id = recycled.next().unwrap_or(op.parent_seq_id);
+            let seq_id = recycled
+                .next()
+                .or_else(|| beam.take_available_seq_id())
+                .unwrap_or(op.parent_seq_id);
             beam.set_beam_seq_id(op.new_beam_idx, seq_id);
+        }
+        for seq_id in recycled {
+            beam.recycle_seq_id(seq_id);
         }
 
         beam.build_output(&req.prompt, &req.prompt_token_ids, 1)
