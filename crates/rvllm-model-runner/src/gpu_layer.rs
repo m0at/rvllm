@@ -723,6 +723,9 @@ mod inner {
                 .map_err(|e| LLMError::GpuError(format!("hgemm_dispatch: {e}")))?;
 
             // M=1: custom GEMV kernel (vectorized half2, warp shuffle reduction)
+            // TMA async-prefetch GEMV available but only benefits when weight > L2 cache.
+            // For standalone O-proj GEMV (~25MB), L2 handles it. TMA will be wired into
+            // the fused kernels where it matters (gateup 135MB weight reads).
             if m == 1 {
                 if let Ok(kernel) = loader.get_func("gemv_f16", "gemv_f16_kernel") {
                     let cfg = LaunchConfig {
