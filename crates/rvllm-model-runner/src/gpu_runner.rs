@@ -418,9 +418,14 @@ mod cuda_impl {
             info!(num_layers, qkv_dim, gate_up_dim, "fused QKV and gate+up weights (f16)");
 
             // FP8 weight quantization for ALL projection weights (when RVLLM_FP8_WEIGHTS=1)
+            // Note: FP8 only helps for M=1 decode (bandwidth-bound GEMV). For batched
+            // decode (M>=8), f16 tensor cores already saturate compute and FP8 adds
+            // cast overhead with no throughput gain. Use for latency-sensitive single-
+            // stream workloads, not high-throughput batch serving.
             if std::env::var("RVLLM_FP8_WEIGHTS").map_or(false, |v| v == "1") {
                 use rvllm_gpu::fp8_quantize::quantize_weight_fp8;
                 info!("quantizing ALL weights to FP8 E4M3 (per-row scales)...");
+                tracing::warn!("FP8 weights: improves single-stream decode latency but does NOT improve batched throughput. For high-concurrency serving, f16 is equivalent or faster.");
 
                 let q_dim = self.config.num_heads * self.config.head_dim;
                 let intermediate = self.config.intermediate_size;
