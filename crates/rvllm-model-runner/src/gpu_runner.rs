@@ -39,7 +39,7 @@ mod cuda_impl {
     use crate::runner::ModelRunnerConfig;
 
     use crate::gpu_layer::{
-        GpuLayerConfig, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer,
+        GpuLayerConfig, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer, LayerScratchRef,
     };
     use crate::layers::linear_cuda::CudaLinearLayer;
 
@@ -172,8 +172,8 @@ mod cuda_impl {
         fp8_down_proj_scale: Vec<CudaSlice<half::f16>>,
         /// FP8 input scratch buffer for cublasLt FP8 GEMM (reused across layers).
         fp8_input_scratch: Option<CudaSlice<u8>>,
-        /// Pre-allocated scratch buffers for the forward pass.
-        f16_scratch: Option<F16LayerScratch>,
+        /// Pre-allocated scratch buffers for the forward pass (RefCell for interior mutability).
+        f16_scratch: RefCell<Option<F16LayerScratch>>,
     }
 
     impl GpuModelRunner {
@@ -304,7 +304,7 @@ mod cuda_impl {
                 fp8_down_proj: Vec::new(),
                 fp8_down_proj_scale: Vec::new(),
                 fp8_input_scratch: None,
-                f16_scratch: None,
+                f16_scratch: RefCell::new(None),
             })
         }
 
@@ -500,14 +500,8 @@ mod cuda_impl {
 
             let total_bytes = (max_tokens * (qkv_dim + q_dim + hidden * 3 + intermediate * 3)) * 2;
             info!(max_tokens, total_bytes, "f16 layer scratch allocated");
-            self.f16_scratch = Some(scratch);
+            *self.f16_scratch.borrow_mut() = Some(scratch);
             Ok(())
-        }
-
-        /// Access the pre-allocated f16 scratch buffers.
-        /// Panics if called before fuse_weights().
-        pub fn f16_scratch(&self) -> &F16LayerScratch {
-            self.f16_scratch.as_ref().expect("f16_scratch not allocated; call fuse_weights() first")
         }
 
         pub fn forward(
@@ -575,6 +569,8 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
+            let use_scratch = num_tokens > 1 && !is_prefill;
+            let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
@@ -601,7 +597,21 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
+                let mut scratch_ref = if use_scratch {
+                    scratch_borrow.as_mut().map(|s| LayerScratchRef {
+                        normed: &mut s.normed,
+                        residual: &mut s.residual,
+                        qkv: &mut s.qkv,
+                        attn_out: &mut s.attn_out,
+                        o_proj: &mut s.o_proj,
+                        gate_up: &mut s.gate_up,
+                        silu_out: &mut s.silu_out,
+                        down: &mut s.down,
+                    })
+                } else {
+                    None
+                };
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
 
@@ -622,6 +632,7 @@ mod cuda_impl {
                     info!("DEBUG layer {layer_idx} mlp_out: first5={mfirst5:?} nan={mnan} max={mmax}");
                 }
             }
+            drop(scratch_borrow);
 
             // Final: fuse last layer's residual add with final RMSNorm
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
@@ -751,7 +762,7 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), None)?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
@@ -921,6 +932,9 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
+            // Use scratch buffers for T>1 decode to eliminate per-layer allocations
+            let use_scratch = num_tokens > 1 && !is_prefill;
+            let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
@@ -947,10 +961,25 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
+                let mut scratch_ref = if use_scratch {
+                    scratch_borrow.as_mut().map(|s| LayerScratchRef {
+                        normed: &mut s.normed,
+                        residual: &mut s.residual,
+                        qkv: &mut s.qkv,
+                        attn_out: &mut s.attn_out,
+                        o_proj: &mut s.o_proj,
+                        gate_up: &mut s.gate_up,
+                        silu_out: &mut s.silu_out,
+                        down: &mut s.down,
+                    })
+                } else {
+                    None
+                };
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
+            drop(scratch_borrow);
 
             // Final: fuse last layer's residual add with final RMSNorm
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
@@ -1069,6 +1098,9 @@ mod cuda_impl {
             let offsets = self.meta_packed_offsets.get();
             // NOTE: No profiling in forward_gpu_only -- this is captured into CUDA graphs.
             // stream.synchronize() during capture would invalidate the graph.
+            // Use scratch buffers for T>1 decode to eliminate per-layer allocations
+            let use_scratch = num_tokens > 1 && !is_prefill;
+            let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
@@ -1095,10 +1127,25 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
+                let mut scratch_ref = if use_scratch {
+                    scratch_borrow.as_mut().map(|s| LayerScratchRef {
+                        normed: &mut s.normed,
+                        residual: &mut s.residual,
+                        qkv: &mut s.qkv,
+                        attn_out: &mut s.attn_out,
+                        o_proj: &mut s.o_proj,
+                        gate_up: &mut s.gate_up,
+                        silu_out: &mut s.silu_out,
+                        down: &mut s.down,
+                    })
+                } else {
+                    None
+                };
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut())?;
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
+            drop(scratch_borrow);
 
             // Final: fuse last layer's residual add with final RMSNorm
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {

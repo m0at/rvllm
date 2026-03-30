@@ -15,19 +15,26 @@ use crate::{LLMError, Result};
 /// Threshold: use cublasLt for decode-sized GEMMs (M <= this value).
 /// Above this we fall back to standard cuBLAS which has less overhead
 /// for large batch prefill shapes.
-pub const CUBLASLT_M_THRESHOLD: usize = 32;
+pub const CUBLASLT_M_THRESHOLD: usize = 256;
+
+/// 4 MiB workspace for split-K heuristics in cublasLt.
+const FP8_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
 
 /// Wrapper around cudarc's `CudaBlasLT` with workspace for heuristic algo selection.
 pub struct CublasLtOps {
     handle: CudaBlasLT,
     stream: Arc<CudaStream>,
+    /// Persistent workspace for cublasLtMatmul (split-K, etc).
+    workspace: CudaSlice<u8>,
 }
 
 impl CublasLtOps {
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
         let handle = CudaBlasLT::new(stream.clone())
             .map_err(|e| LLMError::GpuError(format!("CudaBlasLT init failed: {e}")))?;
-        Ok(Self { handle, stream })
+        let workspace = unsafe { stream.alloc::<u8>(FP8_WORKSPACE_SIZE) }
+            .map_err(|e| LLMError::GpuError(format!("cublasLt workspace alloc: {e}")))?;
+        Ok(Self { handle, stream, workspace })
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -204,7 +211,7 @@ impl CublasLtOps {
 
             let mut pref: lt_sys::cublasLtMatmulPreference_t = std::ptr::null_mut();
             lt_sys::cublasLtMatmulPreferenceCreate(&mut pref);
-            let ws_size: usize = 0;
+            let ws_size: usize = FP8_WORKSPACE_SIZE;
             lt_sys::cublasLtMatmulPreferenceSetAttribute(pref, lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_size as *const _ as *const c_void, std::mem::size_of_val(&ws_size));
 
             let mut heur = std::mem::zeroed::<lt_sys::cublasLtMatmulHeuristicResult_t>();
@@ -222,6 +229,7 @@ impl CublasLtOps {
             let alpha: f32 = 1.0;
             let beta: f32 = 0.0;
 
+            let (ws_ptr, _ws_guard) = DevicePtr::device_ptr(&self.workspace, &self.stream);
             let s = lt_sys::cublasLtMatmul(
                 handle, desc,
                 &alpha as *const f32 as *const c_void,
@@ -231,7 +239,7 @@ impl CublasLtOps {
                 output_f16_ptr as *mut c_void, layout_c,
                 output_f16_ptr as *mut c_void, layout_c,
                 &heur.algo,
-                std::ptr::null_mut(), 0,
+                ws_ptr as *mut c_void, ws_size,
                 self.stream.cu_stream(),
             );
 

@@ -661,7 +661,11 @@ impl GpuWorker {
     fn precapture_decode_graphs(&mut self) -> Result<()> {
         use rvllm_model_runner::bridge::AttentionMetadata;
 
-        const BUCKET_SIZES: &[usize] = &[1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256];
+        const BUCKET_SIZES: &[usize] = &[
+            1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96,
+            104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192,
+            200, 208, 216, 224, 232, 240, 248, 256,
+        ];
         // Max batch size matches the GraphRunnerConfig created in new() (256).
         let max_batch = 256usize;
 
