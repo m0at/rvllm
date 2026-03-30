@@ -227,8 +227,16 @@ mod tests {
             intermediate_size: 4,
             vocab_size: 8,
             max_position: 32,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            partial_rotary_factor: 1.0,
+            attn_logit_softcapping: 0.0,
+            attention_bias: false,
+            sliding_window: Some(4096),
+            layer_types: vec!["sliding_attention".into()],
+            num_local_experts: NUM_EXPERTS,
+            num_experts_per_tok: TOP_K,
             dtype: rvllm_core::types::Dtype::Float16,
-            rms_norm_eps: 1e-5, rope_theta: 10000.0,
             architecture: "MixtralForCausalLM".into(),
         }
     }

@@ -63,7 +63,10 @@ impl QuantizedLinear {
                 w.shape,
             )),
             QuantMethod::FP8 => Ok(dequant::dequantize_fp8(&w.data, &w.scales, w.shape)),
-            QuantMethod::GgufQ5_0 | QuantMethod::GgufQ5KM | QuantMethod::GgufQ8_0 => {
+            QuantMethod::MXFP4
+            | QuantMethod::GgufQ5_0
+            | QuantMethod::GgufQ5KM
+            | QuantMethod::GgufQ8_0 => {
                 Err(LLMError::ModelError(format!(
                     "dequantization not yet implemented for {}",
                     w.quant_config.method

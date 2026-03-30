@@ -516,8 +516,16 @@ mod tests {
             intermediate_size: 16,
             vocab_size: 32,
             max_position: 128,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            partial_rotary_factor: 1.0,
+            attn_logit_softcapping: 0.0,
+            attention_bias: false,
+            sliding_window: None,
+            layer_types: Vec::new(),
+            num_local_experts: 0,
+            num_experts_per_tok: 0,
             dtype: rvllm_core::types::Dtype::Float16,
-            rms_norm_eps: 1e-5, rope_theta: 10000.0,
             architecture: "GPTNeoXForCausalLM".into(),
         }
     }

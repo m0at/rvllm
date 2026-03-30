@@ -29,6 +29,7 @@ pub fn detect_quant_method(model_path: &Path) -> Result<QuantMethod> {
                     "awq" => Ok(QuantMethod::AWQ),
                     "squeezellm" => Ok(QuantMethod::SqueezeLLM),
                     "fp8" => Ok(QuantMethod::FP8),
+                    "mxfp4" => Ok(QuantMethod::MXFP4),
                     other => {
                         tracing::warn!(
                             method = other,
@@ -54,6 +55,7 @@ pub fn detect_quant_method(model_path: &Path) -> Result<QuantMethod> {
                         "awq" => Ok(QuantMethod::AWQ),
                         "squeezellm" => Ok(QuantMethod::SqueezeLLM),
                         "fp8" => Ok(QuantMethod::FP8),
+                        "mxfp4" => Ok(QuantMethod::MXFP4),
                         other => {
                             tracing::warn!(method = other, "unknown quant_method in config.json");
                             Ok(QuantMethod::None)
@@ -145,5 +147,14 @@ mod tests {
         fs::write(dir.path().join("quantize_config.json"), config).unwrap();
         let method = detect_quant_method(dir.path()).unwrap();
         assert_eq!(method, QuantMethod::FP8);
+    }
+
+    #[test]
+    fn detect_mxfp4_from_config_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = r#"{"quantization_config": {"quant_method": "mxfp4"}}"#;
+        fs::write(dir.path().join("config.json"), config).unwrap();
+        let method = detect_quant_method(dir.path()).unwrap();
+        assert_eq!(method, QuantMethod::MXFP4);
     }
 }

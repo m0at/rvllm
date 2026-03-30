@@ -19,6 +19,7 @@ rvllm-tokenizer.workspace = true
 rvllm-sequence.workspace = true
 rvllm-executor.workspace = true
 rvllm-telemetry.workspace = true
+rvllm-quant.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true

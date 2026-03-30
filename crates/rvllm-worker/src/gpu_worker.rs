@@ -491,7 +491,7 @@ impl GpuWorker {
         info!(device_id = self.device_id, path = %model_path.display(), "loading weights to GPU");
 
         let all_weights_f16 =
-            rvllm_model_loader::gpu_loader::load_weights_to_gpu(model_path, &self.stream)
+            rvllm_model_loader::gpu_loader::load_weights_to_gpu_f16(model_path, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("weight loading failed: {e}")))?;
 
         info!("loaded {} weight tensors to GPU (f16)", all_weights_f16.len());
@@ -1857,6 +1857,9 @@ fn worker_config_from_engine(
         enable_prefix_caching: config.cache.enable_prefix_caching,
         partial_rotary_factor: 1.0,
         attn_logit_softcapping: 0.0,
+        attention_bias: false,
+        sliding_window: None,
+        layer_types: Vec::new(),
         num_local_experts: 0,
         num_experts_per_tok: 0,
     }

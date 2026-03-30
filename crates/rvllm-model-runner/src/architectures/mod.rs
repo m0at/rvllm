@@ -4,6 +4,7 @@ pub mod cohere;
 pub mod deepseek;
 pub mod embedding;
 pub mod gemma;
+pub mod gpt_oss;
 pub mod gpt_neox;
 pub mod llama;
 pub mod mistral;
@@ -49,6 +50,9 @@ pub fn create_model(
             deepseek::DeepSeekV2ForCausalLM::new(weights, config)?,
         )),
         "MixtralForCausalLM" => Ok(Box::new(mixtral::MixtralForCausalLM::new(weights, config)?)),
+        "GptOssForCausalLM" => Ok(Box::new(gpt_oss::GptOssForCausalLM::new(
+            weights, config,
+        )?)),
         "PhiForCausalLM" | "Phi3ForCausalLM" | "Phi3SmallForCausalLM" => {
             Ok(Box::new(phi::PhiForCausalLM::new(weights, config)?))
         }

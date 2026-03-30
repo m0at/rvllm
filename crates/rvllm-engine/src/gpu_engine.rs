@@ -36,19 +36,24 @@ mod inner {
     /// Subset of fields from a HuggingFace config.json that we need.
     #[derive(Debug, Clone)]
     struct HfModelConfig {
+        model_type: String,
         hidden_size: usize,
         intermediate_size: usize,
         num_attention_heads: usize,
+        head_dim: usize,
         num_key_value_heads: usize,
         num_hidden_layers: usize,
         vocab_size: usize,
+        max_position_embeddings: usize,
         rms_norm_eps: f32,
         tie_word_embeddings: bool,
         architecture: String,
         rope_theta: f32,
         partial_rotary_factor: f32,
-        head_dim: usize,
         attn_logit_softcapping: f32,
+        attention_bias: bool,
+        sliding_window: Option<usize>,
+        layer_types: Vec<String>,
         num_local_experts: usize,
         num_experts_per_tok: usize,
     }
@@ -85,10 +90,29 @@ mod inner {
                 .map(|v| v as f32)
                 .unwrap_or(default)
         };
+        let get_string = |key: &str, default: &str| -> String {
+            json.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or(default)
+                .to_string()
+        };
+        let get_string_vec = |key: &str| -> Vec<String> {
+            json.get(key)
+                .and_then(|v| v.as_array())
+                .map(|vals| {
+                    vals.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
 
         let hidden_size = get_usize("hidden_size", 4096);
         let num_attention_heads = get_usize("num_attention_heads", 32);
-        let head_dim = get_usize("head_dim", hidden_size / num_attention_heads);
+        let head_dim = get_usize(
+            "head_dim",
+            hidden_size.checked_div(num_attention_heads).unwrap_or(0),
+        );
 
         let architecture = json
             .get("architectures")
@@ -119,12 +143,15 @@ mod inner {
             .unwrap_or_else(|| get_f32("partial_rotary_factor", 1.0));
 
         Ok(HfModelConfig {
+            model_type: get_string("model_type", "llama"),
             hidden_size,
             intermediate_size: get_usize("intermediate_size", 11008),
             num_attention_heads,
+            head_dim,
             num_key_value_heads: get_usize("num_key_value_heads", num_attention_heads),
             num_hidden_layers: get_usize("num_hidden_layers", 32),
             vocab_size: get_usize("vocab_size", 32000),
+            max_position_embeddings: get_usize("max_position_embeddings", 2048),
             rms_norm_eps: get_f32("rms_norm_eps", 1e-5),
             tie_word_embeddings,
             architecture,
@@ -132,8 +159,22 @@ mod inner {
             partial_rotary_factor,
             head_dim,
             attn_logit_softcapping: get_f32("attn_logit_softcapping", 0.0),
+            attention_bias: json
+                .get("attention_bias")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            sliding_window: json
+                .get("sliding_window")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            layer_types: get_string_vec("layer_types"),
             num_local_experts: get_usize("num_local_experts", 0),
-            num_experts_per_tok: get_usize("num_experts_per_tok", 0),
+            num_experts_per_tok: json
+                .get("num_experts_per_tok")
+                .or_else(|| json.get("experts_per_token"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(0),
         })
     }
 
@@ -371,6 +412,7 @@ mod inner {
             let hf_config = read_model_config(&model_dir)?;
             info!(
                 arch = %hf_config.architecture,
+                model_type = %hf_config.model_type,
                 hidden = hf_config.hidden_size,
                 layers = hf_config.num_hidden_layers,
                 heads = hf_config.num_attention_heads,
@@ -380,7 +422,13 @@ mod inner {
                 "model config loaded"
             );
 
-            let head_dim = hf_config.head_dim;
+            let quant_method = rvllm_quant::detect_quant_method(&model_dir)?;
+            if quant_method.is_quantized() && hf_config.architecture != "GptOssForCausalLM" {
+                return Err(LLMError::ModelError(format!(
+                    "quantized model checkpoints are not wired into the GPU engine yet (detected {})",
+                    quant_method
+                )));
+            }
 
             // 3. Tokenizer
             let tokenizer_path = config.model.tokenizer_path.as_deref().unwrap_or(model_name);
@@ -391,12 +439,16 @@ mod inner {
                 device_id: 0,
                 num_layers: hf_config.num_hidden_layers,
                 num_kv_heads: hf_config.num_key_value_heads,
-                head_dim,
+                head_dim: hf_config.head_dim,
                 hidden_size: hf_config.hidden_size,
                 num_attention_heads: hf_config.num_attention_heads,
                 intermediate_size: hf_config.intermediate_size,
                 vocab_size: hf_config.vocab_size,
-                max_model_len: config.model.max_model_len,
+                max_model_len: config
+                    .model
+                    .max_model_len
+                    .min(hf_config.max_position_embeddings),
+                rms_norm_eps: hf_config.rms_norm_eps,
                 block_size: config.cache.block_size,
                 gpu_memory_utilization: config.cache.gpu_memory_utilization,
                 rank: 0,
@@ -404,10 +456,12 @@ mod inner {
                 pipeline_parallel_size: config.parallel.pipeline_parallel_size,
                 architecture: hf_config.architecture.clone(),
                 dtype: config.model.dtype,
-                rms_norm_eps: hf_config.rms_norm_eps,
                 rope_theta: hf_config.rope_theta,
                 partial_rotary_factor: hf_config.partial_rotary_factor,
                 attn_logit_softcapping: hf_config.attn_logit_softcapping,
+                attention_bias: hf_config.attention_bias,
+                sliding_window: hf_config.sliding_window,
+                layer_types: hf_config.layer_types.clone(),
                 num_local_experts: hf_config.num_local_experts,
                 num_experts_per_tok: hf_config.num_experts_per_tok,
                 kv_cache_dtype: config.cache.kv_cache_dtype.clone(),

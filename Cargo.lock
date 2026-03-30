@@ -2675,6 +2675,7 @@ dependencies = [
  "rvllm-config",
  "rvllm-core",
  "rvllm-executor",
+ "rvllm-quant",
  "rvllm-sequence",
  "rvllm-telemetry",
  "rvllm-tokenizer",

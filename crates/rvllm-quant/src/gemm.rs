@@ -185,7 +185,10 @@ fn dequantize_row(
                 *dst = dequant::fp8::FP8_E4M3_LUT[byte as usize] * scale;
             }
         }
-        QuantMethod::GgufQ5_0 | QuantMethod::GgufQ5KM | QuantMethod::GgufQ8_0 => {
+        QuantMethod::MXFP4
+        | QuantMethod::GgufQ5_0
+        | QuantMethod::GgufQ5KM
+        | QuantMethod::GgufQ8_0 => {
             return Err(LLMError::ModelError(format!(
                 "dequantization not yet implemented for {}",
                 weight.quant_config.method
