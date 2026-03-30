@@ -331,7 +331,11 @@ pub struct GpuWorker {
     vocab_table: Option<VocabTable>,
     /// Raw f16 weight map preserved for deferred GpuModelRunner construction.
     #[cfg(feature = "cuda")]
-    raw_weight_map: Option<HashMap<String, CudaSlice<half::f16>>>,
+    raw_weight_map: Option<HashMap<String, CudaSlice<f32>>>,
+    #[cfg(feature = "cuda")]
+    raw_weight_shapes: Option<HashMap<String, Vec<usize>>>,
+    #[cfg(feature = "cuda")]
+    raw_weight_map_f16: Option<HashMap<String, CudaSlice<half::f16>>>,
     /// GPU-resident model runner (full forward pass on GPU, no CPU attention fallback).
     /// Constructed in init_cache() once cache geometry is known.
     #[cfg(feature = "cuda")]
@@ -428,6 +432,7 @@ impl GpuWorker {
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
         });
+        let rms_norm_eps = config.rms_norm_eps;
 
         Ok(Self {
             context,
@@ -442,7 +447,7 @@ impl GpuWorker {
             runner_config: None,
             vocab_size: 0,
             model_weights: None,
-            rms_norm_eps: 1e-6,
+            rms_norm_eps,
             rope_table: None,
             kv_cache: None,
             fp8_kv_cache: None,
@@ -451,6 +456,10 @@ impl GpuWorker {
             vocab_table: None,
             #[cfg(feature = "cuda")]
             raw_weight_map: None,
+            #[cfg(feature = "cuda")]
+            raw_weight_shapes: None,
+            #[cfg(feature = "cuda")]
+            raw_weight_map_f16: None,
             #[cfg(feature = "cuda")]
             gpu_model_runner: None,
             graph_runner,
@@ -474,15 +483,31 @@ impl GpuWorker {
     pub fn load_weights(&mut self, model_path: &Path) -> Result<()> {
         info!(device_id = self.device_id, path = %model_path.display(), "loading weights to GPU");
 
-        let all_weights_f16 =
-            rvllm_model_loader::gpu_loader::load_weights_to_gpu(model_path, &self.stream)
+        let (all_weights_full, all_weight_shapes) =
+            rvllm_model_loader::gpu_loader::load_weights_to_gpu_with_shapes(
+                model_path,
+                &self.stream,
+            )
                 .map_err(|e| LLMError::GpuError(format!("weight loading failed: {e}")))?;
 
-        info!("loaded {} weight tensors to GPU (f16)", all_weights_f16.len());
+        info!("loaded {} weight tensors to GPU", all_weights_full.len());
 
         #[cfg(feature = "cuda")]
         {
-            self.raw_weight_map = Some(all_weights_f16.clone());
+            self.raw_weight_map = Some(all_weights_full.clone());
+            self.raw_weight_shapes = Some(all_weight_shapes.clone());
+
+            // Also load f16 weights for hgemm path when dtype is half
+            if self.config.dtype.is_half() {
+                info!("loading f16 weights for hgemm path");
+                let f16_weights = rvllm_model_loader::gpu_loader::load_weights_to_gpu_f16(
+                    model_path,
+                    &self.stream,
+                )
+                .map_err(|e| LLMError::GpuError(format!("f16 weight loading failed: {e}")))?;
+                info!("loaded {} f16 weight tensors", f16_weights.len());
+                self.raw_weight_map_f16 = Some(f16_weights);
+            }
         }
 
         // Weights are stored only in raw_weight_map for GpuModelRunner.
@@ -548,7 +573,19 @@ impl GpuWorker {
             let raw_map = self.raw_weight_map.take().ok_or_else(|| {
                 LLMError::GpuError("raw weight map not available -- call load_weights first".into())
             })?;
-            let loader_weights = LoaderWeights::new(raw_map, HashMap::new());
+            let raw_shapes = self.raw_weight_shapes.take().ok_or_else(|| {
+                LLMError::GpuError("raw weight shapes not available -- call load_weights first".into())
+            })?;
+            let mut loader_weights = LoaderWeights::new(raw_map, raw_shapes.clone());
+
+            // Insert f16 weights for hgemm path
+            if let Some(f16_map) = self.raw_weight_map_f16.take() {
+                for (name, slice) in f16_map {
+                    let shape = raw_shapes.get(&name).cloned().unwrap_or_default();
+                    loader_weights.insert_f16(name, slice, shape);
+                }
+                info!("inserted f16 weights into model weight container");
+            }
 
             let block_size = self.config.block_size;
             let cache = rvllm_kv_cache::engine_cuda::CudaCacheEngine::new(
@@ -590,8 +627,21 @@ impl GpuWorker {
                 self.stream.clone(),
             )?;
 
-            if let Err(e) = runner.fuse_weights() {
-                warn!("weight fusion failed: {e} -- f16 unfused path");
+            if self.config.dtype.is_half() {
+                runner.enable_fp16();
+                info!("FP16 inference enabled (hgemm path)");
+                // GPT-OSS decode uses a custom MoE path and does not have dense
+                // gate/up projections, so the generic fusion pass can leave a
+                // partially fused runner state. Keep GPT-OSS on the unfused path.
+                if self.config.architecture == "GptOssForCausalLM" {
+                    info!("skipping generic weight fusion for GPT-OSS");
+                    if let Err(e) = runner.prepare_gpt_oss_graph_decode() {
+                        warn!("GPT-OSS graph decode prep failed: {e} -- graph capture disabled");
+                        self.graph_runner.disable();
+                    }
+                } else if let Err(e) = runner.fuse_weights() {
+                    warn!("weight fusion failed: {e} -- using unfused path");
+                }
             }
 
             // Pre-allocate cuBLAS workspace for CUDA graph capture.
@@ -599,6 +649,13 @@ impl GpuWorker {
             if let Err(e) = runner.prepare_for_graph_capture() {
                 warn!("cuBLAS graph workspace setup failed: {e} -- graph capture disabled");
                 self.graph_runner.pool_mut().disable();
+            }
+
+            if !runner.supports_cuda_graphs() {
+                info!(
+                    "disabling CUDA graph replay for GPT-OSS: decode path is not graph-safe"
+                );
+                self.graph_runner.disable();
             }
 
 
@@ -1643,6 +1700,7 @@ fn worker_config_from_engine(
         intermediate_size: 11008,
         vocab_size: 32000,
         max_model_len: config.model.max_model_len,
+        rms_norm_eps: 1e-5,
         block_size: config.cache.block_size,
         gpu_memory_utilization: config.cache.gpu_memory_utilization,
         rank: 0,
@@ -1650,11 +1708,14 @@ fn worker_config_from_engine(
         pipeline_parallel_size: config.parallel.pipeline_parallel_size,
         architecture: "llama".into(),
         dtype: config.model.dtype.clone(),
-        rms_norm_eps: 1e-5, rope_theta: 10000.0,
+        rope_theta: 10000.0,
         kv_cache_dtype: config.cache.kv_cache_dtype.clone(),
         enable_prefix_caching: config.cache.enable_prefix_caching,
         partial_rotary_factor: 1.0,
         attn_logit_softcapping: 0.0,
+        attention_bias: false,
+        sliding_window: None,
+        layer_types: Vec::new(),
         num_local_experts: 0,
         num_experts_per_tok: 0,
     }

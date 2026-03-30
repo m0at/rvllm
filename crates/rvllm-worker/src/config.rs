@@ -45,6 +45,12 @@ pub struct WorkerConfig {
     pub partial_rotary_factor: f32,
     /// Soft-capping value for attention logits (Gemma 2). 0.0 = disabled.
     pub attn_logit_softcapping: f32,
+    /// Whether attention projections include biases.
+    pub attention_bias: bool,
+    /// Sliding-window size for architectures that alternate local/global attention.
+    pub sliding_window: Option<usize>,
+    /// Per-layer attention mode names from the HF config.
+    pub layer_types: Vec<String>,
     /// Number of MoE experts (Mixtral: 8, DeepSeek: 64). 0 = dense.
     pub num_local_experts: usize,
     /// Number of experts activated per token (Mixtral: 2, DeepSeek: 6).
@@ -71,6 +77,13 @@ impl WorkerConfig {
             dtype: self.dtype,
             architecture: self.architecture.clone(),
             rope_theta: self.rope_theta,
+            partial_rotary_factor: self.partial_rotary_factor,
+            attn_logit_softcapping: self.attn_logit_softcapping,
+            attention_bias: self.attention_bias,
+            sliding_window: self.sliding_window,
+            layer_types: self.layer_types.clone(),
+            num_local_experts: self.num_local_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
         }
     }
 

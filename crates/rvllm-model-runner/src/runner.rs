@@ -24,6 +24,13 @@ pub struct ModelRunnerConfig {
     pub max_position: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    pub partial_rotary_factor: f32,
+    pub attn_logit_softcapping: f32,
+    pub attention_bias: bool,
+    pub sliding_window: Option<usize>,
+    pub layer_types: Vec<String>,
+    pub num_local_experts: usize,
+    pub num_experts_per_tok: usize,
     pub dtype: Dtype,
     pub architecture: String,
 }
