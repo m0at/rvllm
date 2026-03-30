@@ -235,6 +235,7 @@ impl Tokenizer {
                 add_generation_prompt,
             )?)),
             ChatTemplateMode::HarmonyGptOss => Ok(RenderedPrompt::Tokens(apply_harmony(
+                &self.inner,
                 messages,
                 add_generation_prompt,
             )?)),

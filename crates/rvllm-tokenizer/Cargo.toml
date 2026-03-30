@@ -19,4 +19,3 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hf-hub = "0.4"
-openai-harmony.workspace = true

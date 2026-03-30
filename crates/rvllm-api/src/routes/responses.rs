@@ -37,35 +37,6 @@ pub struct StoredResponse {
 
 pub type SharedResponseStore = Arc<RwLock<HashMap<String, StoredResponse>>>;
 
-async fn generate_rendered_prompt(
-    state: &Arc<AppState>,
-    rendered_prompt: &rvllm_tokenizer::RenderedPrompt,
-    sampling_params: rvllm_core::prelude::SamplingParams,
-) -> Result<
-    (
-        rvllm_core::prelude::RequestId,
-        tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
-    ),
-    ApiError,
-> {
-    match rendered_prompt {
-        rvllm_tokenizer::RenderedPrompt::Text(prompt) => state
-            .engine
-            .generate(prompt.clone(), sampling_params)
-            .await
-            .map_err(ApiError::from),
-        rvllm_tokenizer::RenderedPrompt::Tokens(prompt_token_ids) => state
-            .engine
-            .generate_token_ids(
-                format!("<rendered:{} tokens>", prompt_token_ids.len()),
-                prompt_token_ids.clone(),
-                sampling_params,
-            )
-            .await
-            .map_err(ApiError::from),
-    }
-}
-
 /// POST /v1/responses -- create a unified response.
 pub async fn create_response(
     State(state): State<Arc<AppState>>,
@@ -138,11 +109,11 @@ pub async fn create_response(
         .map(|message| rvllm_tokenizer::ChatMessage::new(&message.role, &message.content))
         .collect();
 
-    let rendered_prompt = state
+    let prompt = state
         .tokenizer
         .read()
         .await
-        .render_chat_prompt(&tokenizer_messages, true)
+        .apply_chat_template(&tokenizer_messages, true)
         .map_err(|e| ApiError::Internal(format!("chat template error: {}", e)))?;
 
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
@@ -164,7 +135,7 @@ pub async fn create_response(
             return stream_tool_response(
                 state,
                 req,
-                rendered_prompt,
+                prompt,
                 sampling_params,
                 response_id,
                 input_items,
@@ -182,8 +153,11 @@ pub async fn create_response(
         let tool_choice_clone = tool_choice.clone();
         let response_tools_clone = response_tools.clone();
 
-        let (_request_id, mut output_stream) =
-            generate_rendered_prompt(&state, &rendered_prompt, sampling_params).await?;
+        let (_request_id, mut output_stream) = state
+            .engine
+            .generate(prompt, sampling_params)
+            .await
+            .map_err(ApiError::from)?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::convert::Infallible>>(16);
 
@@ -440,8 +414,11 @@ pub async fn create_response(
             .unwrap()
             .into_response())
     } else {
-        let (_request_id, mut output_stream) =
-            generate_rendered_prompt(&state, &rendered_prompt, sampling_params).await?;
+        let (_request_id, mut output_stream) = state
+            .engine
+            .generate(prompt, sampling_params)
+            .await
+            .map_err(ApiError::from)?;
 
         let mut last_output = None;
         while let Some(output) = output_stream.next().await {
@@ -506,7 +483,7 @@ struct StreamedFunctionCallState {
 async fn stream_tool_response(
     state: Arc<AppState>,
     req: CreateResponseRequest,
-    rendered_prompt: rvllm_tokenizer::RenderedPrompt,
+    prompt: String,
     sampling_params: rvllm_core::prelude::SamplingParams,
     response_id: String,
     input_items: Vec<ResponseInputItem>,
@@ -517,8 +494,11 @@ async fn stream_tool_response(
     let tool_choice = req.effective_tool_choice();
     let response_tools = req.tools.clone().unwrap_or_default();
 
-    let (_request_id, mut output_stream) =
-        generate_rendered_prompt(&state, &rendered_prompt, sampling_params).await?;
+    let (_request_id, mut output_stream) = state
+        .engine
+        .generate(prompt, sampling_params)
+        .await
+        .map_err(ApiError::from)?;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::convert::Infallible>>(32);
 
@@ -1283,15 +1263,6 @@ mod tests {
             }
             drop(tx);
             Ok((RequestId(1), ReceiverStream::new(rx)))
-        }
-
-        async fn generate_token_ids(
-            &self,
-            prompt: String,
-            _prompt_token_ids: Vec<rvllm_core::prelude::TokenId>,
-            params: SamplingParams,
-        ) -> rvllm_core::prelude::Result<(RequestId, ReceiverStream<RequestOutput>)> {
-            self.generate(prompt, params).await
         }
     }
 

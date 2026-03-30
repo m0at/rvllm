@@ -272,24 +272,6 @@ impl LLMEngine {
         let prompt_token_ids = self.tokenizer.encode(&prompt)?;
         debug!(%request_id, num_tokens = prompt_token_ids.len(), "prompt tokenized");
 
-        self.add_request_with_token_ids(request_id, prompt, prompt_token_ids, sampling_params)
-    }
-
-    /// Submit a new generation request with pre-rendered prompt token IDs.
-    pub fn add_request_with_token_ids(
-        &mut self,
-        request_id: RequestId,
-        prompt: String,
-        prompt_token_ids: Vec<TokenId>,
-        sampling_params: SamplingParams,
-    ) -> Result<()> {
-        info!(
-            %request_id,
-            prompt_len = prompt.len(),
-            prompt_tokens = prompt_token_ids.len(),
-            "adding request with pre-tokenized prompt"
-        );
-
         if prompt_token_ids.is_empty() {
             return Err(LLMError::TokenizerError(
                 "prompt produced zero tokens".into(),
