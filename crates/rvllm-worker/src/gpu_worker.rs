@@ -338,10 +338,13 @@ pub struct GpuWorker {
     gpu_model_runner: Option<rvllm_model_runner::gpu_runner::GpuModelRunner>,
     /// CUDA graph runner for decode step capture/replay.
     graph_runner: GraphRunner,
+    /// GpuStream wrapping the main compute stream (same Arc as self.stream).
+    /// Used to replay CUDA graphs on the correct stream (the runner's stream).
+    #[cfg(feature = "cuda")]
+    runner_stream: GpuStream,
     /// Number of forward calls so far (for warmup before graph capture).
     forward_count: usize,
     /// Pinned host buffer for async DtoH pipeline. Allocated on first use.
-    /// Sized to max graph batch size (32 i32 elements).
     #[cfg(feature = "cuda")]
     pinned_output: Option<cudarc::driver::PinnedHostSlice<i32>>,
     /// Stored sync output for execute_launch/execute_collect pipeline.
@@ -429,6 +432,12 @@ impl GpuWorker {
             hidden_size: config.hidden_size,
         });
 
+        // GpuStream that wraps the same Arc<CudaStream> used by the model runner.
+        // Graph replay must happen on this stream so that HtoD metadata uploads
+        // (also on this stream) are ordered before the graph's kernels.
+        #[cfg(feature = "cuda")]
+        let runner_stream = GpuStream::from_arc(device_id, context.clone(), stream.clone());
+
         Ok(Self {
             context,
             stream,
@@ -454,6 +463,8 @@ impl GpuWorker {
             #[cfg(feature = "cuda")]
             gpu_model_runner: None,
             graph_runner,
+            #[cfg(feature = "cuda")]
+            runner_stream,
             forward_count: 0,
             #[cfg(feature = "cuda")]
             pinned_output: None,
@@ -1322,7 +1333,10 @@ impl GpuWorker {
         let graph = self.graph_runner.pool().get_exact(padded_batch).ok_or_else(|| {
             LLMError::GpuError(format!("no graph for padded batch {padded_batch}"))
         })?;
-        graph.replay(&self.compute_stream)?;
+        // Replay on the runner's stream. The HtoD metadata upload (above) was
+        // also enqueued on this stream, so CUDA ordering guarantees the kernels
+        // see the updated buffers.
+        graph.replay(&self.runner_stream)?;
 
         // Read results -- skip trim when no padding
         let ids = runner.read_graph_output(padded_batch)?;
@@ -1399,167 +1413,6 @@ impl GpuWorker {
                 Err(e)
             }
         }
-    }
-
-    /// Run a padded decode forward with CUDA graph capture or replay.
-    ///
-    /// Uses `forward_gpu_only` (no DtoH in graph) + `read_graph_output` (DtoH
-    /// outside graph) to ensure correct capture/replay semantics.
-    #[cfg(feature = "cuda")]
-    fn gpu_forward_ex_graphed(
-        &mut self,
-        padded_input: &ModelInput,
-        actual_batch: usize,
-        padded_batch: usize,
-        _greedy_only: bool,
-    ) -> Result<ForwardOutput> {
-        let num_tokens = padded_input.num_tokens();
-        let num_seqs = padded_input.attention_metadata.context_lens.len();
-        let max_context_len = padded_input.attention_metadata.max_context_len;
-
-        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
-            LLMError::GpuError("GPU model runner not initialized".into())
-        })?;
-
-        let t0 = std::time::Instant::now();
-
-        // Upload metadata into persistent GPU buffers (memcpy_htod at stable
-        // GPU pointers). This runs on the runner's stream OUTSIDE any graph.
-        runner.upload_metadata(
-            &padded_input.token_ids,
-            &padded_input.position_ids,
-            &padded_input.attention_metadata,
-        )?;
-        let t_upload = t0.elapsed();
-
-        if self.graph_runner.has_graph_for(padded_batch) {
-            // -- REPLAY path (async DtoH pipeline) --
-            let pool = self.graph_runner.pool();
-            let graph = pool.get(actual_batch).ok_or_else(|| {
-                LLMError::GpuError("graph lookup failed after has_graph_for".into())
-            })?;
-            graph.replay(&self.compute_stream)?;
-            let t_replay = t0.elapsed();
-
-            // Lazily allocate pinned host buffer for async DtoH.
-            if self.pinned_output.is_none() {
-                let pinned = unsafe { self.context.alloc_pinned::<i32>(256) }
-                    .map_err(|e| LLMError::GpuError(format!("pinned alloc: {e}")))?;
-                self.pinned_output = Some(pinned);
-            }
-
-            // Enqueue async DtoH into pinned buffer (returns immediately).
-            let pinned = self.pinned_output.as_mut().unwrap();
-            runner.read_graph_output_async(actual_batch, pinned.as_mut_slice()
-                .map_err(|e| LLMError::GpuError(format!("pinned slice: {e}")))?)?;
-
-            if self.forward_count % 64 == 0 {
-                let upload_us = t_upload.as_micros();
-                let replay_us = (t_replay - t_upload).as_micros();
-                info!(
-                    upload_us, replay_us,
-                    total_us = t0.elapsed().as_micros(),
-                    batch = actual_batch,
-                    "TIMING graph_replay (async DtoH enqueued)"
-                );
-            }
-
-            return Ok(ForwardOutput::TokenIdsPending { actual_batch });
-        }
-
-        if self.forward_count > Self::GRAPH_WARMUP_CALLS
-            && !self.graph_runner.was_capture_attempted(padded_batch)
-        {
-            // -- CAPTURE path --
-            info!(padded_batch, "capturing CUDA graph for decode");
-
-            // Warmup: run forward_gpu_only once outside capture to trigger
-            // any lazy kernel compilation / one-time init.
-            runner.forward_gpu_only(num_tokens, num_seqs, max_context_len, false)?;
-
-            // Synchronize to drain all pending async ops (allocs, frees,
-            // kernel completions) before starting graph capture.
-            let cuda_stream = runner.cuda_stream().clone();
-            cuda_stream.synchronize()
-                .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
-
-            // Re-upload metadata (warmup consumed the stream state).
-            runner.upload_metadata(
-                &padded_input.token_ids,
-                &padded_input.position_ids,
-                &padded_input.attention_metadata,
-            )?;
-
-            // Begin capture on the model runner's stream.
-            let capture_begin = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream);
-            if let Err(e) = capture_begin {
-                warn!("graph capture begin failed: {e} -- skipping capture for batch {padded_batch}");
-                self.graph_runner.mark_captured(padded_batch);
-                // Fall through to normal path below
-            } else {
-                let result = runner.forward_gpu_only(
-                    num_tokens, num_seqs, max_context_len, false,
-                );
-
-                match result {
-                    Ok(()) => {
-                        let graph = self.graph_runner.pool_mut().end_capture_on(
-                            &cuda_stream, padded_batch,
-                        )?;
-                        self.graph_runner.pool_mut().insert(graph);
-                        self.graph_runner.mark_captured(padded_batch);
-                        info!(padded_batch, "CUDA graph captured successfully");
-
-                        // DtoH read from persistent output buffer.
-                        let ids = runner.read_graph_output(num_tokens)?;
-                        let trimmed: Vec<i32> = ids[..actual_batch].to_vec();
-                        return Ok(ForwardOutput::TokenIds(trimmed));
-                    }
-                    Err(e) => {
-                        warn!("graph capture forward failed, falling back: {e}");
-                        let _ = self.graph_runner.pool_mut().end_capture_on(
-                            &cuda_stream, padded_batch,
-                        );
-                        self.graph_runner.mark_captured(padded_batch);
-                        // Fall through to normal path below
-                    }
-                }
-            }
-        }
-
-        // -- NORMAL path (pre-warmup or capture failure) --
-        // Metadata already uploaded. Use forward_graph_body which includes DtoH.
-        let fwd_output = runner.forward_graph_body(
-            num_tokens, num_seqs, max_context_len, false, true,
-        )?;
-
-        // Strip padding from output
-        match fwd_output {
-            ForwardOutput::TokenIds(ref ids) => {
-                let trimmed: Vec<i32> = ids[..actual_batch].to_vec();
-                Ok(ForwardOutput::TokenIds(trimmed))
-            }
-            ForwardOutput::TokenIdsPending { .. } => {
-                // forward_graph_body doesn't produce pending output
-                unreachable!("forward_graph_body should not return TokenIdsPending")
-            }
-            ForwardOutput::Logits(ref logits) => {
-                let unpadded = self.graph_runner.unpad_logits(logits, actual_batch);
-                Ok(ForwardOutput::Logits(unpadded))
-            }
-        }
-    }
-
-    /// Fallback for non-cuda builds.
-    #[cfg(not(feature = "cuda"))]
-    fn gpu_forward_ex_graphed(
-        &mut self,
-        padded_input: &ModelInput,
-        _actual_batch: usize,
-        _padded_batch: usize,
-        greedy_only: bool,
-    ) -> Result<ForwardOutput> {
-        self.raw_gpu_forward_ex(padded_input, greedy_only)
     }
 
     /// Legacy CPU forward pass removed -- f16 only, use GpuModelRunner.

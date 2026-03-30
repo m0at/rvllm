@@ -41,6 +41,17 @@ impl GpuStream {
         })
     }
 
+    /// Wrap an existing `Arc<CudaContext>` + `Arc<CudaStream>` without creating new resources.
+    /// Used so the GPU worker can replay graphs on the model runner's stream.
+    #[cfg(feature = "cuda")]
+    pub fn from_arc(
+        device_id: usize,
+        context: Arc<CudaContext>,
+        stream: Arc<cudarc::driver::CudaStream>,
+    ) -> Self {
+        Self { device_id, context, stream }
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         tracing::trace!(device_id = self.device_id, "synchronizing stream");
         #[cfg(feature = "cuda")]

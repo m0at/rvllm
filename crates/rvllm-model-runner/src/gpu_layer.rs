@@ -399,9 +399,9 @@ mod inner {
                         .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
                     let q_end_t = num_tokens * q_dim;
                     let k_end_t = q_end_t + num_tokens * kv_dim;
-                    { let mut d = qkv_buf.slice_mut(..q_end_t); blas.hgemm_into(num_tokens, q_dim, hidden, 1.0, &normed, weights.q_proj, 0.0, &mut d)?; }
-                    { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.k_proj, 0.0, &mut d)?; }
-                    { let mut d = qkv_buf.slice_mut(k_end_t..); blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.v_proj, 0.0, &mut d)?; }
+                    { let mut d = qkv_buf.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
+                    { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                    { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
                     qkv_buf
                 }
             } else {
@@ -409,9 +409,9 @@ mod inner {
                     .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
                 let q_end_t = num_tokens * q_dim;
                 let k_end_t = q_end_t + num_tokens * kv_dim;
-                { let mut d = qkv_buf.slice_mut(..q_end_t); blas.hgemm_into(num_tokens, q_dim, hidden, 1.0, &normed, weights.q_proj, 0.0, &mut d)?; }
-                { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.k_proj, 0.0, &mut d)?; }
-                { let mut d = qkv_buf.slice_mut(k_end_t..); blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.v_proj, 0.0, &mut d)?; }
+                { let mut d = qkv_buf.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
+                { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
                 qkv_buf
             };
 
@@ -672,6 +672,27 @@ mod inner {
             }
             blas.hgemm(m, n, k, f16::ONE, input, weight, f16::ZERO, &mut output)?;
             Ok(output)
+        }
+
+        /// hgemm dispatch into a pre-allocated view (sub-slice of a larger buffer).
+        /// Uses cublasLt for M<=32, falls back to standard cuBLAS.
+        fn hgemm_dispatch_into(
+            blas: &CublasHandle,
+            lt: Option<&crate::CublasLtRef>,
+            input: &CudaSlice<f16>,
+            weight: &CudaSlice<f16>,
+            m: usize,
+            n: usize,
+            k: usize,
+            out: &mut CudaViewMut<'_, f16>,
+        ) -> Result<()> {
+            #[cfg(feature = "cublaslt")]
+            if let Some(lt_ops) = lt {
+                if m <= rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD {
+                    return lt_ops.hgemm_a_bt_into(m, n, k, 1.0, input, weight, 0.0, out);
+                }
+            }
+            blas.hgemm_into(m, n, k, 1.0, input, weight, 0.0, out)
         }
 
         /// Add bias f16 in-place on a CudaViewMut<f16>.

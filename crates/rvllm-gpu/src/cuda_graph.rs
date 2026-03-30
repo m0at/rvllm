@@ -48,13 +48,22 @@ impl CudaGraph {
         self.batch_size
     }
 
-    /// Replay the captured graph on the given stream.
+    /// Replay the captured graph on `stream`.
+    ///
+    /// The graph is launched via cuGraphLaunch on the provided stream. All
+    /// metadata must be written to the persistent GPU buffers on the SAME
+    /// stream BEFORE calling this so CUDA stream ordering guarantees the
+    /// kernels see the updated data.
     #[cfg(feature = "cuda-graphs")]
-    pub fn replay(&self, _stream: &crate::stream::GpuStream) -> Result<()> {
+    pub fn replay(&self, stream: &crate::stream::GpuStream) -> Result<()> {
         trace!(batch_size = self.batch_size, "replaying CUDA graph");
-        self.inner.launch().map_err(|e| {
-            LLMError::GpuError(format!("cuGraphLaunch failed: {e}"))
-        })?;
+        let cu_stream_ref = stream.cuda_stream();
+        let cu_stream = cu_stream_ref.cu_stream();
+        cu_stream_ref.context().bind_to_thread()
+            .map_err(|e| LLMError::GpuError(format!("bind_to_thread: {e}")))?;
+        unsafe {
+            cudarc::driver::result::graph::launch(self.inner.cu_graph_exec(), cu_stream)
+        }.map_err(|e| LLMError::GpuError(format!("cuGraphLaunch failed: {e}")))?;
         Ok(())
     }
 

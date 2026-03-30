@@ -5,7 +5,7 @@
 //! split-K heuristics and a larger algorithm search space.
 
 use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::f16;
 use std::sync::Arc;
 
@@ -77,6 +77,45 @@ impl CublasLtOps {
             self.handle
                 .matmul(cfg, b, a, c, None, None)
                 .map_err(|e| LLMError::GpuError(format!("cublasLt hgemm_a_bt failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Row-major HGEMM into a view via cublasLt. Accepts any DevicePtr/DevicePtrMut
+    /// so callers can pass CudaViewMut (sub-slices of a larger buffer).
+    pub fn hgemm_a_bt_into(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &impl DevicePtr<f16>,
+        b: &impl DevicePtr<f16>,
+        beta: f32,
+        c: &mut impl DevicePtrMut<f16>,
+    ) -> Result<()> {
+        let cfg = MatmulConfig {
+            transa: true,
+            transb: false,
+            transc: false,
+            m: n as u64,
+            n: m as u64,
+            k: k as u64,
+            alpha,
+            lda: k as i64,
+            ldb: k as i64,
+            beta,
+            ldc: n as i64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+        unsafe {
+            self.handle
+                .matmul(cfg, b, a, c, None, None)
+                .map_err(|e| LLMError::GpuError(format!("cublasLt hgemm_a_bt_into failed: {e}")))?;
         }
         Ok(())
     }
