@@ -50,6 +50,10 @@ mod inner {
         pub fused_gate_up: Option<&'a CudaSlice<f16>>,
         /// Fused QKV bias (f16). None if model has no QKV bias.
         pub qkv_bias: Option<&'a CudaSlice<f16>>,
+        // FP8 quantized weights (u8 data + f16 per-row scales).
+        // Present when RVLLM_FP8_WEIGHTS=1.
+        pub fused_qkv_fp8: Option<&'a CudaSlice<u8>>,
+        pub fused_qkv_fp8_scale: Option<&'a CudaSlice<f16>>,
     }
 
     /// Metadata needed for a single layer forward pass.
@@ -177,8 +181,34 @@ mod inner {
                 let (mut qkv, residual_ref, bias_fused) = if let Some(prev_mlp) = prev_mlp_out {
                     // Try fused add+norm+QKV GEMV (3-way: add + norm + projection)
                     let fused_qkv_w = weights.fused_qkv.unwrap_or(weights.q_proj);
-                    // Try bias-fused variant first if model has QKV bias
-                    if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv")) {
+                    // FP8 fused variant (halves weight bandwidth)
+                    if let (Some(fp8_w), Some(fp8_s), Ok(ref fk)) = (
+                        weights.fused_qkv_fp8,
+                        weights.fused_qkv_fp8_scale,
+                        self.loader.get_func("gemv_fp8", "fused_add_norm_fp8_gemv_kernel"),
+                    ) {
+                        let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
+                            .map_err(|e| LLMError::GpuError(format!("fp8 qkv alloc: {e}")))?;
+                        let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }
+                            .map_err(|e| LLMError::GpuError(format!("fp8 residual alloc: {e}")))?;
+                        let smem = (hidden * 4 + 8 * 4) as u32;
+                        let rpb = 8u32;
+                        if smem > 49152 {
+                            fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
+                                .map_err(|e| LLMError::GpuError(format!("fp8 smem attr: {e}")))?;
+                        }
+                        unsafe {
+                            self.stream.launch_builder(fk)
+                                .arg(&mut qkv_out).arg(&mut residual_out)
+                                .arg(hidden_f16).arg(prev_mlp).arg(norm_w)
+                                .arg(fp8_w).arg(fp8_s)
+                                .arg(&cfg.rms_norm_eps).arg(&(hidden as i32)).arg(&(qkv_dim as i32))
+                                .launch(LaunchConfig { grid_dim: ((qkv_dim as u32 + rpb - 1) / rpb, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
+                                .map_err(|e| LLMError::GpuError(format!("fp8 add_norm_qkv: {e}")))?;
+                        }
+                        (qkv_out, residual_out, false)
+                    // f16 bias-fused variant
+                    } else if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv")) {
                         let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
                             .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
                         let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }

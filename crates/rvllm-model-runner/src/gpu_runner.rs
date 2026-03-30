@@ -161,6 +161,9 @@ mod cuda_impl {
         fused_gate_up_weights: Vec<CudaSlice<half::f16>>,
         /// Fused QKV bias per layer (None if model has no QKV bias).
         fused_qkv_bias: Vec<Option<CudaSlice<half::f16>>>,
+        /// FP8 quantized fused QKV weights + per-row scales (when RVLLM_FP8_WEIGHTS=1).
+        fp8_fused_qkv: Vec<CudaSlice<u8>>,
+        fp8_fused_qkv_scale: Vec<CudaSlice<half::f16>>,
         /// Pre-allocated scratch buffers for the forward pass.
         f16_scratch: Option<F16LayerScratch>,
     }
@@ -284,6 +287,8 @@ mod cuda_impl {
                 fused_qkv_weights: Vec::new(),
                 fused_gate_up_weights: Vec::new(),
                 fused_qkv_bias: Vec::new(),
+                fp8_fused_qkv: Vec::new(),
+                fp8_fused_qkv_scale: Vec::new(),
                 f16_scratch: None,
             })
         }
@@ -359,6 +364,31 @@ mod cuda_impl {
             }
 
             info!(num_layers, qkv_dim, gate_up_dim, "fused QKV and gate+up weights (f16)");
+
+            // FP8 weight quantization (when RVLLM_FP8_WEIGHTS=1)
+            if std::env::var("RVLLM_FP8_WEIGHTS").map_or(false, |v| v == "1") {
+                info!("quantizing weights to FP8 E4M3 (per-row scales)...");
+                for i in 0..num_layers {
+                    let qkv_w = &self.fused_qkv_weights[i];
+                    let qkv_len = qkv_w.len();
+                    // Download to CPU, quantize, re-upload
+                    let mut host = vec![half::f16::ZERO; qkv_len];
+                    self.stream.memcpy_dtoh(qkv_w, &mut host)
+                        .map_err(|e| LLMError::GpuError(format!("fp8 dtoh: {e}")))?;
+                    let q = rvllm_gpu::fp8_quantize::quantize_weight_fp8(&host, qkv_dim, hidden);
+                    let mut fp8_dev = unsafe { self.stream.alloc::<u8>(q.data.len()) }
+                        .map_err(|e| LLMError::GpuError(format!("fp8 alloc: {e}")))?;
+                    self.stream.memcpy_htod(&q.data, &mut fp8_dev)
+                        .map_err(|e| LLMError::GpuError(format!("fp8 htod: {e}")))?;
+                    let mut scale_dev = unsafe { self.stream.alloc::<half::f16>(q.scales.len()) }
+                        .map_err(|e| LLMError::GpuError(format!("fp8 scale alloc: {e}")))?;
+                    self.stream.memcpy_htod(&q.scales, &mut scale_dev)
+                        .map_err(|e| LLMError::GpuError(format!("fp8 scale htod: {e}")))?;
+                    self.fp8_fused_qkv.push(fp8_dev);
+                    self.fp8_fused_qkv_scale.push(scale_dev);
+                }
+                info!(num_layers, "FP8 QKV weight quantization complete");
+            }
 
             self.alloc_scratch()?;
             Ok(())
@@ -1177,6 +1207,8 @@ mod cuda_impl {
                 fused_qkv: self.fused_qkv_weights.get(i),
                 fused_gate_up: self.fused_gate_up_weights.get(i),
                 qkv_bias: self.fused_qkv_bias.get(i).and_then(|o| o.as_ref()),
+                fused_qkv_fp8: self.fp8_fused_qkv.get(i),
+                fused_qkv_fp8_scale: self.fp8_fused_qkv_scale.get(i),
             })
         }
 

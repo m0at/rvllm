@@ -13,26 +13,14 @@
 // (no cuda_fp8.h dependency -- works on sm_80+).
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #define FP8_THREADS 256
 #define FP8_RPB 8
 
-#define FP8_E4M3_MAX 448.0f
-
-// Software FP8 E4M3 -> float conversion (same as fp8_kv.cu)
+// Hardware FP8 E4M3 -> float via __nv_fp8_e4m3 (sm_89+, single instruction)
 __device__ __forceinline__ float fp8e4m3_to_float(unsigned char fp8) {
-    float sign = (fp8 & 0x80) ? -1.0f : 1.0f;
-    int exp = (fp8 >> 3) & 0xF;
-    int mantissa = fp8 & 0x7;
-
-    if (exp == 0) {
-        if (mantissa == 0) return 0.0f;
-        return sign * (float)mantissa * 1.9531e-3f;
-    }
-    if (exp == 15 && mantissa == 7) return 0.0f; // NaN -> 0
-
-    float fmantissa = 1.0f + (float)mantissa * 0.125f;
-    return sign * ldexpf(fmantissa, exp - 7);
+    return float(*reinterpret_cast<const __nv_fp8_e4m3*>(&fp8));
 }
 
 __device__ __forceinline__ float warp_reduce_sum_fp8(float val) {
