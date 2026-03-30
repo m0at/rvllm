@@ -740,8 +740,12 @@ mod inner {
                 // --- Steps 7-10: Try FP8 mega, then f16 mega, then separate ---
                 let (residual, mlp_out) = {
                     let fused_gate_up_w = weights.fused_gate_up.unwrap_or(weights.gate_proj);
-                    // FP8 mega kernel: O-proj + add + norm + gateup, both weights FP8
-                    if let (Some(o_fp8), Some(o_sc), Some(gu_fp8), Some(gu_sc), Ok(ref mk)) = (
+                    // FP8 mega kernel: O-proj + add + norm + gateup, both weights FP8.
+                    // Gate on O-proj fitting in L2: all blocks redundantly read O-proj,
+                    // so for 7B+ where O-proj > L2 capacity this is 100x slower.
+                    let oproj_fp8_ok = (hidden * q_dim) < 4 * 1024 * 1024; // <4MB FP8
+                    if let (true, Some(o_fp8), Some(o_sc), Some(gu_fp8), Some(gu_sc), Ok(ref mk)) = (
+                        oproj_fp8_ok,
                         weights.o_proj_fp8, weights.o_proj_fp8_scale,
                         weights.fused_gate_up_fp8, weights.fused_gate_up_fp8_scale,
                         self.loader.get_func("fused_oproj_add_norm_gateup_gemv", "fused_cute_oproj_add_norm_gateup_fp8_gemv"),
