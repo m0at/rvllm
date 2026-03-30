@@ -157,7 +157,6 @@ mod inner {
             architecture,
             rope_theta,
             partial_rotary_factor,
-            head_dim,
             attn_logit_softcapping: get_f32("attn_logit_softcapping", 0.0),
             attention_bias: json
                 .get("attention_bias")
