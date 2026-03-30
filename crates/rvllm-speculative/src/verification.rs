@@ -49,16 +49,32 @@ pub fn verify_tokens(
 }
 
 /// Deterministic version for testing: accepts an explicit RNG.
+///
+/// `target_probs` may have either K or K+1 entries:
+/// - K entries: bonus token on full acceptance is sampled from position K-1
+///   (the last available target distribution). This is the legacy/test path.
+/// - K+1 entries: the extra entry at index K is the target model's distribution
+///   at the position after all K draft tokens. The bonus on full acceptance is
+///   sampled from this K+1-th distribution, which is the correct behavior for
+///   speculative decoding (the target model evaluates K+1 positions in its
+///   verification forward pass).
 pub fn verify_tokens_with_rng<R: Rng>(
     draft_probs: &[Vec<f32>],
     target_probs: &[Vec<f32>],
     draft_tokens: &[TokenId],
     rng: &mut R,
 ) -> VerificationResult {
-    assert_eq!(draft_probs.len(), target_probs.len());
-    assert_eq!(draft_probs.len(), draft_tokens.len());
-
     let k = draft_tokens.len();
+    assert_eq!(draft_probs.len(), k);
+    // target_probs is K (legacy) or K+1 (correct spec decode)
+    assert!(
+        target_probs.len() == k || target_probs.len() == k + 1,
+        "target_probs.len()={} must be K={} or K+1={}",
+        target_probs.len(),
+        k,
+        k + 1
+    );
+
     let mut accepted_tokens = Vec::with_capacity(k);
 
     for i in 0..k {
@@ -92,13 +108,14 @@ pub fn verify_tokens_with_rng<R: Rng>(
         }
     }
 
-    // All K tokens accepted: sample bonus token from target at position K
-    // (the target model evaluated K+1 positions, use the last one).
-    // If we have target_probs for all K positions, use the last one as the
-    // bonus distribution. In practice the engine provides K+1 target distributions.
-    let bonus = if !target_probs.is_empty() {
-        let last_target = &target_probs[k - 1];
-        Some(sample_from_distribution(last_target, rng))
+    // All K tokens accepted. Sample bonus from:
+    //  - target_probs[K] if K+1 distributions provided (correct path)
+    //  - target_probs[K-1] if only K distributions (legacy/test path)
+    let bonus = if target_probs.len() > k {
+        // K+1 distributions: use the extra one at position K
+        Some(sample_from_distribution(&target_probs[k], rng))
+    } else if !target_probs.is_empty() {
+        Some(sample_from_distribution(&target_probs[k - 1], rng))
     } else {
         None
     };

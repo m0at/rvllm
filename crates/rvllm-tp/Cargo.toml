@@ -1,0 +1,26 @@
+[package]
+name = "rvllm-tp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Tensor parallelism primitives for the rvLLM inference engine"
+keywords = ["llm", "inference", "gpu", "tensor-parallelism", "nccl"]
+categories = ["hardware-support", "science"]
+
+[features]
+default = ["mock-gpu"]
+mock-gpu = ["rvllm-gpu/mock-gpu"]
+cuda = ["rvllm-gpu/cuda"]
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-gpu = { path = "../rvllm-gpu", default-features = false }
+half.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]

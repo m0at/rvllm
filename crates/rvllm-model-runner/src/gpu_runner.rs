@@ -24,6 +24,17 @@ pub enum ForwardOutput {
     TokenIdsPending { actual_batch: usize },
 }
 
+/// Extract the raw CUfunction handle from a CudaFunction for raw launch APIs.
+#[cfg(feature = "cuda")]
+unsafe fn extract_cu_function_from_loader(
+    func: &cudarc::driver::CudaFunction,
+) -> cudarc::driver::sys::CUfunction {
+    std::ptr::read(
+        (func as *const cudarc::driver::CudaFunction)
+            .cast::<cudarc::driver::sys::CUfunction>(),
+    )
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use std::cell::RefCell;
@@ -31,7 +42,7 @@ mod cuda_impl {
 
     use std::cell::Cell;
 
-    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaView, DevicePtrMut, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{debug, info, trace};
 
@@ -105,6 +116,15 @@ mod cuda_impl {
         pub down: CudaSlice<f16>,     // [max_tokens * hidden]
     }
 
+    /// Scratch buffers for the persistent cooperative-groups layer kernel.
+    /// Tiny (< 100KB total), allocated once, reused across all layers.
+    pub struct PersistentLayerScratch {
+        pub qkv: CudaSlice<f16>,       // [qkv_dim]
+        pub attn: CudaSlice<f16>,      // [q_dim]
+        pub oproj: CudaSlice<f16>,     // [hidden_size]
+        pub gateup: CudaSlice<f16>,    // [gate_up_dim]
+    }
+
     /// Element offsets into the packed metadata GPU buffer.
     #[derive(Clone, Copy, Default)]
     struct PackedMetaOffsets {
@@ -163,6 +183,10 @@ mod cuda_impl {
         fused_qkv_bias: Vec<Option<CudaSlice<half::f16>>>,
         /// Pre-allocated scratch buffers for the forward pass.
         f16_scratch: Option<F16LayerScratch>,
+        /// Scratch buffers for persistent cooperative layer kernel (M=1 decode).
+        persistent_scratch: Option<PersistentLayerScratch>,
+        /// Cached max cooperative grid size for the persistent layer kernel.
+        persistent_max_grid: u32,
     }
 
     impl GpuModelRunner {
@@ -285,6 +309,8 @@ mod cuda_impl {
                 fused_gate_up_weights: Vec::new(),
                 fused_qkv_bias: Vec::new(),
                 f16_scratch: None,
+                persistent_scratch: None,
+                persistent_max_grid: 0,
             })
         }
 
@@ -394,13 +420,282 @@ mod cuda_impl {
             let total_bytes = (max_tokens * (qkv_dim + q_dim + hidden * 3 + intermediate * 3)) * 2;
             info!(max_tokens, total_bytes, "f16 layer scratch allocated");
             self.f16_scratch = Some(scratch);
+
+            // Allocate persistent cooperative layer scratch (M=1 only, tiny).
+            let gate_up_dim = intermediate * 2;
+            let p_scratch = PersistentLayerScratch {
+                qkv: alloc(qkv_dim)?,
+                attn: alloc(q_dim)?,
+                oproj: alloc(hidden)?,
+                gateup: alloc(gate_up_dim)?,
+            };
+            let p_bytes = (qkv_dim + q_dim + hidden + gate_up_dim) * 2;
+            info!(p_bytes, "persistent layer scratch allocated");
+            self.persistent_scratch = Some(p_scratch);
+
+            // Query cooperative grid capacity if the kernel is loaded.
+            if self.loader.has_module("persistent_layer_decode") {
+                self.init_persistent_grid(hidden)?;
+            }
+
             Ok(())
+        }
+
+        /// Query and cache the max cooperative grid size for the persistent layer kernel.
+        fn init_persistent_grid(&mut self, hidden_size: usize) -> Result<()> {
+            use rvllm_gpu::cooperative;
+
+            let func = self.loader.get_func(
+                "persistent_layer_decode",
+                "persistent_layer_decode_f16",
+            )?;
+            let cu_func = unsafe {
+                super::extract_cu_function_from_loader(&func)
+            };
+            let shared_bytes = (hidden_size * 4 + 32) as u32;
+            match unsafe {
+                cooperative::max_cooperative_grid(cu_func, 256, shared_bytes, &self.device)
+            } {
+                Ok(max_grid) => {
+                    self.persistent_max_grid = max_grid.min(256);
+                    info!(
+                        max_grid,
+                        capped = self.persistent_max_grid,
+                        "persistent layer cooperative grid"
+                    );
+                }
+                Err(e) => {
+                    info!("cooperative grid query failed ({e:?}), persistent path disabled");
+                    self.persistent_max_grid = 0;
+                }
+            }
+            Ok(())
+        }
+
+        /// Whether the persistent cooperative layer kernel is available.
+        pub fn has_persistent_layer(&self) -> bool {
+            self.persistent_max_grid > 0 && self.persistent_scratch.is_some()
+        }
+
+        /// Access persistent layer scratch buffers.
+        pub fn persistent_scratch(&self) -> &PersistentLayerScratch {
+            self.persistent_scratch.as_ref().expect("persistent_scratch not allocated")
+        }
+
+        /// Max cooperative grid size for the persistent layer kernel.
+        pub fn persistent_max_grid(&self) -> u32 {
+            self.persistent_max_grid
         }
 
         /// Access the pre-allocated f16 scratch buffers.
         /// Panics if called before fuse_weights().
         pub fn f16_scratch(&self) -> &F16LayerScratch {
             self.f16_scratch.as_ref().expect("f16_scratch not allocated; call fuse_weights() first")
+        }
+
+        /// Run a single transformer layer using the persistent cooperative-groups
+        /// kernel. Only valid for M=1 decode (single token).
+        ///
+        /// Returns (residual, mlp_out) just like the multi-kernel path.
+        ///
+        /// # Safety
+        /// Caller must ensure metadata is uploaded and all weight/cache pointers are valid.
+        pub unsafe fn forward_persistent_layer(
+            &self,
+            layer_idx: usize,
+            prev_residual: &CudaSlice<f16>,
+            prev_mlp: Option<&CudaSlice<f16>>,
+            max_context_len: u32,
+            block_size: usize,
+        ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
+            use rvllm_gpu::cooperative;
+
+            let hidden = self.config.hidden_size;
+            let q_dim = self.config.num_heads * self.config.head_dim;
+            let kv_dim = self.config.num_kv_heads * self.config.head_dim;
+            let qkv_dim = q_dim + kv_dim + kv_dim;
+            let intermediate = self.config.intermediate_size;
+            let gate_up_dim = intermediate * 2;
+
+            let ps = self.persistent_scratch.as_ref()
+                .ok_or_else(|| LLMError::GpuError("persistent scratch not allocated".into()))?;
+
+            // Outputs: residual_out and mlp_out (newly allocated, kernel writes all elements)
+            let residual_out = self.stream.alloc::<f16>(hidden)
+                .map_err(|e| LLMError::GpuError(format!("persistent residual alloc: {e}")))?;
+            let mlp_out = self.stream.alloc::<f16>(hidden)
+                .map_err(|e| LLMError::GpuError(format!("persistent mlp alloc: {e}")))?;
+
+            // Cache pointers (kernel reads + writes KV cache)
+            let gpu_cache = self.cache.gpu_cache();
+            let (key_cache, value_cache) = &gpu_cache[layer_idx];
+
+            // Metadata from packed buffer
+            let meta_packed = self.meta_packed.borrow();
+            let packed_buf = meta_packed.slice();
+            let offsets = self.meta_packed_offsets.get();
+
+            // Weight pointers
+            let weights = self.layer_weights(layer_idx)?;
+            let fused_qkv = weights.fused_qkv
+                .ok_or_else(|| LLMError::GpuError("persistent layer needs fused QKV".into()))?;
+            let fused_gate_up = weights.fused_gate_up
+                .ok_or_else(|| LLMError::GpuError("persistent layer needs fused gate_up".into()))?;
+
+            let func = self.loader.get_func(
+                "persistent_layer_decode",
+                "persistent_layer_decode_f16",
+            )?;
+            let cu_func = super::extract_cu_function_from_loader(&func);
+
+            // Shared memory: max(hidden_size * 4 + 32, FA_BC * head_dim * 4 + MAX_HPG * FA_BC * 4 + 32)
+            let fa_bc: usize = 64;
+            let fa_max_hpg: usize = 8;
+            let head_dim = self.config.head_dim;
+            let smem_norm = hidden * 4 + 32;
+            let smem_attn = fa_bc * head_dim * 4 + fa_max_hpg * fa_bc * 4 + 32;
+            let shared_mem = smem_norm.max(smem_attn) as u32;
+
+            let grid_x = self.persistent_max_grid;
+
+            // Extract raw device pointers. DevicePtr::device_ptr works for all
+            // (read-only trait, kernel handles mutability). All on same stream so
+            // ordering is implicit.
+            let (mlp_out_ptr, _g0) = DevicePtr::device_ptr(&mlp_out, &self.stream);
+            let (res_out_ptr, _g1) = DevicePtr::device_ptr(&residual_out, &self.stream);
+            let (prev_res_ptr, _g2) = DevicePtr::device_ptr(prev_residual, &self.stream);
+
+            // prev_mlp: NULL (0u64) for layer 0
+            let _g3_opt;
+            let prev_mlp_dev: u64;
+            if let Some(pm) = prev_mlp {
+                let (p, g) = DevicePtr::device_ptr(pm, &self.stream);
+                prev_mlp_dev = p;
+                _g3_opt = Some(g);
+            } else {
+                prev_mlp_dev = 0;
+                _g3_opt = None;
+            }
+
+            let (kc_ptr, _g4) = DevicePtr::device_ptr(key_cache, &self.stream);
+            let (vc_ptr, _g5) = DevicePtr::device_ptr(value_cache, &self.stream);
+
+            // Metadata views
+            let bt_view = packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables);
+            let cl_view = packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens);
+            let pos_view = packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions);
+            let sm_view = packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping);
+
+            let (bt_ptr, _g6) = DevicePtr::device_ptr(&bt_view, &self.stream);
+            let (cl_ptr, _g7) = DevicePtr::device_ptr(&cl_view, &self.stream);
+            let (pos_ptr, _g8) = DevicePtr::device_ptr(&pos_view, &self.stream);
+            let (sm_ptr, _g9) = DevicePtr::device_ptr(&sm_view, &self.stream);
+
+            let (rcos_ptr, _g10) = DevicePtr::device_ptr(&self.rope_cos, &self.stream);
+            let (rsin_ptr, _g11) = DevicePtr::device_ptr(&self.rope_sin, &self.stream);
+
+            // Weights
+            let (norm_w_ptr, _g12) = DevicePtr::device_ptr(weights.input_layernorm, &self.stream);
+            let (qkv_w_ptr, _g13) = DevicePtr::device_ptr(fused_qkv, &self.stream);
+            let (_g14_opt, qkv_bias_dev);
+            if let Some(b) = weights.qkv_bias {
+                let (p, g) = DevicePtr::device_ptr(b, &self.stream);
+                qkv_bias_dev = p;
+                _g14_opt = Some(g);
+            } else {
+                qkv_bias_dev = 0;
+                _g14_opt = None;
+            }
+            let (o_w_ptr, _g15) = DevicePtr::device_ptr(weights.o_proj, &self.stream);
+            let (post_norm_ptr, _g16) = DevicePtr::device_ptr(weights.post_attention_layernorm, &self.stream);
+            let (gu_w_ptr, _g17) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
+            let (down_w_ptr, _g18) = DevicePtr::device_ptr(weights.down_proj, &self.stream);
+
+            // Scratch buffers
+            let (qkv_s_ptr, _g19) = DevicePtr::device_ptr(&ps.qkv, &self.stream);
+            let (attn_s_ptr, _g20) = DevicePtr::device_ptr(&ps.attn, &self.stream);
+            let (oproj_s_ptr, _g21) = DevicePtr::device_ptr(&ps.oproj, &self.stream);
+            let (gu_s_ptr, _g22) = DevicePtr::device_ptr(&ps.gateup, &self.stream);
+
+            // Scalar config
+            let eps = self.rms_norm_eps;
+            let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+            let hidden_i = hidden as i32;
+            let q_dim_i = q_dim as i32;
+            let kv_dim_i = kv_dim as i32;
+            let qkv_dim_i = qkv_dim as i32;
+            let num_heads_i = self.config.num_heads as i32;
+            let num_kv_heads_i = self.config.num_kv_heads as i32;
+            let head_dim_i = head_dim as i32;
+            let intermediate_i = intermediate as i32;
+            let gate_up_dim_i = gate_up_dim as i32;
+            let block_size_i = block_size as i32;
+            let max_context_i = max_context_len as i32;
+            let max_blocks_per_seq_i = (max_context_len as usize / block_size + 1) as i32;
+
+            // Build args array -- order must match kernel signature exactly.
+            // Each element is a pointer to the local variable holding the CUdeviceptr or scalar.
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                // Outputs
+                &mlp_out_ptr as *const u64 as *mut std::ffi::c_void,
+                &res_out_ptr as *const u64 as *mut std::ffi::c_void,
+                // Inputs
+                &prev_res_ptr as *const u64 as *mut std::ffi::c_void,
+                &prev_mlp_dev as *const u64 as *mut std::ffi::c_void,
+                // Attention I/O
+                &kc_ptr as *const u64 as *mut std::ffi::c_void,
+                &vc_ptr as *const u64 as *mut std::ffi::c_void,
+                &bt_ptr as *const u64 as *mut std::ffi::c_void,
+                &cl_ptr as *const u64 as *mut std::ffi::c_void,
+                &pos_ptr as *const u64 as *mut std::ffi::c_void,
+                &sm_ptr as *const u64 as *mut std::ffi::c_void,
+                &rcos_ptr as *const u64 as *mut std::ffi::c_void,
+                &rsin_ptr as *const u64 as *mut std::ffi::c_void,
+                // Weights
+                &norm_w_ptr as *const u64 as *mut std::ffi::c_void,
+                &qkv_w_ptr as *const u64 as *mut std::ffi::c_void,
+                &qkv_bias_dev as *const u64 as *mut std::ffi::c_void,
+                &o_w_ptr as *const u64 as *mut std::ffi::c_void,
+                &post_norm_ptr as *const u64 as *mut std::ffi::c_void,
+                &gu_w_ptr as *const u64 as *mut std::ffi::c_void,
+                &down_w_ptr as *const u64 as *mut std::ffi::c_void,
+                // Scratch
+                &qkv_s_ptr as *const u64 as *mut std::ffi::c_void,
+                &attn_s_ptr as *const u64 as *mut std::ffi::c_void,
+                &oproj_s_ptr as *const u64 as *mut std::ffi::c_void,
+                &gu_s_ptr as *const u64 as *mut std::ffi::c_void,
+                // Config scalars
+                &eps as *const f32 as *mut std::ffi::c_void,
+                &attn_scale as *const f32 as *mut std::ffi::c_void,
+                &hidden_i as *const i32 as *mut std::ffi::c_void,
+                &q_dim_i as *const i32 as *mut std::ffi::c_void,
+                &kv_dim_i as *const i32 as *mut std::ffi::c_void,
+                &qkv_dim_i as *const i32 as *mut std::ffi::c_void,
+                &num_heads_i as *const i32 as *mut std::ffi::c_void,
+                &num_kv_heads_i as *const i32 as *mut std::ffi::c_void,
+                &head_dim_i as *const i32 as *mut std::ffi::c_void,
+                &intermediate_i as *const i32 as *mut std::ffi::c_void,
+                &gate_up_dim_i as *const i32 as *mut std::ffi::c_void,
+                &block_size_i as *const i32 as *mut std::ffi::c_void,
+                &max_context_i as *const i32 as *mut std::ffi::c_void,
+                &max_blocks_per_seq_i as *const i32 as *mut std::ffi::c_void,
+            ];
+
+            self.device.bind_to_thread()
+                .map_err(|e| LLMError::GpuError(format!("CUDA bind: {e}")))?;
+
+            cooperative::launch_cooperative(
+                cu_func,
+                (grid_x, 1, 1),
+                (256, 1, 1),
+                shared_mem,
+                self.stream.cu_stream(),
+                &mut args,
+            ).map_err(|e| LLMError::GpuError(format!(
+                "persistent_layer_decode cooperative launch (layer {layer_idx}): {e}"
+            )))?;
+
+            Ok((residual_out, mlp_out))
         }
 
         pub fn forward(
@@ -465,10 +760,29 @@ mod cuda_impl {
 
             let gpu_cache = self.cache.gpu_cache();
             let num_layers = self.layers.len();
+            let use_persistent = num_tokens == 1 && !is_prefill && self.has_persistent_layer();
+            let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
+
+            if use_persistent {
+                // Persistent cooperative-groups path: 1 kernel launch per layer
+                // instead of 5-6. forward_persistent_layer borrows meta_packed internally.
+                for layer_idx in 0..num_layers {
+                    let (residual, mlp_out) = unsafe {
+                        self.forward_persistent_layer(
+                            layer_idx,
+                            &hidden_f16,
+                            prev_mlp_out.as_ref(),
+                            max_context_len,
+                            block_size,
+                        )?
+                    };
+                    hidden_f16 = residual;
+                    prev_mlp_out = Some(mlp_out);
+                }
+            } else {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let input = GpuLayerInput {
@@ -510,6 +824,7 @@ mod cuda_impl {
                     info!("DEBUG layer {layer_idx} mlp_out: first5={mfirst5:?} nan={mnan} max={mmax}");
                 }
             }
+            } // end else (fallback multi-kernel path)
 
             // Final: fuse last layer's residual add with final RMSNorm
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
@@ -720,10 +1035,27 @@ mod cuda_impl {
 
             let gpu_cache = self.cache.gpu_cache();
             let num_layers = self.layers.len();
+            let use_persistent = num_tokens == 1 && !is_prefill && self.has_persistent_layer();
+            let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
+
+            if use_persistent {
+                for layer_idx in 0..num_layers {
+                    let (residual, mlp_out) = unsafe {
+                        self.forward_persistent_layer(
+                            layer_idx,
+                            &hidden_f16,
+                            prev_mlp_out.as_ref(),
+                            max_context_len,
+                            block_size,
+                        )?
+                    };
+                    hidden_f16 = residual;
+                    prev_mlp_out = Some(mlp_out);
+                }
+            } else {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let input = GpuLayerInput {
@@ -748,6 +1080,7 @@ mod cuda_impl {
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
+            } // end else (fallback multi-kernel path)
 
             // Final: fuse last layer's residual add with final RMSNorm
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {

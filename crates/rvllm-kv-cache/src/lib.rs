@@ -16,7 +16,11 @@ pub mod ops_cuda;
 
 pub use cache::{CacheConfig, KVCache};
 pub use engine::CacheEngine;
+#[cfg(feature = "cuda")]
+pub use engine_cuda::CudaFP8CacheEngine;
 pub use fp8_cache::{
     dequantize_heads, quantize_heads, FP8CacheConfig, FP8CacheEngine, KVCacheDtype,
 };
 pub use ops::reshape_and_cache;
+#[cfg(feature = "cuda")]
+pub use ops_cuda::{dequantize_cache_blocks_cuda, reshape_and_cache_fp8_cuda};

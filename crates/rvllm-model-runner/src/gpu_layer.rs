@@ -1024,6 +1024,91 @@ mod inner {
                 }
             }
 
+            // Split-KV attention: distribute KV tiles across multiple thread blocks for
+            // long-context decode (512+ tokens). Each block computes a partial softmax +
+            // output, then a combine kernel reduces across splits.
+            const SPLIT_KV_THRESHOLD: u32 = 512;
+            if max_context_len >= SPLIT_KV_THRESHOLD {
+                if let (Ok(split_kernel), Ok(combine_kernel)) = (
+                    loader.get_func("split_kv_attention", "split_kv_decode_f16io_kernel"),
+                    loader.get_func("split_kv_attention", "split_kv_combine_f16io_kernel"),
+                ) {
+                    const SKV_BC: usize = 64;
+                    const SKV_THREADS: u32 = 128;
+
+                    let total_tiles = (max_context_len as usize + SKV_BC - 1) / SKV_BC;
+                    let num_splits = total_tiles.min(16).max(2) as i32;
+
+                    let smem = (2 * SKV_BC * head_dim + SKV_BC + 4) * std::mem::size_of::<f32>();
+                    let shared_mem_bytes = smem as u32;
+
+                    let ws_out_len = num_splits as usize * num_seqs * num_heads * head_dim;
+                    let ws_scalar_len = num_splits as usize * num_seqs * num_heads;
+                    let partial_out = unsafe { stream.alloc::<f32>(ws_out_len) }
+                        .map_err(|e| LLMError::GpuError(format!("split_kv partial_out alloc: {e}")))?;
+                    let partial_max = unsafe { stream.alloc::<f32>(ws_scalar_len) }
+                        .map_err(|e| LLMError::GpuError(format!("split_kv partial_max alloc: {e}")))?;
+                    let partial_sum = unsafe { stream.alloc::<f32>(ws_scalar_len) }
+                        .map_err(|e| LLMError::GpuError(format!("split_kv partial_sum alloc: {e}")))?;
+
+                    let p_num_seqs = num_seqs as i32;
+
+                    if shared_mem_bytes > 49152 {
+                        split_kernel.set_attribute(
+                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            shared_mem_bytes as i32,
+                        ).map_err(|e| LLMError::GpuError(format!("split_kv set max shared mem: {e}")))?;
+                    }
+
+                    let split_cfg = LaunchConfig {
+                        grid_dim: (num_seqs as u32, num_heads as u32, num_splits as u32),
+                        block_dim: (SKV_THREADS, 1, 1),
+                        shared_mem_bytes,
+                    };
+
+                    unsafe {
+                        stream.launch_builder(&split_kernel)
+                            .arg(&partial_out)
+                            .arg(&partial_max)
+                            .arg(&partial_sum)
+                            .arg(q)
+                            .arg(key_cache).arg(value_cache)
+                            .arg(block_tables).arg(context_lens)
+                            .arg(&scale)
+                            .arg(&p_num_seqs)
+                            .arg(&p_num_heads).arg(&p_num_kv_heads)
+                            .arg(&p_head_dim).arg(&p_block_size)
+                            .arg(&p_max_blocks)
+                            .arg(&num_splits)
+                            .launch(split_cfg)
+                            .map_err(|e| LLMError::GpuError(format!("split_kv decode launch: {e}")))?;
+                    }
+
+                    let combine_cfg = LaunchConfig {
+                        grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                        block_dim: (head_dim as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+
+                    unsafe {
+                        stream.launch_builder(&combine_kernel)
+                            .arg(&mut output)
+                            .arg(&partial_out)
+                            .arg(&partial_max)
+                            .arg(&partial_sum)
+                            .arg(context_lens)
+                            .arg(&p_num_seqs)
+                            .arg(&p_num_heads)
+                            .arg(&p_head_dim)
+                            .arg(&num_splits)
+                            .launch(combine_cfg)
+                            .map_err(|e| LLMError::GpuError(format!("split_kv combine launch: {e}")))?;
+                    }
+
+                    return Ok(output);
+                }
+            }
+
             // FA3 kernel: 256 threads, vectorized half2 loads, warp-parallel reductions.
             // Shared memory: 33KB (fits in default 48KB, no set_attribute needed).
             if let Ok(fa3_kernel) = loader.get_func("flash_attention_3", "flash_attention_3_decode_f16io_kernel") {

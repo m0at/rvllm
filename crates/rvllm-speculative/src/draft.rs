@@ -1,4 +1,7 @@
 //! Draft model runner for generating speculative tokens.
+//!
+//! Provides the `DraftModel` trait for pluggable draft model implementations,
+//! and `DraftModelRunner` as the default (placeholder) implementation.
 
 use rvllm_core::prelude::{LLMError, Result, TokenId};
 
@@ -15,7 +18,30 @@ pub struct DraftToken {
     pub draft_probs: Vec<f32>,
 }
 
-/// Wraps a smaller/faster model for draft token generation.
+/// Trait for draft model implementations.
+///
+/// The draft model generates K candidate tokens autoregressively. Each token
+/// must include its full probability distribution so the verifier can perform
+/// speculative sampling (the accept/reject step requires comparing p_draft
+/// vs p_target at each position).
+pub trait DraftModel: Send {
+    /// Generate `num_tokens` draft tokens starting from `input_tokens`.
+    ///
+    /// Returns K `DraftToken`s, each containing the selected token_id and the
+    /// full draft probability distribution at that position. The draft model
+    /// runs autoregressively: token i is appended to context before generating
+    /// token i+1.
+    fn generate(&self, input_tokens: &[TokenId], num_tokens: usize) -> Result<Vec<DraftToken>>;
+
+    /// Vocabulary size of the draft model.
+    fn vocab_size(&self) -> usize;
+}
+
+/// Default draft model runner (placeholder implementation).
+///
+/// In production this would wrap a real smaller model (e.g., same architecture
+/// with fewer layers, or a separate small LM like TinyLlama). The placeholder
+/// uses deterministic token selection for testing.
 pub struct DraftModelRunner {
     config: SpeculativeConfig,
     vocab_size: usize,
@@ -51,6 +77,16 @@ impl DraftModelRunner {
         input_tokens: &[TokenId],
         num_tokens: usize,
     ) -> Result<Vec<DraftToken>> {
+        self.generate(input_tokens, num_tokens)
+    }
+
+    pub fn config(&self) -> &SpeculativeConfig {
+        &self.config
+    }
+}
+
+impl DraftModel for DraftModelRunner {
+    fn generate(&self, input_tokens: &[TokenId], num_tokens: usize) -> Result<Vec<DraftToken>> {
         if input_tokens.is_empty() {
             return Err(LLMError::ModelError(
                 "cannot generate drafts from empty input".into(),
@@ -64,37 +100,29 @@ impl DraftModelRunner {
         );
 
         let mut drafts = Vec::with_capacity(num_tokens);
-        let mut _context: Vec<TokenId> = input_tokens.to_vec();
+        let mut context: Vec<TokenId> = input_tokens.to_vec();
 
         for i in 0..num_tokens {
-            // Placeholder: uniform distribution. A real implementation runs
-            // the draft model forward pass here.
+            // Placeholder: deterministic distribution. A real implementation
+            // runs the draft model forward pass here.
             let mut probs = vec![0.0f32; self.vocab_size];
-            // Simple deterministic placeholder based on last context token.
-            let last = *_context.last().unwrap_or(&0);
+            let last = *context.last().unwrap_or(&0);
             let selected = ((last as usize + i + 1) % self.vocab_size) as TokenId;
             probs[selected as usize] = 1.0;
 
-            let logprob = 0.0; // log(1.0)
-
-            let draft = DraftToken {
+            drafts.push(DraftToken {
                 token_id: selected,
-                logprob,
+                logprob: 0.0, // log(1.0)
                 draft_probs: probs,
-            };
+            });
 
-            _context.push(selected);
-            drafts.push(draft);
+            context.push(selected);
         }
 
         Ok(drafts)
     }
 
-    pub fn config(&self) -> &SpeculativeConfig {
-        &self.config
-    }
-
-    pub fn vocab_size(&self) -> usize {
+    fn vocab_size(&self) -> usize {
         self.vocab_size
     }
 }

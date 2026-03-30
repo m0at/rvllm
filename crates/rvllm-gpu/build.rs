@@ -133,11 +133,17 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
             };
             let ptx_path = ptx_dir.join(&ptx_name);
 
-            let status = Command::new(nvcc)
-                .args(["-ptx", &format!("-arch={}", arch), "-O3", "-o"])
-                .arg(&ptx_path)
-                .arg(&path)
-                .status();
+            // Cooperative-groups kernels need -rdc=true for device-side grid sync.
+            let needs_rdc = stem == "persistent_layer_decode";
+            let arch_flag = format!("-arch={}", arch);
+            let mut nvcc_cmd = Command::new(nvcc);
+            nvcc_cmd.args(["-ptx", &arch_flag, "-O3"]);
+            if needs_rdc {
+                nvcc_cmd.args(["-rdc=true", "--use_fast_math"]);
+            }
+            nvcc_cmd.arg("-o").arg(&ptx_path).arg(&path);
+
+            let status = nvcc_cmd.status();
 
             match status {
                 Ok(s) if s.success() => {

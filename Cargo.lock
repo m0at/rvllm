@@ -2915,6 +2915,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvllm-tp"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "half",
+ "rvllm-core",
+ "rvllm-gpu",
+ "tracing",
+]
+
+[[package]]
 name = "rvllm-worker"
 version = "0.1.0"
 dependencies = [

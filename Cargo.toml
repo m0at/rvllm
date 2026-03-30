@@ -20,6 +20,7 @@ members = [
     "crates/rvllm-api",
     "crates/rvllm-quant",
     "crates/rvllm-speculative",
+    "crates/rvllm-tp",
     "crates/rvllm-telemetry",
     "crates/rvllm-bench",
     "crates/rvllm-server",
@@ -60,6 +61,7 @@ rvllm-engine = { path = "crates/rvllm-engine" }
 rvllm-api = { path = "crates/rvllm-api" }
 rvllm-quant = { path = "crates/rvllm-quant" }
 rvllm-speculative = { path = "crates/rvllm-speculative" }
+rvllm-tp = { path = "crates/rvllm-tp" }
 rvllm-telemetry = { path = "crates/rvllm-telemetry" }
 rvllm-fusion = { path = "crates/rvllm-fusion" }
 
