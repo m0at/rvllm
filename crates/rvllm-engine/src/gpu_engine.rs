@@ -45,6 +45,7 @@ mod inner {
         architecture: String,
         rope_theta: f32,
         partial_rotary_factor: f32,
+        head_dim: usize,
         attn_logit_softcapping: f32,
         num_local_experts: usize,
         num_experts_per_tok: usize,
@@ -62,14 +63,22 @@ mod inner {
         let json: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| LLMError::ModelError(format!("invalid config.json: {e}")))?;
 
+        // Models like Qwen3.5 nest their parameters under "text_config".
+        // Try text_config first, fall back to top-level.
+        let text_json = json.get("text_config").unwrap_or(&json);
+
         let get_usize = |key: &str, default: usize| -> usize {
-            json.get(key)
+            text_json
+                .get(key)
+                .or_else(|| json.get(key))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
                 .unwrap_or(default)
         };
         let get_f32 = |key: &str, default: f32| -> f32 {
-            json.get(key)
+            text_json
+                .get(key)
+                .or_else(|| json.get(key))
                 .and_then(|v| v.as_f64())
                 .map(|v| v as f32)
                 .unwrap_or(default)
@@ -77,7 +86,7 @@ mod inner {
 
         let hidden_size = get_usize("hidden_size", 4096);
         let num_attention_heads = get_usize("num_attention_heads", 32);
-        let head_dim = hidden_size / num_attention_heads;
+        let head_dim = get_usize("head_dim", hidden_size / num_attention_heads);
 
         let architecture = json
             .get("architectures")
@@ -87,6 +96,26 @@ mod inner {
             .unwrap_or("LlamaForCausalLM")
             .to_string();
 
+        let tie_word_embeddings = text_json
+            .get("tie_word_embeddings")
+            .or_else(|| json.get("tie_word_embeddings"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let rope_theta = text_json
+            .get("rope_parameters")
+            .and_then(|v| v.get("rope_theta"))
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or_else(|| get_f32("rope_theta", 10000.0));
+
+        let partial_rotary_factor = text_json
+            .get("rope_parameters")
+            .and_then(|v| v.get("partial_rotary_factor"))
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or_else(|| get_f32("partial_rotary_factor", 1.0));
+
         Ok(HfModelConfig {
             hidden_size,
             intermediate_size: get_usize("intermediate_size", 11008),
@@ -95,13 +124,11 @@ mod inner {
             num_hidden_layers: get_usize("num_hidden_layers", 32),
             vocab_size: get_usize("vocab_size", 32000),
             rms_norm_eps: get_f32("rms_norm_eps", 1e-5),
-            tie_word_embeddings: json
-                .get("tie_word_embeddings")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            tie_word_embeddings,
             architecture,
-            rope_theta: get_f32("rope_theta", 10000.0),
-            partial_rotary_factor: get_f32("partial_rotary_factor", 1.0),
+            rope_theta,
+            partial_rotary_factor,
+            head_dim,
             attn_logit_softcapping: get_f32("attn_logit_softcapping", 0.0),
             num_local_experts: get_usize("num_local_experts", 0),
             num_experts_per_tok: get_usize("num_experts_per_tok", 0),
@@ -351,7 +378,7 @@ mod inner {
                 "model config loaded"
             );
 
-            let head_dim = hf_config.hidden_size / hf_config.num_attention_heads;
+            let head_dim = hf_config.head_dim;
 
             // 3. Tokenizer
             let tokenizer_path = config.model.tokenizer_path.as_deref().unwrap_or(model_name);
