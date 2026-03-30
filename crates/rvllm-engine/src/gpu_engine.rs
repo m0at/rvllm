@@ -1280,11 +1280,13 @@ mod inner {
             block_size: usize,
             num_draft_layers: usize,
         ) -> Box<dyn rvllm_speculative::DraftModel> {
-            let worker_ptr = worker as *mut GpuWorker;
+            struct SendPtr(*mut GpuWorker);
+            unsafe impl Send for SendPtr {}
+            let worker_ptr = SendPtr(worker as *mut GpuWorker);
 
             let partial_fn: rvllm_speculative::self_draft::PartialForwardFn =
                 Box::new(move |tokens: &[TokenId], max_layers: usize| {
-                    let w = unsafe { &mut *worker_ptr };
+                    let w = unsafe { &mut *worker_ptr.0 };
 
                     let seq_id = SequenceId(u64::MAX - 2);
                     let request_id = RequestId(u64::MAX - 2);

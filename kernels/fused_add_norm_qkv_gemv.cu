@@ -210,14 +210,22 @@ fused_cute_add_norm_qkv_bias_gemv(
     {
         const int row = block_base + warp_id;
         if (row < qkv_dim) {
-            const half2* w2 = (const half2*)(proj_weight + (long long)row * hidden_size);
+            const int4* w4 = (const int4*)(proj_weight + (long long)row * hidden_size);
+            const int wh8 = hidden_size / 8;
             float acc = 0.0f;
-            for (int i = lane_id; i < h2; i += 32) {
-                half2 w = w2[i];
-                acc += __half2float(w.x) * s_normed[i * 2] + __half2float(w.y) * s_normed[i * 2 + 1];
+            #pragma unroll 4
+            for (int i = lane_id; i < wh8; i += 32) {
+                int4 packed = w4[i];
+                half2 w01=*reinterpret_cast<half2*>(&packed.x), w23=*reinterpret_cast<half2*>(&packed.y);
+                half2 w45=*reinterpret_cast<half2*>(&packed.z), w67=*reinterpret_cast<half2*>(&packed.w);
+                int base = i * 8;
+                acc += __half2float(w01.x)*s_normed[base] + __half2float(w01.y)*s_normed[base+1]
+                     + __half2float(w23.x)*s_normed[base+2] + __half2float(w23.y)*s_normed[base+3]
+                     + __half2float(w45.x)*s_normed[base+4] + __half2float(w45.y)*s_normed[base+5]
+                     + __half2float(w67.x)*s_normed[base+6] + __half2float(w67.y)*s_normed[base+7];
             }
-            if ((hidden_size & 1) && lane_id == 0)
-                acc += __half2float(proj_weight[row * hidden_size + hidden_size - 1]) * s_normed[hidden_size - 1];
+            for (int i = wh8*8+lane_id; i < hidden_size; i += 32)
+                acc += __half2float(proj_weight[(long long)row*hidden_size+i]) * s_normed[i];
             acc = warp_reduce_sum_anqg(acc);
             if (lane_id == 0) output[row] = __float2half(acc + __half2float(bias[row]));
         }
@@ -249,10 +257,10 @@ fused_cute_norm_qkv_gemv(
     float* s_scratch = smem + hidden_size;
 
     float local_ss = 0.0f;
-    const int h2 = hidden_size / 2;
+    
     const half2* in2 = (const half2*)input;
 
-    for (int i = tid; i < h2; i += THREADS) {
+    for (int i = tid; i < (hidden_size/2); i += THREADS) {
         half2 a = in2[i];
         float v0 = __half2float(a.x);
         float v1 = __half2float(a.y);
@@ -336,10 +344,10 @@ fused_cute_norm_qkv_bias_gemv(
     float* s_scratch = smem + hidden_size;
 
     float local_ss = 0.0f;
-    const int h2 = hidden_size / 2;
+    
     const half2* in2 = (const half2*)input;
 
-    for (int i = tid; i < h2; i += THREADS) {
+    for (int i = tid; i < (hidden_size/2); i += THREADS) {
         half2 a = in2[i];
         float v0 = __half2float(a.x);
         float v1 = __half2float(a.y);
@@ -373,14 +381,22 @@ fused_cute_norm_qkv_bias_gemv(
     {
         const int row = block_base + warp_id;
         if (row < qkv_dim) {
-            const half2* w2 = (const half2*)(proj_weight + (long long)row * hidden_size);
+            const int4* w4 = (const int4*)(proj_weight + (long long)row * hidden_size);
+            const int wh8 = hidden_size / 8;
             float acc = 0.0f;
-            for (int i = lane_id; i < h2; i += 32) {
-                half2 w = w2[i];
-                acc += __half2float(w.x) * s_normed[i * 2] + __half2float(w.y) * s_normed[i * 2 + 1];
+            #pragma unroll 4
+            for (int i = lane_id; i < wh8; i += 32) {
+                int4 packed = w4[i];
+                half2 w01=*reinterpret_cast<half2*>(&packed.x), w23=*reinterpret_cast<half2*>(&packed.y);
+                half2 w45=*reinterpret_cast<half2*>(&packed.z), w67=*reinterpret_cast<half2*>(&packed.w);
+                int base = i * 8;
+                acc += __half2float(w01.x)*s_normed[base] + __half2float(w01.y)*s_normed[base+1]
+                     + __half2float(w23.x)*s_normed[base+2] + __half2float(w23.y)*s_normed[base+3]
+                     + __half2float(w45.x)*s_normed[base+4] + __half2float(w45.y)*s_normed[base+5]
+                     + __half2float(w67.x)*s_normed[base+6] + __half2float(w67.y)*s_normed[base+7];
             }
-            if ((hidden_size & 1) && lane_id == 0)
-                acc += __half2float(proj_weight[row * hidden_size + hidden_size - 1]) * s_normed[hidden_size - 1];
+            for (int i = wh8*8+lane_id; i < hidden_size; i += 32)
+                acc += __half2float(proj_weight[(long long)row*hidden_size+i]) * s_normed[i];
             acc = warp_reduce_sum_anqg(acc);
             if (lane_id == 0) output[row] = __float2half(acc + __half2float(bias[row]));
         }
@@ -525,10 +541,10 @@ fused_cute_norm_qkv_fp8_gemv(
     float* s_scratch = smem + hidden_size;
 
     float local_ss = 0.0f;
-    const int h2 = hidden_size / 2;
+    
     const half2* in2 = (const half2*)input;
 
-    for (int i = tid; i < h2; i += THREADS) {
+    for (int i = tid; i < (hidden_size/2); i += THREADS) {
         half2 a = in2[i];
         float v0 = __half2float(a.x);
         float v1 = __half2float(a.y);
@@ -729,10 +745,10 @@ fused_cute_norm_qkv_fp8_bias_gemv(
     float* s_scratch = smem + hidden_size;
 
     float local_ss = 0.0f;
-    const int h2 = hidden_size / 2;
+    
     const half2* in2 = (const half2*)input;
 
-    for (int i = tid; i < h2; i += THREADS) {
+    for (int i = tid; i < (hidden_size/2); i += THREADS) {
         half2 a = in2[i];
         float v0 = __half2float(a.x);
         float v1 = __half2float(a.y);
