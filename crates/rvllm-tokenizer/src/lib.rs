@@ -11,7 +11,7 @@ pub mod tool_parser;
 
 pub use chat::{ChatMessage, ChatRole};
 pub use incremental::IncrementalDecoder;
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{ChatTemplateMode, RenderedPrompt, Tokenizer};
 pub use tool_parser::{
     format_tool_definitions, parse_tool_calls, FunctionDefinition, ParsedToolCall, ToolDefinition,
     ToolParameterProperty, ToolParameters, ToolParseResult, ToolPromptStyle,

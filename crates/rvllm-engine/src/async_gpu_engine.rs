@@ -21,7 +21,9 @@ mod inner {
     use tracing::{debug, error, info, warn};
 
     use rvllm_config::EngineConfig;
-    use rvllm_core::prelude::{LLMError, RequestId, RequestOutput, Result, SamplingParams};
+    use rvllm_core::prelude::{
+        LLMError, RequestId, RequestOutput, Result, SamplingParams, TokenId,
+    };
 
     use crate::gpu_engine::{AbortQueue, GpuLLMEngine, PendingRequest, RequestQueue};
 
@@ -35,6 +37,7 @@ mod inner {
         AddRequest {
             request_id: RequestId,
             prompt: String,
+            prompt_token_ids: Option<Vec<TokenId>>,
             sampling_params: SamplingParams,
             response_tx: oneshot::Sender<Result<()>>,
         },
@@ -47,6 +50,7 @@ mod inner {
     /// A streaming generation request with its output channel.
     struct GpuEngineRequest {
         prompt: String,
+        prompt_token_ids: Option<Vec<TokenId>>,
         sampling_params: SamplingParams,
         output_tx: mpsc::Sender<RequestOutput>,
         /// Sends back the assigned RequestId once the engine accepts the request.
@@ -138,6 +142,7 @@ mod inner {
             self.gen_tx
                 .send(GpuEngineRequest {
                     prompt,
+                    prompt_token_ids: None,
                     sampling_params: params,
                     output_tx,
                     id_tx,
@@ -164,6 +169,7 @@ mod inner {
                 .send(GpuEngineCommand::AddRequest {
                     request_id,
                     prompt,
+                    prompt_token_ids: None,
                     sampling_params: params,
                     response_tx: resp_tx,
                 })
@@ -173,6 +179,33 @@ mod inner {
             resp_rx
                 .await
                 .map_err(|_| LLMError::GpuError("response channel dropped".into()))?
+        }
+
+        pub async fn generate_token_ids(
+            &self,
+            prompt: String,
+            prompt_token_ids: Vec<TokenId>,
+            params: SamplingParams,
+        ) -> Result<(RequestId, ReceiverStream<RequestOutput>)> {
+            let (output_tx, output_rx) = mpsc::channel(64);
+            let (id_tx, id_rx) = oneshot::channel();
+
+            self.gen_tx
+                .send(GpuEngineRequest {
+                    prompt,
+                    prompt_token_ids: Some(prompt_token_ids),
+                    sampling_params: params,
+                    output_tx,
+                    id_tx,
+                })
+                .await
+                .map_err(|_| LLMError::GpuError("GPU engine background task stopped".into()))?;
+
+            let request_id = id_rx
+                .await
+                .map_err(|_| LLMError::GpuError("request ID channel dropped".into()))??;
+
+            Ok((request_id, ReceiverStream::new(output_rx)))
         }
 
         /// Abort a running request. No-op if the request has already finished.
@@ -399,12 +432,14 @@ mod inner {
                 GpuEngineCommand::AddRequest {
                     request_id,
                     prompt,
+                    prompt_token_ids,
                     sampling_params,
                     response_tx,
                 } => {
                     request_queue.lock().unwrap().push(PendingRequest {
                         request_id,
                         prompt,
+                        prompt_token_ids,
                         params: sampling_params,
                     });
                     // Ack immediately -- the request is queued and will be
@@ -454,6 +489,7 @@ mod inner {
             request_queue.lock().unwrap().push(PendingRequest {
                 request_id: rid,
                 prompt: req.prompt,
+                prompt_token_ids: req.prompt_token_ids,
                 params: req.sampling_params,
             });
 

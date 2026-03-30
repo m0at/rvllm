@@ -96,4 +96,4 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 anyhow = "1"
 pyo3 = { version = "0.25", features = ["extension-module"] }
-
+openai-harmony = "0.0.8"

@@ -1,6 +1,10 @@
 //! Chat message types and simple template rendering.
 
-use rvllm_core::prelude::{LLMError, Result};
+use openai_harmony::chat::{
+    Conversation as HarmonyConversation, Message as HarmonyMessage, Role as HarmonyRole,
+};
+use openai_harmony::{load_harmony_encoding, HarmonyEncodingName};
+use rvllm_core::prelude::{LLMError, Result, TokenId};
 
 /// Role in a chat conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +82,41 @@ pub(crate) fn apply_chatml(
     Ok(out)
 }
 
+pub(crate) fn apply_harmony(
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+) -> Result<Vec<TokenId>> {
+    if messages.is_empty() {
+        return Err(LLMError::TokenizerError("empty message list".into()));
+    }
+
+    let harmony_messages = messages
+        .iter()
+        .map(|msg| {
+            let role = HarmonyRole::try_from(msg.role.as_str()).map_err(|_| {
+                LLMError::TokenizerError(format!(
+                    "unsupported Harmony chat role '{}'",
+                    msg.role
+                ))
+            })?;
+            Ok(HarmonyMessage::from_role_and_content(role, msg.content.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let encoding = load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
+        .map_err(|e| LLMError::TokenizerError(format!("failed to load Harmony encoding: {e}")))?;
+    let convo = HarmonyConversation::from_messages(harmony_messages);
+
+    let tokens = if add_generation_prompt {
+        encoding.render_conversation_for_completion(&convo, HarmonyRole::Assistant, None)
+    } else {
+        encoding.render_conversation(&convo, None)
+    }
+    .map_err(|e| LLMError::TokenizerError(format!("failed to render Harmony prompt: {e}")))?;
+
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +143,16 @@ mod tests {
     #[test]
     fn chatml_empty_errors() {
         assert!(apply_chatml(&[], true).is_err());
+    }
+
+    #[test]
+    fn harmony_basic() {
+        let msgs = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("Hello"),
+        ];
+        let result = apply_harmony(&msgs, true).unwrap();
+        assert!(!result.is_empty());
     }
 
     #[test]

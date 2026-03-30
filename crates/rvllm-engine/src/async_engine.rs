@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use rvllm_config::EngineConfig;
-use rvllm_core::prelude::{LLMError, RequestId, RequestOutput, Result, SamplingParams};
+use rvllm_core::prelude::{LLMError, RequestId, RequestOutput, Result, SamplingParams, TokenId};
 use rvllm_tokenizer::Tokenizer;
 
 use crate::engine::{Executor, LLMEngine, Scheduler};
@@ -16,6 +16,7 @@ enum EngineCommand {
     AddRequest {
         request_id: RequestId,
         prompt: String,
+        prompt_token_ids: Option<Vec<TokenId>>,
         sampling_params: SamplingParams,
         response_tx: oneshot::Sender<Result<()>>,
     },
@@ -28,6 +29,7 @@ enum EngineCommand {
 struct EngineRequest {
     request_id: RequestId,
     prompt: String,
+    prompt_token_ids: Option<Vec<TokenId>>,
     sampling_params: SamplingParams,
     output_tx: mpsc::Sender<RequestOutput>,
 }
@@ -82,6 +84,7 @@ impl AsyncLLMEngine {
             .send(EngineRequest {
                 request_id,
                 prompt,
+                prompt_token_ids: None,
                 sampling_params: params,
                 output_tx,
             })
@@ -103,6 +106,7 @@ impl AsyncLLMEngine {
             .send(EngineCommand::AddRequest {
                 request_id,
                 prompt,
+                prompt_token_ids: None,
                 sampling_params: params,
                 response_tx: resp_tx,
             })
@@ -112,6 +116,29 @@ impl AsyncLLMEngine {
         resp_rx
             .await
             .map_err(|_| LLMError::SchedulerError("response channel dropped".into()))?
+    }
+
+    pub async fn generate_token_ids(
+        &self,
+        prompt: String,
+        prompt_token_ids: Vec<TokenId>,
+        params: SamplingParams,
+    ) -> Result<(RequestId, ReceiverStream<RequestOutput>)> {
+        let request_id = RequestId(rand_id());
+        let (output_tx, output_rx) = mpsc::channel(64);
+
+        self.gen_tx
+            .send(EngineRequest {
+                request_id,
+                prompt,
+                prompt_token_ids: Some(prompt_token_ids),
+                sampling_params: params,
+                output_tx,
+            })
+            .await
+            .map_err(|_| LLMError::SchedulerError("engine background task stopped".into()))?;
+
+        Ok((request_id, ReceiverStream::new(output_rx)))
     }
 
     /// Abort a request.
@@ -158,10 +185,20 @@ impl AsyncLLMEngine {
                     Ok(EngineCommand::AddRequest {
                         request_id,
                         prompt,
+                        prompt_token_ids,
                         sampling_params,
                         response_tx,
                     }) => {
-                        let result = engine.add_request(request_id, prompt, sampling_params);
+                        let result = if let Some(prompt_token_ids) = prompt_token_ids {
+                            engine.add_request_with_token_ids(
+                                request_id,
+                                prompt,
+                                prompt_token_ids,
+                                sampling_params,
+                            )
+                        } else {
+                            engine.add_request(request_id, prompt, sampling_params)
+                        };
                         let _ = response_tx.send(result);
                     }
                     Ok(EngineCommand::AbortRequest { request_id }) => {
@@ -177,7 +214,17 @@ impl AsyncLLMEngine {
                 match gen_rx.try_recv() {
                     Ok(req) => {
                         let rid = req.request_id;
-                        if let Err(e) = engine.add_request(rid, req.prompt, req.sampling_params) {
+                        let result = if let Some(prompt_token_ids) = req.prompt_token_ids {
+                            engine.add_request_with_token_ids(
+                                rid,
+                                req.prompt,
+                                prompt_token_ids,
+                                req.sampling_params,
+                            )
+                        } else {
+                            engine.add_request(rid, req.prompt, req.sampling_params)
+                        };
+                        if let Err(e) = result {
                             error!(%rid, %e, "failed to add generate request");
                             continue;
                         }
@@ -201,10 +248,20 @@ impl AsyncLLMEngine {
                                 EngineCommand::AddRequest {
                                     request_id,
                                     prompt,
+                                    prompt_token_ids,
                                     sampling_params,
                                     response_tx,
                                 } => {
-                                    let result = engine.add_request(request_id, prompt, sampling_params);
+                                    let result = if let Some(prompt_token_ids) = prompt_token_ids {
+                                        engine.add_request_with_token_ids(
+                                            request_id,
+                                            prompt,
+                                            prompt_token_ids,
+                                            sampling_params,
+                                        )
+                                    } else {
+                                        engine.add_request(request_id, prompt, sampling_params)
+                                    };
                                     let _ = response_tx.send(result);
                                 }
                                 EngineCommand::AbortRequest { request_id } => {
@@ -220,11 +277,17 @@ impl AsyncLLMEngine {
                     gen = gen_rx.recv() => {
                         if let Some(req) = gen {
                             let rid = req.request_id;
-                            if let Err(e) = engine.add_request(
-                                rid,
-                                req.prompt,
-                                req.sampling_params,
-                            ) {
+                            let result = if let Some(prompt_token_ids) = req.prompt_token_ids {
+                                engine.add_request_with_token_ids(
+                                    rid,
+                                    req.prompt,
+                                    prompt_token_ids,
+                                    req.sampling_params,
+                                )
+                            } else {
+                                engine.add_request(rid, req.prompt, req.sampling_params)
+                            };
+                            if let Err(e) = result {
                                 error!(%rid, %e, "failed to add generate request");
                             } else {
                                 output_channels.insert(rid, req.output_tx);

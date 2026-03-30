@@ -7,8 +7,20 @@ use rvllm_core::prelude::{LLMError, Result, TokenId};
 use tokenizers::Tokenizer as HfTokenizer;
 use tracing::{debug, info};
 
-use crate::chat::{apply_chatml, ChatMessage};
+use crate::chat::{apply_chatml, apply_harmony, ChatMessage};
 use crate::incremental::IncrementalDecoder;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplateMode {
+    Chatml,
+    HarmonyGptOss,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderedPrompt {
+    Text(String),
+    Tokens(Vec<TokenId>),
+}
 
 /// High-level tokenizer wrapping HuggingFace's tokenizer with vLLM conventions.
 pub struct Tokenizer {
@@ -18,6 +30,7 @@ pub struct Tokenizer {
     bos_token_id: Option<TokenId>,
     pad_token_id: Option<TokenId>,
     incremental: IncrementalDecoder,
+    chat_template_mode: ChatTemplateMode,
 }
 
 impl Tokenizer {
@@ -42,7 +55,7 @@ impl Tokenizer {
                     let tf = entry.path().join("tokenizer.json");
                     if tf.exists() {
                         info!(path = %tf.display(), "loading tokenizer from HF cache");
-                        return Self::from_file(&tf);
+                        return Self::from_file_with_hint(&tf, Some(model_name_or_path));
                     }
                 }
             }
@@ -52,7 +65,7 @@ impl Tokenizer {
         if path.is_dir() {
             let tokenizer_file = path.join("tokenizer.json");
             if tokenizer_file.exists() {
-                return Self::from_file(&tokenizer_file);
+                return Self::from_file_with_hint(&tokenizer_file, Some(model_name_or_path));
             }
             return Err(LLMError::TokenizerError(format!(
                 "no tokenizer.json found in {}",
@@ -62,7 +75,7 @@ impl Tokenizer {
 
         // If it looks like a local file that actually exists, load it directly
         if path.is_file() {
-            return Self::from_file(path);
+            return Self::from_file_with_hint(path, Some(model_name_or_path));
         }
 
         // Download tokenizer.json from HuggingFace hub
@@ -76,22 +89,26 @@ impl Tokenizer {
             ))
         })?;
 
-        Self::from_file(&tokenizer_path)
+        Self::from_file_with_hint(&tokenizer_path, Some(model_name_or_path))
     }
 
     /// Load a tokenizer directly from a `tokenizer.json` file.
     pub fn from_file(path: &Path) -> Result<Self> {
+        Self::from_file_with_hint(path, None)
+    }
+
+    fn from_file_with_hint(path: &Path, model_name_or_path: Option<&str>) -> Result<Self> {
         info!(path = %path.display(), "loading tokenizer from file");
 
         let hf = HfTokenizer::from_file(path).map_err(|e| {
             LLMError::TokenizerError(format!("failed to load {}: {}", path.display(), e))
         })?;
 
-        Ok(Self::from_hf_tokenizer(hf))
+        let chat_template_mode = detect_chat_template_mode(path.parent(), model_name_or_path)?;
+        Ok(Self::from_hf_tokenizer_with_mode(hf, chat_template_mode))
     }
 
-    /// Build from an already-loaded HuggingFace tokenizer.
-    fn from_hf_tokenizer(hf: HfTokenizer) -> Self {
+    fn from_hf_tokenizer_with_mode(hf: HfTokenizer, chat_template_mode: ChatTemplateMode) -> Self {
         let mut special_tokens = Vec::new();
         let mut eos_token_id = None;
         let mut bos_token_id = None;
@@ -134,6 +151,7 @@ impl Tokenizer {
             eos = ?eos_token_id,
             bos = ?bos_token_id,
             pad = ?pad_token_id,
+            chat_template_mode = ?chat_template_mode,
             "tokenizer loaded"
         );
 
@@ -144,6 +162,7 @@ impl Tokenizer {
             bos_token_id,
             pad_token_id,
             incremental: IncrementalDecoder::new(),
+            chat_template_mode,
         }
     }
 
@@ -204,13 +223,37 @@ impl Tokenizer {
     }
 
     /// Apply a chat template to format messages for the model.
-    /// Falls back to ChatML format.
+    /// Returns a rendered prompt that may be either text or token IDs.
+    pub fn render_chat_prompt(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+    ) -> Result<RenderedPrompt> {
+        match self.chat_template_mode {
+            ChatTemplateMode::Chatml => Ok(RenderedPrompt::Text(apply_chatml(
+                messages,
+                add_generation_prompt,
+            )?)),
+            ChatTemplateMode::HarmonyGptOss => Ok(RenderedPrompt::Tokens(apply_harmony(
+                messages,
+                add_generation_prompt,
+            )?)),
+        }
+    }
+
+    /// Apply a chat template to format messages for the model as text.
+    /// Harmony-capable models should use `render_chat_prompt()` instead.
     pub fn apply_chat_template(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<String> {
-        apply_chatml(messages, add_generation_prompt)
+        match self.render_chat_prompt(messages, add_generation_prompt)? {
+            RenderedPrompt::Text(prompt) => Ok(prompt),
+            RenderedPrompt::Tokens(_) => Err(LLMError::TokenizerError(
+                "chat template rendered tokens; use render_chat_prompt() instead".into(),
+            )),
+        }
     }
 
     /// Access the underlying HuggingFace tokenizer.
@@ -218,10 +261,123 @@ impl Tokenizer {
         &self.inner
     }
 
+    pub fn chat_template_mode(&self) -> ChatTemplateMode {
+        self.chat_template_mode
+    }
+
     /// Reset the incremental decoder state.
     pub fn reset_incremental(&mut self) {
         self.incremental.reset();
     }
+}
+
+fn detect_chat_template_mode(
+    model_dir: Option<&Path>,
+    model_name_or_path: Option<&str>,
+) -> Result<ChatTemplateMode> {
+    if let Some(mode) = env_chat_template_mode()? {
+        return Ok(mode);
+    }
+
+    if let Some(dir) = model_dir {
+        if let Some(mode) = detect_chat_template_mode_from_dir(dir)? {
+            return Ok(mode);
+        }
+    }
+
+    if model_name_or_path.is_some_and(looks_like_gpt_oss) {
+        return Ok(ChatTemplateMode::HarmonyGptOss);
+    }
+
+    Ok(ChatTemplateMode::Chatml)
+}
+
+fn env_chat_template_mode() -> Result<Option<ChatTemplateMode>> {
+    let value = match std::env::var("RVLLM_CHAT_TEMPLATE") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(e) => {
+            return Err(LLMError::TokenizerError(format!(
+                "failed to read RVLLM_CHAT_TEMPLATE: {e}"
+            )))
+        }
+    };
+
+    parse_chat_template_mode(&value).map(Some)
+}
+
+fn detect_chat_template_mode_from_dir(dir: &Path) -> Result<Option<ChatTemplateMode>> {
+    for file_name in ["tokenizer_config.json", "config.json"] {
+        let path = dir.join(file_name);
+        if !path.exists() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            LLMError::TokenizerError(format!("failed to read {}: {e}", path.display()))
+        })?;
+        let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+            LLMError::TokenizerError(format!("invalid {}: {e}", path.display()))
+        })?;
+        if let Some(mode) = detect_chat_template_mode_from_json(&json) {
+            return Ok(Some(mode));
+        }
+    }
+    Ok(None)
+}
+
+fn detect_chat_template_mode_from_json(json: &serde_json::Value) -> Option<ChatTemplateMode> {
+    let model_type = json
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase());
+    if model_type
+        .as_deref()
+        .is_some_and(|value| value.contains("gpt_oss") || value.contains("gpt-oss"))
+    {
+        return Some(ChatTemplateMode::HarmonyGptOss);
+    }
+
+    let architecture_matches = json
+        .get("architectures")
+        .and_then(|v| v.as_array())
+        .is_some_and(|architectures| {
+            architectures.iter().filter_map(|v| v.as_str()).any(looks_like_gpt_oss)
+        });
+    if architecture_matches {
+        return Some(ChatTemplateMode::HarmonyGptOss);
+    }
+
+    let chat_template_mentions_harmony = json
+        .get("chat_template")
+        .and_then(|v| v.as_str())
+        .is_some_and(|template| {
+            template.contains("<|start|>")
+                || template.to_ascii_lowercase().contains("harmony")
+                || template.to_ascii_lowercase().contains("analysis")
+        });
+    if chat_template_mentions_harmony {
+        return Some(ChatTemplateMode::HarmonyGptOss);
+    }
+
+    None
+}
+
+fn parse_chat_template_mode(value: &str) -> Result<ChatTemplateMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "chatml" => Ok(ChatTemplateMode::Chatml),
+        "harmony" | "harmony_gpt_oss" | "harmony-gpt-oss" | "gpt_oss" | "gpt-oss" => {
+            Ok(ChatTemplateMode::HarmonyGptOss)
+        }
+        other => Err(LLMError::TokenizerError(format!(
+            "unsupported chat template mode '{}'",
+            other
+        ))),
+    }
+}
+
+fn looks_like_gpt_oss(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("gpt_oss") || normalized.contains("gpt-oss")
 }
 
 #[cfg(test)]
@@ -250,7 +406,7 @@ mod tests {
         let mut hf = HfTokenizer::new(wp);
         hf.with_pre_tokenizer(Some(Whitespace {}));
 
-        Tokenizer::from_hf_tokenizer(hf)
+        Tokenizer::from_hf_tokenizer_with_mode(hf, ChatTemplateMode::Chatml)
     }
 
     #[test]
@@ -308,9 +464,14 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there"),
         ];
-        let result = tok.apply_chat_template(&msgs, true).unwrap();
-        assert!(result.contains("Hello"));
-        assert!(result.contains("Hi there"));
+        let result = tok.render_chat_prompt(&msgs, true).unwrap();
+        match result {
+            RenderedPrompt::Text(prompt) => {
+                assert!(prompt.contains("Hello"));
+                assert!(prompt.contains("Hi there"));
+            }
+            RenderedPrompt::Tokens(_) => panic!("expected ChatML text prompt"),
+        }
     }
 
     #[test]
@@ -334,5 +495,22 @@ mod tests {
         let tok = make_test_tokenizer();
         let inner = tok.inner();
         assert!(inner.get_vocab_size(false) > 0);
+    }
+
+    #[test]
+    fn detects_harmony_from_config() {
+        let json = serde_json::json!({
+            "model_type": "gpt_oss",
+        });
+        assert_eq!(
+            detect_chat_template_mode_from_json(&json),
+            Some(ChatTemplateMode::HarmonyGptOss)
+        );
+    }
+
+    #[test]
+    fn detects_harmony_from_model_name_hint() {
+        assert!(looks_like_gpt_oss("openai/gpt-oss-20b"));
+        assert!(looks_like_gpt_oss("openai/gpt_oss-20b"));
     }
 }

@@ -345,11 +345,11 @@ pub async fn create_chat_completion_with_tools(
         .map(|m| rvllm_tokenizer::ChatMessage::new(&m.role, &m.content))
         .collect();
 
-    let prompt = state
+    let rendered_prompt = state
         .tokenizer
         .read()
         .await
-        .apply_chat_template(&chat_messages, true)
+        .render_chat_prompt(&chat_messages, true)
         .map_err(|e| ApiError::Internal(format!("chat template error: {}", e)))?;
 
     info!(
@@ -366,11 +366,22 @@ pub async fn create_chat_completion_with_tools(
         let stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
         let model = state.model_name.clone();
 
-        let (_request_id, output_stream) = state
-            .engine
-            .generate(prompt, sampling_params)
-            .await
-            .map_err(ApiError::from)?;
+        let (_request_id, output_stream) = match &rendered_prompt {
+            rvllm_tokenizer::RenderedPrompt::Text(prompt) => state
+                .engine
+                .generate(prompt.clone(), sampling_params.clone())
+                .await
+                .map_err(ApiError::from)?,
+            rvllm_tokenizer::RenderedPrompt::Tokens(prompt_token_ids) => state
+                .engine
+                .generate_token_ids(
+                    format!("<rendered:{} tokens>", prompt_token_ids.len()),
+                    prompt_token_ids.clone(),
+                    sampling_params.clone(),
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let stream_id_clone = stream_id.clone();
         let model_clone = model.clone();
@@ -423,11 +434,22 @@ pub async fn create_chat_completion_with_tools(
             .into_response())
     } else {
         // Non-streaming: collect output, then parse for tool calls
-        let (_request_id, mut output_stream) = state
-            .engine
-            .generate(prompt, sampling_params)
-            .await
-            .map_err(ApiError::from)?;
+        let (_request_id, mut output_stream) = match &rendered_prompt {
+            rvllm_tokenizer::RenderedPrompt::Text(prompt) => state
+                .engine
+                .generate(prompt.clone(), sampling_params.clone())
+                .await
+                .map_err(ApiError::from)?,
+            rvllm_tokenizer::RenderedPrompt::Tokens(prompt_token_ids) => state
+                .engine
+                .generate_token_ids(
+                    format!("<rendered:{} tokens>", prompt_token_ids.len()),
+                    prompt_token_ids.clone(),
+                    sampling_params.clone(),
+                )
+                .await
+                .map_err(ApiError::from)?,
+        };
 
         let mut last_output = None;
         while let Some(output) = output_stream.next().await {
