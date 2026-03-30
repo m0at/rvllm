@@ -1266,11 +1266,13 @@ impl GpuWorker {
     ) -> Result<ForwardOutput> {
         self.forward_count += 1;
 
-        // Only use graphs for pure decode steps with greedy sampling
+        // Use graphs for any pure decode step (all query_lens == 1).
+        // Sampling params don't matter -- graphs capture the forward pass
+        // (GEMMs, attention, norms), not the sampling/logit processing.
         let is_decode = !model_input.is_prefill
             && model_input.attention_metadata.query_lens.iter().all(|&q| q == 1);
 
-        if !is_decode || !greedy_only || !self.graph_runner.is_enabled() {
+        if !is_decode || !self.graph_runner.is_enabled() {
             return self.raw_gpu_forward_ex(model_input, greedy_only);
         }
 
