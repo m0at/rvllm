@@ -658,6 +658,7 @@ megakernel_decode_f16(
                 key_caches[li], value_caches[li], block_tables, context_lens,
                 block_size);
             break;
+        }
         case INSTR_ARGMAX:
             exec_argmax(s_scratch, instr, scratch, output_token);
             break;
