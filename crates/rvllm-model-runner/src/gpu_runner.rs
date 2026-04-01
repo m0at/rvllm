@@ -1628,7 +1628,7 @@ mod cuda_impl {
             &self,
             embedding: &CudaSlice<f16>,
             gpu_cache: &[(CudaSlice<f16>, CudaSlice<f16>)],
-            packed_buf: CudaView<'_, i32>,
+            packed_buf: &CudaSlice<i32>,
             offsets: PackedMetaOffsets,
             num_tokens: usize,
             _num_seqs: usize,
