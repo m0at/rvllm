@@ -343,7 +343,11 @@ mod cuda_impl {
 
             // Precompute RoPE cos/sin tables
             let head_dim = config.head_dim;
-            let max_pos = config.max_position;
+            // Cap RoPE table at 32768 or max_position, whichever is smaller.
+            // Qwen 2.5 advertises max_position=131072 but allocating full tables
+            // wastes 33MB+ GPU memory. 32K covers most serving contexts.
+            // The old cap of 8192 was too restrictive (broke >8K context).
+            let max_pos = config.max_position.min(32768);
             let half_dim = head_dim / 2;
             let rope_theta = config.rope_theta;
             let mut cos_table = vec![0.0f32; max_pos * half_dim];
