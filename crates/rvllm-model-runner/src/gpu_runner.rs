@@ -404,10 +404,13 @@ mod cuda_impl {
                 loaded
             };
 
-            // Configure L2 cache: reserve 75% for persisting accesses.
-            // On H100 this gives ~37.5 MB for KV cache pages, RoPE tables, norm weights.
-            if let Err(e) = rvllm_gpu::l2_cache::configure_l2_persisting_cache(0.75) {
-                tracing::warn!("L2 persist config failed (non-fatal): {e}");
+            // L2 cache persistence: reserve 75% for persisting accesses.
+            // Disabled by default -- enable with RVLLM_L2_PERSIST=1.
+            // On H100 gives ~37.5 MB for KV cache pages, RoPE tables, norm weights.
+            if std::env::var("RVLLM_L2_PERSIST").map_or(false, |v| v == "1") {
+                if let Err(e) = rvllm_gpu::l2_cache::configure_l2_persisting_cache(0.75) {
+                    tracing::warn!("L2 persist config failed (non-fatal): {e}");
+                }
             }
 
             Ok(Self {
