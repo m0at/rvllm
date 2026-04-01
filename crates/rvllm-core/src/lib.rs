@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod error;
+pub mod hf;
 pub mod output;
 pub mod prelude;
 pub mod types;

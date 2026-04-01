@@ -7,9 +7,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use hf_hub::api::sync::Api;
+use hf_hub::api::sync::{Api, ApiBuilder};
 use hf_hub::api::{RepoInfo, Siblings};
-use rvllm_core::error::{LLMError, Result};
+use rvllm_core::prelude::{hf_auth_hint, hf_token_from_env, LLMError, Result};
 use serde::Deserialize;
 use tracing::info;
 
@@ -25,6 +25,25 @@ enum WeightLayout {
 #[derive(Debug, Deserialize)]
 struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
+}
+
+fn configured_hf_api() -> Result<Api> {
+    let mut builder = ApiBuilder::from_env();
+    if let Some(token) = hf_token_from_env() {
+        builder = builder.with_token(Some(token));
+    }
+    builder
+        .build()
+        .map_err(|e| LLMError::ModelError(format!("failed to init hf-hub: {e}")))
+}
+
+fn hf_model_error(model_name: &str, action: &str, error: &str) -> LLMError {
+    let mut message = format!("{action} for '{model_name}': {error}");
+    if let Some(hint) = hf_auth_hint(error) {
+        message.push(' ');
+        message.push_str(hint);
+    }
+    LLMError::ModelError(message)
 }
 
 /// Resolve a Hugging Face repo id or local directory to a usable snapshot dir.
@@ -47,13 +66,12 @@ pub(crate) fn ensure_snapshot(model_name: &str) -> Result<PathBuf> {
         model = model_name,
         "downloading model snapshot from HuggingFace"
     );
-    let api =
-        Api::new().map_err(|e| LLMError::ModelError(format!("failed to init hf-hub: {e}")))?;
+    let api = configured_hf_api()?;
     let repo = api.model(model_name.to_string());
 
-    let config_path = repo
-        .get("config.json")
-        .map_err(|e| LLMError::ModelError(format!("failed to download config.json: {e}")))?;
+    let config_path = repo.get("config.json").map_err(|e| {
+        hf_model_error(model_name, "failed to download config.json", &e.to_string())
+    })?;
     let snapshot_dir = config_path.parent().ok_or_else(|| {
         LLMError::ModelError(format!(
             "config.json path '{}' has no parent snapshot dir",
@@ -62,22 +80,36 @@ pub(crate) fn ensure_snapshot(model_name: &str) -> Result<PathBuf> {
     })?;
 
     match detect_weight_layout(&repo.info().map_err(|e| {
-        LLMError::ModelError(format!("failed to query HuggingFace repo info: {e}"))
+        hf_model_error(
+            model_name,
+            "failed to query HuggingFace repo info",
+            &e.to_string(),
+        )
     })?)? {
         WeightLayout::SingleFile { filename } => {
-            repo.get(&filename)
-                .map_err(|e| LLMError::ModelError(format!("failed to download {filename}: {e}")))?;
+            repo.get(&filename).map_err(|e| {
+                hf_model_error(
+                    model_name,
+                    &format!("failed to download {filename}"),
+                    &e.to_string(),
+                )
+            })?;
         }
         WeightLayout::Indexed { index_filename } => {
             let index_path = repo.get(&index_filename).map_err(|e| {
-                LLMError::ModelError(format!("failed to download {index_filename}: {e}"))
+                hf_model_error(
+                    model_name,
+                    &format!("failed to download {index_filename}"),
+                    &e.to_string(),
+                )
             })?;
             for shard_filename in parse_index_shards(&index_path)? {
                 repo.get(&shard_filename).map_err(|e| {
-                    LLMError::ModelError(format!(
-                        "failed to download shard {}: {}",
-                        shard_filename, e
-                    ))
+                    hf_model_error(
+                        model_name,
+                        &format!("failed to download shard {shard_filename}"),
+                        &e.to_string(),
+                    )
                 })?;
             }
         }
@@ -358,5 +390,17 @@ mod tests {
             find_complete_snapshot(&temp.path().join("snapshots")).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn gated_repo_errors_include_auth_hint() {
+        let err = hf_model_error(
+            "meta-llama/Llama-3.1-8B",
+            "failed to download config.json",
+            "HTTP status client error (401 Unauthorized)",
+        );
+        let err = err.to_string();
+        assert!(err.contains("hf auth login"));
+        assert!(err.contains("HF_TOKEN"));
     }
 }

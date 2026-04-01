@@ -1,14 +1,85 @@
 //! Main tokenizer wrapper around the HuggingFace `tokenizers` crate.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
-use hf_hub::api::sync::Api;
-use rvllm_core::prelude::{LLMError, Result, TokenId};
+use hf_hub::api::sync::{Api, ApiBuilder};
+use rvllm_core::prelude::{hf_auth_hint, hf_token_from_env, LLMError, Result, TokenId};
 use tokenizers::Tokenizer as HfTokenizer;
 use tracing::{debug, info};
 
 use crate::chat::{apply_chatml, ChatMessage};
 use crate::incremental::IncrementalDecoder;
+
+const TOKENIZER_JSON: &str = "tokenizer.json";
+const TOKENIZER_MODEL: &str = "tokenizer.model";
+
+fn configured_hf_api() -> Result<Api> {
+    let mut builder = ApiBuilder::from_env();
+    if let Some(token) = hf_token_from_env() {
+        builder = builder.with_token(Some(token));
+    }
+    builder
+        .build()
+        .map_err(|e| LLMError::TokenizerError(format!("failed to init hf-hub API: {e}")))
+}
+
+fn find_cached_tokenizer_json(model_name_or_path: &str) -> Option<PathBuf> {
+    let hf_home = std::env::var("HF_HOME").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/huggingface",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    let cache_snap = Path::new(&hf_home)
+        .join("hub")
+        .join(format!("models--{}", model_name_or_path.replace('/', "--")))
+        .join("snapshots");
+
+    let mut snapshots = std::fs::read_dir(cache_snap)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    snapshots.sort();
+
+    snapshots
+        .into_iter()
+        .map(|snapshot| snapshot.join(TOKENIZER_JSON))
+        .find(|path| path.exists())
+}
+
+fn missing_tokenizer_error(path: &Path) -> LLMError {
+    let tokenizer_model = path.join(TOKENIZER_MODEL);
+    if tokenizer_model.exists() {
+        return unsupported_sentencepiece_error(&tokenizer_model);
+    }
+    LLMError::TokenizerError(format!("no {TOKENIZER_JSON} found in {}", path.display()))
+}
+
+fn unsupported_sentencepiece_error(path: &Path) -> LLMError {
+    LLMError::TokenizerError(format!(
+        "found {} but rvLLM currently only loads {TOKENIZER_JSON}. \
+use a tokenizer export that includes {TOKENIZER_JSON}, or point --tokenizer at a compatible repo/path",
+        path.display()
+    ))
+}
+
+fn download_tokenizer_error(model_name_or_path: &str, error: &str) -> LLMError {
+    let mut message =
+        format!("failed to download {TOKENIZER_JSON} from '{model_name_or_path}': {error}");
+    if let Some(hint) = hf_auth_hint(error) {
+        message.push(' ');
+        message.push_str(hint);
+    } else {
+        message.push_str(&format!(
+            " rvLLM currently expects a {TOKENIZER_JSON} file; if this repo only exposes {TOKENIZER_MODEL}, \
+use a tokenizer export that includes {TOKENIZER_JSON}."
+        ));
+    }
+    LLMError::TokenizerError(message)
+}
 
 /// High-level tokenizer wrapping HuggingFace's tokenizer with vLLM conventions.
 pub struct Tokenizer {
@@ -26,55 +97,34 @@ impl Tokenizer {
         info!(model = model_name_or_path, "loading tokenizer");
 
         // Check HF cache first (avoids network round-trip when model is already downloaded)
-        {
-            let hf_home = std::env::var("HF_HOME").unwrap_or_else(|_| {
-                format!(
-                    "{}/.cache/huggingface",
-                    std::env::var("HOME").unwrap_or_default()
-                )
-            });
-            let cache_snap = std::path::Path::new(&hf_home)
-                .join("hub")
-                .join(format!("models--{}", model_name_or_path.replace("/", "--")))
-                .join("snapshots");
-            if let Ok(mut entries) = std::fs::read_dir(&cache_snap) {
-                if let Some(Ok(entry)) = entries.next() {
-                    let tf = entry.path().join("tokenizer.json");
-                    if tf.exists() {
-                        info!(path = %tf.display(), "loading tokenizer from HF cache");
-                        return Self::from_file(&tf);
-                    }
-                }
-            }
+        if let Some(tokenizer_path) = find_cached_tokenizer_json(model_name_or_path) {
+            info!(path = %tokenizer_path.display(), "loading tokenizer from HF cache");
+            return Self::from_file(&tokenizer_path);
         }
 
         let path = Path::new(model_name_or_path);
         if path.is_dir() {
-            let tokenizer_file = path.join("tokenizer.json");
+            let tokenizer_file = path.join(TOKENIZER_JSON);
             if tokenizer_file.exists() {
                 return Self::from_file(&tokenizer_file);
             }
-            return Err(LLMError::TokenizerError(format!(
-                "no tokenizer.json found in {}",
-                model_name_or_path
-            )));
+            return Err(missing_tokenizer_error(path));
         }
 
         // If it looks like a local file that actually exists, load it directly
         if path.is_file() {
+            if path.file_name() == Some(OsStr::new(TOKENIZER_MODEL)) {
+                return Err(unsupported_sentencepiece_error(path));
+            }
             return Self::from_file(path);
         }
 
         // Download tokenizer.json from HuggingFace hub
-        let api = Api::new()
-            .map_err(|e| LLMError::TokenizerError(format!("failed to init hf-hub API: {}", e)))?;
+        let api = configured_hf_api()?;
         let repo = api.model(model_name_or_path.to_string());
-        let tokenizer_path = repo.get("tokenizer.json").map_err(|e| {
-            LLMError::TokenizerError(format!(
-                "failed to download tokenizer.json from '{}': {}",
-                model_name_or_path, e
-            ))
-        })?;
+        let tokenizer_path = repo
+            .get(TOKENIZER_JSON)
+            .map_err(|e| download_tokenizer_error(model_name_or_path, &e.to_string()))?;
 
         Self::from_file(&tokenizer_path)
     }
@@ -327,6 +377,33 @@ mod tests {
         // Might succeed if there's a tokenizer.json in temp, but likely errors
         // Just exercise the path
         let _ = result;
+    }
+
+    #[test]
+    fn local_sentencepiece_only_dir_errors_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(TOKENIZER_MODEL), b"not-a-real-model").unwrap();
+        let err = match Tokenizer::from_pretrained(dir.path().to_str().unwrap()) {
+            Ok(_) => panic!("expected tokenizer.model-only directory to error"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(err.contains(TOKENIZER_MODEL));
+        assert!(err.contains(TOKENIZER_JSON));
+    }
+
+    #[test]
+    fn local_sentencepiece_file_errors_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join(TOKENIZER_MODEL);
+        std::fs::write(&model_path, b"not-a-real-model").unwrap();
+        let err = match Tokenizer::from_pretrained(model_path.to_str().unwrap()) {
+            Ok(_) => panic!("expected tokenizer.model path to error"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(err.contains(TOKENIZER_MODEL));
+        assert!(err.contains(TOKENIZER_JSON));
     }
 
     #[test]

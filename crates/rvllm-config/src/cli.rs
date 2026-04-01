@@ -6,6 +6,8 @@
 use clap::Parser;
 use rvllm_core::types::Dtype;
 
+use crate::DEFAULT_MAX_MODEL_LEN;
+
 /// Command-line arguments for the vLLM engine.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "vllm", about = "vLLM inference engine")]
@@ -25,7 +27,7 @@ pub struct CliArgs {
     pub dtype: Dtype,
 
     /// Maximum model context length.
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = DEFAULT_MAX_MODEL_LEN)]
     pub max_model_len: usize,
 
     /// Trust remote code when loading model.
@@ -71,7 +73,7 @@ pub struct CliArgs {
     pub max_num_seqs: usize,
 
     /// Max tokens per batch.
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = DEFAULT_MAX_MODEL_LEN)]
     pub max_num_batched_tokens: usize,
 
     /// Max prompt tokens processed per prefill step. 0 disables chunking.

@@ -17,7 +17,7 @@ mod inner {
     use tracing::{debug, info, trace, warn};
 
     use rvllm_block_manager::{BlockManager, MemoryPool};
-    use rvllm_config::EngineConfig;
+    use rvllm_config::{resolve_runtime_max_model_len, EngineConfig};
     use rvllm_core::prelude::{
         BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
         SequenceId, TokenId,
@@ -49,6 +49,7 @@ mod inner {
         num_key_value_heads: usize,
         num_hidden_layers: usize,
         vocab_size: usize,
+        declared_max_model_len: Option<usize>,
         rms_norm_eps: f32,
         tie_word_embeddings: bool,
         architecture: String,
@@ -125,6 +126,14 @@ mod inner {
             .map(|v| v as f32)
             .unwrap_or_else(|| get_f32("partial_rotary_factor", 1.0));
 
+        let declared_max_model_len = text_json
+            .get("max_position_embeddings")
+            .or_else(|| json.get("max_position_embeddings"))
+            .or_else(|| text_json.get("max_sequence_length"))
+            .or_else(|| json.get("max_sequence_length"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
         Ok(HfModelConfig {
             hidden_size,
             intermediate_size: get_usize("intermediate_size", 11008),
@@ -132,6 +141,7 @@ mod inner {
             num_key_value_heads: get_usize("num_key_value_heads", num_attention_heads),
             num_hidden_layers: get_usize("num_hidden_layers", 32),
             vocab_size: get_usize("vocab_size", 32000),
+            declared_max_model_len,
             rms_norm_eps: get_f32("rms_norm_eps", 1e-5),
             tie_word_embeddings,
             architecture,
@@ -255,11 +265,26 @@ mod inner {
                 heads = hf_config.num_attention_heads,
                 kv_heads = hf_config.num_key_value_heads,
                 vocab = hf_config.vocab_size,
+                declared_max_model_len = ?hf_config.declared_max_model_len,
                 intermediate = hf_config.intermediate_size,
                 "model config loaded"
             );
 
             let head_dim = hf_config.head_dim;
+            let max_model_len = resolve_runtime_max_model_len(
+                config.model.max_model_len,
+                &hf_config.architecture,
+                hf_config.declared_max_model_len,
+            );
+            if max_model_len != config.model.max_model_len {
+                info!(
+                    requested = config.model.max_model_len,
+                    resolved = max_model_len,
+                    declared = ?hf_config.declared_max_model_len,
+                    arch = %hf_config.architecture,
+                    "using model-derived max_model_len"
+                );
+            }
 
             // 3. Tokenizer
             let tokenizer_path = config.model.tokenizer_path.as_deref().unwrap_or(model_name);
@@ -275,7 +300,7 @@ mod inner {
                 num_attention_heads: hf_config.num_attention_heads,
                 intermediate_size: hf_config.intermediate_size,
                 vocab_size: hf_config.vocab_size,
-                max_model_len: config.model.max_model_len,
+                max_model_len,
                 block_size: config.cache.block_size,
                 gpu_memory_utilization: config.cache.gpu_memory_utilization,
                 rank: 0,

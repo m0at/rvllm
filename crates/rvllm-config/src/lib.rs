@@ -22,7 +22,10 @@ pub use cache::CacheConfigImpl;
 pub use cli::CliArgs;
 pub use device::DeviceConfig;
 pub use engine::EngineConfig;
-pub use model::ModelConfigImpl;
+pub use model::{
+    resolve_runtime_max_model_len, ModelConfigImpl, AUTO_LLAMA_MAX_MODEL_LEN_CAP,
+    DEFAULT_MAX_MODEL_LEN,
+};
 pub use parallel::ParallelConfigImpl;
 pub use scheduler::{PreemptionMode, SchedulerConfigImpl};
 pub use telemetry::TelemetryConfig;
