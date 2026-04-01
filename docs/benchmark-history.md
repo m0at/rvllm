@@ -2,6 +2,18 @@
 
 All results greedy decoding, 512 tokens/request unless noted. (Prior to 2026-03-30: 32 tokens/request.)
 
+## Phase 9 (2026-04-01) -- Lifecycle race: cold start to shutdown
+
+End-to-end wall time from cold start to last token, including startup, 15k-token benchmark at c=64, and clean shutdown.
+Qwen2.5-7B f16, H100 SXM 80GB. Non-streaming `/v1/completions`.
+
+| Engine | startup_sec | bench_sec | shutdown_sec | e2e_sec | tokens | tok/s | avg_ms | shutdown_ok |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| rvLLM | 2.01 | 0.11 | 0.11 | 2.23 | 15,000 | 143,378 | 52.6 | true |
+| stock vLLM | 44.08 | 2.08 | 0.82 | 46.98 | 15,000 | 7,210 | 1,051.1 | true |
+
+22x faster startup, ~20x throughput, 21x faster end-to-end lifecycle. Both engines: 100/100 requests, clean SIGTERM, port verified closed.
+
 ## Phase 8 (2026-04-01) -- Stock vLLM vs rvllm-lite vs rvLLM, apples-to-apples H100
 
 This is the current public comparison set used in the README, GitHub Pages, and paper.

@@ -1,4 +1,9 @@
-updated rvLLM and cleaned up the public repo/docs.
+updated rvLLM and ran a lifecycle race on H100 -- cold start to /health, 15k tokens, clean shutdown:
+
+rvLLM:      2.01s startup  |  143,378 tok/s  |  52ms avg  |  2.23s total
+stock vLLM: 44.08s startup |    7,210 tok/s  | 1051ms avg | 46.98s total
+
+22x faster startup. 20x throughput. 21x faster end-to-end lifecycle.
 
 current public H100 comparison is against:
 - stock vLLM

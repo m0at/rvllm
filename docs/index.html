@@ -138,8 +138,8 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">3,170 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.99x stock vLLM in the latest apples-to-apples run. HTTP throughput: 2,723 tok/s at 200 requests / concurrency 32.</div>
+  <div class="big">21x faster lifecycle</div>
+  <div class="sub">Cold start to done: rvLLM completes the full lifecycle (startup + 15k tokens + shutdown) in <strong>2.23s</strong> vs vLLM's <strong>46.98s</strong>. Direct engine N=32: 3,170 tok/s (0.99x stock vLLM). HTTP: 2,723 tok/s.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
     <div class="hero-graphic-sub">Three-way benchmark: stock vLLM vs rvllm-lite vs rvLLM, with both direct-engine and HTTP serving results.</div>
@@ -280,6 +280,71 @@ footer a:hover{color:#999}
         <div class="hero-chart-pill">
           <strong>lite exposes the gap</strong>
           rvllm-lite stays near stock direct-engine, then falls apart once the Python serving path is involved.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="hero-graphic" style="margin-top:1rem">
+    <div class="hero-graphic-title">Lifecycle Race -- Cold Start to Shutdown</div>
+    <div class="hero-graphic-sub">End-to-end wall time: cold start, 15,000 tokens at concurrency 64, clean shutdown. Qwen2.5-7B f16, H100 SXM 80GB.</div>
+    <div class="hero-chart-root" aria-label="rvLLM lifecycle race chart">
+      <div class="hero-chart-legend">
+        <span><i style="background:#78CFFF"></i>stock vLLM</span>
+        <span><i style="background:#84E6B7"></i>rvLLM</span>
+      </div>
+      <div class="hero-chart-grid">
+        <div class="hero-chart-card">
+          <div class="hero-chart-head"><div><h3>Startup Time</h3><p>Cold start to first /health response.</p></div></div>
+          <div class="hero-static-block">
+            <div class="hero-static-row">
+              <div class="hero-static-label">vLLM</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#78CFFF"></div></div>
+                <div class="hero-static-meta"><span>44.08s</span></div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">rvLLM</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:4.6%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span style="color:#84E6B7">2.01s <strong>-- 22x faster</strong></span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="hero-chart-card">
+          <div class="hero-chart-head"><div><h3>Serving Throughput</h3><p>15k tokens, concurrency 64, /v1/completions.</p></div></div>
+          <div class="hero-static-block">
+            <div class="hero-static-row">
+              <div class="hero-static-label">rvLLM</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span style="color:#84E6B7">143,378 tok/s</span></div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">vLLM</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:5.0%;background:#78CFFF"></div></div>
+                <div class="hero-static-meta"><span>7,210 tok/s <strong>-- 20x slower</strong></span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="hero-chart-notes">
+        <div class="hero-chart-pill">
+          <strong>2.01s startup</strong>
+          No Python runtime, no torch.compile, no eager warmup. Loads and goes.
+        </div>
+        <div class="hero-chart-pill">
+          <strong>143,378 tok/s</strong>
+          20x stock vLLM throughput at concurrency 64. 52ms avg latency vs 1,051ms.
+        </div>
+        <div class="hero-chart-pill">
+          <strong>2.23s end-to-end</strong>
+          Full lifecycle (start + 15k tokens + shutdown) vs 46.98s for stock vLLM.
         </div>
       </div>
     </div>

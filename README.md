@@ -2,6 +2,19 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) focused on single-card, high-throughput serving with explicit control over kernels, memory, and startup behavior.
 
+## Lifecycle Race (2026-04-01)
+
+Cold-start to first `/health`, serve 15,000 completion tokens at concurrency 64, clean shutdown. Qwen2.5-7B f16, H100 SXM 80GB.
+
+| Engine | startup_sec | bench_sec | shutdown_sec | e2e_sec | tokens | tok/s | avg_ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rvLLM | 2.01 | 0.11 | 0.11 | 2.23 | 15,000 | 143,378 | 52.6 |
+| stock vLLM | 44.08 | 2.08 | 0.82 | 46.98 | 15,000 | 7,210 | 1,051.1 |
+
+- **22x faster startup** (2s vs 44s)
+- **~20x throughput** (143k vs 7.2k tok/s)
+- **21x faster end-to-end lifecycle** (2.23s vs 46.98s)
+
 ## What Is Already Clearly Better
 
 - **HTTP stack is already competitive**: `rvLLM` reaches `2,723 tok/s` over HTTP vs `2,862 tok/s` for stock `vLLM`.
