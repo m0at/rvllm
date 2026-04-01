@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apples-to-apples 10k-token lifecycle benchmark: rvLLM vs vLLM."""
+"""Apples-to-apples 10k-token lifecycle benchmark: launch to last token."""
 
 import asyncio
 import json
@@ -47,6 +47,7 @@ TOP_P = 1.0
 # keeping the race small and stable.
 NUM_REQUESTS = max(CONCURRENCY * 2, math.ceil(TARGET_COMPLETION_TOKENS / MAX_TOKENS) + CONCURRENCY)
 MAX_REASONABLE_THROUGHPUT = 50_000
+PROBE_PROMPT = "Count to one."
 
 def ensure_results_dir():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,15 +70,25 @@ def port_closed(port: int, timeout: float = 30.0) -> bool:
     return False
 
 
-async def wait_health(port: int, timeout: float = HEALTH_TIMEOUT) -> bool:
-    url = f"http://127.0.0.1:{port}/health"
+async def wait_first_completion(port: int, timeout: float = HEALTH_TIMEOUT) -> bool:
+    url = f"http://127.0.0.1:{port}/v1/completions"
+    payload = {
+        "model": MODEL,
+        "prompt": PROBE_PROMPT,
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "top_p": 1.0,
+    }
     deadline = time.time() + timeout
     async with aiohttp.ClientSession() as session:
         while time.time() < deadline:
             try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
                     if r.status == 200:
-                        return True
+                        body = await r.json()
+                        usage = body.get("usage", {})
+                        if usage.get("completion_tokens", 0) > 0:
+                            return True
             except Exception:
                 pass
             await asyncio.sleep(2)
@@ -105,11 +116,11 @@ def run_benchmark_via_client(port: int, output_path: Path):
         str(BENCH_CLIENT),
         "--url", f"http://127.0.0.1:{port}",
         "--model", MODEL,
-        "--num-prompts", str(NUM_REQUESTS),
         "--concurrent", str(CONCURRENCY),
         "--max-tokens", str(MAX_TOKENS),
         "--temperature", str(TEMPERATURE),
         "--top-p", str(TOP_P),
+        "--target-completion-tokens", str(TARGET_COMPLETION_TOKENS),
         "--output", str(output_path),
     ]
 
@@ -178,9 +189,8 @@ def run_lifecycle(name: str, cmd: list, log_path: Path, result_path: Path):
 
     log_f = open(log_path, "w")
 
-    # Startup
     print(f"[{name}] Starting server...")
-    t_start = time.time()
+    launch_wall_start = time.perf_counter()
     proc = subprocess.Popen(
         cmd,
         stdout=log_f,
@@ -190,14 +200,12 @@ def run_lifecycle(name: str, cmd: list, log_path: Path, result_path: Path):
     pid = proc.pid
     print(f"[{name}] PID={pid}")
 
-    # Wait for health
-    healthy = asyncio.run(wait_health(8000, HEALTH_TIMEOUT))
-    startup_sec = round(time.time() - t_start, 2)
+    first_completion = asyncio.run(wait_first_completion(8000, HEALTH_TIMEOUT))
+    first_completion_sec = round(time.perf_counter() - launch_wall_start, 2)
 
-    if not healthy:
-        print(f"[{name}] FAILED to reach healthy state in {HEALTH_TIMEOUT}s")
+    if not first_completion:
+        print(f"[{name}] FAILED to serve first completion in {HEALTH_TIMEOUT}s")
         log_f.close()
-        # Print last 200 lines
         with open(log_path) as f:
             lines = f.readlines()
         print("".join(lines[-200:]))
@@ -205,11 +213,11 @@ def run_lifecycle(name: str, cmd: list, log_path: Path, result_path: Path):
         proc.wait()
         return None
 
-    print(f"[{name}] Healthy after {startup_sec}s")
+    print(f"[{name}] First completion served after {first_completion_sec}s")
 
     # Benchmark
     bench_output_path = RESULTS_DIR / f"{name.lower().replace(' ', '_')}_bench.json"
-    print(f"[{name}] Running benchmark (concurrency={CONCURRENCY}, requests={NUM_REQUESTS}, max_tokens={MAX_TOKENS})...")
+    print(f"[{name}] Running benchmark (concurrency={CONCURRENCY}, target_tokens={TARGET_COMPLETION_TOKENS}, max_tokens={MAX_TOKENS})...")
     try:
         bench = run_benchmark_via_client(8000, bench_output_path)
         validate_benchmark(name, bench)
@@ -228,6 +236,7 @@ def run_lifecycle(name: str, cmd: list, log_path: Path, result_path: Path):
         return None
 
     bench_wall = round(float(bench["total_time_sec"]), 2)
+    launch_to_finished_tokens_sec = round(time.perf_counter() - launch_wall_start, 2)
 
     print(
         f"[{name}] Benchmark done: {bench['total_completion_tokens']} tokens, "
@@ -258,14 +267,14 @@ def run_lifecycle(name: str, cmd: list, log_path: Path, result_path: Path):
     closed = port_closed(8000, timeout=15)
     print(f"[{name}] Port closed: {closed}, shutdown_sec={shutdown_sec}")
 
-    end_to_end = round(startup_sec + bench_wall + shutdown_sec, 2)
-
     result = {
         "engine": name,
-        "startup_sec": startup_sec,
+        "startup_sec": first_completion_sec,
+        "launch_to_first_completion_sec": first_completion_sec,
         "benchmark_wall_sec": bench_wall,
         "shutdown_sec": shutdown_sec,
-        "end_to_end_sec": end_to_end,
+        "launch_to_finished_tokens_sec": launch_to_finished_tokens_sec,
+        "end_to_end_sec": launch_to_finished_tokens_sec,
         "total_completion_tokens": bench["total_completion_tokens"],
         "throughput_tok_per_sec": bench["throughput_tok_per_sec"],
         "avg_latency_ms": bench["avg_latency_ms"],
@@ -288,6 +297,7 @@ def run_lifecycle(name: str, cmd: list, log_path: Path, result_path: Path):
 
 
 def main():
+    engine = os.environ.get("BENCH_ENGINE", "both").strip().lower()
     ensure_results_dir()
     print("=== rvLLM vs vLLM Lifecycle Benchmark ===")
     print(f"Model: {MODEL}")
@@ -296,24 +306,24 @@ def main():
         f"Concurrency: {CONCURRENCY}, Requests: {NUM_REQUESTS}, MaxTokens: {MAX_TOKENS}"
     )
 
-    # Run rvLLM first
-    rv_result = run_lifecycle(
-        "rvLLM",
-        RVLLM_CMD,
-        RESULTS_DIR / "rvllm.log",
-        RESULTS_DIR / "rvllm_result.json",
-    )
-
-    # Brief pause between runs
-    time.sleep(5)
-
-    # Run vLLM second
-    vl_result = run_lifecycle(
-        "vLLM",
-        VLLM_CMD,
-        RESULTS_DIR / "vllm.log",
-        RESULTS_DIR / "vllm_result.json",
-    )
+    rv_result = None
+    vl_result = None
+    if engine in {"both", "rvllm"}:
+        rv_result = run_lifecycle(
+            "rvLLM",
+            RVLLM_CMD,
+            RESULTS_DIR / "rvllm.log",
+            RESULTS_DIR / "rvllm_result.json",
+        )
+    if engine == "both":
+        time.sleep(5)
+    if engine in {"both", "vllm"}:
+        vl_result = run_lifecycle(
+            "vLLM",
+            VLLM_CMD,
+            RESULTS_DIR / "vllm.log",
+            RESULTS_DIR / "vllm_result.json",
+        )
 
     # Print comparison table
     print("\n" + "=" * 80)
@@ -321,8 +331,8 @@ def main():
     print("=" * 80)
 
     headers = [
-        "engine", "startup_sec", "benchmark_wall_sec", "shutdown_sec",
-        "end_to_end_sec", "total_completion_tokens", "throughput_tok_per_sec",
+        "engine", "launch_to_first_completion_sec", "benchmark_wall_sec", "shutdown_sec",
+        "launch_to_finished_tokens_sec", "total_completion_tokens", "throughput_tok_per_sec",
         "avg_latency_ms", "shutdown_ok",
     ]
 

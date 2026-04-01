@@ -30,6 +30,8 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub stop: Option<Vec<String>>,
     #[serde(default)]
+    pub ignore_eos: bool,
+    #[serde(default)]
     pub logprobs: Option<usize>,
     #[serde(default)]
     pub echo: bool,
@@ -60,6 +62,8 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub stop: Option<Vec<String>>,
+    #[serde(default)]
+    pub ignore_eos: bool,
     #[serde(default)]
     pub presence_penalty: f32,
     #[serde(default)]
@@ -122,6 +126,7 @@ impl CompletionRequest {
             top_p: self.top_p,
             max_tokens: self.max_tokens,
             stop_strings: self.stop.clone().unwrap_or_default(),
+            ignore_eos: self.ignore_eos,
             logprobs: self.logprobs,
             echo: self.echo,
             presence_penalty: self.presence_penalty,
@@ -178,6 +183,7 @@ impl ChatCompletionRequest {
             top_p: self.top_p,
             max_tokens: self.max_tokens,
             stop_strings: self.stop.clone().unwrap_or_default(),
+            ignore_eos: self.ignore_eos,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             seed: self.seed,
@@ -202,6 +208,7 @@ mod tests {
             n: 1,
             stream: false,
             stop: Some(vec!["\n".into()]),
+            ignore_eos: true,
             logprobs: Some(5),
             echo: false,
             presence_penalty: 0.0,
@@ -235,6 +242,7 @@ mod tests {
             n: 1,
             stream: true,
             stop: None,
+            ignore_eos: false,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             user: None,
@@ -271,6 +279,7 @@ mod tests {
             n: 1,
             stream: false,
             stop: None,
+            ignore_eos: false,
             logprobs: None,
             echo: false,
             presence_penalty: 0.0,
@@ -292,6 +301,7 @@ mod tests {
             n: 1,
             stream: false,
             stop: None,
+            ignore_eos: false,
             logprobs: None,
             echo: false,
             presence_penalty: 0.0,
@@ -313,6 +323,7 @@ mod tests {
             n: 1,
             stream: false,
             stop: None,
+            ignore_eos: false,
             logprobs: None,
             echo: false,
             presence_penalty: 0.0,
@@ -334,6 +345,7 @@ mod tests {
             n: 1,
             stream: false,
             stop: None,
+            ignore_eos: true,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             user: None,
@@ -358,6 +370,7 @@ mod tests {
             n: 1,
             stream: false,
             stop: None,
+            ignore_eos: false,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             user: None,
@@ -379,6 +392,7 @@ mod tests {
             n: 2,
             stream: false,
             stop: Some(vec!["END".into()]),
+            ignore_eos: true,
             logprobs: Some(3),
             echo: true,
             presence_penalty: 0.1,
@@ -390,6 +404,7 @@ mod tests {
         assert_eq!(sp.max_tokens, 42);
         assert_eq!(sp.temperature, 0.8);
         assert_eq!(sp.top_p, 0.95);
+        assert!(sp.ignore_eos);
         assert_eq!(sp.stop_strings, vec!["END".to_string()]);
         assert_eq!(sp.logprobs, Some(3));
         assert!(sp.echo);

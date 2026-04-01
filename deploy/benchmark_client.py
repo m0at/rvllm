@@ -77,41 +77,46 @@ async def run_benchmark(
     model="default",
     temperature=0.0,
     top_p=1.0,
+    target_completion_tokens=0,
 ):
-    prompts = [PROMPTS[i % len(PROMPTS)] for i in range(num_prompts)]
     results = []
     errors = 0
-    payloads = [
-        json.dumps(
+    dispatched_requests = 0
+    completion_tokens_so_far = 0
+    state_lock = asyncio.Lock()
+
+    def make_payload(index: int) -> bytes:
+        return json.dumps(
             {
                 "model": model,
-                "prompt": prompt,
+                "prompt": PROMPTS[index % len(PROMPTS)],
                 "max_tokens": max_tokens,
                 "temperature": temperature,
                 "top_p": top_p,
+                "ignore_eos": True,
                 "stream": False,
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        for prompt in prompts
-    ]
-    queue: asyncio.Queue[bytes] = asyncio.Queue()
-    for payload in payloads:
-        queue.put_nowait(payload)
 
     async def worker(session):
-        nonlocal errors
+        nonlocal errors, dispatched_requests, completion_tokens_so_far
         while True:
-            try:
-                payload = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
+            async with state_lock:
+                if target_completion_tokens > 0:
+                    if completion_tokens_so_far >= target_completion_tokens:
+                        return
+                elif dispatched_requests >= num_prompts:
+                    return
+                payload = make_payload(dispatched_requests)
+                dispatched_requests += 1
             result = await send_request(session, url, payload)
-            if result is None:
-                errors += 1
-            else:
-                results.append(result)
-            queue.task_done()
+            async with state_lock:
+                if result is None:
+                    errors += 1
+                else:
+                    results.append(result)
+                    completion_tokens_so_far += result["completion_tokens"]
 
     start = time.perf_counter()
     connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ttl_dns_cache=3600)
@@ -137,12 +142,13 @@ async def run_benchmark(
 
     return {
         "server_url": url,
-        "num_requests": num_prompts,
+        "num_requests": dispatched_requests,
         "successful_requests": len(results),
         "concurrency": concurrency,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
+        "target_completion_tokens": target_completion_tokens,
         "total_time_sec": total_time,
         "total_prompt_tokens": total_prompt_tokens,
         "total_completion_tokens": total_completion_tokens,
@@ -171,6 +177,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--target-completion-tokens", type=int, default=0)
     parser.add_argument("--output", default="results.json")
     args = parser.parse_args()
 
@@ -178,7 +185,8 @@ def main():
     print(f"  Model: {args.model}")
     print(
         f"  Prompts: {args.num_prompts}, Concurrency: {args.concurrent}, "
-        f"Max tokens: {args.max_tokens}, Temperature: {args.temperature}, Top-p: {args.top_p}"
+        f"Max tokens: {args.max_tokens}, Temperature: {args.temperature}, Top-p: {args.top_p}, "
+        f"Target completion tokens: {args.target_completion_tokens}"
     )
 
     result = asyncio.run(
@@ -190,6 +198,7 @@ def main():
             args.model,
             args.temperature,
             args.top_p,
+            args.target_completion_tokens,
         )
     )
 

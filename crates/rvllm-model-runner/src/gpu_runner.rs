@@ -96,6 +96,7 @@ mod cuda_impl {
     /// Pre-allocated f16 scratch buffers for the forward pass.
     /// Sized for max_batch_tokens. Reused across all layers (sequential execution).
     pub struct F16LayerScratch {
+        pub max_tokens: usize,
         pub qkv: CudaSlice<f16>,          // [max_tokens * qkv_dim]
         pub attn_out: CudaSlice<f16>,     // [max_tokens * q_dim]
         pub o_proj: CudaSlice<f16>,       // [max_tokens * hidden]
@@ -109,6 +110,8 @@ mod cuda_impl {
         pub residual_b: CudaSlice<f16>,   // [max_tokens * hidden]
         pub down_b: CudaSlice<f16>,       // [max_tokens * hidden]
     }
+
+    const DEFAULT_F16_SCRATCH_TOKENS: usize = 512;
 
     /// Element offsets into the packed metadata GPU buffer.
     #[derive(Clone, Copy, Default)]
@@ -539,15 +542,14 @@ mod cuda_impl {
                 }
             }
 
-            self.alloc_scratch()?;
+            self.alloc_scratch(DEFAULT_F16_SCRATCH_TOKENS)?;
             Ok(())
         }
 
         /// Pre-allocate a reusable set of f16 scratch buffers for the forward pass.
-        /// Sized for max padded batch (256). Since all layers are processed
+        /// Sized for max padded batch tokens. Since all layers are processed
         /// sequentially, one set of buffers covers every layer.
-        fn alloc_scratch(&mut self) -> Result<()> {
-            let max_tokens: usize = 512; // support up to N=512 batch decode
+        fn alloc_scratch(&self, max_tokens: usize) -> Result<()> {
             let hidden = self.config.hidden_size;
             let q_dim = self.config.num_heads * self.config.head_dim;
             let kv_dim = self.config.num_kv_heads * self.config.head_dim;
@@ -561,6 +563,7 @@ mod cuda_impl {
             };
 
             let scratch = F16LayerScratch {
+                max_tokens,
                 qkv: alloc(max_tokens * qkv_dim)?,
                 attn_out: alloc(max_tokens * q_dim)?,
                 o_proj: alloc(max_tokens * hidden)?,
@@ -577,6 +580,21 @@ mod cuda_impl {
             info!(max_tokens, total_bytes, "f16 layer scratch allocated");
             *self.f16_scratch.borrow_mut() = Some(scratch);
             Ok(())
+        }
+
+        fn ensure_scratch_capacity(&self, num_tokens: usize) -> Result<()> {
+            let required_tokens = num_tokens.max(DEFAULT_F16_SCRATCH_TOKENS);
+            let current_tokens = self
+                .f16_scratch
+                .borrow()
+                .as_ref()
+                .map_or(0, |scratch| scratch.max_tokens);
+            if current_tokens >= required_tokens {
+                return Ok(());
+            }
+
+            info!(current_tokens, required_tokens, "growing f16 layer scratch for batched forward");
+            self.alloc_scratch(required_tokens)
         }
 
         pub fn forward(
@@ -645,6 +663,9 @@ mod cuda_impl {
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
             let use_scratch = num_tokens > 1 || is_prefill;
+            if use_scratch {
+                self.ensure_scratch_capacity(num_tokens)?;
+            }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
 
@@ -877,6 +898,9 @@ mod cuda_impl {
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             let path = self.resolve_forward_path(num_tokens, is_prefill);
             let use_scratch = num_tokens > 1 || is_prefill;
+            if use_scratch {
+                self.ensure_scratch_capacity(num_tokens)?;
+            }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
 
             // For Batched path: copy embedding into residual_a for double-buffer read
@@ -1139,6 +1163,9 @@ mod cuda_impl {
             let offsets = self.meta_packed_offsets.get();
             // Double-buffered scratch for T>1 decode: zero per-layer allocations.
             let use_scratch = num_tokens > 1 || is_prefill;
+            if use_scratch {
+                self.ensure_scratch_capacity(num_tokens)?;
+            }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             let path = self.resolve_forward_path(num_tokens, is_prefill);
@@ -1374,6 +1401,9 @@ mod cuda_impl {
             let offsets = self.meta_packed_offsets.get();
             // Double-buffered scratch for T>1 decode: zero per-layer allocations.
             let use_scratch = num_tokens > 1 || is_prefill;
+            if use_scratch {
+                self.ensure_scratch_capacity(num_tokens)?;
+            }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             let path = self.resolve_forward_path(num_tokens, is_prefill);

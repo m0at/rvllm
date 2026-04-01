@@ -19,9 +19,11 @@ impl StopChecker {
         eos_token_id: Option<TokenId>,
     ) -> Option<FinishReason> {
         // Check EOS token
-        if let Some(eos) = eos_token_id {
-            if output_token_ids.last().copied() == Some(eos) {
-                return Some(FinishReason::Stop);
+        if !params.ignore_eos {
+            if let Some(eos) = eos_token_id {
+                if output_token_ids.last().copied() == Some(eos) {
+                    return Some(FinishReason::Stop);
+                }
             }
         }
 
@@ -112,6 +114,15 @@ mod tests {
         // 3 tokens with last being eos -- eos checked first
         let result = StopChecker::check_stop("abc", &[1, 2, 99], &params, Some(99));
         assert_eq!(result, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn ignore_eos_runs_until_max_tokens() {
+        let mut params = default_params();
+        params.max_tokens = 4;
+        params.ignore_eos = true;
+        let result = StopChecker::check_stop("abc", &[1, 2, 99], &params, Some(99));
+        assert_eq!(result, None);
     }
 
     #[test]

@@ -172,6 +172,9 @@ pub struct SamplingParams {
     pub max_tokens: usize,
     /// Stop generation when any of these strings are produced.
     pub stop_strings: Vec<String>,
+    /// If true, do not stop when the EOS token is generated.
+    #[serde(default)]
+    pub ignore_eos: bool,
     /// If set, return this many top log-probabilities per position.
     pub logprobs: Option<usize>,
     /// Deterministic sampling seed.
@@ -200,6 +203,7 @@ impl Default for SamplingParams {
             presence_penalty: 0.0,
             max_tokens: 256,
             stop_strings: Vec::new(),
+            ignore_eos: false,
             logprobs: None,
             seed: None,
             best_of: 1,
