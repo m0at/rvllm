@@ -1,0 +1,11 @@
+.{
+    .name = .rvllm_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xad00ebc1d06ab6e6,
+    .minimum_zig_version = "0.15.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

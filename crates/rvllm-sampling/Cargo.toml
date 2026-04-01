@@ -18,6 +18,7 @@ cuda = ["rvllm-gpu/cuda"]
 [dependencies]
 rvllm-core.workspace = true
 rvllm-gpu.workspace = true
+rvllm-zig.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 thiserror.workspace = true

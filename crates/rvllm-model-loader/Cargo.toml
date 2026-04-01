@@ -18,6 +18,7 @@ cuda = ["rvllm-gpu/cuda", "dep:cudarc", "dep:half"]
 [dependencies]
 rvllm-core.workspace = true
 rvllm-gpu.workspace = true
+rvllm-zig.workspace = true
 safetensors.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true

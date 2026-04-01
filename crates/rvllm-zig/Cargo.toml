@@ -1,0 +1,17 @@
+[package]
+name = "rvllm-zig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+description = "Zig SIMD acceleration for rvLLM (sampling, weight conversion)"
+keywords = ["zig", "simd", "sampling", "f16"]
+categories = ["algorithms", "hardware-support"]
+build = "build.rs"
+
+[build-dependencies]
+
+[dependencies]

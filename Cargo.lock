@@ -2813,6 +2813,7 @@ dependencies = [
  "memmap2",
  "rvllm-core",
  "rvllm-gpu",
+ "rvllm-zig",
  "safetensors",
  "serde",
  "serde_json",
@@ -2878,6 +2879,7 @@ dependencies = [
  "rayon",
  "rvllm-core",
  "rvllm-gpu",
+ "rvllm-zig",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3006,6 +3008,10 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
 ]
+
+[[package]]
+name = "rvllm-zig"
+version = "0.1.0"
 
 [[package]]
 name = "ryu"

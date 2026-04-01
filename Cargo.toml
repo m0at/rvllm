@@ -26,6 +26,7 @@ members = [
     "crates/rvllm-server",
     "crates/rvllm-python",
     "crates/rvllm-fusion",
+    "crates/rvllm-zig",
 ]
 
 [workspace.package]
@@ -64,6 +65,7 @@ rvllm-speculative = { path = "crates/rvllm-speculative" }
 rvllm-tp = { path = "crates/rvllm-tp" }
 rvllm-telemetry = { path = "crates/rvllm-telemetry" }
 rvllm-fusion = { path = "crates/rvllm-fusion" }
+rvllm-zig = { path = "crates/rvllm-zig" }
 # External dependencies
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
