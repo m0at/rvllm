@@ -631,6 +631,16 @@ mod cuda_impl {
             }
 
             let path = self.resolve_forward_path(num_tokens, is_prefill);
+
+            // === MEGAKERNEL: all layers + LM head in one kernel launch ===
+            if path == ForwardPath::MegakernelDecode {
+                return self.forward_megakernel(
+                    &hidden_f16, gpu_cache, packed_buf, offsets,
+                    num_tokens, num_seqs, max_context_len, block_size,
+                    greedy_only,
+                );
+            }
+
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
 
@@ -1611,6 +1621,204 @@ mod cuda_impl {
             }
 
             Ok(output)
+        }
+
+        /// Megakernel decode: all layers + LM head in one kernel launch.
+        fn forward_megakernel(
+            &self,
+            embedding: &CudaSlice<f16>,
+            gpu_cache: &[(CudaSlice<f16>, CudaSlice<f16>)],
+            packed_buf: CudaView<'_, i32>,
+            offsets: &PackedMetaOffsets,
+            num_tokens: usize,
+            _num_seqs: usize,
+            max_context_len: u32,
+            block_size: usize,
+            _greedy_only: bool,
+        ) -> Result<ForwardOutput> {
+            use std::ffi::c_void;
+            use crate::megakernel;
+
+            let cfg = &self.config;
+            let hidden = cfg.hidden_size;
+            let num_heads = cfg.num_attention_heads;
+            let num_kv_heads = cfg.num_kv_heads;
+            let head_dim = cfg.head_dim;
+            let intermediate = cfg.intermediate_size;
+            let vocab = cfg.vocab_size;
+            let num_layers = self.layers.len();
+
+            // Build instruction tape
+            let has_bias = !self.fused_qkv_bias.is_empty()
+                && self.fused_qkv_bias.iter().any(|b| b.is_some());
+            let tape = megakernel::build_instruction_tape(
+                num_layers, hidden, num_heads, num_kv_heads, head_dim,
+                intermediate, vocab, self.rms_norm_eps, has_bias,
+            );
+            let num_instructions = tape.len() as i32;
+
+            // Upload instruction tape
+            let tape_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    tape.as_ptr() as *const u8,
+                    tape.len() * 64,
+                )
+            };
+            let tape_gpu = self.stream.clone_htod(tape_bytes)
+                .map_err(|e| LLMError::GpuError(format!("mk tape upload: {e}")))?;
+
+            // Collect weight pointers (7 per layer + 2 global)
+            let mut wptrs: Vec<u64> = Vec::with_capacity(megakernel::weight_ptr_count(num_layers));
+            for i in 0..num_layers {
+                let w = self.layer_weights(i)?;
+                // input_layernorm
+                wptrs.push(DevicePtr::device_ptr(w.input_layernorm, &self.stream).0);
+                // fused_qkv (required for megakernel)
+                let qkv_w = w.fused_qkv
+                    .ok_or_else(|| LLMError::GpuError("megakernel requires fused_qkv".into()))?;
+                wptrs.push(DevicePtr::device_ptr(qkv_w, &self.stream).0);
+                // qkv_bias (0 if none)
+                wptrs.push(w.qkv_bias.map_or(0u64, |b| DevicePtr::device_ptr(b, &self.stream).0));
+                // o_proj
+                wptrs.push(DevicePtr::device_ptr(w.o_proj, &self.stream).0);
+                // post_attention_layernorm
+                wptrs.push(DevicePtr::device_ptr(w.post_attention_layernorm, &self.stream).0);
+                // fused_gate_up (required)
+                let gu_w = w.fused_gate_up
+                    .ok_or_else(|| LLMError::GpuError("megakernel requires fused_gate_up".into()))?;
+                wptrs.push(DevicePtr::device_ptr(gu_w, &self.stream).0);
+                // down_proj
+                wptrs.push(DevicePtr::device_ptr(w.down_proj, &self.stream).0);
+            }
+            // Global: final_norm, lm_head
+            wptrs.push(DevicePtr::device_ptr(&self.final_norm_weight, &self.stream).0);
+            wptrs.push(DevicePtr::device_ptr(&self.lm_head_weight, &self.stream).0);
+
+            let wptrs_gpu = self.stream.clone_htod(&wptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk wptrs upload: {e}")))?;
+
+            // Allocate scratch buffer
+            let scratch_bytes = megakernel::scratch_size_bytes(
+                hidden, num_heads, num_kv_heads, head_dim, intermediate, vocab);
+            let mut scratch_gpu = unsafe { self.stream.alloc::<u8>(scratch_bytes) }
+                .map_err(|e| LLMError::GpuError(format!("mk scratch: {e}")))?;
+
+            // Copy embedding into residual_a slot in scratch
+            // residual_a starts at offset: qkv*2 + q_dim*2 + hidden*2 + gate_up_dim*2 + hidden*2
+            let q_dim = num_heads * head_dim;
+            let kv_dim = num_kv_heads * head_dim;
+            let qkv_dim = q_dim + 2 * kv_dim;
+            let gate_up_dim = intermediate * 2;
+            let res_a_byte_offset = (qkv_dim + q_dim + hidden + gate_up_dim + hidden) * 2;
+            {
+                let embed_bytes = num_tokens * hidden * 2;
+                let src_u8: &CudaSlice<u8> = unsafe { std::mem::transmute(embedding) };
+                let mut dst_slice = scratch_gpu.slice_mut(res_a_byte_offset..res_a_byte_offset + embed_bytes);
+                self.stream.memcpy_dtod(&src_u8.slice(..embed_bytes), &mut dst_slice)
+                    .map_err(|e| LLMError::GpuError(format!("mk embed->scratch: {e}")))?;
+            }
+
+            // Sync counters (zeroed)
+            let num_counters = megakernel::sync_counter_count(num_layers);
+            let sync_gpu = self.stream.clone_htod(&vec![0i32; num_counters])
+                .map_err(|e| LLMError::GpuError(format!("mk sync: {e}")))?;
+
+            // Collect per-layer KV cache pointers
+            let mut key_ptrs: Vec<u64> = Vec::with_capacity(num_layers);
+            let mut val_ptrs: Vec<u64> = Vec::with_capacity(num_layers);
+            for (kc, vc) in gpu_cache.iter().take(num_layers) {
+                key_ptrs.push(DevicePtr::device_ptr(kc, &self.stream).0);
+                val_ptrs.push(DevicePtr::device_ptr(vc, &self.stream).0);
+            }
+            let key_ptrs_gpu = self.stream.clone_htod(&key_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk key_ptrs: {e}")))?;
+            let val_ptrs_gpu = self.stream.clone_htod(&val_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk val_ptrs: {e}")))?;
+
+            // Output token buffer
+            let output_gpu = self.stream.clone_htod(&[0i32])
+                .map_err(|e| LLMError::GpuError(format!("mk output: {e}")))?;
+
+            // Get device pointers for kernel args
+            let p_tape       = DevicePtr::device_ptr(&tape_gpu, &self.stream).0;
+            let p_wptrs      = DevicePtr::device_ptr(&wptrs_gpu, &self.stream).0;
+            let p_scratch    = DevicePtr::device_ptr(&scratch_gpu, &self.stream).0;
+            let p_sync       = DevicePtr::device_ptr(&sync_gpu, &self.stream).0;
+            let p_keys       = DevicePtr::device_ptr(&key_ptrs_gpu, &self.stream).0;
+            let p_vals       = DevicePtr::device_ptr(&val_ptrs_gpu, &self.stream).0;
+            let p_block_tables = DevicePtr::device_ptr(
+                &packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
+                &self.stream).0;
+            let p_context_lens = DevicePtr::device_ptr(
+                &packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
+                &self.stream).0;
+            let p_positions = DevicePtr::device_ptr(
+                &packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
+                &self.stream).0;
+            let p_slot_mapping = DevicePtr::device_ptr(
+                &packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
+                &self.stream).0;
+            let p_rope_cos   = DevicePtr::device_ptr(&self.rope_cos, &self.stream).0;
+            let p_rope_sin   = DevicePtr::device_ptr(&self.rope_sin, &self.stream).0;
+            let p_output     = DevicePtr::device_ptr(&output_gpu, &self.stream).0;
+            let i_block_size = block_size as i32;
+            let i_max_ctx    = max_context_len as i32;
+
+            // smem: hidden_size * 4 + scratch (match attention needs)
+            let smem = std::cmp::max(
+                (hidden * 4 + 32) as u32,
+                (64 * head_dim * 4 + 8 * 64 * 4 + 32) as u32,
+            );
+
+            #[allow(clippy::cast_ptr_alignment)]
+            let mut args: [*mut c_void; 16] = [
+                &p_tape          as *const u64 as *mut c_void,
+                &num_instructions as *const i32 as *mut c_void,
+                &p_wptrs         as *const u64 as *mut c_void,
+                &p_scratch       as *const u64 as *mut c_void,
+                &p_sync          as *const u64 as *mut c_void,
+                &p_keys          as *const u64 as *mut c_void,
+                &p_vals          as *const u64 as *mut c_void,
+                &p_block_tables  as *const u64 as *mut c_void,
+                &p_context_lens  as *const u64 as *mut c_void,
+                &p_positions     as *const u64 as *mut c_void,
+                &p_slot_mapping  as *const u64 as *mut c_void,
+                &p_rope_cos      as *const u64 as *mut c_void,
+                &p_rope_sin      as *const u64 as *mut c_void,
+                &p_output        as *const u64 as *mut c_void,
+                &i_block_size    as *const i32 as *mut c_void,
+                &i_max_ctx       as *const i32 as *mut c_void,
+            ];
+
+            if smem > 49152 {
+                let cu_func = self.loader.get_cubin_func("megakernel_decode", "megakernel_decode_f16")?;
+                unsafe {
+                    cudarc::driver::sys::cuFuncSetAttribute(
+                        cu_func,
+                        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem as i32,
+                    ).result().map_err(|e| LLMError::GpuError(format!("mk smem attr: {e}")))?;
+                }
+            }
+
+            unsafe {
+                self.loader.launch_cubin_raw(
+                    "megakernel_decode",
+                    "megakernel_decode_f16",
+                    LaunchConfig {
+                        grid_dim: (256, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem,
+                    },
+                    &mut args,
+                )?;
+            }
+
+            // Read output token
+            let output_cpu: Vec<i32> = self.stream.clone_dtoh(&output_gpu)
+                .map_err(|e| LLMError::GpuError(format!("mk output dtoh: {e}")))?;
+
+            Ok(ForwardOutput::TokenIds(output_cpu))
         }
 
         /// Per-layer weight references into the GPU weight map.
