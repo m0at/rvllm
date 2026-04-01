@@ -24,7 +24,7 @@ thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-cudarc = { version = "0.19", features = ["driver"], optional = true }
+cudarc = { version = "0.12", features = ["driver", "cuda-12060"], optional = true }
 half = { version = "2", optional = true }
 
 [dev-dependencies]

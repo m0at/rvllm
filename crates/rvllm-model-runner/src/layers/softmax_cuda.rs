@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceSlice as _, LaunchAsync, LaunchConfig,
 };
 use tracing::trace;
 
@@ -35,7 +35,7 @@ const MAX_BLOCK_SIZE: u32 = 1024;
 /// re-loading overhead. Constructed once during model init, then reused
 /// for every forward pass.
 pub struct CudaSoftmax {
-    context: Arc<CudaContext>,
+    device: Arc<CudaDevice>,
     func: CudaFunction,
 }
 
@@ -45,22 +45,26 @@ impl CudaSoftmax {
     /// `ptx_bytes` should be the compiled PTX of `kernels/softmax.cu`.
     /// The caller can embed this at compile time or load from disk via
     /// `RVLLM_KERNEL_DIR`.
-    pub fn new(context: Arc<CudaContext>, ptx_bytes: &[u8]) -> Result<Self> {
+    pub fn new(device: Arc<CudaDevice>, ptx_bytes: &[u8]) -> Result<Self> {
         let ptx = std::str::from_utf8(ptx_bytes)
             .map_err(|e| LLMError::GpuError(format!("softmax PTX is not valid UTF-8: {e}")))?;
 
-        let module = context
-            .load_module(cudarc::nvrtc::Ptx::from_src(ptx))
+        device
+            .load_ptx(
+                cudarc::nvrtc::Ptx::from_src(ptx),
+                "softmax",
+                &["softmax_kernel"],
+            )
             .map_err(|e| LLMError::GpuError(format!("failed to load softmax PTX: {e}")))?;
 
-        let func = module
-            .load_function("softmax_kernel")
-            .map_err(|e| {
-                LLMError::GpuError(format!("softmax_kernel function not found in PTX module: {e}"))
+        let func = device
+            .get_func("softmax", "softmax_kernel")
+            .ok_or_else(|| {
+                LLMError::GpuError("softmax_kernel function not found in PTX module".into())
             })?;
 
         trace!("CudaSoftmax: loaded softmax_kernel");
-        Ok(Self { context, func })
+        Ok(Self { device, func })
     }
 
     /// Run softmax over `input` rows, returning a new output buffer.
@@ -77,7 +81,7 @@ impl CudaSoftmax {
         input: &CudaSlice<f32>,
         num_rows: usize,
         vocab_size: usize,
-        stream: &Arc<CudaStream>,
+        stream: &CudaStream,
     ) -> Result<CudaSlice<f32>> {
         let total = num_rows * vocab_size;
         if input.len() < total {
@@ -90,8 +94,14 @@ impl CudaSoftmax {
             )));
         }
 
+<<<<<<< Updated upstream
         // Safety: softmax kernel writes all total elements
         let output: CudaSlice<f32> = unsafe { stream.alloc(total) }
+=======
+        let output: CudaSlice<f32> = self
+            .device
+            .alloc_zeros(total)
+>>>>>>> Stashed changes
             .map_err(|e| LLMError::GpuError(format!("softmax output alloc failed: {e}")))?;
 
         self.launch(&output, input, num_rows, vocab_size, stream)?;
@@ -111,7 +121,7 @@ impl CudaSoftmax {
         data: &mut CudaSlice<f32>,
         num_rows: usize,
         vocab_size: usize,
-        stream: &Arc<CudaStream>,
+        stream: &CudaStream,
     ) -> Result<()> {
         let total = num_rows * vocab_size;
         if data.len() < total {
@@ -128,8 +138,8 @@ impl CudaSoftmax {
         let tmp = self.forward(data, num_rows, vocab_size, stream)?;
 
         // Device-to-device copy: tmp -> data.
-        stream
-            .memcpy_dtod(&tmp, data)
+        self.device
+            .dtod_copy(&tmp, data)
             .map_err(|e| LLMError::GpuError(format!("softmax d2d copy failed: {e}")))?;
 
         trace!(num_rows, vocab_size, "softmax inplace completed");
@@ -143,7 +153,7 @@ impl CudaSoftmax {
         input: &CudaSlice<f32>,
         num_rows: usize,
         vocab_size: usize,
-        stream: &Arc<CudaStream>,
+        stream: &CudaStream,
     ) -> Result<()> {
         let block_x = std::cmp::min(vocab_size as u32, MAX_BLOCK_SIZE);
         let cfg = LaunchConfig {
@@ -166,12 +176,9 @@ impl CudaSoftmax {
         //   stride loop expectations.
         // - `output` and `input` do not alias (separate CudaSlice allocations).
         unsafe {
-            stream
-                .launch_builder(&self.func)
-                .arg(output)
-                .arg(input)
-                .arg(&vocab_size_i32)
-                .launch(cfg)
+            self.func
+                .clone()
+                .launch_on_stream(stream, cfg, (output, input, vocab_size_i32))
                 .map_err(|e| LLMError::GpuError(format!("softmax kernel launch failed: {e}")))?;
         }
 
@@ -179,9 +186,9 @@ impl CudaSoftmax {
         Ok(())
     }
 
-    /// Returns a reference to the underlying CUDA context.
-    pub fn context(&self) -> &Arc<CudaContext> {
-        &self.context
+    /// Returns a reference to the underlying CUDA device.
+    pub fn device(&self) -> &Arc<CudaDevice> {
+        &self.device
     }
 }
 
@@ -193,7 +200,7 @@ mod tests {
     // Run with: cargo test -p rvllm-model-runner --features cuda -- softmax_cuda
     //
     // Test outline (requires GPU):
-    // 1. Create CudaContext
+    // 1. Create CudaDevice
     // 2. Load softmax.cu PTX (pre-compiled with nvcc --ptx)
     // 3. Upload known logits [e.g., [1,2,3], [0,0,0]] to GPU
     // 4. Call CudaSoftmax::forward

@@ -13,7 +13,7 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync, LaunchConfig};
     use tracing::trace;
 
     use rvllm_core::prelude::{LLMError, Result};
@@ -30,8 +30,7 @@ mod inner {
     /// Both `residual` (the writeback) and `output` (the normalized result)
     /// are returned so the caller can use the residual for the next add.
     pub fn fused_residual_rmsnorm(
-        stream: &Arc<CudaStream>,
-        kernel: &CudaFunction,
+        device: &Arc<CudaDevice>,
         input: &CudaSlice<f32>,
         add: &CudaSlice<f32>,
         weight: &CudaSlice<f32>,
@@ -41,10 +40,18 @@ mod inner {
     ) -> Result<(CudaSlice<f32>, CudaSlice<f32>)> {
         let n = num_tokens * hidden_size;
 
+<<<<<<< Updated upstream
         // Safety: kernel writes all n elements to both output and residual
         let output = unsafe { stream.alloc::<f32>(n) }
             .map_err(|e| LLMError::GpuError(format!("fused_res_rmsnorm output alloc: {e}")))?;
         let residual = unsafe { stream.alloc::<f32>(n) }
+=======
+        let output = device
+            .alloc_zeros::<f32>(n)
+            .map_err(|e| LLMError::GpuError(format!("fused_res_rmsnorm output alloc: {e}")))?;
+        let residual = device
+            .alloc_zeros::<f32>(n)
+>>>>>>> Stashed changes
             .map_err(|e| LLMError::GpuError(format!("fused_res_rmsnorm residual alloc: {e}")))?;
 
         let block_dim = hidden_size.min(1024) as u32;
@@ -55,20 +62,27 @@ mod inner {
             shared_mem_bytes: shared_mem,
         };
 
+        let kernel = device
+            .get_func("fused_residual_rmsnorm", "fused_residual_rmsnorm_kernel")
+            .ok_or_else(|| LLMError::GpuError("fused_residual_rmsnorm_kernel not loaded".into()))?;
+
         // SAFETY: All slices are valid device memory. Grid covers all tokens,
         // block covers hidden_size with stride loop. Shared memory is sized
         // for the reduction.
         unsafe {
-            stream
-                .launch_builder(kernel)
-                .arg(&output)
-                .arg(&residual)
-                .arg(input)
-                .arg(add)
-                .arg(weight)
-                .arg(&eps)
-                .arg(&(hidden_size as i32))
-                .launch(cfg)
+            kernel
+                .launch(
+                    cfg,
+                    (
+                        &output,
+                        &residual,
+                        input,
+                        add,
+                        weight,
+                        eps,
+                        hidden_size as i32,
+                    ),
+                )
                 .map_err(|e| LLMError::GpuError(format!("fused_residual_rmsnorm launch: {e}")))?;
         }
 
@@ -81,8 +95,7 @@ mod inner {
     ///
     /// The embed table stays on GPU; token IDs are uploaded once as i32.
     pub fn embedding_gather(
-        stream: &Arc<CudaStream>,
-        kernel: &CudaFunction,
+        device: &Arc<CudaDevice>,
         embed_table: &CudaSlice<f32>,
         token_ids: &[u32],
         hidden_size: usize,
@@ -91,14 +104,19 @@ mod inner {
         let num_tokens = token_ids.len();
         let output_len = num_tokens * hidden_size;
 
+<<<<<<< Updated upstream
         // Safety: embedding gather kernel writes all output_len elements
         let output = unsafe { stream.alloc::<f32>(output_len) }
+=======
+        let output = device
+            .alloc_zeros::<f32>(output_len)
+>>>>>>> Stashed changes
             .map_err(|e| LLMError::GpuError(format!("embed_gather output alloc: {e}")))?;
 
         // Upload token IDs (small transfer, typically < 4KB even for batch=1024)
         let token_ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
-        let token_ids_gpu = stream
-            .clone_htod(&token_ids_i32)
+        let token_ids_gpu = device
+            .htod_sync_copy(&token_ids_i32)
             .map_err(|e| LLMError::GpuError(format!("embed_gather token_ids upload: {e}")))?;
 
         let block_dim = hidden_size.min(1024) as u32;
@@ -108,18 +126,25 @@ mod inner {
             shared_mem_bytes: 0,
         };
 
+        let kernel = device
+            .get_func("embedding_gather", "embedding_gather_kernel")
+            .ok_or_else(|| LLMError::GpuError("embedding_gather_kernel not loaded".into()))?;
+
         // SAFETY: embed_table has vocab_size * hidden_size elements.
         // output has num_tokens * hidden_size elements. token_ids_gpu has
         // num_tokens elements. Grid covers all tokens.
         unsafe {
-            stream
-                .launch_builder(kernel)
-                .arg(&output)
-                .arg(embed_table)
-                .arg(&token_ids_gpu)
-                .arg(&(hidden_size as i32))
-                .arg(&(vocab_size as i32))
-                .launch(cfg)
+            kernel
+                .launch(
+                    cfg,
+                    (
+                        &output,
+                        embed_table,
+                        &token_ids_gpu,
+                        hidden_size as i32,
+                        vocab_size as i32,
+                    ),
+                )
                 .map_err(|e| LLMError::GpuError(format!("embedding_gather launch: {e}")))?;
         }
 
@@ -133,8 +158,7 @@ mod inner {
     ///
     /// Replaces the DtoH + CPU add + HtoD pattern in GpuWorker::add_bias_gpu.
     pub fn add_bias_gpu(
-        stream: &Arc<CudaStream>,
-        kernel: &CudaFunction,
+        device: &Arc<CudaDevice>,
         tensor: &mut CudaSlice<f32>,
         bias: &CudaSlice<f32>,
         num_tokens: usize,
@@ -147,14 +171,14 @@ mod inner {
             shared_mem_bytes: 0,
         };
 
+        let kernel = device
+            .get_func("add_bias", "add_bias_kernel")
+            .ok_or_else(|| LLMError::GpuError("add_bias_kernel not loaded".into()))?;
+
         // SAFETY: tensor has num_tokens * dim elements, bias has dim elements.
         unsafe {
-            stream
-                .launch_builder(kernel)
-                .arg(tensor)
-                .arg(bias)
-                .arg(&(dim as i32))
-                .launch(cfg)
+            kernel
+                .launch(cfg, (tensor, bias, dim as i32))
                 .map_err(|e| LLMError::GpuError(format!("add_bias launch: {e}")))?;
         }
 
@@ -166,14 +190,18 @@ mod inner {
     ///
     /// Replaces the DtoH + CPU add + HtoD pattern in GpuWorker::add_tensors_gpu.
     pub fn add_tensors_gpu(
-        stream: &Arc<CudaStream>,
-        kernel: &CudaFunction,
+        device: &Arc<CudaDevice>,
         a: &CudaSlice<f32>,
         b: &CudaSlice<f32>,
         n: usize,
     ) -> Result<CudaSlice<f32>> {
+<<<<<<< Updated upstream
         // Safety: add kernel writes all n elements
         let output = unsafe { stream.alloc::<f32>(n) }
+=======
+        let output = device
+            .alloc_zeros::<f32>(n)
+>>>>>>> Stashed changes
             .map_err(|e| LLMError::GpuError(format!("add_tensors alloc: {e}")))?;
 
         let threads = 256u32;
@@ -184,15 +212,14 @@ mod inner {
             shared_mem_bytes: 0,
         };
 
+        let kernel = device
+            .get_func("add_bias", "add_kernel")
+            .ok_or_else(|| LLMError::GpuError("add_kernel not loaded".into()))?;
+
         // SAFETY: a, b, output all have n elements.
         unsafe {
-            stream
-                .launch_builder(kernel)
-                .arg(&output)
-                .arg(a)
-                .arg(b)
-                .arg(&(n as i32))
-                .launch(cfg)
+            kernel
+                .launch(cfg, (&output, a, b, n as i32))
                 .map_err(|e| LLMError::GpuError(format!("add_kernel launch: {e}")))?;
         }
 
@@ -202,8 +229,7 @@ mod inner {
 
     /// In-place tensor addition on GPU: a += b.
     pub fn add_inplace_gpu(
-        stream: &Arc<CudaStream>,
-        kernel: &CudaFunction,
+        device: &Arc<CudaDevice>,
         a: &mut CudaSlice<f32>,
         b: &CudaSlice<f32>,
         n: usize,
@@ -216,14 +242,14 @@ mod inner {
             shared_mem_bytes: 0,
         };
 
+        let kernel = device
+            .get_func("add_bias", "add_inplace_kernel")
+            .ok_or_else(|| LLMError::GpuError("add_inplace_kernel not loaded".into()))?;
+
         // SAFETY: a and b both have n elements. Per-element operation, no aliasing.
         unsafe {
-            stream
-                .launch_builder(kernel)
-                .arg(a)
-                .arg(b)
-                .arg(&(n as i32))
-                .launch(cfg)
+            kernel
+                .launch(cfg, (a, b, n as i32))
                 .map_err(|e| LLMError::GpuError(format!("add_inplace launch: {e}")))?;
         }
 

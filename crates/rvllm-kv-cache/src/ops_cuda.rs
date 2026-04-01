@@ -10,24 +10,29 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync, LaunchConfig};
     use half::f16;
     use rvllm_core::prelude::{LLMError, Result};
     use tracing::debug;
 
+    const COPY_BLOCKS_MODULE: &str = "copy_blocks";
     const COPY_BLOCKS_FN: &str = "copy_blocks_kernel";
 
     fn map_cuda<E: std::fmt::Display>(context: &str) -> impl FnOnce(E) -> LLMError + '_ {
         move |e| LLMError::GpuError(format!("{context}: {e}"))
     }
 
-    /// Load the copy_blocks PTX module and return the kernel function.
+    /// Load the copy_blocks PTX module into the device if not already loaded.
     ///
     /// Reads pre-compiled PTX from the path specified by RVLLM_KERNEL_DIR
     /// env var (defaults to `kernels/` relative to the workspace root).
     /// Requires that `copy_blocks.ptx` has been compiled from `copy_blocks.cu`
     /// via `nvcc --ptx` or the build system (Agent 1 / Agent 20).
-    fn load_copy_blocks_func(context: &Arc<CudaContext>) -> Result<CudaFunction> {
+    fn ensure_copy_blocks_module(device: &Arc<CudaDevice>) -> Result<()> {
+        if device.has_func(COPY_BLOCKS_MODULE, COPY_BLOCKS_FN) {
+            return Ok(());
+        }
+
         let kernel_dir =
             std::env::var("RVLLM_KERNEL_DIR").unwrap_or_else(|_| "kernels".to_string());
         let ptx_path = std::path::Path::new(&kernel_dir).join("copy_blocks.ptx");
@@ -42,15 +47,11 @@ mod inner {
         let ptx = cudarc::nvrtc::compile_ptx(ptx_src)
             .map_err(|e| LLMError::GpuError(format!("failed to compile copy_blocks PTX: {e}")))?;
 
-        let module: Arc<CudaModule> = context
-            .load_module(ptx)
+        device
+            .load_ptx(ptx, COPY_BLOCKS_MODULE, &[COPY_BLOCKS_FN])
             .map_err(map_cuda("failed to load copy_blocks module"))?;
 
-        let func = module
-            .load_function(COPY_BLOCKS_FN)
-            .map_err(map_cuda("failed to load copy_blocks_kernel function"))?;
-
-        Ok(func)
+        Ok(())
     }
 
     /// Copy cache blocks on the GPU using the copy_blocks CUDA kernel.
@@ -69,14 +70,14 @@ mod inner {
         block_size: usize,
         num_heads: usize,
         head_dim: usize,
-        context: &Arc<CudaContext>,
-        stream: &Arc<CudaStream>,
+        device: &Arc<CudaDevice>,
+        stream: &CudaStream,
     ) -> Result<()> {
         if block_mapping.is_empty() {
             return Ok(());
         }
 
-        let func = load_copy_blocks_func(context)?;
+        ensure_copy_blocks_module(device)?;
 
         let num_pairs = block_mapping.len();
 
@@ -87,8 +88,8 @@ mod inner {
             flat_mapping.push(dst);
         }
 
-        let d_mapping = stream
-            .clone_htod(&flat_mapping)
+        let d_mapping = device
+            .htod_sync_copy(&flat_mapping)
             .map_err(map_cuda("copy_blocks: upload mapping"))?;
 
         let elems_per_block = block_size * num_heads * head_dim;
@@ -99,20 +100,29 @@ mod inner {
             shared_mem_bytes: 0,
         };
 
+        let func = device
+            .get_func(COPY_BLOCKS_MODULE, COPY_BLOCKS_FN)
+            .ok_or_else(|| {
+                LLMError::GpuError("copy_blocks_kernel not found after module load".into())
+            })?;
+
         // SAFETY: kernel signature matches copy_blocks_kernel(half*, half*, long*, int, int, int, int).
         // All device pointers come from valid CudaSlice allocations on the same device.
         unsafe {
-            stream
-                .launch_builder(&func)
-                .arg(key_cache)
-                .arg(value_cache)
-                .arg(&d_mapping)
-                .arg(&(num_pairs as i32))
-                .arg(&(block_size as i32))
-                .arg(&(num_heads as i32))
-                .arg(&(head_dim as i32))
-                .launch(cfg)
-                .map_err(map_cuda("copy_blocks: kernel launch"))?;
+            func.launch_on_stream(
+                stream,
+                cfg,
+                (
+                    key_cache,
+                    value_cache,
+                    &d_mapping,
+                    num_pairs as i32,
+                    block_size as i32,
+                    num_heads as i32,
+                    head_dim as i32,
+                ),
+            )
+            .map_err(map_cuda("copy_blocks: kernel launch"))?;
         }
 
         debug!(num_pairs, "copy_blocks_cuda complete");
@@ -133,7 +143,7 @@ mod inner {
         cpu_value: &[f16],
         mapping: &[(usize, usize)],
         elements_per_block: usize,
-        stream: &Arc<CudaStream>,
+        device: &Arc<CudaDevice>,
     ) -> Result<()> {
         if mapping.is_empty() {
             return Ok(());
@@ -141,11 +151,11 @@ mod inner {
 
         // Download current GPU state, patch mapped blocks from CPU, re-upload.
         // cudarc doesn't expose sub-slice async memcpy, so this is the safe path.
-        let mut key_host = stream
-            .clone_dtoh(gpu_key)
+        let mut key_host = device
+            .dtoh_sync_copy(gpu_key)
             .map_err(map_cuda("swap_in: dtoh key"))?;
-        let mut val_host = stream
-            .clone_dtoh(gpu_value)
+        let mut val_host = device
+            .dtoh_sync_copy(gpu_value)
             .map_err(map_cuda("swap_in: dtoh value"))?;
 
         for &(cpu_idx, gpu_idx) in mapping {
@@ -173,11 +183,11 @@ mod inner {
             val_host[gpu_off..gpu_end].copy_from_slice(&cpu_value[cpu_off..cpu_end]);
         }
 
-        stream
-            .memcpy_htod(&key_host, gpu_key)
+        device
+            .htod_sync_copy_into(&key_host, gpu_key)
             .map_err(map_cuda("swap_in: htod key"))?;
-        stream
-            .memcpy_htod(&val_host, gpu_value)
+        device
+            .htod_sync_copy_into(&val_host, gpu_value)
             .map_err(map_cuda("swap_in: htod value"))?;
 
         debug!(pairs = mapping.len(), "swap_in_cuda complete");
@@ -195,17 +205,17 @@ mod inner {
         cpu_value: &mut [f16],
         mapping: &[(usize, usize)],
         elements_per_block: usize,
-        stream: &Arc<CudaStream>,
+        device: &Arc<CudaDevice>,
     ) -> Result<()> {
         if mapping.is_empty() {
             return Ok(());
         }
 
-        let key_host = stream
-            .clone_dtoh(gpu_key)
+        let key_host = device
+            .dtoh_sync_copy(gpu_key)
             .map_err(map_cuda("swap_out: dtoh key"))?;
-        let val_host = stream
-            .clone_dtoh(gpu_value)
+        let val_host = device
+            .dtoh_sync_copy(gpu_value)
             .map_err(map_cuda("swap_out: dtoh value"))?;
 
         for &(gpu_idx, cpu_idx) in mapping {
@@ -258,7 +268,7 @@ mod inner {
         num_heads: usize,
         head_dim: usize,
         block_size: usize,
-        stream: &Arc<CudaStream>,
+        device: &Arc<CudaDevice>,
     ) -> Result<()> {
         let head_stride = num_heads * head_dim;
         let num_tokens = slot_mapping.len();
@@ -282,11 +292,11 @@ mod inner {
 
         let block_stride = block_size * head_stride;
 
-        let mut key_data = stream
-            .clone_dtoh(key_cache)
+        let mut key_data = device
+            .dtoh_sync_copy(key_cache)
             .map_err(map_cuda("reshape_and_cache: dtoh key"))?;
-        let mut val_data = stream
-            .clone_dtoh(value_cache)
+        let mut val_data = device
+            .dtoh_sync_copy(value_cache)
             .map_err(map_cuda("reshape_and_cache: dtoh value"))?;
 
         for (token_idx, &slot) in slot_mapping.iter().enumerate() {
@@ -315,173 +325,15 @@ mod inner {
                 .copy_from_slice(&value[src_offset..src_offset + head_stride]);
         }
 
-        stream
-            .memcpy_htod(&key_data, key_cache)
+        device
+            .htod_sync_copy_into(&key_data, key_cache)
             .map_err(map_cuda("reshape_and_cache: htod key"))?;
-        stream
-            .memcpy_htod(&val_data, value_cache)
+        device
+            .htod_sync_copy_into(&val_data, value_cache)
             .map_err(map_cuda("reshape_and_cache: htod value"))?;
 
         debug!(num_tokens, "reshape_and_cache_cuda complete");
         Ok(())
-    }
-
-    /// Reshape and scatter f16 key/value tokens into an FP8 paged cache.
-    ///
-    /// Quantizes f16 -> FP8 E4M3 on the host with per-head dynamic scaling,
-    /// then uploads the u8 data and f32 scales to the GPU.
-    ///
-    /// `key` and `value` are host-side f16 tensors `[num_tokens, num_heads * head_dim]`.
-    /// `slot_mapping` maps each token to a flat slot in the cache.
-    pub fn reshape_and_cache_fp8_cuda(
-        key: &[f16],
-        value: &[f16],
-        key_cache: &mut CudaSlice<u8>,
-        value_cache: &mut CudaSlice<u8>,
-        key_scales: &mut CudaSlice<f32>,
-        value_scales: &mut CudaSlice<f32>,
-        slot_mapping: &[i32],
-        num_heads: usize,
-        head_dim: usize,
-        block_size: usize,
-        stream: &Arc<CudaStream>,
-    ) -> Result<()> {
-        let head_stride = num_heads * head_dim;
-        let num_tokens = slot_mapping.len();
-
-        if key.len() != num_tokens * head_stride {
-            return Err(LLMError::MemoryError(format!(
-                "reshape_and_cache_fp8_cuda: key len {} != num_tokens({}) * head_stride({})",
-                key.len(), num_tokens, head_stride
-            )));
-        }
-        if value.len() != num_tokens * head_stride {
-            return Err(LLMError::MemoryError(format!(
-                "reshape_and_cache_fp8_cuda: value len {} != num_tokens({}) * head_stride({})",
-                value.len(), num_tokens, head_stride
-            )));
-        }
-
-        let data_block_stride = block_size * head_stride;
-        let scale_block_stride = block_size * num_heads;
-
-        let mut key_data = stream.clone_dtoh(key_cache)
-            .map_err(map_cuda("fp8 reshape dtoh key data"))?;
-        let mut val_data = stream.clone_dtoh(value_cache)
-            .map_err(map_cuda("fp8 reshape dtoh val data"))?;
-        let mut key_sc = stream.clone_dtoh(key_scales)
-            .map_err(map_cuda("fp8 reshape dtoh key scales"))?;
-        let mut val_sc = stream.clone_dtoh(value_scales)
-            .map_err(map_cuda("fp8 reshape dtoh val scales"))?;
-
-        for (token_idx, &slot) in slot_mapping.iter().enumerate() {
-            if slot < 0 { continue; }
-            let slot = slot as usize;
-            let block_idx = slot / block_size;
-            let block_offset = slot % block_size;
-
-            let data_off = block_idx * data_block_stride + block_offset * head_stride;
-            let scale_off = block_idx * scale_block_stride + block_offset * num_heads;
-            let src_off = token_idx * head_stride;
-
-            if data_off + head_stride > key_data.len() {
-                return Err(LLMError::MemoryError(format!(
-                    "reshape_and_cache_fp8_cuda: cache offset {} exceeds buffer len {}",
-                    data_off + head_stride, key_data.len()
-                )));
-            }
-
-            let key_f32: Vec<f32> = key[src_off..src_off + head_stride]
-                .iter().map(|v| v.to_f32()).collect();
-            let val_f32: Vec<f32> = value[src_off..src_off + head_stride]
-                .iter().map(|v| v.to_f32()).collect();
-
-            let (kq, ks) = crate::fp8_cache::quantize_heads(&key_f32, num_heads, head_dim);
-            let (vq, vs) = crate::fp8_cache::quantize_heads(&val_f32, num_heads, head_dim);
-
-            key_data[data_off..data_off + head_stride].copy_from_slice(&kq);
-            val_data[data_off..data_off + head_stride].copy_from_slice(&vq);
-            key_sc[scale_off..scale_off + num_heads].copy_from_slice(&ks);
-            val_sc[scale_off..scale_off + num_heads].copy_from_slice(&vs);
-        }
-
-        stream.memcpy_htod(&key_data, key_cache)
-            .map_err(map_cuda("fp8 reshape htod key data"))?;
-        stream.memcpy_htod(&val_data, value_cache)
-            .map_err(map_cuda("fp8 reshape htod val data"))?;
-        stream.memcpy_htod(&key_sc, key_scales)
-            .map_err(map_cuda("fp8 reshape htod key scales"))?;
-        stream.memcpy_htod(&val_sc, value_scales)
-            .map_err(map_cuda("fp8 reshape htod val scales"))?;
-
-        debug!(num_tokens, "reshape_and_cache_fp8_cuda complete");
-        Ok(())
-    }
-
-    /// Dequantize FP8 paged cache blocks back to f16 for attention.
-    ///
-    /// Reads `num_blocks` contiguous blocks starting at `start_block` from the
-    /// FP8 cache and writes dequantized f16 into `output_key` / `output_value`.
-    /// The output slices must be pre-allocated with the correct size.
-    pub fn dequantize_cache_blocks_cuda(
-        key_cache: &CudaSlice<u8>,
-        value_cache: &CudaSlice<u8>,
-        key_scales: &CudaSlice<f32>,
-        value_scales: &CudaSlice<f32>,
-        block_indices: &[usize],
-        num_heads: usize,
-        head_dim: usize,
-        block_size: usize,
-        stream: &Arc<CudaStream>,
-    ) -> Result<(Vec<f16>, Vec<f16>)> {
-        let head_stride = num_heads * head_dim;
-        let depb = block_size * head_stride;
-        let sepb = block_size * num_heads;
-
-        let key_data = stream.clone_dtoh(key_cache)
-            .map_err(map_cuda("fp8 deq dtoh key data"))?;
-        let val_data = stream.clone_dtoh(value_cache)
-            .map_err(map_cuda("fp8 deq dtoh val data"))?;
-        let key_sc = stream.clone_dtoh(key_scales)
-            .map_err(map_cuda("fp8 deq dtoh key scales"))?;
-        let val_sc = stream.clone_dtoh(value_scales)
-            .map_err(map_cuda("fp8 deq dtoh val scales"))?;
-
-        let total_elements = block_indices.len() * depb;
-        let mut out_key = vec![f16::ZERO; total_elements];
-        let mut out_val = vec![f16::ZERO; total_elements];
-
-        for (bi, &block_idx) in block_indices.iter().enumerate() {
-            let data_off = block_idx * depb;
-            let scale_off = block_idx * sepb;
-
-            for tok in 0..block_size {
-                let tok_data_off = data_off + tok * head_stride;
-                let tok_scale_off = scale_off + tok * num_heads;
-                let out_off = bi * depb + tok * head_stride;
-
-                let kf32 = crate::fp8_cache::dequantize_heads(
-                    &key_data[tok_data_off..tok_data_off + head_stride],
-                    &key_sc[tok_scale_off..tok_scale_off + num_heads],
-                    num_heads,
-                    head_dim,
-                );
-                let vf32 = crate::fp8_cache::dequantize_heads(
-                    &val_data[tok_data_off..tok_data_off + head_stride],
-                    &val_sc[tok_scale_off..tok_scale_off + num_heads],
-                    num_heads,
-                    head_dim,
-                );
-
-                for i in 0..head_stride {
-                    out_key[out_off + i] = f16::from_f32(kf32[i]);
-                    out_val[out_off + i] = f16::from_f32(vf32[i]);
-                }
-            }
-        }
-
-        debug!(num_blocks = block_indices.len(), "dequantize_cache_blocks_cuda complete");
-        Ok((out_key, out_val))
     }
 
     /// High-level cache ops handle bundling device reference with cache geometry.
@@ -490,8 +342,7 @@ mod inner {
     /// and engine layers to call cache operations without threading geometry
     /// parameters through every call.
     pub struct CudaCacheOps {
-        context: Arc<CudaContext>,
-        stream: Arc<CudaStream>,
+        device: Arc<CudaDevice>,
         num_heads: usize,
         head_dim: usize,
         block_size: usize,
@@ -499,15 +350,13 @@ mod inner {
 
     impl CudaCacheOps {
         pub fn new(
-            context: Arc<CudaContext>,
-            stream: Arc<CudaStream>,
+            device: Arc<CudaDevice>,
             num_heads: usize,
             head_dim: usize,
             block_size: usize,
         ) -> Self {
             Self {
-                context,
-                stream,
+                device,
                 num_heads,
                 head_dim,
                 block_size,
@@ -518,12 +367,8 @@ mod inner {
             self.block_size * self.num_heads * self.head_dim
         }
 
-        pub fn context(&self) -> &Arc<CudaContext> {
-            &self.context
-        }
-
-        pub fn stream(&self) -> &Arc<CudaStream> {
-            &self.stream
+        pub fn device(&self) -> &Arc<CudaDevice> {
+            &self.device
         }
 
         /// Copy blocks within GPU cache using the CUDA copy_blocks kernel.
@@ -532,6 +377,7 @@ mod inner {
             key_cache: &mut CudaSlice<f16>,
             value_cache: &mut CudaSlice<f16>,
             block_mapping: &[(i64, i64)],
+            stream: &CudaStream,
         ) -> Result<()> {
             copy_blocks_cuda(
                 key_cache,
@@ -540,8 +386,8 @@ mod inner {
                 self.block_size,
                 self.num_heads,
                 self.head_dim,
-                &self.context,
-                &self.stream,
+                &self.device,
+                stream,
             )
         }
 
@@ -561,7 +407,7 @@ mod inner {
                 cpu_value,
                 mapping,
                 self.elements_per_block(),
-                &self.stream,
+                &self.device,
             )
         }
 
@@ -581,7 +427,7 @@ mod inner {
                 cpu_value,
                 mapping,
                 self.elements_per_block(),
-                &self.stream,
+                &self.device,
             )
         }
 
@@ -603,55 +449,7 @@ mod inner {
                 self.num_heads,
                 self.head_dim,
                 self.block_size,
-                &self.stream,
-            )
-        }
-
-        /// Reshape and scatter f16 key/value tokens into FP8 paged cache buffers.
-        pub fn reshape_and_cache_fp8(
-            &self,
-            key: &[f16],
-            value: &[f16],
-            key_cache: &mut CudaSlice<u8>,
-            value_cache: &mut CudaSlice<u8>,
-            key_scales: &mut CudaSlice<f32>,
-            value_scales: &mut CudaSlice<f32>,
-            slot_mapping: &[i32],
-        ) -> Result<()> {
-            reshape_and_cache_fp8_cuda(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                key_scales,
-                value_scales,
-                slot_mapping,
-                self.num_heads,
-                self.head_dim,
-                self.block_size,
-                &self.stream,
-            )
-        }
-
-        /// Dequantize FP8 cache blocks back to f16 for attention.
-        pub fn dequantize_cache_blocks(
-            &self,
-            key_cache: &CudaSlice<u8>,
-            value_cache: &CudaSlice<u8>,
-            key_scales: &CudaSlice<f32>,
-            value_scales: &CudaSlice<f32>,
-            block_indices: &[usize],
-        ) -> Result<(Vec<f16>, Vec<f16>)> {
-            dequantize_cache_blocks_cuda(
-                key_cache,
-                value_cache,
-                key_scales,
-                value_scales,
-                block_indices,
-                self.num_heads,
-                self.head_dim,
-                self.block_size,
-                &self.stream,
+                &self.device,
             )
         }
     }

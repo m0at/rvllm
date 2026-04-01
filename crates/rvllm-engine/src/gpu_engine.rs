@@ -22,11 +22,8 @@ mod inner {
     };
     use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus};
     use rvllm_tokenizer::Tokenizer;
-    use rvllm_worker::gpu_worker::{GpuWorker, GpuWorkerOutput};
+    use rvllm_worker::gpu_worker::GpuWorker;
 
-    use rvllm_speculative::{SelfDraftModel, SpeculativeConfig, SpeculativeEngine, TargetModel};
-
-    use crate::hf_snapshot;
     use crate::output::{OutputProcessor, SequenceOutputState};
 
     // ------------------------------------------------------------------
@@ -47,14 +44,88 @@ mod inner {
         architecture: String,
         rope_theta: f32,
         partial_rotary_factor: f32,
-        head_dim: usize,
         attn_logit_softcapping: f32,
         num_local_experts: usize,
         num_experts_per_tok: usize,
+        /// Per-layer type: "full_attention" or "linear_attention" (Qwen3.5 hybrid).
+        /// Empty for standard transformer models.
+        layer_types: Vec<String>,
+        /// Explicit head_dim override (Qwen3.5 uses 256 which differs from hidden/heads).
+        head_dim_override: Option<usize>,
+        /// Qwen3.5: q_proj produces 2x head_dim (query + output gate).
+        has_attn_output_gate: bool,
+        /// Quantization method from config.json (e.g. "fp8"). Empty if unquantized.
+        quantization_method: String,
     }
 
     fn resolve_model_dir(model_name: &str) -> Result<PathBuf> {
-        hf_snapshot::ensure_snapshot(model_name)
+        let path = Path::new(model_name);
+        if path.is_dir() {
+            return Ok(path.to_path_buf());
+        }
+
+        // Look in HF cache
+        let cache_dir = dirs_hf_cache();
+        let repo_dir_name = format!("models--{}", model_name.replace('/', "--"));
+        let repo_path = cache_dir.join(&repo_dir_name).join("snapshots");
+
+        if repo_path.is_dir() {
+            // Find the first snapshot
+            if let Ok(entries) = std::fs::read_dir(&repo_path) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let snap_path = entry.path();
+                    if snap_path.is_dir() {
+                        // Check for config.json
+                        if snap_path.join("config.json").exists() {
+                            info!(path = %snap_path.display(), "found model in HF cache");
+                            return Ok(snap_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try downloading via hf-hub
+        info!(model = model_name, "downloading model from HuggingFace");
+        let api = hf_hub::api::sync::Api::new()
+            .map_err(|e| LLMError::ModelError(format!("failed to init hf-hub: {e}")))?;
+        let repo = api.model(model_name.to_string());
+
+        // Download config.json and model files
+        let _config_path = repo
+            .get("config.json")
+            .map_err(|e| LLMError::ModelError(format!("failed to download config.json: {e}")))?;
+        let _model_path = repo.get("model.safetensors").map_err(|e| {
+            LLMError::ModelError(format!("failed to download model.safetensors: {e}"))
+        })?;
+
+        // Re-check cache after download
+        if repo_path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&repo_path) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let snap_path = entry.path();
+                    if snap_path.is_dir() && snap_path.join("config.json").exists() {
+                        return Ok(snap_path);
+                    }
+                }
+            }
+        }
+
+        Err(LLMError::ModelError(format!(
+            "could not resolve model directory for '{}'",
+            model_name
+        )))
+    }
+
+    fn dirs_hf_cache() -> PathBuf {
+        if let Ok(cache) = std::env::var("HF_HOME") {
+            return PathBuf::from(cache).join("hub");
+        }
+        if let Ok(cache) = std::env::var("HUGGINGFACE_HUB_CACHE") {
+            return PathBuf::from(cache);
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        PathBuf::from(home).join(".cache/huggingface/hub")
     }
 
     fn read_model_config(model_dir: &Path) -> Result<HfModelConfig> {
@@ -65,21 +136,19 @@ mod inner {
         let json: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| LLMError::ModelError(format!("invalid config.json: {e}")))?;
 
-        // Models like Qwen3.5 nest their parameters under "text_config".
-        // Try text_config first, fall back to top-level.
-        let text_json = json.get("text_config").unwrap_or(&json);
+        // For VLM models (Qwen3.5), config values live under text_config.
+        // Fall back to top-level for standard models.
+        let text_cfg = json.get("text_config").unwrap_or(&json);
 
         let get_usize = |key: &str, default: usize| -> usize {
-            text_json
-                .get(key)
+            text_cfg.get(key)
                 .or_else(|| json.get(key))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
                 .unwrap_or(default)
         };
         let get_f32 = |key: &str, default: f32| -> f32 {
-            text_json
-                .get(key)
+            text_cfg.get(key)
                 .or_else(|| json.get(key))
                 .and_then(|v| v.as_f64())
                 .map(|v| v as f32)
@@ -88,7 +157,12 @@ mod inner {
 
         let hidden_size = get_usize("hidden_size", 4096);
         let num_attention_heads = get_usize("num_attention_heads", 32);
-        let head_dim = get_usize("head_dim", hidden_size / num_attention_heads);
+
+        // Explicit head_dim (Qwen3.5 uses 256 which != hidden/heads)
+        let head_dim_override = text_cfg.get("head_dim")
+            .or_else(|| json.get("head_dim"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         let architecture = json
             .get("architectures")
@@ -98,25 +172,19 @@ mod inner {
             .unwrap_or("LlamaForCausalLM")
             .to_string();
 
-        let tie_word_embeddings = text_json
-            .get("tie_word_embeddings")
-            .or_else(|| json.get("tie_word_embeddings"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Parse layer_types for hybrid models (Qwen3.5)
+        let layer_types: Vec<String> = text_cfg.get("layer_types")
+            .or_else(|| json.get("layer_types"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
 
-        let rope_theta = text_json
-            .get("rope_parameters")
-            .and_then(|v| v.get("rope_theta"))
+        // Get rope_theta from rope_parameters if present (Qwen3.5)
+        let rope_theta = text_cfg.get("rope_parameters")
+            .and_then(|rp| rp.get("rope_theta"))
             .and_then(|v| v.as_f64())
             .map(|v| v as f32)
             .unwrap_or_else(|| get_f32("rope_theta", 10000.0));
-
-        let partial_rotary_factor = text_json
-            .get("rope_parameters")
-            .and_then(|v| v.get("partial_rotary_factor"))
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32)
-            .unwrap_or_else(|| get_f32("partial_rotary_factor", 1.0));
 
         Ok(HfModelConfig {
             hidden_size,
@@ -126,14 +194,31 @@ mod inner {
             num_hidden_layers: get_usize("num_hidden_layers", 32),
             vocab_size: get_usize("vocab_size", 32000),
             rms_norm_eps: get_f32("rms_norm_eps", 1e-5),
-            tie_word_embeddings,
+            tie_word_embeddings: json
+                .get("tie_word_embeddings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             architecture,
             rope_theta,
-            partial_rotary_factor,
-            head_dim,
+            partial_rotary_factor: text_cfg.get("rope_parameters")
+                .and_then(|rp| rp.get("partial_rotary_factor"))
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or_else(|| get_f32("partial_rotary_factor", 1.0)),
             attn_logit_softcapping: get_f32("attn_logit_softcapping", 0.0),
             num_local_experts: get_usize("num_local_experts", 0),
             num_experts_per_tok: get_usize("num_experts_per_tok", 0),
+            layer_types,
+            head_dim_override,
+            has_attn_output_gate: text_cfg.get("attn_output_gate")
+                .or_else(|| json.get("attn_output_gate"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            quantization_method: json.get("quantization_config")
+                .and_then(|qc| qc.get("quant_method"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
         })
     }
 
@@ -312,28 +397,13 @@ mod inner {
     // GpuLLMEngine
     // ------------------------------------------------------------------
 
-    /// Shared request queue for async overlap. The async engine pushes
-    /// new requests here; the GPU engine drains them during GPU wait.
-    pub type RequestQueue = std::sync::Arc<std::sync::Mutex<Vec<PendingRequest>>>;
-
-    /// Shared abort queue. The async engine pushes request IDs to abort
-    /// here; the GPU engine drains them at the start of each step.
-    pub type AbortQueue = std::sync::Arc<std::sync::Mutex<Vec<RequestId>>>;
-
-    /// A request buffered for async processing.
-    pub struct PendingRequest {
-        pub request_id: RequestId,
-        pub prompt: String,
-        pub params: SamplingParams,
-    }
-
     pub struct GpuLLMEngine {
         config: EngineConfig,
         scheduler: FifoScheduler,
         worker: GpuWorker,
         tokenizer: Tokenizer,
         requests: HashMap<RequestId, EngineRequest>,
-        next_request_id: std::sync::Arc<AtomicU64>,
+        next_request_id: AtomicU64,
         next_seq_id: u64,
         prefix_cache: Option<PrefixCache>,
         /// Total number of GPU KV-cache blocks available.
@@ -344,18 +414,6 @@ mod inner {
         free_blocks: Vec<u32>,
         /// Per-sequence block tables that persist across step() calls.
         seq_block_tables: HashMap<SequenceId, Vec<BlockId>>,
-        /// Shared queue for new requests arriving during GPU compute.
-        request_queue: Option<RequestQueue>,
-        /// Shared queue for abort requests arriving during GPU compute.
-        abort_queue: Option<AbortQueue>,
-    }
-
-    /// Pending state from step_launch, consumed by step_collect.
-    pub struct StepPending {
-        pub scheduled_groups: Vec<SequenceGroup>,
-        pub metadata: Vec<SequenceGroupMetadata>,
-        /// Async batch size from execute_launch (Some = async DtoH pending).
-        pub actual_batch: Option<usize>,
     }
 
     impl GpuLLMEngine {
@@ -377,16 +435,36 @@ mod inner {
                 kv_heads = hf_config.num_key_value_heads,
                 vocab = hf_config.vocab_size,
                 intermediate = hf_config.intermediate_size,
+                attn_output_gate = hf_config.has_attn_output_gate,
+                partial_rotary = hf_config.partial_rotary_factor,
                 "model config loaded"
             );
 
-            let head_dim = hf_config.head_dim;
+            let head_dim = hf_config.head_dim_override
+                .unwrap_or(hf_config.hidden_size / hf_config.num_attention_heads);
 
             // 3. Tokenizer
             let tokenizer_path = config.model.tokenizer_path.as_deref().unwrap_or(model_name);
             let tokenizer = Tokenizer::from_pretrained(tokenizer_path)?;
 
             // 4. Build WorkerConfig from real model config
+            // Auto-detect quantization from quantization_config when dtype is auto
+            let model_dtype = if config.model.dtype.is_auto() {
+                match hf_config.quantization_method.as_str() {
+                    "fp8" => {
+                        info!("auto-detected FP8 model from quantization_config");
+                        rvllm_core::types::Dtype::Float8E4M3
+                    }
+                    "gptq" => {
+                        info!("auto-detected GPTQ INT4 model from quantization_config");
+                        rvllm_core::types::Dtype::GptqInt4
+                    }
+                    _ => config.model.dtype,
+                }
+            } else {
+                config.model.dtype
+            };
+
             let worker_config = rvllm_worker::WorkerConfig {
                 device_id: 0,
                 num_layers: hf_config.num_hidden_layers,
@@ -403,8 +481,7 @@ mod inner {
                 tensor_parallel_size: config.parallel.tensor_parallel_size,
                 pipeline_parallel_size: config.parallel.pipeline_parallel_size,
                 architecture: hf_config.architecture.clone(),
-                dtype: config.model.dtype,
-                rms_norm_eps: hf_config.rms_norm_eps,
+                dtype: model_dtype,
                 rope_theta: hf_config.rope_theta,
                 partial_rotary_factor: hf_config.partial_rotary_factor,
                 attn_logit_softcapping: hf_config.attn_logit_softcapping,
@@ -412,6 +489,9 @@ mod inner {
                 num_experts_per_tok: hf_config.num_experts_per_tok,
                 kv_cache_dtype: config.cache.kv_cache_dtype.clone(),
                 enable_prefix_caching: config.cache.enable_prefix_caching,
+                layer_types: hf_config.layer_types.clone(),
+                has_attn_output_gate: hf_config.has_attn_output_gate,
+                rms_norm_eps: hf_config.rms_norm_eps,
             };
 
             // 5. Create GPU worker
@@ -446,15 +526,11 @@ mod inner {
                 None
             };
 
-            let spec_enabled = Self::speculative_enabled();
-            let fp8_kv = worker.use_fp8_kv();
             info!(
                 num_gpu_blocks,
                 num_cpu_blocks,
                 block_size = config.cache.block_size,
                 max_num_seqs = config.scheduler.max_num_seqs,
-                fp8_kv,
-                speculative = spec_enabled,
                 "GpuLLMEngine: ready for inference"
             );
             Ok(Self {
@@ -463,15 +539,13 @@ mod inner {
                 worker,
                 tokenizer,
                 requests: HashMap::new(),
-                next_request_id: std::sync::Arc::new(AtomicU64::new(1)),
+                next_request_id: AtomicU64::new(1),
                 next_seq_id: 0,
                 prefix_cache,
                 num_gpu_blocks: num_gpu_blocks as u32,
                 next_block_id: 0,
                 free_blocks: Vec::new(),
                 seq_block_tables: HashMap::new(),
-                request_queue: None,
-                abort_queue: None,
             })
         }
 
@@ -558,15 +632,32 @@ mod inner {
             }
         }
 
-        /// Launch GPU work for one step. Returns pending state if work was
-        /// launched, None if nothing to schedule. GPU computes asynchronously
-        /// after this returns (~60us for graph replay path).
-        pub fn step_launch(&mut self) -> Result<Option<StepPending>> {
-            let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
-                Some(v) => v,
-                None => return Ok(None),
-            };
+        pub fn step(&mut self) -> Result<Vec<RequestOutput>> {
+            debug!("GpuLLMEngine: step begin");
 
+            // Tell the scheduler how many blocks are available so it can gate
+            // admission of new sequences from the waiting queue.
+            let free_count = self.free_blocks.len()
+                + (self.num_gpu_blocks.saturating_sub(self.next_block_id)) as usize;
+            // Watermark: keep 4% of total blocks free so running sequences can
+            // grow into new blocks during decode without hitting OOM.
+            let watermark = (self.num_gpu_blocks as usize / 25).max(1);
+            self.scheduler.set_block_budget(free_count, watermark);
+
+            let (scheduled_groups, num_tokens) = self.scheduler.schedule();
+            debug!(
+                num_groups = scheduled_groups.len(),
+                num_tokens, "scheduler output"
+            );
+
+            if scheduled_groups.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let (metadata, aborted_seqs) = self.build_metadata(&scheduled_groups);
+
+            // Propagate block-allocation aborts to request output states so
+            // finished-request cleanup picks them up.
             if !aborted_seqs.is_empty() {
                 for group in &scheduled_groups {
                     for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
@@ -581,26 +672,13 @@ mod inner {
                 }
             }
 
-            // Launch worker (returns quickly for async graph replay path)
-            let actual_batch = self.worker.execute_launch(&metadata)
-                .map_err(|e| LLMError::GpuError(format!("worker launch failed: {e}")))?;
+            if metadata.is_empty() {
+                return Ok(Vec::new());
+            }
 
-            Ok(Some(StepPending { scheduled_groups, metadata, actual_batch }))
-        }
-
-        /// Collect GPU results and process outputs. Call after step_launch.
-        /// If pending is None, returns empty (nothing was launched).
-        pub fn step_collect(&mut self, pending: Option<StepPending>) -> Result<Vec<RequestOutput>> {
-            let pending = match pending {
-                Some(p) => p,
-                None => return Ok(Vec::new()),
-            };
-
-            let worker_outputs = self.worker.execute_collect(pending.actual_batch, &pending.metadata)
-                .map_err(|e| LLMError::GpuError(format!("worker collect failed: {e}")))?;
-
-            // Prefix caching
+            // Prefix caching: before prefill, check for matching prefix blocks
             if let Some(ref mut pc) = self.prefix_cache {
+<<<<<<< Updated upstream
                 let block_size = self.config.cache.block_size;
                 for meta in &pending.metadata {
                     if meta.is_prompt {
@@ -749,12 +827,31 @@ mod inner {
                                 if let Some(state) = req.seq_states.get_mut(seq_idx) {
                                     state.finish_reason = Some(FinishReason::Abort);
                                 }
+=======
+                for meta in &metadata {
+                    if meta.is_prompt {
+                        for (_seq_id, seq_data) in &meta.seq_data {
+                            let hits = pc.count_hits(&seq_data.prompt_token_ids);
+                            if hits > 0 {
+                                let block_size = self.config.cache.block_size;
+                                let cached_tokens = hits * block_size;
+                                debug!(
+                                    hits,
+                                    cached_tokens,
+                                    prompt_len = seq_data.prompt_token_ids.len(),
+                                    "prefix cache hit: reusing cached KV blocks"
+                                );
+>>>>>>> Stashed changes
                             }
                         }
                     }
                 }
             }
 
+            trace!(
+                num_groups = metadata.len(),
+                "gpu_engine: calling worker.execute"
+            );
             let worker_outputs = self
                 .worker
                 .execute(&metadata)
@@ -764,7 +861,7 @@ mod inner {
                 "gpu_engine: worker.execute returned"
             );
 
-            // Prefix caching: after prefill, register new prefix blocks.
+            // Prefix caching: after prefill, register new prefix blocks
             if let Some(ref mut pc) = self.prefix_cache {
                 let block_size = self.config.cache.block_size;
                 for meta in &metadata {
@@ -791,104 +888,19 @@ mod inner {
                 }
             }
 
-            let results = self.process_worker_outputs(&scheduled_groups, &worker_outputs);
-            self.recycle_dead_blocks();
-
-            debug!(num_outputs = results.len(), "GpuLLMEngine: step complete");
-            Ok(results)
-        }
-
-        pub fn run(&mut self) -> Result<Vec<RequestOutput>> {
-            info!("GpuLLMEngine: run loop starting");
-            let mut all_outputs = Vec::new();
-            while self.has_unfinished() {
-                let results = self.step()?;
-                for output in results {
-                    if output.finished {
-                        all_outputs.push(output);
-                    }
-                }
-            }
-            info!(num_completed = all_outputs.len(), "GpuLLMEngine: run loop finished");
-            Ok(all_outputs)
-        }
-
-        /// Prepare one step: schedule, build metadata, handle prefix cache lookups.
-        /// Returns None if there's nothing to schedule.
-        fn prepare_step(
-            &mut self,
-        ) -> Option<(
-            Vec<SequenceGroup>,
-            Vec<SequenceGroupMetadata>,
-            std::collections::HashSet<SequenceId>,
-        )> {
-            let free_count = self.free_blocks.len()
-                + (self.num_gpu_blocks.saturating_sub(self.next_block_id)) as usize;
-            let watermark = (self.num_gpu_blocks as usize / 25).max(1);
-            self.scheduler.set_block_budget(free_count, watermark);
-
-            let (scheduled_groups, num_tokens) = self.scheduler.schedule();
-            debug!(
-                num_groups = scheduled_groups.len(),
-                num_tokens, "pipelined scheduler output"
-            );
-            if scheduled_groups.is_empty() {
-                return None;
-            }
-
-            let (metadata, aborted_seqs) = self.build_metadata(&scheduled_groups);
-            if metadata.is_empty() {
-                return None;
-            }
-
-            // Prefix caching: check for matching prefix blocks before prefill.
-            if let Some(ref mut pc) = self.prefix_cache {
-                for meta in &metadata {
-                    if meta.is_prompt {
-                        for (_seq_id, seq_data) in &meta.seq_data {
-                            let hits = pc.count_hits(&seq_data.prompt_token_ids);
-                            if hits > 0 {
-                                let block_size = self.config.cache.block_size;
-                                let cached_tokens = hits * block_size;
-                                debug!(
-                                    hits,
-                                    cached_tokens,
-                                    prompt_len = seq_data.prompt_token_ids.len(),
-                                    "prefix cache hit: reusing cached KV blocks"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            trace!(
-                num_groups = metadata.len(),
-                "pipelined: submitting to GPU thread"
-            );
-            Some((scheduled_groups, metadata, aborted_seqs))
-        }
-
-        /// Process worker outputs: update scheduler, build request outputs,
-        /// clean up finished requests.
-        fn process_worker_outputs(
-            &mut self,
-            scheduled_groups: &[SequenceGroup],
-            worker_outputs: &GpuWorkerOutput,
-        ) -> Vec<RequestOutput> {
-            let mut output_map: HashMap<u64, (TokenId, LogProb, &[(TokenId, LogProb)])> =
-                HashMap::with_capacity(worker_outputs.outputs.len());
+            let mut output_map: HashMap<u64, (TokenId, LogProb, Vec<(TokenId, LogProb)>)> =
+                HashMap::new();
             for wo in &worker_outputs.outputs {
                 output_map.insert(
                     wo.seq_id,
-                    (wo.token_id, wo.logprob, &wo.top_logprobs),
+                    (wo.token_id, wo.logprob, wo.top_logprobs.clone()),
                 );
             }
 
-            let mut results = Vec::with_capacity(scheduled_groups.len());
+            let mut results = Vec::new();
             let eos = self.tokenizer.eos_token_id();
 
-            for group in scheduled_groups {
+            for group in &scheduled_groups {
                 let request_id = group.request_id;
                 let req = match self.requests.get_mut(&request_id) {
                     Some(r) => r,
@@ -898,29 +910,20 @@ mod inner {
                 let logprobs_requested =
                     req.sampling_params.logprobs.map(|n| n > 0).unwrap_or(false);
 
-                // Only decode token text when stop_strings require it;
-                // EOS and max_tokens checks only need token IDs.
-                let needs_text = !req.sampling_params.stop_strings.is_empty();
-
                 for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
                     if seq.is_finished() {
                         continue;
                     }
 
                     if let Some((token_id, logprob, top_lps)) = output_map.get(&seq.seq_id.0) {
-                        // Defer tokenizer.decode() when no stop_strings are configured.
-                        // For greedy decode the token ID is sufficient for the scheduler;
-                        // full text is reconstructed when the response is sent to the client.
-                        let decoded = if needs_text {
-                            self.tokenizer.decode(&[*token_id]).unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
+                        let decoded = self.tokenizer.decode(&[*token_id]).unwrap_or_default();
+
+                        // Update the scheduler's sequence with the new token
                         self.scheduler
                             .update_seq_token(seq.seq_id, *token_id, *logprob);
 
                         let top_logprobs = if logprobs_requested && !top_lps.is_empty() {
-                            Some(top_lps.to_vec())
+                            Some(top_lps.clone())
                         } else {
                             None
                         };
@@ -935,6 +938,8 @@ mod inner {
                                 &req.sampling_params,
                                 eos,
                             );
+                            // Sync finish status back to the scheduler so
+                            // schedule() purges the group and blocks get recycled.
                             if let Some(reason) = state.finish_reason {
                                 let status = match reason {
                                     FinishReason::Stop => SequenceStatus::FinishedStopped,
@@ -942,23 +947,6 @@ mod inner {
                                     FinishReason::Abort => SequenceStatus::FinishedAborted,
                                 };
                                 self.scheduler.finish_seq(seq.seq_id, status);
-                            }
-                        }
-                    }
-                }
-
-                // Lazy text reconstruction: when decode was deferred (no stop_strings),
-                // batch-decode accumulated token_ids into text for finished sequences
-                // or for any output that will be returned to the client.
-                if !needs_text {
-                    let all_finished = req.seq_states.iter().all(|s| s.is_finished());
-                    if all_finished {
-                        for state in &mut req.seq_states {
-                            if !state.token_ids.is_empty() && state.text.is_empty() {
-                                state.text = self
-                                    .tokenizer
-                                    .decode(&state.token_ids)
-                                    .unwrap_or_default();
                             }
                         }
                     }
@@ -973,7 +961,7 @@ mod inner {
                 results.push(output);
             }
 
-            // Clean up finished requests.
+            // Clean up finished requests
             let finished_ids: Vec<RequestId> = self
                 .requests
                 .iter()
@@ -984,38 +972,49 @@ mod inner {
                 self.requests.remove(id);
                 self.scheduler.abort_seq_group(id);
             }
-
-            results
-        }
-
-        /// Recycle KV cache blocks from sequences no longer tracked by scheduler.
-        fn recycle_dead_blocks(&mut self) {
-            let live_seq_ids: std::collections::HashSet<SequenceId> =
-                self.scheduler.live_seq_ids();
-            let dead_sids: Vec<SequenceId> = self
-                .seq_block_tables
-                .keys()
-                .filter(|sid| !live_seq_ids.contains(sid))
-                .copied()
-                .collect();
-            for sid in dead_sids {
-                if let Some(blocks) = self.seq_block_tables.remove(&sid) {
-                    debug!(
-                        seq_id = sid.0,
-                        num_blocks = blocks.len(),
-                        "recycling blocks from finished sequence"
-                    );
-                    for b in blocks {
-                        self.free_blocks.push(b.0);
+            // Recycle blocks from dead sequences every step, not just when
+            // requests finish.  With continuous batching there are always
+            // unfinished seqs, so gating on finished_ids caused blocks to
+            // leak and next_block_id to grow past num_gpu_blocks.
+            {
+                let live_seq_ids: std::collections::HashSet<SequenceId> =
+                    self.scheduler.live_seq_ids();
+                let dead_sids: Vec<SequenceId> = self
+                    .seq_block_tables
+                    .keys()
+                    .filter(|sid| !live_seq_ids.contains(sid))
+                    .copied()
+                    .collect();
+                for sid in dead_sids {
+                    if let Some(blocks) = self.seq_block_tables.remove(&sid) {
+                        debug!(seq_id = sid.0, num_blocks = blocks.len(), "recycling blocks from finished sequence");
+                        for b in blocks {
+                            self.free_blocks.push(b.0);
+                        }
                     }
                 }
             }
+
+            debug!(num_outputs = results.len(), "GpuLLMEngine: step complete");
+            Ok(results)
         }
 
-        /// Check for unfinished sequences (scheduler-side only, doesn't
-        /// account for in-flight GPU work).
-        fn has_unfinished_excluding_worker(&self) -> bool {
-            self.scheduler.has_unfinished_seqs() || !self.requests.is_empty()
+        pub fn run(&mut self) -> Result<Vec<RequestOutput>> {
+            info!("GpuLLMEngine: run loop starting");
+            let mut all_outputs = Vec::new();
+            while self.has_unfinished() {
+                let step_outputs = self.step()?;
+                for output in step_outputs {
+                    if output.finished {
+                        all_outputs.push(output);
+                    }
+                }
+            }
+            info!(
+                num_completed = all_outputs.len(),
+                "GpuLLMEngine: run loop finished"
+            );
+            Ok(all_outputs)
         }
 
         pub fn has_unfinished(&self) -> bool {
@@ -1028,11 +1027,6 @@ mod inner {
 
         pub fn config(&self) -> &EngineConfig {
             &self.config
-        }
-
-        /// Get a shared handle to the request ID counter (for async-side ID assignment).
-        pub fn request_id_counter(&self) -> std::sync::Arc<AtomicU64> {
-            self.next_request_id.clone()
         }
 
         /// Build per-group metadata with block allocation.  Returns the
@@ -1127,443 +1121,7 @@ mod inner {
     }
 
     unsafe impl Send for GpuLLMEngine {}
-
-    // ------------------------------------------------------------------
-    // GpuTargetModel: adapter for speculative decoding
-    // ------------------------------------------------------------------
-
-    /// Wraps the GPU worker's forward pass as a [`TargetModel`] for
-    /// speculative decoding verification.
-    ///
-    /// Constructs a synthetic single-sequence metadata batch from the token
-    /// list, runs a full forward pass through the GPU model, and extracts
-    /// probability distributions for the requested verification positions.
-    pub struct GpuTargetModel {
-        worker: *mut GpuWorker,
-        vocab_size: usize,
-        block_size: usize,
-    }
-
-    // SAFETY: GpuTargetModel is only used on the same thread as the engine
-    // that owns the GpuWorker. The raw pointer avoids borrow checker issues
-    // with the engine holding both the worker and the speculative engine.
-    unsafe impl Send for GpuTargetModel {}
-
-    impl GpuTargetModel {
-        /// Create from a mutable reference to GpuWorker.
-        /// Caller must ensure the GpuWorker outlives this adapter.
-        pub unsafe fn new(worker: &mut GpuWorker, vocab_size: usize, block_size: usize) -> Self {
-            Self {
-                worker: worker as *mut GpuWorker,
-                vocab_size,
-                block_size,
-            }
-        }
-
-        fn worker(&mut self) -> &mut GpuWorker {
-            // SAFETY: invariant maintained by caller of new()
-            unsafe { &mut *self.worker }
-        }
-    }
-
-    impl TargetModel for GpuTargetModel {
-        fn forward_verify(
-            &mut self,
-            tokens: &[TokenId],
-            num_verify_positions: usize,
-        ) -> Result<Vec<Vec<f32>>> {
-            if tokens.is_empty() || num_verify_positions == 0 {
-                return Ok(Vec::new());
-            }
-
-            // Build a single-sequence metadata for the full token list.
-            // Treat as a prefill (all tokens processed at once).
-            let seq_id = SequenceId(u64::MAX - 1); // sentinel
-            let request_id = RequestId(u64::MAX - 1);
-
-            let mut seq_data_map = HashMap::new();
-            seq_data_map.insert(
-                seq_id,
-                SequenceData {
-                    prompt_token_ids: tokens.to_vec(),
-                    output_token_ids: Vec::new(),
-                    cumulative_logprob: 0.0,
-                },
-            );
-
-            // Allocate enough blocks for the full token sequence.
-            let needed_blocks = (tokens.len() + self.block_size - 1) / self.block_size;
-            let block_table: Vec<BlockId> = (0..needed_blocks as u32).map(BlockId).collect();
-            let mut block_tables = HashMap::new();
-            block_tables.insert(seq_id, block_table);
-
-            let metadata = vec![SequenceGroupMetadata {
-                request_id,
-                is_prompt: true,
-                seq_data: seq_data_map,
-                sampling_params: SamplingParams::default(),
-                block_tables,
-            }];
-
-            // Run forward pass to get logits for all positions.
-            let logits = self.worker().forward_logits(&metadata)?;
-
-            // Extract probability distributions for the last `num_verify_positions`.
-            // logits layout: [num_tokens, vocab_size]
-            let num_tokens = tokens.len();
-            let vs = self.vocab_size;
-
-            if logits.len() < num_tokens * vs {
-                return Err(LLMError::ModelError(format!(
-                    "logits too short: got {} elements, expected {}",
-                    logits.len(),
-                    num_tokens * vs,
-                )));
-            }
-
-            let mut result = Vec::with_capacity(num_verify_positions);
-            let start_pos = num_tokens.saturating_sub(num_verify_positions);
-
-            for pos in start_pos..num_tokens {
-                let offset = pos * vs;
-                let token_logits = &logits[offset..offset + vs];
-
-                // Convert logits to probabilities via softmax.
-                let max_logit = token_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut probs: Vec<f32> = token_logits.iter().map(|&l| (l - max_logit).exp()).collect();
-                let sum: f32 = probs.iter().sum();
-                if sum > 0.0 {
-                    for p in &mut probs {
-                        *p /= sum;
-                    }
-                }
-                result.push(probs);
-            }
-
-            Ok(result)
-        }
-
-        fn vocab_size(&self) -> usize {
-            self.vocab_size
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Speculative decoding integration on GpuLLMEngine
-    // ------------------------------------------------------------------
-
-    impl GpuLLMEngine {
-        /// Check if speculative decoding is enabled via env var or config.
-        fn speculative_enabled() -> bool {
-            std::env::var("RVLLM_SPECULATIVE").map_or(false, |v| v == "1")
-        }
-
-        /// Get the draft model path from env or default.
-        fn speculative_draft_model() -> Option<String> {
-            std::env::var("RVLLM_SPECULATIVE_DRAFT").ok()
-        }
-
-        /// Get the number of speculative tokens (K) from env or default to 3.
-        fn speculative_k() -> usize {
-            std::env::var("RVLLM_SPECULATIVE_K")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3)
-        }
-
-        /// Get the number of draft layers from env or default to num_layers / 4.
-        fn speculative_draft_layers(total_layers: usize) -> usize {
-            std::env::var("RVLLM_SPECULATIVE_DRAFT_LAYERS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(total_layers / 4)
-        }
-
-        /// Whether to use self-draft (no separate model).
-        fn speculative_self_draft() -> bool {
-            std::env::var("RVLLM_SPECULATIVE_SELF_DRAFT").map_or(false, |v| v == "1")
-                || Self::speculative_draft_model().is_none()
-        }
-
-        /// Build a SelfDraftModel that calls partial forward on the GPU worker.
-        ///
-        /// SAFETY: The returned model holds a raw pointer to the worker.
-        /// Caller must ensure the worker outlives the draft model and that
-        /// no other mutable access occurs concurrently.
-        unsafe fn build_self_draft(
-            worker: &mut GpuWorker,
-            vocab_size: usize,
-            block_size: usize,
-            num_draft_layers: usize,
-        ) -> Box<dyn rvllm_speculative::DraftModel> {
-            struct SendPtr(usize);
-            unsafe impl Send for SendPtr {}
-            impl SendPtr {
-                unsafe fn get(&self) -> &mut GpuWorker { &mut *(self.0 as *mut GpuWorker) }
-            }
-            let worker_ptr = SendPtr(worker as *mut GpuWorker as usize);
-
-            let partial_fn: rvllm_speculative::self_draft::PartialForwardFn =
-                Box::new(move |tokens: &[TokenId], max_layers: usize| {
-                    let w = unsafe { worker_ptr.get() };
-
-                    let seq_id = SequenceId(u64::MAX - 2);
-                    let request_id = RequestId(u64::MAX - 2);
-
-                    let mut seq_data_map = HashMap::new();
-                    seq_data_map.insert(
-                        seq_id,
-                        SequenceData {
-                            prompt_token_ids: tokens.to_vec(),
-                            output_token_ids: Vec::new(),
-                            cumulative_logprob: 0.0,
-                        },
-                    );
-
-                    let needed_blocks = (tokens.len() + block_size - 1) / block_size;
-                    let block_table: Vec<BlockId> =
-                        (0..needed_blocks as u32).map(BlockId).collect();
-                    let mut block_tables = HashMap::new();
-                    block_tables.insert(seq_id, block_table);
-
-                    let metadata = vec![SequenceGroupMetadata {
-                        request_id,
-                        is_prompt: true,
-                        seq_data: seq_data_map,
-                        sampling_params: SamplingParams::default(),
-                        block_tables,
-                    }];
-
-                    w.forward_logits_partial(&metadata, max_layers)
-                });
-
-            Box::new(SelfDraftModel::new(num_draft_layers, vocab_size, partial_fn))
-        }
-
-        /// Run a single request through speculative decoding.
-        /// Returns the generated token IDs (excluding prompt).
-        ///
-        /// When `RVLLM_SPECULATIVE_SELF_DRAFT=1` or no draft model path is set,
-        /// uses self-draft (first N layers of the target model). Otherwise uses
-        /// the placeholder DraftModelRunner with the configured draft model path.
-        pub fn generate_speculative(
-            &mut self,
-            prompt_tokens: &[TokenId],
-            max_tokens: usize,
-            eos_token_id: TokenId,
-        ) -> Result<Vec<TokenId>> {
-            if !Self::speculative_enabled() {
-                return Err(LLMError::ConfigError(
-                    "speculative decoding not enabled (set RVLLM_SPECULATIVE=1)".into(),
-                ));
-            }
-
-            let k = Self::speculative_k();
-            let vocab_size = self.worker.vocab_size();
-            let block_size = self.config.cache.block_size;
-            let use_self_draft = Self::speculative_self_draft();
-            let total_layers = self.worker.num_layers();
-            let draft_layers = Self::speculative_draft_layers(total_layers);
-
-            info!(
-                k,
-                max_tokens,
-                prompt_len = prompt_tokens.len(),
-                self_draft = use_self_draft,
-                draft_layers,
-                "starting speculative decoding"
-            );
-
-            // Build draft model.
-            let draft: Box<dyn rvllm_speculative::DraftModel> = if use_self_draft {
-                // SAFETY: see build_self_draft docs.
-                unsafe { Self::build_self_draft(&mut self.worker, vocab_size, block_size, draft_layers) }
-            } else {
-                let draft_path = Self::speculative_draft_model().unwrap_or_default();
-                let cfg = SpeculativeConfig::new(draft_path, k);
-                Box::new(rvllm_speculative::DraftModelRunner::new(cfg)?)
-            };
-
-            let spec_config = SpeculativeConfig::new("self-draft".into(), k);
-
-            // SAFETY: GpuTargetModel borrows worker mutably via raw pointer.
-            // We don't access self.worker while the SpeculativeEngine is alive.
-            let target = unsafe { GpuTargetModel::new(&mut self.worker, vocab_size, block_size) };
-
-            let mut spec_engine = SpeculativeEngine::with_draft(spec_config, target, draft)?;
-
-            let output_tokens =
-                spec_engine.generate(prompt_tokens, max_tokens, |tok| tok == eos_token_id)?;
-
-            let metrics = spec_engine.metrics();
-            info!(
-                accepted = metrics.total_accepted_tokens,
-                drafted = metrics.total_draft_tokens,
-                steps = metrics.total_steps,
-                rate = %format!("{:.1}%", metrics.acceptance_rate() * 100.0),
-                speedup = %format!("{:.2}x", metrics.speedup_ratio()),
-                "speculative decoding complete"
-            );
-
-            Ok(output_tokens)
-        }
-
-        /// Benchmark speculative decoding with self-draft vs standard decode.
-        ///
-        /// Runs both paths on the same prompt and reports comparative metrics.
-        /// Set RVLLM_SPECULATIVE=1 before calling.
-        pub fn benchmark_speculative(
-            &mut self,
-            prompt_tokens: &[TokenId],
-            max_tokens: usize,
-            eos_token_id: TokenId,
-        ) -> Result<SpeculativeBenchResult> {
-            let k = Self::speculative_k();
-            let vocab_size = self.worker.vocab_size();
-            let block_size = self.config.cache.block_size;
-            let total_layers = self.worker.num_layers();
-            let draft_layers = Self::speculative_draft_layers(total_layers);
-
-            info!(
-                k,
-                draft_layers,
-                total_layers,
-                max_tokens,
-                "benchmarking speculative decoding"
-            );
-
-            // --- Standard decode baseline ---
-            let std_start = Instant::now();
-            let std_tokens = self.generate_standard(prompt_tokens, max_tokens, eos_token_id)?;
-            let std_elapsed = std_start.elapsed();
-            let std_tok_per_sec = std_tokens.len() as f64 / std_elapsed.as_secs_f64();
-
-            // --- Speculative decode ---
-            let spec_config = SpeculativeConfig::new("self-draft".into(), k);
-            let draft = unsafe {
-                Self::build_self_draft(&mut self.worker, vocab_size, block_size, draft_layers)
-            };
-            let target = unsafe { GpuTargetModel::new(&mut self.worker, vocab_size, block_size) };
-            let mut spec_engine = SpeculativeEngine::with_draft(spec_config, target, draft)?;
-
-            let spec_start = Instant::now();
-            let spec_tokens =
-                spec_engine.generate(prompt_tokens, max_tokens, |tok| tok == eos_token_id)?;
-            let spec_elapsed = spec_start.elapsed();
-            let spec_tok_per_sec = spec_tokens.len() as f64 / spec_elapsed.as_secs_f64();
-
-            let metrics = spec_engine.metrics().clone();
-
-            let result = SpeculativeBenchResult {
-                standard_tokens: std_tokens.len(),
-                standard_elapsed_ms: std_elapsed.as_millis() as u64,
-                standard_tok_per_sec: std_tok_per_sec,
-                speculative_tokens: spec_tokens.len(),
-                speculative_elapsed_ms: spec_elapsed.as_millis() as u64,
-                speculative_tok_per_sec: spec_tok_per_sec,
-                acceptance_rate: metrics.acceptance_rate(),
-                speedup_ratio: metrics.speedup_ratio(),
-                draft_layers,
-                k,
-                wall_clock_speedup: spec_tok_per_sec / std_tok_per_sec.max(1e-9),
-            };
-
-            info!(
-                std_tps = %format!("{:.1}", result.standard_tok_per_sec),
-                spec_tps = %format!("{:.1}", result.speculative_tok_per_sec),
-                accept = %format!("{:.1}%", result.acceptance_rate * 100.0),
-                speedup = %format!("{:.2}x", result.wall_clock_speedup),
-                "speculative benchmark complete"
-            );
-
-            Ok(result)
-        }
-
-        /// Simple autoregressive decode loop (no speculation) for benchmarking baseline.
-        fn generate_standard(
-            &mut self,
-            prompt_tokens: &[TokenId],
-            max_tokens: usize,
-            eos_token_id: TokenId,
-        ) -> Result<Vec<TokenId>> {
-            let vocab_size = self.worker.vocab_size();
-            let block_size = self.config.cache.block_size;
-            let mut context = prompt_tokens.to_vec();
-            let mut output = Vec::with_capacity(max_tokens);
-
-            for _ in 0..max_tokens {
-                let seq_id = SequenceId(u64::MAX - 3);
-                let request_id = RequestId(u64::MAX - 3);
-
-                let mut seq_data_map = HashMap::new();
-                seq_data_map.insert(
-                    seq_id,
-                    SequenceData {
-                        prompt_token_ids: context.clone(),
-                        output_token_ids: Vec::new(),
-                        cumulative_logprob: 0.0,
-                    },
-                );
-
-                let needed_blocks = (context.len() + block_size - 1) / block_size;
-                let block_table: Vec<BlockId> =
-                    (0..needed_blocks as u32).map(BlockId).collect();
-                let mut block_tables = HashMap::new();
-                block_tables.insert(seq_id, block_table);
-
-                let metadata = vec![SequenceGroupMetadata {
-                    request_id,
-                    is_prompt: true,
-                    seq_data: seq_data_map,
-                    sampling_params: SamplingParams::default(),
-                    block_tables,
-                }];
-
-                let logits = self.worker.forward_logits(&metadata)?;
-                let num_tokens = context.len();
-                let offset = (num_tokens - 1) * vocab_size;
-                if logits.len() < offset + vocab_size {
-                    break;
-                }
-                let token_logits = &logits[offset..offset + vocab_size];
-
-                // Greedy argmax
-                let mut best_tok = 0u32;
-                let mut best_val = f32::NEG_INFINITY;
-                for (i, &v) in token_logits.iter().enumerate() {
-                    if v > best_val {
-                        best_val = v;
-                        best_tok = i as u32;
-                    }
-                }
-
-                output.push(best_tok);
-                context.push(best_tok);
-                if best_tok == eos_token_id {
-                    break;
-                }
-            }
-
-            Ok(output)
-        }
-    }
-
-    /// Results from benchmarking speculative vs standard decode.
-    #[derive(Debug, Clone)]
-    pub struct SpeculativeBenchResult {
-        pub standard_tokens: usize,
-        pub standard_elapsed_ms: u64,
-        pub standard_tok_per_sec: f64,
-        pub speculative_tokens: usize,
-        pub speculative_elapsed_ms: u64,
-        pub speculative_tok_per_sec: f64,
-        pub acceptance_rate: f64,
-        pub speedup_ratio: f64,
-        pub draft_layers: usize,
-        pub k: usize,
-        pub wall_clock_speedup: f64,
-    }
 }
 
 #[cfg(feature = "cuda")]
-pub use inner::{AbortQueue, GpuLLMEngine, GpuTargetModel, PendingRequest, RequestQueue, SpeculativeBenchResult};
+pub use inner::GpuLLMEngine;

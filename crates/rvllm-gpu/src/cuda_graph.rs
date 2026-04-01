@@ -17,12 +17,7 @@ use crate::LLMError;
 use crate::Result;
 
 /// Supported batch sizes for which we pre-capture CUDA graphs.
-/// Extended range covers high-concurrency decode (inspired by b12x/sglang).
-pub const GRAPH_BATCH_SIZES: &[usize] = &[
-    1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96,
-    104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192,
-    200, 208, 216, 224, 232, 240, 248, 256,
-];
+pub const GRAPH_BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32];
 
 /// Returns the smallest cached batch size >= `actual`, or `None` if `actual`
 /// exceeds the largest cached size.
@@ -34,15 +29,15 @@ pub fn padded_batch_size(actual: usize) -> Option<usize> {
 pub struct CudaGraph {
     batch_size: usize,
     #[cfg(feature = "cuda-graphs")]
-    inner: cudarc::driver::CudaGraph,
+    graph: cudarc::driver::sys::CUgraph,
+    #[cfg(feature = "cuda-graphs")]
+    exec: cudarc::driver::sys::CUgraphExec,
     #[cfg(not(feature = "cuda-graphs"))]
     replay_count: std::sync::atomic::AtomicUsize,
 }
 
-// SAFETY: The underlying CUDA graph/exec handles are device objects managed by
-// the driver. They are thread-safe to send across threads; cudarc's CudaGraph
-// holds raw pointers so doesn't auto-impl Send/Sync, but we guarantee
-// single-writer access via &self in replay and pool ownership.
+// SAFETY: The CUDA graph/exec handles are device objects managed by the driver.
+// They are thread-safe to send across threads.
 unsafe impl Send for CudaGraph {}
 unsafe impl Sync for CudaGraph {}
 
@@ -52,22 +47,22 @@ impl CudaGraph {
         self.batch_size
     }
 
-    /// Replay the captured graph on `stream`.
-    ///
-    /// The graph is launched via cuGraphLaunch on the provided stream. All
-    /// metadata must be written to the persistent GPU buffers on the SAME
-    /// stream BEFORE calling this so CUDA stream ordering guarantees the
-    /// kernels see the updated data.
+    /// Replay the captured graph on the given stream.
     #[cfg(feature = "cuda-graphs")]
     pub fn replay(&self, stream: &crate::stream::GpuStream) -> Result<()> {
         trace!(batch_size = self.batch_size, "replaying CUDA graph");
-        let cu_stream_ref = stream.cuda_stream();
-        let cu_stream = cu_stream_ref.cu_stream();
-        cu_stream_ref.context().bind_to_thread()
-            .map_err(|e| LLMError::GpuError(format!("bind_to_thread: {e}")))?;
-        unsafe {
-            cudarc::driver::result::graph::launch(self.inner.cu_graph_exec(), cu_stream)
-        }.map_err(|e| LLMError::GpuError(format!("cuGraphLaunch failed: {e}")))?;
+        let result = unsafe {
+            cudarc::driver::sys::cuGraphLaunch(
+                self.exec,
+                stream.cuda_stream().stream as cudarc::driver::sys::CUstream,
+            )
+        };
+        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(LLMError::GpuError(format!(
+                "cuGraphLaunch failed: {:?}",
+                result
+            )));
+        }
         Ok(())
     }
 
@@ -89,7 +84,13 @@ impl CudaGraph {
 
 impl Drop for CudaGraph {
     fn drop(&mut self) {
-        // Under cuda-graphs, cudarc::driver::CudaGraph handles cleanup in its own Drop.
+        #[cfg(feature = "cuda-graphs")]
+        {
+            unsafe {
+                cudarc::driver::sys::cuGraphExecDestroy(self.exec);
+                cudarc::driver::sys::cuGraphDestroy(self.graph);
+            }
+        }
         trace!(batch_size = self.batch_size, "CudaGraph dropped");
     }
 }
@@ -136,12 +137,6 @@ impl CudaGraphPool {
         self.graphs.get(&padded)
     }
 
-    /// Get graph for exact batch size (no padding).
-    pub fn get_exact(&self, batch_size: usize) -> Option<&CudaGraph> {
-        if !self.enabled { return None; }
-        self.graphs.get(&batch_size)
-    }
-
     pub fn has_graph(&self, actual_batch_size: usize) -> bool {
         padded_batch_size(actual_batch_size)
             .map(|p| self.graphs.contains_key(&p))
@@ -171,12 +166,18 @@ impl CudaGraphPool {
     #[cfg(feature = "cuda-graphs")]
     pub fn begin_capture(&self, stream: &crate::stream::GpuStream) -> Result<()> {
         debug!("beginning CUDA graph capture");
-        stream
-            .cuda_stream()
-            .begin_capture(
+        let result = unsafe {
+            cudarc::driver::sys::cuStreamBeginCapture(
+                stream.cuda_stream().stream as cudarc::driver::sys::CUstream,
                 cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
             )
-            .map_err(|e| LLMError::GpuError(format!("cuStreamBeginCapture failed: {e}")))?;
+        };
+        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(LLMError::GpuError(format!(
+                "cuStreamBeginCapture failed: {:?}",
+                result
+            )));
+        }
         Ok(())
     }
 
@@ -187,21 +188,47 @@ impl CudaGraphPool {
         stream: &crate::stream::GpuStream,
         batch_size: usize,
     ) -> Result<CudaGraph> {
-        use cudarc::driver::sys::CUgraphInstantiate_flags;
         debug!(batch_size, "ending CUDA graph capture");
 
-        let inner = stream
-            .cuda_stream()
-            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-            .map_err(|e| LLMError::GpuError(format!("cuStreamEndCapture failed: {e}")))?
-            .ok_or_else(|| {
-                LLMError::GpuError("cuStreamEndCapture returned null graph".to_string())
-            })?;
+        let mut graph: cudarc::driver::sys::CUgraph = std::ptr::null_mut();
+        let result = unsafe {
+            cudarc::driver::sys::cuStreamEndCapture(
+                stream.cuda_stream().stream as cudarc::driver::sys::CUstream,
+                &mut graph,
+            )
+        };
+        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(LLMError::GpuError(format!(
+                "cuStreamEndCapture failed: {:?}",
+                result
+            )));
+        }
+
+        let mut exec: cudarc::driver::sys::CUgraphExec = std::ptr::null_mut();
+        let result = unsafe {
+            cudarc::driver::sys::cuGraphInstantiate(
+                &mut exec,
+                graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            unsafe {
+                cudarc::driver::sys::cuGraphDestroy(graph);
+            }
+            return Err(LLMError::GpuError(format!(
+                "cuGraphInstantiate failed: {:?}",
+                result
+            )));
+        }
 
         info!(batch_size, "CUDA graph captured and instantiated");
         Ok(CudaGraph {
             batch_size,
-            inner,
+            graph,
+            exec,
         })
     }
 
@@ -225,63 +252,6 @@ impl CudaGraphPool {
             replay_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
-
-    /// Begin capturing a CUDA graph on a raw CudaStream (for use from GpuModelRunner).
-    #[cfg(feature = "cuda-graphs")]
-    pub fn begin_capture_on(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
-        debug!("beginning CUDA graph capture (raw stream)");
-        stream
-            .begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
-            )
-            .map_err(|e| LLMError::GpuError(format!("cuStreamBeginCapture failed: {e}")))?;
-        Ok(())
-    }
-
-    /// End capture on a raw CudaStream and produce a [`CudaGraph`].
-    #[cfg(feature = "cuda-graphs")]
-    pub fn end_capture_on(
-        &mut self,
-        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-        batch_size: usize,
-    ) -> Result<CudaGraph> {
-        use cudarc::driver::sys::CUgraphInstantiate_flags;
-        debug!(batch_size, "ending CUDA graph capture (raw stream)");
-
-        let inner = stream
-            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
-            .map_err(|e| LLMError::GpuError(format!("cuStreamEndCapture failed: {e}")))?
-            .ok_or_else(|| {
-                LLMError::GpuError("cuStreamEndCapture returned null graph".to_string())
-            })?;
-
-        info!(batch_size, "CUDA graph captured and instantiated (raw stream)");
-        Ok(CudaGraph {
-            batch_size,
-            inner,
-        })
-    }
-
-    /// Begin capture (no-op when cuda-graphs feature is off, cuda still available).
-    #[cfg(all(feature = "cuda", not(feature = "cuda-graphs")))]
-    pub fn begin_capture_on(&self, _stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
-        debug!("beginning CUDA graph capture (raw stream, no-op)");
-        Ok(())
-    }
-
-    /// End capture (no-op): produces a stub CudaGraph.
-    #[cfg(all(feature = "cuda", not(feature = "cuda-graphs")))]
-    pub fn end_capture_on(
-        &mut self,
-        _stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-        batch_size: usize,
-    ) -> Result<CudaGraph> {
-        debug!(batch_size, "ending CUDA graph capture (raw stream, no-op)");
-        Ok(CudaGraph {
-            batch_size,
-            replay_count: std::sync::atomic::AtomicUsize::new(0),
-        })
-    }
 }
 
 #[cfg(test)]
@@ -300,16 +270,13 @@ mod tests {
         assert_eq!(padded_batch_size(3), Some(4));
         assert_eq!(padded_batch_size(5), Some(8));
         assert_eq!(padded_batch_size(9), Some(16));
-        assert_eq!(padded_batch_size(17), Some(24));
-        assert_eq!(padded_batch_size(33), Some(40));
-        assert_eq!(padded_batch_size(65), Some(72));
-        assert_eq!(padded_batch_size(129), Some(136));
+        assert_eq!(padded_batch_size(17), Some(32));
     }
 
     #[test]
     fn padded_batch_size_too_large() {
-        assert_eq!(padded_batch_size(257), None);
-        assert_eq!(padded_batch_size(512), None);
+        assert_eq!(padded_batch_size(33), None);
+        assert_eq!(padded_batch_size(64), None);
     }
 
     #[test]

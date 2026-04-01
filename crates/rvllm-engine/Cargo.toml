@@ -12,7 +12,7 @@ keywords = ["llm", "inference", "engine", "streaming", "vllm"]
 categories = ["science", "asynchronous"]
 
 [dependencies]
-cudarc = { version = "0.19", features = ["driver", "cublas", "f16"], optional = true }
+cudarc = { version = "0.12", features = ["driver", "cublas", "f16", "cuda-12060"], optional = true }
 rvllm-core.workspace = true
 rvllm-config.workspace = true
 rvllm-tokenizer.workspace = true

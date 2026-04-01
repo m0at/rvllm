@@ -404,6 +404,7 @@ mod tests {
             dtype: rvllm_core::types::Dtype::Float16,
             rms_norm_eps: 1e-5, rope_theta: 10000.0,
             architecture: "CohereForCausalLM".into(),
+            layer_types: vec![],
         }
     }
 

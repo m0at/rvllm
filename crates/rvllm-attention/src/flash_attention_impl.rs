@@ -54,11 +54,8 @@ pub struct FlashAttention2 {
 
 #[cfg(feature = "cuda")]
 struct CudaFlashState {
-    context: std::sync::Arc<cudarc::driver::CudaContext>,
-    stream: std::sync::Arc<cudarc::driver::CudaStream>,
-    _module: std::sync::Arc<cudarc::driver::CudaModule>,
-    prefill_func: cudarc::driver::CudaFunction,
-    decode_func: cudarc::driver::CudaFunction,
+    device: std::sync::Arc<cudarc::driver::CudaDevice>,
+    stream: cudarc::driver::CudaStream,
 }
 
 // SAFETY: CudaStream wraps a driver handle bound to a device context.
@@ -88,41 +85,37 @@ impl FlashAttention2 {
         }
     }
 
-    /// Create with CUDA context for GPU execution.
+    /// Create with CUDA device for GPU execution.
     #[cfg(feature = "cuda")]
     pub fn with_cuda(
-        context: std::sync::Arc<cudarc::driver::CudaContext>,
+        device: std::sync::Arc<cudarc::driver::CudaDevice>,
         ptx_bytes: &[u8],
         config: FlashAttention2Config,
     ) -> Result<Self> {
         let ptx_str = std::str::from_utf8(ptx_bytes)
             .map_err(|e| LLMError::GpuError(format!("PTX not valid UTF-8: {e}")))?;
 
-        let module = context
-            .load_module(cudarc::nvrtc::Ptx::from_src(ptx_str))
+        device
+            .load_ptx(
+                cudarc::nvrtc::Ptx::from_src(ptx_str),
+                "flash_attention",
+                &[
+                    "flash_attention_2_kernel",
+                    "flash_attention_2_decode_kernel",
+                    "flash_attention_2_f16kv_kernel",
+                    "flash_attention_2_decode_f16kv_kernel",
+                ],
+            )
             .map_err(|e| LLMError::GpuError(format!("failed to load flash_attention PTX: {e}")))?;
 
-        let prefill_func = module
-            .load_function("flash_attention_2_kernel")
-            .map_err(|e| LLMError::GpuError(format!("failed to load flash_attention_2_kernel: {e}")))?;
-        let decode_func = module
-            .load_function("flash_attention_2_decode_kernel")
-            .map_err(|e| LLMError::GpuError(format!("failed to load flash_attention_2_decode_kernel: {e}")))?;
-
-        let stream = context
-            .new_stream()
+        let stream = device
+            .fork_default_stream()
             .map_err(|e| LLMError::GpuError(format!("failed to create CUDA stream: {e}")))?;
 
         debug!("FlashAttention-2 CUDA backend initialized");
         Ok(Self {
             config,
-            cuda_state: Some(CudaFlashState {
-                context,
-                stream,
-                _module: module,
-                prefill_func,
-                decode_func,
-            }),
+            cuda_state: Some(CudaFlashState { device, stream }),
         })
     }
 
@@ -343,7 +336,7 @@ impl FlashAttention2 {
         max_context_len: usize,
         scale: f32,
     ) -> Result<GpuBuffer<f16>> {
-        use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+        use cudarc::driver::{CudaSlice, LaunchAsync, LaunchConfig};
 
         let state = self
             .cuda_state
@@ -391,31 +384,31 @@ impl FlashAttention2 {
             "FlashAttention2::forward_cuda"
         );
 
-        let stream = &state.stream;
+        let dev = &state.device;
 
         // Upload buffers
         let q_f32: Vec<f32> = query.data.iter().map(|v| v.to_f32()).collect();
         let k_f32: Vec<f32> = key_cache.data.iter().map(|v| v.to_f32()).collect();
         let v_f32: Vec<f32> = value_cache.data.iter().map(|v| v.to_f32()).collect();
 
-        let d_query = stream
-            .clone_htod(&q_f32)
+        let d_query = dev
+            .htod_sync_copy(&q_f32)
             .map_err(|e| LLMError::GpuError(format!("htod query: {e}")))?;
-        let d_key = stream
-            .clone_htod(&k_f32)
+        let d_key = dev
+            .htod_sync_copy(&k_f32)
             .map_err(|e| LLMError::GpuError(format!("htod key_cache: {e}")))?;
-        let d_val = stream
-            .clone_htod(&v_f32)
+        let d_val = dev
+            .htod_sync_copy(&v_f32)
             .map_err(|e| LLMError::GpuError(format!("htod value_cache: {e}")))?;
-        let d_block_tables = stream
-            .clone_htod(&block_tables.data)
+        let d_block_tables = dev
+            .htod_sync_copy(&block_tables.data)
             .map_err(|e| LLMError::GpuError(format!("htod block_tables: {e}")))?;
-        let d_context_lens = stream
-            .clone_htod(&context_lens.data)
+        let d_context_lens = dev
+            .htod_sync_copy(&context_lens.data)
             .map_err(|e| LLMError::GpuError(format!("htod context_lens: {e}")))?;
 
         let output_len = num_tokens * num_heads * head_dim;
-        let d_output: CudaSlice<f32> = stream
+        let d_output: CudaSlice<f32> = dev
             .alloc_zeros(output_len)
             .map_err(|e| LLMError::GpuError(format!("output alloc: {e}")))?;
 
@@ -426,6 +419,12 @@ impl FlashAttention2 {
         let is_decode = num_tokens == num_seqs; // one token per sequence
 
         if is_decode {
+            let func = dev
+                .get_func("flash_attention", "flash_attention_2_decode_kernel")
+                .ok_or_else(|| {
+                    LLMError::GpuError("flash_attention_2_decode_kernel not found".into())
+                })?;
+
             let cfg = LaunchConfig {
                 grid_dim: (num_seqs as u32, num_heads as u32, 1),
                 block_dim: (128, 1, 1),
@@ -433,23 +432,27 @@ impl FlashAttention2 {
             };
 
             unsafe {
-                stream.launch_builder(&state.decode_func)
-                    .arg(&d_output)
-                    .arg(&d_query)
-                    .arg(&d_key)
-                    .arg(&d_val)
-                    .arg(&d_block_tables)
-                    .arg(&d_context_lens)
-                    .arg(&scale)
-                    .arg(&(num_heads as i32))
-                    .arg(&(num_kv_heads as i32))
-                    .arg(&(head_dim as i32))
-                    .arg(&(block_size as i32))
-                    .arg(&(max_blocks_per_seq as i32))
-                    .launch(cfg)
-                    .map_err(|e| {
-                        LLMError::GpuError(format!("flash_attention_2_decode_kernel launch: {e}"))
-                    })?;
+                func.launch_on_stream(
+                    &state.stream,
+                    cfg,
+                    (
+                        &d_output,
+                        &d_query,
+                        &d_key,
+                        &d_val,
+                        &d_block_tables,
+                        &d_context_lens,
+                        scale,
+                        num_heads as i32,
+                        num_kv_heads as i32,
+                        head_dim as i32,
+                        block_size as i32,
+                        max_blocks_per_seq as i32,
+                    ),
+                )
+                .map_err(|e| {
+                    LLMError::GpuError(format!("flash_attention_2_decode_kernel launch: {e}"))
+                })?;
             }
         } else {
             // Prefill path: build seq_start_pos
@@ -457,16 +460,20 @@ impl FlashAttention2 {
             let mut pos = 0i32;
             for i in 0..num_seqs {
                 seq_starts.push(pos);
-                let _ctx = context_lens.data[i];
+                let ctx = context_lens.data[i];
                 pos += if i + 1 < num_seqs {
                     1
                 } else {
                     (num_tokens as i32) - pos
                 };
             }
-            let d_seq_starts = stream
-                .clone_htod(&seq_starts)
+            let d_seq_starts = dev
+                .htod_sync_copy(&seq_starts)
                 .map_err(|e| LLMError::GpuError(format!("htod seq_starts: {e}")))?;
+
+            let func = dev
+                .get_func("flash_attention", "flash_attention_2_kernel")
+                .ok_or_else(|| LLMError::GpuError("flash_attention_2_kernel not found".into()))?;
 
             let cfg = LaunchConfig {
                 grid_dim: (num_seqs as u32, num_heads as u32, 1),
@@ -474,34 +481,43 @@ impl FlashAttention2 {
                 shared_mem_bytes: smem_bytes,
             };
 
-            let p_num_heads = num_heads as i32;
-            let p_num_kv_heads = num_kv_heads as i32;
-            let p_head_dim = head_dim as i32;
-            let p_block_size = block_size as i32;
-            let p_max_ctx = max_context_len as i32;
-            let p_max_blocks = max_blocks_per_seq as i32;
-            let p_num_tokens = num_tokens as i32;
-            let p_causal: i32 = if self.config.causal { 1 } else { 0 };
-
             unsafe {
-                stream.launch_builder(&state.prefill_func)
-                    .arg(&d_output)
-                    .arg(&d_query)
-                    .arg(&d_key)
-                    .arg(&d_val)
-                    .arg(&d_block_tables)
-                    .arg(&d_context_lens)
-                    .arg(&d_seq_starts)
-                    .arg(&scale)
-                    .arg(&p_num_heads)
-                    .arg(&p_num_kv_heads)
-                    .arg(&p_head_dim)
-                    .arg(&p_block_size)
-                    .arg(&p_max_ctx)
-                    .arg(&p_max_blocks)
-                    .arg(&p_num_tokens)
-                    .arg(&p_causal)
-                    .launch(cfg)
+                use cudarc::driver::DevicePtr;
+                let mut p_scale = scale;
+                let mut p_num_heads = num_heads as i32;
+                let mut p_num_kv_heads = num_kv_heads as i32;
+                let mut p_head_dim = head_dim as i32;
+                let mut p_block_size = block_size as i32;
+                let mut p_max_ctx = max_context_len as i32;
+                let mut p_max_blocks = max_blocks_per_seq as i32;
+                let mut p_num_tokens = num_tokens as i32;
+                let mut p_causal: i32 = if self.config.causal { 1 } else { 0 };
+                let mut d_output_ptr = *DevicePtr::device_ptr(&d_output);
+                let mut d_query_ptr = *DevicePtr::device_ptr(&d_query);
+                let mut d_key_ptr = *DevicePtr::device_ptr(&d_key);
+                let mut d_val_ptr = *DevicePtr::device_ptr(&d_val);
+                let mut d_bt_ptr = *DevicePtr::device_ptr(&d_block_tables);
+                let mut d_cl_ptr = *DevicePtr::device_ptr(&d_context_lens);
+                let mut d_ss_ptr = *DevicePtr::device_ptr(&d_seq_starts);
+                let params: &mut [*mut std::ffi::c_void] = &mut [
+                    &mut d_output_ptr as *mut _ as *mut _,
+                    &mut d_query_ptr as *mut _ as *mut _,
+                    &mut d_key_ptr as *mut _ as *mut _,
+                    &mut d_val_ptr as *mut _ as *mut _,
+                    &mut d_bt_ptr as *mut _ as *mut _,
+                    &mut d_cl_ptr as *mut _ as *mut _,
+                    &mut d_ss_ptr as *mut _ as *mut _,
+                    &mut p_scale as *mut f32 as *mut _,
+                    &mut p_num_heads as *mut i32 as *mut _,
+                    &mut p_num_kv_heads as *mut i32 as *mut _,
+                    &mut p_head_dim as *mut i32 as *mut _,
+                    &mut p_block_size as *mut i32 as *mut _,
+                    &mut p_max_ctx as *mut i32 as *mut _,
+                    &mut p_max_blocks as *mut i32 as *mut _,
+                    &mut p_num_tokens as *mut i32 as *mut _,
+                    &mut p_causal as *mut i32 as *mut _,
+                ];
+                func.launch_on_stream(&state.stream, cfg, params)
                     .map_err(|e| {
                         LLMError::GpuError(format!("flash_attention_2_kernel launch: {e}"))
                     })?;
@@ -509,12 +525,11 @@ impl FlashAttention2 {
         }
 
         // Sync and download
-        stream
-            .synchronize()
+        dev.wait_for(&state.stream)
             .map_err(|e| LLMError::GpuError(format!("stream sync: {e}")))?;
 
-        let host_output: Vec<f32> = stream
-            .clone_dtoh(&d_output)
+        let host_output: Vec<f32> = dev
+            .dtoh_sync_copy(&d_output)
             .map_err(|e| LLMError::GpuError(format!("dtoh output: {e}")))?;
 
         let f16_output: Vec<f16> = host_output.iter().map(|v| f16::from_f32(*v)).collect();

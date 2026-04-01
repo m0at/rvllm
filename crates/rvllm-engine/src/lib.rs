@@ -23,8 +23,6 @@ pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod gpu_engine;
 pub mod gpu_metrics;
-#[cfg(any(feature = "cuda", test))]
-mod hf_snapshot;
 pub mod output;
 pub mod stop_checker;
 
@@ -41,8 +39,6 @@ pub use stop_checker::StopChecker;
 pub use async_gpu_engine::AsyncGpuLLMEngine;
 #[cfg(feature = "cuda")]
 pub use gpu_engine::GpuLLMEngine;
-#[cfg(feature = "cuda")]
-pub use gpu_engine::GpuTargetModel;
 
 // Re-export real executor types for downstream convenience
 pub use rvllm_executor::ExecutorConfig;

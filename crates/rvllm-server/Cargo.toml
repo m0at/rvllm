@@ -18,7 +18,6 @@ path = "src/main.rs"
 [features]
 default = []
 cuda = ["rvllm-gpu/cuda", "rvllm-api/cuda", "rvllm-engine/cuda"]
-cublaslt = ["cuda", "rvllm-gpu/cublaslt", "rvllm-engine/cublaslt"]
 
 [dependencies]
 rvllm-core.workspace = true
@@ -34,8 +33,6 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
-tokio-stream.workspace = true
-serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
