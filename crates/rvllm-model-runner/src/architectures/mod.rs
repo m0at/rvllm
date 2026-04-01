@@ -35,7 +35,11 @@ pub fn create_model(
     match architecture {
         "LlamaForCausalLM" => Ok(Box::new(llama::LlamaForCausalLM::new(weights, config)?)),
         "MistralForCausalLM" => Ok(Box::new(mistral::MistralForCausalLM::new(weights, config)?)),
-        "Qwen2ForCausalLM" => Ok(Box::new(qwen2::Qwen2ForCausalLM::new(weights, config)?)),
+        "Qwen2ForCausalLM"
+        | "Qwen3ForCausalLM"
+        | "Qwen3_5ForConditionalGeneration"
+        | "Qwen3_5_VLForConditionalGeneration"
+        | "Qwen3_5ForCausalLM" => Ok(Box::new(qwen2::Qwen2ForCausalLM::new(weights, config)?)),
         "CohereForCausalLM" => Ok(Box::new(cohere::CohereForCausalLM::new(weights, config)?)),
         "GPTNeoXForCausalLM" => Ok(Box::new(gpt_neox::GPTNeoXForCausalLM::new(
             weights, config,

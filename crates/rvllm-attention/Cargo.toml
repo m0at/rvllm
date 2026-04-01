@@ -23,4 +23,4 @@ rvllm-gpu.workspace = true
 thiserror.workspace = true
 half.workspace = true
 tracing.workspace = true
-cudarc = { version = "0.19", features = ["driver", "cublas", "cuda-version-from-build-system"], optional = true }
+cudarc = { version = "0.12", features = ["driver", "cublas", "cuda-12060"], optional = true }

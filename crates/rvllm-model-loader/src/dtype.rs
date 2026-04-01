@@ -11,6 +11,9 @@ pub enum DType {
     Q4_0,
     #[allow(non_camel_case_types)]
     Q4_K_M,
+    /// FP8 E4M3 format (1 sign, 4 exponent, 3 mantissa bits). 1 byte per element.
+    #[allow(non_camel_case_types)]
+    F8_E4M3,
 }
 
 impl DType {
@@ -23,6 +26,7 @@ impl DType {
             DType::BF16 => 2,
             DType::I32 => 4,
             DType::U8 => 1,
+            DType::F8_E4M3 => 1,
             // Q4_0: 32 values packed in 18 bytes (16 nibbles + 2 byte scale) = 0.5625 bytes/elem
             // We report the block size; callers use total_bytes() on WeightTensor for exact sizing.
             DType::Q4_0 => 1,
@@ -39,6 +43,7 @@ impl DType {
             "BF16" => Some(DType::BF16),
             "I32" => Some(DType::I32),
             "U8" | "BOOL" => Some(DType::U8),
+            "F8_E4M3" => Some(DType::F8_E4M3),
             _ => None,
         }
     }
@@ -66,6 +71,7 @@ impl fmt::Display for DType {
             DType::BF16 => write!(f, "BF16"),
             DType::I32 => write!(f, "I32"),
             DType::U8 => write!(f, "U8"),
+            DType::F8_E4M3 => write!(f, "F8_E4M3"),
             DType::Q4_0 => write!(f, "Q4_0"),
             DType::Q4_K_M => write!(f, "Q4_K_M"),
         }

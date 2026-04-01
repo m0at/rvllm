@@ -18,21 +18,42 @@ pub enum Dtype {
     Float16,
     /// 16-bit brain floating point.
     BFloat16,
+    /// 8-bit floating point (E4M3 format). Weights stay as u8 on GPU,
+    /// dequantized to f16 on-the-fly before each GEMM.
+    #[serde(alias = "float8_e4m3")]
+    Float8E4M3,
+    /// GPTQ INT4: 4-bit quantized weights with per-group scales and zero points.
+    /// Weights packed 8 per int32, dequantized on-the-fly during GEMV.
+    #[serde(alias = "gptq_int4")]
+    GptqInt4,
 }
 
 impl Dtype {
     /// Size in bytes of a single element of this dtype.
     /// Returns 4 for Auto (conservative default; caller should resolve first).
+    /// GptqInt4 returns 1 (0.5 bytes/element + overhead, rounded up).
     pub fn size_bytes(self) -> usize {
         match self {
             Dtype::Auto | Dtype::Float32 => 4,
             Dtype::Float16 | Dtype::BFloat16 => 2,
+            Dtype::Float8E4M3 => 1,
+            Dtype::GptqInt4 => 1,
         }
     }
 
     /// True if this is a half-precision type (f16 or bf16).
     pub fn is_half(self) -> bool {
         matches!(self, Dtype::Float16 | Dtype::BFloat16)
+    }
+
+    /// True if this is FP8 (weights stored as u8, compute in f16).
+    pub fn is_fp8(self) -> bool {
+        matches!(self, Dtype::Float8E4M3)
+    }
+
+    /// True if this is GPTQ INT4 quantized.
+    pub fn is_gptq(self) -> bool {
+        matches!(self, Dtype::GptqInt4)
     }
 
     /// True if this is Auto (needs resolution based on GPU capability).
@@ -62,12 +83,15 @@ impl Dtype {
             Dtype::Float32 => "float32",
             Dtype::Float16 => "float16",
             Dtype::BFloat16 => "bfloat16",
+            Dtype::Float8E4M3 => "float8_e4m3",
+            Dtype::GptqInt4 => "gptq_int4",
         }
     }
 
     /// Whether this dtype should use hgemm (half GEMM) vs sgemm (single GEMM).
+    /// FP8 and GPTQ also use hgemm since weights are dequantized to f16 before GEMM.
     pub fn use_hgemm(self) -> bool {
-        matches!(self, Dtype::Float16 | Dtype::BFloat16)
+        matches!(self, Dtype::Float16 | Dtype::BFloat16 | Dtype::Float8E4M3 | Dtype::GptqInt4)
     }
 }
 
@@ -92,8 +116,12 @@ impl FromStr for Dtype {
             "float32" | "fp32" | "f32" => Ok(Dtype::Float32),
             "float16" | "fp16" | "f16" | "half" => Ok(Dtype::Float16),
             "bfloat16" | "bf16" => Ok(Dtype::BFloat16),
+            "float8_e4m3" | "fp8" | "fp8_e4m3" | "f8_e4m3" | "float8" => {
+                Ok(Dtype::Float8E4M3)
+            }
+            "gptq_int4" | "gptq" | "int4" | "gptq-int4" => Ok(Dtype::GptqInt4),
             _ => Err(format!(
-                "unknown dtype '{}': expected auto, float32, float16, or bfloat16",
+                "unknown dtype '{}': expected auto, float32, float16, bfloat16, fp8, or gptq",
                 s
             )),
         }
@@ -299,6 +327,8 @@ mod tests {
         assert_eq!("fp16".parse::<Dtype>().unwrap(), Dtype::Float16);
         assert_eq!("bfloat16".parse::<Dtype>().unwrap(), Dtype::BFloat16);
         assert_eq!("bf16".parse::<Dtype>().unwrap(), Dtype::BFloat16);
+        assert_eq!("fp8".parse::<Dtype>().unwrap(), Dtype::Float8E4M3);
+        assert_eq!("float8_e4m3".parse::<Dtype>().unwrap(), Dtype::Float8E4M3);
         assert!("invalid".parse::<Dtype>().is_err());
     }
 
@@ -317,9 +347,12 @@ mod tests {
         assert_eq!(Dtype::Float32.size_bytes(), 4);
         assert_eq!(Dtype::Float16.size_bytes(), 2);
         assert_eq!(Dtype::BFloat16.size_bytes(), 2);
+        assert_eq!(Dtype::Float8E4M3.size_bytes(), 1);
         assert!(Dtype::Float16.is_half());
         assert!(Dtype::BFloat16.is_half());
         assert!(!Dtype::Float32.is_half());
+        assert!(Dtype::Float8E4M3.is_fp8());
+        assert!(!Dtype::Float16.is_fp8());
     }
 
     #[test]
@@ -340,6 +373,7 @@ mod tests {
     fn dtype_hgemm() {
         assert!(Dtype::Float16.use_hgemm());
         assert!(Dtype::BFloat16.use_hgemm());
+        assert!(Dtype::Float8E4M3.use_hgemm());
         assert!(!Dtype::Float32.use_hgemm());
         assert!(!Dtype::Auto.use_hgemm());
     }

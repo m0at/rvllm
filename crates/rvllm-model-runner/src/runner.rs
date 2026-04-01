@@ -22,10 +22,18 @@ pub struct ModelRunnerConfig {
     pub intermediate_size: usize,
     pub vocab_size: usize,
     pub max_position: usize,
-    pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub dtype: Dtype,
     pub architecture: String,
+    /// Per-layer type for hybrid models: "full_attention" or "linear_attention".
+    /// Empty for standard transformer models.
+    pub layer_types: Vec<String>,
+    /// Fraction of head_dim that gets RoPE (1.0 for standard, 0.25 for Qwen3.5).
+    pub partial_rotary_factor: f32,
+    /// Qwen3.5: q_proj produces 2x head_dim (query + output gate).
+    pub has_attn_output_gate: bool,
+    /// RMSNorm epsilon (Qwen3.5 uses 1e-6, Llama uses 1e-5).
+    pub rms_norm_eps: f32,
 }
 
 /// Drives the transformer forward pass: embed -> layers -> LM head -> logits.

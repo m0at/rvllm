@@ -1,4 +1,8 @@
-// RMSNorm kernel: output[i] = input[i] * weight[i] / sqrt(mean(input^2) + eps)
+// RMSNorm kernel: output[i] = input[i] * w[i] / sqrt(mean(input^2) + eps)
+//   where w[i] = weight[i] + weight_offset
+//
+// weight_offset = 0.0 for standard RMSNorm (Llama, etc.)
+// weight_offset = 1.0 for Qwen3.5 "(1 + weight)" style RMSNorm
 //
 // Launch config:
 //   Grid:  (num_tokens, 1, 1)
@@ -14,7 +18,8 @@ __global__ void rms_norm_kernel(
     const float* __restrict__ input,
     const float* __restrict__ weight,
     float eps,
-    int hidden_size
+    int hidden_size,
+    float weight_offset
 ) {
     const int token_idx = blockIdx.x;
     const int tid = threadIdx.x;
@@ -34,13 +39,10 @@ __global__ void rms_norm_kernel(
     sdata[tid] = local_ss;
     __syncthreads();
 
-    // Parallel reduction in shared memory (handles non-power-of-2 block sizes)
+    // Parallel reduction in shared memory (standard binary tree reduction)
     for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s && tid + s < stride) {
+        if (tid < s) {
             sdata[tid] += sdata[tid + s];
-        }
-        if (s * 2 < stride && tid == 0) {
-            sdata[0] += sdata[s * 2];
         }
         __syncthreads();
     }
@@ -50,6 +52,6 @@ __global__ void rms_norm_kernel(
 
     // Step 3: Apply normalization with weight
     for (int i = tid; i < hidden_size; i += stride) {
-        y[i] = x[i] * weight[i] * rms_scale;
+        y[i] = x[i] * (weight[i] + weight_offset) * rms_scale;
     }
 }

@@ -1,7 +1,7 @@
 //! Async GPU stream wrapper.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::CudaContext;
+use cudarc::driver::CudaDevice;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -14,9 +14,9 @@ use crate::Result;
 pub struct GpuStream {
     device_id: usize,
     #[cfg(feature = "cuda")]
-    context: Arc<CudaContext>,
+    device: Arc<CudaDevice>,
     #[cfg(feature = "cuda")]
-    stream: Arc<cudarc::driver::CudaStream>,
+    stream: cudarc::driver::CudaStream,
 }
 
 impl GpuStream {
@@ -29,34 +29,23 @@ impl GpuStream {
     #[cfg(feature = "cuda")]
     pub fn new(device_id: usize) -> Result<Self> {
         tracing::debug!(device_id, "creating CUDA GPU stream");
-        let context = CudaContext::new(device_id)
+        let device = CudaDevice::new(device_id)
             .map_err(|e| crate::LLMError::MemoryError(format!("CUDA device init failed: {e}")))?;
-        let stream = context.new_stream().map_err(|e| {
+        let stream = device.fork_default_stream().map_err(|e| {
             crate::LLMError::MemoryError(format!("CUDA stream creation failed: {e}"))
         })?;
         Ok(Self {
             device_id,
-            context,
+            device,
             stream,
         })
-    }
-
-    /// Wrap an existing `Arc<CudaContext>` + `Arc<CudaStream>` without creating new resources.
-    /// Used so the GPU worker can replay graphs on the model runner's stream.
-    #[cfg(feature = "cuda")]
-    pub fn from_arc(
-        device_id: usize,
-        context: Arc<CudaContext>,
-        stream: Arc<cudarc::driver::CudaStream>,
-    ) -> Self {
-        Self { device_id, context, stream }
     }
 
     pub fn synchronize(&self) -> Result<()> {
         tracing::trace!(device_id = self.device_id, "synchronizing stream");
         #[cfg(feature = "cuda")]
         {
-            self.stream.synchronize().map_err(|e| {
+            self.device.wait_for(&self.stream).map_err(|e| {
                 crate::LLMError::MemoryError(format!("CUDA stream sync failed: {e}"))
             })?;
         }
@@ -68,12 +57,12 @@ impl GpuStream {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn cuda_context(&self) -> &Arc<CudaContext> {
-        &self.context
+    pub fn cuda_device(&self) -> &Arc<CudaDevice> {
+        &self.device
     }
 
     #[cfg(feature = "cuda")]
-    pub fn cuda_stream(&self) -> &Arc<cudarc::driver::CudaStream> {
+    pub fn cuda_stream(&self) -> &cudarc::driver::CudaStream {
         &self.stream
     }
 }

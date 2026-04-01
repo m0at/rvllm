@@ -5,13 +5,15 @@
 //! cudarc for device memory types.
 
 #[cfg(feature = "cuda")]
-use std::sync::Arc;
-#[cfg(feature = "cuda")]
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaDevice, CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice as _, LaunchAsync, LaunchConfig,
+};
 #[cfg(feature = "cuda")]
 use rvllm_core::error::{LLMError, Result};
 #[cfg(feature = "cuda")]
 use rvllm_gpu::kernel_loader::KernelLoader;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 /// CUDA-backed RMSNorm layer.
 ///
@@ -43,7 +45,19 @@ impl CudaRMSNorm {
         eps: f32,
         hidden_size: usize,
         loader: &KernelLoader,
-        stream: &Arc<CudaStream>,
+    ) -> Result<CudaSlice<f32>> {
+        Self::forward_with_offset(input, weight, eps, hidden_size, loader, 0.0)
+    }
+
+    /// RMSNorm with configurable weight offset.
+    /// weight_offset = 0.0 for standard, 1.0 for Qwen3.5 "(1+w)" style.
+    pub fn forward_with_offset(
+        input: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        eps: f32,
+        hidden_size: usize,
+        loader: &KernelLoader,
+        weight_offset: f32,
     ) -> Result<CudaSlice<f32>> {
         let num_elements = input.len();
         if num_elements == 0 {
@@ -74,8 +88,15 @@ impl CudaRMSNorm {
             shared_mem_bytes,
         };
 
+<<<<<<< Updated upstream
         // Safety: rms_norm kernel writes all num_elements elements
         let output = unsafe { stream.alloc::<f32>(num_elements) }
+=======
+        // Allocate output buffer on the same device
+        let device = loader.device();
+        let output = device
+            .alloc_zeros::<f32>(num_elements)
+>>>>>>> Stashed changes
             .map_err(|e| LLMError::GpuError(format!("CudaRMSNorm: output alloc failed: {e}")))?;
 
         let hidden_size_i32 = hidden_size as i32;
@@ -86,14 +107,7 @@ impl CudaRMSNorm {
         // memory layout as documented in rms_norm.cu.
         let func = loader.get_func("rms_norm", "rms_norm_kernel")?;
         unsafe {
-            stream
-                .launch_builder(&func)
-                .arg(&output)
-                .arg(input)
-                .arg(weight)
-                .arg(&eps)
-                .arg(&hidden_size_i32)
-                .launch(cfg)
+            func.launch(cfg, (&output, input, weight, eps, hidden_size_i32, weight_offset))
                 .map_err(|e| {
                     LLMError::GpuError(format!("CudaRMSNorm: kernel launch failed: {e}"))
                 })?;
@@ -111,7 +125,17 @@ impl CudaRMSNorm {
         eps: f32,
         hidden_size: usize,
         loader: &KernelLoader,
-        stream: &CudaStream,
+    ) -> Result<()> {
+        Self::forward_inplace_with_offset(input, weight, eps, hidden_size, loader, 0.0)
+    }
+
+    pub fn forward_inplace_with_offset(
+        input: &mut CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        eps: f32,
+        hidden_size: usize,
+        loader: &KernelLoader,
+        weight_offset: f32,
     ) -> Result<()> {
         let num_elements = input.len();
         if num_elements == 0 {
@@ -147,24 +171,24 @@ impl CudaRMSNorm {
         // SAFETY: In-place variant -- output pointer == input pointer. The kernel
         // uses __syncthreads() between reading input and writing output within each
         // block, so there is no data race for a single-token-per-block launch.
-        // We extract the raw device pointer first to avoid borrow conflicts from
-        // passing `input` as both &mut (output) and & (input) to the builder.
         let func = loader.get_func("rms_norm", "rms_norm_kernel")?;
-        let (raw_ptr, _sync) = input.device_ptr_mut(stream);
         unsafe {
-            stream
-                .launch_builder(&func)
-                .arg(&raw_ptr)       // output (same ptr)
-                .arg(&raw_ptr)       // input  (same ptr)
-                .arg(weight)
-                .arg(&eps)
-                .arg(&hidden_size_i32)
-                .launch(cfg)
-                .map_err(|e| {
-                    LLMError::GpuError(format!(
-                        "CudaRMSNorm: inplace kernel launch failed: {e}"
-                    ))
-                })?;
+            let mut in_ptr = *DevicePtrMut::device_ptr_mut(input);
+            let mut w_ptr = *DevicePtr::device_ptr(weight);
+            let mut eps_val = eps;
+            let mut hs = hidden_size_i32;
+            let mut wo = weight_offset;
+            let params: &mut [*mut std::ffi::c_void] = &mut [
+                &mut in_ptr as *mut _ as *mut _, // output (aliases input)
+                &mut in_ptr as *mut _ as *mut _, // input
+                &mut w_ptr as *mut _ as *mut _,
+                &mut eps_val as *mut _ as *mut _,
+                &mut hs as *mut _ as *mut _,
+                &mut wo as *mut _ as *mut _,
+            ];
+            func.launch(cfg, params).map_err(|e| {
+                LLMError::GpuError(format!("CudaRMSNorm: inplace kernel launch failed: {e}"))
+            })?;
         }
 
         Ok(())

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bytemuck::Pod;
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::CudaDevice;
 use tracing::{debug, trace};
 
 use crate::allocator::GpuAllocator;
@@ -12,26 +12,20 @@ use crate::device::MemoryInfo;
 use crate::Result;
 
 pub struct CudaGpuAllocator {
-    context: Arc<CudaContext>,
-    stream: Arc<CudaStream>,
+    device: Arc<CudaDevice>,
 }
 
 impl CudaGpuAllocator {
     pub fn new(device_id: usize) -> Result<Self> {
-        let context = CudaContext::new(device_id).map_err(|e| {
+        let device = CudaDevice::new(device_id).map_err(|e| {
             crate::LLMError::MemoryError(format!("CUDA device {device_id} init failed: {e}"))
         })?;
-        let stream = context.default_stream();
         debug!(device_id, "CudaGpuAllocator created");
-        Ok(Self { context, stream })
+        Ok(Self { device })
     }
 
-    pub fn context(&self) -> &Arc<CudaContext> {
-        &self.context
-    }
-
-    pub fn stream(&self) -> &Arc<CudaStream> {
-        &self.stream
+    pub fn device(&self) -> &Arc<CudaDevice> {
+        &self.device
     }
 }
 
@@ -41,7 +35,7 @@ impl GpuAllocator for CudaGpuAllocator {
         trace!(bytes, count, "CUDA alloc");
 
         let slice = unsafe {
-            self.context
+            self.device
                 .bind_to_thread()
                 .map_err(|e| crate::LLMError::MemoryError(format!("CUDA bind failed: {e}")))?;
             let cu_ptr = cudarc::driver::result::malloc_sync(bytes).map_err(|e| {
@@ -50,14 +44,13 @@ impl GpuAllocator for CudaGpuAllocator {
             cudarc::driver::result::memset_d8_sync(cu_ptr, 0, bytes).map_err(|e| {
                 crate::LLMError::MemoryError(format!("CUDA memset failed ({bytes} bytes): {e}"))
             })?;
-            self.stream.upgrade_device_ptr::<T>(cu_ptr, count)
+            self.device.upgrade_device_ptr::<T>(cu_ptr, count)
         };
 
         Ok(GpuBuffer {
             inner: GpuBufferInner::Cuda {
                 slice,
-                context: Arc::clone(&self.context),
-                stream: Arc::clone(&self.stream),
+                device: Arc::clone(&self.device),
             },
         })
     }
@@ -68,9 +61,6 @@ impl GpuAllocator for CudaGpuAllocator {
     }
 
     fn device_memory_info(&self) -> Result<MemoryInfo> {
-        self.context
-            .bind_to_thread()
-            .map_err(|e| crate::LLMError::MemoryError(format!("CUDA bind failed: {e}")))?;
         let (free, total) = cudarc::driver::result::mem_get_info()
             .map_err(|e| crate::LLMError::MemoryError(format!("CUDA mem_get_info failed: {e}")))?;
         Ok(MemoryInfo {

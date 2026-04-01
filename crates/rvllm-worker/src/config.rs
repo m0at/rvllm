@@ -37,8 +37,6 @@ pub struct WorkerConfig {
     pub architecture: String,
     /// Data type for model weights and compute.
     pub dtype: Dtype,
-    /// RMSNorm epsilon. Must match model config exactly (e.g. 1e-6 for Qwen, 1e-5 for Llama).
-    pub rms_norm_eps: f32,
     /// RoPE theta parameter.
     pub rope_theta: f32,
     /// Fraction of head_dim that gets RoPE (Phi: 0.5, others: 1.0).
@@ -53,6 +51,13 @@ pub struct WorkerConfig {
     pub kv_cache_dtype: String,
     /// Enable prefix caching.
     pub enable_prefix_caching: bool,
+    /// Per-layer type for hybrid models: "full_attention" or "linear_attention".
+    /// Empty for standard transformer models.
+    pub layer_types: Vec<String>,
+    /// Qwen3.5: q_proj produces 2x head_dim (query + output gate).
+    pub has_attn_output_gate: bool,
+    /// RMSNorm epsilon (Qwen3.5 uses 1e-6, Llama uses 1e-5).
+    pub rms_norm_eps: f32,
 }
 
 impl WorkerConfig {
@@ -67,10 +72,13 @@ impl WorkerConfig {
             intermediate_size: self.intermediate_size,
             vocab_size: self.vocab_size,
             max_position: self.max_model_len,
-            rms_norm_eps: self.rms_norm_eps,
             dtype: self.dtype,
             architecture: self.architecture.clone(),
             rope_theta: self.rope_theta,
+            layer_types: self.layer_types.clone(),
+            partial_rotary_factor: self.partial_rotary_factor,
+            has_attn_output_gate: self.has_attn_output_gate,
+            rms_norm_eps: self.rms_norm_eps,
         }
     }
 

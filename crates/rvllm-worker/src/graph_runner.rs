@@ -115,13 +115,12 @@ impl GraphRunner {
         let mut context_lens = input.attention_metadata.context_lens.clone();
         let mut block_tables = input.attention_metadata.block_tables.clone();
 
-        // Pad with dummy entries. Use -1 for slot_mapping so cache_write
-        // skips padded tokens (kernel checks slot >= 0).
+        // Pad with dummy entries
         for _ in 0..pad_count {
             token_ids.push(0);
             position_ids.push(0);
-            slot_mapping.push(u32::MAX); // -1 as u32, kernel interprets as negative i32
-            context_lens.push(0); // 0 context = attention kernel skips this seq
+            slot_mapping.push(0);
+            context_lens.push(1);
             block_tables.push(vec![0]);
         }
 
@@ -177,11 +176,6 @@ impl GraphRunner {
     /// Check if a graph has been captured for the given batch size.
     pub fn has_graph_for(&self, batch_size: usize) -> bool {
         self.pool.has_graph(batch_size)
-    }
-
-    /// Check if a graph exists for this EXACT batch size (no padding lookup).
-    pub fn has_graph_for_exact(&self, batch_size: usize) -> bool {
-        self.pool.get_exact(batch_size).is_some()
     }
 
     /// Record that a graph capture was attempted for a batch size.
@@ -368,7 +362,7 @@ mod tests {
     #[test]
     fn pad_input_too_large() {
         let runner = GraphRunner::new(GraphRunnerConfig::default());
-        let input = make_decode_input(512);
+        let input = make_decode_input(64);
         assert!(runner.pad_input(&input).is_err());
     }
 

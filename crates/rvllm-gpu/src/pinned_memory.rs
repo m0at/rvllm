@@ -55,7 +55,7 @@ impl<T: Pod + Send> PinnedBuffer<T> {
 
             // SAFETY: cuMemAllocHost allocates page-locked memory on the host.
             // The pointer is valid until cuMemFreeHost is called (in Drop).
-            let result = unsafe { cudarc::driver::sys::cuMemAllocHost_v2(&mut ptr, bytes) };
+            let result = unsafe { cudarc::driver::sys::lib().cuMemAllocHost_v2(&mut ptr, bytes) };
 
             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 return Err(crate::LLMError::MemoryError(format!(
@@ -184,7 +184,7 @@ impl<T: Pod + Send> Drop for PinnedBuffer<T> {
                 // SAFETY: ptr was allocated with cuMemAllocHost.
                 unsafe {
                     let _ =
-                        cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
+                        cudarc::driver::sys::lib().cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
                 }
             }
         }

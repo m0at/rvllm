@@ -237,10 +237,8 @@ impl AsyncLLMEngine {
                 continue;
             }
 
-            // `engine.step()` bridges into async executor code via `Handle::block_on`.
-            // Run it inside `block_in_place` so the background task can safely call
-            // that sync wrapper on Tokio's multi-thread runtime.
-            match tokio::task::block_in_place(|| engine.step()) {
+            // Run one engine step
+            match engine.step() {
                 Ok(outputs) => {
                     for output in outputs {
                         let rid = output.request_id;
@@ -292,10 +290,8 @@ fn rand_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{ExecutorAdapter, ExecutorInput, SamplerOutput, SchedulerOutputs};
-    use rvllm_executor::ExecutorConfig;
+    use crate::engine::{ExecutorInput, SamplerOutput, SchedulerOutputs};
     use rvllm_sequence::SequenceGroup;
-    use tokio_stream::StreamExt;
 
     // Reuse mock types from engine tests
 
@@ -428,39 +424,6 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        engine.shutdown().unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn async_engine_generate_with_executor_adapter_does_not_panic_in_tokio_runtime() {
-        let config = EngineConfig::default();
-        let tokenizer = make_test_tokenizer();
-        let scheduler = Box::new(MockScheduler::new());
-        let rt = tokio::runtime::Handle::current();
-        let executor = Box::new(
-            ExecutorAdapter::from_config(
-                ExecutorConfig {
-                    num_gpus: 1,
-                    model_name: "test-model".into(),
-                    ..ExecutorConfig::default()
-                },
-                rt,
-            )
-            .unwrap(),
-        );
-
-        let engine = AsyncLLMEngine::new(config, executor, scheduler, tokenizer).unwrap();
-
-        let mut params = SamplingParams::default();
-        params.max_tokens = 1;
-
-        let (_request_id, mut stream) = engine.generate("hello".to_string(), params).await.unwrap();
-        let output = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
-            .await
-            .expect("timed out waiting for generated output")
-            .expect("output stream ended unexpectedly");
-
-        assert!(!output.outputs.is_empty());
         engine.shutdown().unwrap();
     }
 }

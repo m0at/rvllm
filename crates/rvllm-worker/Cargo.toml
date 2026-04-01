@@ -13,11 +13,11 @@ categories = ["concurrency", "hardware-support"]
 
 [features]
 default = []
-cuda = ["dep:cudarc", "rvllm-gpu/cuda", "rvllm-gpu/cuda-graphs", "rvllm-model-runner/cuda", "rvllm-kv-cache/cuda", "rvllm-sampling/cuda", "rvllm-model-loader/cuda"]
+cuda = ["dep:cudarc", "rvllm-gpu/cuda", "rvllm-model-runner/cuda", "rvllm-kv-cache/cuda", "rvllm-sampling/cuda", "rvllm-model-loader/cuda"]
 cublaslt = ["cuda", "rvllm-gpu/cublaslt", "rvllm-model-runner/cublaslt"]
 
 [dependencies]
-cudarc = { version = "0.19", features = ["driver", "cublas", "f16"], optional = true }
+cudarc = { version = "0.12", features = ["driver", "cublas", "f16", "cuda-12060"], optional = true }
 half = "2"
 rvllm-core.workspace = true
 rvllm-config.workspace = true
@@ -30,6 +30,7 @@ rvllm-fusion.workspace = true
 rvllm-sequence.workspace = true
 rvllm-telemetry.workspace = true
 hf-hub = "0.4"
+openssl = { workspace = true }
 memmap2.workspace = true
 metrics-exporter-prometheus.workspace = true
 serde_json.workspace = true

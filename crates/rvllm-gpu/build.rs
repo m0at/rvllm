@@ -12,7 +12,7 @@
 //
 // Supported architectures: sm_70 (Volta), sm_75 (Turing), sm_80/sm_86/sm_89 (Ampere),
 // sm_90/sm_90a (Hopper), sm_100/sm_100a (Blackwell data-center),
-// sm_120/sm_122 (Blackwell consumer).
+// sm_120/sm_121/sm_122 (Blackwell consumer: RTX 5090/GB10/RTX 5080).
 //
 // On Mac / CI without CUDA toolkit this is a silent no-op.
 
@@ -49,6 +49,7 @@ fn cc_to_sm(cc: &str) -> Option<&'static str> {
         "9.0" => Some("sm_90"),
         "10.0" => Some("sm_100"),
         "12.0" => Some("sm_120"),
+        "12.1" => Some("sm_121"),
         "12.2" => Some("sm_122"),
         _ => None,
     }
@@ -133,6 +134,7 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
             };
             let ptx_path = ptx_dir.join(&ptx_name);
 
+<<<<<<< Updated upstream
             // Cooperative-groups kernels need cubin (not PTX) to preserve
             // grid-level sync. PTX compilation downgrades grid.sync() to
             // block-level bar.sync which silently breaks the kernel.
@@ -181,6 +183,20 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
                             stem, arch, e
                         );
                     }
+=======
+            let status = Command::new(nvcc)
+                .args(["-ptx", &format!("-arch={}", arch), "-O3", "-o"])
+                .arg(&ptx_path)
+                .arg(&path)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    println!(
+                        "cargo:warning=Compiled kernel: {}.cu -> {} ({})",
+                        stem, ptx_name, arch
+                    );
+>>>>>>> Stashed changes
                 }
             } else {
                 let mut nvcc_cmd = Command::new(nvcc);
@@ -212,6 +228,7 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
     }
 
     println!("cargo:rustc-env=RVLLM_PTX_DIR={}", ptx_dir.display());
+<<<<<<< Updated upstream
 
     // Also copy PTX files to workspace target/ptx/ where the runtime loader
     // checks first (avoids hash-dependent build output paths).
@@ -244,6 +261,8 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
             }
         }
     }
+=======
+>>>>>>> Stashed changes
 }
 
 fn main() {

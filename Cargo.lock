@@ -629,9 +629,9 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.19.4"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f071cd6a7b5d51607df76aa2d426aaabc7a74bc6bdb885b8afa63a880572ad9b"
+checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
 dependencies = [
  "half",
  "libloading 0.9.0",
@@ -1573,6 +1573,7 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 [[package]]
 name = "libloading"
 version = "0.8.9"
+<<<<<<< Updated upstream
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
@@ -1583,8 +1584,10 @@ dependencies = [
 [[package]]
 name = "libloading"
 version = "0.9.0"
+=======
+>>>>>>> Stashed changes
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
  "cfg-if",
  "windows-link",
@@ -1953,6 +1956,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "openssl-src"
+version = "300.5.5+3.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f1787d533e03597a7934fd0a765f0d28e94ecc5fb7789f8053b1e699a56f709"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "openssl-sys"
 version = "0.9.112"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1960,6 +1972,7 @@ checksum = "57d55af3b3e226502be1526dfdba67ab0e9c96fc293004e79576b2b9edb0dbdb"
 dependencies = [
  "cc",
  "libc",
+ "openssl-src",
  "pkg-config",
  "vcpkg",
 ]
@@ -2925,7 +2938,6 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tokio",
- "tokio-stream",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2963,6 +2975,7 @@ name = "rvllm-tokenizer"
 version = "0.1.0"
 dependencies = [
  "hf-hub",
+ "openssl",
  "rvllm-core",
  "serde",
  "serde_json",
@@ -2991,6 +3004,7 @@ dependencies = [
  "hf-hub",
  "memmap2",
  "metrics-exporter-prometheus",
+ "openssl",
  "rand 0.8.5",
  "rvllm-config",
  "rvllm-core",

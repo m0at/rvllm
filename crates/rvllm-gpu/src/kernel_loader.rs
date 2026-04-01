@@ -4,18 +4,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaStream, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::Ptx;
-use tracing::{debug, info, trace};
-
-/// Extract the raw CUfunction handle from a CudaFunction.
-/// CudaFunction's first field is `cu_function: sys::CUfunction` (a *mut CUfunc_st).
-/// SAFETY: CudaFunction is a non-repr(C) struct but the first field is always at offset 0 for
-/// a struct whose first field is a pointer (no padding before it). This is an implementation
-/// detail of cudarc 0.19 and is only used in unsafe raw-launch paths.
-unsafe fn extract_cu_function(func: &CudaFunction) -> cudarc::driver::sys::CUfunction {
-    std::ptr::read((func as *const CudaFunction).cast::<cudarc::driver::sys::CUfunction>())
-}
+use tracing::{debug, info, trace, warn};
 
 use crate::Result;
 
@@ -27,6 +18,7 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         &["silu_kernel", "fused_silu_mul_kernel", "gelu_kernel"],
     ),
     ("argmax", &["argmax_kernel"]),
+    ("argmax_f16", &["argmax_f16_kernel"]),
     (
         "activation_f16",
         &[
@@ -35,12 +27,44 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
             "gelu_f16_kernel",
         ],
     ),
-    ("add_bias", &["add_bias_kernel", "add_kernel"]),
+    (
+        "add_bias",
+        &["add_bias_kernel", "add_kernel", "add_inplace_kernel"],
+    ),
+    (
+        "attn_gate",
+        &["split_gate_kernel", "truncate_q_kernel", "sigmoid_gate_kernel"],
+    ),
     (
         "add_bias_f16",
         &["add_bias_f16_kernel", "add_f16_kernel", "add_inplace_f16_kernel"],
     ),
     ("copy_blocks", &["copy_blocks_kernel"]),
+    ("copy_blocks_f16", &["copy_blocks_f16_kernel"]),
+    ("dequant_f16", &["dequant_f16_to_f32"]),
+    (
+        "dequant_fp8",
+        &[
+            "dequant_fp8_to_f16_kernel",
+            "dequant_fp8_scaled_to_f16_kernel",
+            "dequant_fp8_blockwise_to_f16_kernel",
+            "dequant_fp8_to_bf16_kernel",
+            "dequant_fp8_scaled_to_bf16_kernel",
+            "dequant_fp8_blockwise_to_bf16_kernel",
+        ],
+    ),
+    (
+        "fp8_gemv",
+        &["fp8_gemv_blockwise_kernel", "fp8_gemv_blockwise_vec_kernel", "fp8_gemv_blockwise_lut_kernel", "fp8_gemv_blockwise_v2_kernel", "fp8_gemv_scaled_kernel", "fp8_gemv_kernel", "fp8_gemv_blockwise_wpr_kernel", "fp8_gemv_blockwise_wpr_lut_kernel", "fp8_gemv_blockwise_wpr_native_kernel"],
+    ),
+    (
+        "fp8_gemv_smem",
+        &["fp8_gemv_smem_kernel"],
+    ),
+    (
+        "int4_gemv",
+        &["int4_gemv_kernel", "dequant_int4_to_f16_kernel"],
+    ),
     ("embedding_gather", &["embedding_gather_kernel"]),
     ("embedding_gather_f16", &["embedding_gather_f16_kernel"]),
     (
@@ -50,10 +74,10 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
             "flash_attention_2_decode_kernel",
             "flash_attention_2_f16kv_kernel",
             "flash_attention_2_decode_f16kv_kernel",
-            "flash_attention_2_decode_f16io_kernel",
         ],
     ),
     (
+<<<<<<< Updated upstream
         "flash_attention_3",
         &["flash_attention_3_decode_f16io_kernel", "flash_attention_3_decode_gqa_f16io_kernel"],
     ),
@@ -66,6 +90,8 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         &["fa3_v3_decode_gqa_kernel", "fa3_v3_decode_kernel", "fa3_v3_combine_f16_kernel"],
     ),
     (
+=======
+>>>>>>> Stashed changes
         "fp8_kv",
         &[
             "quantize_kv_kernel",
@@ -75,28 +101,22 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     ("fused_residual_rmsnorm", &["fused_residual_rmsnorm_kernel"]),
-    ("fused_residual_rmsnorm_f16", &["fused_residual_rmsnorm_f16_kernel"]),
+    (
+        "fused_residual_rmsnorm_f16",
+        &["fused_residual_rmsnorm_f16_kernel"],
+    ),
     (
         "paged_attention",
         &["paged_attention_v2_kernel", "paged_attention_v2_f16kv_kernel"],
     ),
     (
-        "split_kv_attention",
-        &[
-            "split_kv_decode_f16kv_kernel",
-            "split_kv_combine_kernel",
-            "split_kv_decode_fp8kv_kernel",
-            "split_kv_decode_single_f16kv_kernel",
-            "split_kv_decode_f16io_kernel",
-            "split_kv_combine_f16io_kernel",
-        ],
-    ),
-    (
         "reshape_and_cache",
         &["reshape_and_cache_kernel", "reshape_and_cache_f16_kernel"],
     ),
+    ("reshape_and_cache_f16", &["reshape_and_cache_f16_kernel"]),
     (
         "cast_fp",
+<<<<<<< Updated upstream
         &["cast_f32_to_f16_kernel", "cast_f16_to_f32_kernel"],
     ),
     (
@@ -137,106 +157,47 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "gemv_fp8",
+=======
+>>>>>>> Stashed changes
         &[
-            "gemv_fp8_kernel",
-            "fused_add_norm_fp8_gemv_kernel",
-            "fused_norm_fp8_gemv_kernel",
-            "fused_silu_down_fp8_gemv_kernel",
+            "cast_f32_to_f16_kernel",
+            "cast_f16_to_f32_kernel",
+            "cast_f32_to_bf16_kernel",
+            "cast_bf16_to_f32_kernel",
+            "round_f32_to_bf16_kernel",
         ],
     ),
-    (
-        "tma_gemv_fp16",
-        &["tma_gemv_fp16_kernel", "tma_gemv_fp16_bias_kernel"],
-    ),
-    (
-        "wgmma_gemv",
-        &[
-            "wgmma_gemv_f16_kernel",
-            "wgmma_gemv_f16_unrolled_kernel",
-            "wgmma_gemv_f16_splitk_kernel",
-            "splitk_f32_to_f16_kernel",
-        ],
-    ),
-    ("cutlass_qkv_bias", &["cutlass_qkv_bias_gemm"]),
-    ("cutlass_oproj_residual", &["cutlass_oproj_residual_gemm"]),
-    ("cutlass_gateup_silu", &["cutlass_gateup_gemm"]),
-    ("cast_f16_to_fp8", &["cast_f16_to_fp8_kernel"]),
-    ("jit_add_norm_qkv", &["fused_add_rmsnorm_gemv_3584x4608"]),
-    ("jit_add_norm_gateup", &["fused_add_rmsnorm_gemv_3584x37888"]),
-    ("jit_silu_down", &["fused_silu_mul_gemv_18944x3584"]),
-    ("jit_norm_qkv", &["fused_rmsnorm_gemv_3584x4608"]),
-    ("gemv_f16", &["gemv_f16_kernel", "gemv_batched_f16_kernel"]),
     ("rms_norm", &["rms_norm_kernel"]),
-    ("rms_norm_f16", &["rms_norm_f16_kernel"]),
+    (
+        "rms_norm_f16",
+        &["rms_norm_f16_kernel", "fused_residual_rmsnorm_f16_kernel"],
+    ),
     ("rotary_embedding", &["rotary_embedding_kernel"]),
     ("rotary_embedding_f16", &["rotary_embedding_f16_kernel"]),
     ("softmax", &["softmax_kernel"]),
+    ("softmax_f16", &["softmax_f16_kernel"]),
     (
-        "fused_lm_head_argmax",
+        "mamba2_ssm",
         &[
-            "fused_lm_head_argmax_kernel",
-            "fused_lm_head_argmax_reduce_kernel",
+            "mamba2_conv1d_step",
+            "mamba2_compute_gates",
+            "mamba2_l2_normalize",
+            "mamba2_gqa_expand",
+            "mamba2_ssm_step",
+            "mamba2_norm_gate",
+            "mamba2_init_state",
+            "mamba2_small_gemv",
         ],
-    ),
-    (
-        "fused_lm_head_argmax_f16",
-        &["fused_lm_head_argmax_f16_kernel"],
     ),
 ];
 
-/// Wrapper for a raw CUmodule loaded from cubin bytes.
-/// Cubin modules can't go through cudarc's Ptx path because cudarc
-/// compiles PTX source, but cubin is already compiled device code.
-struct RawCubinModule {
-    module: cudarc::driver::sys::CUmodule,
-}
-
-impl RawCubinModule {
-    unsafe fn new(module: cudarc::driver::sys::CUmodule) -> Self {
-        Self { module }
-    }
-
-    fn get_function(&self, name: &str) -> std::result::Result<cudarc::driver::sys::CUfunction, String> {
-        let c_name = std::ffi::CString::new(name).map_err(|e| format!("invalid function name: {e}"))?;
-        let mut func = std::mem::MaybeUninit::<cudarc::driver::sys::CUfunction>::uninit();
-        let result = unsafe {
-            cudarc::driver::sys::cuModuleGetFunction(
-                func.as_mut_ptr(),
-                self.module,
-                c_name.as_ptr(),
-            )
-        };
-        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(format!("cuModuleGetFunction('{}') failed: {:?}", name, result));
-        }
-        Ok(unsafe { func.assume_init() })
-    }
-}
-
-impl Drop for RawCubinModule {
-    fn drop(&mut self) {
-        unsafe {
-            cudarc::driver::sys::cuModuleUnload(self.module);
-        }
-    }
-}
-
-// SAFETY: CUmodule is a device handle that can be used from any thread
-// as long as the CUDA context is current. KernelLoader ensures context
-// binding before any operation.
-unsafe impl Send for RawCubinModule {}
-unsafe impl Sync for RawCubinModule {}
-
 /// Loads and manages CUDA PTX modules, providing kernel launch capabilities.
 ///
-/// Wraps `cudarc::driver::CudaContext` module management with a higher-level
+/// Wraps `cudarc::driver::CudaDevice` module management with a higher-level
 /// API that understands the vllm-rs kernel naming conventions.
 pub struct KernelLoader {
-    context: Arc<CudaContext>,
-    stream: Arc<CudaStream>,
-    modules: HashMap<String, Arc<CudaModule>>,
-    cubin_modules: HashMap<String, RawCubinModule>,
-    loaded_func_names: HashMap<String, Vec<&'static str>>,
+    device: Arc<CudaDevice>,
+    loaded_modules: HashMap<String, Vec<&'static str>>,
 }
 
 impl KernelLoader {
@@ -244,17 +205,10 @@ impl KernelLoader {
     ///
     /// Falls back to the `RVLLM_KERNEL_DIR` environment variable if `kernel_dir`
     /// does not contain any .ptx files.
-    pub fn new(
-        context: Arc<CudaContext>,
-        stream: Arc<CudaStream>,
-        kernel_dir: &Path,
-    ) -> Result<Self> {
+    pub fn new(device: Arc<CudaDevice>, kernel_dir: &Path) -> Result<Self> {
         let mut loader = Self {
-            context,
-            stream,
-            modules: HashMap::new(),
-            cubin_modules: HashMap::new(),
-            loaded_func_names: HashMap::new(),
+            device,
+            loaded_modules: HashMap::new(),
         };
 
         let dir = if kernel_dir.exists() && kernel_dir.is_dir() {
@@ -285,13 +239,10 @@ impl KernelLoader {
 
     /// Create a KernelLoader with no pre-loaded kernels.
     /// Kernels can be loaded later via `load_ptx`.
-    pub fn empty(context: Arc<CudaContext>, stream: Arc<CudaStream>) -> Self {
+    pub fn empty(device: Arc<CudaDevice>) -> Self {
         Self {
-            context,
-            stream,
-            modules: HashMap::new(),
-            cubin_modules: HashMap::new(),
-            loaded_func_names: HashMap::new(),
+            device,
+            loaded_modules: HashMap::new(),
         }
     }
 
@@ -318,81 +269,14 @@ impl KernelLoader {
 
         let ptx = Ptx::from_src(ptx_src);
 
-        let module = self.context.load_module(ptx).map_err(|e| {
+        self.device.load_ptx(ptx, name, func_names).map_err(|e| {
             crate::LLMError::GpuError(format!("failed to load PTX module '{name}': {e}"))
         })?;
 
         debug!(module = name, functions = ?func_names, "loaded PTX module");
-        self.modules.insert(name.to_string(), module);
-        self.loaded_func_names
+        self.loaded_modules
             .insert(name.to_string(), func_names.to_vec());
         Ok(())
-    }
-
-    /// Load a cubin module from raw bytes.
-    ///
-    /// Cubin (compiled binary) modules are required for kernels using
-    /// cooperative_groups grid.sync() since PTX compilation downgrades
-    /// grid-level sync to block-level bar.sync. The cubin must be compiled
-    /// offline with `nvcc -arch=sm_XX -cubin`.
-    ///
-    /// `cuModuleLoadData` accepts both cubin and PTX, so we use the same
-    /// driver call but skip the Ptx wrapper.
-    pub fn load_cubin(&mut self, name: &str, cubin_bytes: &[u8]) -> Result<()> {
-        let func_names = self.resolve_function_names(name);
-        self.load_cubin_with_functions(name, cubin_bytes, &func_names)
-    }
-
-    /// Load a cubin module from raw bytes with explicit function names.
-    pub fn load_cubin_with_functions(
-        &mut self,
-        name: &str,
-        cubin_bytes: &[u8],
-        func_names: &[&'static str],
-    ) -> Result<()> {
-        use std::ffi::c_void;
-
-        self.context
-            .bind_to_thread()
-            .map_err(|e| crate::LLMError::GpuError(format!("CUDA bind for cubin load: {e}")))?;
-
-        // cuModuleLoadData accepts cubin bytes directly
-        let mut module_handle = std::mem::MaybeUninit::<cudarc::driver::sys::CUmodule>::uninit();
-        let result = unsafe {
-            cudarc::driver::sys::cuModuleLoadData(
-                module_handle.as_mut_ptr(),
-                cubin_bytes.as_ptr() as *const c_void,
-            )
-        };
-        if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(crate::LLMError::GpuError(format!(
-                "cuModuleLoadData failed for cubin '{}': {:?}", name, result
-            )));
-        }
-
-        // Wrap the raw CUmodule in an Arc<CudaModule> via load_module with PTX
-        // fallback: create a Ptx from a minimal valid PTX to get a CudaModule,
-        // then we actually need the raw handle. Since cudarc doesn't expose
-        // CudaModule::from_raw, we use the raw function loading path instead.
-        //
-        // Store the raw module handle and look up functions via cuModuleGetFunction.
-        let raw_module = unsafe { module_handle.assume_init() };
-        let wrapped = unsafe { RawCubinModule::new(raw_module) };
-        debug!(module = name, functions = ?func_names, "loaded cubin module");
-        self.cubin_modules.insert(name.to_string(), wrapped);
-        self.loaded_func_names
-            .insert(name.to_string(), func_names.to_vec());
-        Ok(())
-    }
-
-    /// Load a cubin module from a file path.
-    pub fn load_cubin_file(&mut self, name: &str, path: &Path) -> Result<()> {
-        let bytes = std::fs::read(path).map_err(|e| {
-            crate::LLMError::GpuError(format!(
-                "failed to read cubin file '{}': {e}", path.display()
-            ))
-        })?;
-        self.load_cubin(name, &bytes)
     }
 
     /// Load a PTX file from disk by path.
@@ -400,49 +284,26 @@ impl KernelLoader {
         let func_names = self.resolve_function_names(name);
         let ptx = Ptx::from_file(path);
 
-        let module = self.context.load_module(ptx).map_err(|e| {
+        self.device.load_ptx(ptx, name, &func_names).map_err(|e| {
             crate::LLMError::GpuError(format!("failed to load PTX file '{}': {e}", path.display()))
         })?;
 
         debug!(module = name, path = %path.display(), "loaded PTX file");
-        self.modules.insert(name.to_string(), module);
-        self.loaded_func_names
+        self.loaded_modules
             .insert(name.to_string(), func_names.to_vec());
         Ok(())
     }
 
     /// Retrieve a loaded CUDA function by module and function name.
-    ///
-    /// Checks PTX modules first, then cubin modules.
     pub fn get_func(&self, module: &str, function: &str) -> Result<CudaFunction> {
-        if let Some(m) = self.modules.get(module) {
-            return m.load_function(function).map_err(|e| {
-                crate::LLMError::GpuError(format!(
-                    "function '{function}' not found in module '{module}': {e}"
-                ))
-            });
-        }
-        // Cubin modules use raw CUfunction handles -- not wrapped in CudaFunction.
-        // For cubin functions, use get_cubin_func() instead.
-        Err(crate::LLMError::GpuError(format!("module '{module}' not loaded")))
-    }
-
-    /// Retrieve a raw CUfunction from a cubin module.
-    pub fn get_cubin_func(
-        &self,
-        module: &str,
-        function: &str,
-    ) -> Result<cudarc::driver::sys::CUfunction> {
-        let m = self.cubin_modules.get(module).ok_or_else(|| {
-            crate::LLMError::GpuError(format!("cubin module '{module}' not loaded"))
-        })?;
-        m.get_function(function).map_err(|e| {
+        self.device.get_func(module, function).ok_or_else(|| {
             crate::LLMError::GpuError(format!(
-                "function '{function}' not found in cubin module '{module}': {e}"
+                "function '{function}' not found in module '{module}'"
             ))
         })
     }
 
+<<<<<<< Updated upstream
     /// Like get_func but panics if the kernel is missing.
     /// Use this for kernels that MUST be available -- no silent fallbacks.
     pub fn require_func(&self, module: &str, function: &str) -> CudaFunction {
@@ -504,26 +365,24 @@ impl KernelLoader {
     }
 
     /// Check if a module has been loaded (PTX or cubin).
+=======
+    /// Check if a module has been loaded.
+>>>>>>> Stashed changes
     pub fn has_module(&self, module: &str) -> bool {
-        self.modules.contains_key(module) || self.cubin_modules.contains_key(module)
+        self.loaded_modules.contains_key(module)
     }
 
-    /// Check if a specific function is available in a loaded module (PTX or cubin).
+    /// Check if a specific function is available.
     pub fn has_func(&self, module: &str, function: &str) -> bool {
-        if let Some(m) = self.modules.get(module) {
-            return m.load_function(function).ok().is_some();
-        }
-        if let Some(m) = self.cubin_modules.get(module) {
-            return m.get_function(function).is_ok();
-        }
-        false
+        self.device.has_func(module, function)
     }
 
-    /// Launch a kernel on the loader's stream.
+    /// Launch a kernel on the device's default stream.
     ///
     /// # Safety
     /// The caller must ensure that the kernel arguments match the kernel signature
     /// exactly: correct types, correct count, correct mutability for output buffers.
+    /// See `cudarc::driver::LaunchAsync` for full safety requirements.
     pub unsafe fn launch_raw(
         &self,
         module: &str,
@@ -532,19 +391,8 @@ impl KernelLoader {
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<()> {
         let func = self.get_func(module, function)?;
-        self.context
-            .bind_to_thread()
-            .map_err(|e| crate::LLMError::GpuError(format!("CUDA bind failed: {e}")))?;
-        let cu_func = extract_cu_function(&func);
-        cudarc::driver::result::launch_kernel(
-            cu_func,
-            cfg.grid_dim,
-            cfg.block_dim,
-            cfg.shared_mem_bytes,
-            self.stream.cu_stream(),
-            args,
-        )
-        .map_err(|e| {
+        // SAFETY: caller guarantees args match the kernel signature
+        func.launch(cfg, args).map_err(|e| {
             crate::LLMError::GpuError(format!("kernel launch {module}::{function} failed: {e}"))
         })
     }
@@ -563,58 +411,21 @@ impl KernelLoader {
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<()> {
         let func = self.get_func(module, function)?;
-        self.context
-            .bind_to_thread()
-            .map_err(|e| crate::LLMError::GpuError(format!("CUDA bind failed: {e}")))?;
-        let cu_func = extract_cu_function(&func);
-        cudarc::driver::result::launch_kernel(
-            cu_func,
-            cfg.grid_dim,
-            cfg.block_dim,
-            cfg.shared_mem_bytes,
-            stream.cu_stream(),
-            args,
-        )
-        .map_err(|e| {
+        // SAFETY: caller guarantees args match the kernel signature and
+        // there are no data races on this stream
+        func.launch_on_stream(stream, cfg, args).map_err(|e| {
             crate::LLMError::GpuError(format!(
                 "kernel launch {module}::{function} on stream failed: {e}"
             ))
         })
     }
 
-    /// Launch a cubin kernel on the loader's stream.
-    ///
-    /// For persistent kernels that need cooperative launch, use
-    /// `get_cubin_func` + `cooperative::launch_cooperative` instead.
-    ///
-    /// # Safety
-    /// Same requirements as `launch_raw`.
-    pub unsafe fn launch_cubin_raw(
-        &self,
-        module: &str,
-        function: &str,
-        cfg: LaunchConfig,
-        args: &mut [*mut std::ffi::c_void],
-    ) -> Result<()> {
-        let cu_func = self.get_cubin_func(module, function)?;
-        self.context
-            .bind_to_thread()
-            .map_err(|e| crate::LLMError::GpuError(format!("CUDA bind failed: {e}")))?;
-        cudarc::driver::result::launch_kernel(
-            cu_func,
-            cfg.grid_dim,
-            cfg.block_dim,
-            cfg.shared_mem_bytes,
-            self.stream.cu_stream(),
-            args,
-        )
-        .map_err(|e| {
-            crate::LLMError::GpuError(format!(
-                "cubin kernel launch {module}::{function} failed: {e}"
-            ))
-        })
+    /// Returns a reference to the underlying CUDA device.
+    pub fn device(&self) -> &Arc<CudaDevice> {
+        &self.device
     }
 
+<<<<<<< Updated upstream
     /// Launch a cubin kernel cooperatively (all blocks must be co-resident).
     ///
     /// Uses `cuLaunchCooperativeKernel` so grid-level synchronization via
@@ -658,64 +469,41 @@ impl KernelLoader {
     }
 
     /// List all loaded module names (PTX and cubin).
+=======
+    /// List all loaded module names.
+>>>>>>> Stashed changes
     pub fn loaded_modules(&self) -> Vec<&str> {
-        self.modules.keys()
-            .chain(self.cubin_modules.keys())
-            .map(|s| s.as_str())
-            .collect()
+        self.loaded_modules.keys().map(|s| s.as_str()).collect()
     }
 
     // --- private helpers ---
 
-    /// Scan a directory for .ptx and .cubin files and load each one.
-    ///
-    /// When both `foo.ptx` and `foo.cubin` exist for the same stem, the cubin
-    /// takes priority (it preserves grid-level sync for cooperative kernels).
+    /// Scan a directory for .ptx files and load each one.
     fn load_directory(&mut self, dir: &Path) -> Result<()> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
             crate::LLMError::GpuError(format!("cannot read kernel dir '{}': {e}", dir.display()))
         })?;
 
-        // Collect all files, preferring .cubin over .ptx when both exist
-        let mut ptx_files: HashMap<String, std::path::PathBuf> = HashMap::new();
-        let mut cubin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
-
+        let mut count = 0u32;
         for entry in entries {
             let entry =
                 entry.map_err(|e| crate::LLMError::GpuError(format!("readdir error: {e}")))?;
             let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str());
-            let stem = path.file_stem().and_then(|s| s.to_str()).map(String::from);
-            match (ext, stem) {
-                (Some("ptx"), Some(s)) => { ptx_files.insert(s, path); }
-                (Some("cubin"), Some(s)) => { cubin_files.insert(s, path); }
-                _ => {}
+            if path.extension().and_then(|e| e.to_str()) == Some("ptx") {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                match self.load_ptx_file(stem, &path) {
+                    Ok(()) => count += 1,
+                    Err(e) => {
+                        warn!(module = stem, error = %e, "skipping PTX file that failed to load");
+                    }
+                }
             }
         }
 
-        let mut count = 0u32;
-
-        // Load cubin files first
-        for (stem, path) in &cubin_files {
-            self.load_cubin_file(stem, path)?;
-            count += 1;
-        }
-
-        // Load PTX files that don't have a cubin counterpart
-        for (stem, path) in &ptx_files {
-            if !cubin_files.contains_key(stem) {
-                self.load_ptx_file(stem, path)?;
-                count += 1;
-            } else {
-                debug!(stem, "skipping PTX, cubin version loaded");
-            }
-        }
-
-        info!(
-            dir = %dir.display(), count,
-            ptx = ptx_files.len(), cubin = cubin_files.len(),
-            "loaded kernel files from directory"
-        );
+        info!(dir = %dir.display(), count, "loaded PTX files from directory");
         Ok(())
     }
 
@@ -759,9 +547,8 @@ mod tests {
 
     #[test]
     fn resolve_known_kernel_names() {
-        let context = CudaContext::new(0).unwrap();
-        let stream = context.new_stream().unwrap();
-        let loader = KernelLoader::empty(context, stream);
+        let device = CudaDevice::new(0).unwrap();
+        let loader = KernelLoader::empty(device);
 
         let names = loader.resolve_function_names("activation");
         assert_eq!(
@@ -775,9 +562,8 @@ mod tests {
 
     #[test]
     fn resolve_unknown_uses_convention() {
-        let context = CudaContext::new(0).unwrap();
-        let stream = context.new_stream().unwrap();
-        let loader = KernelLoader::empty(context, stream);
+        let device = CudaDevice::new(0).unwrap();
+        let loader = KernelLoader::empty(device);
 
         let names = loader.resolve_function_names("my_custom");
         assert_eq!(names, &["my_custom_kernel"]);
@@ -785,18 +571,16 @@ mod tests {
 
     #[test]
     fn empty_loader_has_no_modules() {
-        let context = CudaContext::new(0).unwrap();
-        let stream = context.new_stream().unwrap();
-        let loader = KernelLoader::empty(context, stream);
+        let device = CudaDevice::new(0).unwrap();
+        let loader = KernelLoader::empty(device);
         assert!(loader.loaded_modules().is_empty());
         assert!(!loader.has_module("anything"));
     }
 
     #[test]
     fn new_with_nonexistent_dir() {
-        let context = CudaContext::new(0).unwrap();
-        let stream = context.new_stream().unwrap();
-        let loader = KernelLoader::new(context, stream, &PathBuf::from("/nonexistent/path")).unwrap();
+        let device = CudaDevice::new(0).unwrap();
+        let loader = KernelLoader::new(device, &PathBuf::from("/nonexistent/path")).unwrap();
         assert!(loader.loaded_modules().is_empty());
     }
 }

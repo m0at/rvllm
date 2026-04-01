@@ -32,7 +32,7 @@
 // Tile sizes for K/V streaming. Br = rows of Q per tile, Bc = cols of K per tile.
 // For decode (single query token), Br=1 is optimal.
 // For prefill, Br=64 or 128 is typical.
-#define FA2_BC 64          // K/V tile width (number of KV positions per tile)
+#define FA2_BC 32          // K/V tile width (reduced from 64 for head_dim=256 on Blackwell)
 #define FA2_THREADS 128    // Threads per block
 
 // ============================================================================

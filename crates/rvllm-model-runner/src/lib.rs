@@ -18,14 +18,6 @@ pub mod gpu_layer;
 #[cfg(feature = "cuda")]
 pub mod gpu_runner;
 
-/// Type alias for cublasLt handle. Compiles to a usable type with the
-/// `cublaslt` feature, or a zero-size dummy without it. This lets
-/// function signatures reference it unconditionally.
-#[cfg(feature = "cublaslt")]
-pub type CublasLtRef = rvllm_gpu::cublaslt_ops::CublasLtOps;
-#[cfg(not(feature = "cublaslt"))]
-pub type CublasLtRef = ();
-
 pub use architectures::{create_model, Architecture};
 pub use input::ModelInput;
 pub use runner::{ModelRunner, ModelRunnerConfig};

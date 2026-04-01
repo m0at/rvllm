@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice as _};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -29,8 +29,7 @@ pub(crate) enum GpuBufferInner<T: Pod + Send> {
     #[cfg(feature = "cuda")]
     Cuda {
         slice: CudaSlice<T>,
-        context: Arc<CudaContext>,
-        stream: Arc<CudaStream>,
+        device: Arc<cudarc::driver::CudaDevice>,
     },
     #[cfg(not(any(feature = "mock-gpu", feature = "cuda")))]
     #[allow(dead_code)]
@@ -70,10 +69,9 @@ impl<T: Pod + Send> GpuBuffer<T> {
             #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, .. } => data.as_ptr(),
             #[cfg(feature = "cuda")]
-            GpuBufferInner::Cuda { slice, stream, .. } => {
+            GpuBufferInner::Cuda { slice, .. } => {
                 // SAFETY: returns device pointer as raw ptr for kernel launches
-                let (ptr, _sync) = slice.device_ptr(stream);
-                ptr as *const T
+                *slice.device_ptr() as *const T
             }
             #[cfg(not(any(feature = "mock-gpu", feature = "cuda")))]
             GpuBufferInner::Placeholder { ptr, .. } => *ptr as *const T,
@@ -85,10 +83,9 @@ impl<T: Pod + Send> GpuBuffer<T> {
             #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, .. } => data.as_mut_ptr(),
             #[cfg(feature = "cuda")]
-            GpuBufferInner::Cuda { slice, stream, .. } => {
+            GpuBufferInner::Cuda { slice, .. } => {
                 // SAFETY: returns device pointer as raw mut ptr for kernel launches
-                let (ptr, _sync) = slice.device_ptr_mut(stream);
-                ptr as *mut T
+                *slice.device_ptr_mut() as *mut T
             }
             #[cfg(not(any(feature = "mock-gpu", feature = "cuda")))]
             GpuBufferInner::Placeholder { ptr, .. } => *ptr,
@@ -110,13 +107,15 @@ impl<T: Pod + Send> GpuBuffer<T> {
                 Ok(())
             }
             #[cfg(feature = "cuda")]
-            GpuBufferInner::Cuda { slice, context, stream } => {
-                context
+            GpuBufferInner::Cuda { slice, device } => {
+                device
                     .bind_to_thread()
                     .map_err(|e| crate::LLMError::MemoryError(format!("CUDA bind failed: {e}")))?;
-                let (dst_ptr, _sync) = slice.device_ptr_mut(stream);
                 unsafe {
-                    cudarc::driver::result::memcpy_htod_async(dst_ptr, src, stream.cu_stream())
+                    cudarc::driver::result::memcpy_htod_sync(
+                        *DevicePtrMut::device_ptr_mut(slice),
+                        src,
+                    )
                 }
                 .map_err(|e| crate::LLMError::MemoryError(format!("CUDA htod copy failed: {e}")))?;
                 Ok(())
@@ -133,18 +132,19 @@ impl<T: Pod + Send> GpuBuffer<T> {
             #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, .. } => Ok(data.clone()),
             #[cfg(feature = "cuda")]
-            GpuBufferInner::Cuda { slice, context, stream } => {
-                context
+            GpuBufferInner::Cuda { slice, device } => {
+                device
                     .bind_to_thread()
                     .map_err(|e| crate::LLMError::MemoryError(format!("CUDA bind failed: {e}")))?;
-                let (src_ptr, _sync) = slice.device_ptr(stream);
-                let mut host = vec![T::zeroed(); slice.len()];
+                let len = cudarc::driver::DeviceSlice::len(slice);
+                let mut host = vec![T::zeroed(); len];
                 unsafe {
-                    cudarc::driver::result::memcpy_dtoh_async(&mut host, src_ptr, stream.cu_stream())
+                    cudarc::driver::result::memcpy_dtoh_sync(
+                        &mut host,
+                        *DevicePtr::device_ptr(slice),
+                    )
                 }
                 .map_err(|e| crate::LLMError::MemoryError(format!("CUDA dtoh copy failed: {e}")))?;
-                stream.synchronize()
-                    .map_err(|e| crate::LLMError::MemoryError(format!("CUDA sync failed: {e}")))?;
                 Ok(host)
             }
             #[cfg(not(any(feature = "mock-gpu", feature = "cuda")))]
