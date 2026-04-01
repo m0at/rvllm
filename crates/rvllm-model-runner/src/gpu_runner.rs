@@ -247,7 +247,7 @@ mod cuda_impl {
 
             // Precompute RoPE cos/sin tables
             let head_dim = config.head_dim;
-            let max_pos = config.max_position.min(8192);
+            let max_pos = config.max_position.min(32768);
             let half_dim = head_dim / 2;
             let rope_theta = config.rope_theta;
             let mut cos_table = vec![0.0f32; max_pos * half_dim];
@@ -1765,6 +1765,7 @@ mod cuda_impl {
             let p_output     = DevicePtr::device_ptr(&output_gpu, &self.stream).0;
             let i_block_size = block_size as i32;
             let i_max_ctx    = max_context_len as i32;
+            let i_hidden     = hidden as i32;
 
             // smem: hidden_size * 4 + scratch (match attention needs)
             let smem = std::cmp::max(
@@ -1773,7 +1774,7 @@ mod cuda_impl {
             );
 
             #[allow(clippy::cast_ptr_alignment)]
-            let mut args: [*mut c_void; 16] = [
+            let mut args: [*mut c_void; 17] = [
                 &p_tape          as *const u64 as *mut c_void,
                 &num_instructions as *const i32 as *mut c_void,
                 &p_wptrs         as *const u64 as *mut c_void,
@@ -1790,6 +1791,7 @@ mod cuda_impl {
                 &p_output        as *const u64 as *mut c_void,
                 &i_block_size    as *const i32 as *mut c_void,
                 &i_max_ctx       as *const i32 as *mut c_void,
+                &i_hidden        as *const i32 as *mut c_void,
             ];
 
             if smem > 49152 {

@@ -27,7 +27,7 @@
 #define V3_BC 64
 #define V3_THREADS 256
 #define V3_WARPS 8
-#define V3_GQA_MAX_HPG 8
+#define V3_GQA_MAX_HPG 16
 #define V3_SCORE_STRIDE (V3_BC + 1)
 #define V3_CHUNK 8  // f16 elements per cp.async (16 bytes)
 

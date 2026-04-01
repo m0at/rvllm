@@ -320,11 +320,17 @@ impl Scheduler {
 
     /// If there isn't enough GPU memory for all running sequences, preempt
     /// the lowest-priority ones until memory is sufficient.
+    /// Caps at 4 preemptions per call to prevent thrashing loops where
+    /// recompute-mode sequences are immediately re-admitted and re-preempted.
     fn preempt_if_needed(&mut self) -> Result<Vec<(BlockId, BlockId)>> {
         let mut swap_pairs = Vec::new();
+        let mut preempted = 0usize;
+        const MAX_PREEMPTIONS: usize = 4;
 
-        while !self.running.is_empty() && !self.block_manager.above_watermark() {
-            // Preempt the last (lowest-priority after sort) running group.
+        while !self.running.is_empty()
+            && !self.block_manager.above_watermark()
+            && preempted < MAX_PREEMPTIONS
+        {
             let victim = self.running.pop().unwrap();
             tracing::debug!(
                 request_id = %victim.request_id,
@@ -341,14 +347,15 @@ impl Scheduler {
                     self.swapped.push_back(swapped);
                 }
                 PreemptionMode::Recompute => {
-                    // Free blocks, reset prefill progress, put back in waiting.
                     self.free_group(&victim);
                     let mut requeued = victim;
                     requeued.num_prompt_tokens_processed = 0;
                     requeued.set_status(SequenceStatus::Waiting);
-                    self.waiting.push_front(requeued);
+                    // Push to back (not front) so other seqs make progress first
+                    self.waiting.push_back(requeued);
                 }
             }
+            preempted += 1;
         }
 
         Ok(swap_pairs)
