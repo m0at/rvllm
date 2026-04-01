@@ -401,15 +401,15 @@ impl GpuTransformerLayer {
         };
 
         unsafe {
-            let mut builder = self.stream.launch_builder(kernel);
-            builder = builder.arg(&mut qkv_out).arg(&mut residual_out)
+            let builder = self.stream.launch_builder(kernel);
+            let builder = builder.arg(&mut qkv_out).arg(&mut residual_out)
                 .arg(hidden_states).arg(prev_mlp).arg(norm_w).arg(weight);
-            if let Some(scale) = fp8_scale {
-                builder = builder.arg(scale);
-            }
-            if let Some(bias) = qkv_bias {
-                builder = builder.arg(bias);
-            }
+            let builder = if let Some(scale) = fp8_scale {
+                builder.arg(scale)
+            } else { builder };
+            let builder = if let Some(bias) = qkv_bias {
+                builder.arg(bias)
+            } else { builder };
             builder.arg(&eps).arg(&(hidden as i32)).arg(&(qkv_dim as i32))
                 .launch(launch_cfg)
                 .map_err(|e| LLMError::GpuError(format!("fused add_norm_qkv: {e}")))?;

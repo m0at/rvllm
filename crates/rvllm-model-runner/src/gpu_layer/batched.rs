@@ -69,13 +69,7 @@ impl GpuTransformerLayer {
             residual_from_fused = false;
         };
 
-        let residual_ref: &CudaSlice<f16> = if residual_from_fused {
-            &*scratch.down
-        } else {
-            input.hidden_states
-        };
-
-        // 2-3. QKV GEMM + bias
+        // 2-3. QKV GEMM + bias (before taking residual_ref to avoid borrow conflict)
         let used_fused_cutlass = self.batched_qkv_cutlass(
             weights, scratch, cutlass, num_tokens, qkv_dim, hidden, q_dim, kv_dim)?;
 
@@ -83,6 +77,12 @@ impl GpuTransformerLayer {
             self.batched_qkv_gemm(weights, blas, lt, scratch,
                 num_tokens, qkv_dim, hidden, q_dim, kv_dim)?;
         }
+
+        let residual_ref: &CudaSlice<f16> = if residual_from_fused {
+            &*scratch.down
+        } else {
+            input.hidden_states
+        };
 
         // 4-5. RoPE + KV cache write
         if num_tokens == 1 {
