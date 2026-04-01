@@ -14,7 +14,7 @@ use rvllm_core::prelude::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
 use rvllm_gpu::cublas_ops::CublasOps;
 #[cfg(feature = "cublaslt")]
-use rvllm_gpu::cublaslt_ops::{CublasLtOps, CUBLASLT_M_THRESHOLD};
+use rvllm_gpu::cublaslt_ops::CublasLtOps;
 use std::sync::Arc;
 
 /// GPU-accelerated dense linear projection using cuBLAS SGEMM.
@@ -220,10 +220,9 @@ impl CudaLinearLayer {
 
     /// Static forward with f16 weights using cublasLt for decode-sized batches.
     ///
-    /// When `cublaslt` feature is enabled and `m <= CUBLASLT_M_THRESHOLD`,
-    /// uses cublasLt's heuristic algo selection (with workspace + split-K)
-    /// for better decode performance. Falls back to standard cuBLAS hgemm
-    /// for larger batches.
+    /// When `cublaslt` feature is enabled and the shape is either autotuned
+    /// or small enough for the heuristic path, use cublasLt. Falls back to
+    /// standard cuBLAS only when the shape is not covered.
     #[cfg(feature = "cublaslt")]
     pub fn forward_once_f16_lt(
         input: &CudaSlice<f32>,
@@ -235,8 +234,7 @@ impl CudaLinearLayer {
         lt: &CublasLtOps,
         loader: &rvllm_gpu::kernel_loader::KernelLoader,
     ) -> Result<CudaSlice<f32>> {
-        // For large M (prefill), standard cuBLAS is fine -- less overhead.
-        if m > CUBLASLT_M_THRESHOLD {
+        if !lt.should_use_f16_for_shape(m, n, k) {
             return Self::forward_once_f16(input, weight, m, n, k, blas, loader);
         }
 

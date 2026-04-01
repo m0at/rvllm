@@ -399,7 +399,7 @@ mod inner {
 
             #[cfg(feature = "cublaslt")]
             if let Some(lt_ops) = lt {
-                if m <= rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD {
+                if lt_ops.should_use_f16_for_shape(m, n, k) {
                     lt_ops.hgemm_a_bt(m, n, k, 1.0, input, weight, 0.0, &mut output)?;
                     return Ok(output);
                 }
@@ -449,7 +449,7 @@ mod inner {
 
             #[cfg(feature = "cublaslt")]
             if let Some(lt_ops) = lt {
-                if m <= rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD {
+                if lt_ops.should_use_f16_for_shape(m, n, k) {
                     lt_ops.hgemm_a_bt(m, n, k, 1.0, input, weight, 0.0, output)?;
                     return Ok(());
                 }
@@ -471,7 +471,7 @@ mod inner {
         ) -> Result<()> {
             #[cfg(feature = "cublaslt")]
             if let Some(lt_ops) = lt {
-                if m <= rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD {
+                if lt_ops.should_use_f16_for_shape(m, n, k) {
                     return lt_ops.hgemm_a_bt_into(m, n, k, 1.0, input, weight, 0.0, out);
                 }
             }

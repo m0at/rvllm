@@ -355,7 +355,7 @@ impl CublasAutotuner {
         intermediate: usize,
         gate_up_dim: usize,
     ) -> Result<Self> {
-        let m_values: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128];
+        let m_values: &[usize] = &[1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128];
         let nk_shapes: &[(usize, usize)] = &[
             (qkv_dim, hidden),        // QKV projection
             (hidden, q_dim),           // O-proj

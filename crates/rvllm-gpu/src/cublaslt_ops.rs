@@ -9,6 +9,8 @@ use crate::cublaslt_raw as lt_sys;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::f16;
 use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 use crate::{LLMError, Result};
 
@@ -82,6 +84,18 @@ pub struct CublasLtOps {
 }
 
 impl CublasLtOps {
+    fn log_shape_choice_once(&self, m: usize, n: usize, k: usize, cached: bool, use_lt: bool) {
+        if std::env::var("RVLLM_LOG_GEMM_SHAPES").map_or(true, |v| v != "1") {
+            return;
+        }
+        static SEEN: OnceLock<Mutex<HashSet<(usize, usize, usize, bool, bool)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut lock = seen.lock().unwrap();
+        if lock.insert((m, n, k, cached, use_lt)) {
+            tracing::info!(m, n, k, cached, use_lt, "f16 gemm shape decision");
+        }
+    }
+
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
         let handle = CudaBlasLT::new(stream.clone())
             .map_err(|e| LLMError::GpuError(format!("CudaBlasLT init failed: {e}")))?;
@@ -158,6 +172,17 @@ impl CublasLtOps {
         &self.stream
     }
 
+    pub fn has_autotuned_f16(&self, m: usize, n: usize, k: usize) -> bool {
+        self.f16_cache.borrow().contains_key(&(m, n, k))
+    }
+
+    pub fn should_use_f16_for_shape(&self, m: usize, n: usize, k: usize) -> bool {
+        let cached = self.has_autotuned_f16(m, n, k);
+        let use_lt = cached || m <= CUBLASLT_M_THRESHOLD;
+        self.log_shape_choice_once(m, n, k, cached, use_lt);
+        use_lt
+    }
+
     /// Raw cublasLt handle for autotuning.
     pub fn handle(&self) -> &lt_sys::cublasLtHandle_t {
         self.handle.handle()
@@ -179,36 +204,7 @@ impl CublasLtOps {
         beta: f32,
         c: &mut CudaSlice<f16>,
     ) -> Result<()> {
-        // Row-major C[m,n] = A[m,k] @ B[n,k]^T
-        // cuBLAS col-major: C_col[n,m] = B_col[k,n]^T @ A_col[k,m]
-        //   B row[n,k] = col[k,n]. transa=true -> transpose to [n,k]. lda=k.
-        //   A row[m,k] = col[k,m]. transb=false -> [k,m]. ldb=k.
-        //   C_col[n,m]. ldc=n.
-        let cfg = MatmulConfig {
-            transa: true,
-            transb: false,
-            transc: false,
-            m: n as u64,
-            n: m as u64,
-            k: k as u64,
-            alpha,
-            lda: k as i64,
-            ldb: k as i64,
-            beta,
-            ldc: n as i64,
-            stride_a: None,
-            stride_b: None,
-            stride_c: None,
-            stride_bias: None,
-            batch_size: None,
-        };
-
-        unsafe {
-            self.handle
-                .matmul(cfg, b, a, c, None, None)
-                .map_err(|e| LLMError::GpuError(format!("cublasLt hgemm_a_bt failed: {e}")))?;
-        }
-        Ok(())
+        self.hgemm_a_bt_into(m, n, k, alpha, a, b, beta, c)
     }
 
     /// Row-major HGEMM into a view via cublasLt. Accepts any DevicePtr/DevicePtrMut
