@@ -641,7 +641,7 @@ mod cuda_impl {
             self.upload_metadata(token_ids, positions, attn_meta)?;
 
             // Step 1: token embedding lookup from packed buffer
-            info!("gpu_runner: embedding lookup");
+            trace!("gpu_runner: embedding lookup");
 
             // === f16 forward path ===
             let debug_fwd = std::env::var("RVLLM_DEBUG").is_ok();
