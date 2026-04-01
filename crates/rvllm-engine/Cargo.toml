@@ -29,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+parking_lot.workspace = true
 rvllm-worker = { workspace = true, optional = true }
 rvllm-block-manager = { workspace = true, optional = true }
 rvllm-scheduler = { workspace = true, optional = true }
