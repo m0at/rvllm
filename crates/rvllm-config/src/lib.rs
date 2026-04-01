@@ -53,6 +53,13 @@ pub enum ConfigError {
 /// Convenience result alias for this crate.
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
+fn config_file_sets_max_model_len(contents: &str) -> bool {
+    toml::from_str::<toml::Value>(contents)
+        .ok()
+        .and_then(|value| value.get("model").and_then(|model| model.get("max_model_len")).cloned())
+        .is_some()
+}
+
 /// Load a fully-validated [`EngineConfig`] from CLI args.
 ///
 /// Resolution order (later wins):
@@ -64,7 +71,11 @@ pub fn load_config(args: &CliArgs) -> Result<EngineConfig> {
     let mut config = if let Some(ref path) = args.config_file {
         tracing::info!(path = %path, "loading config from file");
         let contents = std::fs::read_to_string(path)?;
-        toml::from_str::<EngineConfig>(&contents)?
+        let mut config = toml::from_str::<EngineConfig>(&contents)?;
+        if config_file_sets_max_model_len(&contents) {
+            config.model.max_model_len_explicit = true;
+        }
+        config
     } else {
         EngineConfig::default()
     };
@@ -87,7 +98,10 @@ fn apply_cli_overrides(config: &mut EngineConfig, args: &CliArgs) {
         config.model.tokenizer_path = Some(tok.clone());
     }
     config.model.dtype = args.dtype;
-    config.model.max_model_len = args.max_model_len;
+    if let Some(max_model_len) = args.max_model_len {
+        config.model.max_model_len = max_model_len;
+        config.model.max_model_len_explicit = true;
+    }
     config.model.trust_remote_code = args.trust_remote_code;
 
     // Cache
@@ -134,7 +148,7 @@ mod tests {
             model: "test/model".into(),
             tokenizer: None,
             dtype: Dtype::Float16,
-            max_model_len: 4096,
+            max_model_len: Some(4096),
             trust_remote_code: false,
             block_size: 16,
             gpu_memory_utilization: 0.9,
@@ -163,6 +177,7 @@ mod tests {
         assert_eq!(cfg.model.model_path, "test/model");
         assert_eq!(cfg.model.dtype, Dtype::Float16);
         assert_eq!(cfg.model.max_model_len, 4096);
+        assert!(cfg.model.max_model_len_explicit);
         assert_eq!(cfg.telemetry.prometheus_port, Some(9090));
         assert_eq!(cfg.telemetry.log_level, "debug");
     }
@@ -208,7 +223,7 @@ log_level = "warn"
             model: "bigscience/bloom-560m".into(),
             tokenizer: None,
             dtype: Dtype::BFloat16,
-            max_model_len: 1024,
+            max_model_len: Some(1024),
             trust_remote_code: false,
             block_size: 8,
             gpu_memory_utilization: 0.8,
@@ -235,8 +250,44 @@ log_level = "warn"
 
         let cfg = load_config(&args).unwrap();
         assert_eq!(cfg.model.model_path, "bigscience/bloom-560m");
+        assert!(cfg.model.max_model_len_explicit);
         assert_eq!(cfg.cache.block_size, 8);
         assert_eq!(cfg.scheduler.preemption_mode, PreemptionMode::Swap);
+    }
+
+    #[test]
+    fn default_cli_max_model_len_is_not_marked_explicit() {
+        use rvllm_core::types::Dtype;
+        let args = CliArgs {
+            model: "test/model".into(),
+            tokenizer: None,
+            dtype: Dtype::Float16,
+            max_model_len: None,
+            trust_remote_code: false,
+            block_size: 16,
+            gpu_memory_utilization: 0.9,
+            swap_space_gb: 4.0,
+            num_gpu_blocks: None,
+            num_cpu_blocks: None,
+            enable_prefix_caching: false,
+            kv_cache_dtype: "auto".into(),
+            max_num_seqs: 256,
+            max_num_batched_tokens: 4096,
+            max_paddings: 256,
+            preemption_mode: "recompute".into(),
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            device: "cuda".into(),
+            disable_telemetry: false,
+            prometheus_port: None,
+            otlp_endpoint: None,
+            log_level: "info".into(),
+            config_file: None,
+        };
+
+        let cfg = load_config(&args).unwrap();
+        assert_eq!(cfg.model.max_model_len, DEFAULT_MAX_MODEL_LEN);
+        assert!(!cfg.model.max_model_len_explicit);
     }
 
     #[test]
@@ -246,7 +297,7 @@ log_level = "warn"
             model: "".into(), // empty = invalid
             tokenizer: None,
             dtype: Dtype::Auto,
-            max_model_len: 2048,
+            max_model_len: Some(2048),
             trust_remote_code: false,
             block_size: 16,
             gpu_memory_utilization: 0.9,
@@ -289,7 +340,11 @@ log_level = "warn"
 
         let json = serde_json::to_string(&cfg).unwrap();
         let back: EngineConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg, back);
+        assert!(!back.model.max_model_len_explicit);
+
+        let mut expected = cfg;
+        expected.model.max_model_len_explicit = false;
+        assert_eq!(expected, back);
     }
 
     #[test]

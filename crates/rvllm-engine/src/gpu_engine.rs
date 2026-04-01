@@ -273,6 +273,7 @@ mod inner {
             let head_dim = hf_config.head_dim;
             let max_model_len = resolve_runtime_max_model_len(
                 config.model.max_model_len,
+                config.model.max_model_len_explicit,
                 &hf_config.architecture,
                 hf_config.declared_max_model_len,
             );

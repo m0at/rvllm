@@ -28,8 +28,8 @@ enum Commands {
         port: u16,
         #[arg(long, default_value = "auto")]
         dtype: Dtype,
-        #[arg(long, default_value_t = 2048)]
-        max_model_len: usize,
+        #[arg(long)]
+        max_model_len: Option<usize>,
         #[arg(long, default_value_t = 0.90)]
         gpu_memory_utilization: f32,
         #[arg(long, default_value_t = 0.0)]
@@ -67,8 +67,8 @@ enum Commands {
         output_len: usize,
         #[arg(long, default_value = "auto")]
         dtype: Dtype,
-        #[arg(long, default_value_t = 2048)]
-        max_model_len: usize,
+        #[arg(long)]
+        max_model_len: Option<usize>,
         #[arg(long, default_value_t = 0.90)]
         gpu_memory_utilization: f32,
         #[arg(long, default_value_t = 0.0)]
@@ -170,8 +170,10 @@ async fn main() -> anyhow::Result<()> {
                     .model({
                         let mut m = ModelConfigImpl::builder()
                             .model_path(&model)
-                            .dtype(dtype)
-                            .max_model_len(max_model_len);
+                            .dtype(dtype);
+                        if let Some(max_model_len) = max_model_len {
+                            m = m.max_model_len(max_model_len);
+                        }
                         if let Some(ref tok) = tokenizer {
                             m = m.tokenizer_path(tok);
                         }
@@ -209,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 host = %host,
                 port = port,
                 dtype = %dtype,
-                max_model_len = max_model_len,
+                max_model_len = config.model.max_model_len,
                 gpu_memory_utilization = gpu_memory_utilization,
                 gpu_memory_reserve_gb = gpu_memory_reserve_gb,
                 num_gpu_blocks = num_gpu_blocks,
@@ -270,13 +272,15 @@ async fn main() -> anyhow::Result<()> {
                     cache = cache.num_cpu_blocks(v);
                 }
                 EngineConfig::builder()
-                    .model(
-                        ModelConfigImpl::builder()
+                    .model({
+                        let mut m = ModelConfigImpl::builder()
                             .model_path(&model)
-                            .dtype(dtype)
-                            .max_model_len(max_model_len)
-                            .build(),
-                    )
+                            .dtype(dtype);
+                        if let Some(max_model_len) = max_model_len {
+                            m = m.max_model_len(max_model_len);
+                        }
+                        m.build()
+                    })
                     .cache(cache.build())
                     .scheduler(
                         SchedulerConfigImpl::builder()
@@ -306,26 +310,20 @@ async fn main() -> anyhow::Result<()> {
                 if batch_sizes.len() > 1 {
                     let exe = std::env::current_exe()?;
                     for &batch in &batch_sizes {
-                        let output = std::process::Command::new(&exe)
+                        let mut command = std::process::Command::new(&exe);
+                        command
                             .arg("benchmark")
-                            .arg("--model")
-                            .arg(&model)
-                            .arg("--dtype")
-                            .arg(format!("{dtype}"))
-                            .arg("--output-len")
-                            .arg(format!("{output_len}"))
-                            .arg("--max-model-len")
-                            .arg(format!("{max_model_len}"))
-                            .arg("--gpu-memory-utilization")
-                            .arg(format!("{gpu_memory_utilization}"))
-                            .arg("--n")
-                            .arg(format!("{batch}"))
+                            .arg("--model").arg(&model)
+                            .arg("--dtype").arg(format!("{dtype}"))
+                            .arg("--output-len").arg(format!("{output_len}"))
+                            .arg("--gpu-memory-utilization").arg(format!("{gpu_memory_utilization}"))
+                            .arg("--n").arg(format!("{batch}"))
                             .args(if json { vec!["--json"] } else { vec![] })
-                            .env(
-                                "RVLLM_PTX_DIR",
-                                std::env::var("RVLLM_PTX_DIR").unwrap_or_default(),
-                            )
-                            .output()?;
+                            .env("RVLLM_PTX_DIR", std::env::var("RVLLM_PTX_DIR").unwrap_or_default());
+                        if let Some(max_model_len) = max_model_len {
+                            command.arg("--max-model-len").arg(format!("{max_model_len}"));
+                        }
+                        let output = command.output()?;
                         // Print child's stderr (bench results) and stdout (json)
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         let stdout = String::from_utf8_lossy(&output.stdout);

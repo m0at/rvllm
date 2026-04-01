@@ -27,8 +27,8 @@ pub struct CliArgs {
     pub dtype: Dtype,
 
     /// Maximum model context length.
-    #[arg(long, default_value_t = DEFAULT_MAX_MODEL_LEN)]
-    pub max_model_len: usize,
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
 
     /// Trust remote code when loading model.
     #[arg(long, default_value_t = false)]

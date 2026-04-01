@@ -8,13 +8,21 @@ pub const LEGACY_HF_TOKEN_ENV: &str = "HUGGING_FACE_HUB_TOKEN";
 const GATED_MODEL_HINT: &str =
     "If this is a gated Hugging Face model (for example Meta Llama), run `hf auth login` or set `HF_TOKEN`.";
 
+fn first_non_empty_token(tokens: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    tokens
+        .into_iter()
+        .flatten()
+        .map(|token| token.trim().to_string())
+        .find(|token| !token.is_empty())
+}
+
 /// Return the first non-empty Hugging Face auth token found in the environment.
 pub fn hf_token_from_env() -> Option<String> {
-    [HF_TOKEN_ENV, LEGACY_HF_TOKEN_ENV]
-        .into_iter()
-        .find_map(|name| std::env::var(name).ok())
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
+    first_non_empty_token(
+        [HF_TOKEN_ENV, LEGACY_HF_TOKEN_ENV]
+            .into_iter()
+            .map(|name| std::env::var(name).ok()),
+    )
 }
 
 /// Return a user-facing auth hint when an error message looks like a gated/private
@@ -50,5 +58,13 @@ mod tests {
     #[test]
     fn auth_hint_ignores_unrelated_errors() {
         assert!(hf_auth_hint("failed to parse config.json").is_none());
+    }
+
+    #[test]
+    fn skips_empty_primary_token_env() {
+        assert_eq!(
+            first_non_empty_token([Some("".into()), Some("legacy-token".into())]).as_deref(),
+            Some("legacy-token")
+        );
     }
 }

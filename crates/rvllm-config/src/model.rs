@@ -19,6 +19,9 @@ pub struct ModelConfigImpl {
     pub dtype: Dtype,
     /// Maximum sequence length the model supports.
     pub max_model_len: usize,
+    /// Whether `max_model_len` came from an explicit user override.
+    #[serde(skip, default)]
+    pub max_model_len_explicit: bool,
     /// Whether to trust remote code when loading the model.
     pub trust_remote_code: bool,
 }
@@ -30,6 +33,7 @@ impl Default for ModelConfigImpl {
             tokenizer_path: None,
             dtype: Dtype::Auto,
             max_model_len: DEFAULT_MAX_MODEL_LEN,
+            max_model_len_explicit: false,
             trust_remote_code: false,
         }
     }
@@ -68,6 +72,7 @@ impl ModelConfigBuilder {
     /// Set the max model length.
     pub fn max_model_len(mut self, v: usize) -> Self {
         self.0.max_model_len = v;
+        self.0.max_model_len_explicit = true;
         self
     }
 
@@ -90,10 +95,14 @@ impl ModelConfigBuilder {
 /// stays within the currently-supported 8K window.
 pub fn resolve_runtime_max_model_len(
     requested: usize,
+    requested_was_explicit: bool,
     architecture: &str,
     declared: Option<usize>,
 ) -> usize {
-    if requested != DEFAULT_MAX_MODEL_LEN || architecture != "LlamaForCausalLM" {
+    if requested_was_explicit
+        || requested != DEFAULT_MAX_MODEL_LEN
+        || architecture != "LlamaForCausalLM"
+    {
         return requested;
     }
 
@@ -118,11 +127,21 @@ mod tests {
     #[test]
     fn llama_auto_expands_to_declared_len() {
         assert_eq!(
-            resolve_runtime_max_model_len(DEFAULT_MAX_MODEL_LEN, "LlamaForCausalLM", Some(4096)),
+            resolve_runtime_max_model_len(
+                DEFAULT_MAX_MODEL_LEN,
+                false,
+                "LlamaForCausalLM",
+                Some(4096),
+            ),
             4096
         );
         assert_eq!(
-            resolve_runtime_max_model_len(DEFAULT_MAX_MODEL_LEN, "LlamaForCausalLM", Some(8192)),
+            resolve_runtime_max_model_len(
+                DEFAULT_MAX_MODEL_LEN,
+                false,
+                "LlamaForCausalLM",
+                Some(8192),
+            ),
             8192
         );
     }
@@ -130,11 +149,21 @@ mod tests {
     #[test]
     fn llama_auto_does_not_shrink_or_overexpand() {
         assert_eq!(
-            resolve_runtime_max_model_len(DEFAULT_MAX_MODEL_LEN, "LlamaForCausalLM", Some(2048)),
+            resolve_runtime_max_model_len(
+                DEFAULT_MAX_MODEL_LEN,
+                false,
+                "LlamaForCausalLM",
+                Some(2048),
+            ),
             DEFAULT_MAX_MODEL_LEN
         );
         assert_eq!(
-            resolve_runtime_max_model_len(DEFAULT_MAX_MODEL_LEN, "LlamaForCausalLM", Some(131072)),
+            resolve_runtime_max_model_len(
+                DEFAULT_MAX_MODEL_LEN,
+                false,
+                "LlamaForCausalLM",
+                Some(131072),
+            ),
             DEFAULT_MAX_MODEL_LEN
         );
     }
@@ -142,15 +171,29 @@ mod tests {
     #[test]
     fn explicit_override_wins() {
         assert_eq!(
-            resolve_runtime_max_model_len(1024, "LlamaForCausalLM", Some(4096)),
+            resolve_runtime_max_model_len(1024, true, "LlamaForCausalLM", Some(4096)),
             1024
+        );
+        assert_eq!(
+            resolve_runtime_max_model_len(
+                DEFAULT_MAX_MODEL_LEN,
+                true,
+                "LlamaForCausalLM",
+                Some(4096),
+            ),
+            DEFAULT_MAX_MODEL_LEN
         );
     }
 
     #[test]
     fn non_llama_models_keep_requested_len() {
         assert_eq!(
-            resolve_runtime_max_model_len(DEFAULT_MAX_MODEL_LEN, "Qwen2ForCausalLM", Some(32768)),
+            resolve_runtime_max_model_len(
+                DEFAULT_MAX_MODEL_LEN,
+                false,
+                "Qwen2ForCausalLM",
+                Some(32768),
+            ),
             DEFAULT_MAX_MODEL_LEN
         );
     }
