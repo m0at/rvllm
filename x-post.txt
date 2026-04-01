@@ -1,54 +1,32 @@
-23 Rust crates. 50 hand-written CUDA kernels. 792 tests. built in ~22 hours with Claude Opus doing architecture, CUDA kernels, debugging, and 30-agent swarms for major optimization passes. $1,600 vast.ai GPU rentals + $280 Claude Code usage.
+updated rvLLM and cleaned up the public repo/docs.
 
-what changed since last post
-- FA3 v3 attention: cp.async bulk global-to-shared copies (128-bit, bypasses registers/L1) and split-KV that distributes KV tiles across thread blocks. 31-42% faster than FA3 v2 across all concurrency levels.
-- killed all silent kernel fallbacks. startup now validates every kernel loads or the server crashes. was masking missing fused kernels and silently degrading to slow paths.
-- JIT PTX compiler: Rust emits shape-specialized fused kernels at model load. Add+RMSNorm+GateUp GEMV 5.12x faster, SiLU*Mul+Down GEMV 7.48x faster than the hand-written CUDA equivalents. no nvcc, no Triton, no Python.
-- CUTLASS header integration for sm_90 attention primitives.
-- found and fixed the coherence bug. fused QKV GEMM outputs [T, QKV_dim] (interleaved per token) but the split assumed [all_Q | all_K | all_V] layout. identical for T=1 (decode), completely wrong for T>1 (prefill). corrupted the KV cache on every prompt. fix: unfused projections for prefill, fused for decode.
-- rms_norm_eps was hardcoded at 1e-5 instead of reading from model config (Qwen2.5 uses 1e-6). now read from config.json and logged at startup.
-- pure f16 data path. f32 only remains for RoPE trig tables and the final argmax logits boundary.
-- pre-allocated metadata + output GPU buffers at max size so CUDA graph-captured pointers never go stale on reallocation.
-- removed ~530 lines of dead f32 CPU attention fallback code and duplicate f32 weight storage.
+current public comparison is a simple apples-to-apples H100 run on Qwen2.5-7B f16 against:
+- stock vLLM
+- rvllm-lite
+- rvLLM
 
-H100 results (direct engine, no HTTP, Qwen2.5-7B f16, 128 tok/req)
-- N=1: 98 tok/s (vLLM 170, 0.58x)
-- N=16: 2,122 tok/s (vLLM 2,202, 0.96x)
-- N=32: 3,957 tok/s (vLLM 4,585, 0.86x)
-- N=64: 7,451 tok/s (vLLM 7,888, 0.94x)
-- N=128: 12,312 tok/s (vLLM 14,528, 0.85x)
+latest verified numbers
 
-HTTP (apples-to-apples, enforce_eager)
-- N=16: 1,503 vs 1,714 (0.88x)
-- N=128: 8,161 vs 12,230 (0.67x)
+direct engine, 256 output tokens
+- N=1: rvLLM 120.6 tok/s, stock vLLM 133.7
+- N=16: rvLLM 1,648.9 tok/s, stock vLLM 1,934.5
+- N=32: rvLLM 3,170.0 tok/s, stock vLLM 3,197.1
 
-architecture
-- pure f16 forward: embed(f16) -> 28 layers(f16) -> norm(f16) -> LM head(f16xf16->f32) -> argmax
-- three-tier kernel stack: JIT fused (2-7.5x faster) > 50 hand-written CUDA > cuBLAS autotuned
-- fused QKV + gate+up weights for decode (T=1): 5 GEMMs -> 2 per layer
-- unfused for prefill (T>1): correct [all_Q | all_K | all_V] layout
-- cross-layer residual+RMSNorm fusion
-- FA3 v3 decode attention: cp.async, split-KV, parallel softmax, bank-conflict-free smem, GQA V reuse
-- CUDA graph capture per exact batch size, 1 cuGraphLaunch replaces 284 kernel launches
-- custom GEMV (M=1) + cublasLt split-K (M<=32) + cuBLAS hgemm (M>32)
-- no-fallback kernel validation at startup -- every kernel loads or server exits
-- dedicated GPU OS thread, async DtoH with pinned memory
-- 10 architectures: Llama, Mistral, Qwen2, Phi, Gemma, Mixtral, DeepSeek, GPT-NeoX, StableLM, Cohere
+HTTP, 200 requests, concurrency 32, max_tokens=256
+- stock vLLM: 2,861.9 tok/s
+- rvLLM: 2,723.2 tok/s
+- rvllm-lite: 131.8 tok/s
 
-system
-- startup: 6s vs ~120s (20x)
-- binary: 16 MB vs ~500 MB (31x)
-- memory: 348 MB vs ~1 GB (3x)
-- P95 latency: 34 ms vs 190 ms (5.6x tighter)
-- CUDA graph capture: 1.7s vs ~60s (35x)
+the useful result for me was not just rvLLM vs vLLM. it was that rvllm-lite stays near stock vLLM on direct engine, then falls apart over HTTP. that makes the serving/scheduler overhead much easier to see.
 
-what's next
-- TMA and full warp specialization for attention (main remaining gap vs Tri Dao's FA3)
-- Triton-autotuned GEMM parity (dominant gap at high concurrency)
-- speculative decoding
-- multi-GPU tensor parallel
+other changes since the last writeup
+- reserve-based safe-max VRAM sizing in rvLLM startup
+- fixed the FA3 v3 decode crash
+- updated README, github pages, and paper to the current benchmark set
+- rebuilt the paper PDFs and pushed everything to main
+
+still true: rvLLM is close at N=32 direct engine and close over HTTP, but it is not beating stock vLLM consistently yet. the remaining work is mostly direct-engine tuning: GEMM, attention, and scheduler behavior.
 
 repo: https://github.com/m0at/rvllm
+site: https://m0at.github.io/rvllm/
 paper: https://m0at.github.io/rvllm/paper/rvllm.pdf
-live site: https://m0at.github.io/rvllm/
-Apache-2.0. open source.

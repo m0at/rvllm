@@ -2,11 +2,21 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) focused on single-card, high-throughput serving with explicit control over kernels, memory, and startup behavior.
 
-**Latest verified H100 run (2026-04-01): `rvLLM` reaches 3,170 tok/s at `N=32` direct engine (`0.99x` stock `vLLM`) and 2,723 tok/s over HTTP at 200 requests / concurrency 32 (`0.95x` stock `vLLM`). 54 CUDA kernels. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. Rust PTX compiler. Safe-max VRAM sizing via `--gpu-memory-reserve-gb` and explicit block controls.**
+## What Is Already Clearly Better
+
+- **HTTP stack is already competitive**: `rvLLM` reaches `2,723 tok/s` over HTTP vs `2,862 tok/s` for stock `vLLM`.
+- **Direct engine gets close by `N=32`**: `rvLLM` reaches `3,170 tok/s` vs `3,197 tok/s` for stock `vLLM`.
+- **`rvllm-lite` cleanly exposes serving overhead**: near-stock direct engine, then `131.8 tok/s` over HTTP.
+- **VRAM startup is safer to drive hard**: reserve-based fill via `--gpu-memory-reserve-gb`, plus explicit `--num-gpu-blocks` and `--num-cpu-blocks`.
+- **Kernel behavior is explicit**: 54 CUDA kernels, no-fallback validation, and a Rust PTX fusion path with measured `2-7.5x` decode microbench wins vs our hand-written CUDA equivalents.
 
 ## Current H100 Comparison
 
-All measurements below use Qwen2.5-7B f16 on H100 SXM 80GB. Direct engine runs use 256 output tokens. HTTP runs use 200 prompts at concurrency 32 with `max_tokens=256`. Stock `vLLM` was benchmarked through its own OpenAI server, `rvllm-lite` is the intermediate Python serving layer, and `rvLLM` is the Rust server.
+Qwen2.5-7B f16 on H100 SXM 80GB. Direct engine runs use 256 output tokens. HTTP runs use 200 requests at concurrency 32 with `max_tokens=256`.
+
+![Current H100 comparison](docs/assets/h100-comparison.svg)
+
+All measurements below use the same setup. Stock `vLLM` was benchmarked through its own OpenAI server, `rvllm-lite` is the intermediate Python serving layer, and `rvLLM` is the Rust server.
 
 ### Direct Engine
 
