@@ -136,7 +136,7 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
             // Cooperative-groups kernels need cubin (not PTX) to preserve
             // grid-level sync. PTX compilation downgrades grid.sync() to
             // block-level bar.sync which silently breaks the kernel.
-            let needs_cubin = stem == "persistent_layer_decode";
+            let needs_cubin = stem == "persistent_layer_decode" || stem == "megakernel_decode";
             let arch_flag = format!("-arch={}", arch);
 
             if needs_cubin {

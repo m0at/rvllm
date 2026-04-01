@@ -111,6 +111,9 @@ mod inner {
         /// T=1 decode: single cooperative kernel executes the entire transformer layer.
         /// Requires persistent_layer_decode cubin. Eliminates ~6 kernel launches per layer.
         PersistentDecode,
+        /// All 28 layers + LM head in ONE kernel launch via interpreter.
+        /// Enable with RVLLM_MEGAKERNEL=1.
+        MegakernelDecode,
         /// T>=1 batched decode or prefill with cuBLAS/CUTLASS GEMMs.
         /// Always requires scratch buffers.
         Batched,
@@ -174,6 +177,9 @@ mod inner {
                 }
                 ForwardPath::PersistentDecode => {
                     Ok(Some(self.forward_persistent_decode(input, weights, prev_mlp_out)?))
+                }
+                ForwardPath::MegakernelDecode => {
+                    Err(LLMError::GpuError("MegakernelDecode is handled at the runner level, not per-layer".into()))
                 }
                 ForwardPath::Batched => {
                     let scratch = scratch.expect("Batched path requires scratch buffers");

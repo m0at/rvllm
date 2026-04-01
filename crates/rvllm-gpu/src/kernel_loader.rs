@@ -132,6 +132,10 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         &["persistent_layer_decode_f16"],
     ),
     (
+        "megakernel_decode",
+        &["megakernel_decode_f16"],
+    ),
+    (
         "gemv_fp8",
         &[
             "gemv_fp8_kernel",

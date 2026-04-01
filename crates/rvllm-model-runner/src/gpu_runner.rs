@@ -1245,7 +1245,12 @@ mod cuda_impl {
 
         fn resolve_forward_path(&self, num_tokens: usize, is_prefill: bool) -> ForwardPath {
             if num_tokens == 1 && !is_prefill {
-                // DAG persistent decode: single cooperative kernel per layer
+                // Megakernel: all 28 layers in one kernel launch
+                // Enable with RVLLM_MEGAKERNEL=1
+                if std::env::var("RVLLM_MEGAKERNEL").map_or(false, |v| v == "1") {
+                    return ForwardPath::MegakernelDecode;
+                }
+                // DAG persistent decode: single kernel per layer
                 // Enable with RVLLM_PERSISTENT=1
                 if std::env::var("RVLLM_PERSISTENT").map_or(false, |v| v == "1") {
                     return ForwardPath::PersistentDecode;
