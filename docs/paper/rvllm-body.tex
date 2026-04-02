@@ -20,13 +20,16 @@ attention, no-fallback kernel validation, and a Rust-native PTX compiler that
 generates fused decode kernels 2--7.5$\times$ faster than the hand-written CUDA
 baselines in the measured microbenchmarks. In the latest verified apples-to-apples
 comparison on a single H100~SXM~80\,GB serving Qwen2.5-7B f16, rvLLM reaches
-3{,}170~tok/s at $N\!=\!32$ direct engine (\textbf{0.99$\times$ stock vLLM~0.6.3.post1})
-and 2{,}723~tok/s over HTTP at 200 requests / concurrency 32 (\textbf{0.95$\times$ stock vLLM}).
-An intermediate Python stack, \texttt{rvllm-lite}, retains near-stock direct-engine
-speed but falls to 131.8~tok/s over HTTP, isolating the serving layer as a major
-source of practical overhead. The remaining direct-engine gap is dominated by GEMM
-tuning, attention microarchitecture, and scheduler maturity rather than by Rust or
-CUDA integration overhead. rvLLM is open-source under the Apache-2.0 license.
+3{,}170~tok/s at $N\!=\!32$ direct engine (\textbf{0.99$\times$ stock vLLM~0.6.3.post1}).
+In a matched fixed-length 10k lifecycle race on clean H100 boxes, rvLLM finishes
+14{,}080 completion tokens in \textbf{30.33\,s} launch-to-finished versus
+\textbf{35.51\,s} for stock vLLM, while stock vLLM still leads on steady-state HTTP
+throughput at 4{,}394.6~tok/s versus 3{,}419.4~tok/s for rvLLM. An intermediate Python
+stack, \texttt{rvllm-lite}, retains near-stock direct-engine speed but falls to
+131.8~tok/s over HTTP, isolating the serving layer as a major source of practical
+overhead. The current gap is therefore no longer a large raw card-performance deficit;
+it is concentrated in HTTP, prefill, and request-handling maturity. rvLLM is
+open-source under the Apache-2.0 license.
 \end{abstract}
 
 % ============================================================================
@@ -81,8 +84,9 @@ The primary contributions are:
         safe-max VRAM sizing for server startup. No-fallback startup validation ensures
         every required kernel loads or the server fails fast.
   \item Verified three-way H100 benchmark results against stock vLLM and an
-        intermediate Python serving layer, separating direct-engine performance from
-        serving-stack overhead.
+        intermediate Python serving layer, plus a matched 10k launch-to-finished
+        lifecycle race that separates raw direct-engine parity from serving-stack
+        overhead.
   \item A Rust-native PTX emission path for fused decode kernels, with measured
         2--7.5$\times$ speedups over the corresponding hand-written CUDA kernels.
   \item A development cost analysis: approximately \$1{,}780 in compute and AI

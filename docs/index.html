@@ -139,7 +139,7 @@ footer a:hover{color:#999}
 
 <div class="hero">
   <div class="big">3,170 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.99x stock vLLM in the latest apples-to-apples run. Latest rvLLM lifecycle run: 30.33s launch-to-finished, 3,419 tok/s. Remaining gap is HTTP + prefill path, not raw direct-engine parity.</div>
+  <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.99x stock vLLM in the latest apples-to-apples run. In the matched 10k lifecycle race, rvLLM finishes in 30.33s vs 35.51s for stock vLLM. Remaining gap is still HTTP + prefill path, not raw direct-engine parity.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
     <div class="hero-graphic-sub">Three-way benchmark: stock vLLM vs rvllm-lite vs rvLLM, with both direct-engine and HTTP serving results.</div>
@@ -300,11 +300,13 @@ footer a:hover{color:#999}
 </p>
 <p>
   In the latest verified apples-to-apples H100 SXM 80GB comparison on Qwen2.5-7B f16,
-  rvLLM reaches <strong>3,170 tok/s at N=32 direct engine</strong> (<strong>0.99x stock vLLM</strong>)
-  and <strong>2,723 tok/s over HTTP</strong> at 200 requests / concurrency 32
-  (<strong>0.95x stock vLLM</strong>). The intermediate <code>rvllm-lite</code> stack keeps near-stock
-  direct-engine speed but collapses to 131.8 tok/s over HTTP, which isolates the Python
-  serving layer as a major source of practical overhead.
+  rvLLM reaches <strong>3,170 tok/s at N=32 direct engine</strong> (<strong>0.99x stock vLLM</strong>).
+  In the matched fixed-length 10k lifecycle race, <strong>rvLLM finishes in 30.33s</strong>
+  versus <strong>35.51s for stock vLLM</strong>, while stock <code>vLLM</code> still leads on
+  steady-state HTTP throughput at <strong>4,394.6 tok/s</strong> versus <strong>3,419.4 tok/s</strong>
+  for rvLLM. The intermediate <code>rvllm-lite</code> stack keeps near-stock direct-engine speed but
+  collapses to 131.8 tok/s over HTTP, which isolates the Python serving layer as a major source
+  of practical overhead.
 </p>
 </section>
 
@@ -366,6 +368,23 @@ footer a:hover{color:#999}
 </div>
 <div class="note">
   `rvllm-lite` is the important middle row here: near-stock direct engine, but effectively serialized HTTP behavior. That makes it a useful diagnostic target and makes the serving stack problem visible instead of hiding it inside kernel comparisons.
+</div>
+</section>
+
+<section>
+<h2>Matched 10k Lifecycle Race</h2>
+<p class="section-sub">Clean H100 SXM boxes, fixed-length greedy decode, 14,080 completion tokens, concurrency 32</p>
+<div class="tbl">
+<table>
+<thead><tr><th>Engine</th><th class="r">First completion (s)</th><th class="r">Bench tail (s)</th><th class="r">Shutdown (s)</th><th class="r">Launch to finished (s)</th><th class="r">Completion toks</th><th class="r">tok/s</th><th class="r">Avg latency (ms)</th></tr></thead>
+<tbody>
+<tr class="peak"><td>rvLLM</td><td class="r">26.04</td><td class="r">4.12</td><td class="r">0.51</td><td class="r">30.33</td><td class="r">14,080</td><td class="r">3,419.4</td><td class="r">1,043.3</td></tr>
+<tr><td>stock vLLM</td><td class="r">32.10</td><td class="r">3.20</td><td class="r">0.81</td><td class="r">35.51</td><td class="r">14,080</td><td class="r">4,394.6</td><td class="r">716.1</td></tr>
+</tbody>
+</table>
+</div>
+<div class="note">
+  This is the current practical read: direct engine is already near parity, rvLLM wins full launch-to-finished wall clock, and stock vLLM still wins steady-state HTTP throughput. That leaves the remaining obvious optimization surface in HTTP, prefill, and request handling.
 </div>
 </section>
 

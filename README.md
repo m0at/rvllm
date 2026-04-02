@@ -14,10 +14,11 @@ Results land in `bench/combined_results_h100_lifecycle.json`. The instance stays
 
 ## What Is Already Clearly Better
 
-- **HTTP stack is already competitive**: `rvLLM` reaches `2,723 tok/s` over HTTP vs `2,862 tok/s` for stock `vLLM`.
 - **Direct engine gets close by `N=32`**: `rvLLM` reaches `3,170 tok/s` vs `3,197 tok/s` for stock `vLLM`.
+- **Launch-to-finished lifecycle is faster right now**: in the matched 10k race, `rvLLM` finishes in `30.33s` vs `35.51s` for stock `vLLM`.
+- **HTTP steady-state still has obvious headroom**: the same matched race lands at `3,419.4 tok/s` for `rvLLM` vs `4,394.6 tok/s` for stock `vLLM`, so the remaining gap is still serving-path work.
 - **`rvllm-lite` cleanly exposes serving overhead**: near-stock direct engine, then `131.8 tok/s` over HTTP.
-- **The 10k lifecycle path is now verified on real GPU**: `rvLLM` completes `14,080` completion tokens at concurrency `32` in `30.33s` launch-to-finished (`26.04s` to first completion, `4.12s` bench tail, `3,419.4 tok/s`).
+- **The 10k lifecycle path is verified on real GPU**: `rvLLM` completes `14,080` completion tokens at concurrency `32` in `30.33s` launch-to-finished (`26.04s` to first completion, `4.12s` bench tail, `3,419.4 tok/s`).
 - **VRAM startup is safer to drive hard**: reserve-based fill via `--gpu-memory-reserve-gb`, plus explicit `--num-gpu-blocks` and `--num-cpu-blocks`.
 - **Kernel behavior is explicit**: 54 CUDA kernels, no-fallback validation, and a Rust PTX fusion path with measured `2-7.5x` decode microbench wins vs our hand-written CUDA equivalents.
 
@@ -53,15 +54,16 @@ The key result is that `rvllm-lite` keeps near-stock direct-engine speed but col
 
 Historical phase-by-phase numbers, including the earlier `12,312 tok/s @ N=128` run, live in [docs/benchmark-history.md](docs/benchmark-history.md).
 
-### rvLLM 10k Lifecycle
+### 10k Lifecycle Race
 
-Verified on an isolated H100 SXM 80GB instance with Qwen2.5-7B f16. This is the `rvLLM` side only, using the fixed lifecycle harness and `32` concurrency. The first `64`-concurrency attempt crashed in `gpu-step`, so `32` is the current stable race setting.
+Verified on isolated H100 SXM 80GB instances with Qwen2.5-7B f16. This is the matched fixed-length greedy lifecycle harness at `32` concurrency. The first `64`-concurrency `rvLLM` attempt crashed in `gpu-step`, so `32` is the current stable race setting.
 
 | Engine | Concurrency | first_completion_sec | benchmark_wall_sec | shutdown_sec | launch_to_finished_tokens_sec | completion_tokens | throughput_tok_per_sec | avg_latency_ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | rvLLM | 32 | 26.04 | 4.12 | 0.51 | 30.33 | 14,080 | 3,419.4 | 1,043.3 |
+| stock vLLM | 32 | 32.10 | 3.20 | 0.81 | 35.51 | 14,080 | 4,394.6 | 716.1 |
 
-This run matters because it lines up with the direct-engine `0.99x` parity result at `N=32`: the remaining shortfall is in the HTTP + prefill + request-handling path, not in some giant raw decode-kernel deficit.
+This run matters because it lines up with the direct-engine `0.99x` parity result at `N=32`: the raw card path is already basically there, while the remaining shortfall is in the HTTP + prefill + request-handling path. The headline read right now is simple: `rvLLM` wins launch-to-finished, stock `vLLM` still wins steady-state HTTP throughput.
 
 Artifacts:
 - `rvLLM` result: `/root/bench_results/rvllm_result_c32.json`
@@ -257,7 +259,7 @@ Note: Phase 5d and earlier numbers used 512 tok/req. Phase 6+ uses 128 tok/req (
 
 ### What Differs from vLLM
 
-In the latest verified run, `rvLLM` ranges from `0.79x` to `0.99x` stock `vLLM` on direct engine and reaches `0.95x` of stock `vLLM` HTTP throughput. Root causes, in order of impact:
+In the latest verified run, `rvLLM` ranges from `0.79x` to `0.99x` stock `vLLM` on direct engine, wins the matched `10k` launch-to-finished lifecycle race (`30.33s` vs `35.51s`), and still trails stock `vLLM` on steady-state HTTP throughput (`3,419.4` vs `4,394.6 tok/s`). Root causes, in order of impact:
 
 1. **GEMM tuning**: vLLM uses Triton autotuned GEMMs + torch.compile; we use stock cuBLAS heuristics. This is the dominant remaining gap at high concurrency.
 2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA, heavily optimized with TMA, warp specialization, pipelining); our FA3 v3 uses cp.async and split-KV but still lacks TMA and full warp specialization.
@@ -297,7 +299,7 @@ What rvLLM does better:
 cargo install rvllm --features cuda,cublaslt
 
 # From PyPI
-pip install rvllm
+uv pip install rvllm
 ```
 
 Or build from source:
