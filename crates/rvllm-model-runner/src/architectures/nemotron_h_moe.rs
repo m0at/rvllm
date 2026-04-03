@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Experimental Nemotron Cascade / `nemotron_h_moe` architecture.
 //!
 //! The real model is a hybrid stack with attention in every layer plus an
