@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use memmap2::Mmap;
 use rvllm_core::error::{LLMError, Result};
 use tracing::{debug, info};
 
@@ -18,11 +17,10 @@ impl GGUFLoader {
     pub fn load(path: &Path, gpu: &dyn GpuAllocator) -> Result<ModelWeights> {
         info!("loading GGUF from {}", path.display());
 
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            LLMError::ModelError(format!("mmap failed for {}: {}", path.display(), e))
+        let data = std::fs::read(path).map_err(|e| {
+            LLMError::ModelError(format!("failed to read {}: {}", path.display(), e))
         })?;
-        let data: &[u8] = &mmap;
+        let data: &[u8] = &data;
 
         let header = parse_gguf_header(data)?;
 
@@ -241,11 +239,10 @@ fn read_metadata_f32_value(data: &[u8], offset: usize, vtype: u32) -> Option<f32
 }
 
 pub fn inspect_gguf_model_info(path: &Path) -> Result<GGUFModelInfo> {
-    let file = std::fs::File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-        LLMError::ModelError(format!("mmap failed for {}: {}", path.display(), e))
+    let data = std::fs::read(path).map_err(|e| {
+        LLMError::ModelError(format!("failed to read {}: {}", path.display(), e))
     })?;
-    let data: &[u8] = &mmap;
+    let data: &[u8] = &data;
     let header = parse_gguf_header(data)?;
     let mut offset = 24usize;
     let mut architecture = None;
