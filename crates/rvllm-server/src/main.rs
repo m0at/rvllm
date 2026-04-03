@@ -123,7 +123,7 @@ fn detect_device_string() -> anyhow::Result<&'static str> {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        anyhow::bail!("rvllm was built without CUDA support; refusing to start non-GPU backend")
+        Ok("cpu")
     }
 }
 

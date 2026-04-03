@@ -444,6 +444,7 @@ mod tests {
             intermediate_size: 16,
             vocab_size: 16,
             max_position: 16,
+            rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: rvllm_core::types::Dtype::Float16,
             architecture: "nemotron_h_moe".to_string(),

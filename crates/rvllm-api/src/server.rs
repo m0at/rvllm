@@ -7,6 +7,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[cfg(not(feature = "cuda"))]
+use tokenizers::models::bpe::BPE;
+#[cfg(not(feature = "cuda"))]
+use tokenizers::pre_tokenizers::whitespace::Whitespace;
+#[cfg(not(feature = "cuda"))]
+use tokenizers::Tokenizer as HfTokenizer;
+
 use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::RwLock;
@@ -51,7 +58,6 @@ pub trait InferenceEngine: Send + Sync {
     }
 }
 
-#[async_trait::async_trait]
 #[cfg(feature = "cuda")]
 #[async_trait::async_trait]
 impl InferenceEngine for rvllm_engine::AsyncGpuLLMEngine {
@@ -76,6 +82,20 @@ impl InferenceEngine for rvllm_engine::AsyncGpuLLMEngine {
         tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
     )> {
         self.generate_with_mode(prompt, params, emit_intermediate).await
+    }
+}
+
+#[async_trait::async_trait]
+impl InferenceEngine for rvllm_engine::AsyncLLMEngine {
+    async fn generate(
+        &self,
+        prompt: String,
+        params: rvllm_core::prelude::SamplingParams,
+    ) -> rvllm_core::prelude::Result<(
+        RequestId,
+        tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
+    )> {
+        self.generate(prompt, params).await
     }
 }
 
@@ -184,6 +204,77 @@ fn cuda_gpu_available() -> bool {
     }
 }
 
+#[cfg(not(feature = "cuda"))]
+struct MockScheduler {
+    groups: Vec<rvllm_sequence::SequenceGroup>,
+}
+
+#[cfg(not(feature = "cuda"))]
+impl MockScheduler {
+    fn new() -> Self {
+        Self { groups: Vec::new() }
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl rvllm_engine::Scheduler for MockScheduler {
+    fn add_seq_group(&mut self, seq_group: rvllm_sequence::SequenceGroup) {
+        self.groups.push(seq_group);
+    }
+
+    fn abort_seq_group(&mut self, request_id: &RequestId) {
+        self.groups.retain(|g| g.request_id != *request_id);
+    }
+
+    fn schedule(&mut self) -> rvllm_engine::SchedulerOutputs {
+        let groups = self.groups.clone();
+        self.groups.retain(|g| !g.is_finished());
+        let num_tokens = groups.iter().flat_map(|g| g.get_seqs()).map(|s| s.num_new_tokens().max(1)).sum();
+        rvllm_engine::SchedulerOutputs { scheduled_seq_groups: groups, num_batched_tokens: num_tokens, preempted: false }
+    }
+
+    fn has_unfinished_seqs(&self) -> bool { !self.groups.is_empty() }
+    fn get_num_unfinished_seq_groups(&self) -> usize { self.groups.len() }
+}
+
+#[cfg(not(feature = "cuda"))]
+struct MockExecutor { calls: usize }
+
+#[cfg(not(feature = "cuda"))]
+impl MockExecutor { fn new() -> Self { Self { calls: 0 } } }
+
+#[cfg(not(feature = "cuda"))]
+impl rvllm_engine::Executor for MockExecutor {
+    fn execute_model(&mut self, input: rvllm_engine::ExecutorInput) -> rvllm_core::prelude::Result<Vec<rvllm_engine::SamplerOutput>> {
+        self.calls += 1;
+        let mut outputs = Vec::new();
+        for meta in &input.seq_group_metadata {
+            for &seq_id in meta.seq_data.keys() {
+                outputs.push(rvllm_engine::SamplerOutput { seq_id, token_id: if self.calls >= 8 { 0 } else { 1 }, logprob: -0.5, top_logprobs: None });
+            }
+        }
+        Ok(outputs)
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn build_mock_tokenizer() -> rvllm_tokenizer::Tokenizer {
+    let mut vocab = std::collections::HashMap::new();
+    vocab.insert("hello".to_string(), 0);
+    vocab.insert("world".to_string(), 1);
+    vocab.insert(" ".to_string(), 2);
+    vocab.insert("!".to_string(), 3);
+    vocab.insert("[UNK]".to_string(), 4);
+    let bpe = BPE::builder().vocab_and_merges(vocab, vec![]).unk_token("[UNK]".to_string()).build().unwrap();
+    let mut hf = HfTokenizer::new(bpe);
+    hf.with_pre_tokenizer(Some(Whitespace {}));
+    let path = std::env::temp_dir().join(format!("rvllm-mock-tokenizer-{}.json", std::process::id()));
+    hf.save(&path, false).unwrap();
+    let tok = rvllm_tokenizer::Tokenizer::from_file(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    tok
+}
+
 pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
     let model_name = config.model.model_path.clone();
     let tokenizer_path = config
@@ -194,16 +285,48 @@ pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
 
     info!(model = %model_name, "initializing engine");
 
-    let tokenizer = Tokenizer::from_pretrained(&tokenizer_path)?;
+    let has_cuda = cuda_gpu_available();
+    let mock_mode = model_name == "mock-model" && !has_cuda;
 
-    if !cuda_gpu_available() {
-        return Err(rvllm_core::prelude::LLMError::GpuError(
-            "no CUDA GPU detected; refusing to start mock/non-GPU server backend".into(),
-        ));
-    }
+    let tokenizer = if mock_mode {
+        #[cfg(not(feature = "cuda"))]
+        {
+            build_mock_tokenizer()
+        }
+        #[cfg(feature = "cuda")]
+        {
+            Tokenizer::from_pretrained(&tokenizer_path)?
+        }
+    } else {
+        Tokenizer::from_pretrained(&tokenizer_path)?
+    };
 
-    info!("GPU detected, creating AsyncGpuLLMEngine for real inference");
-    let engine: Arc<dyn InferenceEngine> = create_gpu_engine(config).await?;
+    let engine: Arc<dyn InferenceEngine> = if has_cuda {
+        info!("GPU detected, creating AsyncGpuLLMEngine for real inference");
+        create_gpu_engine(config).await?
+    } else {
+        #[cfg(not(feature = "cuda"))]
+        {
+            if !mock_mode {
+                return Err(rvllm_core::prelude::LLMError::GpuError(
+                    "no CUDA GPU detected; non-CUDA server mode currently supports mock-model only".into(),
+                ));
+            }
+            info!("starting mock AsyncLLMEngine for non-CUDA smoke/integration flows");
+            Arc::new(rvllm_engine::AsyncLLMEngine::new(
+                config,
+                Box::new(MockExecutor::new()),
+                Box::new(MockScheduler::new()),
+                build_mock_tokenizer(),
+            )?)
+        }
+        #[cfg(feature = "cuda")]
+        {
+            return Err(rvllm_core::prelude::LLMError::GpuError(
+                "no CUDA GPU detected; refusing to start non-GPU server backend".into(),
+            ));
+        }
+    };
 
     let state = Arc::new(AppState::new(engine, model_name, tokenizer));
     let app = build_router(state);
