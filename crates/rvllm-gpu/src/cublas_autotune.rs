@@ -10,6 +10,7 @@ use cudarc::driver::{DevicePtr, DevicePtrMut};
 use std::collections::HashMap;
 use std::ffi::c_void;
 
+use crate::autotune_cache::{AutotuneCache, AutotuneCacheEntry, AutotuneCacheKey};
 use crate::cublaslt_ops::CublasLtOps;
 use crate::{LLMError, Result};
 
@@ -346,6 +347,9 @@ impl CublasAutotuner {
 
     /// Autotune all GEMM shapes for the model across decode + prefill batch sizes.
     /// Covers M=1,2,4,8,16,32,64,128 x all projection shapes.
+    ///
+    /// Loads a disk cache first; shapes already cached are skipped. After
+    /// benchmarking new shapes the updated cache is written back.
     pub fn autotune_model(
         lt_ops: &CublasLtOps,
         dtype: GemmDtype,
@@ -354,6 +358,7 @@ impl CublasAutotuner {
         qkv_dim: usize,
         intermediate: usize,
         gate_up_dim: usize,
+        gpu_name: &str,
     ) -> Result<Self> {
         let m_values: &[usize] = &[1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128];
         let nk_shapes: &[(usize, usize)] = &[
@@ -370,13 +375,48 @@ impl CublasAutotuner {
             }
         }
 
+        let cache_path = AutotuneCache::cache_path();
+        let no_cache = AutotuneCache::is_disabled();
+        let mut disk_cache = if no_cache {
+            AutotuneCache::default()
+        } else {
+            AutotuneCache::load(&cache_path)
+        };
+
+        let dtype_str = match dtype {
+            GemmDtype::F16 => "f16",
+            GemmDtype::Fp8E4M3 => "fp8e4m3",
+        };
+
         let mut tuner = Self::new();
+        let mut cached_count = 0usize;
         tracing::info!(
             num_shapes = shapes.len(),
             m_values = ?m_values,
             "autotuning cublasLt algos"
         );
         for &(m, n, k) in &shapes {
+            let cache_key = AutotuneCacheKey {
+                gpu_name: gpu_name.to_string(),
+                m,
+                n,
+                k,
+                dtype: dtype_str.to_string(),
+            };
+
+            if !no_cache {
+                if let Some(entry) = disk_cache.get(&cache_key) {
+                    tracing::debug!(m, n, k, "autotune cache hit");
+                    tuner.results.insert((m, n, k), AutotunedAlgo {
+                        algo: unsafe { std::mem::zeroed() },
+                        workspace_size: entry.workspace_size,
+                        time_us: entry.time_us,
+                    });
+                    cached_count += 1;
+                    continue;
+                }
+            }
+
             tracing::info!(m, n, k, ?dtype, "autotune start");
             match Self::autotune_shape(lt_ops, m, n, k, dtype) {
                 Ok(result) => {
@@ -386,6 +426,11 @@ impl CublasAutotuner {
                         ws = result.workspace_size,
                         "autotune best algo"
                     );
+                    disk_cache.insert(cache_key, AutotuneCacheEntry {
+                        workspace_size: result.workspace_size,
+                        time_us: result.time_us,
+                        algo_index: 0,
+                    });
                     tuner.results.insert((m, n, k), result);
                 }
                 Err(e) => {
@@ -393,6 +438,17 @@ impl CublasAutotuner {
                 }
             }
         }
+
+        if cached_count > 0 {
+            tracing::info!(cached_count, "shapes loaded from autotune cache");
+        }
+
+        if !no_cache {
+            if let Err(e) = disk_cache.save(&cache_path) {
+                tracing::warn!(%e, "failed to save autotune cache");
+            }
+        }
+
         Ok(tuner)
     }
 

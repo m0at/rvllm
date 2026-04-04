@@ -5,6 +5,7 @@
 //! heap-backed implementation with zero unsafe for CPU-only testing.
 
 pub mod allocator;
+pub mod autotune_cache;
 pub mod buffer;
 pub mod cpu_buffer;
 #[cfg(feature = "cuda")]
@@ -41,6 +42,7 @@ pub use rvllm_core::prelude::{LLMError, Result};
 #[cfg(feature = "cuda")]
 pub use cuda_allocator::CudaGpuAllocator;
 
+pub use autotune_cache::{AutotuneCache, AutotuneCacheEntry, AutotuneCacheKey};
 #[cfg(feature = "cublaslt")]
 pub use cublas_autotune::{CublasAutotuner, GemmDtype};
 #[cfg(feature = "cublaslt")]

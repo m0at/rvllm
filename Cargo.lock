@@ -2802,6 +2802,9 @@ dependencies = [
  "libloading 0.8.9",
  "parking_lot",
  "rvllm-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
