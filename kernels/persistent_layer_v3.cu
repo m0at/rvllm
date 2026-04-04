@@ -699,25 +699,87 @@ __device__ void plv3_add_rmsnorm_phase5(
 }
 
 // ============================================================================
-// Phase 6: Materialize SiLU(gate) * up once per block, then down-proj GEMV.
-// The activated vector fits in shared memory as f16 and avoids redoing the
-// nonlinearity inside every output row.
+// Phase 5.5: Compute the activated FFN vector directly from fused gate/up
+// weights, then Phase 6 only has to run the down-projection.
 // ============================================================================
 
-__device__ void plv3_activate_silu_mul(
+__device__ void plv3_gateup_activate_gemv(
     __half* __restrict__ activated,
-    const __half* __restrict__ gateup,
+    const float* __restrict__ s_input,
+    const __half* __restrict__ gateup_weight,
+    int hidden_size,
     int intermediate_size
 ) {
     const int tid = threadIdx.x;
-    const __half* gate = gateup;
-    const __half* up = gateup + intermediate_size;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int k4 = hidden_size / 8;
 
-    for (int i = tid; i < intermediate_size; i += PLV3_THREADS) {
-        float g = __half2float(gate[i]);
-        float u = __half2float(up[i]);
-        activated[i] = __float2half(plv3_silu(g) * u);
+    for (int block_base = blockIdx.x * PLV3_BLOCK_N;
+         block_base < intermediate_size;
+         block_base += gridDim.x * PLV3_BLOCK_N)
+    {
+        int warp_base = block_base + warp_id * PLV3_RPW;
+        if (warp_base >= intermediate_size) continue;
+        int valid_rows = min(PLV3_RPW, intermediate_size - warp_base);
+
+        for (int r = 0; r < valid_rows; r++) {
+            int row_idx = warp_base + r;
+            const __half* gate_row = gateup_weight + (long long)row_idx * hidden_size;
+            const __half* up_row = gateup_weight + (long long)(row_idx + intermediate_size) * hidden_size;
+            float gate_dot = 0.0f;
+            float up_dot = 0.0f;
+
+            for (int c = lane_id; c < k4; c += 32) {
+                float4 gv = *reinterpret_cast<const float4*>(&gate_row[c * 8]);
+                __half* gh = reinterpret_cast<__half*>(&gv);
+                float4 uv = *reinterpret_cast<const float4*>(&up_row[c * 8]);
+                __half* uh = reinterpret_cast<__half*>(&uv);
+                float inp0 = s_input[c * 8 + 0];
+                float inp1 = s_input[c * 8 + 1];
+                float inp2 = s_input[c * 8 + 2];
+                float inp3 = s_input[c * 8 + 3];
+                float inp4 = s_input[c * 8 + 4];
+                float inp5 = s_input[c * 8 + 5];
+                float inp6 = s_input[c * 8 + 6];
+                float inp7 = s_input[c * 8 + 7];
+
+                gate_dot += __half2float(gh[0]) * inp0 + __half2float(gh[1]) * inp1
+                         +  __half2float(gh[2]) * inp2 + __half2float(gh[3]) * inp3
+                         +  __half2float(gh[4]) * inp4 + __half2float(gh[5]) * inp5
+                         +  __half2float(gh[6]) * inp6 + __half2float(gh[7]) * inp7;
+                up_dot += __half2float(uh[0]) * inp0 + __half2float(uh[1]) * inp1
+                       +  __half2float(uh[2]) * inp2 + __half2float(uh[3]) * inp3
+                       +  __half2float(uh[4]) * inp4 + __half2float(uh[5]) * inp5
+                       +  __half2float(uh[6]) * inp6 + __half2float(uh[7]) * inp7;
+            }
+
+            int rem_start = k4 * 8;
+            for (int k = rem_start + lane_id; k < hidden_size; k += 32) {
+                float inp = s_input[k];
+                gate_dot += __half2float(gate_row[k]) * inp;
+                up_dot += __half2float(up_row[k]) * inp;
+            }
+
+            gate_dot = plv3_warp_xor_reduce(gate_dot);
+            up_dot = plv3_warp_xor_reduce(up_dot);
+            if (lane_id == 0)
+                activated[row_idx] = __float2half(plv3_silu(gate_dot) * up_dot);
+        }
     }
+}
+
+// ============================================================================
+// Phase 6: Down-projection GEMV over the activated FFN vector.
+// ============================================================================
+
+__device__ void plv3_load_activated(
+    __half* __restrict__ s_activated,
+    const __half* __restrict__ activated,
+    int intermediate_size
+) {
+    for (int i = threadIdx.x; i < intermediate_size; i += PLV3_THREADS)
+        s_activated[i] = activated[i];
     __syncthreads();
 }
 
@@ -810,7 +872,7 @@ __device__ __forceinline__ void persistent_layer_v3_f16_body(
     __half* __restrict__ qkv_scratch,          // [qkv_dim]
     __half* __restrict__ attn_scratch,         // [q_dim]
     __half* __restrict__ oproj_scratch,        // [hidden]
-    __half* __restrict__ gateup_scratch,       // [gate_up_dim]
+    __half* __restrict__ gateup_scratch,       // activated vector in first [intermediate_size]
     // Split-KV scratch
     float* __restrict__ split_max_buf,
     float* __restrict__ split_sum_buf,
@@ -922,23 +984,24 @@ __device__ __forceinline__ void persistent_layer_v3_f16_body(
     plv3_profile_stamp<Profile>(sync_flags, 4);
 
     // ====================================================================
-    // PHASE 5: Residual add + RMSNorm + GateUp GEMV
+    // PHASE 5: Residual add + RMSNorm + GateUp activation GEMV
     // ====================================================================
     plv3_add_rmsnorm_phase5(s_normed, s_scratch, residual_out, oproj_scratch,
                             post_norm_w, eps, hidden_size, sync_flags);
 
-    plv3_gemv(gateup_scratch, s_normed, gateup_weight, gate_up_dim, hidden_size);
+    plv3_gateup_activate_gemv(gateup_scratch, s_normed, gateup_weight,
+                              hidden_size, intermediate_size);
 
     plv3_signal(sync_flags, PLV3_SYNC_GATEUP);
     plv3_wait(sync_flags, PLV3_SYNC_GATEUP, (int)gridDim.x);
     plv3_profile_stamp<Profile>(sync_flags, 5);
 
     // ====================================================================
-    // PHASE 6: Activate once + Down GEMV
+    // PHASE 6: Down GEMV
     // ====================================================================
     {
         __half* s_activated = (__half*)smem_raw;
-        plv3_activate_silu_mul(s_activated, gateup_scratch, intermediate_size);
+        plv3_load_activated(s_activated, gateup_scratch, intermediate_size);
         plv3_down_gemv(mlp_out, s_activated, down_weight, hidden_size, intermediate_size);
     }
     plv3_profile_stamp<Profile>(sync_flags, 6);
