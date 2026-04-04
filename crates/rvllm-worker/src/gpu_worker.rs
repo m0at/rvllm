@@ -1632,17 +1632,12 @@ impl GpuWorker {
             self.fp8_pre_forward_dequantize(model_input)?;
         }
 
-        // Use graphs for any pure decode step (all query_lens == 1).
-        // Sampling params don't matter -- graphs capture the forward pass
-        // (GEMMs, attention, norms), not the sampling/logit processing.
-        let is_decode = !model_input.is_prefill
-            && model_input
-                .attention_metadata
-                .query_lens
-                .iter()
-                .all(|&q| q == 1);
+        // Graph replay currently captures the GPU-only argmax path, so it is
+        // only valid for greedy decode steps within the configured graph range.
+        // Non-greedy sampling still needs full logits from the raw path.
+        let can_graph = greedy_only && self.graph_runner.can_use_graph(model_input);
 
-        let result = if !is_decode || !self.graph_runner.is_enabled() {
+        let result = if !can_graph || !self.graph_runner.is_enabled() {
             self.raw_gpu_forward_ex(model_input, greedy_only)
         } else {
             #[cfg(feature = "cuda")]
@@ -1714,21 +1709,18 @@ impl GpuWorker {
             .as_ref()
             .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
 
-        // Upload metadata (skip clone when no padding needed)
-        if actual_batch == padded_batch {
-            runner.upload_metadata(
-                &model_input.token_ids,
-                &model_input.position_ids,
-                &model_input.attention_metadata,
-            )?;
-        } else {
-            runner.upload_metadata_padded(
-                &model_input.token_ids,
-                &model_input.position_ids,
-                &model_input.attention_metadata,
-                padded_batch,
-            )?;
-        }
+        let (padded_input, padded_actual_batch) = self.graph_runner.pad_input(model_input)?;
+        debug_assert_eq!(padded_actual_batch, actual_batch);
+        debug_assert_eq!(padded_input.num_tokens(), padded_batch);
+
+        // Upload metadata using the safe padded decode input. Padded tokens use
+        // slot_mapping=-1 and context_len=0 so cache-write/attention kernels
+        // skip them instead of corrupting live KV slots.
+        runner.upload_metadata(
+            &padded_input.token_ids,
+            &padded_input.position_ids,
+            &padded_input.attention_metadata,
+        )?;
 
         let graph = self
             .graph_runner
@@ -1749,7 +1741,7 @@ impl GpuWorker {
         let dst = pinned
             .as_mut_slice()
             .map_err(|e| LLMError::GpuError(format!("pinned buf write: {e}")))?;
-        runner.read_graph_output_async(actual_batch, dst)?;
+        runner.read_graph_output_async(padded_actual_batch, dst)?;
         Ok(ForwardOutput::TokenIdsPending { actual_batch })
     }
 
@@ -1762,7 +1754,6 @@ impl GpuWorker {
         padded_batch: usize,
         _greedy_only: bool,
     ) -> Result<ForwardOutput> {
-        let max_context_len = model_input.attention_metadata.max_context_len;
         self.ensure_pinned_output_capacity(actual_batch)?;
 
         let runner = self
@@ -1781,14 +1772,22 @@ impl GpuWorker {
             actual_batch, "capturing CUDA graph for padded batch size"
         );
 
+        let (padded_input, padded_actual_batch) = self.graph_runner.pad_input(model_input)?;
+        debug_assert_eq!(padded_actual_batch, actual_batch);
+        debug_assert_eq!(padded_input.num_tokens(), padded_batch);
+
         // Warmup forward (outside capture)
-        runner.upload_metadata_padded(
-            &model_input.token_ids,
-            &model_input.position_ids,
-            &model_input.attention_metadata,
-            padded_batch,
+        runner.upload_metadata(
+            &padded_input.token_ids,
+            &padded_input.position_ids,
+            &padded_input.attention_metadata,
         )?;
-        runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false)?;
+        runner.forward_gpu_only(
+            padded_batch,
+            padded_batch,
+            padded_input.attention_metadata.max_context_len,
+            false,
+        )?;
 
         // Sync before capture
         let cuda_stream = runner.cuda_stream().clone();
@@ -1797,11 +1796,10 @@ impl GpuWorker {
             .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
 
         // Re-upload padded metadata
-        runner.upload_metadata_padded(
-            &model_input.token_ids,
-            &model_input.position_ids,
-            &model_input.attention_metadata,
-            padded_batch,
+        runner.upload_metadata(
+            &padded_input.token_ids,
+            &padded_input.position_ids,
+            &padded_input.attention_metadata,
         )?;
 
         // Capture
@@ -1812,8 +1810,12 @@ impl GpuWorker {
             return Err(LLMError::GpuError(format!("graph capture failed: {e}")));
         }
 
-        let fwd_result =
-            runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false);
+        let fwd_result = runner.forward_gpu_only(
+            padded_batch,
+            padded_batch,
+            padded_input.attention_metadata.max_context_len,
+            false,
+        );
 
         match fwd_result {
             Ok(()) => {
@@ -1830,7 +1832,7 @@ impl GpuWorker {
                 let dst = pinned
                     .as_mut_slice()
                     .map_err(|e| LLMError::GpuError(format!("pinned buf write: {e}")))?;
-                runner.read_graph_output_async(actual_batch, dst)?;
+                runner.read_graph_output_async(padded_actual_batch, dst)?;
                 Ok(ForwardOutput::TokenIdsPending { actual_batch })
             }
             Err(e) => {

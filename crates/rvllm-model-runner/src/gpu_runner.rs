@@ -1523,7 +1523,9 @@ mod cuda_impl {
         }
 
         /// Upload metadata padded to `padded_batch` tokens.
-        /// Extra slots are filled with dummy data (duplicating seq 0's metadata).
+        ///
+        /// Extra slots use safe decode sentinels so graph-captured kernels skip
+        /// padded entries instead of touching live KV slots.
         pub fn upload_metadata_padded(
             &self,
             token_ids: &[u32],
@@ -1545,24 +1547,18 @@ mod cuda_impl {
             let mut padded_positions: Vec<u32> = positions.to_vec();
             padded_positions.resize(padded_batch, 0);
 
-            // Pad attention metadata
+            // Pad attention metadata using the same sentinels as GraphRunner:
+            // slot_mapping=-1 skips cache writes and context_len=0 marks the
+            // sequence as empty for attention kernels.
             let mut padded_meta = attn_meta.clone();
-            let dummy_ctx = if attn_meta.context_lens.is_empty() {
-                1
-            } else {
-                attn_meta.context_lens[0]
-            };
-            padded_meta.context_lens.resize(padded_batch, dummy_ctx);
+            padded_meta.context_lens.resize(padded_batch, 0);
             padded_meta.query_lens.resize(padded_batch, 1);
-            let dummy_bt = if attn_meta.block_tables.is_empty() {
-                vec![]
-            } else {
-                attn_meta.block_tables[0].clone()
-            };
             for _ in 0..pad_count {
-                padded_meta.block_tables.push(dummy_bt.clone());
+                padded_meta.block_tables.push(vec![0]);
             }
-            padded_meta.slot_mapping.resize(padded_batch, 0);
+            padded_meta.slot_mapping.resize(padded_batch, u32::MAX);
+            padded_meta.max_context_len =
+                padded_meta.context_lens.iter().copied().max().unwrap_or(0);
 
             self.upload_metadata(&padded_tokens, &padded_positions, &padded_meta)
         }
