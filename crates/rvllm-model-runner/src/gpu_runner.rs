@@ -31,7 +31,10 @@ mod cuda_impl {
 
     use std::cell::Cell;
 
-    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{
+        CudaContext, CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut, LaunchConfig,
+        PushKernelArg,
+    };
     use half::f16;
     use tracing::{debug, info, trace};
 
@@ -97,18 +100,18 @@ mod cuda_impl {
     /// Sized for max_batch_tokens. Reused across all layers (sequential execution).
     pub struct F16LayerScratch {
         pub max_tokens: usize,
-        pub qkv: CudaSlice<f16>,          // [max_tokens * qkv_dim]
-        pub attn_out: CudaSlice<f16>,     // [max_tokens * q_dim]
-        pub o_proj: CudaSlice<f16>,       // [max_tokens * hidden]
-        pub normed: CudaSlice<f16>,       // [max_tokens * hidden]
-        pub gate_up: CudaSlice<f16>,      // [max_tokens * intermediate * 2]
-        pub silu_out: CudaSlice<f16>,     // [max_tokens * intermediate]
+        pub qkv: CudaSlice<f16>,      // [max_tokens * qkv_dim]
+        pub attn_out: CudaSlice<f16>, // [max_tokens * q_dim]
+        pub o_proj: CudaSlice<f16>,   // [max_tokens * hidden]
+        pub normed: CudaSlice<f16>,   // [max_tokens * hidden]
+        pub gate_up: CudaSlice<f16>,  // [max_tokens * intermediate * 2]
+        pub silu_out: CudaSlice<f16>, // [max_tokens * intermediate]
         // Double-buffered: layer N writes to pair A, reads from pair B.
         // Layer N+1 writes to pair B, reads from pair A. Zero alloc, zero copy.
-        pub residual_a: CudaSlice<f16>,   // [max_tokens * hidden]
-        pub down_a: CudaSlice<f16>,       // [max_tokens * hidden]
-        pub residual_b: CudaSlice<f16>,   // [max_tokens * hidden]
-        pub down_b: CudaSlice<f16>,       // [max_tokens * hidden]
+        pub residual_a: CudaSlice<f16>, // [max_tokens * hidden]
+        pub down_a: CudaSlice<f16>,     // [max_tokens * hidden]
+        pub residual_b: CudaSlice<f16>, // [max_tokens * hidden]
+        pub down_b: CudaSlice<f16>,     // [max_tokens * hidden]
     }
 
     const DEFAULT_F16_SCRATCH_TOKENS: usize = 512;
@@ -141,6 +144,7 @@ mod cuda_impl {
         device: Arc<CudaContext>,
         stream: Arc<CudaStream>,
         cutlass: Option<Arc<rvllm_gpu::cutlass_ffi::CutlassKernels>>,
+        persistent_v2: Option<Arc<rvllm_gpu::persistent_v2_ffi::PersistentV2Kernels>>,
         gemm_strategy: GemmStrategy,
         layers: Vec<GpuTransformerLayer>,
         embed_tokens: CudaSlice<f16>,
@@ -240,7 +244,11 @@ mod cuda_impl {
                     rms_norm_eps: config.rms_norm_eps,
                     layer_idx: i,
                 };
-                layers.push(GpuTransformerLayer::new(layer_cfg, Arc::clone(&stream), Arc::clone(&loader)));
+                layers.push(GpuTransformerLayer::new(
+                    layer_cfg,
+                    Arc::clone(&stream),
+                    Arc::clone(&loader),
+                ));
             }
             info!(
                 rms_norm_eps = config.rms_norm_eps,
@@ -279,8 +287,12 @@ mod cuda_impl {
             let block_size = cache.block_size();
             let graph_max_blocks = (config.max_position + block_size - 1) / block_size;
             let rms_norm_eps = config.rms_norm_eps;
-            info!(graph_max_blocks, block_size, max_position = config.max_position,
-                  "fixed block_tables stride for CUDA graph stability");
+            info!(
+                graph_max_blocks,
+                block_size,
+                max_position = config.max_position,
+                "fixed block_tables stride for CUDA graph stability"
+            );
 
             #[cfg(feature = "cublaslt")]
             let blas_lt = rvllm_gpu::cublaslt_ops::CublasLtOps::new(stream.clone()).ok();
@@ -311,9 +323,32 @@ mod cuda_impl {
                     }
                 }
                 if loaded.is_none() {
-                    info!("CUTLASS .so not found, using cuBLAS fallback for all GEMMs");
+                    info!("CUTLASS .so not found, using cuBLAS for all GEMMs");
+                } else {
+                    info!(
+                        "Using Hybrid strategy: cuBLAS for GEMMs, CUTLASS for gateup+silu fusion"
+                    );
                 }
                 loaded
+            };
+
+            // Load persistent_v2 cubins (cooperative TC GEMV + split-KV kernels).
+            let persistent_v2 = {
+                use rvllm_gpu::persistent_v2_ffi::PersistentV2Kernels;
+                match PersistentV2Kernels::load(device.clone()) {
+                    Ok(k) => {
+                        info!(
+                            layer = k.has_layer_kernel(),
+                            mega = k.has_mega_kernel(),
+                            "persistent_v2 cubins loaded"
+                        );
+                        Some(Arc::new(k))
+                    }
+                    Err(e) => {
+                        debug!("persistent_v2 cubins not found: {e}");
+                        None
+                    }
+                }
             };
 
             Ok(Self {
@@ -326,8 +361,13 @@ mod cuda_impl {
                 config,
                 device,
                 stream,
-                gemm_strategy: if cutlass.is_some() { GemmStrategy::Cutlass } else { GemmStrategy::Cublas },
+                gemm_strategy: if cutlass.is_some() {
+                    GemmStrategy::Hybrid
+                } else {
+                    GemmStrategy::Cublas
+                },
                 cutlass,
+                persistent_v2,
                 layers,
                 embed_tokens,
                 final_norm_weight,
@@ -371,54 +411,88 @@ mod cuda_impl {
 
             for i in 0..num_layers {
                 // Fuse QKV: concat [q_dim, hidden] + [kv_dim, hidden] + [kv_dim, hidden]
-                let q_w = self.weights.get(
-                    &format!("model.layers.{i}.self_attn.q_proj.weight")
-                ).ok_or_else(|| LLMError::GpuError(format!("missing q_proj layer {i}")))?;
-                let k_w = self.weights.get(
-                    &format!("model.layers.{i}.self_attn.k_proj.weight")
-                ).ok_or_else(|| LLMError::GpuError(format!("missing k_proj layer {i}")))?;
-                let v_w = self.weights.get(
-                    &format!("model.layers.{i}.self_attn.v_proj.weight")
-                ).ok_or_else(|| LLMError::GpuError(format!("missing v_proj layer {i}")))?;
+                let q_w = self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.q_proj.weight"))
+                    .ok_or_else(|| LLMError::GpuError(format!("missing q_proj layer {i}")))?;
+                let k_w = self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.k_proj.weight"))
+                    .ok_or_else(|| LLMError::GpuError(format!("missing k_proj layer {i}")))?;
+                let v_w = self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.v_proj.weight"))
+                    .ok_or_else(|| LLMError::GpuError(format!("missing v_proj layer {i}")))?;
 
-                let mut fused_qkv = self.stream.alloc_zeros::<half::f16>(qkv_dim * hidden)
+                let mut fused_qkv = self
+                    .stream
+                    .alloc_zeros::<half::f16>(qkv_dim * hidden)
                     .map_err(|e| LLMError::GpuError(format!("fused_qkv alloc: {e}")))?;
-                self.stream.memcpy_dtod(q_w, &mut fused_qkv.slice_mut(..q_dim * hidden))
+                self.stream
+                    .memcpy_dtod(q_w, &mut fused_qkv.slice_mut(..q_dim * hidden))
                     .map_err(|e| LLMError::GpuError(format!("fused_qkv q copy: {e}")))?;
-                self.stream.memcpy_dtod(k_w, &mut fused_qkv.slice_mut(q_dim * hidden..(q_dim + kv_dim) * hidden))
+                self.stream
+                    .memcpy_dtod(
+                        k_w,
+                        &mut fused_qkv.slice_mut(q_dim * hidden..(q_dim + kv_dim) * hidden),
+                    )
                     .map_err(|e| LLMError::GpuError(format!("fused_qkv k copy: {e}")))?;
-                self.stream.memcpy_dtod(v_w, &mut fused_qkv.slice_mut((q_dim + kv_dim) * hidden..qkv_dim * hidden))
+                self.stream
+                    .memcpy_dtod(
+                        v_w,
+                        &mut fused_qkv.slice_mut((q_dim + kv_dim) * hidden..qkv_dim * hidden),
+                    )
                     .map_err(|e| LLMError::GpuError(format!("fused_qkv v copy: {e}")))?;
                 self.fused_qkv_weights.push(fused_qkv);
 
                 // Fuse gate+up: concat [intermediate, hidden] + [intermediate, hidden]
-                let gate_w = self.weights.get(
-                    &format!("model.layers.{i}.mlp.gate_proj.weight")
-                ).ok_or_else(|| LLMError::GpuError(format!("missing gate_proj layer {i}")))?;
-                let up_w = self.weights.get(
-                    &format!("model.layers.{i}.mlp.up_proj.weight")
-                ).ok_or_else(|| LLMError::GpuError(format!("missing up_proj layer {i}")))?;
+                let gate_w = self
+                    .weights
+                    .get(&format!("model.layers.{i}.mlp.gate_proj.weight"))
+                    .ok_or_else(|| LLMError::GpuError(format!("missing gate_proj layer {i}")))?;
+                let up_w = self
+                    .weights
+                    .get(&format!("model.layers.{i}.mlp.up_proj.weight"))
+                    .ok_or_else(|| LLMError::GpuError(format!("missing up_proj layer {i}")))?;
 
-                let mut fused_gu = self.stream.alloc_zeros::<half::f16>(gate_up_dim * hidden)
+                let mut fused_gu = self
+                    .stream
+                    .alloc_zeros::<half::f16>(gate_up_dim * hidden)
                     .map_err(|e| LLMError::GpuError(format!("fused_gate_up alloc: {e}")))?;
-                self.stream.memcpy_dtod(gate_w, &mut fused_gu.slice_mut(..intermediate * hidden))
+                self.stream
+                    .memcpy_dtod(gate_w, &mut fused_gu.slice_mut(..intermediate * hidden))
                     .map_err(|e| LLMError::GpuError(format!("fused_gate_up gate copy: {e}")))?;
-                self.stream.memcpy_dtod(up_w, &mut fused_gu.slice_mut(intermediate * hidden..gate_up_dim * hidden))
+                self.stream
+                    .memcpy_dtod(
+                        up_w,
+                        &mut fused_gu.slice_mut(intermediate * hidden..gate_up_dim * hidden),
+                    )
                     .map_err(|e| LLMError::GpuError(format!("fused_gate_up up copy: {e}")))?;
                 self.fused_gate_up_weights.push(fused_gu);
 
                 // Fuse QKV biases: concat q_bias || k_bias || v_bias (already f16)
-                let q_bias = self.weights.get(&format!("model.layers.{i}.self_attn.q_proj.bias"));
-                let k_bias = self.weights.get(&format!("model.layers.{i}.self_attn.k_proj.bias"));
-                let v_bias = self.weights.get(&format!("model.layers.{i}.self_attn.v_proj.bias"));
+                let q_bias = self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.q_proj.bias"));
+                let k_bias = self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.k_proj.bias"));
+                let v_bias = self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.v_proj.bias"));
                 if let (Some(qb), Some(kb), Some(vb)) = (q_bias, k_bias, v_bias) {
-                    let mut fused_bias = self.stream.alloc_zeros::<half::f16>(qkv_dim)
+                    let mut fused_bias = self
+                        .stream
+                        .alloc_zeros::<half::f16>(qkv_dim)
                         .map_err(|e| LLMError::GpuError(format!("fused_bias alloc: {e}")))?;
-                    self.stream.memcpy_dtod(qb, &mut fused_bias.slice_mut(..q_dim))
+                    self.stream
+                        .memcpy_dtod(qb, &mut fused_bias.slice_mut(..q_dim))
                         .map_err(|e| LLMError::GpuError(format!("fused_bias q copy: {e}")))?;
-                    self.stream.memcpy_dtod(kb, &mut fused_bias.slice_mut(q_dim..q_dim + kv_dim))
+                    self.stream
+                        .memcpy_dtod(kb, &mut fused_bias.slice_mut(q_dim..q_dim + kv_dim))
                         .map_err(|e| LLMError::GpuError(format!("fused_bias k copy: {e}")))?;
-                    self.stream.memcpy_dtod(vb, &mut fused_bias.slice_mut(q_dim + kv_dim..qkv_dim))
+                    self.stream
+                        .memcpy_dtod(vb, &mut fused_bias.slice_mut(q_dim + kv_dim..qkv_dim))
                         .map_err(|e| LLMError::GpuError(format!("fused_bias v copy: {e}")))?;
                     self.fused_qkv_bias.push(Some(fused_bias));
                 } else {
@@ -426,7 +500,10 @@ mod cuda_impl {
                 }
             }
 
-            info!(num_layers, qkv_dim, gate_up_dim, "fused QKV and gate+up weights (f16)");
+            info!(
+                num_layers,
+                qkv_dim, gate_up_dim, "fused QKV and gate+up weights (f16)"
+            );
 
             // FP8 weight quantization for ALL projection weights (when RVLLM_FP8_WEIGHTS=1)
             // Note: FP8 only helps for M=1 decode (bandwidth-bound GEMV). For batched
@@ -445,79 +522,100 @@ mod cuda_impl {
                 for i in 0..num_layers {
                     // QKV: [qkv_dim, hidden]
                     let mut host = vec![half::f16::ZERO; self.fused_qkv_weights[i].len()];
-                    self.stream.memcpy_dtoh(&self.fused_qkv_weights[i], &mut host)
+                    self.stream
+                        .memcpy_dtoh(&self.fused_qkv_weights[i], &mut host)
                         .map_err(|e| LLMError::GpuError(format!("fp8 dtoh qkv: {e}")))?;
                     let q = quantize_weight_fp8(&host, qkv_dim, hidden);
                     let mut fp8 = unsafe { self.stream.alloc::<u8>(q.data.len()) }
                         .map_err(|e| LLMError::GpuError(format!("fp8 alloc qkv: {e}")))?;
-                    self.stream.memcpy_htod(&q.data, &mut fp8)
+                    self.stream
+                        .memcpy_htod(&q.data, &mut fp8)
                         .map_err(|e| LLMError::GpuError(format!("fp8 htod qkv: {e}")))?;
                     let mut sc = unsafe { self.stream.alloc::<half::f16>(q.scales.len()) }
                         .map_err(|e| LLMError::GpuError(format!("fp8 scale qkv: {e}")))?;
-                    self.stream.memcpy_htod(&q.scales, &mut sc)
+                    self.stream
+                        .memcpy_htod(&q.scales, &mut sc)
                         .map_err(|e| LLMError::GpuError(format!("fp8 scale htod qkv: {e}")))?;
                     self.fp8_fused_qkv.push(fp8);
                     self.fp8_fused_qkv_scale.push(sc);
 
                     // O-proj: [hidden, q_dim]
                     let o_name = format!("model.layers.{i}.self_attn.o_proj.weight");
-                    let o_w = self.weights.get(&o_name)
+                    let o_w = self
+                        .weights
+                        .get(&o_name)
                         .ok_or_else(|| LLMError::GpuError(format!("missing {o_name}")))?;
                     let mut host = vec![half::f16::ZERO; o_w.len()];
-                    self.stream.memcpy_dtoh(o_w, &mut host)
+                    self.stream
+                        .memcpy_dtoh(o_w, &mut host)
                         .map_err(|e| LLMError::GpuError(format!("fp8 dtoh o: {e}")))?;
                     let q = quantize_weight_fp8(&host, hidden, q_dim);
                     let mut fp8 = unsafe { self.stream.alloc::<u8>(q.data.len()) }
                         .map_err(|e| LLMError::GpuError(format!("fp8 alloc o: {e}")))?;
-                    self.stream.memcpy_htod(&q.data, &mut fp8)
+                    self.stream
+                        .memcpy_htod(&q.data, &mut fp8)
                         .map_err(|e| LLMError::GpuError(format!("fp8 htod o: {e}")))?;
                     let mut sc = unsafe { self.stream.alloc::<half::f16>(q.scales.len()) }
                         .map_err(|e| LLMError::GpuError(format!("fp8 scale o: {e}")))?;
-                    self.stream.memcpy_htod(&q.scales, &mut sc)
+                    self.stream
+                        .memcpy_htod(&q.scales, &mut sc)
                         .map_err(|e| LLMError::GpuError(format!("fp8 scale htod o: {e}")))?;
                     self.fp8_o_proj.push(fp8);
                     self.fp8_o_proj_scale.push(sc);
 
                     // Gate+up: [gate_up_dim, hidden]
                     let mut host = vec![half::f16::ZERO; self.fused_gate_up_weights[i].len()];
-                    self.stream.memcpy_dtoh(&self.fused_gate_up_weights[i], &mut host)
+                    self.stream
+                        .memcpy_dtoh(&self.fused_gate_up_weights[i], &mut host)
                         .map_err(|e| LLMError::GpuError(format!("fp8 dtoh gu: {e}")))?;
                     let q = quantize_weight_fp8(&host, gate_up_dim, hidden);
                     let mut fp8 = unsafe { self.stream.alloc::<u8>(q.data.len()) }
                         .map_err(|e| LLMError::GpuError(format!("fp8 alloc gu: {e}")))?;
-                    self.stream.memcpy_htod(&q.data, &mut fp8)
+                    self.stream
+                        .memcpy_htod(&q.data, &mut fp8)
                         .map_err(|e| LLMError::GpuError(format!("fp8 htod gu: {e}")))?;
                     let mut sc = unsafe { self.stream.alloc::<half::f16>(q.scales.len()) }
                         .map_err(|e| LLMError::GpuError(format!("fp8 scale gu: {e}")))?;
-                    self.stream.memcpy_htod(&q.scales, &mut sc)
+                    self.stream
+                        .memcpy_htod(&q.scales, &mut sc)
                         .map_err(|e| LLMError::GpuError(format!("fp8 scale htod gu: {e}")))?;
                     self.fp8_fused_gate_up.push(fp8);
                     self.fp8_fused_gate_up_scale.push(sc);
 
                     // Down: [hidden, intermediate]
                     let down_name = format!("model.layers.{i}.mlp.down_proj.weight");
-                    let down_w = self.weights.get(&down_name)
+                    let down_w = self
+                        .weights
+                        .get(&down_name)
                         .ok_or_else(|| LLMError::GpuError(format!("missing {down_name}")))?;
                     let mut host = vec![half::f16::ZERO; down_w.len()];
-                    self.stream.memcpy_dtoh(down_w, &mut host)
+                    self.stream
+                        .memcpy_dtoh(down_w, &mut host)
                         .map_err(|e| LLMError::GpuError(format!("fp8 dtoh down: {e}")))?;
                     let q = quantize_weight_fp8(&host, hidden, intermediate);
                     let mut fp8 = unsafe { self.stream.alloc::<u8>(q.data.len()) }
                         .map_err(|e| LLMError::GpuError(format!("fp8 alloc down: {e}")))?;
-                    self.stream.memcpy_htod(&q.data, &mut fp8)
+                    self.stream
+                        .memcpy_htod(&q.data, &mut fp8)
                         .map_err(|e| LLMError::GpuError(format!("fp8 htod down: {e}")))?;
                     let mut sc = unsafe { self.stream.alloc::<half::f16>(q.scales.len()) }
                         .map_err(|e| LLMError::GpuError(format!("fp8 scale down: {e}")))?;
-                    self.stream.memcpy_htod(&q.scales, &mut sc)
+                    self.stream
+                        .memcpy_htod(&q.scales, &mut sc)
                         .map_err(|e| LLMError::GpuError(format!("fp8 scale htod down: {e}")))?;
                     self.fp8_down_proj.push(fp8);
                     self.fp8_down_proj_scale.push(sc);
                 }
                 // Allocate FP8 input scratch (max of all input dimensions)
                 let max_k = *[hidden, q_dim, intermediate].iter().max().unwrap();
-                self.fp8_input_scratch = Some(unsafe { self.stream.alloc::<u8>(max_k) }
-                    .map_err(|e| LLMError::GpuError(format!("fp8 input scratch: {e}")))?);
-                info!(num_layers, "FP8 weight quantization complete (all projections)");
+                self.fp8_input_scratch = Some(
+                    unsafe { self.stream.alloc::<u8>(max_k) }
+                        .map_err(|e| LLMError::GpuError(format!("fp8 input scratch: {e}")))?,
+                );
+                info!(
+                    num_layers,
+                    "FP8 weight quantization complete (all projections)"
+                );
             }
 
             // Autotune cublasLt algorithms now that weights are loaded and GPU
@@ -603,14 +701,20 @@ mod cuda_impl {
                 return Ok(());
             }
 
-            info!(current_tokens, required_tokens, "growing f16 layer scratch for batched forward");
+            info!(
+                current_tokens,
+                required_tokens, "growing f16 layer scratch for batched forward"
+            );
             self.alloc_scratch(required_tokens)
         }
 
         /// Prepare the minimal unfused fp16 runtime state.
         pub fn prepare_fp16_runtime(&mut self) -> Result<()> {
             if self.f16_scratch.borrow().is_none() {
-                info!(num_layers = self.layers.len(), "prepared zero-copy unfused fp16 runtime state");
+                info!(
+                    num_layers = self.layers.len(),
+                    "prepared zero-copy unfused fp16 runtime state"
+                );
                 self.alloc_scratch(256)?;
             }
             Ok(())
@@ -652,7 +756,10 @@ mod cuda_impl {
                 return Err(LLMError::ModelError("empty input".into()));
             }
 
-            debug!(num_tokens, num_seqs, is_prefill, greedy_only, "GpuModelRunner::forward_ex");
+            debug!(
+                num_tokens,
+                num_seqs, is_prefill, greedy_only, "GpuModelRunner::forward_ex"
+            );
 
             let max_context_len = attn_meta.max_context_len;
 
@@ -667,7 +774,9 @@ mod cuda_impl {
             let mut hidden_f16 = self.embedding_lookup_from_meta(num_tokens)?;
 
             if debug_fwd {
-                let vals: Vec<f16> = self.stream.clone_dtoh(&hidden_f16)
+                let vals: Vec<f16> = self
+                    .stream
+                    .clone_dtoh(&hidden_f16)
                     .map_err(|e| LLMError::GpuError(format!("debug dtoh: {e}")))?;
                 let first10: Vec<f32> = vals.iter().take(10).map(|v| v.to_f32()).collect();
                 let has_nan = vals.iter().any(|v| v.to_f32().is_nan());
@@ -692,18 +801,69 @@ mod cuda_impl {
             // first layer can read from it while writing to residual_b.
             if use_scratch {
                 if let Some(ref mut s) = *scratch_borrow {
-                    self.stream.memcpy_dtod(&hidden_f16, &mut s.residual_a.slice_mut(..num_tokens * hidden_size))
+                    self.stream
+                        .memcpy_dtod(
+                            &hidden_f16,
+                            &mut s.residual_a.slice_mut(..num_tokens * hidden_size),
+                        )
                         .map_err(|e| LLMError::GpuError(format!("embed->scratch: {e}")))?;
                 }
             }
 
             let path = self.resolve_forward_path(num_tokens, is_prefill);
 
-            // === MEGAKERNEL: all layers + LM head in one kernel launch ===
+            // === MEGAKERNEL V2: all layers in one cooperative launch (TC GEMV + split-KV) ===
+            if path == ForwardPath::MegakernelV2Decode {
+                return self.forward_megakernel_v2(
+                    &hidden_f16,
+                    gpu_cache,
+                    packed_buf,
+                    offsets,
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
+                );
+            }
+            // === PERSISTENT V3: non-cooperative, 1024 blocks, vectorized GEMV ===
+            if path == ForwardPath::PersistentV3Decode {
+                return self.forward_persistent_v3(
+                    &hidden_f16,
+                    gpu_cache,
+                    packed_buf,
+                    offsets,
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
+                    greedy_only,
+                );
+            }
+            // === PERSISTENT V2: per-layer cooperative TC GEMV + split-KV ===
+            if path == ForwardPath::PersistentV2Decode {
+                return self.forward_persistent_v2(
+                    &hidden_f16,
+                    gpu_cache,
+                    packed_buf,
+                    offsets,
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
+                    greedy_only,
+                );
+            }
+            // === MEGAKERNEL V1: all layers + LM head in one kernel launch ===
             if path == ForwardPath::MegakernelDecode {
                 return self.forward_megakernel(
-                    &hidden_f16, gpu_cache, packed_buf, offsets,
-                    num_tokens, num_seqs, max_context_len, block_size,
+                    &hidden_f16,
+                    gpu_cache,
+                    packed_buf,
+                    offsets,
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
                     greedy_only,
                 );
             }
@@ -713,7 +873,11 @@ mod cuda_impl {
 
                 // Double-buffer: even layers write A read B, odd write B read A.
                 let use_double_buf = use_scratch && scratch_borrow.is_some();
-                let (scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_double_buf {
+                let (scratch_ref_opt, hs_ref, pmo_ref): (
+                    Option<LayerScratchRef<'_>>,
+                    &CudaSlice<f16>,
+                    Option<&CudaSlice<f16>>,
+                ) = if use_double_buf {
                     let s = scratch_borrow.as_mut().unwrap();
                     let even = layer_idx % 2 == 0;
                     let (write_res, write_down, read_res, read_down) = if even {
@@ -721,35 +885,52 @@ mod cuda_impl {
                     } else {
                         (&mut s.residual_a, &mut s.down_a, &s.residual_b, &s.down_b)
                     };
-                    let pmo = if layer_idx > 0 { Some(read_down as &CudaSlice<f16>) } else { None };
-                    (Some(LayerScratchRef {
-                        normed: &mut s.normed,
-                        residual: write_res,
-                        qkv: &mut s.qkv,
-                        attn_out: &mut s.attn_out,
-                        o_proj: &mut s.o_proj,
-                        gate_up: &mut s.gate_up,
-                        silu_out: &mut s.silu_out,
-                        down: write_down,
-                    }), read_res as &CudaSlice<f16>, pmo)
+                    let pmo = if layer_idx > 0 {
+                        Some(read_down as &CudaSlice<f16>)
+                    } else {
+                        None
+                    };
+                    (
+                        Some(LayerScratchRef {
+                            normed: &mut s.normed,
+                            residual: write_res,
+                            qkv: &mut s.qkv,
+                            attn_out: &mut s.attn_out,
+                            o_proj: &mut s.o_proj,
+                            gate_up: &mut s.gate_up,
+                            silu_out: &mut s.silu_out,
+                            down: write_down,
+                        }),
+                        read_res as &CudaSlice<f16>,
+                        pmo,
+                    )
                 } else {
                     (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
                 };
 
                 let input = GpuLayerInput {
                     hidden_states: hs_ref,
-                    positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
+                    positions: packed_buf
+                        .slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
-                    block_tables: packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
-                    context_lens: packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
-                    slot_mapping: packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
+                    block_tables: packed_buf.slice(
+                        offsets.block_tables..offsets.block_tables + offsets.num_block_tables,
+                    ),
+                    context_lens: packed_buf.slice(
+                        offsets.context_lens..offsets.context_lens + offsets.num_context_lens,
+                    ),
+                    slot_mapping: packed_buf.slice(
+                        offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping,
+                    ),
                     num_tokens,
                     num_seqs,
                     max_context_len,
                     block_size,
                     is_prefill,
-                    seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
+                    seq_start_pos: packed_buf.slice(
+                        offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos,
+                    ),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
                     fp8_input_scratch_ptr: self.fp8_input_scratch.as_ref().map_or(0u64, |s| {
@@ -760,9 +941,21 @@ mod cuda_impl {
                 };
                 let weights = self.layer_weights(layer_idx)?;
                 let mut scratch_ref = scratch_ref_opt;
-                let result = layer.forward(path, &input, &weights, &self.blas,
-                    if use_double_buf { pmo_ref } else { prev_mlp_out.as_ref() },
-                    self.cublaslt_ref(), scratch_ref.as_mut(), self.gemm_strategy, self.cutlass.as_deref())?;
+                let result = layer.forward(
+                    path,
+                    &input,
+                    &weights,
+                    &self.blas,
+                    if use_double_buf {
+                        pmo_ref
+                    } else {
+                        prev_mlp_out.as_ref()
+                    },
+                    self.cublaslt_ref(),
+                    scratch_ref.as_mut(),
+                    self.gemm_strategy,
+                    self.cutlass.as_deref(),
+                )?;
                 if let Some((residual, mlp_out)) = result {
                     // Non-scratch path: take ownership
                     hidden_f16 = residual;
@@ -772,7 +965,9 @@ mod cuda_impl {
                 // next iteration reads them via the double-buffer swap.
 
                 if debug_fwd && (layer_idx < 3 || layer_idx == num_layers - 1) {
-                    let vals: Vec<f16> = self.stream.clone_dtoh(&hidden_f16)
+                    let vals: Vec<f16> = self
+                        .stream
+                        .clone_dtoh(&hidden_f16)
                         .map_err(|e| LLMError::GpuError(format!("debug dtoh: {e}")))?;
                     let first5: Vec<f32> = vals.iter().take(5).map(|v| v.to_f32()).collect();
                     let has_nan = vals.iter().any(|v| v.to_f32().is_nan());
@@ -780,12 +975,19 @@ mod cuda_impl {
                     let max_abs = vals.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
                     info!("DEBUG layer {layer_idx} residual: first5={first5:?} nan={has_nan} inf={has_inf} max={max_abs}");
 
-                    let mvals: Vec<f16> = self.stream.clone_dtoh(prev_mlp_out.as_ref().unwrap())
+                    let mvals: Vec<f16> = self
+                        .stream
+                        .clone_dtoh(prev_mlp_out.as_ref().unwrap())
                         .map_err(|e| LLMError::GpuError(format!("debug dtoh: {e}")))?;
                     let mfirst5: Vec<f32> = mvals.iter().take(5).map(|v| v.to_f32()).collect();
                     let mnan = mvals.iter().any(|v| v.to_f32().is_nan());
-                    let mmax = mvals.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
-                    info!("DEBUG layer {layer_idx} mlp_out: first5={mfirst5:?} nan={mnan} max={mmax}");
+                    let mmax = mvals
+                        .iter()
+                        .map(|v| v.to_f32().abs())
+                        .fold(0.0f32, f32::max);
+                    info!(
+                        "DEBUG layer {layer_idx} mlp_out: first5={mfirst5:?} nan={mnan} max={mmax}"
+                    );
                 }
             }
 
@@ -801,12 +1003,14 @@ mod cuda_impl {
                     let n = num_tokens * hidden_size;
                     let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
                         .map_err(|e| LLMError::GpuError(format!("final res: {e}")))?;
-                    self.stream.memcpy_dtod(&res_src.slice(..n), &mut res_out)
+                    self.stream
+                        .memcpy_dtod(&res_src.slice(..n), &mut res_out)
                         .map_err(|e| LLMError::GpuError(format!("final res dtod: {e}")))?;
                     hidden_f16 = res_out;
                     let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
                         .map_err(|e| LLMError::GpuError(format!("final mlp: {e}")))?;
-                    self.stream.memcpy_dtod(&down_src.slice(..n), &mut down_out)
+                    self.stream
+                        .memcpy_dtod(&down_src.slice(..n), &mut down_out)
                         .map_err(|e| LLMError::GpuError(format!("final mlp dtod: {e}")))?;
                     prev_mlp_out = Some(down_out);
                 }
@@ -816,9 +1020,14 @@ mod cuda_impl {
             // Final: fuse last layer's residual add with final RMSNorm
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
                 let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
-                    &self.stream, &self.loader,
-                    &hidden_f16, last_mlp, &self.final_norm_weight,
-                    self.rms_norm_eps, num_tokens, hidden_size,
+                    &self.stream,
+                    &self.loader,
+                    &hidden_f16,
+                    last_mlp,
+                    &self.final_norm_weight,
+                    self.rms_norm_eps,
+                    num_tokens,
+                    hidden_size,
                 )?;
                 n
             } else {
@@ -827,30 +1036,49 @@ mod cuda_impl {
 
             if debug_fwd {
                 // Check normed hidden and top logits
-                let nvals: Vec<f16> = self.stream.clone_dtoh(&normed_f16)
+                let nvals: Vec<f16> = self
+                    .stream
+                    .clone_dtoh(&normed_f16)
                     .map_err(|e| LLMError::GpuError(format!("debug dtoh: {e}")))?;
                 let nfirst5: Vec<f32> = nvals.iter().take(5).map(|v| v.to_f32()).collect();
                 let nnan = nvals.iter().any(|v| v.to_f32().is_nan());
-                let nmax = nvals.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+                let nmax = nvals
+                    .iter()
+                    .map(|v| v.to_f32().abs())
+                    .fold(0.0f32, f32::max);
                 info!("DEBUG normed: first5={nfirst5:?} nan={nnan} max={nmax}");
 
                 // Compute full logits and find top-5
                 let logits_dbg = CudaLinearLayer::forward_f16_in(
-                    &normed_f16, &self.lm_head_weight, num_tokens, vocab_size, hidden_size,
+                    &normed_f16,
+                    &self.lm_head_weight,
+                    num_tokens,
+                    vocab_size,
+                    hidden_size,
                     &self.blas,
                 )?;
-                let logits_cpu: Vec<f32> = self.stream.clone_dtoh(&logits_dbg)
+                let logits_cpu: Vec<f32> = self
+                    .stream
+                    .clone_dtoh(&logits_dbg)
                     .map_err(|e| LLMError::GpuError(format!("debug logits dtoh: {e}")))?;
                 // Find top-5 for last token
                 let last_start = (num_tokens - 1) * vocab_size;
                 let last_logits = &logits_cpu[last_start..last_start + vocab_size];
-                let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                let mut indexed: Vec<(usize, f32)> = last_logits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i, v))
+                    .collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let top5: Vec<(usize, f32)> = indexed[..5.min(indexed.len())].to_vec();
                 info!("DEBUG top5_logits: {:?}", top5);
-                info!("DEBUG logits range: min={:.2} max={:.2} mean={:.4}",
+                info!(
+                    "DEBUG logits range: min={:.2} max={:.2} mean={:.4}",
                     last_logits.iter().cloned().fold(f32::INFINITY, f32::min),
-                    last_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    last_logits
+                        .iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max),
                     last_logits.iter().sum::<f32>() / last_logits.len() as f32,
                 );
             }
@@ -858,26 +1086,40 @@ mod cuda_impl {
             // LM head + argmax: f16 hidden -> fused argmax
             if num_tokens == 1 && greedy_only {
                 let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
-                    &normed_f16, &self.lm_head_weight, vocab_size, hidden_size)?;
-                let token_ids_cpu = self.stream.clone_dtoh(&token_ids_gpu)
+                    &normed_f16,
+                    &self.lm_head_weight,
+                    vocab_size,
+                    hidden_size,
+                )?;
+                let token_ids_cpu = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
                     .map_err(|e| LLMError::GpuError(format!("fused_lm_head token DtoH: {e}")))?;
                 return Ok(ForwardOutput::TokenIds(token_ids_cpu));
             }
 
             // Full logits path: hgemm f16 hidden x f16 lm_head -> f32 logits
             let logits_gpu = CudaLinearLayer::forward_f16_in(
-                &normed_f16, &self.lm_head_weight, num_tokens, vocab_size, hidden_size,
+                &normed_f16,
+                &self.lm_head_weight,
+                num_tokens,
+                vocab_size,
+                hidden_size,
                 &self.blas,
             )?;
 
             if greedy_only {
                 let token_ids_gpu = self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?;
-                let token_ids_cpu = self.stream.clone_dtoh(&token_ids_gpu)
+                let token_ids_cpu = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
                     .map_err(|e| LLMError::GpuError(format!("argmax DtoH: {e}")))?;
                 return Ok(ForwardOutput::TokenIds(token_ids_cpu));
             }
 
-            let logits_cpu = self.stream.clone_dtoh(&logits_gpu)
+            let logits_cpu = self
+                .stream
+                .clone_dtoh(&logits_gpu)
                 .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
             Ok(ForwardOutput::Logits(logits_cpu))
         }
@@ -925,7 +1167,11 @@ mod cuda_impl {
             // For Batched path: copy embedding into residual_a for double-buffer read
             if use_scratch {
                 if let Some(ref mut s) = *scratch_borrow {
-                    self.stream.memcpy_dtod(&hidden_f16, &mut s.residual_a.slice_mut(..num_tokens * hidden_size))
+                    self.stream
+                        .memcpy_dtod(
+                            &hidden_f16,
+                            &mut s.residual_a.slice_mut(..num_tokens * hidden_size),
+                        )
                         .map_err(|e| LLMError::GpuError(format!("partial embed->scratch: {e}")))?;
                 }
             }
@@ -933,7 +1179,11 @@ mod cuda_impl {
             for (layer_idx, layer) in self.layers.iter().take(layers_to_run).enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
 
-                let (mut scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_scratch {
+                let (mut scratch_ref_opt, hs_ref, pmo_ref): (
+                    Option<LayerScratchRef<'_>>,
+                    &CudaSlice<f16>,
+                    Option<&CudaSlice<f16>>,
+                ) = if use_scratch {
                     if let Some(ref mut s) = *scratch_borrow {
                         let even = layer_idx % 2 == 0;
                         let (write_res, write_down, read_res, read_down) = if even {
@@ -941,20 +1191,31 @@ mod cuda_impl {
                         } else {
                             (&mut s.residual_a, &mut s.down_a, &s.residual_b, &s.down_b)
                         };
-                        let pmo = if layer_idx > 0 { Some(read_down as &CudaSlice<f16>) } else { None };
-                        let hs: &CudaSlice<f16> = if layer_idx > 0 { read_res } else { &hidden_f16 };
-                        (Some(LayerScratchRef {
-                            normed: &mut s.normed,
-                            residual: write_res,
-                            qkv: &mut s.qkv,
-                            attn_out: &mut s.attn_out,
-                            o_proj: &mut s.o_proj,
-                            gate_up: &mut s.gate_up,
-                            silu_out: &mut s.silu_out,
-                            down: write_down,
-                        }), hs, pmo)
+                        let pmo = if layer_idx > 0 {
+                            Some(read_down as &CudaSlice<f16>)
+                        } else {
+                            None
+                        };
+                        let hs: &CudaSlice<f16> =
+                            if layer_idx > 0 { read_res } else { &hidden_f16 };
+                        (
+                            Some(LayerScratchRef {
+                                normed: &mut s.normed,
+                                residual: write_res,
+                                qkv: &mut s.qkv,
+                                attn_out: &mut s.attn_out,
+                                o_proj: &mut s.o_proj,
+                                gate_up: &mut s.gate_up,
+                                silu_out: &mut s.silu_out,
+                                down: write_down,
+                            }),
+                            hs,
+                            pmo,
+                        )
                     } else {
-                        return Err(LLMError::GpuError("Batched path requires scratch buffers".into()));
+                        return Err(LLMError::GpuError(
+                            "Batched path requires scratch buffers".into(),
+                        ));
                     }
                 } else {
                     (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
@@ -962,18 +1223,27 @@ mod cuda_impl {
 
                 let input = GpuLayerInput {
                     hidden_states: hs_ref,
-                    positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
+                    positions: packed_buf
+                        .slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
-                    block_tables: packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
-                    context_lens: packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
-                    slot_mapping: packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
+                    block_tables: packed_buf.slice(
+                        offsets.block_tables..offsets.block_tables + offsets.num_block_tables,
+                    ),
+                    context_lens: packed_buf.slice(
+                        offsets.context_lens..offsets.context_lens + offsets.num_context_lens,
+                    ),
+                    slot_mapping: packed_buf.slice(
+                        offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping,
+                    ),
                     num_tokens,
                     num_seqs,
                     max_context_len,
                     block_size,
                     is_prefill,
-                    seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
+                    seq_start_pos: packed_buf.slice(
+                        offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos,
+                    ),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
                     fp8_input_scratch_ptr: self.fp8_input_scratch.as_ref().map_or(0u64, |s| {
@@ -983,9 +1253,21 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let result = layer.forward(path, &input, &weights, &self.blas,
-                    if use_scratch { pmo_ref } else { prev_mlp_out.as_ref() },
-                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.gemm_strategy, self.cutlass.as_deref())?;
+                let result = layer.forward(
+                    path,
+                    &input,
+                    &weights,
+                    &self.blas,
+                    if use_scratch {
+                        pmo_ref
+                    } else {
+                        prev_mlp_out.as_ref()
+                    },
+                    self.cublaslt_ref(),
+                    scratch_ref_opt.as_mut(),
+                    self.gemm_strategy,
+                    self.cutlass.as_deref(),
+                )?;
                 if let Some((residual, mlp_out)) = result {
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
@@ -1004,12 +1286,14 @@ mod cuda_impl {
                     let n = num_tokens * hidden_size;
                     let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
                         .map_err(|e| LLMError::GpuError(format!("partial final res: {e}")))?;
-                    self.stream.memcpy_dtod(&res_src.slice(..n), &mut res_out)
+                    self.stream
+                        .memcpy_dtod(&res_src.slice(..n), &mut res_out)
                         .map_err(|e| LLMError::GpuError(format!("partial final res dtod: {e}")))?;
                     hidden_f16 = res_out;
                     let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
                         .map_err(|e| LLMError::GpuError(format!("partial final mlp: {e}")))?;
-                    self.stream.memcpy_dtod(&down_src.slice(..n), &mut down_out)
+                    self.stream
+                        .memcpy_dtod(&down_src.slice(..n), &mut down_out)
                         .map_err(|e| LLMError::GpuError(format!("partial final mlp dtod: {e}")))?;
                     prev_mlp_out = Some(down_out);
                 }
@@ -1018,9 +1302,14 @@ mod cuda_impl {
             // Final norm + LM head (same as full forward)
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
                 let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
-                    &self.stream, &self.loader,
-                    &hidden_f16, last_mlp, &self.final_norm_weight,
-                    self.rms_norm_eps, num_tokens, hidden_size,
+                    &self.stream,
+                    &self.loader,
+                    &hidden_f16,
+                    last_mlp,
+                    &self.final_norm_weight,
+                    self.rms_norm_eps,
+                    num_tokens,
+                    hidden_size,
                 )?;
                 n
             } else {
@@ -1028,11 +1317,17 @@ mod cuda_impl {
             };
 
             let logits_gpu = CudaLinearLayer::forward_f16_in(
-                &normed_f16, &self.lm_head_weight, num_tokens, vocab_size, hidden_size,
+                &normed_f16,
+                &self.lm_head_weight,
+                num_tokens,
+                vocab_size,
+                hidden_size,
                 &self.blas,
             )?;
 
-            let logits_cpu = self.stream.clone_dtoh(&logits_gpu)
+            let logits_cpu = self
+                .stream
+                .clone_dtoh(&logits_gpu)
                 .map_err(|e| LLMError::GpuError(format!("forward_partial logits DtoH: {e}")))?;
             Ok(logits_cpu)
         }
@@ -1093,7 +1388,9 @@ mod cuda_impl {
             let num_seq_start_pos = scratch.len() - seq_start_pos_off;
 
             // Single packed upload (1 memcpy_htod instead of 6).
-            self.meta_packed.borrow_mut().upload(&scratch, &self.stream)
+            self.meta_packed
+                .borrow_mut()
+                .upload(&scratch, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("packed metadata HtoD: {e}")))?;
 
             self.meta_packed_offsets.set(PackedMetaOffsets {
@@ -1139,10 +1436,18 @@ mod cuda_impl {
 
             // Pad attention metadata
             let mut padded_meta = attn_meta.clone();
-            let dummy_ctx = if attn_meta.context_lens.is_empty() { 1 } else { attn_meta.context_lens[0] };
+            let dummy_ctx = if attn_meta.context_lens.is_empty() {
+                1
+            } else {
+                attn_meta.context_lens[0]
+            };
             padded_meta.context_lens.resize(padded_batch, dummy_ctx);
             padded_meta.query_lens.resize(padded_batch, 1);
-            let dummy_bt = if attn_meta.block_tables.is_empty() { vec![] } else { attn_meta.block_tables[0].clone() };
+            let dummy_bt = if attn_meta.block_tables.is_empty() {
+                vec![]
+            } else {
+                attn_meta.block_tables[0].clone()
+            };
             for _ in 0..pad_count {
                 padded_meta.block_tables.push(dummy_bt.clone());
             }
@@ -1192,25 +1497,38 @@ mod cuda_impl {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let even = layer_idx % 2 == 0;
 
-                let (mut scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_scratch {
+                let (mut scratch_ref_opt, hs_ref, pmo_ref): (
+                    Option<LayerScratchRef<'_>>,
+                    &CudaSlice<f16>,
+                    Option<&CudaSlice<f16>>,
+                ) = if use_scratch {
                     if let Some(ref mut s) = *scratch_borrow {
                         let (write_res, write_down, read_res, read_down) = if even {
                             (&mut s.residual_b, &mut s.down_b, &s.residual_a, &s.down_a)
                         } else {
                             (&mut s.residual_a, &mut s.down_a, &s.residual_b, &s.down_b)
                         };
-                        let pmo = if layer_idx > 0 { Some(read_down as &CudaSlice<f16>) } else { None };
-                        let hs: &CudaSlice<f16> = if layer_idx > 0 { read_res } else { &hidden_f16 };
-                        (Some(LayerScratchRef {
-                            normed: &mut s.normed,
-                            residual: write_res,
-                            qkv: &mut s.qkv,
-                            attn_out: &mut s.attn_out,
-                            o_proj: &mut s.o_proj,
-                            gate_up: &mut s.gate_up,
-                            silu_out: &mut s.silu_out,
-                            down: write_down,
-                        }), hs, pmo)
+                        let pmo = if layer_idx > 0 {
+                            Some(read_down as &CudaSlice<f16>)
+                        } else {
+                            None
+                        };
+                        let hs: &CudaSlice<f16> =
+                            if layer_idx > 0 { read_res } else { &hidden_f16 };
+                        (
+                            Some(LayerScratchRef {
+                                normed: &mut s.normed,
+                                residual: write_res,
+                                qkv: &mut s.qkv,
+                                attn_out: &mut s.attn_out,
+                                o_proj: &mut s.o_proj,
+                                gate_up: &mut s.gate_up,
+                                silu_out: &mut s.silu_out,
+                                down: write_down,
+                            }),
+                            hs,
+                            pmo,
+                        )
                     } else {
                         (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
                     }
@@ -1220,18 +1538,27 @@ mod cuda_impl {
 
                 let input = GpuLayerInput {
                     hidden_states: hs_ref,
-                    positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
+                    positions: packed_buf
+                        .slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
-                    block_tables: packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
-                    context_lens: packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
-                    slot_mapping: packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
+                    block_tables: packed_buf.slice(
+                        offsets.block_tables..offsets.block_tables + offsets.num_block_tables,
+                    ),
+                    context_lens: packed_buf.slice(
+                        offsets.context_lens..offsets.context_lens + offsets.num_context_lens,
+                    ),
+                    slot_mapping: packed_buf.slice(
+                        offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping,
+                    ),
                     num_tokens,
                     num_seqs,
                     max_context_len,
                     block_size,
                     is_prefill,
-                    seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
+                    seq_start_pos: packed_buf.slice(
+                        offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos,
+                    ),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
                     fp8_input_scratch_ptr: self.fp8_input_scratch.as_ref().map_or(0u64, |s| {
@@ -1241,9 +1568,21 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let result = layer.forward(path, &input, &weights, &self.blas,
-                    if use_scratch { pmo_ref } else { prev_mlp_out.as_ref() },
-                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.gemm_strategy, self.cutlass.as_deref())?;
+                let result = layer.forward(
+                    path,
+                    &input,
+                    &weights,
+                    &self.blas,
+                    if use_scratch {
+                        pmo_ref
+                    } else {
+                        prev_mlp_out.as_ref()
+                    },
+                    self.cublaslt_ref(),
+                    scratch_ref_opt.as_mut(),
+                    self.gemm_strategy,
+                    self.cutlass.as_deref(),
+                )?;
                 if let Some((residual, mlp_out)) = result {
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
@@ -1262,12 +1601,14 @@ mod cuda_impl {
                     let n = num_tokens * hidden_size;
                     let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
                         .map_err(|e| LLMError::GpuError(format!("final res: {e}")))?;
-                    self.stream.memcpy_dtod(&res_src.slice(..n), &mut res_out)
+                    self.stream
+                        .memcpy_dtod(&res_src.slice(..n), &mut res_out)
                         .map_err(|e| LLMError::GpuError(format!("final res dtod: {e}")))?;
                     hidden_f16 = res_out;
                     let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
                         .map_err(|e| LLMError::GpuError(format!("final mlp: {e}")))?;
-                    self.stream.memcpy_dtod(&down_src.slice(..n), &mut down_out)
+                    self.stream
+                        .memcpy_dtod(&down_src.slice(..n), &mut down_out)
                         .map_err(|e| LLMError::GpuError(format!("final mlp dtod: {e}")))?;
                     prev_mlp_out = Some(down_out);
                 }
@@ -1277,9 +1618,14 @@ mod cuda_impl {
             // Final: fuse last layer's residual add with final RMSNorm
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
                 let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
-                    &self.stream, &self.loader,
-                    &hidden_f16, last_mlp, &self.final_norm_weight,
-                    self.rms_norm_eps, num_tokens, hidden_size,
+                    &self.stream,
+                    &self.loader,
+                    &hidden_f16,
+                    last_mlp,
+                    &self.final_norm_weight,
+                    self.rms_norm_eps,
+                    num_tokens,
+                    hidden_size,
                 )?;
                 n
             } else {
@@ -1289,26 +1635,40 @@ mod cuda_impl {
             // LM head + argmax: f16 hidden -> fused argmax
             if num_tokens == 1 && greedy_only {
                 let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
-                    &normed_f16, &self.lm_head_weight, vocab_size, hidden_size)?;
-                let token_ids_cpu = self.stream.clone_dtoh(&token_ids_gpu)
+                    &normed_f16,
+                    &self.lm_head_weight,
+                    vocab_size,
+                    hidden_size,
+                )?;
+                let token_ids_cpu = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
                     .map_err(|e| LLMError::GpuError(format!("fused_lm_head token DtoH: {e}")))?;
                 return Ok(ForwardOutput::TokenIds(token_ids_cpu));
             }
 
             // Full logits path: hgemm f16 hidden x f16 lm_head -> f32 logits
             let logits_gpu = CudaLinearLayer::forward_f16_in(
-                &normed_f16, &self.lm_head_weight, num_tokens, vocab_size, hidden_size,
+                &normed_f16,
+                &self.lm_head_weight,
+                num_tokens,
+                vocab_size,
+                hidden_size,
                 &self.blas,
             )?;
 
             if greedy_only {
                 let token_ids_gpu = self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?;
-                let token_ids_cpu = self.stream.clone_dtoh(&token_ids_gpu)
+                let token_ids_cpu = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
                     .map_err(|e| LLMError::GpuError(format!("argmax DtoH: {e}")))?;
                 return Ok(ForwardOutput::TokenIds(token_ids_cpu));
             }
 
-            let logits_cpu = self.stream.clone_dtoh(&logits_gpu)
+            let logits_cpu = self
+                .stream
+                .clone_dtoh(&logits_gpu)
                 .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
             Ok(ForwardOutput::Logits(logits_cpu))
         }
@@ -1318,12 +1678,29 @@ mod cuda_impl {
             &self.stream
         }
 
+        /// Whether the selected forward path can be executed by
+        /// `forward_gpu_only()` and therefore participate in CUDA graph capture.
+        pub fn graph_capture_supported(&self, num_tokens: usize, is_prefill: bool) -> bool {
+            matches!(
+                self.resolve_forward_path(num_tokens, is_prefill),
+                ForwardPath::Fp8Decode
+                    | ForwardPath::FusedDecode
+                    | ForwardPath::PersistentDecode
+                    | ForwardPath::CublasGemvDecode
+                    | ForwardPath::Batched
+            )
+        }
+
         /// Get cublasLt reference (None when feature is off).
         fn cublaslt_ref(&self) -> Option<&crate::CublasLtRef> {
             #[cfg(feature = "cublaslt")]
-            { self.blas_lt.as_ref() }
+            {
+                self.blas_lt.as_ref()
+            }
             #[cfg(not(feature = "cublaslt"))]
-            { None }
+            {
+                None
+            }
         }
 
         fn resolve_forward_path(&self, num_tokens: usize, is_prefill: bool) -> ForwardPath {
@@ -1333,13 +1710,41 @@ mod cuda_impl {
                 if std::env::var("RVLLM_CUBLAS_DECODE").map_or(false, |v| v == "1") {
                     return ForwardPath::CublasGemvDecode;
                 }
-                // Megakernel: all 28 layers in one kernel launch
-                // Enable with RVLLM_MEGAKERNEL=1
+                // v3 persistent per-layer: non-cooperative, 1024 blocks, vectorized GEMV
+                if std::env::var("RVLLM_PERSISTENT_V3").map_or(false, |v| v == "1") {
+                    if self
+                        .persistent_v2
+                        .as_ref()
+                        .map_or(false, |k| k.has_v3_kernel())
+                    {
+                        return ForwardPath::PersistentV3Decode;
+                    }
+                }
+                // v2 megakernel: all layers + LM head in one cooperative launch (TC GEMV + split-KV)
+                if std::env::var("RVLLM_MEGAKERNEL_V2").map_or(false, |v| v == "1") {
+                    if self
+                        .persistent_v2
+                        .as_ref()
+                        .map_or(false, |k| k.has_mega_kernel())
+                    {
+                        return ForwardPath::MegakernelV2Decode;
+                    }
+                }
+                // v2 persistent per-layer: cooperative TC GEMV + split-KV attention
+                if std::env::var("RVLLM_PERSISTENT_V2").map_or(false, |v| v == "1") {
+                    if self
+                        .persistent_v2
+                        .as_ref()
+                        .map_or(false, |k| k.has_layer_kernel())
+                    {
+                        return ForwardPath::PersistentV2Decode;
+                    }
+                }
+                // v1 megakernel: all 28 layers in one kernel launch (instruction tape)
                 if std::env::var("RVLLM_MEGAKERNEL").map_or(false, |v| v == "1") {
                     return ForwardPath::MegakernelDecode;
                 }
-                // DAG persistent decode: single kernel per layer
-                // Enable with RVLLM_PERSISTENT=1
+                // v1 DAG persistent decode: single kernel per layer (scalar GEMV)
                 if std::env::var("RVLLM_PERSISTENT").map_or(false, |v| v == "1") {
                     return ForwardPath::PersistentDecode;
                 }
@@ -1378,12 +1783,18 @@ mod cuda_impl {
             let dummy = vec![0i32; max_meta];
             meta.upload(&dummy, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("pre-alloc meta: {e}")))?;
-            info!(max_meta, "pre-allocated packed metadata buffer for graph stability");
+            info!(
+                max_meta,
+                "pre-allocated packed metadata buffer for graph stability"
+            );
             // Pre-allocate graph output buffer too (same reason -- stable pointer).
             {
                 let mut out = self.graph_output.borrow_mut();
-                *out = Some(self.stream.alloc_zeros::<i32>(max_seqs)
-                    .map_err(|e| LLMError::GpuError(format!("pre-alloc graph_output: {e}")))?);
+                *out = Some(
+                    self.stream
+                        .alloc_zeros::<i32>(max_seqs)
+                        .map_err(|e| LLMError::GpuError(format!("pre-alloc graph_output: {e}")))?,
+                );
             }
             Ok(())
         }
@@ -1430,25 +1841,38 @@ mod cuda_impl {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let even = layer_idx % 2 == 0;
 
-                let (mut scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_scratch {
+                let (mut scratch_ref_opt, hs_ref, pmo_ref): (
+                    Option<LayerScratchRef<'_>>,
+                    &CudaSlice<f16>,
+                    Option<&CudaSlice<f16>>,
+                ) = if use_scratch {
                     if let Some(ref mut s) = *scratch_borrow {
                         let (write_res, write_down, read_res, read_down) = if even {
                             (&mut s.residual_b, &mut s.down_b, &s.residual_a, &s.down_a)
                         } else {
                             (&mut s.residual_a, &mut s.down_a, &s.residual_b, &s.down_b)
                         };
-                        let pmo = if layer_idx > 0 { Some(read_down as &CudaSlice<f16>) } else { None };
-                        let hs: &CudaSlice<f16> = if layer_idx > 0 { read_res } else { &hidden_f16 };
-                        (Some(LayerScratchRef {
-                            normed: &mut s.normed,
-                            residual: write_res,
-                            qkv: &mut s.qkv,
-                            attn_out: &mut s.attn_out,
-                            o_proj: &mut s.o_proj,
-                            gate_up: &mut s.gate_up,
-                            silu_out: &mut s.silu_out,
-                            down: write_down,
-                        }), hs, pmo)
+                        let pmo = if layer_idx > 0 {
+                            Some(read_down as &CudaSlice<f16>)
+                        } else {
+                            None
+                        };
+                        let hs: &CudaSlice<f16> =
+                            if layer_idx > 0 { read_res } else { &hidden_f16 };
+                        (
+                            Some(LayerScratchRef {
+                                normed: &mut s.normed,
+                                residual: write_res,
+                                qkv: &mut s.qkv,
+                                attn_out: &mut s.attn_out,
+                                o_proj: &mut s.o_proj,
+                                gate_up: &mut s.gate_up,
+                                silu_out: &mut s.silu_out,
+                                down: write_down,
+                            }),
+                            hs,
+                            pmo,
+                        )
                     } else {
                         (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
                     }
@@ -1458,18 +1882,27 @@ mod cuda_impl {
 
                 let input = GpuLayerInput {
                     hidden_states: hs_ref,
-                    positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
+                    positions: packed_buf
+                        .slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
-                    block_tables: packed_buf.slice(offsets.block_tables..offsets.block_tables + offsets.num_block_tables),
-                    context_lens: packed_buf.slice(offsets.context_lens..offsets.context_lens + offsets.num_context_lens),
-                    slot_mapping: packed_buf.slice(offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping),
+                    block_tables: packed_buf.slice(
+                        offsets.block_tables..offsets.block_tables + offsets.num_block_tables,
+                    ),
+                    context_lens: packed_buf.slice(
+                        offsets.context_lens..offsets.context_lens + offsets.num_context_lens,
+                    ),
+                    slot_mapping: packed_buf.slice(
+                        offsets.slot_mapping..offsets.slot_mapping + offsets.num_slot_mapping,
+                    ),
                     num_tokens,
                     num_seqs,
                     max_context_len,
                     block_size,
                     is_prefill,
-                    seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
+                    seq_start_pos: packed_buf.slice(
+                        offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos,
+                    ),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
                     fp8_input_scratch_ptr: self.fp8_input_scratch.as_ref().map_or(0u64, |s| {
@@ -1479,9 +1912,21 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let result = layer.forward(path, &input, &weights, &self.blas,
-                    if use_scratch { pmo_ref } else { prev_mlp_out.as_ref() },
-                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.gemm_strategy, self.cutlass.as_deref())?;
+                let result = layer.forward(
+                    path,
+                    &input,
+                    &weights,
+                    &self.blas,
+                    if use_scratch {
+                        pmo_ref
+                    } else {
+                        prev_mlp_out.as_ref()
+                    },
+                    self.cublaslt_ref(),
+                    scratch_ref_opt.as_mut(),
+                    self.gemm_strategy,
+                    self.cutlass.as_deref(),
+                )?;
                 if let Some((residual, mlp_out)) = result {
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
@@ -1500,12 +1945,14 @@ mod cuda_impl {
                     let n = num_tokens * hidden_size;
                     let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
                         .map_err(|e| LLMError::GpuError(format!("final res: {e}")))?;
-                    self.stream.memcpy_dtod(&res_src.slice(..n), &mut res_out)
+                    self.stream
+                        .memcpy_dtod(&res_src.slice(..n), &mut res_out)
                         .map_err(|e| LLMError::GpuError(format!("final res dtod: {e}")))?;
                     hidden_f16 = res_out;
                     let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
                         .map_err(|e| LLMError::GpuError(format!("final mlp: {e}")))?;
-                    self.stream.memcpy_dtod(&down_src.slice(..n), &mut down_out)
+                    self.stream
+                        .memcpy_dtod(&down_src.slice(..n), &mut down_out)
                         .map_err(|e| LLMError::GpuError(format!("final mlp dtod: {e}")))?;
                     prev_mlp_out = Some(down_out);
                 }
@@ -1515,9 +1962,14 @@ mod cuda_impl {
             // Final: fuse last layer's residual add with final RMSNorm
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
                 let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
-                    &self.stream, &self.loader,
-                    &hidden_f16, last_mlp, &self.final_norm_weight,
-                    self.rms_norm_eps, num_tokens, hidden_size,
+                    &self.stream,
+                    &self.loader,
+                    &hidden_f16,
+                    last_mlp,
+                    &self.final_norm_weight,
+                    self.rms_norm_eps,
+                    num_tokens,
+                    hidden_size,
                 )?;
                 n
             } else {
@@ -1526,11 +1978,19 @@ mod cuda_impl {
 
             let token_ids_gpu = if num_tokens == 1 {
                 self.gpu_fused_lm_head_argmax_f16_hidden(
-                    &normed_f16, &self.lm_head_weight, vocab_size, hidden_size)?
+                    &normed_f16,
+                    &self.lm_head_weight,
+                    vocab_size,
+                    hidden_size,
+                )?
             } else {
                 // Multi-token: hgemm f16 hidden x f16 lm_head -> f32 logits -> argmax
                 let logits_gpu = CudaLinearLayer::forward_f16_in(
-                    &normed_f16, &self.lm_head_weight, num_tokens, vocab_size, hidden_size,
+                    &normed_f16,
+                    &self.lm_head_weight,
+                    num_tokens,
+                    vocab_size,
+                    hidden_size,
                     &self.blas,
                 )?;
                 self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?
@@ -1543,11 +2003,15 @@ mod cuda_impl {
             let need = num_tokens;
             let have = out.as_ref().map_or(0, |b| b.len());
             if have < need {
-                *out = Some(self.stream.alloc_zeros::<i32>(need)
-                    .map_err(|e| LLMError::GpuError(format!("graph_output alloc: {e}")))?);
+                *out = Some(
+                    self.stream
+                        .alloc_zeros::<i32>(need)
+                        .map_err(|e| LLMError::GpuError(format!("graph_output alloc: {e}")))?,
+                );
             }
             let dst = out.as_mut().unwrap();
-            self.stream.memcpy_dtod(&token_ids_gpu, dst)
+            self.stream
+                .memcpy_dtod(&token_ids_gpu, dst)
                 .map_err(|e| LLMError::GpuError(format!("graph_output dtod: {e}")))?;
 
             Ok(())
@@ -1560,10 +2024,14 @@ mod cuda_impl {
         pub fn read_graph_output(&self, num_tokens: usize) -> Result<Vec<i32>> {
             let out = self.graph_output.borrow();
             let buf = out.as_ref().ok_or_else(|| {
-                LLMError::GpuError("graph_output not populated -- call forward_gpu_only first".into())
+                LLMError::GpuError(
+                    "graph_output not populated -- call forward_gpu_only first".into(),
+                )
             })?;
             // Copy only the needed elements
-            let full = self.stream.clone_dtoh(buf)
+            let full = self
+                .stream
+                .clone_dtoh(buf)
                 .map_err(|e| LLMError::GpuError(format!("graph_output DtoH: {e}")))?;
             Ok(full[..num_tokens].to_vec())
         }
@@ -1574,18 +2042,17 @@ mod cuda_impl {
         /// The caller must call `sync_stream()` before reading from `dst`.
         /// `dst` MUST be pinned host memory for truly async behavior; with
         /// pageable memory cuMemcpyDtoHAsync degrades to synchronous.
-        pub fn read_graph_output_async(
-            &self,
-            num_tokens: usize,
-            dst: &mut [i32],
-        ) -> Result<()> {
+        pub fn read_graph_output_async(&self, num_tokens: usize, dst: &mut [i32]) -> Result<()> {
             let out = self.graph_output.borrow();
             let buf = out.as_ref().ok_or_else(|| {
-                LLMError::GpuError("graph_output not populated -- call forward_gpu_only first".into())
+                LLMError::GpuError(
+                    "graph_output not populated -- call forward_gpu_only first".into(),
+                )
             })?;
             // Only copy num_tokens elements (not the full padded buffer)
             let src_view = buf.slice(..num_tokens);
-            self.stream.memcpy_dtoh(&src_view, &mut dst[..num_tokens])
+            self.stream
+                .memcpy_dtoh(&src_view, &mut dst[..num_tokens])
                 .map_err(|e| LLMError::GpuError(format!("graph_output async DtoH: {e}")))?;
             Ok(())
         }
@@ -1593,7 +2060,8 @@ mod cuda_impl {
         /// Synchronize the runner's CUDA stream, blocking until all enqueued
         /// work (graph replay + async DtoH) completes.
         pub fn sync_stream(&self) -> Result<()> {
-            self.stream.synchronize()
+            self.stream
+                .synchronize()
                 .map_err(|e| LLMError::GpuError(format!("stream sync: {e}")))?;
             Ok(())
         }
@@ -1605,9 +2073,7 @@ mod cuda_impl {
             num_tokens: usize,
             vocab_size: usize,
         ) -> Result<CudaSlice<i32>> {
-            let kernel = self
-                .loader
-                .get_func("argmax", "argmax_kernel")?;
+            let kernel = self.loader.get_func("argmax", "argmax_kernel")?;
 
             let output: CudaSlice<i32> = self
                 .stream
@@ -1642,23 +2108,24 @@ mod cuda_impl {
             vocab_size: usize,
             hidden_size: usize,
         ) -> Result<CudaSlice<i32>> {
-            let pass1 = self
-                .loader
-                .get_func("fused_lm_head_argmax_f16", "fused_lm_head_argmax_f16_kernel")?;
+            let pass1 = self.loader.get_func(
+                "fused_lm_head_argmax_f16",
+                "fused_lm_head_argmax_f16_kernel",
+            )?;
             let pass2 = self
                 .loader
                 .get_func("fused_lm_head_argmax", "fused_lm_head_argmax_reduce_kernel")?;
 
             let num_blocks = (vocab_size + 255) / 256;
 
-            let partial_val: CudaSlice<f32> = self
-                .stream
-                .alloc_zeros::<f32>(num_blocks)
-                .map_err(|e| LLMError::GpuError(format!("fused_lm_head_f16 partial_val alloc: {e}")))?;
-            let partial_idx: CudaSlice<i32> = self
-                .stream
-                .alloc_zeros::<i32>(num_blocks)
-                .map_err(|e| LLMError::GpuError(format!("fused_lm_head_f16 partial_idx alloc: {e}")))?;
+            let partial_val: CudaSlice<f32> =
+                self.stream.alloc_zeros::<f32>(num_blocks).map_err(|e| {
+                    LLMError::GpuError(format!("fused_lm_head_f16 partial_val alloc: {e}"))
+                })?;
+            let partial_idx: CudaSlice<i32> =
+                self.stream.alloc_zeros::<i32>(num_blocks).map_err(|e| {
+                    LLMError::GpuError(format!("fused_lm_head_f16 partial_idx alloc: {e}"))
+                })?;
             let output: CudaSlice<i32> = self
                 .stream
                 .alloc_zeros::<i32>(1)
@@ -1680,7 +2147,9 @@ mod cuda_impl {
                     .arg(&(vocab_size as i32))
                     .arg(&(hidden_size as i32))
                     .launch(cfg1)
-                    .map_err(|e| LLMError::GpuError(format!("fused_lm_head_argmax_f16_kernel launch: {e}")))?;
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("fused_lm_head_argmax_f16_kernel launch: {e}"))
+                    })?;
             }
 
             // Pass 2: reduce partials to single token ID
@@ -1698,7 +2167,9 @@ mod cuda_impl {
                     .arg(&output)
                     .arg(&(num_blocks as i32))
                     .launch(cfg2)
-                    .map_err(|e| LLMError::GpuError(format!("fused_lm_head_argmax_f16_reduce launch: {e}")))?;
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("fused_lm_head_argmax_f16_reduce launch: {e}"))
+                    })?;
             }
 
             Ok(output)
@@ -1717,8 +2188,8 @@ mod cuda_impl {
             block_size: usize,
             _greedy_only: bool,
         ) -> Result<ForwardOutput> {
-            use std::ffi::c_void;
             use crate::megakernel;
+            use std::ffi::c_void;
 
             let cfg = &self.config;
             let hidden = cfg.hidden_size;
@@ -1730,22 +2201,27 @@ mod cuda_impl {
             let num_layers = self.layers.len();
 
             // Build instruction tape
-            let has_bias = !self.fused_qkv_bias.is_empty()
-                && self.fused_qkv_bias.iter().any(|b| b.is_some());
+            let has_bias =
+                !self.fused_qkv_bias.is_empty() && self.fused_qkv_bias.iter().any(|b| b.is_some());
             let tape = megakernel::build_instruction_tape(
-                num_layers, hidden, num_heads, num_kv_heads, head_dim,
-                intermediate, vocab, self.rms_norm_eps, has_bias,
+                num_layers,
+                hidden,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                intermediate,
+                vocab,
+                self.rms_norm_eps,
+                has_bias,
             );
             let num_instructions = tape.len() as i32;
 
             // Upload instruction tape
-            let tape_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    tape.as_ptr() as *const u8,
-                    tape.len() * 64,
-                )
-            };
-            let tape_gpu = self.stream.clone_htod(tape_bytes)
+            let tape_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(tape.as_ptr() as *const u8, tape.len() * 64) };
+            let tape_gpu = self
+                .stream
+                .clone_htod(tape_bytes)
                 .map_err(|e| LLMError::GpuError(format!("mk tape upload: {e}")))?;
 
             // Collect weight pointers (7 per layer + 2 global)
@@ -1755,18 +2231,23 @@ mod cuda_impl {
                 // input_layernorm
                 wptrs.push(DevicePtr::device_ptr(w.input_layernorm, &self.stream).0);
                 // fused_qkv (required for megakernel)
-                let qkv_w = w.fused_qkv
+                let qkv_w = w
+                    .fused_qkv
                     .ok_or_else(|| LLMError::GpuError("megakernel requires fused_qkv".into()))?;
                 wptrs.push(DevicePtr::device_ptr(qkv_w, &self.stream).0);
                 // qkv_bias (0 if none)
-                wptrs.push(w.qkv_bias.map_or(0u64, |b| DevicePtr::device_ptr(b, &self.stream).0));
+                wptrs.push(
+                    w.qkv_bias
+                        .map_or(0u64, |b| DevicePtr::device_ptr(b, &self.stream).0),
+                );
                 // o_proj
                 wptrs.push(DevicePtr::device_ptr(w.o_proj, &self.stream).0);
                 // post_attention_layernorm
                 wptrs.push(DevicePtr::device_ptr(w.post_attention_layernorm, &self.stream).0);
                 // fused_gate_up (required)
-                let gu_w = w.fused_gate_up
-                    .ok_or_else(|| LLMError::GpuError("megakernel requires fused_gate_up".into()))?;
+                let gu_w = w.fused_gate_up.ok_or_else(|| {
+                    LLMError::GpuError("megakernel requires fused_gate_up".into())
+                })?;
                 wptrs.push(DevicePtr::device_ptr(gu_w, &self.stream).0);
                 // down_proj
                 wptrs.push(DevicePtr::device_ptr(w.down_proj, &self.stream).0);
@@ -1775,12 +2256,20 @@ mod cuda_impl {
             wptrs.push(DevicePtr::device_ptr(&self.final_norm_weight, &self.stream).0);
             wptrs.push(DevicePtr::device_ptr(&self.lm_head_weight, &self.stream).0);
 
-            let wptrs_gpu = self.stream.clone_htod(&wptrs)
+            let wptrs_gpu = self
+                .stream
+                .clone_htod(&wptrs)
                 .map_err(|e| LLMError::GpuError(format!("mk wptrs upload: {e}")))?;
 
             // Allocate scratch buffer
             let scratch_bytes = megakernel::scratch_size_bytes(
-                hidden, num_heads, num_kv_heads, head_dim, intermediate, vocab);
+                hidden,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                intermediate,
+                vocab,
+            );
             let mut scratch_gpu = unsafe { self.stream.alloc::<u8>(scratch_bytes) }
                 .map_err(|e| LLMError::GpuError(format!("mk scratch: {e}")))?;
 
@@ -1793,18 +2282,25 @@ mod cuda_impl {
             {
                 let embed_bytes = num_tokens * hidden * 2;
                 let src_ptr = DevicePtr::device_ptr(embedding, &self.stream).0;
-                let dst_ptr = DevicePtr::device_ptr(&scratch_gpu, &self.stream).0 + res_a_byte_offset as u64;
+                let dst_ptr =
+                    DevicePtr::device_ptr(&scratch_gpu, &self.stream).0 + res_a_byte_offset as u64;
                 unsafe {
                     cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-                        dst_ptr, src_ptr, embed_bytes as usize,
+                        dst_ptr,
+                        src_ptr,
+                        embed_bytes as usize,
                         self.stream.cu_stream(),
-                    ).result().map_err(|e| LLMError::GpuError(format!("mk embed copy: {e}")))?;
+                    )
+                    .result()
+                    .map_err(|e| LLMError::GpuError(format!("mk embed copy: {e}")))?;
                 }
             }
 
             // Sync counters (zeroed)
             let num_counters = megakernel::sync_counter_count(num_layers);
-            let sync_gpu = self.stream.clone_htod(&vec![0i32; num_counters])
+            let sync_gpu = self
+                .stream
+                .clone_htod(&vec![0i32; num_counters])
                 .map_err(|e| LLMError::GpuError(format!("mk sync: {e}")))?;
 
             // Collect per-layer KV cache pointers
@@ -1814,34 +2310,40 @@ mod cuda_impl {
                 key_ptrs.push(DevicePtr::device_ptr(kc, &self.stream).0);
                 val_ptrs.push(DevicePtr::device_ptr(vc, &self.stream).0);
             }
-            let key_ptrs_gpu = self.stream.clone_htod(&key_ptrs)
+            let key_ptrs_gpu = self
+                .stream
+                .clone_htod(&key_ptrs)
                 .map_err(|e| LLMError::GpuError(format!("mk key_ptrs: {e}")))?;
-            let val_ptrs_gpu = self.stream.clone_htod(&val_ptrs)
+            let val_ptrs_gpu = self
+                .stream
+                .clone_htod(&val_ptrs)
                 .map_err(|e| LLMError::GpuError(format!("mk val_ptrs: {e}")))?;
 
             // Output token buffer
-            let output_gpu = self.stream.clone_htod(&[0i32])
+            let output_gpu = self
+                .stream
+                .clone_htod(&[0i32])
                 .map_err(|e| LLMError::GpuError(format!("mk output: {e}")))?;
 
             // Get device pointers for kernel args
-            let p_tape       = DevicePtr::device_ptr(&tape_gpu, &self.stream).0;
-            let p_wptrs      = DevicePtr::device_ptr(&wptrs_gpu, &self.stream).0;
-            let p_scratch    = DevicePtr::device_ptr(&scratch_gpu, &self.stream).0;
-            let p_sync       = DevicePtr::device_ptr(&sync_gpu, &self.stream).0;
-            let p_keys       = DevicePtr::device_ptr(&key_ptrs_gpu, &self.stream).0;
-            let p_vals       = DevicePtr::device_ptr(&val_ptrs_gpu, &self.stream).0;
+            let p_tape = DevicePtr::device_ptr(&tape_gpu, &self.stream).0;
+            let p_wptrs = DevicePtr::device_ptr(&wptrs_gpu, &self.stream).0;
+            let p_scratch = DevicePtr::device_ptr(&scratch_gpu, &self.stream).0;
+            let p_sync = DevicePtr::device_ptr(&sync_gpu, &self.stream).0;
+            let p_keys = DevicePtr::device_ptr(&key_ptrs_gpu, &self.stream).0;
+            let p_vals = DevicePtr::device_ptr(&val_ptrs_gpu, &self.stream).0;
             // Compute metadata pointers via base + byte offset (avoids slice bounds issues)
             let p_packed_base = DevicePtr::device_ptr(packed_buf, &self.stream).0;
             let p_block_tables = p_packed_base + (offsets.block_tables * 4) as u64;
             let p_context_lens = p_packed_base + (offsets.context_lens * 4) as u64;
-            let p_positions    = p_packed_base + (offsets.positions * 4) as u64;
+            let p_positions = p_packed_base + (offsets.positions * 4) as u64;
             let p_slot_mapping = p_packed_base + (offsets.slot_mapping * 4) as u64;
-            let p_rope_cos   = DevicePtr::device_ptr(&self.rope_cos, &self.stream).0;
-            let p_rope_sin   = DevicePtr::device_ptr(&self.rope_sin, &self.stream).0;
-            let p_output     = DevicePtr::device_ptr(&output_gpu, &self.stream).0;
+            let p_rope_cos = DevicePtr::device_ptr(&self.rope_cos, &self.stream).0;
+            let p_rope_sin = DevicePtr::device_ptr(&self.rope_sin, &self.stream).0;
+            let p_output = DevicePtr::device_ptr(&output_gpu, &self.stream).0;
             let i_block_size = block_size as i32;
-            let i_max_ctx    = max_context_len as i32;
-            let i_hidden     = hidden as i32;
+            let i_max_ctx = max_context_len as i32;
+            let i_hidden = hidden as i32;
 
             // smem: hidden_size * 4 + scratch (match attention needs)
             let smem = std::cmp::max(
@@ -1851,27 +2353,29 @@ mod cuda_impl {
 
             #[allow(clippy::cast_ptr_alignment)]
             let mut args: [*mut c_void; 17] = [
-                &p_tape          as *const u64 as *mut c_void,
+                &p_tape as *const u64 as *mut c_void,
                 &num_instructions as *const i32 as *mut c_void,
-                &p_wptrs         as *const u64 as *mut c_void,
-                &p_scratch       as *const u64 as *mut c_void,
-                &p_sync          as *const u64 as *mut c_void,
-                &p_keys          as *const u64 as *mut c_void,
-                &p_vals          as *const u64 as *mut c_void,
-                &p_block_tables  as *const u64 as *mut c_void,
-                &p_context_lens  as *const u64 as *mut c_void,
-                &p_positions     as *const u64 as *mut c_void,
-                &p_slot_mapping  as *const u64 as *mut c_void,
-                &p_rope_cos      as *const u64 as *mut c_void,
-                &p_rope_sin      as *const u64 as *mut c_void,
-                &p_output        as *const u64 as *mut c_void,
-                &i_block_size    as *const i32 as *mut c_void,
-                &i_max_ctx       as *const i32 as *mut c_void,
-                &i_hidden        as *const i32 as *mut c_void,
+                &p_wptrs as *const u64 as *mut c_void,
+                &p_scratch as *const u64 as *mut c_void,
+                &p_sync as *const u64 as *mut c_void,
+                &p_keys as *const u64 as *mut c_void,
+                &p_vals as *const u64 as *mut c_void,
+                &p_block_tables as *const u64 as *mut c_void,
+                &p_context_lens as *const u64 as *mut c_void,
+                &p_positions as *const u64 as *mut c_void,
+                &p_slot_mapping as *const u64 as *mut c_void,
+                &p_rope_cos as *const u64 as *mut c_void,
+                &p_rope_sin as *const u64 as *mut c_void,
+                &p_output as *const u64 as *mut c_void,
+                &i_block_size as *const i32 as *mut c_void,
+                &i_max_ctx as *const i32 as *mut c_void,
+                &i_hidden as *const i32 as *mut c_void,
             ];
 
             if smem > 49152 {
-                let cu_func = self.loader.get_cubin_func("megakernel_decode", "megakernel_decode_f16")?;
+                let cu_func = self
+                    .loader
+                    .get_cubin_func("megakernel_decode", "megakernel_decode_f16")?;
                 unsafe {
                     cudarc::driver::sys::cuFuncSetAttribute(
                         cu_func,
@@ -1895,8 +2399,762 @@ mod cuda_impl {
             }
 
             // Read output token
-            let output_cpu: Vec<i32> = self.stream.clone_dtoh(&output_gpu)
+            let output_cpu: Vec<i32> = self
+                .stream
+                .clone_dtoh(&output_gpu)
                 .map_err(|e| LLMError::GpuError(format!("mk output dtoh: {e}")))?;
+
+            Ok(ForwardOutput::TokenIds(output_cpu))
+        }
+
+        // ===================================================================
+        // Persistent V2: per-layer cooperative TC GEMV + split-KV attention
+        // ===================================================================
+
+        fn forward_persistent_v2(
+            &self,
+            embedding: &CudaSlice<f16>,
+            gpu_cache: &[(CudaSlice<f16>, CudaSlice<f16>)],
+            packed_buf: &CudaSlice<i32>,
+            offsets: PackedMetaOffsets,
+            num_tokens: usize,
+            _num_seqs: usize,
+            max_context_len: u32,
+            block_size: usize,
+            greedy_only: bool,
+        ) -> Result<ForwardOutput> {
+            use rvllm_gpu::persistent_v2_ffi::PersistentV2Kernels;
+
+            let pv2 = self
+                .persistent_v2
+                .as_ref()
+                .ok_or_else(|| LLMError::GpuError("persistent_v2 not loaded".into()))?;
+
+            let cfg = &self.config;
+            let hidden = cfg.hidden_size;
+            let num_heads = cfg.num_heads;
+            let num_kv_heads = cfg.num_kv_heads;
+            let head_dim = cfg.head_dim;
+            let intermediate = cfg.intermediate_size;
+            let num_layers = self.layers.len();
+            let q_dim = num_heads * head_dim;
+            let kv_dim = num_kv_heads * head_dim;
+            let qkv_dim = q_dim + 2 * kv_dim;
+            let gate_up_dim = intermediate * 2;
+            let heads_per_group = num_heads / num_kv_heads;
+            let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+            let smem = PersistentV2Kernels::layer_shared_mem(hidden, head_dim, heads_per_group);
+
+            // Query max cooperative grid size
+            let max_grid = pv2
+                .layer_max_grid(smem)
+                .map_err(|e| LLMError::GpuError(e))?;
+            let grid_blocks = max_grid.min(256);
+
+            // Split-KV config: max 8 splits (256 blocks / 32 kv_heads)
+            let max_splits = (grid_blocks as usize / num_kv_heads).min(8).max(1) as i32;
+
+            // Allocate per-layer scratch (reused across layers)
+            let mut qkv_scratch = unsafe { self.stream.alloc::<f16>(qkv_dim) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 alloc: {e}")))?;
+            let mut attn_scratch = unsafe { self.stream.alloc::<f16>(q_dim) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 alloc: {e}")))?;
+            let mut oproj_scratch = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 alloc: {e}")))?;
+            let mut gateup_scratch = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 alloc: {e}")))?;
+
+            // Split-KV scratch
+            let (max_sz, sum_sz, acc_sz) = PersistentV2Kernels::split_kv_scratch_size(
+                num_kv_heads,
+                max_splits as usize,
+                heads_per_group,
+                head_dim,
+            );
+            let split_max_buf = unsafe { self.stream.alloc::<u8>(max_sz) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 split_max: {e}")))?;
+            let split_sum_buf = unsafe { self.stream.alloc::<u8>(sum_sz) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 split_sum: {e}")))?;
+            let split_acc_buf = unsafe { self.stream.alloc::<u8>(acc_sz) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 split_acc: {e}")))?;
+
+            // Sync flags (zeroed before each layer launch)
+            let sync_flags = self
+                .stream
+                .clone_htod(&[0i32; 6])
+                .map_err(|e| LLMError::GpuError(format!("pv2 sync: {e}")))?;
+
+            // Double-buffer residuals
+            let mut residual_a = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 alloc: {e}")))?;
+            let mut residual_b = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 alloc: {e}")))?;
+            let mut mlp_a = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 alloc: {e}")))?;
+            let mut mlp_b = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv2 alloc: {e}")))?;
+
+            // Copy embedding into residual_a
+            self.stream
+                .memcpy_dtod(embedding, &mut residual_a.slice_mut(..hidden))
+                .map_err(|e| LLMError::GpuError(format!("pv2 embed copy: {e}")))?;
+
+            let max_blocks = (self.graph_max_blocks) as i32;
+            let cu_stream = self.stream.cu_stream();
+
+            // Metadata pointers
+            let p_packed_base = DevicePtr::device_ptr(packed_buf, &self.stream).0;
+            let p_block_tables = p_packed_base + (offsets.block_tables * 4) as u64;
+            let p_context_lens = p_packed_base + (offsets.context_lens * 4) as u64;
+            let p_positions = p_packed_base + (offsets.positions * 4) as u64;
+            let p_slot_mapping = p_packed_base + (offsets.slot_mapping * 4) as u64;
+            let p_rope_cos = DevicePtr::device_ptr(&self.rope_cos, &self.stream).0;
+            let p_rope_sin = DevicePtr::device_ptr(&self.rope_sin, &self.stream).0;
+
+            let p_qkv_scratch = DevicePtr::device_ptr(&qkv_scratch, &self.stream).0;
+            let p_attn_scratch = DevicePtr::device_ptr(&attn_scratch, &self.stream).0;
+            let p_oproj_scratch = DevicePtr::device_ptr(&oproj_scratch, &self.stream).0;
+            let p_gateup_scratch = DevicePtr::device_ptr(&gateup_scratch, &self.stream).0;
+            let p_split_max = DevicePtr::device_ptr(&split_max_buf, &self.stream).0;
+            let p_split_sum = DevicePtr::device_ptr(&split_sum_buf, &self.stream).0;
+            let p_split_acc = DevicePtr::device_ptr(&split_acc_buf, &self.stream).0;
+            let p_sync = DevicePtr::device_ptr(&sync_flags, &self.stream).0;
+
+            for layer_idx in 0..num_layers {
+                let (key_cache, value_cache) = &gpu_cache[layer_idx];
+                let w = self.layer_weights(layer_idx)?;
+                let fused_qkv = w
+                    .fused_qkv
+                    .ok_or_else(|| LLMError::GpuError("PersistentV2 requires fused_qkv".into()))?;
+                let fused_gate_up = w.fused_gate_up.ok_or_else(|| {
+                    LLMError::GpuError("PersistentV2 requires fused_gate_up".into())
+                })?;
+
+                let even = layer_idx % 2 == 0;
+                let (read_res, write_res) = if even {
+                    (&residual_a, &residual_b)
+                } else {
+                    (&residual_b, &residual_a)
+                };
+                let (read_mlp, write_mlp) = if even {
+                    (&mlp_a, &mlp_b)
+                } else {
+                    (&mlp_b, &mlp_a)
+                };
+
+                let p_prev_residual = DevicePtr::device_ptr(read_res, &self.stream).0;
+                let p_residual_out = DevicePtr::device_ptr(write_res, &self.stream).0;
+                let p_prev_mlp = if layer_idx > 0 {
+                    DevicePtr::device_ptr(read_mlp, &self.stream).0
+                } else {
+                    0u64
+                };
+                let p_mlp_out = DevicePtr::device_ptr(write_mlp, &self.stream).0;
+
+                // Zero sync flags before each layer
+                unsafe {
+                    cudarc::driver::sys::cuMemsetD32Async(p_sync, 0, 6, cu_stream)
+                        .result()
+                        .map_err(|e| LLMError::GpuError(format!("pv2 zero sync: {e}")))?;
+                }
+
+                pv2.launch_layer(
+                    cu_stream,
+                    grid_blocks,
+                    smem,
+                    p_mlp_out,
+                    p_residual_out,
+                    p_prev_residual,
+                    p_prev_mlp,
+                    DevicePtr::device_ptr(key_cache, &self.stream).0,
+                    DevicePtr::device_ptr(value_cache, &self.stream).0,
+                    p_block_tables,
+                    p_context_lens,
+                    p_positions,
+                    p_slot_mapping,
+                    p_rope_cos,
+                    p_rope_sin,
+                    DevicePtr::device_ptr(w.input_layernorm, &self.stream).0,
+                    DevicePtr::device_ptr(fused_qkv, &self.stream).0,
+                    w.qkv_bias
+                        .map_or(0u64, |b| DevicePtr::device_ptr(b, &self.stream).0),
+                    DevicePtr::device_ptr(w.o_proj, &self.stream).0,
+                    DevicePtr::device_ptr(w.post_attention_layernorm, &self.stream).0,
+                    DevicePtr::device_ptr(fused_gate_up, &self.stream).0,
+                    DevicePtr::device_ptr(w.down_proj, &self.stream).0,
+                    p_qkv_scratch,
+                    p_attn_scratch,
+                    p_oproj_scratch,
+                    p_gateup_scratch,
+                    p_split_max,
+                    p_split_sum,
+                    p_split_acc,
+                    max_splits,
+                    self.rms_norm_eps,
+                    attn_scale,
+                    hidden as i32,
+                    q_dim as i32,
+                    kv_dim as i32,
+                    qkv_dim as i32,
+                    num_heads as i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                    intermediate as i32,
+                    gate_up_dim as i32,
+                    block_size as i32,
+                    max_context_len as i32,
+                    max_blocks,
+                    p_sync,
+                )
+                .map_err(|e| LLMError::GpuError(e))?;
+            }
+
+            // After all layers: final residual is in write buffer of last layer
+            let even_last = (num_layers - 1) % 2 == 0;
+            let final_residual = if even_last { &residual_b } else { &residual_a };
+            let final_mlp = if even_last { &mlp_b } else { &mlp_a };
+
+            // Final: fuse last residual add + RMSNorm
+            let (normed_f16, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                &self.stream,
+                &self.loader,
+                final_residual,
+                final_mlp,
+                &self.final_norm_weight,
+                self.rms_norm_eps,
+                1,
+                hidden,
+            )?;
+
+            // LM head + argmax
+            let vocab_size = self.config.vocab_size;
+            if greedy_only {
+                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
+                    &normed_f16,
+                    &self.lm_head_weight,
+                    vocab_size,
+                    hidden,
+                )?;
+                let token_ids_cpu = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
+                    .map_err(|e| LLMError::GpuError(format!("pv2 argmax dtoh: {e}")))?;
+                return Ok(ForwardOutput::TokenIds(token_ids_cpu));
+            }
+            let logits_gpu = CudaLinearLayer::forward_f16_in(
+                &normed_f16,
+                &self.lm_head_weight,
+                1,
+                vocab_size,
+                hidden,
+                &self.blas,
+            )?;
+            let logits_cpu = self
+                .stream
+                .clone_dtoh(&logits_gpu)
+                .map_err(|e| LLMError::GpuError(format!("pv2 logits dtoh: {e}")))?;
+            Ok(ForwardOutput::Logits(logits_cpu))
+        }
+
+        // ===================================================================
+        // Persistent V3: non-cooperative, 1024 blocks, vectorized GEMV, BC=32
+        // ===================================================================
+
+        fn forward_persistent_v3(
+            &self,
+            embedding: &CudaSlice<f16>,
+            gpu_cache: &[(CudaSlice<f16>, CudaSlice<f16>)],
+            packed_buf: &CudaSlice<i32>,
+            offsets: PackedMetaOffsets,
+            num_tokens: usize,
+            _num_seqs: usize,
+            max_context_len: u32,
+            block_size: usize,
+            greedy_only: bool,
+        ) -> Result<ForwardOutput> {
+            use rvllm_gpu::persistent_v2_ffi::PersistentV2Kernels;
+
+            let pv2 = self
+                .persistent_v2
+                .as_ref()
+                .ok_or_else(|| LLMError::GpuError("persistent_v3 not loaded".into()))?;
+
+            let cfg = &self.config;
+            let hidden = cfg.hidden_size;
+            let num_heads = cfg.num_heads;
+            let num_kv_heads = cfg.num_kv_heads;
+            let head_dim = cfg.head_dim;
+            let intermediate = cfg.intermediate_size;
+            let num_layers = self.layers.len();
+            let q_dim = num_heads * head_dim;
+            let kv_dim = num_kv_heads * head_dim;
+            let qkv_dim = q_dim + 2 * kv_dim;
+            let gate_up_dim = intermediate * 2;
+            let heads_per_group = num_heads / num_kv_heads;
+            let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+            let smem = PersistentV2Kernels::v3_shared_mem(hidden, head_dim, heads_per_group);
+
+            // V3: non-cooperative, up to 1024 blocks
+            let grid_blocks = pv2.v3_max_grid(smem).map_err(|e| LLMError::GpuError(e))?;
+
+            // Split-KV config
+            let max_splits = (grid_blocks as usize / num_kv_heads).min(8).max(1) as i32;
+
+            // Allocate per-layer scratch (reused across layers)
+            let mut qkv_scratch = unsafe { self.stream.alloc::<f16>(qkv_dim) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
+            let mut attn_scratch = unsafe { self.stream.alloc::<f16>(q_dim) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
+            let mut oproj_scratch = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
+            let mut gateup_scratch = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
+
+            // Split-KV scratch
+            let (max_sz, sum_sz, acc_sz) = PersistentV2Kernels::split_kv_scratch_size(
+                num_kv_heads,
+                max_splits as usize,
+                heads_per_group,
+                head_dim,
+            );
+            let split_max_buf = unsafe { self.stream.alloc::<u8>(max_sz) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 split_max: {e}")))?;
+            let split_sum_buf = unsafe { self.stream.alloc::<u8>(sum_sz) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 split_sum: {e}")))?;
+            let split_acc_buf = unsafe { self.stream.alloc::<u8>(acc_sz) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 split_acc: {e}")))?;
+
+            // Sync flags (zeroed before each layer launch)
+            let sync_flags = self
+                .stream
+                .clone_htod(&[0i32; 6])
+                .map_err(|e| LLMError::GpuError(format!("pv3 sync: {e}")))?;
+
+            // Double-buffer residuals
+            let mut residual_a = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
+            let mut residual_b = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
+            let mut mlp_a = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
+            let mut mlp_b = unsafe { self.stream.alloc::<f16>(hidden) }
+                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
+
+            // Copy embedding into residual_a
+            self.stream
+                .memcpy_dtod(embedding, &mut residual_a.slice_mut(..hidden))
+                .map_err(|e| LLMError::GpuError(format!("pv3 embed copy: {e}")))?;
+
+            let max_blocks = (self.graph_max_blocks) as i32;
+            let cu_stream = self.stream.cu_stream();
+
+            // Metadata pointers
+            let p_packed_base = DevicePtr::device_ptr(packed_buf, &self.stream).0;
+            let p_block_tables = p_packed_base + (offsets.block_tables * 4) as u64;
+            let p_context_lens = p_packed_base + (offsets.context_lens * 4) as u64;
+            let p_positions = p_packed_base + (offsets.positions * 4) as u64;
+            let p_slot_mapping = p_packed_base + (offsets.slot_mapping * 4) as u64;
+            let p_rope_cos = DevicePtr::device_ptr(&self.rope_cos, &self.stream).0;
+            let p_rope_sin = DevicePtr::device_ptr(&self.rope_sin, &self.stream).0;
+
+            let p_qkv_scratch = DevicePtr::device_ptr(&qkv_scratch, &self.stream).0;
+            let p_attn_scratch = DevicePtr::device_ptr(&attn_scratch, &self.stream).0;
+            let p_oproj_scratch = DevicePtr::device_ptr(&oproj_scratch, &self.stream).0;
+            let p_gateup_scratch = DevicePtr::device_ptr(&gateup_scratch, &self.stream).0;
+            let p_split_max = DevicePtr::device_ptr(&split_max_buf, &self.stream).0;
+            let p_split_sum = DevicePtr::device_ptr(&split_sum_buf, &self.stream).0;
+            let p_split_acc = DevicePtr::device_ptr(&split_acc_buf, &self.stream).0;
+            let p_sync = DevicePtr::device_ptr(&sync_flags, &self.stream).0;
+
+            debug!(grid_blocks, smem, max_splits, "persistent_v3 launching");
+
+            for layer_idx in 0..num_layers {
+                let (key_cache, value_cache) = &gpu_cache[layer_idx];
+                let w = self.layer_weights(layer_idx)?;
+                let fused_qkv = w
+                    .fused_qkv
+                    .ok_or_else(|| LLMError::GpuError("PersistentV3 requires fused_qkv".into()))?;
+                let fused_gate_up = w.fused_gate_up.ok_or_else(|| {
+                    LLMError::GpuError("PersistentV3 requires fused_gate_up".into())
+                })?;
+
+                let even = layer_idx % 2 == 0;
+                let (read_res, write_res) = if even {
+                    (&residual_a, &residual_b)
+                } else {
+                    (&residual_b, &residual_a)
+                };
+                let (read_mlp, write_mlp) = if even {
+                    (&mlp_a, &mlp_b)
+                } else {
+                    (&mlp_b, &mlp_a)
+                };
+
+                let p_prev_residual = DevicePtr::device_ptr(read_res, &self.stream).0;
+                let p_residual_out = DevicePtr::device_ptr(write_res, &self.stream).0;
+                let p_prev_mlp = if layer_idx > 0 {
+                    DevicePtr::device_ptr(read_mlp, &self.stream).0
+                } else {
+                    0u64
+                };
+                let p_mlp_out = DevicePtr::device_ptr(write_mlp, &self.stream).0;
+
+                // Zero sync flags before each layer
+                unsafe {
+                    cudarc::driver::sys::cuMemsetD32Async(p_sync, 0, 6, cu_stream)
+                        .result()
+                        .map_err(|e| LLMError::GpuError(format!("pv3 zero sync: {e}")))?;
+                }
+
+                pv2.launch_v3_layer(
+                    cu_stream,
+                    grid_blocks,
+                    smem,
+                    p_mlp_out,
+                    p_residual_out,
+                    p_prev_residual,
+                    p_prev_mlp,
+                    DevicePtr::device_ptr(key_cache, &self.stream).0,
+                    DevicePtr::device_ptr(value_cache, &self.stream).0,
+                    p_block_tables,
+                    p_context_lens,
+                    p_positions,
+                    p_slot_mapping,
+                    p_rope_cos,
+                    p_rope_sin,
+                    DevicePtr::device_ptr(w.input_layernorm, &self.stream).0,
+                    DevicePtr::device_ptr(fused_qkv, &self.stream).0,
+                    w.qkv_bias
+                        .map_or(0u64, |b| DevicePtr::device_ptr(b, &self.stream).0),
+                    DevicePtr::device_ptr(w.o_proj, &self.stream).0,
+                    DevicePtr::device_ptr(w.post_attention_layernorm, &self.stream).0,
+                    DevicePtr::device_ptr(fused_gate_up, &self.stream).0,
+                    DevicePtr::device_ptr(w.down_proj, &self.stream).0,
+                    p_qkv_scratch,
+                    p_attn_scratch,
+                    p_oproj_scratch,
+                    p_gateup_scratch,
+                    p_split_max,
+                    p_split_sum,
+                    p_split_acc,
+                    max_splits,
+                    self.rms_norm_eps,
+                    attn_scale,
+                    hidden as i32,
+                    q_dim as i32,
+                    kv_dim as i32,
+                    qkv_dim as i32,
+                    num_heads as i32,
+                    num_kv_heads as i32,
+                    head_dim as i32,
+                    intermediate as i32,
+                    gate_up_dim as i32,
+                    block_size as i32,
+                    max_context_len as i32,
+                    max_blocks,
+                    p_sync,
+                )
+                .map_err(|e| LLMError::GpuError(e))?;
+            }
+
+            // After all layers: final residual is in write buffer of last layer
+            let even_last = (num_layers - 1) % 2 == 0;
+            let final_residual = if even_last { &residual_b } else { &residual_a };
+            let final_mlp = if even_last { &mlp_b } else { &mlp_a };
+
+            // Final: fuse last residual add + RMSNorm
+            let (normed_f16, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                &self.stream,
+                &self.loader,
+                final_residual,
+                final_mlp,
+                &self.final_norm_weight,
+                self.rms_norm_eps,
+                1,
+                hidden,
+            )?;
+
+            // LM head + argmax
+            let vocab_size = self.config.vocab_size;
+            if greedy_only {
+                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
+                    &normed_f16,
+                    &self.lm_head_weight,
+                    vocab_size,
+                    hidden,
+                )?;
+                let token_ids_cpu = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
+                    .map_err(|e| LLMError::GpuError(format!("pv3 argmax dtoh: {e}")))?;
+                return Ok(ForwardOutput::TokenIds(token_ids_cpu));
+            }
+            let logits_gpu = CudaLinearLayer::forward_f16_in(
+                &normed_f16,
+                &self.lm_head_weight,
+                1,
+                vocab_size,
+                hidden,
+                &self.blas,
+            )?;
+            let logits_cpu = self
+                .stream
+                .clone_dtoh(&logits_gpu)
+                .map_err(|e| LLMError::GpuError(format!("pv3 logits dtoh: {e}")))?;
+            Ok(ForwardOutput::Logits(logits_cpu))
+        }
+
+        // ===================================================================
+        // Megakernel V2: all layers + embed + LM head in one cooperative launch
+        // ===================================================================
+
+        fn forward_megakernel_v2(
+            &self,
+            _embedding: &CudaSlice<f16>,
+            gpu_cache: &[(CudaSlice<f16>, CudaSlice<f16>)],
+            packed_buf: &CudaSlice<i32>,
+            offsets: PackedMetaOffsets,
+            num_tokens: usize,
+            _num_seqs: usize,
+            max_context_len: u32,
+            block_size: usize,
+        ) -> Result<ForwardOutput> {
+            use rvllm_gpu::persistent_v2_ffi::PersistentV2Kernels;
+
+            let pv2 = self
+                .persistent_v2
+                .as_ref()
+                .ok_or_else(|| LLMError::GpuError("persistent_v2 not loaded".into()))?;
+
+            let cfg = &self.config;
+            let hidden = cfg.hidden_size;
+            let num_heads = cfg.num_heads;
+            let num_kv_heads = cfg.num_kv_heads;
+            let head_dim = cfg.head_dim;
+            let intermediate = cfg.intermediate_size;
+            let vocab = cfg.vocab_size;
+            let num_layers = self.layers.len();
+            let q_dim = num_heads * head_dim;
+            let kv_dim = num_kv_heads * head_dim;
+            let qkv_dim = q_dim + 2 * kv_dim;
+            let gate_up_dim = intermediate * 2;
+            let heads_per_group = num_heads / num_kv_heads;
+            let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+            let smem = PersistentV2Kernels::layer_shared_mem(hidden, head_dim, heads_per_group);
+            let max_grid = pv2.mega_max_grid(smem).map_err(|e| LLMError::GpuError(e))?;
+            let grid_blocks = max_grid.min(256);
+            let max_splits = (grid_blocks as usize / num_kv_heads).min(8).max(1) as i32;
+
+            // Build 7 per-layer weight pointer arrays
+            let mut norm_ptrs = Vec::with_capacity(num_layers);
+            let mut qkv_ptrs = Vec::with_capacity(num_layers);
+            let mut bias_ptrs = Vec::with_capacity(num_layers);
+            let mut o_ptrs = Vec::with_capacity(num_layers);
+            let mut post_norm_ptrs = Vec::with_capacity(num_layers);
+            let mut gateup_ptrs = Vec::with_capacity(num_layers);
+            let mut down_ptrs = Vec::with_capacity(num_layers);
+
+            for i in 0..num_layers {
+                let w = self.layer_weights(i)?;
+                let fused_qkv = w
+                    .fused_qkv
+                    .ok_or_else(|| LLMError::GpuError("MegakernelV2 requires fused_qkv".into()))?;
+                let fused_gate_up = w.fused_gate_up.ok_or_else(|| {
+                    LLMError::GpuError("MegakernelV2 requires fused_gate_up".into())
+                })?;
+
+                norm_ptrs.push(DevicePtr::device_ptr(w.input_layernorm, &self.stream).0);
+                qkv_ptrs.push(DevicePtr::device_ptr(fused_qkv, &self.stream).0);
+                bias_ptrs.push(
+                    w.qkv_bias
+                        .map_or(0u64, |b| DevicePtr::device_ptr(b, &self.stream).0),
+                );
+                o_ptrs.push(DevicePtr::device_ptr(w.o_proj, &self.stream).0);
+                post_norm_ptrs
+                    .push(DevicePtr::device_ptr(w.post_attention_layernorm, &self.stream).0);
+                gateup_ptrs.push(DevicePtr::device_ptr(fused_gate_up, &self.stream).0);
+                down_ptrs.push(DevicePtr::device_ptr(w.down_proj, &self.stream).0);
+            }
+
+            // Upload all pointer arrays to GPU
+            let g_norm = self
+                .stream
+                .clone_htod(&norm_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk2 upload: {e}")))?;
+            let g_qkv = self
+                .stream
+                .clone_htod(&qkv_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk2 upload: {e}")))?;
+            let g_bias = self
+                .stream
+                .clone_htod(&bias_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk2 upload: {e}")))?;
+            let g_o = self
+                .stream
+                .clone_htod(&o_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk2 upload: {e}")))?;
+            let g_post = self
+                .stream
+                .clone_htod(&post_norm_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk2 upload: {e}")))?;
+            let g_gateup = self
+                .stream
+                .clone_htod(&gateup_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk2 upload: {e}")))?;
+            let g_down = self
+                .stream
+                .clone_htod(&down_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk2 upload: {e}")))?;
+
+            // Per-layer KV cache pointer arrays
+            let mut key_ptrs = Vec::with_capacity(num_layers);
+            let mut val_ptrs = Vec::with_capacity(num_layers);
+            for (kc, vc) in gpu_cache.iter().take(num_layers) {
+                key_ptrs.push(DevicePtr::device_ptr(kc, &self.stream).0);
+                val_ptrs.push(DevicePtr::device_ptr(vc, &self.stream).0);
+            }
+            let g_keys = self
+                .stream
+                .clone_htod(&key_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk2 upload: {e}")))?;
+            let g_vals = self
+                .stream
+                .clone_htod(&val_ptrs)
+                .map_err(|e| LLMError::GpuError(format!("mk2 upload: {e}")))?;
+
+            // Scratch buffers
+            let (h_sz, m_sz, qkv_sz, a_sz, o_sz, gu_sz, l_sz) =
+                PersistentV2Kernels::megakernel_scratch_elems(
+                    hidden,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    intermediate,
+                    vocab,
+                );
+            let hidden_buf = unsafe { self.stream.alloc::<f16>(h_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+            let mlp_buf = unsafe { self.stream.alloc::<f16>(m_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+            let qkv_scratch = unsafe { self.stream.alloc::<f16>(qkv_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+            let attn_scratch = unsafe { self.stream.alloc::<f16>(a_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+            let oproj_scratch = unsafe { self.stream.alloc::<f16>(o_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+            let gateup_scratch = unsafe { self.stream.alloc::<f16>(gu_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+            let logits_scratch = unsafe { self.stream.alloc::<f16>(l_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+
+            // Split-KV scratch
+            let (max_sz, sum_sz, acc_sz) = PersistentV2Kernels::split_kv_scratch_size(
+                num_kv_heads,
+                max_splits as usize,
+                heads_per_group,
+                head_dim,
+            );
+            let split_max_buf = unsafe { self.stream.alloc::<u8>(max_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+            let split_sum_buf = unsafe { self.stream.alloc::<u8>(sum_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+            let split_acc_buf = unsafe { self.stream.alloc::<u8>(acc_sz) }
+                .map_err(|e| LLMError::GpuError(format!("mk2 alloc: {e}")))?;
+
+            // Sync flags (zeroed)
+            let sync_count = PersistentV2Kernels::megakernel_sync_flags_size(num_layers) / 4;
+            let sync_flags = self
+                .stream
+                .clone_htod(&vec![0i32; sync_count])
+                .map_err(|e| LLMError::GpuError(format!("mk2 sync: {e}")))?;
+
+            // Input token (from packed metadata, positions[0] area has the token_id)
+            let p_packed_base = DevicePtr::device_ptr(packed_buf, &self.stream).0;
+            let p_input_token = p_packed_base; // token_ids are at offset 0
+            let p_positions = p_packed_base + (offsets.positions * 4) as u64;
+            let p_slot_mapping = p_packed_base + (offsets.slot_mapping * 4) as u64;
+            let p_block_tables = p_packed_base + (offsets.block_tables * 4) as u64;
+            let p_context_lens = p_packed_base + (offsets.context_lens * 4) as u64;
+
+            // Output token
+            let output_gpu = self
+                .stream
+                .clone_htod(&[0i32])
+                .map_err(|e| LLMError::GpuError(format!("mk2 output: {e}")))?;
+
+            let max_blocks = self.graph_max_blocks as i32;
+
+            pv2.launch_megakernel(
+                self.stream.cu_stream(),
+                grid_blocks,
+                smem,
+                // Per-layer weight arrays
+                DevicePtr::device_ptr(&g_norm, &self.stream).0,
+                DevicePtr::device_ptr(&g_qkv, &self.stream).0,
+                DevicePtr::device_ptr(&g_bias, &self.stream).0,
+                DevicePtr::device_ptr(&g_o, &self.stream).0,
+                DevicePtr::device_ptr(&g_post, &self.stream).0,
+                DevicePtr::device_ptr(&g_gateup, &self.stream).0,
+                DevicePtr::device_ptr(&g_down, &self.stream).0,
+                // KV caches
+                DevicePtr::device_ptr(&g_keys, &self.stream).0,
+                DevicePtr::device_ptr(&g_vals, &self.stream).0,
+                // Global weights
+                DevicePtr::device_ptr(&self.embed_tokens, &self.stream).0,
+                DevicePtr::device_ptr(&self.final_norm_weight, &self.stream).0,
+                DevicePtr::device_ptr(&self.lm_head_weight, &self.stream).0,
+                // Input metadata
+                p_input_token,
+                p_positions,
+                p_slot_mapping,
+                p_block_tables,
+                p_context_lens,
+                DevicePtr::device_ptr(&self.rope_cos, &self.stream).0,
+                DevicePtr::device_ptr(&self.rope_sin, &self.stream).0,
+                // Scratch
+                DevicePtr::device_ptr(&hidden_buf, &self.stream).0,
+                DevicePtr::device_ptr(&mlp_buf, &self.stream).0,
+                DevicePtr::device_ptr(&qkv_scratch, &self.stream).0,
+                DevicePtr::device_ptr(&attn_scratch, &self.stream).0,
+                DevicePtr::device_ptr(&oproj_scratch, &self.stream).0,
+                DevicePtr::device_ptr(&gateup_scratch, &self.stream).0,
+                DevicePtr::device_ptr(&logits_scratch, &self.stream).0,
+                // Split-KV
+                DevicePtr::device_ptr(&split_max_buf, &self.stream).0,
+                DevicePtr::device_ptr(&split_sum_buf, &self.stream).0,
+                DevicePtr::device_ptr(&split_acc_buf, &self.stream).0,
+                max_splits,
+                // Sync
+                DevicePtr::device_ptr(&sync_flags, &self.stream).0,
+                // Config
+                num_layers as i32,
+                hidden as i32,
+                q_dim as i32,
+                kv_dim as i32,
+                qkv_dim as i32,
+                num_heads as i32,
+                num_kv_heads as i32,
+                head_dim as i32,
+                intermediate as i32,
+                gate_up_dim as i32,
+                block_size as i32,
+                max_context_len as i32,
+                max_blocks,
+                vocab as i32,
+                self.rms_norm_eps,
+                attn_scale,
+                // Output
+                DevicePtr::device_ptr(&output_gpu, &self.stream).0,
+            )
+            .map_err(|e| LLMError::GpuError(e))?;
+
+            let output_cpu: Vec<i32> = self
+                .stream
+                .clone_dtoh(&output_gpu)
+                .map_err(|e| LLMError::GpuError(format!("mk2 output dtoh: {e}")))?;
 
             Ok(ForwardOutput::TokenIds(output_cpu))
         }
@@ -1939,7 +3197,8 @@ mod cuda_impl {
         fn embedding_lookup_from_meta(&self, num_tokens: usize) -> Result<CudaSlice<f16>> {
             let hidden_size = self.config.hidden_size;
 
-            let kernel = self.loader
+            let kernel = self
+                .loader
                 .get_func("embedding_gather_f16", "embedding_gather_f16_kernel")?;
 
             // Safety: embedding gather kernel writes all num_tokens * hidden_size elements
@@ -1949,9 +3208,8 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            let token_ids_view = packed_buf.slice(
-                offsets.token_ids..offsets.token_ids + offsets.num_token_ids,
-            );
+            let token_ids_view =
+                packed_buf.slice(offsets.token_ids..offsets.token_ids + offsets.num_token_ids);
 
             let block_dim = hidden_size.min(1024) as u32;
             let cfg = LaunchConfig {
@@ -1992,9 +3250,12 @@ mod cuda_impl {
                 block_dim: (block_threads, 1, 1),
                 shared_mem_bytes: block_threads * std::mem::size_of::<f32>() as u32,
             };
-            let kernel = self.loader.get_func("rms_norm_f16", "rms_norm_f16_kernel")?;
+            let kernel = self
+                .loader
+                .get_func("rms_norm_f16", "rms_norm_f16_kernel")?;
             unsafe {
-                self.stream.launch_builder(&kernel)
+                self.stream
+                    .launch_builder(&kernel)
                     .arg(&mut output)
                     .arg(input)
                     .arg(weight)
@@ -2028,7 +3289,8 @@ mod cuda_impl {
                 shared_mem_bytes: 0,
             };
             unsafe {
-                self.stream.launch_builder(&cast_kernel)
+                self.stream
+                    .launch_builder(&cast_kernel)
                     .arg(&mut hidden_f32)
                     .arg(hidden_state_f16)
                     .arg(&(hidden_size as i32))
@@ -2049,7 +3311,6 @@ mod cuda_impl {
         pub fn cache_mut(&mut self) -> &mut CudaCacheEngine {
             &mut self.cache
         }
-
     }
 }
 
@@ -2062,9 +3323,9 @@ pub use cuda_impl::GpuModelRunner;
 // =========================================================================
 #[cfg(not(feature = "cuda"))]
 mod mock_impl {
+    use super::ForwardOutput;
     use crate::bridge::{LLMError, Result};
     use crate::runner::ModelRunnerConfig;
-    use super::ForwardOutput;
 
     /// Stub GpuModelRunner for non-CUDA builds.
     ///
@@ -2171,7 +3432,6 @@ mod mock_impl {
                 "GpuModelRunner requires the `cuda` feature".into(),
             ))
         }
-
     }
 }
 
@@ -2198,7 +3458,8 @@ mod tests {
                 intermediate_size: 128,
                 vocab_size: 100,
                 max_position: 512,
-                rms_norm_eps: 1e-5, rope_theta: 10000.0,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
                 dtype: "float32".to_string(),
                 architecture: "LlamaForCausalLM".to_string(),
             };
@@ -2223,7 +3484,8 @@ mod tests {
                 intermediate_size: 512,
                 vocab_size: 32000,
                 max_position: 2048,
-                rms_norm_eps: 1e-5, rope_theta: 10000.0,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
                 dtype: "float16".to_string(),
                 architecture: "LlamaForCausalLM".to_string(),
             };

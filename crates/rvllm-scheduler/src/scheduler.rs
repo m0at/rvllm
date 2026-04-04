@@ -323,6 +323,7 @@ impl Scheduler {
             num_batched_tokens += tokens_this_group;
             scheduled.push(ScheduledSequenceGroup {
                 seq_group: group,
+                is_prefill,
                 token_chunk_size: tokens_this_group,
             });
         }
@@ -879,6 +880,7 @@ mod tests {
         sched.add_request(make_group(1, 1, 128));
         let out = sched.schedule().unwrap();
         assert_eq!(out.scheduled_seq_groups.len(), 1);
+        assert!(out.scheduled_seq_groups[0].is_prefill);
         assert_eq!(out.scheduled_seq_groups[0].token_chunk_size, 32);
         assert_eq!(out.num_prefill_groups, 1);
     }
@@ -898,16 +900,19 @@ mod tests {
 
         // Step 1: processes 32 tokens.
         let out1 = sched.schedule().unwrap();
+        assert!(out1.scheduled_seq_groups[0].is_prefill);
         assert_eq!(out1.scheduled_seq_groups[0].token_chunk_size, 32);
         assert_eq!(out1.num_prefill_groups, 1);
 
         // Step 2: processes remaining 32 tokens.
         let out2 = sched.schedule().unwrap();
+        assert!(out2.scheduled_seq_groups[0].is_prefill);
         assert_eq!(out2.scheduled_seq_groups[0].token_chunk_size, 32);
         assert_eq!(out2.num_prefill_groups, 1);
 
         // Step 3: prefill done, now decoding (1 token per seq).
         let out3 = sched.schedule().unwrap();
+        assert!(!out3.scheduled_seq_groups[0].is_prefill);
         assert_eq!(out3.scheduled_seq_groups[0].token_chunk_size, 1);
         assert_eq!(out3.num_prefill_groups, 0);
     }

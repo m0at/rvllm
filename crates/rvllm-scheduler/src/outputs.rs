@@ -8,6 +8,8 @@ use crate::scheduler::SequenceGroup;
 #[derive(Debug, Clone)]
 pub struct ScheduledSequenceGroup {
     pub seq_group: SequenceGroup,
+    /// True when this scheduled step is processing prompt tokens.
+    pub is_prefill: bool,
     /// Number of tokens to process this step (chunked prefill support).
     pub token_chunk_size: usize,
 }

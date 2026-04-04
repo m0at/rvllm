@@ -18,12 +18,12 @@ mod inner {
 
     use rvllm_block_manager::{BlockManager, MemoryPool};
     use rvllm_config::{resolve_runtime_max_model_len, EngineConfig};
-    use rvllm_model_loader::{detect_format, ModelFormat};
-    use rvllm_model_loader::gguf::inspect_gguf_model_info;
     use rvllm_core::prelude::{
         BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
         SequenceId, TokenId,
     };
+    use rvllm_model_loader::gguf::inspect_gguf_model_info;
+    use rvllm_model_loader::{detect_format, ModelFormat};
     use rvllm_scheduler::{
         scheduler::SequenceGroup as ScheduledSequenceGroupState,
         PreemptionMode as SchedulerPreemptionMode, ScheduledSequenceGroup,
@@ -72,19 +72,29 @@ mod inner {
             let gguf_path = if model_dir.is_dir() {
                 std::fs::read_dir(model_dir)?
                     .filter_map(|e| e.ok())
-                    .find(|e| e.path().extension().map(|ext| ext == "gguf").unwrap_or(false))
+                    .find(|e| {
+                        e.path()
+                            .extension()
+                            .map(|ext| ext == "gguf")
+                            .unwrap_or(false)
+                    })
                     .map(|e| e.path())
-                    .ok_or_else(|| LLMError::ModelError("no .gguf file found in directory".into()))?
+                    .ok_or_else(|| {
+                        LLMError::ModelError("no .gguf file found in directory".into())
+                    })?
             } else {
                 model_dir.to_path_buf()
             };
             let info = inspect_gguf_model_info(&gguf_path)?;
-            let hidden_size = info.embedding_length
+            let hidden_size = info
+                .embedding_length
                 .ok_or_else(|| LLMError::ModelError("GGUF missing embedding_length".into()))?;
-            let num_attention_heads = info.attention_head_count
+            let num_attention_heads = info
+                .attention_head_count
                 .ok_or_else(|| LLMError::ModelError("GGUF missing attention.head_count".into()))?;
             let num_key_value_heads = info.attention_head_count_kv.unwrap_or(num_attention_heads);
-            let head_dim = info.attention_key_length
+            let head_dim = info
+                .attention_key_length
                 .or(info.attention_value_length)
                 .unwrap_or_else(|| hidden_size / num_attention_heads.max(1));
             return Ok(HfModelConfig {
@@ -92,9 +102,11 @@ mod inner {
                 intermediate_size: info.feed_forward_length.unwrap_or(hidden_size * 4),
                 num_attention_heads,
                 num_key_value_heads,
-                num_hidden_layers: info.block_count
+                num_hidden_layers: info
+                    .block_count
                     .ok_or_else(|| LLMError::ModelError("GGUF missing block_count".into()))?,
-                vocab_size: info.vocab_size
+                vocab_size: info
+                    .vocab_size
                     .ok_or_else(|| LLMError::ModelError("GGUF missing vocab_size".into()))?,
                 declared_max_model_len: None,
                 rms_norm_eps: info.rms_norm_eps.unwrap_or(1e-5),
@@ -871,7 +883,7 @@ mod inner {
                 let chunk_end = group.num_prompt_tokens_processed.min(prompt_len);
                 let chunk_start =
                     chunk_end.saturating_sub(scheduled.token_chunk_size.min(chunk_end));
-                if chunk_start < chunk_end && chunk_end >= prompt_len {
+                if scheduled.is_prefill && chunk_end >= prompt_len {
                     for seq in &group.sequences {
                         self.scheduler.register_finished_prompt(seq.seq_id);
                     }
@@ -961,10 +973,17 @@ mod inner {
             for scheduled in groups {
                 let group = &scheduled.seq_group;
                 let prompt_len = group.prompt_len();
-                let chunk_end = group.num_prompt_tokens_processed.min(prompt_len);
-                let chunk_start =
-                    chunk_end.saturating_sub(scheduled.token_chunk_size.min(chunk_end));
-                let is_prompt = chunk_start < chunk_end;
+                let is_prompt = scheduled.is_prefill;
+                let chunk_end = if is_prompt {
+                    group.num_prompt_tokens_processed.min(prompt_len)
+                } else {
+                    0
+                };
+                let chunk_start = if is_prompt {
+                    chunk_end.saturating_sub(scheduled.token_chunk_size.min(chunk_end))
+                } else {
+                    0
+                };
                 let mut seq_data = HashMap::new();
                 let mut block_tables = HashMap::new();
 
