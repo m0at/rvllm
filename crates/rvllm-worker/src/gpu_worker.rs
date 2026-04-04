@@ -671,7 +671,11 @@ impl GpuWorker {
 
             // Pre-capture CUDA graphs for common decode batch sizes to avoid
             // mid-generation capture stalls.
-            if let Err(e) = self.precapture_decode_graphs() {
+            // RVLLM_NO_GRAPH=1 disables graph capture entirely (useful for debugging).
+            if std::env::var("RVLLM_NO_GRAPH").map_or(false, |v| v == "1") {
+                info!("RVLLM_NO_GRAPH=1: disabling CUDA graph capture/replay");
+                self.graph_runner.pool_mut().disable();
+            } else if let Err(e) = self.precapture_decode_graphs() {
                 warn!("pre-capture failed: {e} -- graphs will be captured lazily");
             }
         }
