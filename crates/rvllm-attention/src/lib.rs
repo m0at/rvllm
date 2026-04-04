@@ -10,6 +10,7 @@ pub mod buffer;
 pub mod flash_attention;
 pub mod flash_attention_impl;
 pub mod metadata;
+pub mod mla;
 pub mod mock;
 pub mod paged_attention;
 #[cfg(feature = "cuda")]
@@ -22,6 +23,7 @@ pub use buffer::GpuBuffer;
 pub use flash_attention::FlashAttentionPaged;
 pub use flash_attention_impl::{FlashAttention2, FlashAttention2Config};
 pub use metadata::AttentionMetadata;
+pub use mla::{MlaAttentionBackend, MlaConfig};
 pub use mock::MockAttentionBackend;
 pub use paged_attention::PagedAttentionV2;
 #[cfg(feature = "cuda")]
