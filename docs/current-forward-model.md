@@ -1,74 +1,128 @@
-# Current Forward Model (as of d9cd982)
+# Current Forward Model (April 4, 2026)
 
-Exact operation sequence for ONE decode step, ONE token, Qwen2.5-1.5B f16.
-Reference: `crates/rvllm-model-runner/src/gpu_layer.rs` forward_f16().
+This is the current high-level forward-path model for `rvLLM`, not the older pre-fusion trace.
 
-## Per-Step Outer Loop (gpu_worker.rs)
+The two important ideas now are:
 
-```
-1. prepare_input()           -- CPU: build ModelInput from metadata
-2. upload_metadata()         -- 6x memcpy_htod (token_ids, positions, context_lens, block_tables, slot_mapping, seq_start_pos)
-3. graph.replay()            -- if graph captured, else forward_gpu_only()
-4. read_graph_output()       -- 1x memcpy_dtoh (i32 token IDs)
-5. sample_tokens()           -- CPU: extract token ID from array
-```
+1. `T=1` and `T>=2` are intentionally different execution regimes.
+2. The runner makes an explicit per-op GEMM policy choice instead of letting CUTLASS availability accidentally choose the path.
 
-## Per-Layer Operations (forward_f16, x28 layers)
+## Current Path Selection
 
-Each `forward_once_f16` call does: cast_f32_to_f16 + alloc + hgemm + cast_f16_to_f32 + alloc = **3 allocs, 2 cast kernels, 1 cuBLAS call**.
+### Batch-1 (`T=1`)
 
-```
- #  Operation                    Kernels  Allocs  Memcpy   Source
---- ----------------------------  -------  ------  ------  --------
- 1  rms_norm(input)                  1       1       0     gpu_layer.rs:158
- 2  Q = forward_once_f16(normed)     3       3       0     gpu_layer.rs:172  (cast+hgemm+cast)
- 3  K = forward_once_f16(normed)     3       3       0     gpu_layer.rs:175
- 4  V = forward_once_f16(normed)     3       3       0     gpu_layer.rs:178
- 5  add_bias(Q)                      1       0       0     gpu_layer.rs:184  (Qwen2.5 only)
- 6  add_bias(K)                      1       0       0     gpu_layer.rs:187
- 7  add_bias(V)                      1       0       0     gpu_layer.rs:189
- 8  RoPE: alloc q_out                0       1       0     gpu_layer.rs:671
- 9  RoPE: alloc k_out                0       1       0     gpu_layer.rs:674
-10  RoPE: dtod q -> q_out            0       0       1     gpu_layer.rs:678
-11  RoPE: dtod k -> k_out            0       0       1     gpu_layer.rs:681
-12  RoPE: rotary_kernel              1       0       0     gpu_layer.rs:703
-13  cache_write(k_rot, v)            1       0       0     gpu_layer.rs:209
-14  decode_attention(q_rot)          1       1       0     gpu_layer.rs:241  (FA2 f16kv)
-15  O = forward_once_f16(attn)       3       3       0     gpu_layer.rs:260
-16  residual = add(input, O)         1       1       0     gpu_layer.rs:265
-17  normed2 = rms_norm(residual)     1       1       0     gpu_layer.rs:274
-18  gate = forward_once_f16(norm2)   3       3       0     gpu_layer.rs:285
-19  up = forward_once_f16(norm2)     3       3       0     gpu_layer.rs:288
-20  fused = silu_mul(gate, up)       1       1       0     gpu_layer.rs:291
-21  down = forward_once_f16(fused)   3       3       0     gpu_layer.rs:292
-22  output = add(residual, down)     1       1       0     gpu_layer.rs:297
---- ----------------------------  -------  ------  ------
-    TOTAL PER LAYER:                 32      29      2
-    TOTAL 28 LAYERS:                896     812     56
+Normal batch-1 decode now defaults to:
+
+```text
+CublasGemvDecode
 ```
 
-## Post-Layer (gpu_runner.rs forward_gpu_only)
+That was a deliberate fix. The previous default still favored the older fused decode path, which lost on the real H100 end-to-end benchmark.
 
+The batch-1 selection order is now:
+
+```text
+explicit experimental env paths
+-> FP8 decode if FP8 weights are active
+-> CublasGemvDecode (default normal path)
+-> legacy FusedDecode only if forced
 ```
-23  final_rms_norm                   1       1       0
-24  fused_lm_head_argmax_f16         2       3       0     (pass1 + reduce)
-25  dtod to graph_output             0       0       1
---- ----------------------------  -------  ------  ------
-    TOTAL FORWARD:                 899     816     57
+
+Current verified number on H100 / Qwen2.5-7B / `output-len=128`:
+
+- `N=1`: `127.9 tok/s`
+
+### Batched (`T>=2`)
+
+Batched prefill and batched decode use the normal layer stack plus an explicit GEMM policy.
+
+Current default:
+
+```text
+GemmStrategy::Hybrid
 ```
 
-## Summary
+Hybrid means:
 
-| Metric | Count |
-|--------|-------|
-| Kernel launches | 899 |
-| GPU memory allocations | 816 |
-| Device-to-device memcpy | 57 |
-| Host-to-device memcpy (metadata) | 6 |
-| Device-to-host memcpy (output) | 1 |
-| cuBLAS GEMM calls | 196 (7 per layer x 28) |
-| Cast kernels (f32<->f16) | 392 (14 per layer x 28) |
+```text
+QKV        -> cuBLAS / cublasLt
+O-proj     -> cuBLAS / cublasLt
+GateUp     -> CUTLASS
+SiLU       -> fused with GateUp CUTLASS epilogue
+Down-proj  -> cuBLAS / cublasLt
+```
 
-With CUDA graph replay: the 899 kernel launches + 816 allocs inside forward_gpu_only
-are captured as one graph. But the 6 HtoD metadata uploads + 1 DtoH output read
-happen outside the graph every step.
+The old bug was that the runner conceptually wanted this hybrid policy, but the actual enum and dispatch did not encode it cleanly. As a result, QKV could still wander onto CUTLASS just because the shared library was present.
+
+That is fixed now.
+
+## Current Layer Shape
+
+### Batch-1 normal decode
+
+Per layer:
+
+```text
+RMSNorm
+QKV projection via cuBLAS / cublasLt
+RoPE + KV cache write
+attention decode
+O-proj via cuBLAS / cublasLt
+RMSNorm
+gate_up via cuBLAS / cublasLt
+SiLU * Mul
+down via cuBLAS / cublasLt
+```
+
+### Batched decode / prefill
+
+Per layer:
+
+```text
+RMSNorm
+QKV via cuBLAS / cublasLt
+bias / layout handling as needed
+RoPE + cache update
+attention backend
+O-proj via cuBLAS / cublasLt
+residual + RMSNorm
+GateUp + SiLU via CUTLASS
+down via cuBLAS / cublasLt
+```
+
+## Current Benchmark Truth
+
+Same H100, same Qwen2.5-7B snapshot, `output-len=128`, direct engine:
+
+| N | vLLM 0.19.0 | rvLLM | rvLLM / vLLM |
+|---:|---:|---:|---:|
+| 1 | 165.5 | 127.9 | 0.77x |
+| 32 | 4467.7 | 4407.5 | 0.99x |
+| 64 | 7972.1 | 7964.0 | 1.00x |
+| 128 | 13903.5 | 13148.3 | 0.95x |
+
+## What Is Still Behind
+
+- `N=1` decode is still materially behind vLLM.
+- `N=32` and `N=64` are basically tied now.
+- `N=128` is close, but still a few percent behind.
+- `cublasLt` autotune cache behavior is still flaky on some shapes and should fall back more aggressively when a cached algo goes bad.
+
+## Relevant Controls
+
+```bash
+RVLLM_CUBLAS_DECODE=0|1
+RVLLM_BATCHED_GEMM_STRATEGY=cublas|hybrid|cutlass
+RVLLM_PERSISTENT_V3=1
+RVLLM_FP8_WEIGHTS=1
+```
+
+## Bottom Line
+
+The current system is no longer “fused decode by default, CUTLASS when available.”
+
+It is:
+
+- batch-1 normal decode on `CublasGemvDecode`
+- batched execution on an explicit hybrid policy
+- experimental persistent and megakernel paths kept separate from the normal path

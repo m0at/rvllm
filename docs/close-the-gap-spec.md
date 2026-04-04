@@ -1,5 +1,10 @@
 # Close the 10% gap -- pure Rust implementation spec
 
+> Superseded by the April 4, 2026 benchmark set and architecture fixes.
+> Current public direct-engine comparison on H100 / Qwen2.5-7B / `output-len=128`:
+> `N=1 127.9 vs 165.5`, `N=32 4407.5 vs 4467.7`, `N=64 7964.0 vs 7972.1`, `N=128 13148.3 vs 13903.5` (rvLLM vs vLLM 0.19.0).
+> The biggest fixes since this spec were the batch-1 dispatch correction and the explicit batched `Hybrid` GEMM policy.
+
 Three agents, all working in existing crates. Zero new dependencies.
 
 ## Agent 1: Metadata pre-packing (5% gap)

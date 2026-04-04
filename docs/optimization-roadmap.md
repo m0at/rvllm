@@ -1,5 +1,9 @@
 # rvLLM Optimization Roadmap
 
+> Historical planning document. Superseded by the April 4, 2026 benchmark set and dispatch-policy fixes.
+> Current public direct-engine comparison on H100 / Qwen2.5-7B / `output-len=128`:
+> `N=1 127.9 vs 165.5`, `N=32 4407.5 vs 4467.7`, `N=64 7964.0 vs 7972.1`, `N=128 13148.3 vs 13903.5` (rvLLM vs vLLM 0.19.0).
+
 ## Current State (April 1, 2026)
 
 Verified coherent: **12,312 tok/s** at N=128 on H100 SXM 80GB, Qwen2.5-7B f16, direct engine.

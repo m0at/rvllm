@@ -138,11 +138,11 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">4,385 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.92x stock vLLM 0.19.0 (4,773 tok/s) in an honest same-GPU comparison against the latest release. Consistent ~10% gap across all concurrency levels points to GEMM tuning as the dominant remaining bottleneck.</div>
+  <div class="big">13,148 tok/s</div>
+  <div class="sub">Qwen2.5-7B on H100, direct engine, N=128. Current rvLLM is 0.95x vLLM 0.19.0 at N=128, effectively tied at N=64, and still behind at N=1. These are the real April 4, 2026 apples-to-apples numbers after the batch-1 dispatch fix and batched hybrid GEMM fix.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
-    <div class="hero-graphic-sub">Three-way benchmark: stock vLLM vs rvllm-lite vs rvLLM, with both direct-engine and HTTP serving results.</div>
+    <div class="hero-graphic-sub">Current direct-engine comparison up top, older HTTP context kept below for reference.</div>
     <div class="hero-chart-root" aria-label="rvLLM H100 comparison chart">
       <div class="hero-chart-legend">
         <span><i style="background:#78CFFF"></i>vLLM 0.19.0</span>
@@ -154,62 +154,51 @@ footer a:hover{color:#999}
           <div class="hero-chart-head">
             <div>
               <h3>Direct Engine Throughput</h3>
-              <p>Same GPU, same model, vLLM 0.19.0 vs rvLLM (April 4, 2026).</p>
+              <p>Same GPU, same model, same Qwen2.5-7B snapshot, `output-len=128`.</p>
             </div>
           </div>
           <div class="hero-static-block">
             <div class="hero-static-row">
               <div class="hero-static-label">N=1</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:3.5%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:3.0%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:1.2%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:0.9%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>167.8</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>143.9 (0.86x)</span>
-                </div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label">N=4</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:13.9%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:12.6%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>664.3</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>599.8 (0.90x)</span>
-                </div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label">N=8</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:27.7%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:24.8%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>1321.8</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>1183.8 (0.90x)</span>
-                </div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label">N=16</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:51.1%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:47.1%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>2440.1</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>2247.6 (0.92x)</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>165.5</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>127.9 (0.77x)</span>
                 </div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=32</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:91.9%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:32.1%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:31.7%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>4772.7 tok/s</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>4384.7 tok/s (0.92x)</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>4467.7</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>4407.5 (0.99x)</span>
+                </div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=64</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:57.3%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:57.3%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta">
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>7972.1</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>7964.0 (1.00x)</span>
+                </div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=128</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:94.6%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta">
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>13903.5</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>13148.3 (0.95x)</span>
                 </div>
               </div>
             </div>
@@ -259,16 +248,16 @@ footer a:hover{color:#999}
 
       <div class="hero-chart-notes">
         <div class="hero-chart-pill">
-          <strong>0.92x at N=32</strong>
-          Honest comparison against vLLM 0.19.0 (latest release, April 2026). Consistent ~10% gap across all batch sizes.
+          <strong>Near tie at N=32 and N=64</strong>
+          Current committed rvLLM is 0.99x vLLM at N=32 and 1.00x at N=64 on the direct-engine H100 run.
         </div>
         <div class="hero-chart-pill">
-          <strong>GEMM tuning is the bottleneck</strong>
-          The uniform gap points to a single cause: vLLM's Triton autotuned GEMMs with 6+ months of per-model config tuning vs our fresh cuBLAS autotuning.
+          <strong>Two real fixes mattered</strong>
+          Batch-1 now defaults to cuBLAS GEMV, and batched execution now has a real hybrid GEMM policy instead of an accidental CUTLASS mix.
         </div>
         <div class="hero-chart-pill">
           <strong>Zero Python overhead</strong>
-          ~50 MB container, 35s build, no GIL/GC. The ~10% raw throughput gap is the honest trade-off for full Rust ownership of the stack.
+          ~50 MB container, 35s build, no GIL/GC. The remaining weak spot is single-stream decode, not the batched direct-engine path.
         </div>
       </div>
     </div>
@@ -278,7 +267,7 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Abstract</h2>
-<p class="section-sub">Andy Norris (m0at) -- San Francisco, April 3 2026</p>
+<p class="section-sub">Andy Norris (m0at) -- San Francisco, April 4 2026</p>
 <p>
   rvLLM is a from-scratch Rust implementation of the vLLM inference engine for
   OpenAI-compatible API serving with CUDA GPU acceleration. 310 commits, 31 crates,
@@ -290,13 +279,17 @@ footer a:hover{color:#999}
 </p>
 <p>
   In the latest verified apples-to-apples H100 SXM 80GB comparison on Qwen2.5-7B f16,
-  rvLLM reaches <strong>3,170 tok/s at N=32 direct engine</strong> (<strong>0.99x stock vLLM</strong>).
-  In the matched fixed-length 10k lifecycle race, <strong>rvLLM finishes in 30.33s</strong>
-  versus <strong>35.51s for stock vLLM</strong>, while stock <code>vLLM</code> still leads on
-  steady-state HTTP throughput at <strong>4,394.6 tok/s</strong> versus <strong>3,419.4 tok/s</strong>
-  for rvLLM. The intermediate <code>rvllm-lite</code> stack keeps near-stock direct-engine speed but
-  collapses to 131.8 tok/s over HTTP, which isolates the Python serving layer as a major source
-  of practical overhead.
+  rvLLM reaches <strong>4407.5 tok/s at N=32</strong>, <strong>7964.0 tok/s at N=64</strong>,
+  and <strong>13148.3 tok/s at N=128</strong> on direct engine. Against <code>vLLM 0.19.0</code>,
+  that is <strong>0.99x at N=32</strong>, <strong>1.00x at N=64</strong>, and <strong>0.95x at N=128</strong>.
+  The same run still shows the main remaining weakness clearly: <strong>N=1 is only 127.9 tok/s</strong>
+  versus <strong>165.5 tok/s</strong> for stock <code>vLLM 0.19.0</code>.
+</p>
+<p>
+  The two most important fixes behind the current numbers were architectural, not cosmetic:
+  batch-1 normal decode now defaults to the right path (<code>CublasGemvDecode</code>), and the
+  batched path now has a real explicit hybrid GEMM policy instead of a half-wired "CUTLASS if present"
+  behavior that could route QKV incorrectly.
 </p>
 <p>
   The API layer implements 14 OpenAI-compatible endpoints including completions, chat
@@ -337,21 +330,33 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Current H100 Direct</h2>
-<p class="section-sub">Qwen2.5-7B f16, 256 output tok/req, vLLM 0.19.0 vs rvLLM, same GPU (April 4, 2026)</p>
+<p class="section-sub">Qwen2.5-7B f16, 128 output tok/req, vLLM 0.19.0 vs rvLLM, same GPU (April 4, 2026)</p>
 <div class="tbl">
 <table>
 <thead><tr><th class="r">N</th><th class="r">vLLM 0.19.0</th><th class="r">rvLLM</th><th>rvLLM / vLLM</th></tr></thead>
 <tbody>
-<tr><td class="r">1</td><td class="r">167.8</td><td class="r">143.9</td><td>0.86x</td></tr>
-<tr><td class="r">4</td><td class="r">664.3</td><td class="r">599.8</td><td>0.90x</td></tr>
-<tr><td class="r">8</td><td class="r">1,321.8</td><td class="r">1,183.8</td><td>0.90x</td></tr>
-<tr><td class="r">16</td><td class="r">2,440.1</td><td class="r">2,247.6</td><td>0.92x</td></tr>
-<tr class="peak"><td class="r">32</td><td class="r">4,772.7</td><td class="r">4,384.7</td><td>0.92x</td></tr>
+<tr><td class="r">1</td><td class="r">165.5</td><td class="r">127.9</td><td>0.77x</td></tr>
+<tr><td class="r">32</td><td class="r">4467.7</td><td class="r">4407.5</td><td>0.99x</td></tr>
+<tr><td class="r">64</td><td class="r">7972.1</td><td class="r">7964.0</td><td>1.00x</td></tr>
+<tr class="peak"><td class="r">128</td><td class="r">13903.5</td><td class="r">13148.3</td><td>0.95x</td></tr>
 </tbody>
 </table>
 </div>
 <div class="note">
-  <strong>Honest baseline</strong>: previous comparisons used vLLM 0.6.3 (late 2024). vLLM 0.19.0 is ~25-50% faster due to Triton autotuned GEMMs, zero-bubble scheduling, and DBO. The gap is now a consistent ~10%.
+  <strong>Honest baseline</strong>: this table is the current public truth. rvLLM is basically tied in the batched regime that matters most here, but still clearly behind on single-stream decode.
+</div>
+</section>
+
+<section>
+<h2>What Was Wrong Before</h2>
+<p class="section-sub">The April 4 architecture correction</p>
+<ol>
+<li><strong>Batch-1 default decode was wrong.</strong> Normal <code>T=1</code> execution still favored the older fused decode path. The current default is <code>CublasGemvDecode</code>, which moved the real batch-1 baseline to <strong>127.9 tok/s</strong>.</li>
+<li><strong>The batched GEMM policy was half-wired.</strong> The runner wanted a hybrid strategy, but the actual dispatch could still let QKV take CUTLASS just because the shared library existed.</li>
+<li><strong>The docs were still describing the old architecture.</strong> Public docs now match the real dispatch: batch-1 on cuBLAS GEMV, batched path on explicit hybrid routing.</li>
+</ol>
+<div class="note">
+  Current hybrid policy: <strong>QKV / O / down on cuBLAS or cublasLt</strong>, <strong>GateUp + SiLU on CUTLASS</strong>.
 </div>
 </section>
 
@@ -404,7 +409,8 @@ footer a:hover{color:#999}
 <ol>
 <li><strong>JIT fused kernels</strong> (fastest) -- Rust PTX emitter generates shape-specialized fused kernels at model load. 2-7.5x faster than hand-written CUDA for M=1 decode. Patterns: RMSNorm+GEMV, Add+RMSNorm+GEMV, SiLU*Mul+GEMV.</li>
 <li><strong>54 hand-written CUDA kernels</strong> -- fused decode (add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down), FP8 E4M3 variants, TMA async-prefetch GEMV, WGMMA tensor core GEMV, split-KV attention, INT4 W4A16 GEMV (4 fused variants, pending Rust wiring). No-fallback validation at startup ensures every kernel loads or the server fails fast.</li>
-<li><strong>cuBLAS/cublasLt</strong> (batched M>1) -- autotuned algorithm selection with vendored type shim for cudarc 0.19. 32 candidates benchmarked per GEMM shape at startup.</li>
+<li><strong>cuBLAS/cublasLt</strong> (batched QKV/O/down) -- autotuned algorithm selection with vendored type shim for cudarc 0.19. 32 candidates benchmarked per GEMM shape at startup.</li>
+<li><strong>CUTLASS</strong> (batched GateUp+SiLU) -- the current default hybrid epilogue path for the MLP expansion.</li>
 </ol>
 <p>Plus an <strong>LLVM NVPTX backend</strong> (experimental) -- full compiler pipeline: Fusion IR -> LLVM IR -> NVPTX -> PTX via inkwell. Same backend as Triton.</p>
 </section>
@@ -416,6 +422,8 @@ footer a:hover{color:#999}
 <li><strong>JIT fused kernels</strong> -- compiler-generated fused norm+GEMV eliminates HBM round-trips</li>
 <li><strong>GPU-resident argmax</strong> -- eliminates 74 MB DtoH per step</li>
 <li><strong>CUDA graph replay</strong> -- 35 pre-captured graphs, 1.7 sec total capture time</li>
+<li><strong>Batch-1 dispatch fix</strong> -- normal single-stream decode now takes the right default path</li>
+<li><strong>Explicit batched hybrid GEMM routing</strong> -- QKV/O/down on cuBLAS, GateUp+SiLU on CUTLASS</li>
 <li><strong>cuBLAS autotuning</strong> -- best algorithm per GEMM shape, benchmarked at startup</li>
 <li><strong>FP16 hgemm + f16 KV cache</strong> -- tensor cores for all projections</li>
 <li><strong>FA3 v3 cp.async + split-KV attention</strong> -- cp.async bulk copies, split-KV across thread blocks, parallel softmax, bank-conflict-free smem, V reuse across head groups</li>
@@ -445,7 +453,7 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Optimization Timeline</h2>
-<p class="section-sub">Historical 7B tok/s at N=128 on H100</p>
+<p class="section-sub">Historical milestones, including the April 4 dispatch/policy fixes</p>
 <div class="tbl">
 <table>
 <thead><tr><th>Phase</th><th>Change</th><th class="r">tok/s</th><th>Date</th></tr></thead>
@@ -464,6 +472,8 @@ footer a:hover{color:#999}
 <tr><td>9</td><td>Responses API + Harmony templates + vision types</td><td class="r">--</td><td>Apr 3</td></tr>
 <tr><td>10</td><td>Qwen/Nemotron integrations + GGUF loader + mock smoke path</td><td class="r">--</td><td>Apr 3</td></tr>
 <tr class="peak"><td>11</td><td>v0.19 upgrade: zero-bubble, DBO, MLA, Gemma 4, Blackwell, MXFP8</td><td class="r">4,385 (N=32)</td><td>Apr 4</td></tr>
+<tr><td>12</td><td>Batch-1 dispatch fix: default to cuBLAS GEMV</td><td class="r">127.9 (N=1)</td><td>Apr 4</td></tr>
+<tr class="peak"><td>13</td><td>Batched hybrid GEMM policy fix</td><td class="r">13,148 (N=128)</td><td>Apr 4</td></tr>
 </tbody>
 </table>
 </div>
@@ -471,7 +481,7 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Architecture</h2>
-<p class="section-sub">31 crates, 54 CUDA kernels, 13 model architectures, 6 decode paths</p>
+<p class="section-sub">31 crates, 54 CUDA kernels, 13 model architectures, current dispatch fixed as of April 4</p>
 <pre>rvllm-server          CLI binary (serve, benchmark, info)
   +-- rvllm-api         axum HTTP server, 14 OpenAI-compatible routes, SSE streaming
   +-- rvllm-engine      async engine, continuous batching, dedicated GPU thread
@@ -500,12 +510,12 @@ Model architectures:
   SentenceTransformer (embedding models)
 
 Decode paths (N=1):
-  FusedDecode .......... 121 tok/s  (JIT fused norm+GEMV)
-  CublasGemvDecode ..... 118 tok/s  (separate norm + cuBLAS HGEMM, 84% BW)
+  CublasGemvDecode ..... 127.9 tok/s (current default normal path)
+  FusedDecode .......... legacy      (older fused path, now opt-in)
   Megakernel ............ 50 tok/s  (28-layer single-launch, instruction tape)
   Persistent ............ 51 tok/s  (SM-DAG cooperative kernel)
   Fp8Decode ............. --        (FP8 E4M3 cublasLt)
-  Batched ............... auto      (cuBLAS/CUTLASS for T>=2)
+  Batched ............... auto      (Hybrid: QKV/O/down on cuBLAS, GateUp+SiLU on CUTLASS)
   Theoretical f16 ceiling: 222 tok/s</pre>
 </section>
 

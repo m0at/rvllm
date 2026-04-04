@@ -7,7 +7,7 @@
   \vspace{0.3em}
   {\normalsize\texttt{https://github.com/m0at/rvllm}\par}
   \vspace{0.3em}
-  {\normalsize San Francisco, April 3, 2026\par}
+  {\normalsize San Francisco, April 4, 2026\par}
 \end{center}
 \vspace{1em}
 
@@ -20,16 +20,17 @@ architectures (Llama, Qwen2, Mistral, DeepSeek-V2, Mixtral, NemotronH~MoE, Gemma
 and others), FA3 v3 cp.async + split-KV attention, no-fallback kernel validation,
 and a Rust-native PTX compiler that generates fused decode kernels
 2--7.5$\times$ faster than the hand-written CUDA baselines in the measured
-microbenchmarks. In an honest same-GPU comparison on H100~SXM~80\,GB
-serving Qwen2.5-7B f16 against the latest vLLM release (0.19.0, April 2026),
-rvLLM reaches 4{,}385~tok/s at $N\!=\!32$ direct engine
-(\textbf{0.92$\times$ stock vLLM~0.19.0}, which achieves 4{,}773~tok/s).
-The gap is consistent at $\sim$10\% across all concurrency levels ($N\!=\!1$
-through $N\!=\!32$), pointing to GEMM algorithm selection as the dominant
-remaining bottleneck: vLLM uses Triton autotuned GEMMs with months of
-per-model config tuning, while rvLLM uses cuBLAS with freshly-implemented
-disk-cached autotuning. rvLLM is
-open-source under the Apache-2.0 license.
+microbenchmarks. In the latest honest same-GPU comparison on H100~SXM~80\,GB
+serving Qwen2.5-7B f16 against vLLM~0.19.0 (April 2026), rvLLM reaches
+4{,}407.5~tok/s at $N\!=\!32$ (\textbf{0.99$\times$ vLLM}),
+7{,}964.0~tok/s at $N\!=\!64$ (\textbf{1.00$\times$ vLLM}), and
+13{,}148.3~tok/s at $N\!=\!128$ (\textbf{0.95$\times$ vLLM}), while remaining
+materially behind at $N\!=\!1$ (127.9 vs.\ 165.5~tok/s, \textbf{0.77$\times$}).
+The most important changes in this revision are architectural rather than cosmetic:
+batch-1 normal decode now defaults to the correct cuBLAS GEMV path, and batched
+execution now uses an explicit hybrid GEMM policy with QKV/O/down on cuBLAS or
+cublasLt and GateUp+SiLU on CUTLASS. rvLLM is open-source under the Apache-2.0
+license.
 \end{abstract}
 
 % ============================================================================
@@ -104,7 +105,7 @@ The primary contributions are:
 \label{sec:architecture}
 % ============================================================================
 
-rvLLM is organised as a Cargo workspace containing 26~member packages. Dependencies
+rvLLM is organised as a Cargo workspace containing 31~member packages. Dependencies
 flow strictly downward from the API layer to GPU primitives.
 
 \subsection{Core and Configuration}
@@ -169,7 +170,15 @@ All activations remain on-device throughout the entire layer loop. No per-layer
 synchronisation or device-to-host transfer occurs. RoPE cosine/sine tables are
 precomputed once at model load time and uploaded as persistent GPU buffers.
 
-Ten model architectures are supported (Table~\ref{tab:architectures}), each
+As of this revision, the runner uses two distinct normal execution regimes. For
+$T\!=\!1$ batch-1 decode, the standard path now defaults to
+\texttt{CublasGemvDecode}. For $T\!\ge\!2$, the normal path is an explicit hybrid
+GEMM policy: QKV, O-proj, and down-proj use cuBLAS or cublasLt, while GateUp+SiLU
+uses CUTLASS. This replaced an older half-wired configuration in which the runner
+conceptually wanted a hybrid policy but QKV routing could still drift based only
+on CUTLASS library presence.
+
+Thirteen model architectures are supported (Table~\ref{tab:architectures}), each
 implementing an \texttt{Architecture} trait.
 
 \begin{table}[t]
@@ -457,51 +466,75 @@ the theoretical peak observed empirically at smaller model sizes.
 
 The public benchmark set in this revision is the latest verified apples-to-apples
 comparison on Qwen2.5-7B f16, using a single H100~SXM~80\,GB rented on vast.ai.
-All direct-engine runs use 256 output tokens per request. HTTP runs use 200 prompts
-at concurrency 32 with \texttt{max\_tokens}=256 and \texttt{max\_model\_len}=4096.
+All direct-engine runs in Table~\ref{tab:h100_direct} use 128 output tokens per
+request and compare current committed rvLLM directly against current vLLM~0.19.0
+on the same GPU and model snapshot.
 
-Three stacks were measured:
-\begin{itemize}
-  \item \textbf{stock vLLM~0.6.3.post1}: direct \texttt{LLM.generate(...)} and the
-        stock OpenAI server;
-  \item \textbf{rvllm-lite}: a Python serving layer that wraps vLLM internals;
-  \item \textbf{rvLLM}: the Rust server and direct engine, launched with
-        \texttt{--gpu-memory-utilization 1.0 --gpu-memory-reserve-gb 2.0}.
-\end{itemize}
-All three stacks completed the HTTP benchmark with 200/200 successful requests.
-
-\subsection{Direct Engine: Three-Way Comparison}
+\subsection{Direct Engine: Current vLLM 0.19.0 Comparison}
 
 \begin{table}[t]
   \centering
-  \caption{H100 direct-engine comparison. Qwen2.5-7B f16, 256 output tokens/request.}
+  \caption{Current H100 direct-engine comparison. Qwen2.5-7B f16, 128 output tokens/request.}
   \label{tab:h100_direct}
   \small
-  \begin{tabular}{@{}rrrrr@{}}
+  \begin{tabular}{@{}rrrr@{}}
     \toprule
-    \thead{$N$} & \thead{stock vLLM} & \thead{rvllm-lite} & \thead{rvLLM} & \thead{rvLLM / vLLM} \\
+    \thead{$N$} & \thead{vLLM~0.19.0} & \thead{rvLLM} & \thead{rvLLM / vLLM} \\
     \midrule
-    1  & 133.7 & 133.9 & 120.6 & 0.90$\times$ \\
+    1   & 165.5 & 127.9 & 0.77$\times$ \\
     \rowcolor{gray!8}
-    4  & 543.3 & 542.8 & 427.9 & 0.79$\times$ \\
-    8  & 926.1 & 925.4 & 845.8 & 0.91$\times$ \\
-    \rowcolor{gray!8}
-    16 & 1{,}934.5 & 1{,}664.8 & 1{,}648.9 & 0.85$\times$ \\
-    \textbf{32} & \textbf{3{,}197.1} & \textbf{2{,}994.5} & \textbf{3{,}170.0} & \textbf{0.99$\times$} \\
+    32  & 4{,}467.7 & 4{,}407.5 & 0.99$\times$ \\
+    64  & 7{,}972.1 & 7{,}964.0 & 1.00$\times$ \\
+    \textbf{128} & \textbf{13{,}903.5} & \textbf{13{,}148.3} & \textbf{0.95$\times$} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\texttt{rvllm-lite} is effectively the stock vLLM library path wrapped in a custom
-Python server, so Table~\ref{tab:h100_direct} isolates the kernel/runtime gap. In
-the latest verified run, rvLLM remains behind at low and mid concurrency but closes
-to near parity by $N\!=\!32$.
+\subsection{What Was Wrong Before}
 
-\subsection{HTTP Serving: Three-Way Comparison}
+The most important finding of this revision is that the previous public comparison
+was distorted by two architecture problems inside rvLLM rather than by one deep
+fundamental deficit.
+
+\begin{enumerate}
+  \item \textbf{Batch-1 default path selection was wrong.} Normal $T\!=\!1$ decode
+        still favored the older fused decode path instead of the better
+        \texttt{CublasGemvDecode} path. Fixing that lifted the current normal
+        batch-1 path to 127.9~tok/s.
+  \item \textbf{The batched GEMM policy was only half-expressed.} The runner wanted
+        a hybrid strategy, but the actual dispatch did not encode that cleanly, so
+        QKV could still opportunistically route through CUTLASS merely because the
+        shared library was present.
+\end{enumerate}
+
+The current batched policy is now explicit:
+\begin{itemize}
+  \item QKV: cuBLAS / cublasLt
+  \item O-proj: cuBLAS / cublasLt
+  \item GateUp+SiLU: CUTLASS
+  \item Down-proj: cuBLAS / cublasLt
+\end{itemize}
+
+\subsection{Interpretation}
+
+Table~\ref{tab:h100_direct} changes the story materially. rvLLM is no longer
+uniformly behind by $\sim$10\%. Instead, the picture is split:
+\begin{itemize}
+  \item \textbf{Batch-1 remains weak}: 0.77$\times$ vLLM at $N\!=\!1$.
+  \item \textbf{The main batched regime is nearly there}: 0.99$\times$ at $N\!=\!32$
+        and effectively 1.00$\times$ at $N\!=\!64$.
+  \item \textbf{Large batched decode still trails slightly}: 0.95$\times$ at $N\!=\!128$.
+\end{itemize}
+
+This implies that the remaining gap is not one monolithic systems-language tax. The
+normal batched stack is now competitive; the largest remaining problems are the
+single-stream decode path and a few percent of high-end batched efficiency.
+
+\subsection{Historical HTTP Serving Context}
 
 \begin{table}[t]
   \centering
-  \caption{H100 HTTP comparison. Qwen2.5-7B f16, 200 requests, concurrency 32, 256 max tokens.}
+  \caption{Historical H100 HTTP comparison retained for context only.}
   \label{tab:h100_http}
   \small
   \begin{tabular}{@{}lrrrr@{}}
@@ -516,18 +549,16 @@ to near parity by $N\!=\!32$.
   \end{tabular}
 \end{table}
 
-The HTTP comparison is the cleanest argument for treating direct-engine and
-serving-stack performance separately. \texttt{rvllm-lite} tracks stock vLLM closely
-in direct-engine mode, yet drops by more than 20$\times$ under HTTP load. That
-isolates the Python serving/scheduling layer as the dominant practical overhead in
-that stack. By contrast, rvLLM's Rust server stays in the same throughput class as
-stock vLLM while the direct engine still trails at low and mid concurrency.
+These HTTP numbers were measured against an older vLLM release and are kept only
+because they remain useful for separating direct-engine performance from
+serving-stack performance. They are not the current headline comparison in this
+revision.
 
 \subsection{Measured VRAM Footprint}
 
 \begin{table}[t]
   \centering
-  \caption{Measured VRAM footprint for the latest H100 comparison.}
+  \caption{Measured VRAM footprint for the older H100 HTTP comparison retained for context.}
   \label{tab:h100_vram}
   \small
   \begin{tabular}{@{}lrr@{}}
@@ -573,12 +604,11 @@ between GPU forward passes, measured on Apple~M5 (10 cores, 24\,GB).
 
 \subsection{Where the Speed Comes From}
 
-The remaining gap to stock vLLM is not attributable to any single issue. The latest
-H100 run suggests that rvLLM's server path is already competitive, while the direct
-engine still needs additional work in the same places that distinguish mature vLLM
-deployments: GEMM tuning, attention microarchitecture, and scheduler behavior. The
-measured gains in rvLLM still come from a compound effect of several reinforcing
-mechanisms:
+The remaining gap to stock vLLM is now more specific than in earlier revisions.
+The latest H100 run suggests that rvLLM's batched direct-engine path is already
+competitive, while single-stream decode and a few percent of high-end batched
+efficiency still need work. The measured gains in rvLLM come from a compound
+effect of several reinforcing mechanisms:
 
 \begin{enumerate}
   \item \textbf{GPU-resident argmax} (\S\ref{sec:argmax}): eliminates 74\,MB of
@@ -597,13 +627,16 @@ mechanisms:
         throughout the $N$-layer forward pass. No per-layer DtoH synchronisation.
   \item \textbf{Prefix caching}: shared system prompts reuse computed KV blocks
         across requests, reducing amortised prefill cost.
+  \item \textbf{Correct path selection}: batch-1 normal decode now takes the faster
+        cuBLAS GEMV route instead of the older fused default.
+  \item \textbf{Explicit batched hybrid GEMM routing}: the best current policy keeps
+        QKV/O/down on cuBLAS while using CUTLASS only where it currently wins
+        (GateUp+SiLU).
 \end{enumerate}
 
-The direct-engine table shows that these mechanisms are sufficient to close to
-0.99$\times$ stock vLLM by $N\!=\!32$, but not yet enough to win consistently at
-low and mid concurrency. The \texttt{rvllm-lite} result is particularly informative:
-because it preserves near-stock direct-engine speed while collapsing under HTTP
-load, much of the practical overhead in that stack lies above the kernels.
+The direct-engine table shows that these mechanisms are sufficient to make rvLLM
+effectively tie vLLM at $N\!=\!64$ and nearly tie it at $N\!=\!32$, but not yet
+enough to win at $N\!=\!1$ or $N\!=\!128$.
 
 \subsection{Limitations}
 
@@ -611,9 +644,8 @@ load, much of the practical overhead in that stack lies above the kernels.
   \item The current public benchmark set covers one model family
         (Qwen2.5-7B f16) and one GPU class (H100~SXM~80\,GB). Broader claims require
         rerunning the same harness on more models and hardware.
-  \item rvLLM still trails stock vLLM on direct engine at low and mid concurrency,
-        especially around $N\!=\!4$ to $N\!=\!16$ where GEMM and attention details are
-        still exposed.
+  \item rvLLM still trails stock vLLM materially on direct engine at $N\!=\!1$,
+        and remains a few percent behind at $N\!=\!128$.
   \item Earlier large-$N$ historical results in this repository were collected with
         different harnesses and should be treated as optimization history rather than
         as the current headline comparison.
@@ -690,12 +722,17 @@ paged KV cache support and GQA, plus a CPU reference for testing.
 % ============================================================================
 
 rvLLM demonstrates that a systems-language reimplementation of LLM serving can
-reach near-parity with stock vLLM on a current H100 apples-to-apples benchmark:
-0.99$\times$ by $N\!=\!32$ on direct engine and 0.95$\times$ on HTTP throughput.
-The most important comparative result is not just the rvLLM vs vLLM ratio, but the
-fact that \texttt{rvllm-lite} preserves near-stock direct-engine speed while collapsing
-under HTTP load. That separation makes the optimization target clearer: rvLLM's
-remaining work is now mostly direct-engine tuning rather than basic server plumbing.
+reach near-parity with stock vLLM in the batched direct-engine regime on a current
+H100 apples-to-apples benchmark: 0.99$\times$ at $N\!=\!32$, effectively
+1.00$\times$ at $N\!=\!64$, and 0.95$\times$ at $N\!=\!128$. The same benchmark
+also makes the remaining weakness explicit: single-stream decode is still only
+0.77$\times$ vLLM at $N\!=\!1$.
+
+The most important result of this revision is that the last large public gap was
+partly architectural self-inflicted damage. Correcting the batch-1 default path
+selection and expressing the batched hybrid GEMM policy explicitly moved the
+comparison from a uniform ``rvLLM is slower'' story to a split picture: batched
+decode is competitive, single-stream decode is not.
 
 The current tree also demonstrates a practical development approach for this class
 of system: explicit GPU memory sizing, no-fallback kernel validation, and a Rust-native

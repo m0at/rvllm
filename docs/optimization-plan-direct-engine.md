@@ -1,5 +1,9 @@
 # rvLLM Direct Engine Optimization Plan
 
+> Historical planning document. Superseded by the April 4, 2026 benchmark set and the current batch-1 / batched GEMM routing fixes.
+> Current public direct-engine comparison on H100 / Qwen2.5-7B / `output-len=128`:
+> `N=1 127.9 vs 165.5`, `N=32 4407.5 vs 4467.7`, `N=64 7964.0 vs 7972.1`, `N=128 13148.3 vs 13903.5` (rvLLM vs vLLM 0.19.0).
+
 End-to-end token throughput optimization for the direct engine path (no HTTP overhead). Target: match or exceed vLLM 0.18 at all batch sizes on H100 SXM, then scale to B200.
 
 Current state: 12,312 tok/s at N=128 (0.85x vLLM). The gap is not one thing -- it is death by a thousand cuts across the entire pipeline. This document orders every optimization by expected impact, implementation difficulty, and dependencies.

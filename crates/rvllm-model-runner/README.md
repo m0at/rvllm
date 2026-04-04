@@ -1,114 +1,126 @@
-# rvllm-model-runner: Decode Paths and Kernel Tuning
+# rvllm-model-runner: Decode Paths and GEMM Policy
 
-The model runner orchestrates the GPU forward pass for all supported architectures. Its core design principle is **no fallbacks** -- every decode path either runs its intended kernels or fails loud. Silent degradation from missing or misconfigured kernels is treated as a bug.
+The model runner owns the actual forward-path selection for decode and batched execution. Its core rule is still **no silent fallback**: if a path is selected, it must run that path or fail loud.
 
 ## Decode Path Architecture
 
-The runner selects a `ForwardPath` at model load time based on batch size, available kernels, weight format, and environment variables. The path is fixed for the lifetime of a CUDA graph capture.
+The runner selects a `ForwardPath` from batch size, weight format, available kernels, and env vars.
 
 ```
 Request arrives
     |
     v
-T == 1?  ----yes----> Check decode path env vars
-    |                      |
-    no                     v
-    |              FP8 weights? --yes--> Fp8Decode (cublasLt FP8 GEMMs)
-    |                      |
-    v                      no
-Batched path               |
-(cuBLAS/CUTLASS)     CUBLAS_DECODE=1? --yes--> CublasGemvDecode
-                           |
-                           no
-                           |
-                           v
-                     FusedDecode (default)
-                     Fused f16 GEMV kernels
+T == 1? ----yes----> Check explicit experimental env vars first
+    |                     |
+    no                    v
+    |              FP8 weights? --------yes--> Fp8Decode
+    |                     |
+    v                     no
+Batched path              |
+Hybrid/CUBLAS/CUTLASS     v
+                     CublasGemvDecode (default)
+                     Legacy FusedDecode only if forced
 ```
 
-### FusedDecode (default, T=1)
+## What Was Wrong Before
 
-The production N=1 decode path. Each layer runs fused GEMV kernels that combine normalization with matrix-vector products, eliminating intermediate memory traffic.
+Two things were out of date:
 
-Per-layer operation sequence:
+1. Batch-1 normal decode still defaulted to the older fused path.
+2. Batched execution had a conceptual "hybrid" policy, but the actual `GemmStrategy` could not encode it cleanly, so QKV routing was inconsistent.
+
+That meant the docs said one thing, the runner thought another thing, and the real per-op policy could still drift based on whether CUTLASS happened to be loaded.
+
+## Current Batch-1 Decode
+
+### CublasGemvDecode (default, `T=1`)
+
+This is now the normal batch-1 decode path.
+
+Per-layer shape:
 ```
-residual + RMSNorm + QKV GEMV  (1 kernel: add_rmsnorm_qkv_gemv)
-RoPE + KV cache write          (1 kernel: rope_cache_write)
-GQA Flash Attention Decode      (1 kernel: gqa_attention_decode)
-O-proj GEMV                     (1 kernel: o_proj_gemv)
-residual + RMSNorm + GateUp GEMV (1 kernel: add_rmsnorm_gateup_gemv)
-SiLU * Mul + Down GEMV         (1 kernel: silu_mul_down_gemv)
-```
-
-6 kernel launches per layer vs 10+ for unfused paths. The JIT compiler (`rvllm-fusion`) generates these kernels with shape-specialized tiling at model load time.
-
-**121 tok/s** on H100 with Qwen2.5-7B f16, 55% HBM bandwidth utilization.
-
-### CublasGemvDecode (T=1, `RVLLM_CUBLAS_DECODE=1`)
-
-Separate RMSNorm kernels followed by cuBLAS HGEMM calls. No fusion, but cuBLAS can sometimes pick better algorithms for specific shapes.
-
-Per-layer operation sequence:
-```
-RMSNorm                         (1 kernel)
-cuBLAS HGEMM: QKV projection    (1 cuBLAS call)
-RoPE + KV cache write           (1 kernel)
-Flash Attention Decode           (1 kernel)
-cuBLAS HGEMM: O-proj            (1 cuBLAS call)
-RMSNorm                         (1 kernel)
-cuBLAS HGEMM: gate_up           (1 cuBLAS call)
-SiLU * Mul                      (1 kernel)
-cuBLAS HGEMM: down              (1 cuBLAS call)
+RMSNorm
+cuBLAS / cublasLt QKV projection
+RoPE + KV cache write
+Flash attention decode
+cuBLAS / cublasLt O-proj
+RMSNorm
+cuBLAS / cublasLt gate_up
+SiLU * Mul
+cuBLAS / cublasLt down
 ```
 
-**118 tok/s** on H100, 84% HBM bandwidth utilization in standalone cuBLAS calls but slightly slower end-to-end due to extra kernel launch overhead.
+Latest verified number on H100 with Qwen2.5-7B f16:
+- **127.9 tok/s**
 
-### MegakernelDecode (T=1, experimental)
+This replaced the older default because it wins end-to-end on the real benchmark.
 
-All 28 transformer layers and the LM head packed into a single CUDA kernel launch, driven by an instruction tape.
+### FusedDecode (legacy, `RVLLM_CUBLAS_DECODE=0`)
 
-The instruction tape is a linear sequence of operations:
+The older fused f16 GEMV path is still present, but it is no longer the default batch-1 choice.
+
+Per-layer shape:
 ```
-[op: RMSNORM, layer: 0, src: hidden, dst: scratch0]
-[op: GEMV,    layer: 0, src: scratch0, dst: qkv, weight: q_proj]
-[op: ROPE,    layer: 0, src: qkv, dst: qkv]
-[op: ATTN,    layer: 0, src: qkv, dst: attn_out]
-...
-[op: GEMV,    layer: 27, src: scratch1, dst: hidden, weight: down_proj]
-[op: GEMV,    layer: -1, src: hidden, dst: logits, weight: lm_head]
+residual + RMSNorm + QKV GEMV
+RoPE + KV cache write
+attention decode
+O-proj GEMV
+residual + RMSNorm + GateUp GEMV
+SiLU * Mul + Down GEMV
 ```
 
-Key implementation details:
-- Double-buffered residuals to avoid read-after-write hazards across layers
-- Per-layer KV cache pointers embedded in the tape metadata
-- Incrementing sync counters (not barriers) for inter-warp coordination
-- Chunked gate/up splits to fit shared memory budgets
-- RoPE bias race avoidance via warp-level sequencing
+This remains useful as an explicit comparison path and as a base for kernel work, but not as the current default.
 
-**~50 tok/s** on H100. The single-launch approach eliminates all inter-kernel launch overhead but is limited by the inability to overlap computation with memory transfers across layers.
+### Megakernel / Persistent / FP8
 
-### PersistentDecode (T=1, experimental)
+- **MegakernelDecode**: experimental instruction-tape path, still around `~50 tok/s` on the measured H100 run.
+- **PersistentDecode / PersistentV3Decode**: experimental runner-level paths for custom decode kernels.
+- **Fp8Decode**: selected when FP8 weights are present.
 
-SM-DAG (Streaming Multiprocessor Directed Acyclic Graph) cooperative kernel. Each SM is assigned a portion of the layer computation, and SMs coordinate via global memory flags rather than kernel launch boundaries.
+## Current Batched Policy (`T >= 2`)
 
-Uses `cudaLaunchCooperativeKernel` for grid-level synchronization across all SMs.
+The important fix was making batched GEMM routing explicit.
 
-**~51 tok/s** on H100. Similar throughput to megakernel but with cleaner inter-SM communication patterns.
+### `GemmStrategy::Hybrid` (default when CUTLASS is available)
 
-### Fp8Decode (T=1, `RVLLM_FP8_WEIGHTS=1`)
+Hybrid now means exactly this:
 
-All projection GEMMs use FP8 E4M3 weights with cublasLt. Weight quantization happens once at startup. Halves weight memory bandwidth for M=1 GEMV, which is the bottleneck for single-sequence decode.
+- **QKV**: cuBLAS / cublasLt
+- **O-proj**: cuBLAS / cublasLt
+- **GateUp + SiLU**: CUTLASS
+- **Down-proj**: cuBLAS / cublasLt
 
-Does NOT improve batched throughput -- at M>=8, f16 tensor cores already saturate compute and the f16->fp8 cast adds overhead.
+This is the best current policy on the measured H100 Qwen2.5-7B run.
 
-### Batched (T>=2)
+Latest verified `output-len=128` numbers:
+- `N=32`: **4407.5 tok/s**
+- `N=64`: **7964.0 tok/s**
+- `N=128`: **13148.3 tok/s**
 
-Standard cuBLAS/CUTLASS path for prefill and batched decode. Uses autotuned cublasLt algorithm selection with 32 candidates benchmarked per GEMM shape at startup.
+### Explicit batched strategy override
 
-GEMM strategy dispatch:
-- **CUTLASS**: Fused epilogues (QKV+bias, O-proj+residual, GateUp+SiLU) when CUTLASS .so is available
-- **cuBLAS**: Separate kernel launches when CUTLASS is not available
-- **cublasLt for M<=32, cuBLAS for M>32**: Routing based on batch size
+Use:
+
+```bash
+RVLLM_BATCHED_GEMM_STRATEGY=cublas
+RVLLM_BATCHED_GEMM_STRATEGY=hybrid
+RVLLM_BATCHED_GEMM_STRATEGY=cutlass
+```
+
+The latest explicit H100 sweep showed:
+- `cublas`: slower than `hybrid`
+- `hybrid`: best current policy
+- `cutlass`: slower than `hybrid`
+
+### cublasLt routing
+
+Within the cuBLAS-backed ops, the runner still uses:
+- `cublasLt` for smaller `M`
+- cuBLAS for larger `M`
+
+Autotuned cublasLt algorithm selection still benchmarks 32 candidates per shape and caches results on disk.
+
+## Kernel Loader
 
 ## Kernel Loader
 
@@ -137,7 +149,7 @@ The `GraphRunner` (`rvllm-worker/src/graph_runner.rs`) pre-captures CUDA graphs 
 Batch sizes: 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, ...
 ```
 
-For batch sizes without an exact graph, the runner pads up to the next captured size and unpads the logits afterward. Graph capture includes the full layer stack: all GEMM calls, attention, sampling prep.
+For batch sizes without an exact graph, the runner pads up to the next captured size and unpads the logits afterward. Graph capture includes the full layer stack: GEMMs, attention, and sampling prep.
 
 ## Architecture Registration
 
