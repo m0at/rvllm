@@ -6,15 +6,18 @@
 //! - `batched.rs`: T>=1 batched decode / prefill path (cuBLAS/CUTLASS GEMMs)
 
 #[cfg(feature = "cuda")]
-mod decode;
-#[cfg(feature = "cuda")]
 mod batched;
+#[cfg(feature = "cuda")]
+mod decode;
 
 #[cfg(feature = "cuda")]
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{
+        CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice,
+        LaunchConfig, PushKernelArg,
+    };
     use half::f16;
     use tracing::info;
 
@@ -111,12 +114,18 @@ mod inner {
         /// T=1 decode: single cooperative kernel executes the entire transformer layer.
         /// Requires persistent_layer_decode cubin. Eliminates ~6 kernel launches per layer.
         PersistentDecode,
+        /// T=1 decode with the persistent_v2 runner-level path.
+        PersistentV2Decode,
+        /// T=1 decode with the persistent_v3 runner-level path.
+        PersistentV3Decode,
         /// T=1 decode with separate norm + cuBLAS GEMM (better BW than fused GEMV).
         /// Enable with RVLLM_CUBLAS_DECODE=1.
         CublasGemvDecode,
         /// All 28 layers + LM head in ONE kernel launch via interpreter.
         /// Enable with RVLLM_MEGAKERNEL=1.
         MegakernelDecode,
+        /// All 28 layers + LM head in ONE kernel launch via the v2 interpreter.
+        MegakernelV2Decode,
         /// T>=1 batched decode or prefill with cuBLAS/CUTLASS GEMMs.
         /// Always requires scratch buffers.
         Batched,
@@ -126,6 +135,8 @@ mod inner {
     /// Determined once at model load time based on CUTLASS .so availability.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum GemmStrategy {
+        /// cuBLAS/cublasLt for QKV, O-proj, and down-proj; CUTLASS only for gateup+silu.
+        Hybrid,
         /// CUTLASS FFI: fused oproj+residual, fused gateup+silu.
         Cutlass,
         /// cuBLAS (+ cublasLt for small M): separate kernels.
@@ -143,8 +154,16 @@ mod inner {
     }
 
     impl GpuTransformerLayer {
-        pub fn new(config: GpuLayerConfig, stream: Arc<CudaStream>, loader: Arc<KernelLoader>) -> Self {
-            Self { config, stream, loader }
+        pub fn new(
+            config: GpuLayerConfig,
+            stream: Arc<CudaStream>,
+            loader: Arc<KernelLoader>,
+        ) -> Self {
+            Self {
+                config,
+                stream,
+                loader,
+            }
         }
 
         /// Dispatch to the correct forward path based on `path` enum.
@@ -168,28 +187,64 @@ mod inner {
                     #[cfg(feature = "cublaslt")]
                     {
                         let lt = lt.expect("Fp8Decode requires cublasLt");
-                        Ok(Some(self.forward_fp8_decode(input, weights, blas, lt, prev_mlp_out)?))
+                        Ok(Some(self.forward_fp8_decode(
+                            input,
+                            weights,
+                            blas,
+                            lt,
+                            prev_mlp_out,
+                        )?))
                     }
                     #[cfg(not(feature = "cublaslt"))]
                     {
-                        Err(LLMError::GpuError("Fp8Decode requires cublaslt feature".into()))
+                        Err(LLMError::GpuError(
+                            "Fp8Decode requires cublaslt feature".into(),
+                        ))
                     }
                 }
-                ForwardPath::FusedDecode => {
-                    Ok(Some(self.forward_fused_decode(input, weights, blas, lt, prev_mlp_out)?))
-                }
-                ForwardPath::PersistentDecode => {
-                    Ok(Some(self.forward_persistent_decode(input, weights, prev_mlp_out)?))
-                }
-                ForwardPath::CublasGemvDecode => {
-                    Ok(Some(self.forward_cublas_decode(input, weights, blas, lt, prev_mlp_out)?))
-                }
-                ForwardPath::MegakernelDecode => {
-                    Err(LLMError::GpuError("MegakernelDecode is handled at the runner level, not per-layer".into()))
-                }
+                ForwardPath::FusedDecode => Ok(Some(self.forward_fused_decode(
+                    input,
+                    weights,
+                    blas,
+                    lt,
+                    prev_mlp_out,
+                )?)),
+                ForwardPath::PersistentDecode => Ok(Some(self.forward_persistent_decode(
+                    input,
+                    weights,
+                    prev_mlp_out,
+                )?)),
+                ForwardPath::PersistentV2Decode => Err(LLMError::GpuError(
+                    "PersistentV2Decode is handled at the runner level, not per-layer".into(),
+                )),
+                ForwardPath::PersistentV3Decode => Err(LLMError::GpuError(
+                    "PersistentV3Decode is handled at the runner level, not per-layer".into(),
+                )),
+                ForwardPath::CublasGemvDecode => Ok(Some(self.forward_cublas_decode(
+                    input,
+                    weights,
+                    blas,
+                    lt,
+                    prev_mlp_out,
+                )?)),
+                ForwardPath::MegakernelDecode => Err(LLMError::GpuError(
+                    "MegakernelDecode is handled at the runner level, not per-layer".into(),
+                )),
+                ForwardPath::MegakernelV2Decode => Err(LLMError::GpuError(
+                    "MegakernelV2Decode is handled at the runner level, not per-layer".into(),
+                )),
                 ForwardPath::Batched => {
                     let scratch = scratch.expect("Batched path requires scratch buffers");
-                    self.forward_batched(input, weights, blas, lt, prev_mlp_out, scratch, gemm_strategy, cutlass)?;
+                    self.forward_batched(
+                        input,
+                        weights,
+                        blas,
+                        lt,
+                        prev_mlp_out,
+                        scratch,
+                        gemm_strategy,
+                        cutlass,
+                    )?;
                     Ok(None)
                 }
             }
@@ -220,9 +275,13 @@ mod inner {
             };
             let kernel = loader.get_func("rms_norm_f16", "rms_norm_f16_kernel")?;
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(&mut output).arg(input).arg(weight)
-                    .arg(&eps).arg(&(hidden_size as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(input)
+                    .arg(weight)
+                    .arg(&eps)
+                    .arg(&(hidden_size as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("rms_norm_f16 launch: {e}")))?;
             }
@@ -248,9 +307,13 @@ mod inner {
             };
             let kernel = loader.get_func("rms_norm_f16", "rms_norm_f16_kernel")?;
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(output).arg(input).arg(weight)
-                    .arg(&eps).arg(&(hidden_size as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(output)
+                    .arg(input)
+                    .arg(weight)
+                    .arg(&eps)
+                    .arg(&(hidden_size as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("rms_norm_f16_into launch: {e}")))?;
             }
@@ -279,12 +342,20 @@ mod inner {
                 block_dim: (block_threads, 1, 1),
                 shared_mem_bytes: block_threads * std::mem::size_of::<f32>() as u32,
             };
-            let kernel = loader.get_func("fused_residual_rmsnorm_f16", "fused_residual_rmsnorm_f16_kernel")?;
+            let kernel = loader.get_func(
+                "fused_residual_rmsnorm_f16",
+                "fused_residual_rmsnorm_f16_kernel",
+            )?;
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(&mut output).arg(&mut residual)
-                    .arg(input).arg(add).arg(weight)
-                    .arg(&eps).arg(&(hidden_size as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(&mut residual)
+                    .arg(input)
+                    .arg(add)
+                    .arg(weight)
+                    .arg(&eps)
+                    .arg(&(hidden_size as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("fused_rn_f16 launch: {e}")))?;
             }
@@ -310,12 +381,20 @@ mod inner {
                 block_dim: (block_threads, 1, 1),
                 shared_mem_bytes: block_threads * std::mem::size_of::<f32>() as u32,
             };
-            let kernel = loader.get_func("fused_residual_rmsnorm_f16", "fused_residual_rmsnorm_f16_kernel")?;
+            let kernel = loader.get_func(
+                "fused_residual_rmsnorm_f16",
+                "fused_residual_rmsnorm_f16_kernel",
+            )?;
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(output).arg(residual)
-                    .arg(input).arg(add).arg(weight)
-                    .arg(&eps).arg(&(hidden_size as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(output)
+                    .arg(residual)
+                    .arg(input)
+                    .arg(add)
+                    .arg(weight)
+                    .arg(&eps)
+                    .arg(&(hidden_size as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("fused_rn_f16_into launch: {e}")))?;
             }
@@ -356,20 +435,29 @@ mod inner {
 
             #[cfg(feature = "cublaslt")]
             if let (Some(w_fp8), Some(lt_ops)) = (fp8_weight, lt) {
-                let cast_kernel = loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel")
-                    .map_err(|e| LLMError::GpuError(format!("Required cast_f16_to_fp8 kernel missing (FP8 weights present): {e}")))?;
+                let cast_kernel = loader
+                    .get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel")
+                    .map_err(|e| {
+                        LLMError::GpuError(format!(
+                            "Required cast_f16_to_fp8 kernel missing (FP8 weights present): {e}"
+                        ))
+                    })?;
                 let total_elems = m * k;
                 let mut fp8_input_buf = unsafe { stream.alloc::<u8>(total_elems) }
                     .map_err(|e| LLMError::GpuError(format!("fp8 input alloc: {e}")))?;
                 let cast_cfg = LaunchConfig {
                     grid_dim: (((total_elems + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1), shared_mem_bytes: 0,
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
                 };
                 let (fp8_in_ptr, _ig) = DevicePtrMut::device_ptr_mut(&mut fp8_input_buf, stream);
                 let (input_ptr, _ipg) = DevicePtr::device_ptr(input, stream);
                 unsafe {
-                    stream.launch_builder(&cast_kernel)
-                        .arg(&fp8_in_ptr).arg(&input_ptr).arg(&(total_elems as i32))
+                    stream
+                        .launch_builder(&cast_kernel)
+                        .arg(&fp8_in_ptr)
+                        .arg(&input_ptr)
+                        .arg(&(total_elems as i32))
                         .launch(cast_cfg)
                         .map_err(|e| LLMError::GpuError(format!("cast f16->fp8: {e}")))?;
                 }
@@ -381,16 +469,24 @@ mod inner {
             }
 
             if m == 1 {
-                let kernel = loader.get_func("gemv_f16", "gemv_f16_kernel")
-                    .map_err(|e| LLMError::GpuError(format!("Required gemv_f16 kernel missing for M=1: {e}")))?;
+                let kernel = loader
+                    .get_func("gemv_f16", "gemv_f16_kernel")
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("Required gemv_f16 kernel missing for M=1: {e}"))
+                    })?;
                 let cfg = LaunchConfig {
                     grid_dim: (n as u32, 1, 1),
-                    block_dim: (256, 1, 1), shared_mem_bytes: 0,
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
                 };
                 unsafe {
-                    stream.launch_builder(&kernel)
-                        .arg(&mut output).arg(weight).arg(input)
-                        .arg(&(n as i32)).arg(&(k as i32))
+                    stream
+                        .launch_builder(&kernel)
+                        .arg(&mut output)
+                        .arg(weight)
+                        .arg(input)
+                        .arg(&(n as i32))
+                        .arg(&(k as i32))
                         .launch(cfg)
                         .map_err(|e| LLMError::GpuError(format!("gemv_f16 launch: {e}")))?;
                 }
@@ -424,20 +520,29 @@ mod inner {
         ) -> Result<()> {
             #[cfg(feature = "cublaslt")]
             if let (Some(w_fp8), Some(lt_ops)) = (fp8_weight, lt) {
-                let cast_kernel = loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel")
-                    .map_err(|e| LLMError::GpuError(format!("Required cast_f16_to_fp8 kernel missing (FP8 weights present): {e}")))?;
+                let cast_kernel = loader
+                    .get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel")
+                    .map_err(|e| {
+                        LLMError::GpuError(format!(
+                            "Required cast_f16_to_fp8 kernel missing (FP8 weights present): {e}"
+                        ))
+                    })?;
                 let total_elems = m * k;
                 let mut fp8_input_buf = unsafe { stream.alloc::<u8>(total_elems) }
                     .map_err(|e| LLMError::GpuError(format!("fp8 input alloc: {e}")))?;
                 let cast_cfg = LaunchConfig {
                     grid_dim: (((total_elems + 255) / 256) as u32, 1, 1),
-                    block_dim: (256, 1, 1), shared_mem_bytes: 0,
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
                 };
                 let (fp8_in_ptr, _ig) = DevicePtrMut::device_ptr_mut(&mut fp8_input_buf, stream);
                 let (input_ptr, _ipg) = DevicePtr::device_ptr(input, stream);
                 unsafe {
-                    stream.launch_builder(&cast_kernel)
-                        .arg(&fp8_in_ptr).arg(&input_ptr).arg(&(total_elems as i32))
+                    stream
+                        .launch_builder(&cast_kernel)
+                        .arg(&fp8_in_ptr)
+                        .arg(&input_ptr)
+                        .arg(&(total_elems as i32))
                         .launch(cast_cfg)
                         .map_err(|e| LLMError::GpuError(format!("cast f16->fp8: {e}")))?;
                 }
@@ -494,8 +599,11 @@ mod inner {
                 shared_mem_bytes: 0,
             };
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(tensor).arg(bias).arg(&(dim as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(tensor)
+                    .arg(bias)
+                    .arg(&(dim as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("add_bias_f16 launch: {e}")))?;
             }
@@ -518,8 +626,11 @@ mod inner {
                 shared_mem_bytes: 0,
             };
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(tensor).arg(bias).arg(&(dim as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(tensor)
+                    .arg(bias)
+                    .arg(&(dim as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("add_bias_f16 launch: {e}")))?;
             }
@@ -540,7 +651,9 @@ mod inner {
             num_kv_heads: usize,
             head_dim: usize,
         ) -> Result<()> {
-            if num_tokens == 0 { return Ok(()); }
+            if num_tokens == 0 {
+                return Ok(());
+            }
             let kernel = loader.get_func("rotary_embedding_f16", "rotary_embedding_f16_kernel")?;
             let half_dim = head_dim / 2;
             let grid_y = num_heads.max(num_kv_heads) as u32;
@@ -550,11 +663,17 @@ mod inner {
                 shared_mem_bytes: 0,
             };
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(q).arg(k)
-                    .arg(rope_cos).arg(rope_sin).arg(positions)
-                    .arg(&(num_tokens as i32)).arg(&(num_heads as i32))
-                    .arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(q)
+                    .arg(k)
+                    .arg(rope_cos)
+                    .arg(rope_sin)
+                    .arg(positions)
+                    .arg(&(num_tokens as i32))
+                    .arg(&(num_heads as i32))
+                    .arg(&(num_kv_heads as i32))
+                    .arg(&(head_dim as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("rope_f16 launch: {e}")))?;
             }
@@ -575,7 +694,8 @@ mod inner {
             head_dim: usize,
         ) -> Result<()> {
             let kv_dim = num_kv_heads * head_dim;
-            let kernel = loader.get_func("reshape_and_cache_f16", "reshape_and_cache_f16io_kernel")?;
+            let kernel =
+                loader.get_func("reshape_and_cache_f16", "reshape_and_cache_f16io_kernel")?;
             let threads = kv_dim.min(1024) as u32;
             let cfg = LaunchConfig {
                 grid_dim: (num_tokens as u32, 1, 1),
@@ -583,10 +703,16 @@ mod inner {
                 shared_mem_bytes: 0,
             };
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(key_cache).arg(value_cache)
-                    .arg(k).arg(v).arg(slot_mapping)
-                    .arg(&(num_tokens as i32)).arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(key_cache)
+                    .arg(value_cache)
+                    .arg(k)
+                    .arg(v)
+                    .arg(slot_mapping)
+                    .arg(&(num_tokens as i32))
+                    .arg(&(num_kv_heads as i32))
+                    .arg(&(head_dim as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("cache_write_f16 launch: {e}")))?;
             }
@@ -606,22 +732,37 @@ mod inner {
             head_dim: usize,
             num_tokens: usize,
         ) -> Result<()> {
-            let fk = loader.get_func("fused_rope_cache", "fused_rope_cache_f16_kernel")
-                .map_err(|e| LLMError::GpuError(format!("Required fused_rope_cache kernel missing: {e}")))?;
+            let fk = loader
+                .get_func("fused_rope_cache", "fused_rope_cache_f16_kernel")
+                .map_err(|e| {
+                    LLMError::GpuError(format!("Required fused_rope_cache kernel missing: {e}"))
+                })?;
             let (mut q_part, mut kv_rest) = qkv.split_at_mut(q_dim);
             let (mut k_part, v_part) = kv_rest.split_at_mut(kv_dim);
             let v_view = v_part.slice(..kv_dim);
             let half_dim = head_dim / 2;
             let grid_y = num_heads.max(num_kv_heads) as u32;
             unsafe {
-                stream.launch_builder(&fk)
-                    .arg(&mut q_part).arg(&mut k_part).arg(&v_view)
-                    .arg(input.key_cache).arg(input.value_cache)
-                    .arg(input.rope_cos).arg(input.rope_sin)
-                    .arg(&input.positions).arg(&input.slot_mapping)
-                    .arg(&(num_tokens as i32)).arg(&(num_heads as i32))
-                    .arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
-                    .launch(LaunchConfig { grid_dim: (num_tokens as u32, grid_y, 1), block_dim: (half_dim.min(1024) as u32, 1, 1), shared_mem_bytes: 0 })
+                stream
+                    .launch_builder(&fk)
+                    .arg(&mut q_part)
+                    .arg(&mut k_part)
+                    .arg(&v_view)
+                    .arg(input.key_cache)
+                    .arg(input.value_cache)
+                    .arg(input.rope_cos)
+                    .arg(input.rope_sin)
+                    .arg(&input.positions)
+                    .arg(&input.slot_mapping)
+                    .arg(&(num_tokens as i32))
+                    .arg(&(num_heads as i32))
+                    .arg(&(num_kv_heads as i32))
+                    .arg(&(head_dim as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (num_tokens as u32, grid_y, 1),
+                        block_dim: (half_dim.min(1024) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
                     .map_err(|e| LLMError::GpuError(format!("fused rope+cache: {e}")))?;
             }
             Ok(())
@@ -646,7 +787,11 @@ mod inner {
             max_context_len: u32,
             block_size: usize,
         ) -> Result<CudaSlice<f16>> {
-            let kernel = loader.get_func("flash_attention_3_prefill", "flash_attention_3_prefill_f16io_kernel")
+            let kernel = loader
+                .get_func(
+                    "flash_attention_3_prefill",
+                    "flash_attention_3_prefill_f16io_kernel",
+                )
                 .map_err(|e| LLMError::GpuError(format!("load prefill f16io kernel: {e}")))?;
 
             let out_len = num_tokens * num_heads * head_dim;
@@ -657,11 +802,13 @@ mod inner {
             const FA3_BC: usize = 64;
             const FA3_THREADS: u32 = 256;
             let smem = FA3_BC * head_dim * std::mem::size_of::<u16>()
-                     + (FA3_BC + 8) * std::mem::size_of::<f32>();
+                + (FA3_BC + 8) * std::mem::size_of::<f32>();
             let shared_mem_bytes = smem as u32;
 
             if num_seqs == 0 {
-                return Err(LLMError::GpuError("prefill_attention_f16io: num_seqs == 0".into()));
+                return Err(LLMError::GpuError(
+                    "prefill_attention_f16io: num_seqs == 0".into(),
+                ));
             }
 
             let cfg = LaunchConfig {
@@ -680,14 +827,23 @@ mod inner {
             }
 
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(&mut output).arg(q)
-                    .arg(key_cache).arg(value_cache)
-                    .arg(block_tables).arg(context_lens).arg(seq_start_pos)
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(q)
+                    .arg(key_cache)
+                    .arg(value_cache)
+                    .arg(block_tables)
+                    .arg(context_lens)
+                    .arg(seq_start_pos)
                     .arg(&scale)
-                    .arg(&(num_heads as i32)).arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
-                    .arg(&(block_size as i32)).arg(&(max_context_len as i32))
-                    .arg(&max_blocks_per_seq).arg(&(num_tokens as i32))
+                    .arg(&(num_heads as i32))
+                    .arg(&(num_kv_heads as i32))
+                    .arg(&(head_dim as i32))
+                    .arg(&(block_size as i32))
+                    .arg(&(max_context_len as i32))
+                    .arg(&max_blocks_per_seq)
+                    .arg(&(num_tokens as i32))
                     .arg(&1i32) // causal
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("prefill FA3 f16io launch: {e}")))?;
@@ -720,12 +876,21 @@ mod inner {
             let p_head_dim = head_dim as i32;
             let p_block_size = block_size as i32;
             let p_max_blocks = (block_tables.len() / num_seqs.max(1)) as i32;
-            let heads_per_group = if num_kv_heads > 0 { num_heads / num_kv_heads } else { 1 };
+            let heads_per_group = if num_kv_heads > 0 {
+                num_heads / num_kv_heads
+            } else {
+                1
+            };
 
-            let num_splits: i32 = if max_context_len <= 512 { 1 }
-                else if max_context_len <= 2048 { 2 }
-                else if max_context_len <= 8192 { 4 }
-                else { 8 };
+            let num_splits: i32 = if max_context_len <= 512 {
+                1
+            } else if max_context_len <= 2048 {
+                2
+            } else if max_context_len <= 8192 {
+                4
+            } else {
+                8
+            };
 
             // v3 GQA kernel
             if num_heads != num_kv_heads && heads_per_group <= 8 && head_dim % 8 == 0 {
@@ -737,8 +902,8 @@ mod inner {
 
                 // Double-buffered: 2x KV tile buffers (K + V)
                 let smem = 2 * V3_BC * head_dim * std::mem::size_of::<u16>()
-                         + V3_MAX_HPG * V3_SCORE_STRIDE * std::mem::size_of::<f32>()
-                         + 8 * std::mem::size_of::<f32>();
+                    + V3_MAX_HPG * V3_SCORE_STRIDE * std::mem::size_of::<f32>()
+                    + 8 * std::mem::size_of::<f32>();
                 let shared_mem_bytes = smem as u32;
                 let p_max_context = max_context_len as i32;
 
@@ -749,11 +914,32 @@ mod inner {
                     ).map_err(|e| LLMError::GpuError(format!("v3 GQA set smem: {e}")))?;
                 }
 
-                return Self::launch_v3_attention(stream, loader, &v3_gqa,
-                    q, key_cache, value_cache, block_tables, context_lens,
-                    scale, p_num_heads, p_num_kv_heads, p_head_dim, p_block_size,
-                    p_max_context, p_max_blocks, num_splits, num_seqs, num_heads,
-                    num_kv_heads, head_dim, out_len, shared_mem_bytes, V3_THREADS, true);
+                return Self::launch_v3_attention(
+                    stream,
+                    loader,
+                    &v3_gqa,
+                    q,
+                    key_cache,
+                    value_cache,
+                    block_tables,
+                    context_lens,
+                    scale,
+                    p_num_heads,
+                    p_num_kv_heads,
+                    p_head_dim,
+                    p_block_size,
+                    p_max_context,
+                    p_max_blocks,
+                    num_splits,
+                    num_seqs,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    out_len,
+                    shared_mem_bytes,
+                    V3_THREADS,
+                    true,
+                );
             }
 
             // v3 non-GQA kernel (MHA)
@@ -763,7 +949,7 @@ mod inner {
                 const V3_THREADS: u32 = 256;
                 // Double-buffered: 2x KV tile buffers (K + V)
                 let smem = 2 * V3_BC * head_dim * std::mem::size_of::<u16>()
-                         + (V3_BC + 8) * std::mem::size_of::<f32>();
+                    + (V3_BC + 8) * std::mem::size_of::<f32>();
                 let shared_mem_bytes = smem as u32;
 
                 if shared_mem_bytes > 49152 {
@@ -773,11 +959,32 @@ mod inner {
                     ).map_err(|e| LLMError::GpuError(format!("v3 set smem: {e}")))?;
                 }
 
-                return Self::launch_v3_attention(stream, loader, &v3_kernel,
-                    q, key_cache, value_cache, block_tables, context_lens,
-                    scale, p_num_heads, p_num_kv_heads, p_head_dim, p_block_size,
-                    max_context_len as i32, p_max_blocks, num_splits, num_seqs, num_heads,
-                    num_kv_heads, head_dim, out_len, shared_mem_bytes, V3_THREADS, false);
+                return Self::launch_v3_attention(
+                    stream,
+                    loader,
+                    &v3_kernel,
+                    q,
+                    key_cache,
+                    value_cache,
+                    block_tables,
+                    context_lens,
+                    scale,
+                    p_num_heads,
+                    p_num_kv_heads,
+                    p_head_dim,
+                    p_block_size,
+                    max_context_len as i32,
+                    p_max_blocks,
+                    num_splits,
+                    num_seqs,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    out_len,
+                    shared_mem_bytes,
+                    V3_THREADS,
+                    false,
+                );
             }
 
             Err(LLMError::GpuError(format!(
@@ -827,13 +1034,25 @@ mod inner {
                     shared_mem_bytes,
                 };
                 unsafe {
-                    stream.launch_builder(kernel)
-                        .arg(&mut output).arg(&dummy).arg(&dummy).arg(&dummy)
-                        .arg(q).arg(key_cache).arg(value_cache)
-                        .arg(block_tables).arg(context_lens)
-                        .arg(&scale).arg(&p_num_heads).arg(&p_num_kv_heads)
-                        .arg(&p_head_dim).arg(&p_block_size)
-                        .arg(&p_max_context).arg(&p_max_blocks).arg(&num_splits)
+                    stream
+                        .launch_builder(kernel)
+                        .arg(&mut output)
+                        .arg(&dummy)
+                        .arg(&dummy)
+                        .arg(&dummy)
+                        .arg(q)
+                        .arg(key_cache)
+                        .arg(value_cache)
+                        .arg(block_tables)
+                        .arg(context_lens)
+                        .arg(&scale)
+                        .arg(&p_num_heads)
+                        .arg(&p_num_kv_heads)
+                        .arg(&p_head_dim)
+                        .arg(&p_block_size)
+                        .arg(&p_max_context)
+                        .arg(&p_max_blocks)
+                        .arg(&num_splits)
                         .launch(cfg)
                         .map_err(|e| LLMError::GpuError(format!("v3 decode: {e}")))?;
                 }
@@ -855,25 +1074,45 @@ mod inner {
                 shared_mem_bytes,
             };
             unsafe {
-                stream.launch_builder(kernel)
-                    .arg(&mut output).arg(&mut p_out).arg(&mut p_max).arg(&mut p_sum)
-                    .arg(q).arg(key_cache).arg(value_cache)
-                    .arg(block_tables).arg(context_lens)
-                    .arg(&scale).arg(&p_num_heads).arg(&p_num_kv_heads)
-                    .arg(&p_head_dim).arg(&p_block_size)
-                    .arg(&p_max_context).arg(&p_max_blocks).arg(&num_splits)
+                stream
+                    .launch_builder(kernel)
+                    .arg(&mut output)
+                    .arg(&mut p_out)
+                    .arg(&mut p_max)
+                    .arg(&mut p_sum)
+                    .arg(q)
+                    .arg(key_cache)
+                    .arg(value_cache)
+                    .arg(block_tables)
+                    .arg(context_lens)
+                    .arg(&scale)
+                    .arg(&p_num_heads)
+                    .arg(&p_num_kv_heads)
+                    .arg(&p_head_dim)
+                    .arg(&p_block_size)
+                    .arg(&p_max_context)
+                    .arg(&p_max_blocks)
+                    .arg(&num_splits)
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("v3 decode: {e}")))?;
             }
 
-            let combine = loader.get_func("flash_attention_3_v3", "fa3_v3_combine_f16_kernel")
+            let combine = loader
+                .get_func("flash_attention_3_v3", "fa3_v3_combine_f16_kernel")
                 .map_err(|e| LLMError::GpuError(format!("v3 combine missing: {e}")))?;
             let p_num_seqs = num_seqs as i32;
             unsafe {
-                stream.launch_builder(&combine)
-                    .arg(&mut output).arg(&p_out).arg(&p_max).arg(&p_sum)
+                stream
+                    .launch_builder(&combine)
+                    .arg(&mut output)
+                    .arg(&p_out)
+                    .arg(&p_max)
+                    .arg(&p_sum)
                     .arg(context_lens)
-                    .arg(&p_num_seqs).arg(&p_num_heads).arg(&p_head_dim).arg(&num_splits)
+                    .arg(&p_num_seqs)
+                    .arg(&p_num_heads)
+                    .arg(&p_head_dim)
+                    .arg(&num_splits)
                     .launch(LaunchConfig {
                         grid_dim: (num_seqs as u32, num_heads as u32, 1),
                         block_dim: (head_dim as u32, 1, 1),
@@ -905,11 +1144,16 @@ mod inner {
             };
             let kernel = loader.get_func("activation_f16", "fused_silu_mul_f16_kernel")?;
             unsafe {
-                stream.launch_builder(&kernel)
-                    .arg(&mut output).arg(&gate_view).arg(&up_view)
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(&gate_view)
+                    .arg(&up_view)
                     .arg(&(n as i32))
                     .launch(cfg)
-                    .map_err(|e| LLMError::GpuError(format!("fused_silu_mul_f16_split launch: {e}")))?;
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("fused_silu_mul_f16_split launch: {e}"))
+                    })?;
             }
             Ok(output)
         }

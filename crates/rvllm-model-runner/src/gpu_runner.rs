@@ -341,14 +341,47 @@ mod cuda_impl {
                     }
                 }
                 if loaded.is_none() {
-                    info!("CUTLASS .so not found, using cuBLAS for all GEMMs");
+                    info!("CUTLASS .so not found");
                 } else {
-                    info!(
-                        "Using Hybrid strategy: cuBLAS for GEMMs, CUTLASS for gateup+silu fusion"
-                    );
+                    info!("CUTLASS kernels loaded");
                 }
                 loaded
             };
+
+            let gemm_strategy = match std::env::var("RVLLM_BATCHED_GEMM_STRATEGY").ok().as_deref() {
+                Some("cublas") => GemmStrategy::Cublas,
+                Some("cutlass") if cutlass.is_some() => GemmStrategy::Cutlass,
+                Some("cutlass") => {
+                    info!(
+                        "RVLLM_BATCHED_GEMM_STRATEGY=cutlass requested but CUTLASS is unavailable"
+                    );
+                    GemmStrategy::Cublas
+                }
+                Some("hybrid") | None => {
+                    if cutlass.is_some() {
+                        GemmStrategy::Hybrid
+                    } else {
+                        GemmStrategy::Cublas
+                    }
+                }
+                Some(other) => {
+                    info!(
+                        value = other,
+                        "unknown RVLLM_BATCHED_GEMM_STRATEGY, defaulting"
+                    );
+                    if cutlass.is_some() {
+                        GemmStrategy::Hybrid
+                    } else {
+                        GemmStrategy::Cublas
+                    }
+                }
+            };
+
+            match gemm_strategy {
+                GemmStrategy::Hybrid => info!("Using batched GEMM policy: cuBLAS/cublasLt for QKV/O-proj/down, CUTLASS for gateup+silu"),
+                GemmStrategy::Cutlass => info!("Using batched GEMM policy: CUTLASS for QKV/O-proj/gateup, cuBLAS/cublasLt for down"),
+                GemmStrategy::Cublas => info!("Using batched GEMM policy: cuBLAS/cublasLt for all batched GEMMs"),
+            }
 
             // Load persistent_v2 cubins (cooperative TC GEMV + split-KV kernels).
             let persistent_v2 = {
@@ -379,11 +412,7 @@ mod cuda_impl {
                 config,
                 device,
                 stream,
-                gemm_strategy: if cutlass.is_some() {
-                    GemmStrategy::Hybrid
-                } else {
-                    GemmStrategy::Cublas
-                },
+                gemm_strategy,
                 cutlass,
                 persistent_v2,
                 layers,
