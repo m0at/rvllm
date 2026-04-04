@@ -33,6 +33,7 @@ struct NeoXConfig {
     intermediate_size: usize,
     vocab_size: usize,
     layer_norm_eps: f32,
+    rope_theta: f32,
     use_parallel_residual: bool,
 }
 
@@ -85,7 +86,8 @@ impl GPTNeoXForCausalLM {
             head_dim: config.head_dim,
             intermediate_size: config.intermediate_size,
             vocab_size: config.vocab_size,
-            layer_norm_eps: 1e-5,
+            layer_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
             use_parallel_residual: true,
         };
 
@@ -215,7 +217,7 @@ impl Architecture for GPTNeoXForCausalLM {
             // RoPE on full head_dim (non-interleaved -- same RotaryEmbedding,
             // GPT-NeoX applies rotation to the entire head dimension).
             let (q_rot, k_rot) =
-                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
+                RotaryEmbedding::forward_with_base(&input.position_ids, &q, &k, self.config.head_dim, self.config.rope_theta)?;
 
             // Attention.
             let attn_out =
@@ -303,7 +305,8 @@ impl StableLmForCausalLM {
             head_dim: config.head_dim,
             intermediate_size: config.intermediate_size,
             vocab_size: config.vocab_size,
-            layer_norm_eps: 1e-5,
+            layer_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
             use_parallel_residual: true,
         };
 
@@ -427,7 +430,7 @@ impl Architecture for StableLmForCausalLM {
             let v = LinearLayer::forward(&normed_attn, &layer.v_proj, layer.v_bias.as_ref())?;
 
             let (q_rot, k_rot) =
-                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
+                RotaryEmbedding::forward_with_base(&input.position_ids, &q, &k, self.config.head_dim, self.config.rope_theta)?;
 
             let attn_out =
                 attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;

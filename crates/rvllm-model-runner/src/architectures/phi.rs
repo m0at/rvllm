@@ -48,6 +48,8 @@ struct PhiConfig {
     rotary_dim: usize,
     /// Norm epsilon.
     norm_eps: f32,
+    /// RoPE base frequency.
+    rope_theta: f32,
     #[allow(dead_code)]
     variant: PhiVariant,
 }
@@ -143,6 +145,7 @@ impl PhiForCausalLM {
             partial_rotary_factor,
             rotary_dim,
             norm_eps,
+            rope_theta: config.rope_theta,
             variant,
         };
 
@@ -384,6 +387,7 @@ impl PhiForCausalLM {
             &k,
             self.config.head_dim,
             self.config.rotary_dim,
+            self.config.rope_theta,
         )?;
 
         let attn_out =
@@ -431,6 +435,7 @@ impl PhiForCausalLM {
             &k,
             self.config.head_dim,
             self.config.rotary_dim,
+            self.config.rope_theta,
         )?;
 
         let attn_out =
@@ -463,10 +468,11 @@ fn partial_rotary_forward(
     key: &GpuBuffer<f16>,
     head_dim: usize,
     rotary_dim: usize,
+    rope_theta: f32,
 ) -> Result<(GpuBuffer<f16>, GpuBuffer<f16>)> {
     if rotary_dim == head_dim {
         // Full rotation, use standard RoPE.
-        return RotaryEmbedding::forward(positions, query, key, head_dim);
+        return RotaryEmbedding::forward_with_base(positions, query, key, head_dim, rope_theta);
     }
 
     let num_tokens = positions.len();
@@ -503,7 +509,7 @@ fn partial_rotary_forward(
     let q_rot_buf = GpuBuffer::from_vec(q_rot_part, vec![num_tokens, num_q_heads * rotary_dim]);
     let k_rot_buf = GpuBuffer::from_vec(k_rot_part, vec![num_tokens, num_k_heads * rotary_dim]);
     let (q_rotated, k_rotated) =
-        RotaryEmbedding::forward(positions, &q_rot_buf, &k_rot_buf, rotary_dim)?;
+        RotaryEmbedding::forward_with_base(positions, &q_rot_buf, &k_rot_buf, rotary_dim, rope_theta)?;
 
     // Reassemble: interleave rotary and pass-through per head.
     let pass_dim = head_dim - rotary_dim;
@@ -589,7 +595,7 @@ mod tests {
         let vals: Vec<f16> = (1..=8).map(|i| f16::from_f32(i as f32)).collect();
         let q = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
         let k = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
-        let (qr, kr) = partial_rotary_forward(&[0], &q, &k, head_dim, rotary_dim).unwrap();
+        let (qr, kr) = partial_rotary_forward(&[0], &q, &k, head_dim, rotary_dim, 10000.0).unwrap();
         // All values should be unchanged at position 0.
         for i in 0..head_dim {
             assert!(
@@ -617,7 +623,7 @@ mod tests {
         let vals: Vec<f16> = (1..=8).map(|i| f16::from_f32(i as f32)).collect();
         let q = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
         let k = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
-        let (qr, kr) = partial_rotary_forward(&[50], &q, &k, head_dim, rotary_dim).unwrap();
+        let (qr, kr) = partial_rotary_forward(&[50], &q, &k, head_dim, rotary_dim, 10000.0).unwrap();
         // Pass-through dims (indices 4..8) should be unchanged.
         for i in rotary_dim..head_dim {
             assert!(
@@ -652,7 +658,7 @@ mod tests {
         let q = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
         let k = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
         let (qr_partial, kr_partial) =
-            partial_rotary_forward(&[10], &q, &k, head_dim, head_dim).unwrap();
+            partial_rotary_forward(&[10], &q, &k, head_dim, head_dim, 10000.0).unwrap();
         let (qr_standard, kr_standard) = RotaryEmbedding::forward(&[10], &q, &k, head_dim).unwrap();
         for i in 0..head_dim {
             assert!((qr_partial.data[i].to_f32() - qr_standard.data[i].to_f32()).abs() < 0.01,);

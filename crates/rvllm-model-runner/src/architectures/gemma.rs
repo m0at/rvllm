@@ -178,6 +178,7 @@ pub struct GemmaForCausalLM {
     head_dim: usize,
     vocab_size: usize,
     rms_norm_eps: f32,
+    rope_theta: f32,
     embed_tokens: GpuBuffer<f16>,
     layers: Vec<GemmaLayer>,
     norm_weight: GpuBuffer<f16>,
@@ -269,7 +270,8 @@ impl GemmaForCausalLM {
             hidden_size: config.hidden_size,
             head_dim: config.head_dim,
             vocab_size: config.vocab_size,
-            rms_norm_eps: 1e-6,
+            rms_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
             embed_tokens,
             layers,
             norm_weight,
@@ -301,7 +303,7 @@ impl Architecture for GemmaForCausalLM {
             let v = LinearLayer::forward(&normed, &layer.v_proj, None)?;
 
             let (q_rot, k_rot) =
-                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.head_dim)?;
+                RotaryEmbedding::forward_with_base(&input.position_ids, &q, &k, self.head_dim, self.rope_theta)?;
 
             let attn_out =
                 attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
@@ -341,6 +343,7 @@ pub struct Gemma2ForCausalLM {
     head_dim: usize,
     vocab_size: usize,
     rms_norm_eps: f32,
+    rope_theta: f32,
     /// Soft cap applied as cap * tanh(logits / cap). 0.0 means disabled.
     attn_logit_softcap: f32,
     /// Final logit soft-cap before sampling. 0.0 means disabled.
@@ -450,7 +453,8 @@ impl Gemma2ForCausalLM {
             hidden_size: config.hidden_size,
             head_dim: config.head_dim,
             vocab_size: config.vocab_size,
-            rms_norm_eps: 1e-6,
+            rms_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
             attn_logit_softcap: 50.0,
             final_logit_softcap: 30.0,
             sliding_window: 4096,
@@ -484,7 +488,7 @@ impl Architecture for Gemma2ForCausalLM {
             let v = LinearLayer::forward(&normed, &layer.v_proj, None)?;
 
             let (q_rot, k_rot) =
-                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.head_dim)?;
+                RotaryEmbedding::forward_with_base(&input.position_ids, &q, &k, self.head_dim, self.rope_theta)?;
 
             // Attention (sliding window on even layers, global on odd).
             let _use_sliding = self.sliding_window > 0 && layer_idx % 2 == 0;

@@ -22,6 +22,7 @@ pub struct Qwen2ForCausalLM {
     head_dim: usize,
     vocab_size: usize,
     rms_norm_eps: f32,
+    rope_theta: f32,
     embed_tokens: GpuBuffer<f16>,
     layers: Vec<Qwen2Layer>,
     norm_weight: GpuBuffer<f16>,
@@ -125,7 +126,8 @@ impl Qwen2ForCausalLM {
             hidden_size: config.hidden_size,
             head_dim: config.head_dim,
             vocab_size: config.vocab_size,
-            rms_norm_eps: 1e-6, // Qwen2 uses 1e-6 by default.
+            rms_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
             embed_tokens,
             layers,
             norm_weight,
@@ -154,8 +156,9 @@ impl Architecture for Qwen2ForCausalLM {
             let k = LinearLayer::forward(&normed, &layer.k_proj, layer.k_bias.as_ref())?;
             let v = LinearLayer::forward(&normed, &layer.v_proj, layer.v_bias.as_ref())?;
 
-            let (q_rot, k_rot) =
-                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.head_dim)?;
+            let (q_rot, k_rot) = RotaryEmbedding::forward_with_base(
+                &input.position_ids, &q, &k, self.head_dim, self.rope_theta,
+            )?;
 
             let attn_out =
                 attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
