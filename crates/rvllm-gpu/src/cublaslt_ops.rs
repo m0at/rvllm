@@ -257,7 +257,11 @@ impl CublasLtOps {
                     lt_sys::cu_stream_to_cuda_stream(cu_stream),
                 );
                 if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                    return Err(LLMError::GpuError(format!("hgemm_a_bt_into (autotuned) matmul: {s:?}")));
+                    return Err(LLMError::GpuError(format!(
+                        "AUTOTUNED cublasLt GEMM FAILED: status={s:?} shape=({m},{n},{k}). \
+                         The cached algorithm does not support this configuration. \
+                         Delete ~/.cache/rvllm/autotune.json and re-run to retune."
+                    )));
                 }
             }
             return Ok(());

@@ -725,6 +725,11 @@ impl GpuWorker {
                 continue;
             }
             if let Err(e) = runner.forward_gpu_only(n, n, 1, false) {
+                let msg = format!("{e}");
+                if msg.contains("AUTOTUNED") || msg.contains("NOT_SUPPORTED") {
+                    tracing::error!(n, "FATAL: {msg}");
+                    return Err(e);
+                }
                 warn!(n, "precapture warmup forward failed: {e}");
                 skipped += 1;
                 continue;
