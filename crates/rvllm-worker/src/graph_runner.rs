@@ -76,8 +76,8 @@ impl GraphRunner {
         if !self.config.enabled || !self.pool.is_enabled() {
             return false;
         }
-        // Only decode steps (not prefill)
-        if input.is_prefill {
+        // Only single-token decode steps are graphable.
+        if input.is_prefill || input.attention_metadata.query_lens.iter().any(|&q| q != 1) {
             return false;
         }
         let batch_size = input.num_tokens();
@@ -334,6 +334,15 @@ mod tests {
     }
 
     #[test]
+    fn can_use_graph_rejects_multi_token_decode_shapes() {
+        let runner = GraphRunner::new(GraphRunnerConfig::default());
+        let mut decode = make_decode_input(4);
+        decode.attention_metadata.query_lens[0] = 2;
+
+        assert!(!runner.can_use_graph(&decode));
+    }
+
+    #[test]
     fn can_use_graph_disabled() {
         let mut runner = GraphRunner::new(GraphRunnerConfig::default());
         runner.disable();
@@ -363,6 +372,19 @@ mod tests {
         assert_eq!(padded.num_tokens(), 4); // rounded up to 4
         assert_eq!(padded.token_ids[..3], vec![42, 42, 42]);
         assert_eq!(padded.token_ids[3], 0); // padding token
+    }
+
+    #[test]
+    fn pad_input_uses_skip_sentinels_for_padding() {
+        let runner = GraphRunner::new(GraphRunnerConfig::default());
+        let input = make_decode_input(3);
+        let (padded, _) = runner.pad_input(&input).unwrap();
+
+        assert_eq!(padded.attention_metadata.slot_mapping[3], u32::MAX);
+        assert_eq!(padded.attention_metadata.context_lens[3], 0);
+        assert_eq!(padded.attention_metadata.query_lens[3], 1);
+        assert_eq!(padded.attention_metadata.block_tables[3], vec![0]);
+        assert_eq!(padded.position_ids[3], 0);
     }
 
     #[test]
