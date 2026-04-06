@@ -401,7 +401,7 @@ mod inner {
             Ok(())
         }
 
-        /// hgemm dispatch: GEMV for M=1, cublasLt for small M, cuBLAS for large M.
+        /// hgemm dispatch: cublasLt for small/mid M, cuBLAS for larger M.
         pub(crate) fn hgemm_dispatch(
             stream: &Arc<CudaStream>,
             blas: &CublasHandle,
@@ -465,31 +465,6 @@ mod inner {
                 let (out_ptr, _og) = DevicePtrMut::device_ptr_mut(&mut output, stream);
                 lt_ops.fp8_gemm_a_bt_raw(m, n, k, fp8_in_ptr, w_ptr, out_ptr)?;
                 drop((_wg, _og));
-                return Ok(output);
-            }
-
-            if m == 1 {
-                let kernel = loader
-                    .get_func("gemv_f16", "gemv_f16_kernel")
-                    .map_err(|e| {
-                        LLMError::GpuError(format!("Required gemv_f16 kernel missing for M=1: {e}"))
-                    })?;
-                let cfg = LaunchConfig {
-                    grid_dim: (n as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                unsafe {
-                    stream
-                        .launch_builder(&kernel)
-                        .arg(&mut output)
-                        .arg(weight)
-                        .arg(input)
-                        .arg(&(n as i32))
-                        .arg(&(k as i32))
-                        .launch(cfg)
-                        .map_err(|e| LLMError::GpuError(format!("gemv_f16 launch: {e}")))?;
-                }
                 return Ok(output);
             }
 
