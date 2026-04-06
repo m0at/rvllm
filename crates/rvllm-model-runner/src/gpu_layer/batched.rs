@@ -312,8 +312,13 @@ impl GpuTransformerLayer {
             let n = gate_up_dim as i32;
             let k = hidden as i32;
             let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
-            let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
-                .map_err(|e| LLMError::GpuError(format!("cutlass gateup ws alloc: {e}")))?;
+            if scratch.gateup_ws.len() < ws_bytes.max(1) {
+                return Err(LLMError::GpuError(format!(
+                    "cutlass gateup workspace too small: need {} bytes, have {}",
+                    ws_bytes.max(1),
+                    scratch.gateup_ws.len()
+                )));
+            }
             let out_ptr = {
                 let (p, _g) = DevicePtrMut::device_ptr_mut(&mut *scratch.silu_out, &self.stream);
                 p
@@ -324,6 +329,7 @@ impl GpuTransformerLayer {
             };
             let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
             let ws_ptr = {
+                let mut ws = scratch.gateup_ws.slice_mut(..ws_bytes.max(1));
                 let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
                 p
             };

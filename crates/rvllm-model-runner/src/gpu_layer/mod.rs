@@ -94,6 +94,7 @@ mod inner {
         pub attn_out: &'a mut CudaSlice<f16>,
         pub o_proj: &'a mut CudaSlice<f16>,
         pub gate_up: &'a mut CudaSlice<f16>,
+        pub gateup_ws: &'a mut CudaSlice<u8>,
         pub silu_out: &'a mut CudaSlice<f16>,
         pub down: &'a mut CudaSlice<f16>,
     }

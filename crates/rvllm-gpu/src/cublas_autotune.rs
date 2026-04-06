@@ -385,10 +385,11 @@ impl CublasAutotuner {
         gate_up_dim: usize,
         gpu_name: &str,
     ) -> Result<Self> {
-        // Cap at M=32 to avoid OOM during autotuning (large gate_up shapes
-        // at M=128 need ~300MB per benchmark buffer). Model load happens after
-        // autotuning, so we can't use all VRAM.
-        let m_values: &[usize] = &[1, 2, 4, 8, 16, 32];
+        // Include the real high-throughput decode buckets. The largest batched
+        // gate-up shape still fits comfortably on 80 GB H100s, and these are
+        // exactly the shapes where heuristic-only cublasLt selection leaves
+        // measurable throughput on the floor.
+        let m_values: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128];
         let nk_shapes: &[(usize, usize)] = &[
             (qkv_dim, hidden),        // QKV projection
             (hidden, q_dim),           // O-proj

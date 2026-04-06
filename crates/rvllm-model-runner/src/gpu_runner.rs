@@ -105,6 +105,7 @@ mod cuda_impl {
         pub o_proj: CudaSlice<f16>,   // [max_tokens * hidden]
         pub normed: CudaSlice<f16>,   // [max_tokens * hidden]
         pub gate_up: CudaSlice<f16>,  // [max_tokens * intermediate * 2]
+        pub gateup_ws: CudaSlice<u8>, // CUTLASS gateup workspace
         pub silu_out: CudaSlice<f16>, // [max_tokens * intermediate]
         // Double-buffered: layer N writes to pair A, reads from pair B.
         // Layer N+1 writes to pair B, reads from pair A. Zero alloc, zero copy.
@@ -357,23 +358,20 @@ mod cuda_impl {
                     );
                     GemmStrategy::Cublas
                 }
-                Some("hybrid") | None => {
-                    if cutlass.is_some() {
-                        GemmStrategy::Hybrid
-                    } else {
-                        GemmStrategy::Cublas
-                    }
+                Some("hybrid") if cutlass.is_some() => GemmStrategy::Hybrid,
+                Some("hybrid") => {
+                    info!(
+                        "RVLLM_BATCHED_GEMM_STRATEGY=hybrid requested but CUTLASS is unavailable"
+                    );
+                    GemmStrategy::Cublas
                 }
+                None => GemmStrategy::Cublas,
                 Some(other) => {
                     info!(
                         value = other,
                         "unknown RVLLM_BATCHED_GEMM_STRATEGY, defaulting"
                     );
-                    if cutlass.is_some() {
-                        GemmStrategy::Hybrid
-                    } else {
-                        GemmStrategy::Cublas
-                    }
+                    GemmStrategy::Cublas
                 }
             };
 
@@ -717,6 +715,18 @@ mod cuda_impl {
                 unsafe { self.stream.alloc::<f16>(n) }
                     .map_err(|e| LLMError::GpuError(format!("f16 scratch alloc ({n} elems): {e}")))
             };
+            let alloc_u8 = |n: usize| -> Result<CudaSlice<u8>> {
+                unsafe { self.stream.alloc::<u8>(n.max(1)) }
+                    .map_err(|e| LLMError::GpuError(format!("u8 scratch alloc ({n} elems): {e}")))
+            };
+            let gateup_ws_bytes = self.cutlass.as_ref().map_or(1usize, |ck| {
+                ck.gateup_silu_workspace_size(
+                    max_tokens as i32,
+                    (intermediate * 2) as i32,
+                    hidden as i32,
+                )
+                .max(1)
+            });
 
             let scratch = F16LayerScratch {
                 max_tokens,
@@ -725,6 +735,7 @@ mod cuda_impl {
                 o_proj: alloc(max_tokens * hidden)?,
                 normed: alloc(max_tokens * hidden)?,
                 gate_up: alloc(max_tokens * intermediate * 2)?,
+                gateup_ws: alloc_u8(gateup_ws_bytes)?,
                 silu_out: alloc(max_tokens * intermediate)?,
                 residual_a: alloc(max_tokens * hidden)?,
                 down_a: alloc(max_tokens * hidden)?,
@@ -1009,6 +1020,7 @@ mod cuda_impl {
                             attn_out: &mut s.attn_out,
                             o_proj: &mut s.o_proj,
                             gate_up: &mut s.gate_up,
+                            gateup_ws: &mut s.gateup_ws,
                             silu_out: &mut s.silu_out,
                             down: write_down,
                         }),
@@ -1317,6 +1329,7 @@ mod cuda_impl {
                                 attn_out: &mut s.attn_out,
                                 o_proj: &mut s.o_proj,
                                 gate_up: &mut s.gate_up,
+                                gateup_ws: &mut s.gateup_ws,
                                 silu_out: &mut s.silu_out,
                                 down: write_down,
                             }),
@@ -1648,6 +1661,7 @@ mod cuda_impl {
                                 attn_out: &mut s.attn_out,
                                 o_proj: &mut s.o_proj,
                                 gate_up: &mut s.gate_up,
+                                gateup_ws: &mut s.gateup_ws,
                                 silu_out: &mut s.silu_out,
                                 down: write_down,
                             }),
@@ -2014,6 +2028,7 @@ mod cuda_impl {
                                 attn_out: &mut s.attn_out,
                                 o_proj: &mut s.o_proj,
                                 gate_up: &mut s.gate_up,
+                                gateup_ws: &mut s.gateup_ws,
                                 silu_out: &mut s.silu_out,
                                 down: write_down,
                             }),

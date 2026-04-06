@@ -19,8 +19,12 @@ use crate::{LLMError, Result};
 /// has less overhead for larger prefill shapes.
 pub const CUBLASLT_M_THRESHOLD: usize = 128;
 
-/// 4 MiB workspace for split-K heuristics in cublasLt.
-const FP8_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
+/// Runtime cublasLt workspace.
+///
+/// Keep this aligned with the autotuner's search budget so cached plans are
+/// replayed under the same workspace constraint they were selected for.
+const CUBLASLT_WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+const FP8_WORKSPACE_SIZE: usize = CUBLASLT_WORKSPACE_SIZE;
 
 fn is_retryable_cached_algo_failure(status: lt_sys::cublasStatus_t) -> bool {
     matches!(
@@ -113,7 +117,7 @@ impl CublasLtOps {
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
         let handle = CudaBlasLT::new(stream.clone())
             .map_err(|e| LLMError::GpuError(format!("CudaBlasLT init failed: {e}")))?;
-        let workspace = unsafe { stream.alloc::<u8>(FP8_WORKSPACE_SIZE) }
+        let workspace = unsafe { stream.alloc::<u8>(CUBLASLT_WORKSPACE_SIZE) }
             .map_err(|e| LLMError::GpuError(format!("cublasLt workspace alloc: {e}")))?;
         Ok(Self {
             handle,
@@ -280,7 +284,7 @@ impl CublasLtOps {
                     plan.layout_c,
                     &plan.algo,
                     ws_ptr as *mut c_void,
-                    FP8_WORKSPACE_SIZE,
+                    CUBLASLT_WORKSPACE_SIZE,
                     lt_sys::cu_stream_to_cuda_stream(cu_stream),
                 );
                 if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
@@ -347,7 +351,7 @@ impl CublasLtOps {
 
             let mut pref: lt_sys::cublasLtMatmulPreference_t = std::ptr::null_mut();
             lt_sys::cublasLtMatmulPreferenceCreate(&mut pref);
-            let ws_size: usize = FP8_WORKSPACE_SIZE;
+            let ws_size: usize = CUBLASLT_WORKSPACE_SIZE;
             lt_sys::cublasLtMatmulPreferenceSetAttribute(
                 pref,
                 lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
