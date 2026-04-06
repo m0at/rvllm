@@ -9,6 +9,10 @@ pub struct SequenceData {
     pub prompt_token_ids: Vec<TokenId>,
     pub output_token_ids: Vec<TokenId>,
     pub cumulative_logprob: f32,
+    #[serde(default)]
+    pub seq_len: u32,
+    #[serde(default)]
+    pub last_token_id: TokenId,
 }
 
 /// Metadata for a sequence group, serialized and sent to model workers.
@@ -33,6 +37,8 @@ mod tests {
                 prompt_token_ids: vec![10, 20],
                 output_token_ids: vec![30],
                 cumulative_logprob: -1.5,
+                seq_len: 3,
+                last_token_id: 30,
             },
         );
         let mut block_tables = HashMap::new();
@@ -70,6 +76,8 @@ mod tests {
                 prompt_token_ids: vec![1],
                 output_token_ids: vec![],
                 cumulative_logprob: 0.0,
+                seq_len: 1,
+                last_token_id: 1,
             },
         );
         seq_data.insert(
@@ -78,6 +86,8 @@ mod tests {
                 prompt_token_ids: vec![1],
                 output_token_ids: vec![2, 3],
                 cumulative_logprob: -2.0,
+                seq_len: 3,
+                last_token_id: 3,
             },
         );
 

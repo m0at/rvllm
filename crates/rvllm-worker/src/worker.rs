@@ -368,11 +368,15 @@ mod tests {
             prompt_token_ids: vec![1],
             output_token_ids: vec![2],
             cumulative_logprob: 0.0,
+            seq_len: 2,
+            last_token_id: 2,
         };
         let sd1 = SequenceData {
             prompt_token_ids: vec![3],
             output_token_ids: vec![4],
             cumulative_logprob: 0.0,
+            seq_len: 2,
+            last_token_id: 4,
         };
         let groups = vec![
             SequenceGroupMetadata {
@@ -409,6 +413,8 @@ mod tests {
             prompt_token_ids: vec![1],
             output_token_ids: vec![],
             cumulative_logprob: 0.0,
+            seq_len: 1,
+            last_token_id: 1,
         };
         let groups = vec![SequenceGroupMetadata {
             request_id: RequestId(0),

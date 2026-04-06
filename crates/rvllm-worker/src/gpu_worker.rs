@@ -354,6 +354,7 @@ pub struct GpuWorker {
     pinned_output: Option<cudarc::driver::PinnedHostSlice<i32>>,
     /// Stored sync output for execute_launch/execute_collect pipeline.
     pending_sync_output: Option<(ForwardOutput, Vec<SequenceGroupMetadata>)>,
+    decode_input_scratch: input::DecodeInputScratch,
 }
 
 impl GpuWorker {
@@ -483,7 +484,12 @@ impl GpuWorker {
             #[cfg(feature = "cuda")]
             pinned_output: None,
             pending_sync_output: None,
+            decode_input_scratch: input::DecodeInputScratch::new(),
         })
+    }
+
+    fn prepare_model_input(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<ModelInput> {
+        input::prepare_input_reuse(&mut self.decode_input_scratch, metadata, self.config.block_size)
     }
 
     /// Convenience constructor from EngineConfig and model path.
@@ -1308,7 +1314,7 @@ impl GpuWorker {
         if metadata.is_empty() {
             return Ok(Vec::new());
         }
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         self.gpu_forward(&model_input)
     }
 
@@ -1319,7 +1325,7 @@ impl GpuWorker {
         if metadata.is_empty() {
             return Ok(None);
         }
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         let greedy_only = Self::all_greedy(metadata);
         let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
         match fwd_output {
@@ -1340,8 +1346,7 @@ impl GpuWorker {
     ) -> Result<GpuWorkerOutput> {
         if let Some(batch) = actual_batch {
             // Async path: sync and read from pinned buffer
-            let token_ids = self.collect_pending_tokens(batch)?;
-            let outputs = self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?;
+            let outputs = self.sample_pending_tokens_from_pinned(batch, metadata)?;
             return Ok(GpuWorkerOutput { outputs });
         }
         // Sync path: output was stored in pending_sync_output
@@ -1375,7 +1380,7 @@ impl GpuWorker {
             });
         }
 
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         let greedy_only = Self::all_greedy(metadata);
         let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
 
@@ -1384,8 +1389,7 @@ impl GpuWorker {
                 // GPU is computing async. Run the overlap closure NOW.
                 during_gpu();
                 // THEN sync and read results.
-                let token_ids = self.collect_pending_tokens(actual_batch)?;
-                self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?
+                self.sample_pending_tokens_from_pinned(actual_batch, metadata)?
             }
             ForwardOutput::TokenIds(ref token_ids) => {
                 during_gpu();
@@ -1409,7 +1413,7 @@ impl GpuWorker {
 
         let t_start = std::time::Instant::now();
 
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         let t_input = t_start.elapsed();
 
         let greedy_only = Self::all_greedy(metadata);
@@ -1422,8 +1426,7 @@ impl GpuWorker {
             }
             ForwardOutput::TokenIdsPending { actual_batch } => {
                 // Async DtoH was enqueued. Sync now and read from pinned buffer.
-                let token_ids = self.collect_pending_tokens(actual_batch)?;
-                self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?
+                self.sample_pending_tokens_from_pinned(actual_batch, metadata)?
             }
             ForwardOutput::Logits(ref logits) => self.sample_tokens(logits, metadata)?,
         };
@@ -1465,7 +1468,7 @@ impl GpuWorker {
             }));
         }
 
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         let greedy_only = Self::all_greedy(metadata);
         let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
 
@@ -1496,8 +1499,7 @@ impl GpuWorker {
     ) -> Result<GpuWorkerOutput> {
         // Determine actual batch size from metadata
         let actual_batch: usize = metadata.iter().map(|g| g.seq_data.len()).sum();
-        let token_ids = self.collect_pending_tokens(actual_batch)?;
-        let outputs = self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?;
+        let outputs = self.sample_pending_tokens_from_pinned(actual_batch, metadata)?;
         Ok(GpuWorkerOutput { outputs })
     }
 
@@ -1975,8 +1977,40 @@ impl GpuWorker {
         Ok(slice[..actual_batch].to_vec())
     }
 
+    #[cfg(feature = "cuda")]
+    fn sample_pending_tokens_from_pinned(
+        &mut self,
+        actual_batch: usize,
+        metadata: &[SequenceGroupMetadata],
+    ) -> Result<Vec<GpuSamplerResult>> {
+        let runner = self
+            .gpu_model_runner
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
+        runner.sync_stream()?;
+        let pinned = self
+            .pinned_output
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("pinned output buffer not allocated".into()))?;
+        let slice = pinned
+            .as_slice()
+            .map_err(|e| LLMError::GpuError(format!("pinned buf read: {e}")))?;
+        self.sample_tokens_from_gpu_argmax(&slice[..actual_batch], metadata)
+    }
+
     #[cfg(not(feature = "cuda"))]
     fn collect_pending_tokens(&mut self, _actual_batch: usize) -> Result<Vec<i32>> {
+        Err(LLMError::GpuError(
+            "async DtoH requires cuda feature".into(),
+        ))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn sample_pending_tokens_from_pinned(
+        &mut self,
+        _actual_batch: usize,
+        _metadata: &[SequenceGroupMetadata],
+    ) -> Result<Vec<GpuSamplerResult>> {
         Err(LLMError::GpuError(
             "async DtoH requires cuda feature".into(),
         ))
@@ -2045,7 +2079,7 @@ impl GpuWorker {
         if metadata.is_empty() {
             return Ok(Vec::new());
         }
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let model_input = self.prepare_model_input(metadata)?;
         #[cfg(feature = "cuda")]
         {
             let runner = self
@@ -2131,6 +2165,8 @@ mod tests {
             prompt_token_ids: prompt,
             output_token_ids: output,
             cumulative_logprob: 0.0,
+            seq_len: 0,
+            last_token_id: 0,
         }
     }
 

@@ -46,6 +46,35 @@ pub fn prepare_input(metadata: &[SequenceGroupMetadata], block_size: usize) -> R
     }
 }
 
+/// Like `prepare_input`, but reuses caller-owned scratch for pure decode batches.
+pub fn prepare_input_reuse(
+    decode_scratch: &mut DecodeInputScratch,
+    metadata: &[SequenceGroupMetadata],
+    block_size: usize,
+) -> Result<ModelInput> {
+    if metadata.is_empty() {
+        return Ok(ModelInput {
+            token_ids: Vec::new(),
+            position_ids: Vec::new(),
+            attention_metadata: AttentionMetadata {
+                slot_mapping: Vec::new(),
+                context_lens: Vec::new(),
+                block_tables: Vec::new(),
+                max_context_len: 0,
+                query_lens: Vec::new(),
+            },
+            is_prefill: true,
+        });
+    }
+
+    let all_decode = metadata.iter().all(|g| !g.is_prompt);
+    if all_decode {
+        return prepare_decode_reuse(decode_scratch, metadata, block_size);
+    }
+
+    prepare_input(metadata, block_size)
+}
+
 /// Prepare input for the prefill (prompt processing) phase.
 ///
 /// Each sequence contributes all its prompt tokens. Position IDs are
@@ -127,12 +156,10 @@ fn prepare_decode(metadata: &[SequenceGroupMetadata], block_size: usize) -> Resu
 
     for group in metadata {
         for (seq_id, seq_data) in &group.seq_data {
-            // Decode: single token per sequence (the last one)
-            let all_tokens = all_token_ids(seq_data);
-            let last_token = all_tokens.last().copied().unwrap_or(0);
+            let last_token = decode_last_token(seq_data);
             token_ids.push(last_token);
 
-            let seq_len = all_tokens.len();
+            let seq_len = decode_seq_len(seq_data);
             position_ids.push((seq_len - 1) as u32);
             context_lens.push(seq_len as u32);
 
@@ -249,11 +276,10 @@ fn prepare_decode_refs(
 
     for group in metadata {
         for (seq_id, seq_data) in &group.seq_data {
-            let all_tokens = all_token_ids(seq_data);
-            let last_token = all_tokens.last().copied().unwrap_or(0);
+            let last_token = decode_last_token(seq_data);
             token_ids.push(last_token);
 
-            let seq_len = all_tokens.len();
+            let seq_len = decode_seq_len(seq_data);
             position_ids.push((seq_len - 1) as u32);
             context_lens.push(seq_len as u32);
 
@@ -340,8 +366,6 @@ pub struct DecodeInputScratch {
     pub context_lens: Vec<u32>,
     pub block_tables: Vec<Vec<u32>>,
     pub query_lens: Vec<u32>,
-    /// Scratch for concatenating prompt + output token ids without allocating.
-    all_tokens: Vec<TokenId>,
 }
 
 impl DecodeInputScratch {
@@ -353,7 +377,6 @@ impl DecodeInputScratch {
             context_lens: Vec::with_capacity(64),
             block_tables: Vec::with_capacity(64),
             query_lens: Vec::with_capacity(64),
-            all_tokens: Vec::with_capacity(256),
         }
     }
 
@@ -389,19 +412,10 @@ pub fn prepare_decode_reuse(
 
     for group in metadata {
         for (seq_id, seq_data) in &group.seq_data {
-            // Build all token ids in scratch buffer
-            scratch.all_tokens.clear();
-            scratch
-                .all_tokens
-                .extend_from_slice(&seq_data.prompt_token_ids);
-            scratch
-                .all_tokens
-                .extend_from_slice(&seq_data.output_token_ids);
-
-            let last_token = scratch.all_tokens.last().copied().unwrap_or(0);
+            let seq_len = decode_seq_len(seq_data);
+            let last_token = decode_last_token(seq_data);
             scratch.token_ids.push(last_token);
 
-            let seq_len = scratch.all_tokens.len();
             scratch.position_ids.push((seq_len - 1) as u32);
             scratch.context_lens.push(seq_len as u32);
 
@@ -454,11 +468,24 @@ pub fn prepare_decode_reuse(
     })
 }
 
-/// Helper: get all token IDs (prompt + output) from SequenceData.
-fn all_token_ids(sd: &SequenceData) -> Vec<TokenId> {
-    let mut ids = sd.prompt_token_ids.clone();
-    ids.extend_from_slice(&sd.output_token_ids);
-    ids
+fn decode_seq_len(sd: &SequenceData) -> usize {
+    if sd.seq_len != 0 {
+        sd.seq_len as usize
+    } else {
+        sd.prompt_token_ids.len() + sd.output_token_ids.len()
+    }
+}
+
+fn decode_last_token(sd: &SequenceData) -> TokenId {
+    if sd.seq_len != 0 {
+        sd.last_token_id
+    } else {
+        sd.output_token_ids
+            .last()
+            .or_else(|| sd.prompt_token_ids.last())
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +500,8 @@ mod tests {
             prompt_token_ids: prompt,
             output_token_ids: output,
             cumulative_logprob: 0.0,
+            seq_len: 0,
+            last_token_id: 0,
         }
     }
 
@@ -594,9 +623,8 @@ mod tests {
     #[test]
     fn sequence_data_properties() {
         let sd = make_seq_data(vec![1, 2, 3], vec![4, 5]);
-        let all = all_token_ids(&sd);
-        assert_eq!(all.len(), 5);
-        assert_eq!(all.last(), Some(&5));
+        assert_eq!(decode_seq_len(&sd), 5);
+        assert_eq!(decode_last_token(&sd), 5);
         assert_eq!(sd.output_token_ids.len(), 2);
         assert_eq!(sd.prompt_token_ids.len(), 3);
     }

@@ -381,9 +381,9 @@ async fn main() -> anyhow::Result<()> {
                                 ..Default::default()
                             };
                             let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
-                            engine.add_request_auto_id(prompt, p)?;
+                            engine.add_request_auto_id_with_emit_intermediate(prompt, p, false)?;
                         }
-                        let _ = engine.run()?;
+                        let _ = engine.run_count_tokens_only()?;
                     }
 
                     let params = rvllm_core::types::SamplingParams {
@@ -396,17 +396,16 @@ async fn main() -> anyhow::Result<()> {
                     let t0 = std::time::Instant::now();
                     for i in 0..batch {
                         let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
-                        engine.add_request_auto_id(prompt, params.clone())?;
+                        engine.add_request_auto_id_with_emit_intermediate(
+                            prompt,
+                            params.clone(),
+                            false,
+                        )?;
                     }
 
-                    let outputs = engine.run()?;
+                    let (total_toks, finished) = engine.run_count_tokens_only()?;
                     let elapsed = t0.elapsed();
-                    let total_toks: usize = outputs
-                        .iter()
-                        .flat_map(|out| out.outputs.iter())
-                        .map(|c| c.token_ids.len())
-                        .sum();
-                    let failed = batch.saturating_sub(outputs.len());
+                    let failed = batch.saturating_sub(finished);
                     let tps = total_toks as f64 / elapsed.as_secs_f64();
 
                     if json {

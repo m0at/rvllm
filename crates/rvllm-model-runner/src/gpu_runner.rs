@@ -1728,8 +1728,10 @@ mod cuda_impl {
                 }
             }
 
-            // Double-buffer: extract final layer results (1 copy at end, not per-layer)
-            if use_scratch {
+            // Final: fuse last layer's residual add with final RMSNorm.
+            // For the graphed batched path, read the final residual/down buffers
+            // directly from scratch instead of copying them out first.
+            let normed_f16 = if use_scratch {
                 if let Some(ref s) = *scratch_borrow {
                     let last_even = (num_layers - 1) % 2 == 0;
                     let (res_src, down_src) = if last_even {
@@ -1737,25 +1739,33 @@ mod cuda_impl {
                     } else {
                         (&s.residual_a, &s.down_a)
                     };
-                    let n = num_tokens * hidden_size;
-                    let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
-                        .map_err(|e| LLMError::GpuError(format!("final res: {e}")))?;
-                    self.stream
-                        .memcpy_dtod(&res_src.slice(..n), &mut res_out)
-                        .map_err(|e| LLMError::GpuError(format!("final res dtod: {e}")))?;
-                    hidden_f16 = res_out;
-                    let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
-                        .map_err(|e| LLMError::GpuError(format!("final mlp: {e}")))?;
-                    self.stream
-                        .memcpy_dtod(&down_src.slice(..n), &mut down_out)
-                        .map_err(|e| LLMError::GpuError(format!("final mlp dtod: {e}")))?;
-                    prev_mlp_out = Some(down_out);
+                    let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                        &self.stream,
+                        &self.loader,
+                        res_src,
+                        down_src,
+                        &self.final_norm_weight,
+                        self.rms_norm_eps,
+                        num_tokens,
+                        hidden_size,
+                    )?;
+                    n
+                } else if let Some(ref last_mlp) = prev_mlp_out {
+                    let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                        &self.stream,
+                        &self.loader,
+                        &hidden_f16,
+                        last_mlp,
+                        &self.final_norm_weight,
+                        self.rms_norm_eps,
+                        num_tokens,
+                        hidden_size,
+                    )?;
+                    n
+                } else {
+                    self.rms_norm_f16_runner(&hidden_f16, &self.final_norm_weight, hidden_size)?
                 }
-            }
-            drop(scratch_borrow);
-
-            // Final: fuse last layer's residual add with final RMSNorm
-            let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
+            } else if let Some(ref last_mlp) = prev_mlp_out {
                 let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
                     &self.stream,
                     &self.loader,
@@ -1770,6 +1780,7 @@ mod cuda_impl {
             } else {
                 self.rms_norm_f16_runner(&hidden_f16, &self.final_norm_weight, hidden_size)?
             };
+            drop(scratch_borrow);
 
             // LM head + argmax: f16 hidden -> fused argmax
             if num_tokens == 1 && greedy_only {
@@ -2095,8 +2106,10 @@ mod cuda_impl {
                 }
             }
 
-            // Double-buffer: extract final layer results (1 copy at end, not per-layer)
-            if use_scratch {
+            // Final: fuse last layer's residual add with final RMSNorm.
+            // For the graphed batched path, read the final residual/down buffers
+            // directly from scratch instead of copying them out first.
+            let normed_f16 = if use_scratch {
                 if let Some(ref s) = *scratch_borrow {
                     let last_even = (num_layers - 1) % 2 == 0;
                     let (res_src, down_src) = if last_even {
@@ -2104,25 +2117,33 @@ mod cuda_impl {
                     } else {
                         (&s.residual_a, &s.down_a)
                     };
-                    let n = num_tokens * hidden_size;
-                    let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
-                        .map_err(|e| LLMError::GpuError(format!("final res: {e}")))?;
-                    self.stream
-                        .memcpy_dtod(&res_src.slice(..n), &mut res_out)
-                        .map_err(|e| LLMError::GpuError(format!("final res dtod: {e}")))?;
-                    hidden_f16 = res_out;
-                    let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
-                        .map_err(|e| LLMError::GpuError(format!("final mlp: {e}")))?;
-                    self.stream
-                        .memcpy_dtod(&down_src.slice(..n), &mut down_out)
-                        .map_err(|e| LLMError::GpuError(format!("final mlp dtod: {e}")))?;
-                    prev_mlp_out = Some(down_out);
+                    let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                        &self.stream,
+                        &self.loader,
+                        res_src,
+                        down_src,
+                        &self.final_norm_weight,
+                        self.rms_norm_eps,
+                        num_tokens,
+                        hidden_size,
+                    )?;
+                    n
+                } else if let Some(ref last_mlp) = prev_mlp_out {
+                    let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                        &self.stream,
+                        &self.loader,
+                        &hidden_f16,
+                        last_mlp,
+                        &self.final_norm_weight,
+                        self.rms_norm_eps,
+                        num_tokens,
+                        hidden_size,
+                    )?;
+                    n
+                } else {
+                    self.rms_norm_f16_runner(&hidden_f16, &self.final_norm_weight, hidden_size)?
                 }
-            }
-            drop(scratch_borrow);
-
-            // Final: fuse last layer's residual add with final RMSNorm
-            let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
+            } else if let Some(ref last_mlp) = prev_mlp_out {
                 let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
                     &self.stream,
                     &self.loader,
@@ -2137,16 +2158,17 @@ mod cuda_impl {
             } else {
                 self.rms_norm_f16_runner(&hidden_f16, &self.final_norm_weight, hidden_size)?
             };
+            drop(scratch_borrow);
 
-            let token_ids_gpu = if num_tokens == 1 {
-                self.gpu_fused_lm_head_argmax_f16_hidden(
+            if num_tokens == 1 {
+                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
                     &normed_f16,
                     &self.lm_head_weight,
                     vocab_size,
                     hidden_size,
-                )?
+                )?;
+                self.write_graph_output(&token_ids_gpu, num_tokens)?;
             } else {
-                // Multi-token: hgemm f16 hidden x f16 lm_head -> f32 logits -> argmax
                 let logits_gpu = CudaLinearLayer::forward_f16_in(
                     &normed_f16,
                     &self.lm_head_weight,
@@ -2155,13 +2177,21 @@ mod cuda_impl {
                     hidden_size,
                     &self.blas,
                 )?;
-                self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?
-            };
-
-            // Copy argmax result into the persistent output buffer.
-            // On first call this allocates; on subsequent calls with the same
-            // num_tokens it reuses the same GPU pointer (crucial for graph replay).
-            self.write_graph_output(&token_ids_gpu, num_tokens)?;
+                let mut out = self.graph_output.borrow_mut();
+                let dst = out.as_mut().ok_or_else(|| {
+                    LLMError::GpuError(
+                        "graph_output not preallocated -- call prepare_for_graph_capture first"
+                            .into(),
+                    )
+                })?;
+                if dst.len() < num_tokens {
+                    return Err(LLMError::GpuError(format!(
+                        "graph_output too small for {num_tokens} tokens (have {})",
+                        dst.len()
+                    )));
+                }
+                self.gpu_argmax_into(&logits_gpu, dst, num_tokens, vocab_size)?;
+            }
 
             Ok(())
         }
@@ -2244,12 +2274,24 @@ mod cuda_impl {
             num_tokens: usize,
             vocab_size: usize,
         ) -> Result<CudaSlice<i32>> {
-            let kernel = self.loader.get_func("argmax", "argmax_kernel")?;
-
             let output: CudaSlice<i32> = self
                 .stream
                 .alloc_zeros::<i32>(num_tokens)
                 .map_err(|e| LLMError::GpuError(format!("argmax alloc: {e}")))?;
+
+            self.gpu_argmax_into(logits_gpu, &output, num_tokens, vocab_size)?;
+
+            Ok(output)
+        }
+
+        fn gpu_argmax_into(
+            &self,
+            logits_gpu: &CudaSlice<f32>,
+            output: &CudaSlice<i32>,
+            num_tokens: usize,
+            vocab_size: usize,
+        ) -> Result<()> {
+            let kernel = self.loader.get_func("argmax", "argmax_kernel")?;
 
             let block_dim = vocab_size.min(1024) as u32;
             let cfg = LaunchConfig {
@@ -2262,13 +2304,13 @@ mod cuda_impl {
                 self.stream
                     .launch_builder(&kernel)
                     .arg(logits_gpu)
-                    .arg(&output)
+                    .arg(output)
                     .arg(&(vocab_size as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("argmax_kernel launch: {e}")))?;
             }
 
-            Ok(output)
+            Ok(())
         }
 
         /// Fused LM-head matvec + argmax for single-token greedy decode (f16 weights).

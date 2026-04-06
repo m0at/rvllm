@@ -18,9 +18,9 @@ mod inner {
 
     use rvllm_block_manager::{BlockManager, MemoryPool};
     use rvllm_config::{resolve_runtime_max_model_len, EngineConfig};
-    use rvllm_core::prelude::{
-        BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
-        SequenceId, TokenId,
+use rvllm_core::prelude::{
+        BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, ResponseFormat,
+        Result, SamplingParams, SequenceId, TokenId,
     };
     use rvllm_model_loader::gguf::inspect_gguf_model_info;
     use rvllm_model_loader::{detect_format, ModelFormat};
@@ -491,8 +491,17 @@ mod inner {
             prompt: String,
             params: SamplingParams,
         ) -> Result<RequestId> {
+            self.add_request_auto_id_with_emit_intermediate(prompt, params, true)
+        }
+
+        pub fn add_request_auto_id_with_emit_intermediate(
+            &mut self,
+            prompt: String,
+            params: SamplingParams,
+            emit_intermediate: bool,
+        ) -> Result<RequestId> {
             let request_id = RequestId(self.next_request_id.fetch_add(1, Ordering::Relaxed));
-            self.add_request(request_id, prompt, params, true)?;
+            self.add_request(request_id, prompt, params, emit_intermediate)?;
             Ok(request_id)
         }
 
@@ -765,6 +774,48 @@ mod inner {
             Ok(all_outputs)
         }
 
+        /// Benchmark-only run loop that skips RequestOutput construction and
+        /// returns just the total generated token count and number of finished
+        /// requests.
+        pub fn run_count_tokens_only(&mut self) -> Result<(usize, usize)> {
+            let mut total_tokens = 0usize;
+            let mut total_finished = 0usize;
+            while self.has_unfinished() {
+                let (tokens, finished) = self.step_count_tokens_only()?;
+                total_tokens += tokens;
+                total_finished += finished;
+            }
+            Ok((total_tokens, total_finished))
+        }
+
+        fn step_count_tokens_only(&mut self) -> Result<(usize, usize)> {
+            let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
+                Some(v) => v,
+                None => return Ok((0, 0)),
+            };
+
+            if !aborted_seqs.is_empty() {
+                for scheduled in &scheduled_groups {
+                    let group = &scheduled.seq_group;
+                    for (seq_idx, seq) in group.sequences.iter().enumerate() {
+                        if aborted_seqs.contains(&seq.seq_id) {
+                            if let Some(req) = self.requests.get_mut(&group.request_id) {
+                                if let Some(state) = req.seq_states.get_mut(seq_idx) {
+                                    state.finish_reason = Some(FinishReason::Abort);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let worker_outputs = self
+                .worker
+                .execute(&metadata)
+                .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
+            self.process_worker_outputs_count_only(&scheduled_groups, &worker_outputs)
+        }
+
         /// Prepare one step: schedule, build metadata, handle prefix cache lookups.
         /// Returns None if there's nothing to schedule.
         fn prepare_step(
@@ -931,6 +982,102 @@ mod inner {
             results
         }
 
+        fn process_worker_outputs_count_only(
+            &mut self,
+            scheduled_groups: &[ScheduledSequenceGroup],
+            worker_outputs: &GpuWorkerOutput,
+        ) -> Result<(usize, usize)> {
+            let mut output_map: HashMap<u64, (TokenId, LogProb, &[(TokenId, LogProb)])> =
+                HashMap::with_capacity(worker_outputs.outputs.len());
+            for wo in &worker_outputs.outputs {
+                output_map.insert(wo.seq_id, (wo.token_id, wo.logprob, &wo.top_logprobs));
+            }
+
+            let eos = self.tokenizer.eos_token_id();
+
+            for scheduled in scheduled_groups {
+                let group = &scheduled.seq_group;
+                let request_id = group.request_id;
+                let req = match self.requests.get_mut(&request_id) {
+                    Some(r) => r,
+                    None => continue,
+                };
+
+                let logprobs_requested =
+                    req.sampling_params.logprobs.map(|n| n > 0).unwrap_or(false);
+
+                for (seq_idx, seq) in group.sequences.iter().enumerate() {
+                    if seq.is_finished() {
+                        continue;
+                    }
+
+                    if let Some((token_id, logprob, top_lps)) = output_map.get(&seq.seq_id.0) {
+                        if let Err(err) = self
+                            .scheduler
+                            .update_seq_token(seq.seq_id, *token_id, *logprob)
+                        {
+                            warn!(seq_id = seq.seq_id.0, %err, "failed to extend scheduler state after token append");
+                            continue;
+                        }
+
+                        let top_logprobs = if logprobs_requested && !top_lps.is_empty() {
+                            Some(top_lps.to_vec())
+                        } else {
+                            None
+                        };
+
+                        if let Some(state) = req.seq_states.get_mut(seq_idx) {
+                            OutputProcessor::process_token(
+                                state,
+                                *token_id,
+                                *logprob,
+                                top_logprobs,
+                                "",
+                                &req.sampling_params,
+                                eos,
+                            );
+                            if let Some(reason) = state.finish_reason {
+                                let status = match reason {
+                                    FinishReason::Stop => SequenceStatus::FinishedStopped,
+                                    FinishReason::Length => SequenceStatus::FinishedLength,
+                                    FinishReason::Abort => SequenceStatus::FinishedAborted,
+                                };
+                                let _ = self.scheduler.finish_seq(seq.seq_id, status);
+                            }
+                        }
+                    }
+                }
+
+                let prompt_len = group.prompt_len();
+                let chunk_end = group.num_prompt_tokens_processed.min(prompt_len);
+                if scheduled.is_prefill && chunk_end >= prompt_len {
+                    for seq in &group.sequences {
+                        self.scheduler.register_finished_prompt(seq.seq_id);
+                    }
+                }
+            }
+
+            let finished_ids: Vec<RequestId> = self
+                .requests
+                .iter()
+                .filter(|(_, req)| req.seq_states.iter().all(|s| s.is_finished()))
+                .map(|(&id, _)| id)
+                .collect();
+
+            let total_tokens: usize = finished_ids
+                .iter()
+                .filter_map(|id| self.requests.get(id))
+                .map(|req| req.seq_states.iter().map(|s| s.token_ids.len()).sum::<usize>())
+                .sum();
+
+            for id in &finished_ids {
+                self.requests.remove(id);
+                self.scheduler.abort_request(id);
+            }
+
+            Ok((total_tokens, finished_ids.len()))
+        }
+
         /// Check for unfinished sequences (scheduler-side only, doesn't
         /// account for in-flight GPU work).
         fn has_unfinished_excluding_worker(&self) -> bool {
@@ -972,6 +1119,11 @@ mod inner {
 
             for scheduled in groups {
                 let group = &scheduled.seq_group;
+                let decode_fast_path = self
+                    .requests
+                    .get(&group.request_id)
+                    .map(|req| matches!(req.sampling_params.response_format, ResponseFormat::Text))
+                    .unwrap_or(false);
                 let prompt_len = group.prompt_len();
                 let is_prompt = scheduled.is_prefill;
                 let chunk_end = if is_prompt {
@@ -1008,17 +1160,47 @@ mod inner {
                     seq_data.insert(
                         seq.seq_id,
                         if is_prompt {
+                            let prompt_chunk = &seq.prompt_token_ids[chunk_start..chunk_end];
+                            let prior_prompt = &seq.prompt_token_ids[..chunk_start];
                             SequenceData {
-                                prompt_token_ids: seq.prompt_token_ids[chunk_start..chunk_end]
-                                    .to_vec(),
-                                output_token_ids: seq.prompt_token_ids[..chunk_start].to_vec(),
+                                prompt_token_ids: prompt_chunk.to_vec(),
+                                output_token_ids: prior_prompt.to_vec(),
                                 cumulative_logprob: seq.cumulative_logprob,
+                                seq_len: (prompt_chunk.len() + prior_prompt.len()) as u32,
+                                last_token_id: prompt_chunk
+                                    .last()
+                                    .or_else(|| prior_prompt.last())
+                                    .copied()
+                                    .unwrap_or(0),
+                            }
+                        } else if decode_fast_path {
+                            let seq_len = seq.prompt_token_ids.len() + seq.output_token_ids.len();
+                            let last_token_id = seq
+                                .output_token_ids
+                                .last()
+                                .or_else(|| seq.prompt_token_ids.last())
+                                .copied()
+                                .unwrap_or(0);
+                            SequenceData {
+                                prompt_token_ids: Vec::new(),
+                                output_token_ids: Vec::new(),
+                                cumulative_logprob: seq.cumulative_logprob,
+                                seq_len: seq_len as u32,
+                                last_token_id,
                             }
                         } else {
                             SequenceData {
                                 prompt_token_ids: seq.prompt_token_ids.clone(),
                                 output_token_ids: seq.output_token_ids.clone(),
                                 cumulative_logprob: seq.cumulative_logprob,
+                                seq_len: (seq.prompt_token_ids.len() + seq.output_token_ids.len())
+                                    as u32,
+                                last_token_id: seq
+                                    .output_token_ids
+                                    .last()
+                                    .or_else(|| seq.prompt_token_ids.last())
+                                    .copied()
+                                    .unwrap_or(0),
                             }
                         },
                     );
@@ -1105,6 +1287,8 @@ mod inner {
                     prompt_token_ids: tokens.to_vec(),
                     output_token_ids: Vec::new(),
                     cumulative_logprob: 0.0,
+                    seq_len: tokens.len() as u32,
+                    last_token_id: tokens.last().copied().unwrap_or(0),
                 },
             );
 
@@ -1242,6 +1426,8 @@ mod inner {
                             prompt_token_ids: tokens.to_vec(),
                             output_token_ids: Vec::new(),
                             cumulative_logprob: 0.0,
+                            seq_len: tokens.len() as u32,
+                            last_token_id: tokens.last().copied().unwrap_or(0),
                         },
                     );
 
@@ -1430,6 +1616,8 @@ mod inner {
                         prompt_token_ids: context.clone(),
                         output_token_ids: Vec::new(),
                         cumulative_logprob: 0.0,
+                        seq_len: context.len() as u32,
+                        last_token_id: context.last().copied().unwrap_or(0),
                     },
                 );
 

@@ -482,6 +482,13 @@ impl LLMEngine {
                         prompt_token_ids: seq.prompt_token_ids.clone(),
                         output_token_ids: seq.output_token_ids.clone(),
                         cumulative_logprob: seq.cumulative_logprob,
+                        seq_len: (seq.prompt_token_ids.len() + seq.output_token_ids.len()) as u32,
+                        last_token_id: seq
+                            .output_token_ids
+                            .last()
+                            .or_else(|| seq.prompt_token_ids.last())
+                            .copied()
+                            .unwrap_or(0),
                     },
                 );
             }
