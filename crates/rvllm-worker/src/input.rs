@@ -407,6 +407,10 @@ impl DecodeInputScratch {
         }
         &self.block_tables_flat
     }
+
+    pub fn max_context_len(&self) -> u32 {
+        self.context_lens.iter().copied().max().unwrap_or(0)
+    }
 }
 
 impl Default for DecodeInputScratch {
@@ -467,7 +471,7 @@ fn fill_decode_scratch(
     let num_seqs = scratch.context_lens.len();
     scratch.query_lens.resize(num_seqs, 1);
 
-    scratch.context_lens.iter().copied().max().unwrap_or(0)
+    scratch.max_context_len()
 }
 
 /// Like `prepare_decode` but reuses caller-owned scratch buffers to avoid heap allocations.

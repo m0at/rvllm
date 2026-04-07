@@ -559,21 +559,17 @@ impl GpuWorker {
         )?;
 
         let output = match dispatch.action {
-            DecodeGraphAction::Replay => {
-                self.gpu_forward_ex_graphed_persistent_decode(dispatch.execution)?
-            }
-            DecodeGraphAction::Capture => {
-                match self.try_capture_graph_persistent_decode(dispatch.execution) {
-                    Ok(output) => output,
-                    Err(e) => {
-                        warn!(
-                            graph_batch = dispatch.execution.graph_tokens,
-                            "persistent decode graph capture failed, falling back: {e}"
-                        );
-                        return Ok(None);
-                    }
+            DecodeGraphAction::Replay => self.replay_decode_graph(dispatch.execution, None)?,
+            DecodeGraphAction::Capture => match self.capture_decode_graph(dispatch.execution, None) {
+                Ok(output) => output,
+                Err(e) => {
+                    warn!(
+                        graph_batch = dispatch.execution.graph_tokens,
+                        "persistent decode graph capture failed, falling back: {e}"
+                    );
+                    return Ok(None);
                 }
-            }
+            },
             DecodeGraphAction::Raw => return Ok(None),
         };
 
@@ -1806,24 +1802,18 @@ impl GpuWorker {
 
                 match dispatch.action {
                     DecodeGraphAction::Raw => self.raw_gpu_forward_ex(model_input, greedy_only),
-                    DecodeGraphAction::Replay => self.gpu_forward_ex_graphed_padded(
-                        model_input,
-                        dispatch.execution,
-                        greedy_only,
-                    ),
-                    DecodeGraphAction::Capture => {
-                        match self.try_capture_graph_padded(
-                            model_input,
-                            dispatch.execution,
-                            greedy_only,
-                        ) {
-                            Ok(output) => Ok(output),
-                            Err(e) => {
-                                warn!(graph_batch = dispatch.execution.graph_tokens, "graph capture failed, raw forward: {e}");
-                                self.raw_gpu_forward_ex(model_input, greedy_only)
-                            }
-                        }
+                    DecodeGraphAction::Replay => {
+                        self.replay_decode_graph(dispatch.execution, Some(model_input))
                     }
+                    DecodeGraphAction::Capture => match self
+                        .capture_decode_graph(dispatch.execution, Some(model_input))
+                    {
+                        Ok(output) => Ok(output),
+                        Err(e) => {
+                            warn!(graph_batch = dispatch.execution.graph_tokens, "graph capture failed, raw forward: {e}");
+                            self.raw_gpu_forward_ex(model_input, greedy_only)
+                        }
+                    },
                 }
             }
 
@@ -1847,26 +1837,19 @@ impl GpuWorker {
         result
     }
 
-    /// Replay a captured graph for a padded batch size, return only actual_batch results.
     #[cfg(feature = "cuda")]
-    fn gpu_forward_ex_graphed_padded(
+    fn upload_decode_graph_metadata(
         &mut self,
-        model_input: &ModelInput,
         plan: DecodeExecutionPlan,
-        _greedy_only: bool,
-    ) -> Result<ForwardOutput> {
-        let actual_batch = plan.actual_tokens;
+        model_input: Option<&ModelInput>,
+    ) -> Result<u32> {
         let padded_batch = plan.graph_tokens;
-        self.ensure_pinned_output_capacity(actual_batch)?;
         let runner = self
             .gpu_model_runner
             .as_ref()
             .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
 
-        // Upload metadata (skip clone when no padding needed)
         if plan.use_batched_v2 {
-            self.decode_input_scratch
-                .rebuild_block_tables_flat(runner.graph_max_blocks());
             let scratch = &self.decode_input_scratch;
             runner.upload_decode_metadata_v2_flat(
                 &scratch.token_ids,
@@ -1877,7 +1860,13 @@ impl GpuWorker {
                 &scratch.block_tables_flat,
                 padded_batch,
             )?;
-        } else if actual_batch == padded_batch {
+            return Ok(scratch.max_context_len());
+        }
+
+        let model_input = model_input.ok_or_else(|| {
+            LLMError::GpuError("generic decode graph path requires model input".into())
+        })?;
+        if plan.actual_tokens == padded_batch {
             runner.upload_metadata(
                 &model_input.token_ids,
                 &model_input.position_ids,
@@ -1891,6 +1880,23 @@ impl GpuWorker {
                 padded_batch,
             )?;
         }
+        Ok(model_input.attention_metadata.max_context_len)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn replay_decode_graph(
+        &mut self,
+        plan: DecodeExecutionPlan,
+        model_input: Option<&ModelInput>,
+    ) -> Result<ForwardOutput> {
+        let actual_batch = plan.actual_tokens;
+        let padded_batch = plan.graph_tokens;
+        self.ensure_pinned_output_capacity(actual_batch)?;
+        self.upload_decode_graph_metadata(plan, model_input)?;
+        let runner = self
+            .gpu_model_runner
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
 
         let graph = self
             .graph_runner
@@ -1916,59 +1922,13 @@ impl GpuWorker {
     }
 
     #[cfg(feature = "cuda")]
-    fn gpu_forward_ex_graphed_persistent_decode(
+    fn capture_decode_graph(
         &mut self,
         plan: DecodeExecutionPlan,
+        model_input: Option<&ModelInput>,
     ) -> Result<ForwardOutput> {
         let actual_batch = plan.actual_tokens;
         let padded_batch = plan.graph_tokens;
-        self.ensure_pinned_output_capacity(actual_batch)?;
-        let runner = self
-            .gpu_model_runner
-            .as_ref()
-            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
-
-        runner.upload_decode_metadata_v2_flat(
-            &self.decode_input_scratch.token_ids,
-            &self.decode_input_scratch.position_ids,
-            &self.decode_input_scratch.query_lens,
-            &self.decode_input_scratch.context_lens,
-            &self.decode_input_scratch.slot_mapping,
-            &self.decode_input_scratch.block_tables_flat,
-            padded_batch,
-        )?;
-
-        let graph = self
-            .graph_runner
-            .pool()
-            .get_exact(padded_batch)
-            .ok_or_else(|| {
-                LLMError::GpuError(format!("no graph for padded batch {padded_batch}"))
-            })?;
-        graph.replay(&self.runner_stream)?;
-
-        let pinned = self
-            .pinned_output
-            .as_mut()
-            .ok_or_else(|| LLMError::GpuError("pinned output buffer not allocated".into()))?;
-        let dst = pinned
-            .as_mut_slice()
-            .map_err(|e| LLMError::GpuError(format!("pinned buf write: {e}")))?;
-        runner.read_graph_output_async(actual_batch, dst)?;
-        Ok(ForwardOutput::TokenIdsPending { actual_batch })
-    }
-
-    /// Try to capture a graph for a padded batch size.
-    #[cfg(feature = "cuda")]
-    fn try_capture_graph_padded(
-        &mut self,
-        model_input: &ModelInput,
-        plan: DecodeExecutionPlan,
-        _greedy_only: bool,
-    ) -> Result<ForwardOutput> {
-        let actual_batch = plan.actual_tokens;
-        let padded_batch = plan.graph_tokens;
-        let max_context_len = model_input.attention_metadata.max_context_len;
         self.ensure_pinned_output_capacity(actual_batch)?;
 
         let runner = self
@@ -1987,58 +1947,16 @@ impl GpuWorker {
             actual_batch, "capturing CUDA graph for padded batch size"
         );
 
-        // Warmup forward (outside capture)
-        if plan.use_batched_v2 {
-            self.decode_input_scratch
-                .rebuild_block_tables_flat(runner.graph_max_blocks());
-            let scratch = &self.decode_input_scratch;
-            runner.upload_decode_metadata_v2_flat(
-                &scratch.token_ids,
-                &scratch.position_ids,
-                &scratch.query_lens,
-                &scratch.context_lens,
-                &scratch.slot_mapping,
-                &scratch.block_tables_flat,
-                padded_batch,
-            )?;
-        } else {
-            runner.upload_metadata_padded(
-                &model_input.token_ids,
-                &model_input.position_ids,
-                &model_input.attention_metadata,
-                padded_batch,
-            )?;
-        }
+        let max_context_len = self.upload_decode_graph_metadata(plan, model_input)?;
         runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false)?;
 
-        // Sync before capture
         let cuda_stream = runner.cuda_stream().clone();
         cuda_stream
             .synchronize()
             .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
 
-        // Re-upload padded metadata
-        if plan.use_batched_v2 {
-            let scratch = &self.decode_input_scratch;
-            runner.upload_decode_metadata_v2_flat(
-                &scratch.token_ids,
-                &scratch.position_ids,
-                &scratch.query_lens,
-                &scratch.context_lens,
-                &scratch.slot_mapping,
-                &scratch.block_tables_flat,
-                padded_batch,
-            )?;
-        } else {
-            runner.upload_metadata_padded(
-                &model_input.token_ids,
-                &model_input.position_ids,
-                &model_input.attention_metadata,
-                padded_batch,
-            )?;
-        }
+        self.upload_decode_graph_metadata(plan, model_input)?;
 
-        // Capture
         let capture_result = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream);
         if let Err(e) = capture_result {
             warn!(padded_batch, "graph capture begin failed: {e}");
@@ -2069,96 +1987,6 @@ impl GpuWorker {
             }
             Err(e) => {
                 warn!(padded_batch, "graph capture forward failed: {e}");
-                let _ = self
-                    .graph_runner
-                    .pool_mut()
-                    .end_capture_on(&cuda_stream, padded_batch);
-                self.graph_runner.mark_captured(padded_batch);
-                Err(e)
-            }
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    fn try_capture_graph_persistent_decode(
-        &mut self,
-        plan: DecodeExecutionPlan,
-    ) -> Result<ForwardOutput> {
-        let actual_batch = plan.actual_tokens;
-        let padded_batch = plan.graph_tokens;
-        let max_context_len = self
-            .decode_input_scratch
-            .context_lens
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        self.ensure_pinned_output_capacity(actual_batch)?;
-
-        let runner = self
-            .gpu_model_runner
-            .as_ref()
-            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
-
-        if !plan.use_graphed_decode {
-            return Err(LLMError::GpuError(format!(
-                "graph capture unsupported for batch {padded_batch}"
-            )));
-        }
-
-        runner.upload_decode_metadata_v2_flat(
-            &self.decode_input_scratch.token_ids,
-            &self.decode_input_scratch.position_ids,
-            &self.decode_input_scratch.query_lens,
-            &self.decode_input_scratch.context_lens,
-            &self.decode_input_scratch.slot_mapping,
-            &self.decode_input_scratch.block_tables_flat,
-            padded_batch,
-        )?;
-        runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false)?;
-
-        let cuda_stream = runner.cuda_stream().clone();
-        cuda_stream
-            .synchronize()
-            .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
-
-        runner.upload_decode_metadata_v2_flat(
-            &self.decode_input_scratch.token_ids,
-            &self.decode_input_scratch.position_ids,
-            &self.decode_input_scratch.query_lens,
-            &self.decode_input_scratch.context_lens,
-            &self.decode_input_scratch.slot_mapping,
-            &self.decode_input_scratch.block_tables_flat,
-            padded_batch,
-        )?;
-
-        if let Err(e) = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream) {
-            warn!(padded_batch, "graph capture begin failed: {e}");
-            self.graph_runner.mark_captured(padded_batch);
-            return Err(LLMError::GpuError(format!("graph capture failed: {e}")));
-        }
-
-        let fwd_result =
-            runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false);
-
-        match fwd_result {
-            Ok(()) => {
-                let graph = self
-                    .graph_runner
-                    .pool_mut()
-                    .end_capture_on(&cuda_stream, padded_batch)?;
-                self.graph_runner.pool_mut().insert(graph);
-                self.graph_runner.mark_captured(padded_batch);
-                let pinned = self.pinned_output.as_mut().ok_or_else(|| {
-                    LLMError::GpuError("pinned output buffer not allocated".into())
-                })?;
-                let dst = pinned
-                    .as_mut_slice()
-                    .map_err(|e| LLMError::GpuError(format!("pinned buf write: {e}")))?;
-                runner.read_graph_output_async(actual_batch, dst)?;
-                Ok(ForwardOutput::TokenIdsPending { actual_batch })
-            }
-            Err(e) => {
                 let _ = self
                     .graph_runner
                     .pool_mut()
