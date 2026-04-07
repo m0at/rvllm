@@ -222,6 +222,7 @@ use rvllm_core::prelude::{
         sampling_params: SamplingParams,
         emit_intermediate: bool,
         seq_states: Vec<SequenceOutputState>,
+        decode_seq_data: Vec<SequenceData>,
     }
 
     struct LocalPool {
@@ -303,6 +304,21 @@ use rvllm_core::prelude::{
     }
 
     impl GpuLLMEngine {
+        fn sync_decode_seq_data(
+            req: &mut EngineRequest,
+            seq_idx: usize,
+            token_id: TokenId,
+            cumulative_logprob: LogProb,
+        ) {
+            if let Some(seq_data) = req.decode_seq_data.get_mut(seq_idx) {
+                seq_data.output_token_ids.push(token_id);
+                seq_data.cumulative_logprob = cumulative_logprob;
+                seq_data.seq_len =
+                    (seq_data.prompt_token_ids.len() + seq_data.output_token_ids.len()) as u32;
+                seq_data.last_token_id = token_id;
+            }
+        }
+
         pub fn new(config: EngineConfig) -> Result<Self> {
             let model_name = &config.model.model_path;
             info!(model = %model_name, "GpuLLMEngine: initializing");
@@ -536,6 +552,15 @@ use rvllm_core::prelude::{
                     sampling_params: params,
                     emit_intermediate,
                     seq_states,
+                    decode_seq_data: (0..num_seqs)
+                        .map(|_| SequenceData {
+                            prompt_token_ids: prompt_token_ids.clone(),
+                            output_token_ids: Vec::new(),
+                            cumulative_logprob: 0.0,
+                            seq_len: prompt_token_ids.len() as u32,
+                            last_token_id: prompt_token_ids.last().copied().unwrap_or(0),
+                        })
+                        .collect(),
                 },
             );
 
@@ -908,24 +933,36 @@ use rvllm_core::prelude::{
                             None
                         };
 
-                        if let Some(state) = req.seq_states.get_mut(seq_idx) {
-                            OutputProcessor::process_token(
-                                state,
+                        let (finish_reason, cumulative_logprob) =
+                            if let Some(state) = req.seq_states.get_mut(seq_idx) {
+                                OutputProcessor::process_token(
+                                    state,
+                                    *token_id,
+                                    *logprob,
+                                    top_logprobs,
+                                    &decoded,
+                                    &req.sampling_params,
+                                    eos,
+                                );
+                                (state.finish_reason, state.cumulative_logprob)
+                            } else {
+                                (None, 0.0)
+                            };
+                        if !scheduled.is_prefill {
+                            Self::sync_decode_seq_data(
+                                req,
+                                seq_idx,
                                 *token_id,
-                                *logprob,
-                                top_logprobs,
-                                &decoded,
-                                &req.sampling_params,
-                                eos,
+                                cumulative_logprob,
                             );
-                            if let Some(reason) = state.finish_reason {
-                                let status = match reason {
-                                    FinishReason::Stop => SequenceStatus::FinishedStopped,
-                                    FinishReason::Length => SequenceStatus::FinishedLength,
-                                    FinishReason::Abort => SequenceStatus::FinishedAborted,
-                                };
-                                let _ = self.scheduler.finish_seq(seq.seq_id, status);
-                            }
+                        }
+                        if let Some(reason) = finish_reason {
+                            let status = match reason {
+                                FinishReason::Stop => SequenceStatus::FinishedStopped,
+                                FinishReason::Length => SequenceStatus::FinishedLength,
+                                FinishReason::Abort => SequenceStatus::FinishedAborted,
+                            };
+                            let _ = self.scheduler.finish_seq(seq.seq_id, status);
                         }
                     }
                 }
@@ -1026,24 +1063,36 @@ use rvllm_core::prelude::{
                             None
                         };
 
-                        if let Some(state) = req.seq_states.get_mut(seq_idx) {
-                            OutputProcessor::process_token(
-                                state,
+                        let (finish_reason, cumulative_logprob) =
+                            if let Some(state) = req.seq_states.get_mut(seq_idx) {
+                                OutputProcessor::process_token(
+                                    state,
+                                    *token_id,
+                                    *logprob,
+                                    top_logprobs,
+                                    "",
+                                    &req.sampling_params,
+                                    eos,
+                                );
+                                (state.finish_reason, state.cumulative_logprob)
+                            } else {
+                                (None, 0.0)
+                            };
+                        if !scheduled.is_prefill {
+                            Self::sync_decode_seq_data(
+                                req,
+                                seq_idx,
                                 *token_id,
-                                *logprob,
-                                top_logprobs,
-                                "",
-                                &req.sampling_params,
-                                eos,
+                                cumulative_logprob,
                             );
-                            if let Some(reason) = state.finish_reason {
-                                let status = match reason {
-                                    FinishReason::Stop => SequenceStatus::FinishedStopped,
-                                    FinishReason::Length => SequenceStatus::FinishedLength,
-                                    FinishReason::Abort => SequenceStatus::FinishedAborted,
-                                };
-                                let _ = self.scheduler.finish_seq(seq.seq_id, status);
-                            }
+                        }
+                        if let Some(reason) = finish_reason {
+                            let status = match reason {
+                                FinishReason::Stop => SequenceStatus::FinishedStopped,
+                                FinishReason::Length => SequenceStatus::FinishedLength,
+                                FinishReason::Abort => SequenceStatus::FinishedAborted,
+                            };
+                            let _ = self.scheduler.finish_seq(seq.seq_id, status);
                         }
                     }
                 }
@@ -1134,10 +1183,17 @@ use rvllm_core::prelude::{
                 let mut seq_data = HashMap::new();
                 let mut block_tables = HashMap::new();
 
-                for seq in &group.sequences {
+                for (seq_idx, seq) in group.sequences.iter().enumerate() {
                     if seq.is_finished() {
                         continue;
                     }
+                    let decode_seq_data = if is_prompt {
+                        None
+                    } else {
+                        self.requests
+                            .get(&group.request_id)
+                            .and_then(|req| req.decode_seq_data.get(seq_idx).cloned())
+                    };
                     let Some(existing) = self.scheduler.get_block_table(seq.seq_id) else {
                         warn!(
                             seq_id = seq.seq_id.0,
@@ -1169,20 +1225,22 @@ use rvllm_core::prelude::{
                                     .unwrap_or(0),
                             }
                         } else {
-                            let seq_len = seq.prompt_token_ids.len() + seq.output_token_ids.len();
-                            let last_token_id = seq
-                                .output_token_ids
-                                .last()
-                                .or_else(|| seq.prompt_token_ids.last())
-                                .copied()
-                                .unwrap_or(0);
-                            SequenceData {
-                                prompt_token_ids: Vec::new(),
-                                output_token_ids: Vec::new(),
-                                cumulative_logprob: seq.cumulative_logprob,
-                                seq_len: seq_len as u32,
-                                last_token_id,
-                            }
+                            decode_seq_data.unwrap_or_else(|| {
+                                let seq_len = seq.prompt_token_ids.len() + seq.output_token_ids.len();
+                                let last_token_id = seq
+                                    .output_token_ids
+                                    .last()
+                                    .or_else(|| seq.prompt_token_ids.last())
+                                    .copied()
+                                    .unwrap_or(0);
+                                SequenceData {
+                                    prompt_token_ids: seq.prompt_token_ids.clone(),
+                                    output_token_ids: seq.output_token_ids.clone(),
+                                    cumulative_logprob: seq.cumulative_logprob,
+                                    seq_len: seq_len as u32,
+                                    last_token_id,
+                                }
+                            })
                         },
                     );
                 }
