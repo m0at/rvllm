@@ -19,6 +19,8 @@ pub struct CutlassKernels {
     fn_oproj_residual_ws: WorkspaceSizeFn,
     fn_gateup_silu: GateUpSiluFn,
     fn_gateup_silu_ws: WorkspaceSizeFn,
+    fn_gate_silu_mul: GateSiluMulFn,
+    fn_gate_silu_mul_ws: WorkspaceSizeFn,
     fn_hgemm: HgemmFn,
     fn_hgemm_ws: WorkspaceSizeFn,
 }
@@ -29,7 +31,9 @@ type QkvBiasFn = unsafe extern "C" fn(
     input: *const c_void,
     weight: *const c_void,
     bias: *const c_void,
-    m: i32, n: i32, k: i32,
+    m: i32,
+    n: i32,
+    k: i32,
     workspace: *mut c_void,
     workspace_size: usize,
     stream: *mut c_void, // cudaStream_t
@@ -40,7 +44,9 @@ type OprojResidualFn = unsafe extern "C" fn(
     input: *const c_void,
     weight: *const c_void,
     residual: *const c_void,
-    m: i32, n: i32, k: i32,
+    m: i32,
+    n: i32,
+    k: i32,
     workspace: *mut c_void,
     workspace_size: usize,
     stream: *mut c_void,
@@ -50,7 +56,22 @@ type GateUpSiluFn = unsafe extern "C" fn(
     output: *mut c_void,
     input: *const c_void,
     weight: *const c_void,
-    m: i32, n: i32, k: i32,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut c_void,
+    workspace_size: usize,
+    stream: *mut c_void,
+) -> i32;
+
+type GateSiluMulFn = unsafe extern "C" fn(
+    output: *mut c_void,
+    input: *const c_void,
+    gate_weight: *const c_void,
+    aux_up: *const c_void,
+    m: i32,
+    n: i32,
+    k: i32,
     workspace: *mut c_void,
     workspace_size: usize,
     stream: *mut c_void,
@@ -60,7 +81,9 @@ type HgemmFn = unsafe extern "C" fn(
     output: *mut c_void,
     input: *const c_void,
     weight: *const c_void,
-    m: i32, n: i32, k: i32,
+    m: i32,
+    n: i32,
+    k: i32,
     workspace: *mut c_void,
     workspace_size: usize,
     stream: *mut c_void,
@@ -78,21 +101,35 @@ impl CutlassKernels {
             .map_err(|e| format!("dlopen {}: {e}", lib_path.display()))?;
 
         unsafe {
-            let fn_qkv_bias: QkvBiasFn = *lib.get(b"cutlass_qkv_bias_gemm\0")
+            let fn_qkv_bias: QkvBiasFn = *lib
+                .get(b"cutlass_qkv_bias_gemm\0")
                 .map_err(|e| format!("cutlass_qkv_bias_gemm: {e}"))?;
-            let fn_qkv_bias_ws: WorkspaceSizeFn = *lib.get(b"cutlass_qkv_bias_workspace_size\0")
+            let fn_qkv_bias_ws: WorkspaceSizeFn = *lib
+                .get(b"cutlass_qkv_bias_workspace_size\0")
                 .map_err(|e| format!("cutlass_qkv_bias_workspace_size: {e}"))?;
-            let fn_oproj_residual: OprojResidualFn = *lib.get(b"cutlass_oproj_residual_gemm\0")
+            let fn_oproj_residual: OprojResidualFn = *lib
+                .get(b"cutlass_oproj_residual_gemm\0")
                 .map_err(|e| format!("cutlass_oproj_residual_gemm: {e}"))?;
-            let fn_oproj_residual_ws: WorkspaceSizeFn = *lib.get(b"cutlass_oproj_residual_workspace_size\0")
+            let fn_oproj_residual_ws: WorkspaceSizeFn = *lib
+                .get(b"cutlass_oproj_residual_workspace_size\0")
                 .map_err(|e| format!("cutlass_oproj_residual_workspace_size: {e}"))?;
-            let fn_gateup_silu: GateUpSiluFn = *lib.get(b"cutlass_gateup_silu\0")
+            let fn_gateup_silu: GateUpSiluFn = *lib
+                .get(b"cutlass_gateup_silu\0")
                 .map_err(|e| format!("cutlass_gateup_silu: {e}"))?;
-            let fn_gateup_silu_ws: WorkspaceSizeFn = *lib.get(b"cutlass_gateup_silu_workspace_size\0")
+            let fn_gateup_silu_ws: WorkspaceSizeFn = *lib
+                .get(b"cutlass_gateup_silu_workspace_size\0")
                 .map_err(|e| format!("cutlass_gateup_silu_workspace_size: {e}"))?;
-            let fn_hgemm: HgemmFn = *lib.get(b"cutlass_hgemm\0")
+            let fn_gate_silu_mul: GateSiluMulFn = *lib
+                .get(b"cutlass_gate_silu_mul\0")
+                .map_err(|e| format!("cutlass_gate_silu_mul: {e}"))?;
+            let fn_gate_silu_mul_ws: WorkspaceSizeFn = *lib
+                .get(b"cutlass_gate_silu_mul_workspace_size\0")
+                .map_err(|e| format!("cutlass_gate_silu_mul_workspace_size: {e}"))?;
+            let fn_hgemm: HgemmFn = *lib
+                .get(b"cutlass_hgemm\0")
                 .map_err(|e| format!("cutlass_hgemm: {e}"))?;
-            let fn_hgemm_ws: WorkspaceSizeFn = *lib.get(b"cutlass_hgemm_workspace_size\0")
+            let fn_hgemm_ws: WorkspaceSizeFn = *lib
+                .get(b"cutlass_hgemm_workspace_size\0")
                 .map_err(|e| format!("cutlass_hgemm_workspace_size: {e}"))?;
 
             Ok(Self {
@@ -103,6 +140,8 @@ impl CutlassKernels {
                 fn_oproj_residual_ws,
                 fn_gateup_silu,
                 fn_gateup_silu_ws,
+                fn_gate_silu_mul,
+                fn_gate_silu_mul_ws,
                 fn_hgemm,
                 fn_hgemm_ws,
             })
@@ -113,9 +152,15 @@ impl CutlassKernels {
     /// All pointers are raw device pointers (u64 from cudarc DevicePtr).
     pub fn qkv_bias_gemm(
         &self,
-        output: u64, input: u64, weight: u64, bias: u64,
-        m: i32, n: i32, k: i32,
-        workspace: u64, workspace_size: usize,
+        output: u64,
+        input: u64,
+        weight: u64,
+        bias: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
         stream: u64,
     ) -> Result<(), String> {
         let status = unsafe {
@@ -124,7 +169,9 @@ impl CutlassKernels {
                 input as *const c_void,
                 weight as *const c_void,
                 bias as *const c_void,
-                m, n, k,
+                m,
+                n,
+                k,
                 workspace as *mut c_void,
                 workspace_size,
                 stream as *mut c_void,
@@ -144,9 +191,15 @@ impl CutlassKernels {
     /// O-projection GEMM with fused residual add.
     pub fn oproj_residual_gemm(
         &self,
-        output: u64, input: u64, weight: u64, residual: u64,
-        m: i32, n: i32, k: i32,
-        workspace: u64, workspace_size: usize,
+        output: u64,
+        input: u64,
+        weight: u64,
+        residual: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
         stream: u64,
     ) -> Result<(), String> {
         let status = unsafe {
@@ -155,7 +208,9 @@ impl CutlassKernels {
                 input as *const c_void,
                 weight as *const c_void,
                 residual as *const c_void,
-                m, n, k,
+                m,
+                n,
+                k,
                 workspace as *mut c_void,
                 workspace_size,
                 stream as *mut c_void,
@@ -177,9 +232,14 @@ impl CutlassKernels {
     /// Output is [M, N/2] after SiLU activation.
     pub fn gateup_silu(
         &self,
-        output: u64, input: u64, weight: u64,
-        m: i32, n: i32, k: i32,
-        workspace: u64, workspace_size: usize,
+        output: u64,
+        input: u64,
+        weight: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
         stream: u64,
     ) -> Result<(), String> {
         let status = unsafe {
@@ -187,7 +247,9 @@ impl CutlassKernels {
                 output as *mut c_void,
                 input as *const c_void,
                 weight as *const c_void,
-                m, n, k,
+                m,
+                n,
+                k,
                 workspace as *mut c_void,
                 workspace_size,
                 stream as *mut c_void,
@@ -204,12 +266,55 @@ impl CutlassKernels {
         unsafe { (self.fn_gateup_silu_ws)(m, n, k) }
     }
 
+    /// Gate-only GEMM with Sm90 epilogue: SiLU(gate) * aux_up.
+    pub fn gate_silu_mul(
+        &self,
+        output: u64,
+        input: u64,
+        gate_weight: u64,
+        aux_up: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<(), String> {
+        let status = unsafe {
+            (self.fn_gate_silu_mul)(
+                output as *mut c_void,
+                input as *const c_void,
+                gate_weight as *const c_void,
+                aux_up as *const c_void,
+                m,
+                n,
+                k,
+                workspace as *mut c_void,
+                workspace_size,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            return Err(format!("cutlass_gate_silu_mul failed: {status}"));
+        }
+        Ok(())
+    }
+
+    pub fn gate_silu_mul_workspace_size(&self, m: i32, n: i32, k: i32) -> usize {
+        unsafe { (self.fn_gate_silu_mul_ws)(m, n, k) }
+    }
+
     /// Plain half-precision GEMM (no epilogue fusion).
     pub fn hgemm(
         &self,
-        output: u64, input: u64, weight: u64,
-        m: i32, n: i32, k: i32,
-        workspace: u64, workspace_size: usize,
+        output: u64,
+        input: u64,
+        weight: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
         stream: u64,
     ) -> Result<(), String> {
         let status = unsafe {
@@ -217,7 +322,9 @@ impl CutlassKernels {
                 output as *mut c_void,
                 input as *const c_void,
                 weight as *const c_void,
-                m, n, k,
+                m,
+                n,
+                k,
                 workspace as *mut c_void,
                 workspace_size,
                 stream as *mut c_void,

@@ -365,6 +365,7 @@ mod cuda_impl {
                     );
                     GemmStrategy::Cublas
                 }
+                None if cutlass.is_some() => GemmStrategy::Hybrid,
                 None => GemmStrategy::Cublas,
                 Some(other) => {
                     info!(
@@ -720,12 +721,14 @@ mod cuda_impl {
                     .map_err(|e| LLMError::GpuError(format!("u8 scratch alloc ({n} elems): {e}")))
             };
             let gateup_ws_bytes = self.cutlass.as_ref().map_or(1usize, |ck| {
-                ck.gateup_silu_workspace_size(
+                let gateup_ws = ck.gateup_silu_workspace_size(
                     max_tokens as i32,
                     (intermediate * 2) as i32,
                     hidden as i32,
-                )
-                .max(1)
+                );
+                let gate_aux_ws =
+                    ck.gate_silu_mul_workspace_size(max_tokens as i32, intermediate as i32, hidden as i32);
+                gateup_ws.max(gate_aux_ws).max(1)
             });
 
             let scratch = F16LayerScratch {

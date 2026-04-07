@@ -305,91 +305,150 @@ impl GpuTransformerLayer {
             LLMError::GpuError("Batched path requires fused_gate_up weight".into())
         })?;
         let gate_up_dim = intermediate * 2;
+        let use_cutlass_gate_aux = Self::use_cutlass_gateup(gemm_strategy)
+            && cutlass.is_some()
+            && !input.is_prefill
+            && weights.fused_gate_up_fp8.is_none()
+            && weights.down_proj_fp8.is_none()
+            && std::env::var("RVLLM_CUTLASS_GATE_AUX").map_or(true, |v| v != "0");
 
-        if Self::use_cutlass_gateup(gemm_strategy) {
-            let ck = cutlass.expect("GemmStrategy::Cutlass requires loaded CUTLASS kernels");
+        if use_cutlass_gate_aux {
+            let ck = cutlass.expect("CUTLASS gate-aux path requires loaded CUTLASS kernels");
+            Self::hgemm_dispatch_fp8_into(
+                &self.stream,
+                blas,
+                lt,
+                &*scratch.normed,
+                weights.up_proj,
+                num_tokens,
+                intermediate,
+                hidden,
+                &self.loader,
+                None,
+                scratch.gate_up,
+            )?;
+
             let m = num_tokens as i32;
-            let n = gate_up_dim as i32;
+            let n = intermediate as i32;
             let k = hidden as i32;
-            let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
+            let ws_bytes = ck.gate_silu_mul_workspace_size(m, n, k);
             if scratch.gateup_ws.len() < ws_bytes.max(1) {
                 return Err(LLMError::GpuError(format!(
-                    "cutlass gateup workspace too small: need {} bytes, have {}",
+                    "cutlass gate_silu_mul workspace too small: need {} bytes, have {}",
                     ws_bytes.max(1),
                     scratch.gateup_ws.len()
                 )));
             }
             let out_ptr = {
-                let (p, _g) = DevicePtrMut::device_ptr_mut(&mut *scratch.silu_out, &self.stream);
+                let (p, _g) =
+                    DevicePtrMut::device_ptr_mut(&mut *scratch.silu_out, &self.stream);
                 p
             };
             let in_ptr = {
                 let (p, _g) = DevicePtr::device_ptr(&*scratch.normed, &self.stream);
                 p
             };
-            let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
+            let (gate_ptr, _g2) = DevicePtr::device_ptr(weights.gate_proj, &self.stream);
+            let (aux_ptr, _g3) = DevicePtr::device_ptr(&*scratch.gate_up, &self.stream);
             let ws_ptr = {
                 let mut ws = scratch.gateup_ws.slice_mut(..ws_bytes.max(1));
                 let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
                 p
             };
             let stream_ptr = self.stream.cu_stream() as u64;
-            ck.gateup_silu(
-                out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
+            ck.gate_silu_mul(
+                out_ptr, in_ptr, gate_ptr, aux_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
             )
-            .map_err(|e| LLMError::GpuError(e))?;
+            .map_err(LLMError::GpuError)?;
         } else {
+            if Self::use_cutlass_gateup(gemm_strategy) {
+                let ck = cutlass.expect("GemmStrategy::Cutlass requires loaded CUTLASS kernels");
+                let m = num_tokens as i32;
+                let n = gate_up_dim as i32;
+                let k = hidden as i32;
+                let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
+                if scratch.gateup_ws.len() < ws_bytes.max(1) {
+                    return Err(LLMError::GpuError(format!(
+                        "cutlass gateup workspace too small: need {} bytes, have {}",
+                        ws_bytes.max(1),
+                        scratch.gateup_ws.len()
+                    )));
+                }
+                let out_ptr = {
+                    let (p, _g) =
+                        DevicePtrMut::device_ptr_mut(&mut *scratch.silu_out, &self.stream);
+                    p
+                };
+                let in_ptr = {
+                    let (p, _g) = DevicePtr::device_ptr(&*scratch.normed, &self.stream);
+                    p
+                };
+                let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
+                let ws_ptr = {
+                    let mut ws = scratch.gateup_ws.slice_mut(..ws_bytes.max(1));
+                    let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                    p
+                };
+                let stream_ptr = self.stream.cu_stream() as u64;
+                ck.gateup_silu(
+                    out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
+                )
+                .map_err(|e| LLMError::GpuError(e))?;
+            } else {
+                Self::hgemm_dispatch_fp8_into(
+                    &self.stream,
+                    blas,
+                    lt,
+                    &*scratch.normed,
+                    fused_gate_up,
+                    num_tokens,
+                    gate_up_dim,
+                    hidden,
+                    &self.loader,
+                    weights.fused_gate_up_fp8,
+                    scratch.gate_up,
+                )?;
+                let silu_fn = self
+                    .loader
+                    .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
+                    .map_err(|e| {
+                        LLMError::GpuError(format!(
+                            "Required silu_mul_interleaved kernel missing: {e}"
+                        ))
+                    })?;
+                let n_elems = num_tokens * intermediate;
+                let total = n_elems as u32;
+                unsafe {
+                    self.stream
+                        .launch_builder(&silu_fn)
+                        .arg(&mut *scratch.silu_out)
+                        .arg(&*scratch.gate_up)
+                        .arg(&(num_tokens as i32))
+                        .arg(&(intermediate as i32))
+                        .launch(LaunchConfig {
+                            grid_dim: ((total + 255) / 256, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
+                }
+            }
+
+            // 10. Down projection into scratch.down
             Self::hgemm_dispatch_fp8_into(
                 &self.stream,
                 blas,
                 lt,
-                &*scratch.normed,
-                fused_gate_up,
+                &*scratch.silu_out,
+                weights.down_proj,
                 num_tokens,
-                gate_up_dim,
                 hidden,
+                intermediate,
                 &self.loader,
-                weights.fused_gate_up_fp8,
-                scratch.gate_up,
+                weights.down_proj_fp8,
+                scratch.down,
             )?;
-            let silu_fn = self
-                .loader
-                .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
-                .map_err(|e| {
-                    LLMError::GpuError(format!("Required silu_mul_interleaved kernel missing: {e}"))
-                })?;
-            let n_elems = num_tokens * intermediate;
-            let total = n_elems as u32;
-            unsafe {
-                self.stream
-                    .launch_builder(&silu_fn)
-                    .arg(&mut *scratch.silu_out)
-                    .arg(&*scratch.gate_up)
-                    .arg(&(num_tokens as i32))
-                    .arg(&(intermediate as i32))
-                    .launch(LaunchConfig {
-                        grid_dim: ((total + 255) / 256, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                    .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
-            }
         }
-
-        // 10. Down projection into scratch.down
-        Self::hgemm_dispatch_fp8_into(
-            &self.stream,
-            blas,
-            lt,
-            &*scratch.silu_out,
-            weights.down_proj,
-            num_tokens,
-            hidden,
-            intermediate,
-            &self.loader,
-            weights.down_proj_fp8,
-            scratch.down,
-        )?;
 
         Ok(())
     }

@@ -22,6 +22,8 @@
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
 #include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/fusion/operations.hpp>
+#include <cutlass/epilogue/thread/activation.h>
 #include <cute/tensor.hpp>
 #include <cutlass/util/packed_stride.hpp>
 #include <cuda_fp16.h>
@@ -88,6 +90,62 @@ using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
 >;
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+template <class T>
+struct SiLuMulAux {
+    CUTLASS_HOST_DEVICE
+    T operator()(T const& z, T const& aux) const {
+        cutlass::epilogue::thread::SiLu<T> silu;
+        cutlass::multiplies<T> mul;
+        return mul(silu(z), aux);
+    }
+};
+
+using GateElementAux = cutlass::half_t;
+using GateLayoutAux = cutlass::layout::RowMajor;
+using GateFusionOp = cutlass::epilogue::fusion::LinCombDeEltAct<
+    GateLayoutAux,
+    SiLuMulAux,
+    ElementC,
+    ElementAccum,
+    GateElementAux,
+    void,
+    ElementAccum
+>;
+
+using GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
+using GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+
+using GateCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    TileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccum, ElementAccum,
+    void, LayoutC, 8,
+    ElementC, LayoutC, 8,
+    GateEpilogueSchedule,
+    GateFusionOp
+>::CollectiveOp;
+
+using GateCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    ElementA, LayoutA, 8,
+    ElementB, LayoutB, 8,
+    ElementAccum,
+    TileShape,
+    ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename GateCollectiveEpilogue::SharedStorage))>,
+    GateKernelSchedule
+>::CollectiveOp;
+
+using GateGemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    GateCollectiveMainloop,
+    GateCollectiveEpilogue
+>;
+
+using GateGemm = cutlass::gemm::device::GemmUniversalAdapter<GateGemmKernel>;
 
 // ============================================================================
 // Fused SiLU*Mul kernel: reads [M, 2*I], writes [M, I]
@@ -175,6 +233,30 @@ size_t cutlass_gateup_silu_workspace_size(int M, int N, int K) {
     return gemm_ws + temp_bytes;
 }
 
+size_t cutlass_gate_silu_mul_workspace_size(int M, int N, int K) {
+    auto prob_shape = cute::make_shape(M, N, K, 1);
+    auto stride_A = cutlass::make_cute_packed_stride(
+        typename GateGemm::GemmKernel::StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(
+        typename GateGemm::GemmKernel::StrideB{}, {N, K, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(
+        typename GateGemm::GemmKernel::StrideD{}, {M, N, 1});
+
+    typename GateGemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        prob_shape,
+        {nullptr, stride_A, nullptr, stride_B},
+        {}
+    };
+    args.epilogue.ptr_C = nullptr;
+    args.epilogue.dC = {};
+    args.epilogue.ptr_D = nullptr;
+    args.epilogue.dD = stride_D;
+
+    GateGemm gemm_op;
+    return gemm_op.get_workspace_size(args);
+}
+
 // Fused GateUp GEMM + SiLU*Mul
 //   output:     [M, N/2] -- final activated output (half width)
 //   input:      [M, K]   -- hidden states
@@ -256,6 +338,56 @@ int cutlass_gateup_silu(
         M,
         intermediate_size
     );
+
+    return 0;
+}
+
+int cutlass_gate_silu_mul(
+    void* output,
+    const void* input,
+    const void* gate_weight,
+    const void* aux_up,
+    int M, int N, int K,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream
+) {
+    auto prob_shape = cute::make_shape(M, N, K, 1);
+
+    auto stride_A = cutlass::make_cute_packed_stride(
+        typename GateGemm::GemmKernel::StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(
+        typename GateGemm::GemmKernel::StrideB{}, {N, K, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(
+        typename GateGemm::GemmKernel::StrideD{}, {M, N, 1});
+
+    typename GateGemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        prob_shape,
+        {
+            reinterpret_cast<const ElementA*>(input), stride_A,
+            reinterpret_cast<const ElementB*>(gate_weight), stride_B,
+        },
+        {}
+    };
+    args.epilogue.ptr_C = nullptr;
+    args.epilogue.dC = {};
+    args.epilogue.ptr_D = reinterpret_cast<ElementC*>(output);
+    args.epilogue.dD = stride_D;
+    args.epilogue.thread.alpha = ElementAccum(1.0f);
+    args.epilogue.thread.beta = ElementAccum(0.0f);
+    args.epilogue.thread.aux_ptr = reinterpret_cast<const ElementC*>(aux_up);
+    args.epilogue.thread.dAux = stride_D;
+
+    GateGemm gemm_op;
+    cutlass::Status status = gemm_op.can_implement(args);
+    if (status != cutlass::Status::kSuccess) return -1;
+
+    status = gemm_op.initialize(args, workspace, stream);
+    if (status != cutlass::Status::kSuccess) return -2;
+
+    status = gemm_op(stream);
+    if (status != cutlass::Status::kSuccess) return -3;
 
     return 0;
 }

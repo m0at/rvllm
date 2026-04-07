@@ -25,6 +25,7 @@ NVCC=${NVCC:-nvcc}
 NVCC_FLAGS="-std=c++17 -arch=${ARCH}a --expt-relaxed-constexpr -O3 --use_fast_math \
     -I${CUTLASS_DIR}/include \
     -I${CUTLASS_DIR}/tools/util/include \
+    -I${CUTLASS_DIR}/examples/45_dual_gemm \
     --compiler-options -fPIC"
 
 echo "Building CUTLASS shared library for $ARCH..."
