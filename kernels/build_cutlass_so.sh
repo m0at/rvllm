@@ -45,6 +45,22 @@ for var in \
     fi
 done
 
+GATE_SOURCE_GEN=${RVLLM_CUTLASS_GATE_SOURCE_GEN:-0}
+
+generate_gate_source() {
+    local src="$1"
+    local out="$2"
+    cp "$src" "$out"
+    perl -0pi -e 's@\n#ifndef RVLLM_CUTLASS_GATE_TILE_M.*?#define RVLLM_CUTE_INT\(x\) RVLLM_CUTE_INT_\(x\)\n@@s' "$out"
+    perl -0pi -e "s@using GateTileShape = Shape<.*?>;@using GateTileShape = Shape<_${RVLLM_CUTLASS_GATE_TILE_M}, _${RVLLM_CUTLASS_GATE_TILE_N}, _${RVLLM_CUTLASS_GATE_TILE_K}>;@s" "$out"
+    perl -0pi -e "s@using GateClusterShape = Shape<.*?>;@using GateClusterShape = Shape<_${RVLLM_CUTLASS_GATE_CLUSTER_M}, _${RVLLM_CUTLASS_GATE_CLUSTER_N}, _${RVLLM_CUTLASS_GATE_CLUSTER_K}>;@s" "$out"
+    if [ "${RVLLM_CUTLASS_GATE_SCHEDULE:-0}" = "1" ]; then
+        perl -0pi -e 's@#if RVLLM_CUTLASS_GATE_SCHEDULE == 1\nusing GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;\nusing GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;\n#else\nusing GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecialized;\nusing GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized;\n#endif@using GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;\nusing GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;@s' "$out"
+    else
+        perl -0pi -e 's@#if RVLLM_CUTLASS_GATE_SCHEDULE == 1\nusing GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;\nusing GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;\n#else\nusing GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecialized;\nusing GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized;\n#endif@using GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecialized;\nusing GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized;@s' "$out"
+    fi
+}
+
 echo "Building CUTLASS shared library for $ARCH..."
 if [ -n "$GATE_DEFINES" ]; then
     echo "  cutlass_gateup_silu.cu defines:$GATE_DEFINES"
@@ -61,8 +77,14 @@ for f in cutlass_qkv_bias.cu cutlass_oproj_residual.cu cutlass_gateup_silu.cu cu
     stem=${f%.cu}
     obj="$OBJ_DIR/${stem}.o"
     EXTRA_FLAGS=""
+    SOURCE_FILE="$f"
     if [ "$f" = "cutlass_gateup_silu.cu" ]; then
         EXTRA_FLAGS="$GATE_DEFINES"
+        if [ "$GATE_SOURCE_GEN" = "1" ]; then
+            SOURCE_FILE="$ARCH/generated_${stem}.cu"
+            generate_gate_source "$f" "$SOURCE_FILE"
+            EXTRA_FLAGS=""
+        fi
     fi
     if [ "$GATE_ONLY" = "1" ] && [ "$f" != "cutlass_gateup_silu.cu" ] && [ -f "$obj" ]; then
         echo "  $f -> ${stem}.o ... cached"
@@ -70,7 +92,7 @@ for f in cutlass_qkv_bias.cu cutlass_oproj_residual.cu cutlass_gateup_silu.cu cu
         continue
     fi
     echo -n "  $f -> ${stem}.o ... "
-    if $NVCC -c $NVCC_FLAGS $EXTRA_FLAGS -o "$obj" "$f" 2>/tmp/nvcc_so_${stem}.log; then
+    if $NVCC -c $NVCC_FLAGS $EXTRA_FLAGS -o "$obj" "$SOURCE_FILE" 2>/tmp/nvcc_so_${stem}.log; then
         echo "ok"
         OBJS="$OBJS $obj"
         OK=$((OK + 1))

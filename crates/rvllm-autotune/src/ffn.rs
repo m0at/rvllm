@@ -759,6 +759,7 @@ fn build_gate_variant(
         .arg(arch)
         .arg(cutlass_dir)
         .env("RVLLM_CUTLASS_GATE_ONLY", "1")
+        .env("RVLLM_CUTLASS_GATE_SOURCE_GEN", "1")
         .env("RVLLM_CUTLASS_GATE_TILE_M", config.tile_m.to_string())
         .env("RVLLM_CUTLASS_GATE_TILE_N", config.tile_n.to_string())
         .env("RVLLM_CUTLASS_GATE_TILE_K", config.tile_k.to_string())
