@@ -116,7 +116,8 @@ profile_vllm() {
     local base="$OUT_DIR/profiles/vllm_n${n}"
     local out_json="$OUT_DIR/benchmarks/vllm_profile_n${n}.json"
     log "vllm nsys n=${n}"
-    "$NSYS_BIN" profile --stats=true --force-overwrite=true -o "$base" \
+    "$NSYS_BIN" profile --stats=true --force-overwrite=true \
+        --wait=all --trace-fork-before-exec=true -o "$base" \
         python3 deploy/vllm_direct_bench.py \
             --model "$MODEL" \
             --max-tokens "$PROFILE_OUTPUT_LEN" \
