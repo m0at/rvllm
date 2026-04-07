@@ -1183,8 +1183,8 @@ use rvllm_core::prelude::{
                 } else {
                     0
                 };
-                let mut seq_data = HashMap::new();
-                let mut block_tables = HashMap::new();
+                let mut seq_data = HashMap::with_capacity(group.sequences.len());
+                let mut block_tables = HashMap::with_capacity(group.sequences.len());
 
                 for (seq_idx, seq) in group.sequences.iter().enumerate() {
                     if seq.is_finished() {
@@ -1237,8 +1237,8 @@ use rvllm_core::prelude::{
                                     .copied()
                                     .unwrap_or(0);
                                 SequenceData {
-                                    prompt_token_ids: seq.prompt_token_ids.clone(),
-                                    output_token_ids: seq.output_token_ids.clone(),
+                                    prompt_token_ids: Vec::new(),
+                                    output_token_ids: Vec::new(),
                                     cumulative_logprob: seq.cumulative_logprob,
                                     seq_len: seq_len as u32,
                                     last_token_id,
