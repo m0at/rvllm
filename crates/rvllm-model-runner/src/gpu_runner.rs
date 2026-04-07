@@ -72,8 +72,8 @@ mod cuda_impl {
     use crate::runner::ModelRunnerConfig;
 
     use crate::gpu_layer::{
-        BatchedLayerPhaseTimings, ForwardPath, GemmStrategy, GpuLayerConfig, GpuLayerInput,
-        GpuLayerWeights, GpuTransformerLayer, LayerScratchRef,
+        BatchedLayerPhaseTimings, BatchedV2PolicyConfig, ForwardPath, GemmStrategy,
+        GpuLayerConfig, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer, LayerScratchRef,
     };
     use crate::layers::linear_cuda::CudaLinearLayer;
 
@@ -393,6 +393,16 @@ mod cuda_impl {
                 .clone();
 
             let mut layers = Vec::with_capacity(config.num_layers);
+            let batched_v2_policy = BatchedV2PolicyConfig {
+                use_cutlass_qkv: std::env::var("RVLLM_V2_CUTLASS_QKV")
+                    .map_or(false, |v| v == "1"),
+                use_cutlass_oproj: std::env::var("RVLLM_V2_CUTLASS_OPROJ")
+                    .map_or(false, |v| v == "1"),
+                use_cutlass_gateup: std::env::var("RVLLM_V2_CUTLASS_GATEUP")
+                    .map_or(false, |v| v == "1"),
+                use_cutlass_gate_aux: std::env::var("RVLLM_V2_CUTLASS_GATE_AUX")
+                    .map_or(false, |v| v == "1"),
+            };
             for i in 0..config.num_layers {
                 let layer_cfg = GpuLayerConfig {
                     hidden_size: config.hidden_size,
@@ -407,6 +417,7 @@ mod cuda_impl {
                     layer_cfg,
                     Arc::clone(&stream),
                     Arc::clone(&loader),
+                    batched_v2_policy,
                 ));
             }
             info!(

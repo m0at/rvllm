@@ -157,6 +157,14 @@ mod inner {
         Cublas,
     }
 
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct BatchedV2PolicyConfig {
+        pub use_cutlass_qkv: bool,
+        pub use_cutlass_oproj: bool,
+        pub use_cutlass_gateup: bool,
+        pub use_cutlass_gate_aux: bool,
+    }
+
     // ===================================================================
     // GpuTransformerLayer
     // ===================================================================
@@ -165,6 +173,7 @@ mod inner {
         pub(crate) config: GpuLayerConfig,
         pub(crate) stream: Arc<CudaStream>,
         pub(crate) loader: Arc<KernelLoader>,
+        pub(crate) batched_v2_policy: BatchedV2PolicyConfig,
     }
 
     impl GpuTransformerLayer {
@@ -172,11 +181,13 @@ mod inner {
             config: GpuLayerConfig,
             stream: Arc<CudaStream>,
             loader: Arc<KernelLoader>,
+            batched_v2_policy: BatchedV2PolicyConfig,
         ) -> Self {
             Self {
                 config,
                 stream,
                 loader,
+                batched_v2_policy,
             }
         }
 

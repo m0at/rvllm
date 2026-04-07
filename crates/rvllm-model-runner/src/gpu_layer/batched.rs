@@ -132,7 +132,7 @@ impl GpuTransformerLayer {
         gemm_strategy: GemmStrategy,
         cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
     ) -> Result<()> {
-        let policy = Self::batched_v2_policy(input, weights, cutlass);
+        let policy = self.batched_v2_policy(input, weights, cutlass);
         self.forward_batched_with_policy(
             input,
             weights,
@@ -167,23 +167,21 @@ impl GpuTransformerLayer {
     }
 
     fn batched_v2_policy(
+        &self,
         input: &GpuLayerInput<'_>,
         weights: &GpuLayerWeights<'_>,
         cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
     ) -> BatchedPipelinePolicy {
         let cutlass_loaded = cutlass.is_some();
-        let gateup =
-            cutlass_loaded && std::env::var("RVLLM_V2_CUTLASS_GATEUP").map_or(false, |v| v == "1");
+        let gateup = cutlass_loaded && self.batched_v2_policy.use_cutlass_gateup;
         let gate_aux = gateup
             && !input.is_prefill
             && weights.fused_gate_up_fp8.is_none()
             && weights.down_proj_fp8.is_none()
-            && std::env::var("RVLLM_V2_CUTLASS_GATE_AUX").map_or(false, |v| v == "1");
+            && self.batched_v2_policy.use_cutlass_gate_aux;
         BatchedPipelinePolicy {
-            use_cutlass_qkv: cutlass_loaded
-                && std::env::var("RVLLM_V2_CUTLASS_QKV").map_or(false, |v| v == "1"),
-            use_cutlass_oproj: cutlass_loaded
-                && std::env::var("RVLLM_V2_CUTLASS_OPROJ").map_or(false, |v| v == "1"),
+            use_cutlass_qkv: cutlass_loaded && self.batched_v2_policy.use_cutlass_qkv,
+            use_cutlass_oproj: cutlass_loaded && self.batched_v2_policy.use_cutlass_oproj,
             use_cutlass_gateup: gateup,
             use_cutlass_gate_aux: gate_aux,
         }
