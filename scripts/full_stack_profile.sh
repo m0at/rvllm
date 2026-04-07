@@ -10,6 +10,7 @@ OUTPUT_LEN="${OUTPUT_LEN:-128}"
 PROFILE_OUTPUT_LEN="${PROFILE_OUTPUT_LEN:-128}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+PROFILE_GPU_MEM_UTIL="${PROFILE_GPU_MEM_UTIL:-$GPU_MEM_UTIL}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 WARMUP_MAX_TOKENS="${WARMUP_MAX_TOKENS:-5}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/results/full_stack_profile/$(date +%Y%m%d_%H%M%S)}"
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
         --output-len) OUTPUT_LEN="$2"; shift 2 ;;
         --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
         --gpu-mem) GPU_MEM_UTIL="$2"; shift 2 ;;
+        --profile-gpu-mem) PROFILE_GPU_MEM_UTIL="$2"; shift 2 ;;
         --out-dir) OUT_DIR="$2"; shift 2 ;;
         --ncu-set) NCU_SET="$2"; shift 2 ;;
         *) echo "unknown flag: $1" >&2; exit 1 ;;
@@ -59,7 +61,7 @@ run_ncu_rvllm() {
             --n "$n" \
             --output-len "$PROFILE_OUTPUT_LEN" \
             --max-model-len "$MAX_MODEL_LEN" \
-            --gpu-memory-utilization "$GPU_MEM_UTIL" \
+            --gpu-memory-utilization "$PROFILE_GPU_MEM_UTIL" \
             --json > "${base}.stdout" 2> "${base}.stderr" || true
 }
 
@@ -72,7 +74,7 @@ run_ncu_vllm() {
             --model "$MODEL" \
             --max-tokens "$PROFILE_OUTPUT_LEN" \
             --max-model-len "$MAX_MODEL_LEN" \
-            --gpu-memory-utilization "$GPU_MEM_UTIL" \
+            --gpu-memory-utilization "$PROFILE_GPU_MEM_UTIL" \
             --concurrency "$n" \
             --temperature "$TEMPERATURE" \
             --warmup-concurrency "$n" \
@@ -92,7 +94,7 @@ run_vllm_flamegraph() {
             --model "$MODEL" \
             --max-tokens "$PROFILE_OUTPUT_LEN" \
             --max-model-len "$MAX_MODEL_LEN" \
-            --gpu-memory-utilization "$GPU_MEM_UTIL" \
+            --gpu-memory-utilization "$PROFILE_GPU_MEM_UTIL" \
             --concurrency 64 \
             --temperature "$TEMPERATURE" \
             --warmup-concurrency 64 \
@@ -110,6 +112,7 @@ bash scripts/profile_compare.sh \
     --profile-ns "$N_VALUES" \
     --profile-output-len "$PROFILE_OUTPUT_LEN" \
     --gpu-mem "$GPU_MEM_UTIL" \
+    --profile-gpu-mem "$PROFILE_GPU_MEM_UTIL" \
     --max-model-len "$MAX_MODEL_LEN" \
     --warmup-max-tokens "$WARMUP_MAX_TOKENS" \
     --out-dir "$OUT_DIR"
