@@ -1,0 +1,14 @@
+{
+  "engine": "rvllm",
+  "model": "/root/models/Qwen2.5-7B",
+  "output_len": 128,
+  "results": [
+    {
+      "elapsed_ms": 964,
+      "failed": 0,
+      "n": 64,
+      "tok_per_sec": 8496.9,
+      "total_tokens": 8192
+    }
+  ]
+}
