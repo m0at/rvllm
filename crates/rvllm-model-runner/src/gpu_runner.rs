@@ -143,6 +143,45 @@ mod cuda_impl {
         }
     }
 
+    struct PersistentDecodeMetadataBuffers {
+        token_ids: RefCell<ReusableGpuBuf>,
+        positions: RefCell<ReusableGpuBuf>,
+        context_lens: RefCell<ReusableGpuBuf>,
+        block_tables: RefCell<ReusableGpuBuf>,
+        slot_mapping: RefCell<ReusableGpuBuf>,
+        seq_start_pos: RefCell<ReusableGpuBuf>,
+    }
+
+    impl PersistentDecodeMetadataBuffers {
+        fn new() -> Self {
+            Self {
+                token_ids: RefCell::new(ReusableGpuBuf::new()),
+                positions: RefCell::new(ReusableGpuBuf::new()),
+                context_lens: RefCell::new(ReusableGpuBuf::new()),
+                block_tables: RefCell::new(ReusableGpuBuf::new()),
+                slot_mapping: RefCell::new(ReusableGpuBuf::new()),
+                seq_start_pos: RefCell::new(ReusableGpuBuf::new()),
+            }
+        }
+
+        fn ensure_len(
+            &self,
+            padded: usize,
+            max_blocks: usize,
+            stream: &Arc<CudaStream>,
+        ) -> std::result::Result<(), cudarc::driver::result::DriverError> {
+            self.token_ids.borrow_mut().ensure_len(padded, stream)?;
+            self.positions.borrow_mut().ensure_len(padded, stream)?;
+            self.context_lens.borrow_mut().ensure_len(padded, stream)?;
+            self.block_tables
+                .borrow_mut()
+                .ensure_len(padded * max_blocks, stream)?;
+            self.slot_mapping.borrow_mut().ensure_len(padded, stream)?;
+            self.seq_start_pos.borrow_mut().ensure_len(padded + 1, stream)?;
+            Ok(())
+        }
+    }
+
     /// Pre-allocated f16 scratch buffers for the forward pass.
     /// Sized for max_batch_tokens. Reused across all layers (sequential execution).
     pub struct F16LayerScratch {
@@ -322,6 +361,8 @@ mod cuda_impl {
         graph_output: RefCell<Option<CudaSlice<i32>>>,
         /// Reusable CPU scratch buffer for packing metadata.
         cpu_scratch: RefCell<Vec<i32>>,
+        /// Persistent device-side decode metadata state for BatchedV2.
+        persistent_decode_meta: PersistentDecodeMetadataBuffers,
         /// Fixed max blocks per sequence for CUDA graph capture/replay.
         graph_max_blocks: usize,
         /// Fused QKV weights per layer: [q_dim + kv_dim + kv_dim, hidden] f16.
@@ -575,6 +616,7 @@ mod cuda_impl {
                 meta_packed_offsets: Cell::new(PackedMetaOffsets::default()),
                 graph_output: RefCell::new(None),
                 cpu_scratch: RefCell::new(Vec::with_capacity(4096)),
+                persistent_decode_meta: PersistentDecodeMetadataBuffers::new(),
                 graph_max_blocks,
                 fused_qkv_weights: Vec::new(),
                 fused_gate_up_weights: Vec::new(),
@@ -1856,24 +1898,22 @@ mod cuda_impl {
             let dummy_ctx = attn_meta.context_lens.first().copied().unwrap_or(1) as i32;
             let dummy_bt = attn_meta.block_tables.first();
 
-            let mut scratch = self.cpu_scratch.borrow_mut();
-            scratch.clear();
-            scratch.resize(total_len, 0i32);
+            let mut token_ids_host = vec![0i32; padded];
+            for (dst, &src) in token_ids_host.iter_mut().zip(token_ids.iter()) {
+                *dst = src as i32;
+            }
 
-            for (idx, &tok) in token_ids.iter().enumerate() {
-                scratch[token_ids_off + idx] = tok as i32;
+            let mut positions_host = vec![0i32; padded];
+            for (dst, &src) in positions_host.iter_mut().zip(positions.iter()) {
+                *dst = src as i32;
             }
-            for (idx, &pos) in positions.iter().enumerate() {
-                scratch[positions_off + idx] = pos as i32;
+
+            let mut context_lens_host = vec![dummy_ctx; padded];
+            for (dst, &src) in context_lens_host.iter_mut().zip(attn_meta.context_lens.iter()) {
+                *dst = src as i32;
             }
-            for idx in 0..padded {
-                scratch[context_lens_off + idx] = attn_meta
-                    .context_lens
-                    .get(idx)
-                    .copied()
-                    .map(|v| v as i32)
-                    .unwrap_or(dummy_ctx);
-            }
+
+            let mut block_tables_host = vec![0i32; bt_len];
             for seq_idx in 0..padded {
                 let row = attn_meta
                     .block_tables
@@ -1881,27 +1921,122 @@ mod cuda_impl {
                     .or(dummy_bt)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                let row_base = block_tables_off + seq_idx * max_blocks;
+                let row_base = seq_idx * max_blocks;
                 for (blk_idx, &blk) in row.iter().take(max_blocks).enumerate() {
-                    scratch[row_base + blk_idx] = blk as i32;
+                    block_tables_host[row_base + blk_idx] = blk as i32;
                 }
             }
-            for (idx, &slot) in attn_meta.slot_mapping.iter().enumerate().take(padded) {
-                scratch[slot_mapping_off + idx] = slot as i32;
+
+            let mut slot_mapping_host = vec![0i32; padded];
+            for (dst, &src) in slot_mapping_host
+                .iter_mut()
+                .zip(attn_meta.slot_mapping.iter())
+            {
+                *dst = src as i32;
             }
 
+            let mut seq_start_pos_host = vec![0i32; padded + 1];
             let mut seq_pos = 0i32;
             for idx in 0..padded {
-                scratch[seq_start_pos_off + idx] = seq_pos;
+                seq_start_pos_host[idx] = seq_pos;
                 seq_pos += attn_meta.query_lens.get(idx).copied().unwrap_or(1) as i32;
             }
-            scratch[seq_start_pos_off + padded] = seq_pos;
+            seq_start_pos_host[padded] = seq_pos;
+
+            self.persistent_decode_meta
+                .ensure_len(padded, max_blocks, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 persistent meta alloc: {e}")))?;
+
+            self.persistent_decode_meta
+                .token_ids
+                .borrow_mut()
+                .upload(&token_ids_host, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 token_ids HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .positions
+                .borrow_mut()
+                .upload(&positions_host, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 positions HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .context_lens
+                .borrow_mut()
+                .upload(&context_lens_host, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 context_lens HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .block_tables
+                .borrow_mut()
+                .upload(&block_tables_host, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 block_tables HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .slot_mapping
+                .borrow_mut()
+                .upload(&slot_mapping_host, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 slot_mapping HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .seq_start_pos
+                .borrow_mut()
+                .upload(&seq_start_pos_host, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 seq_start_pos HtoD: {e}")))?;
 
             let mut meta = self.meta_packed.borrow_mut();
             meta.ensure_len(total_len, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("decode v2 meta alloc: {e}")))?;
-            meta.upload(&scratch, &self.stream)
-                .map_err(|e| LLMError::GpuError(format!("decode v2 packed metadata HtoD: {e}")))?;
+            let packed = meta.buf.as_mut().expect("meta_packed allocated");
+
+            {
+                let src = self.persistent_decode_meta.token_ids.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(token_ids_off..token_ids_off + padded),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 token_ids DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.positions.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(positions_off..positions_off + padded),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 positions DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.context_lens.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(context_lens_off..context_lens_off + padded),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 context_lens DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.block_tables.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(block_tables_off..block_tables_off + bt_len),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 block_tables DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.slot_mapping.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(slot_mapping_off..slot_mapping_off + padded),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 slot_mapping DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.seq_start_pos.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(seq_start_pos_off..seq_start_pos_off + padded + 1),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 seq_start_pos DtoD: {e}")))?;
+            }
 
             self.meta_packed_offsets.set(PackedMetaOffsets {
                 token_ids: token_ids_off,
@@ -2339,9 +2474,11 @@ mod cuda_impl {
             //   block_tables(N * graph_max_blocks) + slot_mapping(N) + seq_start_pos(N+1)
             let max_seqs = 256usize; // must match max_num_seqs
             let max_meta = max_seqs * (1 + 1 + 1 + self.graph_max_blocks + 1 + 1) + 1;
+            self.persistent_decode_meta
+                .ensure_len(max_seqs, self.graph_max_blocks, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("pre-alloc persistent v2 meta: {e}")))?;
             let mut meta = self.meta_packed.borrow_mut();
-            let dummy = vec![0i32; max_meta];
-            meta.upload(&dummy, &self.stream)
+            meta.ensure_len(max_meta, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("pre-alloc meta: {e}")))?;
             info!(
                 max_meta,
