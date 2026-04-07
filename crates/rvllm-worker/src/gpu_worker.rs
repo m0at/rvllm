@@ -745,7 +745,9 @@ impl GpuWorker {
             };
 
             // Warmup forward (outside capture)
-            let upload_result = if plan.graph_tokens == n {
+            let upload_result = if plan.use_batched_v2 {
+                runner.upload_decode_metadata_v2(&token_ids, &positions, &attn_meta, plan.graph_tokens)
+            } else if plan.graph_tokens == n {
                 runner.upload_metadata(&token_ids, &positions, &attn_meta)
             } else {
                 runner.upload_metadata_padded(&token_ids, &positions, &attn_meta, plan.graph_tokens)
@@ -775,7 +777,9 @@ impl GpuWorker {
             }
 
             // Re-upload for capture
-            let reupload_result = if plan.graph_tokens == n {
+            let reupload_result = if plan.use_batched_v2 {
+                runner.upload_decode_metadata_v2(&token_ids, &positions, &attn_meta, plan.graph_tokens)
+            } else if plan.graph_tokens == n {
                 runner.upload_metadata(&token_ids, &positions, &attn_meta)
             } else {
                 runner.upload_metadata_padded(&token_ids, &positions, &attn_meta, plan.graph_tokens)
@@ -1717,7 +1721,14 @@ impl GpuWorker {
             .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
 
         // Upload metadata (skip clone when no padding needed)
-        if actual_batch == padded_batch {
+        if plan.use_batched_v2 {
+            runner.upload_decode_metadata_v2(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                padded_batch,
+            )?;
+        } else if actual_batch == padded_batch {
             runner.upload_metadata(
                 &model_input.token_ids,
                 &model_input.position_ids,
@@ -1785,12 +1796,21 @@ impl GpuWorker {
         );
 
         // Warmup forward (outside capture)
-        runner.upload_metadata_padded(
-            &model_input.token_ids,
-            &model_input.position_ids,
-            &model_input.attention_metadata,
-            padded_batch,
-        )?;
+        if plan.use_batched_v2 {
+            runner.upload_decode_metadata_v2(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                padded_batch,
+            )?;
+        } else {
+            runner.upload_metadata_padded(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                padded_batch,
+            )?;
+        }
         runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false)?;
 
         // Sync before capture
@@ -1800,12 +1820,21 @@ impl GpuWorker {
             .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
 
         // Re-upload padded metadata
-        runner.upload_metadata_padded(
-            &model_input.token_ids,
-            &model_input.position_ids,
-            &model_input.attention_metadata,
-            padded_batch,
-        )?;
+        if plan.use_batched_v2 {
+            runner.upload_decode_metadata_v2(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                padded_batch,
+            )?;
+        } else {
+            runner.upload_metadata_padded(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                padded_batch,
+            )?;
+        }
 
         // Capture
         let capture_result = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream);

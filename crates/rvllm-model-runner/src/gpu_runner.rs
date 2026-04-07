@@ -29,6 +29,7 @@ pub struct DecodeExecutionPlan {
     pub actual_tokens: usize,
     pub graph_tokens: usize,
     pub use_graphed_decode: bool,
+    pub use_batched_v2: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -101,6 +102,20 @@ mod cuda_impl {
 
         fn slice(&self) -> &CudaSlice<i32> {
             self.buf.as_ref().expect("upload() must be called first")
+        }
+
+        fn ensure_len(
+            &mut self,
+            len: usize,
+            stream: &Arc<CudaStream>,
+        ) -> std::result::Result<(), cudarc::driver::result::DriverError> {
+            let need = len.max(1);
+            let have = self.buf.as_ref().map_or(0, |b| b.len());
+            if have < need {
+                let cap = need.max(have * 2).max(64);
+                self.buf = Some(stream.alloc_zeros::<i32>(cap)?);
+            }
+            Ok(())
         }
     }
 
@@ -1777,6 +1792,95 @@ mod cuda_impl {
             self.upload_metadata(&padded_tokens, &padded_positions, &padded_meta)
         }
 
+        /// Upload decode metadata for the V2 graphed path using a stable padded
+        /// packed layout without cloning a temporary metadata object.
+        pub fn upload_decode_metadata_v2(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            attn_meta: &crate::bridge::AttentionMetadata,
+            padded_batch: usize,
+        ) -> Result<()> {
+            let actual = token_ids.len();
+            let padded = padded_batch.max(actual);
+            let max_blocks = self.graph_max_blocks;
+            let bt_len = padded * max_blocks;
+            let token_ids_off = 0usize;
+            let positions_off = token_ids_off + padded;
+            let context_lens_off = positions_off + padded;
+            let block_tables_off = context_lens_off + padded;
+            let slot_mapping_off = block_tables_off + bt_len;
+            let seq_start_pos_off = slot_mapping_off + padded;
+            let total_len = seq_start_pos_off + padded + 1;
+
+            let dummy_ctx = attn_meta.context_lens.first().copied().unwrap_or(1) as i32;
+            let dummy_bt = attn_meta.block_tables.first();
+
+            let mut scratch = self.cpu_scratch.borrow_mut();
+            scratch.clear();
+            scratch.resize(total_len, 0i32);
+
+            for (idx, &tok) in token_ids.iter().enumerate() {
+                scratch[token_ids_off + idx] = tok as i32;
+            }
+            for (idx, &pos) in positions.iter().enumerate() {
+                scratch[positions_off + idx] = pos as i32;
+            }
+            for idx in 0..padded {
+                scratch[context_lens_off + idx] = attn_meta
+                    .context_lens
+                    .get(idx)
+                    .copied()
+                    .map(|v| v as i32)
+                    .unwrap_or(dummy_ctx);
+            }
+            for seq_idx in 0..padded {
+                let row = attn_meta
+                    .block_tables
+                    .get(seq_idx)
+                    .or(dummy_bt)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let row_base = block_tables_off + seq_idx * max_blocks;
+                for (blk_idx, &blk) in row.iter().take(max_blocks).enumerate() {
+                    scratch[row_base + blk_idx] = blk as i32;
+                }
+            }
+            for (idx, &slot) in attn_meta.slot_mapping.iter().enumerate().take(padded) {
+                scratch[slot_mapping_off + idx] = slot as i32;
+            }
+
+            let mut seq_pos = 0i32;
+            for idx in 0..padded {
+                scratch[seq_start_pos_off + idx] = seq_pos;
+                seq_pos += attn_meta.query_lens.get(idx).copied().unwrap_or(1) as i32;
+            }
+            scratch[seq_start_pos_off + padded] = seq_pos;
+
+            let mut meta = self.meta_packed.borrow_mut();
+            meta.ensure_len(total_len, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 meta alloc: {e}")))?;
+            meta.upload(&scratch, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 packed metadata HtoD: {e}")))?;
+
+            self.meta_packed_offsets.set(PackedMetaOffsets {
+                token_ids: token_ids_off,
+                positions: positions_off,
+                context_lens: context_lens_off,
+                block_tables: block_tables_off,
+                slot_mapping: slot_mapping_off,
+                seq_start_pos: seq_start_pos_off,
+                num_token_ids: padded,
+                num_positions: padded,
+                num_context_lens: padded,
+                num_block_tables: bt_len,
+                num_slot_mapping: padded,
+                num_seq_start_pos: padded + 1,
+            });
+
+            Ok(())
+        }
+
         /// Run the forward pass using already-uploaded metadata buffers.
         ///
         /// Call `upload_metadata()` first. This method does NOT upload metadata --
@@ -2062,6 +2166,7 @@ mod cuda_impl {
                 graph_tokens,
                 use_graphed_decode: is_pure_decode
                     && forward_path_graph_capture_supported(graph_path),
+                use_batched_v2: matches!(graph_path, ForwardPath::BatchedV2),
             }
         }
 
@@ -3851,7 +3956,20 @@ mod mock_impl {
                 actual_tokens: num_tokens,
                 graph_tokens: num_tokens,
                 use_graphed_decode: false,
+                use_batched_v2: false,
             }
+        }
+
+        pub fn upload_decode_metadata_v2(
+            &self,
+            _token_ids: &[u32],
+            _positions: &[u32],
+            _attn_meta: &crate::bridge::AttentionMetadata,
+            _padded_batch: usize,
+        ) -> Result<()> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
         }
 
         pub fn upload_metadata(
