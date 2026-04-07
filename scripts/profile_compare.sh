@@ -10,7 +10,10 @@ OUTPUT_LEN="${OUTPUT_LEN:-128}"
 PROFILE_NS="${PROFILE_NS:-1,32,64,96,128}"
 PROFILE_OUTPUT_LEN="${PROFILE_OUTPUT_LEN:-16}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
+WARMUP_CONCURRENCY="${WARMUP_CONCURRENCY:-0}"
+WARMUP_MAX_TOKENS="${WARMUP_MAX_TOKENS:-5}"
 RVLLM_FEATURES="${RVLLM_FEATURES:-cuda,cublaslt}"
 BUILD_RVLLM="${BUILD_RVLLM:-1}"
 RUN_RVLLM="${RUN_RVLLM:-1}"
@@ -27,6 +30,9 @@ while [[ $# -gt 0 ]]; do
         --profile-ns) PROFILE_NS="$2"; shift 2 ;;
         --profile-output-len) PROFILE_OUTPUT_LEN="$2"; shift 2 ;;
         --gpu-mem) GPU_MEM_UTIL="$2"; shift 2 ;;
+        --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
+        --warmup-concurrency) WARMUP_CONCURRENCY="$2"; shift 2 ;;
+        --warmup-max-tokens) WARMUP_MAX_TOKENS="$2"; shift 2 ;;
         --skip-build-rvllm) BUILD_RVLLM=0; shift ;;
         --skip-rvllm) RUN_RVLLM=0; shift ;;
         --skip-vllm) RUN_VLLM=0; shift ;;
@@ -63,6 +69,7 @@ run_rvllm_bench() {
         --model "$MODEL" \
         --n "$n" \
         --output-len "$OUTPUT_LEN" \
+        --max-model-len "$MAX_MODEL_LEN" \
         --gpu-memory-utilization "$GPU_MEM_UTIL" \
         --json > "$out_json"
 }
@@ -74,9 +81,12 @@ run_vllm_bench() {
     python3 deploy/vllm_direct_bench.py \
         --model "$MODEL" \
         --max-tokens "$OUTPUT_LEN" \
+        --max-model-len "$MAX_MODEL_LEN" \
         --gpu-memory-utilization "$GPU_MEM_UTIL" \
         --concurrency "$n" \
         --temperature "$TEMPERATURE" \
+        --warmup-concurrency "$n" \
+        --warmup-max-tokens "$WARMUP_MAX_TOKENS" \
         --ignore-eos \
         --output "$out_json" >/dev/null
 }
@@ -90,6 +100,7 @@ profile_rvllm() {
         --model "$MODEL" \
         --n "$n" \
         --output-len "$PROFILE_OUTPUT_LEN" \
+        --max-model-len "$MAX_MODEL_LEN" \
         --gpu-memory-utilization "$GPU_MEM_UTIL" \
         --json > "${base}.stdout" 2> "${base}.stderr" || true
     "$NSYS_BIN" stats --force-export=true -r cuda_gpu_kern_sum "${base}.nsys-rep" \
@@ -109,9 +120,12 @@ profile_vllm() {
         python3 deploy/vllm_direct_bench.py \
             --model "$MODEL" \
             --max-tokens "$PROFILE_OUTPUT_LEN" \
+            --max-model-len "$MAX_MODEL_LEN" \
             --gpu-memory-utilization "$GPU_MEM_UTIL" \
             --concurrency "$n" \
             --temperature "$TEMPERATURE" \
+            --warmup-concurrency "$n" \
+            --warmup-max-tokens "$WARMUP_MAX_TOKENS" \
             --ignore-eos \
             --output "$out_json" > "${base}.stdout" 2> "${base}.stderr" || true
     "$NSYS_BIN" stats --force-export=true -r cuda_gpu_kern_sum "${base}.nsys-rep" \
@@ -153,7 +167,7 @@ if [[ "$RUN_NSYS" == "1" ]]; then
     done
 fi
 
-python3 - "$OUT_DIR/manifest.json" "$MODEL" "$N_VALUES" "$OUTPUT_LEN" "$PROFILE_NS" "$PROFILE_OUTPUT_LEN" "$GPU_MEM_UTIL" "$TEMPERATURE" <<'PY'
+python3 - "$OUT_DIR/manifest.json" "$MODEL" "$N_VALUES" "$OUTPUT_LEN" "$PROFILE_NS" "$PROFILE_OUTPUT_LEN" "$GPU_MEM_UTIL" "$TEMPERATURE" "$MAX_MODEL_LEN" "$WARMUP_CONCURRENCY" "$WARMUP_MAX_TOKENS" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -190,6 +204,9 @@ manifest = {
     "profile_output_len": int(sys.argv[6]),
     "gpu_memory_utilization": float(sys.argv[7]),
     "temperature": float(sys.argv[8]),
+    "max_model_len": int(sys.argv[9]),
+    "warmup_concurrency": int(sys.argv[10]),
+    "warmup_max_tokens": int(sys.argv[11]),
     "engines": {
         "rvllm": engine_paths("rvllm", sys.argv[3], sys.argv[5]),
         "vllm": engine_paths("vllm", sys.argv[3], sys.argv[5]),

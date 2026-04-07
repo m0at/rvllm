@@ -40,12 +40,23 @@ PROMPTS = [
 ]
 
 
-def bench_concurrency(llm, sampling_params, n, warmup=True):
+def bench_concurrency(
+    llm,
+    sampling_params,
+    n,
+    warmup=True,
+    warmup_concurrency=None,
+    warmup_sampling_params=None,
+):
     """Benchmark at concurrency N by batching N prompts."""
     prompts = [PROMPTS[i % len(PROMPTS)] for i in range(n)]
 
     if warmup:
-        llm.generate(prompts[:min(n, 4)], sampling_params)
+        warmup_n = n if warmup_concurrency is None else min(n, warmup_concurrency)
+        llm.generate(
+            prompts[:warmup_n],
+            warmup_sampling_params or sampling_params,
+        )
 
     start = time.perf_counter()
     outputs = llm.generate(prompts, sampling_params)
@@ -69,11 +80,24 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B")
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--output", default="/root/results_vllm_direct.json")
     parser.add_argument("--concurrency", type=str, default="1,4,16,32,64,128",
                         help="Comma-separated concurrency levels")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--ignore-eos", action="store_true", default=True)
+    parser.add_argument(
+        "--warmup-concurrency",
+        type=int,
+        default=4,
+        help="Warmup prompt count. Use 0 to disable warmup.",
+    )
+    parser.add_argument(
+        "--warmup-max-tokens",
+        type=int,
+        default=None,
+        help="Warmup max tokens. Defaults to --max-tokens.",
+    )
     args = parser.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -84,7 +108,7 @@ def main():
         model=args.model,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=False,
-        max_model_len=4096,
+        max_model_len=args.max_model_len,
     )
     load_time = time.perf_counter() - load_start
     print(f"Model loaded in {load_time:.1f}s")
@@ -92,6 +116,15 @@ def main():
     sampling_params = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        ignore_eos=args.ignore_eos,
+    )
+    warmup_sampling_params = SamplingParams(
+        temperature=args.temperature,
+        max_tokens=(
+            args.max_tokens
+            if args.warmup_max_tokens is None
+            else args.warmup_max_tokens
+        ),
         ignore_eos=args.ignore_eos,
     )
 
@@ -104,7 +137,14 @@ def main():
     print("-" * 45)
 
     for n in concurrency_levels:
-        r = bench_concurrency(llm, sampling_params, n, warmup=(n == concurrency_levels[0]))
+        r = bench_concurrency(
+            llm,
+            sampling_params,
+            n,
+            warmup=(n == concurrency_levels[0] and args.warmup_concurrency != 0),
+            warmup_concurrency=args.warmup_concurrency,
+            warmup_sampling_params=warmup_sampling_params,
+        )
         results.append(r)
         print(f"{r['n']:>6} | {r['tok_per_sec']:>10,.1f} | {r['total_tokens']:>8,} | {r['elapsed_ms'] / 1000:>7.2f}s")
 
@@ -113,8 +153,11 @@ def main():
         "model": args.model,
         "output_len": args.max_tokens,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_model_len": args.max_model_len,
         "temperature": args.temperature,
         "ignore_eos": args.ignore_eos,
+        "warmup_concurrency": args.warmup_concurrency,
+        "warmup_max_tokens": warmup_sampling_params.max_tokens,
         "load_time_sec": round(load_time, 1),
         "results": results,
     }
