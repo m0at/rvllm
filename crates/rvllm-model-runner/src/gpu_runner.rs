@@ -2019,54 +2019,60 @@ mod cuda_impl {
 
             {
                 let src = self.persistent_decode_meta.token_ids.borrow();
+                let src_view = src.slice().slice(..padded);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(token_ids_off..token_ids_off + padded),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 token_ids DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.positions.borrow();
+                let src_view = src.slice().slice(..padded);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(positions_off..positions_off + padded),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 positions DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.context_lens.borrow();
+                let src_view = src.slice().slice(..padded);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(context_lens_off..context_lens_off + padded),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 context_lens DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.block_tables.borrow();
+                let src_view = src.slice().slice(..bt_len);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(block_tables_off..block_tables_off + bt_len),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 block_tables DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.slot_mapping.borrow();
+                let src_view = src.slice().slice(..padded);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(slot_mapping_off..slot_mapping_off + padded),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 slot_mapping DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.seq_start_pos.borrow();
+                let src_view = src.slice().slice(..padded + 1);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(seq_start_pos_off..seq_start_pos_off + padded + 1),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 seq_start_pos DtoD: {e}")))?;
@@ -2213,54 +2219,60 @@ mod cuda_impl {
 
             {
                 let src = self.persistent_decode_meta.token_ids.borrow();
+                let src_view = src.slice().slice(..padded);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(token_ids_off..token_ids_off + padded),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 token_ids DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.positions.borrow();
+                let src_view = src.slice().slice(..padded);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(positions_off..positions_off + padded),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 positions DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.context_lens.borrow();
+                let src_view = src.slice().slice(..padded);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(context_lens_off..context_lens_off + padded),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 context_lens DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.block_tables.borrow();
+                let src_view = src.slice().slice(..bt_len);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(block_tables_off..block_tables_off + bt_len),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 block_tables DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.slot_mapping.borrow();
+                let src_view = src.slice().slice(..padded);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(slot_mapping_off..slot_mapping_off + padded),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 slot_mapping DtoD: {e}")))?;
             }
             {
                 let src = self.persistent_decode_meta.seq_start_pos.borrow();
+                let src_view = src.slice().slice(..padded + 1);
                 self.stream
                     .memcpy_dtod(
-                        src.slice(),
+                        &src_view,
                         &mut packed.slice_mut(seq_start_pos_off..seq_start_pos_off + padded + 1),
                     )
                     .map_err(|e| LLMError::GpuError(format!("decode v2 seq_start_pos DtoD: {e}")))?;
