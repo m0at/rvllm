@@ -242,6 +242,13 @@ mod cuda_impl {
         )
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct ForwardExecutionPlan {
+        path: ForwardPath,
+        use_scratch: bool,
+        graph_capture_supported: bool,
+    }
+
     /// Element offsets into the packed metadata GPU buffer.
     #[derive(Clone, Copy, Default)]
     struct PackedMetaOffsets {
@@ -1022,13 +1029,12 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            let path = self.resolve_forward_path(num_tokens, is_prefill);
+            let plan = self.forward_execution_plan(num_tokens, is_prefill);
+            let path = plan.path;
             if is_prefill || !matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2) {
                 phase_profile = None;
             }
-            let use_scratch =
-                num_tokens > 1 || is_prefill || matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2);
-            if use_scratch {
+            if plan.use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
@@ -1036,7 +1042,7 @@ mod cuda_impl {
 
             // For scratch double-buffering: copy embedding into residual_a so the
             // first layer can read from it while writing to residual_b.
-            if use_scratch {
+            if plan.use_scratch {
                 if let Some(ref mut s) = *scratch_borrow {
                     self.stream
                         .memcpy_dtod(
@@ -1250,7 +1256,7 @@ mod cuda_impl {
             }
 
             // Double-buffer: extract final layer results from scratch (1 copy at end, not 28)
-            if use_scratch {
+            if plan.use_scratch {
                 if let Some(ref s) = *scratch_borrow {
                     let last_even = (num_layers - 1) % 2 == 0;
                     let (res_src, down_src) = if last_even {
@@ -1491,16 +1497,15 @@ mod cuda_impl {
             let max_context_len = attn_meta.max_context_len;
             let layers_to_run = max_layers.min(self.layers.len());
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
-            let path = self.resolve_forward_path(num_tokens, is_prefill);
-            let use_scratch =
-                num_tokens > 1 || is_prefill || matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2);
-            if use_scratch {
+            let plan = self.forward_execution_plan(num_tokens, is_prefill);
+            let path = plan.path;
+            if plan.use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
 
             // For Batched path: copy embedding into residual_a for double-buffer read
-            if use_scratch {
+            if plan.use_scratch {
                 if let Some(ref mut s) = *scratch_borrow {
                     self.stream
                         .memcpy_dtod(
@@ -1518,7 +1523,7 @@ mod cuda_impl {
                     Option<LayerScratchRef<'_>>,
                     &CudaSlice<f16>,
                     Option<&CudaSlice<f16>>,
-                ) = if use_scratch {
+                ) = if plan.use_scratch {
                     if let Some(ref mut s) = *scratch_borrow {
                         let even = layer_idx % 2 == 0;
                         let (write_res, write_down, read_res, read_down) = if even {
@@ -1594,7 +1599,7 @@ mod cuda_impl {
                     &input,
                     &weights,
                     &self.blas,
-                    if use_scratch {
+                    if plan.use_scratch {
                         pmo_ref
                     } else {
                         prev_mlp_out.as_ref()
@@ -1611,7 +1616,7 @@ mod cuda_impl {
             }
 
             // Extract final results from scratch double-buffer
-            if use_scratch {
+            if plan.use_scratch {
                 if let Some(ref s) = *scratch_borrow {
                     let last_even = (layers_to_run - 1) % 2 == 0;
                     let (res_src, down_src) = if last_even {
@@ -1910,7 +1915,8 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            let path = self.resolve_forward_path(num_tokens, is_prefill);
+            let plan = self.forward_execution_plan(num_tokens, is_prefill);
+            let path = plan.path;
             if path == ForwardPath::PersistentV3Decode {
                 return self.forward_persistent_v3(
                     &hidden_f16,
@@ -1926,9 +1932,7 @@ mod cuda_impl {
             }
             // Double-buffered scratch for batched decode/prefill and optional
             // batch-1 decode experiments: zero per-layer allocations.
-            let use_scratch =
-                num_tokens > 1 || is_prefill || matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2);
-            if use_scratch {
+            if plan.use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
@@ -1941,7 +1945,7 @@ mod cuda_impl {
                     Option<LayerScratchRef<'_>>,
                     &CudaSlice<f16>,
                     Option<&CudaSlice<f16>>,
-                ) = if use_scratch {
+                ) = if plan.use_scratch {
                     if let Some(ref mut s) = *scratch_borrow {
                         let (write_res, write_down, read_res, read_down) = if even {
                             (&mut s.residual_b, &mut s.down_b, &s.residual_a, &s.down_a)
@@ -2014,7 +2018,7 @@ mod cuda_impl {
                     &input,
                     &weights,
                     &self.blas,
-                    if use_scratch {
+                    if plan.use_scratch {
                         pmo_ref
                     } else {
                         prev_mlp_out.as_ref()
@@ -2033,7 +2037,7 @@ mod cuda_impl {
             // Final: fuse last layer's residual add with final RMSNorm.
             // For the graphed batched path, read the final residual/down buffers
             // directly from scratch instead of copying them out first.
-            let normed_f16 = if use_scratch {
+            let normed_f16 = if plan.use_scratch {
                 if let Some(ref s) = *scratch_borrow {
                     let last_even = (num_layers - 1) % 2 == 0;
                     let (res_src, down_src) = if last_even {
@@ -2160,20 +2164,20 @@ mod cuda_impl {
             } else {
                 num_tokens
             };
-            let graph_path = self.resolve_forward_path(graph_tokens, is_prefill);
+            let graph_plan = self.forward_execution_plan(graph_tokens, is_prefill);
             DecodeExecutionPlan {
                 actual_tokens: num_tokens,
                 graph_tokens,
-                use_graphed_decode: is_pure_decode
-                    && forward_path_graph_capture_supported(graph_path),
-                use_batched_v2: matches!(graph_path, ForwardPath::BatchedV2),
+                use_graphed_decode: is_pure_decode && graph_plan.graph_capture_supported,
+                use_batched_v2: matches!(graph_plan.path, ForwardPath::BatchedV2),
             }
         }
 
         /// Whether the selected forward path can be executed by
         /// `forward_gpu_only()` and therefore participate in CUDA graph capture.
         pub fn graph_capture_supported(&self, num_tokens: usize, is_prefill: bool) -> bool {
-            forward_path_graph_capture_supported(self.resolve_forward_path(num_tokens, is_prefill))
+            self.forward_execution_plan(num_tokens, is_prefill)
+                .graph_capture_supported
         }
 
         /// Get cublasLt reference (None when feature is off).
@@ -2210,6 +2214,21 @@ mod cuda_impl {
                     return ForwardPath::Fp8Decode;
                 }
                 ForwardPath::FusedDecode
+            }
+        }
+
+        fn forward_execution_plan(
+            &self,
+            num_tokens: usize,
+            is_prefill: bool,
+        ) -> ForwardExecutionPlan {
+            let path = self.resolve_forward_path(num_tokens, is_prefill);
+            ForwardExecutionPlan {
+                path,
+                use_scratch: num_tokens > 1
+                    || is_prefill
+                    || matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2),
+                graph_capture_supported: forward_path_graph_capture_supported(path),
             }
         }
 
@@ -2315,7 +2334,8 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            let path = self.resolve_forward_path(num_tokens, is_prefill);
+            let plan = self.forward_execution_plan(num_tokens, is_prefill);
+            let path = plan.path;
             if path == ForwardPath::PersistentV3Decode {
                 return self.forward_persistent_v3_graph(
                     &hidden_f16,
@@ -2330,9 +2350,7 @@ mod cuda_impl {
             }
             // Double-buffered scratch for batched decode/prefill and optional
             // batch-1 decode experiments: zero per-layer allocations.
-            let use_scratch =
-                num_tokens > 1 || is_prefill || matches!(path, ForwardPath::Batched | ForwardPath::BatchedV2);
-            if use_scratch {
+            if plan.use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
@@ -2345,7 +2363,7 @@ mod cuda_impl {
                     Option<LayerScratchRef<'_>>,
                     &CudaSlice<f16>,
                     Option<&CudaSlice<f16>>,
-                ) = if use_scratch {
+                ) = if plan.use_scratch {
                     if let Some(ref mut s) = *scratch_borrow {
                         let (write_res, write_down, read_res, read_down) = if even {
                             (&mut s.residual_b, &mut s.down_b, &s.residual_a, &s.down_a)
@@ -2418,7 +2436,7 @@ mod cuda_impl {
                     &input,
                     &weights,
                     &self.blas,
-                    if use_scratch {
+                    if plan.use_scratch {
                         pmo_ref
                     } else {
                         prev_mlp_out.as_ref()
@@ -2437,7 +2455,7 @@ mod cuda_impl {
             // Final: fuse last layer's residual add with final RMSNorm.
             // For the graphed batched path, read the final residual/down buffers
             // directly from scratch instead of copying them out first.
-            let normed_f16 = if use_scratch {
+            let normed_f16 = if plan.use_scratch {
                 if let Some(ref s) = *scratch_borrow {
                     let last_even = (num_layers - 1) % 2 == 0;
                     let (res_src, down_src) = if last_even {
