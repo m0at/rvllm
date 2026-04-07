@@ -223,6 +223,7 @@ use rvllm_core::prelude::{
         emit_intermediate: bool,
         seq_states: Vec<SequenceOutputState>,
         decode_seq_data: Vec<SequenceData>,
+        decode_block_tables: Vec<Vec<BlockId>>,
     }
 
     struct LocalPool {
@@ -316,6 +317,16 @@ use rvllm_core::prelude::{
                 seq_data.seq_len =
                     (seq_data.prompt_token_ids.len() + seq_data.output_token_ids.len()) as u32;
                 seq_data.last_token_id = token_id;
+            }
+        }
+
+        fn sync_decode_block_table(
+            req: &mut EngineRequest,
+            seq_idx: usize,
+            block_table: Vec<BlockId>,
+        ) {
+            if let Some(dst) = req.decode_block_tables.get_mut(seq_idx) {
+                *dst = block_table;
             }
         }
 
@@ -564,6 +575,7 @@ use rvllm_core::prelude::{
                             last_token_id: decode_last_token_id,
                         })
                         .collect(),
+                    decode_block_tables: (0..num_seqs).map(|_| Vec::new()).collect(),
                 },
             );
 
@@ -958,6 +970,9 @@ use rvllm_core::prelude::{
                                 *token_id,
                                 cumulative_logprob,
                             );
+                            if let Some(block_table) = self.scheduler.get_block_table(seq.seq_id) {
+                                Self::sync_decode_block_table(req, seq_idx, block_table);
+                            }
                         }
                         if let Some(reason) = finish_reason {
                             let status = match reason {
@@ -1197,7 +1212,16 @@ use rvllm_core::prelude::{
                             .get(&group.request_id)
                             .and_then(|req| req.decode_seq_data.get(seq_idx).cloned())
                     };
-                    let Some(existing) = self.scheduler.get_block_table(seq.seq_id) else {
+                    let Some(existing) = (if is_prompt {
+                        self.scheduler.get_block_table(seq.seq_id)
+                    } else {
+                        self.requests
+                            .get(&group.request_id)
+                            .and_then(|req| req.decode_block_tables.get(seq_idx))
+                            .filter(|bt| !bt.is_empty())
+                            .cloned()
+                            .or_else(|| self.scheduler.get_block_table(seq.seq_id))
+                    }) else {
                         warn!(
                             seq_id = seq.seq_id.0,
                             "missing block table for scheduled sequence"
