@@ -8,6 +8,9 @@
 use std::collections::HashMap;
 
 #[cfg(feature = "cuda")]
+use std::ffi::CStr;
+
+#[cfg(feature = "cuda")]
 use std::sync::Mutex;
 
 #[cfg(feature = "cuda")]
