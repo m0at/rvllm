@@ -30,6 +30,7 @@ mod cuda_impl {
     use std::sync::Arc;
 
     use std::cell::Cell;
+    use std::time::Instant;
 
     use cudarc::driver::{
         CudaContext, CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut, LaunchConfig,
@@ -42,8 +43,8 @@ mod cuda_impl {
     use crate::runner::ModelRunnerConfig;
 
     use crate::gpu_layer::{
-        ForwardPath, GemmStrategy, GpuLayerConfig, GpuLayerInput, GpuLayerWeights,
-        GpuTransformerLayer, LayerScratchRef,
+        BatchedLayerPhaseTimings, ForwardPath, GemmStrategy, GpuLayerConfig, GpuLayerInput,
+        GpuLayerWeights, GpuTransformerLayer, LayerScratchRef,
     };
     use crate::layers::linear_cuda::CudaLinearLayer;
 
@@ -132,6 +133,79 @@ mod cuda_impl {
     }
 
     const DEFAULT_F16_SCRATCH_TOKENS: usize = 512;
+
+    struct DecodePhaseProfileSummary {
+        target_bucket: usize,
+        pre_attn_norm_ns: Vec<u64>,
+        qkv_ns: Vec<u64>,
+        rope_cache_ns: Vec<u64>,
+        attn_ns: Vec<u64>,
+        oproj_norm_ns: Vec<u64>,
+        gateup_silu_ns: Vec<u64>,
+        down_ns: Vec<u64>,
+        final_norm_ns: u64,
+        lm_head_ns: u64,
+    }
+
+    impl DecodePhaseProfileSummary {
+        fn new(target_bucket: usize) -> Self {
+            Self {
+                target_bucket,
+                pre_attn_norm_ns: Vec::new(),
+                qkv_ns: Vec::new(),
+                rope_cache_ns: Vec::new(),
+                attn_ns: Vec::new(),
+                oproj_norm_ns: Vec::new(),
+                gateup_silu_ns: Vec::new(),
+                down_ns: Vec::new(),
+                final_norm_ns: 0,
+                lm_head_ns: 0,
+            }
+        }
+
+        fn observe_layer(&mut self, t: &BatchedLayerPhaseTimings) {
+            self.pre_attn_norm_ns.push(t.pre_attn_norm.as_nanos() as u64);
+            self.qkv_ns.push(t.qkv.as_nanos() as u64);
+            self.rope_cache_ns.push(t.rope_cache.as_nanos() as u64);
+            self.attn_ns.push(t.attn.as_nanos() as u64);
+            self.oproj_norm_ns.push(t.oproj_norm.as_nanos() as u64);
+            self.gateup_silu_ns.push(t.gateup_silu.as_nanos() as u64);
+            self.down_ns.push(t.down.as_nanos() as u64);
+        }
+
+        fn median_us(values: &[u64]) -> f64 {
+            if values.is_empty() {
+                return 0.0;
+            }
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            let mid = sorted.len() / 2;
+            let ns = if sorted.len() % 2 == 0 {
+                (sorted[mid - 1] + sorted[mid]) / 2
+            } else {
+                sorted[mid]
+            };
+            ns as f64 / 1_000.0
+        }
+
+        fn log(&self, batch: usize, num_layers: usize) {
+            info!(
+                target_bucket = self.target_bucket,
+                batch,
+                num_layers,
+                pre_attn_norm_us = Self::median_us(&self.pre_attn_norm_ns),
+                qkv_us = Self::median_us(&self.qkv_ns),
+                rope_cache_us = Self::median_us(&self.rope_cache_ns),
+                attn_us = Self::median_us(&self.attn_ns),
+                oproj_norm_us = Self::median_us(&self.oproj_norm_ns),
+                gateup_silu_us = Self::median_us(&self.gateup_silu_ns),
+                down_us = Self::median_us(&self.down_ns),
+                final_norm_us = self.final_norm_ns as f64 / 1_000.0,
+                lm_head_us = self.lm_head_ns as f64 / 1_000.0,
+                "decode phase profile"
+            );
+        }
+    }
 
     /// Element offsets into the packed metadata GPU buffer.
     #[derive(Clone, Copy, Default)]
@@ -853,7 +927,7 @@ mod cuda_impl {
             attn_meta: &crate::bridge::AttentionMetadata,
             is_prefill: bool,
         ) -> Result<Vec<f32>> {
-            match self.forward_ex(token_ids, positions, attn_meta, is_prefill, false)? {
+            match self.forward_ex(token_ids, positions, attn_meta, is_prefill, false, None)? {
                 ForwardOutput::Logits(logits) => Ok(logits),
                 ForwardOutput::TokenIds(_) | ForwardOutput::TokenIdsPending { .. } => {
                     unreachable!("greedy_only=false must return Logits")
@@ -871,6 +945,7 @@ mod cuda_impl {
             attn_meta: &crate::bridge::AttentionMetadata,
             is_prefill: bool,
             greedy_only: bool,
+            profile_decode_bucket: Option<usize>,
         ) -> Result<ForwardOutput> {
             let num_tokens = token_ids.len();
             let num_seqs = attn_meta.context_lens.len();
@@ -917,6 +992,9 @@ mod cuda_impl {
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
             let path = self.resolve_forward_path(num_tokens, is_prefill);
+            let mut phase_profile = profile_decode_bucket
+                .filter(|_| !is_prefill && path == ForwardPath::Batched)
+                .map(DecodePhaseProfileSummary::new);
             let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
@@ -1067,6 +1145,9 @@ mod cuda_impl {
                 };
                 let weights = self.layer_weights(layer_idx)?;
                 let mut scratch_ref = scratch_ref_opt;
+                let mut layer_phase = phase_profile
+                    .as_ref()
+                    .map(|_| BatchedLayerPhaseTimings::default());
                 let result = layer.forward(
                     path,
                     &input,
@@ -1079,9 +1160,13 @@ mod cuda_impl {
                     },
                     self.cublaslt_ref(),
                     scratch_ref.as_mut(),
+                    layer_phase.as_mut(),
                     self.gemm_strategy,
                     self.cutlass.as_deref(),
                 )?;
+                if let (Some(summary), Some(layer_phase)) = (phase_profile.as_mut(), layer_phase.as_ref()) {
+                    summary.observe_layer(layer_phase);
+                }
                 if let Some((residual, mlp_out)) = result {
                     // Non-scratch path: take ownership
                     hidden_f16 = residual;
@@ -1144,6 +1229,14 @@ mod cuda_impl {
             drop(scratch_borrow);
 
             // Final: fuse last layer's residual add with final RMSNorm
+            let final_norm_start = if phase_profile.is_some() {
+                self.stream
+                    .synchronize()
+                    .map_err(|e| LLMError::GpuError(format!("phase profile sync: {e}")))?;
+                Some(Instant::now())
+            } else {
+                None
+            };
             let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
                 let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
                     &self.stream,
@@ -1159,6 +1252,12 @@ mod cuda_impl {
             } else {
                 self.rms_norm_f16_runner(&hidden_f16, &self.final_norm_weight, hidden_size)?
             };
+            if let Some(summary) = phase_profile.as_mut() {
+                self.stream
+                    .synchronize()
+                    .map_err(|e| LLMError::GpuError(format!("phase profile sync: {e}")))?;
+                summary.final_norm_ns = final_norm_start.unwrap().elapsed().as_nanos() as u64;
+            }
 
             if debug_fwd {
                 // Check normed hidden and top logits
@@ -1210,6 +1309,14 @@ mod cuda_impl {
             }
 
             // LM head + argmax: f16 hidden -> fused argmax
+            let lm_head_start = if phase_profile.is_some() {
+                self.stream
+                    .synchronize()
+                    .map_err(|e| LLMError::GpuError(format!("phase profile sync: {e}")))?;
+                Some(Instant::now())
+            } else {
+                None
+            };
             if num_tokens == 1 && greedy_only {
                 let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
                     &normed_f16,
@@ -1221,6 +1328,13 @@ mod cuda_impl {
                     .stream
                     .clone_dtoh(&token_ids_gpu)
                     .map_err(|e| LLMError::GpuError(format!("fused_lm_head token DtoH: {e}")))?;
+                if let Some(summary) = phase_profile.as_mut() {
+                    self.stream
+                        .synchronize()
+                        .map_err(|e| LLMError::GpuError(format!("phase profile sync: {e}")))?;
+                    summary.lm_head_ns = lm_head_start.unwrap().elapsed().as_nanos() as u64;
+                    summary.log(num_tokens, num_layers);
+                }
                 return Ok(ForwardOutput::TokenIds(token_ids_cpu));
             }
 
@@ -1240,6 +1354,13 @@ mod cuda_impl {
                     .stream
                     .clone_dtoh(&token_ids_gpu)
                     .map_err(|e| LLMError::GpuError(format!("argmax DtoH: {e}")))?;
+                if let Some(summary) = phase_profile.as_mut() {
+                    self.stream
+                        .synchronize()
+                        .map_err(|e| LLMError::GpuError(format!("phase profile sync: {e}")))?;
+                    summary.lm_head_ns = lm_head_start.unwrap().elapsed().as_nanos() as u64;
+                    summary.log(num_tokens, num_layers);
+                }
                 return Ok(ForwardOutput::TokenIds(token_ids_cpu));
             }
 
@@ -1247,6 +1368,13 @@ mod cuda_impl {
                 .stream
                 .clone_dtoh(&logits_gpu)
                 .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
+            if let Some(summary) = phase_profile.as_mut() {
+                self.stream
+                    .synchronize()
+                    .map_err(|e| LLMError::GpuError(format!("phase profile sync: {e}")))?;
+                summary.lm_head_ns = lm_head_start.unwrap().elapsed().as_nanos() as u64;
+                summary.log(num_tokens, num_layers);
+            }
             Ok(ForwardOutput::Logits(logits_cpu))
         }
 
@@ -1392,6 +1520,7 @@ mod cuda_impl {
                     },
                     self.cublaslt_ref(),
                     scratch_ref_opt.as_mut(),
+                    None,
                     self.gemm_strategy,
                     self.cutlass.as_deref(),
                 )?;
@@ -1722,6 +1851,7 @@ mod cuda_impl {
                     },
                     self.cublaslt_ref(),
                     scratch_ref_opt.as_mut(),
+                    None,
                     self.gemm_strategy,
                     self.cutlass.as_deref(),
                 )?;
@@ -2100,6 +2230,7 @@ mod cuda_impl {
                     },
                     self.cublaslt_ref(),
                     scratch_ref_opt.as_mut(),
+                    None,
                     self.gemm_strategy,
                     self.cutlass.as_deref(),
                 )?;
@@ -3598,6 +3729,7 @@ mod mock_impl {
             _attn_meta: &crate::bridge::AttentionMetadata,
             _is_prefill: bool,
             _greedy_only: bool,
+            _profile_decode_bucket: Option<usize>,
         ) -> Result<ForwardOutput> {
             Err(LLMError::GpuError(
                 "GpuModelRunner requires the `cuda` feature".into(),

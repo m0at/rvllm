@@ -4,7 +4,7 @@
 //! a real transformer forward pass using cuBLAS SGEMM for each layer.
 //! Supports Qwen2/Llama-family architectures with RoPE, KV cache, and GQA.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -355,6 +355,7 @@ pub struct GpuWorker {
     /// Stored sync output for execute_launch/execute_collect pipeline.
     pending_sync_output: Option<(ForwardOutput, Vec<SequenceGroupMetadata>)>,
     decode_input_scratch: input::DecodeInputScratch,
+    profiled_decode_batches: HashSet<usize>,
 }
 
 impl GpuWorker {
@@ -485,11 +486,16 @@ impl GpuWorker {
             pinned_output: None,
             pending_sync_output: None,
             decode_input_scratch: input::DecodeInputScratch::new(),
+            profiled_decode_batches: HashSet::new(),
         })
     }
 
     fn prepare_model_input(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<ModelInput> {
-        input::prepare_input_reuse(&mut self.decode_input_scratch, metadata, self.config.block_size)
+        input::prepare_input_reuse(
+            &mut self.decode_input_scratch,
+            metadata,
+            self.config.block_size,
+        )
     }
 
     /// Convenience constructor from EngineConfig and model path.
@@ -1545,6 +1551,7 @@ impl GpuWorker {
         &self,
         model_input: &ModelInput,
         greedy_only: bool,
+        profile_decode_bucket: Option<usize>,
     ) -> Result<ForwardOutput> {
         #[cfg(feature = "cuda")]
         {
@@ -1560,12 +1567,13 @@ impl GpuWorker {
                 &model_input.attention_metadata,
                 model_input.is_prefill,
                 greedy_only,
+                profile_decode_bucket,
             );
         }
 
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (model_input, greedy_only);
+            let _ = (model_input, greedy_only, profile_decode_bucket);
             return Err(LLMError::GpuError(
                 "GPU forward pass requires --features cuda. CPU fallback is disabled.".into(),
             ));
@@ -1643,14 +1651,22 @@ impl GpuWorker {
                 .query_lens
                 .iter()
                 .all(|&q| q == 1);
+        let batch = model_input.num_tokens();
+        let padded = Self::padded_batch_size(batch);
+        let profile_decode_bucket = is_decode
+            .then(|| Self::phase_profile_decode_bucket(batch, padded))
+            .flatten()
+            .filter(|bucket| !self.profiled_decode_batches.contains(bucket));
 
-        let result = if !is_decode || !self.graph_runner.is_enabled() {
-            self.raw_gpu_forward_ex(model_input, greedy_only)
+        let result = if let Some(target_bucket) = profile_decode_bucket {
+            info!(batch, padded, target_bucket, "profiling real decode bucket via raw forward");
+            self.profiled_decode_batches.insert(target_bucket);
+            self.raw_gpu_forward_ex(model_input, greedy_only, Some(target_bucket))
+        } else if !is_decode || !self.graph_runner.is_enabled() {
+            self.raw_gpu_forward_ex(model_input, greedy_only, None)
         } else {
             #[cfg(feature = "cuda")]
             {
-                let batch = model_input.num_tokens();
-                let padded = Self::padded_batch_size(batch);
                 let runner = self
                     .gpu_model_runner
                     .as_ref()
@@ -1660,7 +1676,7 @@ impl GpuWorker {
                 // Runner-level decode paths are not graph-safe: bypass replay/capture
                 // and let raw forward dispatch them correctly.
                 if !graph_capture_supported {
-                    self.raw_gpu_forward_ex(model_input, greedy_only)
+                    self.raw_gpu_forward_ex(model_input, greedy_only, None)
                 // 1. Check for padded graph (hot path)
                 } else if self.graph_runner.has_graph_for_exact(padded) {
                     self.gpu_forward_ex_graphed_padded(model_input, batch, padded, greedy_only)
@@ -1672,18 +1688,18 @@ impl GpuWorker {
                         Ok(output) => Ok(output),
                         Err(e) => {
                             warn!(padded, "graph capture failed, raw forward: {e}");
-                            self.raw_gpu_forward_ex(model_input, greedy_only)
+                            self.raw_gpu_forward_ex(model_input, greedy_only, None)
                         }
                     }
                 } else {
                     // 3. Fallback: raw forward (pre-warmup or capture failure)
-                    self.raw_gpu_forward_ex(model_input, greedy_only)
+                    self.raw_gpu_forward_ex(model_input, greedy_only, None)
                 }
             }
 
             #[cfg(not(feature = "cuda"))]
             {
-                self.raw_gpu_forward_ex(model_input, greedy_only)
+                self.raw_gpu_forward_ex(model_input, greedy_only, None)
             }
         };
 
@@ -1699,6 +1715,17 @@ impl GpuWorker {
         }
 
         result
+    }
+
+    fn phase_profile_decode_bucket(batch: usize, padded: usize) -> Option<usize> {
+        std::env::var("RVLLM_PHASE_PROFILE_BATCHES")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .find(|&n| n == batch || n == padded)
+            })
+            .flatten()
     }
 
     /// Replay a captured graph for a padded batch size, return only actual_batch results.

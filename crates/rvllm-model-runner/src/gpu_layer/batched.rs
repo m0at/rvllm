@@ -4,6 +4,7 @@
 //! Per-op CUTLASS vs cuBLAS routing determined by GemmStrategy (set at init time).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use cudarc::driver::{
     CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice,
@@ -15,7 +16,10 @@ use tracing::info;
 use rvllm_core::error::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
 
-use super::{GemmStrategy, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer, LayerScratchRef};
+use super::{
+    BatchedLayerPhaseTimings, GemmStrategy, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer,
+    LayerScratchRef,
+};
 
 impl GpuTransformerLayer {
     #[inline]
@@ -45,6 +49,7 @@ impl GpuTransformerLayer {
         lt: Option<&crate::CublasLtRef>,
         prev_mlp_out: Option<&CudaSlice<f16>>,
         scratch: &mut LayerScratchRef<'_>,
+        mut phase_timings: Option<&mut BatchedLayerPhaseTimings>,
         gemm_strategy: GemmStrategy,
         cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
     ) -> Result<()> {
@@ -62,6 +67,8 @@ impl GpuTransformerLayer {
         let k_end = q_end + num_tokens * kv_dim;
 
         let dbg = cfg.layer_idx < 1 && std::env::var("RVLLM_DEBUG").is_ok();
+        let profile = phase_timings.is_some();
+        let mut phase_start = Instant::now();
         let dbg_dump = |label: &str, buf: &CudaSlice<f16>, stream: &Arc<CudaStream>| {
             if let Ok(vals) = stream.clone_dtoh(buf) {
                 let first5: Vec<f32> = vals.iter().take(5).map(|v| v.to_f32()).collect();
@@ -78,6 +85,17 @@ impl GpuTransformerLayer {
                 info!("DEBUG L0 {label}: first5={first5:?} last5={last5:?} max={max:.4} mean={mean:.6} nan={nan} len={}", vals.len());
             }
         };
+        let mut mark_phase =
+            |slot: fn(&mut BatchedLayerPhaseTimings) -> &mut std::time::Duration| -> Result<()> {
+                if let Some(t) = phase_timings.as_deref_mut() {
+                    self.stream
+                        .synchronize()
+                        .map_err(|e| LLMError::GpuError(format!("phase profile sync: {e}")))?;
+                    *slot(t) = phase_start.elapsed();
+                    phase_start = Instant::now();
+                }
+                Ok(())
+            };
 
         // 1. Pre-attention RMSNorm
         let residual_from_fused: bool;
@@ -108,6 +126,9 @@ impl GpuTransformerLayer {
             )?;
             residual_from_fused = false;
         };
+        if profile {
+            mark_phase(|t| &mut t.pre_attn_norm)?;
+        }
 
         // 2-3. QKV GEMM + bias (before taking residual_ref to avoid borrow conflict)
         let used_fused_cutlass = self.batched_qkv_cutlass(
@@ -126,6 +147,9 @@ impl GpuTransformerLayer {
             self.batched_qkv_gemm(
                 weights, blas, lt, scratch, num_tokens, qkv_dim, hidden, q_dim, kv_dim,
             )?;
+        }
+        if profile {
+            mark_phase(|t| &mut t.qkv)?;
         }
 
         let residual_ref: &CudaSlice<f16> = if residual_from_fused {
@@ -185,6 +209,9 @@ impl GpuTransformerLayer {
                 )?;
             }
         }
+        if profile {
+            mark_phase(|t| &mut t.rope_cache)?;
+        }
 
         // 6. Attention
         let attn_out = if input.is_prefill {
@@ -226,6 +253,9 @@ impl GpuTransformerLayer {
 
         if dbg {
             dbg_dump("attn_out", &attn_out, &self.stream);
+        }
+        if profile {
+            mark_phase(|t| &mut t.attn)?;
         }
 
         // 7-8. O projection + residual + post-norm
@@ -298,6 +328,9 @@ impl GpuTransformerLayer {
                 scratch.normed,
                 scratch.residual,
             )?;
+        }
+        if profile {
+            mark_phase(|t| &mut t.oproj_norm)?;
         }
 
         // 9. Gate+up GEMM + SiLU
@@ -433,6 +466,9 @@ impl GpuTransformerLayer {
                         .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
                 }
             }
+            if profile {
+                mark_phase(|t| &mut t.gateup_silu)?;
+            }
 
             // 10. Down projection into scratch.down
             Self::hgemm_dispatch_fp8_into(
@@ -448,6 +484,30 @@ impl GpuTransformerLayer {
                 weights.down_proj_fp8,
                 scratch.down,
             )?;
+            if profile {
+                mark_phase(|t| &mut t.down)?;
+            }
+            return Ok(());
+        }
+
+        if profile {
+            mark_phase(|t| &mut t.gateup_silu)?;
+        }
+        Self::hgemm_dispatch_fp8_into(
+            &self.stream,
+            blas,
+            lt,
+            &*scratch.silu_out,
+            weights.down_proj,
+            num_tokens,
+            hidden,
+            intermediate,
+            &self.loader,
+            weights.down_proj_fp8,
+            scratch.down,
+        )?;
+        if profile {
+            mark_phase(|t| &mut t.down)?;
         }
 
         Ok(())
