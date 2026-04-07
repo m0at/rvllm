@@ -1212,16 +1212,20 @@ use rvllm_core::prelude::{
                             .get(&group.request_id)
                             .and_then(|req| req.decode_seq_data.get(seq_idx).cloned())
                     };
-                    let Some(existing) = (if is_prompt {
-                        self.scheduler.get_block_table(seq.seq_id)
+                    let (existing, from_scheduler_fallback) = if is_prompt {
+                        (self.scheduler.get_block_table(seq.seq_id), false)
+                    } else if let Some(cached) = self
+                        .requests
+                        .get(&group.request_id)
+                        .and_then(|req| req.decode_block_tables.get(seq_idx))
+                        .filter(|bt| !bt.is_empty())
+                        .cloned()
+                    {
+                        (Some(cached), false)
                     } else {
-                        self.requests
-                            .get(&group.request_id)
-                            .and_then(|req| req.decode_block_tables.get(seq_idx))
-                            .filter(|bt| !bt.is_empty())
-                            .cloned()
-                            .or_else(|| self.scheduler.get_block_table(seq.seq_id))
-                    }) else {
+                        (self.scheduler.get_block_table(seq.seq_id), true)
+                    };
+                    let Some(existing) = existing else {
                         warn!(
                             seq_id = seq.seq_id.0,
                             "missing block table for scheduled sequence"
@@ -1232,6 +1236,11 @@ use rvllm_core::prelude::{
                         aborted_seqs.insert(seq.seq_id);
                         continue;
                     };
+                    if from_scheduler_fallback {
+                        if let Some(req) = self.requests.get_mut(&group.request_id) {
+                            Self::sync_decode_block_table(req, seq_idx, existing.clone());
+                        }
+                    }
 
                     block_tables.insert(seq.seq_id, existing);
 
