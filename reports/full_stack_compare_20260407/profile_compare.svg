@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1120" viewBox="0 0 1440 1120">
+<style>
+text{font-family:Helvetica,Arial,sans-serif;fill:#111}
+.title{font-size:28px;font-weight:700}
+.subtitle{font-size:14px;fill:#555}
+.section{font-size:18px;font-weight:700}
+.small{font-size:12px;fill:#555}
+.axis{font-size:12px;fill:#666}
+.label{font-size:13px}
+.mono{font-family:Menlo,Consolas,monospace;font-size:12px}
+</style>
+<rect width="100%" height="100%" fill="#fafafa"/>
+<text x="70" y="52" class="title">rvLLM vs vLLM 0.19 GPU Profile Comparison</text>
+<text x="70" y="78" class="subtitle">/root/models/Qwen2.5-7B on H100 · benchmark output_len=128 · profile output_len=128 · temperature=0.0</text>
+<rect x="70" y="96" width="16" height="16" rx="3" fill="#1f77b4"/>
+<text x="94" y="108" class="label">rvllm</text>
+<rect x="220" y="96" width="16" height="16" rx="3" fill="#ff7f0e"/>
+<text x="244" y="108" class="label">vllm</text>
+<text x="70" y="116" class="section">Throughput by Batch</text>
+<rect x="70" y="140" width="900" height="320" fill="white" stroke="#e5e5e5"/>
+<line x1="70" y1="460.0" x2="970" y2="460.0" stroke="#eee"/>
+<text x="62" y="464.0" text-anchor="end" class="axis">0</text>
+<line x1="70" y1="380.0" x2="970" y2="380.0" stroke="#eee"/>
+<text x="62" y="384.0" text-anchor="end" class="axis">4,672</text>
+<line x1="70" y1="300.0" x2="970" y2="300.0" stroke="#eee"/>
+<text x="62" y="304.0" text-anchor="end" class="axis">9,345</text>
+<line x1="70" y1="220.0" x2="970" y2="220.0" stroke="#eee"/>
+<text x="62" y="224.0" text-anchor="end" class="axis">14,017</text>
+<line x1="70" y1="140.0" x2="970" y2="140.0" stroke="#eee"/>
+<text x="62" y="144.0" text-anchor="end" class="axis">18,690</text>
+<rect x="122.0" y="457.7" width="32" height="2.3" fill="#1f77b4" rx="4"/>
+<rect x="166.0" y="457.1" width="32" height="2.9" fill="#ff7f0e" rx="4"/>
+<text x="160.0" y="480" text-anchor="middle" class="label">N=1</text>
+<rect x="302.0" y="383.2" width="32" height="76.8" fill="#1f77b4" rx="4"/>
+<rect x="346.0" y="373.1" width="32" height="86.9" fill="#ff7f0e" rx="4"/>
+<text x="340.0" y="480" text-anchor="middle" class="label">N=32</text>
+<rect x="482.0" y="314.5" width="32" height="145.5" fill="#1f77b4" rx="4"/>
+<rect x="526.0" y="298.5" width="32" height="161.5" fill="#ff7f0e" rx="4"/>
+<text x="520.0" y="480" text-anchor="middle" class="label">N=64</text>
+<rect x="662.0" y="279.2" width="32" height="180.8" fill="#1f77b4" rx="4"/>
+<rect x="706.0" y="234.4" width="32" height="225.6" fill="#ff7f0e" rx="4"/>
+<text x="700.0" y="480" text-anchor="middle" class="label">N=96</text>
+<rect x="842.0" y="225.0" width="32" height="235.0" fill="#1f77b4" rx="4"/>
+<rect x="886.0" y="174.3" width="32" height="285.7" fill="#ff7f0e" rx="4"/>
+<text x="880.0" y="480" text-anchor="middle" class="label">N=128</text>
+<text x="1020" y="116" class="section">rvLLM / vLLM Ratio</text>
+<rect x="1020" y="140" width="320" height="320" fill="white" stroke="#e5e5e5"/>
+<line x1="1020" y1="300.0" x2="1340" y2="300.0" stroke="#ddd"/>
+<rect x="1046.0" y="300.0" width="28" height="80.0" fill="#e76f51" rx="4"/>
+<text x="1060.0" y="480" text-anchor="middle" class="label">1</text>
+<text x="1060.0" y="396.0" text-anchor="middle" class="small">0.79x</text>
+<rect x="1099.6" y="300.0" width="28" height="44.6" fill="#e76f51" rx="4"/>
+<text x="1113.6" y="480" text-anchor="middle" class="label">32</text>
+<text x="1113.6" y="360.6" text-anchor="middle" class="small">0.88x</text>
+<rect x="1153.2" y="300.0" width="28" height="38.0" fill="#e76f51" rx="4"/>
+<text x="1167.2" y="480" text-anchor="middle" class="label">64</text>
+<text x="1167.2" y="354.0" text-anchor="middle" class="small">0.90x</text>
+<rect x="1206.8" y="300.0" width="28" height="76.4" fill="#e76f51" rx="4"/>
+<text x="1220.8" y="480" text-anchor="middle" class="label">96</text>
+<text x="1220.8" y="392.4" text-anchor="middle" class="small">0.80x</text>
+<rect x="1260.4" y="300.0" width="28" height="68.2" fill="#e76f51" rx="4"/>
+<text x="1274.4" y="480" text-anchor="middle" class="label">128</text>
+<text x="1274.4" y="384.2" text-anchor="middle" class="small">0.82x</text>
+<text x="70" y="532" class="section">Top Kernels and Transfer Tax</text>
+<text x="70" y="552" class="subtitle">Kernel shares come from nsys cuda_gpu_kern_sum; transfer tax comes from cuda_gpu_mem_time_sum.</text>
+<rect x="70" y="560" width="1300" height="530" fill="white" stroke="#e5e5e5"/>
+<text x="82" y="586" class="label">Batch</text>
+<text x="160" y="586" class="label">rvLLM top kernels</text>
+<text x="740" y="586" class="label">vLLM top kernels</text>
+<line x1="70" y1="628" x2="1370" y2="628" stroke="#f0f0f0"/>
+<text x="82" y="620" class="label">N=1</text>
+<rect x="160.0" y="604" width="43.4" height="18" fill="#0f4c5c"/>
+<rect x="203.4" y="604" width="23.2" height="18" fill="#2c7da0"/>
+<rect x="226.7" y="604" width="18.9" height="18" fill="#84a98c"/>
+<rect x="245.6" y="604" width="15.9" height="18" fill="#bc4749"/>
+<rect x="160" y="604" width="430" height="18" fill="none" stroke="#ddd"/>
+<text x="160" y="640" class="small">fa3_v3_decode_gqa_kernel 10.1%</text>
+<text x="160" y="654" class="small">nvjet_hsh_192x128_64x5_1x2_h_bz_coopB_TNT 5.4%</text>
+<text x="160" y="668" class="small">fused_residual_rmsnorm_f16_kernel 4.4%</text>
+<text x="480" y="640" class="small">HtoD 97.7%</text>
+<rect x="740.0" y="604" width="109.7" height="18" fill="#0f4c5c"/>
+<rect x="849.6" y="604" width="59.3" height="18" fill="#2c7da0"/>
+<rect x="909.0" y="604" width="21.9" height="18" fill="#84a98c"/>
+<rect x="930.9" y="604" width="17.6" height="18" fill="#bc4749"/>
+<rect x="740" y="604" width="430" height="18" fill="none" stroke="#ddd"/>
+<text x="740" y="640" class="small">nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN 25.5%</text>
+<text x="740" y="654" class="small">nvjet_tst_256x128_64x4_1x2_h_bz_coopA_TNT 13.8%</text>
+<text x="740" y="668" class="small">nvjet_tst_192x128_64x5_1x2_h_bz_coopB_TNT 5.1%</text>
+<text x="1060" y="640" class="small">HtoD 99.9%</text>
+<line x1="70" y1="724" x2="1370" y2="724" stroke="#f0f0f0"/>
+<text x="82" y="716" class="label">N=32</text>
+<rect x="160.0" y="700" width="41.3" height="18" fill="#0f4c5c"/>
+<rect x="201.3" y="700" width="21.9" height="18" fill="#2c7da0"/>
+<rect x="223.2" y="700" width="18.9" height="18" fill="#84a98c"/>
+<rect x="242.1" y="700" width="16.8" height="18" fill="#bc4749"/>
+<rect x="160" y="700" width="430" height="18" fill="none" stroke="#ddd"/>
+<text x="160" y="736" class="small">fa3_v3_decode_gqa_kernel 9.6%</text>
+<text x="160" y="750" class="small">nvjet_hsh_192x128_64x5_1x2_h_bz_coopB_TNT 5.1%</text>
+<text x="160" y="764" class="small">fused_residual_rmsnorm_f16_kernel 4.4%</text>
+<text x="480" y="736" class="small">HtoD 97.7%</text>
+<rect x="740.0" y="700" width="109.7" height="18" fill="#0f4c5c"/>
+<rect x="849.6" y="700" width="59.3" height="18" fill="#2c7da0"/>
+<rect x="909.0" y="700" width="21.9" height="18" fill="#84a98c"/>
+<rect x="930.9" y="700" width="17.6" height="18" fill="#bc4749"/>
+<rect x="740" y="700" width="430" height="18" fill="none" stroke="#ddd"/>
+<text x="740" y="736" class="small">nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN 25.5%</text>
+<text x="740" y="750" class="small">nvjet_tst_256x128_64x4_1x2_h_bz_coopA_TNT 13.8%</text>
+<text x="740" y="764" class="small">nvjet_tst_192x128_64x5_1x2_h_bz_coopB_TNT 5.1%</text>
+<text x="1060" y="736" class="small">HtoD 99.9%</text>
+<line x1="70" y1="820" x2="1370" y2="820" stroke="#f0f0f0"/>
+<text x="82" y="812" class="label">N=64</text>
+<rect x="160.0" y="796" width="39.1" height="18" fill="#0f4c5c"/>
+<rect x="199.1" y="796" width="21.5" height="18" fill="#2c7da0"/>
+<rect x="220.6" y="796" width="21.1" height="18" fill="#84a98c"/>
+<rect x="241.7" y="796" width="18.5" height="18" fill="#bc4749"/>
+<rect x="160" y="796" width="430" height="18" fill="none" stroke="#ddd"/>
+<text x="160" y="832" class="small">fa3_v3_decode_gqa_kernel 9.1%</text>
+<text x="160" y="846" class="small">nvjet_hsh_144x128_64x6_2x1_v_bz_TNN 5.0%</text>
+<text x="160" y="860" class="small">nvjet_hsh_192x128_64x5_1x2_h_bz_coopB_TNT 4.9%</text>
+<text x="480" y="832" class="small">HtoD 97.7%</text>
+<text x="740" y="810" class="small">no profile export</text>
+<text x="1060" y="832" class="small">HtoD 0.0%</text>
+<line x1="70" y1="916" x2="1370" y2="916" stroke="#f0f0f0"/>
+<text x="82" y="908" class="label">N=96</text>
+<rect x="160.0" y="892" width="37.0" height="18" fill="#0f4c5c"/>
+<rect x="197.0" y="892" width="23.6" height="18" fill="#2c7da0"/>
+<rect x="220.6" y="892" width="23.2" height="18" fill="#84a98c"/>
+<rect x="243.8" y="892" width="19.8" height="18" fill="#bc4749"/>
+<rect x="160" y="892" width="430" height="18" fill="none" stroke="#ddd"/>
+<text x="160" y="928" class="small">fa3_v3_decode_gqa_kernel 8.6%</text>
+<text x="160" y="942" class="small">nvjet_hsh_128x232_64x4_2x1_v_bz_coopA_TNT 5.5%</text>
+<text x="160" y="956" class="small">flash_attention_3_prefill_f16io_kernel 5.4%</text>
+<text x="480" y="928" class="small">HtoD 97.7%</text>
+<text x="740" y="906" class="small">no profile export</text>
+<text x="1060" y="928" class="small">HtoD 0.0%</text>
+<line x1="70" y1="1012" x2="1370" y2="1012" stroke="#f0f0f0"/>
+<text x="82" y="1004" class="label">N=128</text>
+<rect x="160.0" y="988" width="35.3" height="18" fill="#0f4c5c"/>
+<rect x="195.3" y="988" width="29.7" height="18" fill="#2c7da0"/>
+<rect x="224.9" y="988" width="27.9" height="18" fill="#84a98c"/>
+<rect x="252.9" y="988" width="19.3" height="18" fill="#bc4749"/>
+<rect x="160" y="988" width="430" height="18" fill="none" stroke="#ddd"/>
+<text x="160" y="1024" class="small">fa3_v3_decode_gqa_kernel 8.2%</text>
+<text x="160" y="1038" class="small">nvjet_hsh_192x208_64x4_2x1_v_bz_coopB_TNT 6.9%</text>
+<text x="160" y="1052" class="small">flash_attention_3_prefill_f16io_kernel 6.5%</text>
+<text x="480" y="1024" class="small">HtoD 97.7%</text>
+<text x="740" y="1002" class="small">no profile export</text>
+<text x="1060" y="1024" class="small">HtoD 0.0%</text>
+</svg>

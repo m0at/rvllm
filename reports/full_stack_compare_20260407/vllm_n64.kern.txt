@@ -1,0 +1,179 @@
+Generating SQLite file /workspace/results/manual_profile_n64_20260407_230500/vllm_n64.sqlite from /workspace/results/manual_profile_n64_20260407_230500/vllm_n64.nsys-rep
+Processing [/workspace/results/manual_profile_n64_20260407_230500/vllm_n64.sqlite] with [/opt/nvidia/nsight-compute/2025.1.0/host/target-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+
+ ** CUDA GPU Kernel Summary (cuda_gpu_kern_sum):
+
+ Time (%)  Total Time (ns)  Instances   Avg (ns)    Med (ns)   Min (ns)  Max (ns)  StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  ----------  ----------  --------  --------  -----------  ----------------------------------------------------------------------------------------------------
+     25.6        339152299        224   1514072.8    135503.0    132127   6194750    2395824.1  nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN                                                           
+     13.7        181852306        112   1623681.3   1492288.0    473243   3043232    1102206.9  nvjet_tst_256x128_64x4_1x2_h_bz_coopA_TNT                                                           
+      5.1         67756116        504    134436.7    106255.0    103167    206974      33354.0  nvjet_tst_192x128_64x5_1x2_h_bz_coopB_TNT                                                           
+      4.1         54653522       2449     22316.7      8128.0      1888    598298      87999.8  triton_poi_fused_mul_silu_slice_1                                                                   
+      3.8         50697552        840     60354.2     87983.5     18623    117630      37566.4  nvjet_tst_112x128_64x7_2x1_v_bz_TNN                                                                 
+      3.0         40119313         56    716416.3    715464.5    686425    784279      25170.4  nvjet_tst_192x192_64x4_2x1_v_bz_coopB_bias_TNN                                                      
+      2.9         38750903        910     42583.4     39999.5     25184     63136      11842.6  void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMa…
+      1.9         25095798       3906      6424.9      4672.0      2176    308573      16754.6  void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, __nv_bfloat16, (vllm::Fp8KVCacheDataType)0…
+      1.5         20358767       2449      8313.1      4000.0      2432    187230      27044.3  triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_2                                                  
+      1.5         19628176         56    350503.1    350252.5    345916    357853       2874.9  nvjet_tst_512x64_64x2_2x1_v_bz_coopB_TNN                                                            
+      1.5         19280715        336     57383.1     57647.5     52959     62015       1848.7  nvjet_tst_112x128_64x7_2x1_v_bz_splitK_TNN                                                          
+      1.5         19276911        112    172115.3    172030.0    168958    178078       1760.7  nvjet_tst_192x160_64x4_2x1_v_bz_coopB_TNT                                                           
+      1.4         17899456          1  17899456.0  17899456.0  17899456  17899456          0.0  _topk_topp_kernel                                                                                   
+      1.2         15440028         56    275714.8    274381.5      6240    547610     271533.4  void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<signed char>, std::a…
+      1.1         14547216       2450      5937.6      3232.0      2207    112511      15921.3  triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0                                                  
+      1.0         12929302        112    115440.2    115423.0    113503    118207        847.9  nvjet_tst_192x160_64x4_1x2_h_bz_coopB_TNT                                                           
+      0.9         12395995        168     73785.7     72479.0     70239     87807       3658.9  nvjet_tst_168x128_64x5_2x1_v_bz_splitK_TNN                                                          
+      0.9         12262535       2362      5191.6      2912.0      1824    102495      14097.3  triton_poi_fused_3                                                                                  
+      0.9         11484006        112    102535.8    102463.0    100735    104575        906.3  nvjet_tst_192x160_64x4_4x1_v_bz_coopB_TNT                                                           
+      0.9         11379273        112    101600.7    101535.0    100063    103903        660.8  nvjet_tst_192x112_64x5_1x2_h_bz_TNT                                                                 
+      0.8         11238444        112    100343.3    100271.0     98367    103647       1009.5  nvjet_tst_144x192_64x5_2x1_v_bz_coopB_TNN                                                           
+      0.8         10454740        112     93345.9     93455.5     92095     96031        558.3  nvjet_tst_192x8_64x8_4x1_v_bz_TNT                                                                   
+      0.7          9482883       1861      5095.6      5056.0      2015      9216       1691.1  void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat1…
+      0.7          9060871         56    161801.3    161726.5    159710    164158       1019.5  nvjet_tst_128x224_64x4_2x1_v_bz_coopA_TNT                                                           
+      0.7          8946466        336     26626.4     26351.5     24800     32063       1017.8  nvjet_tst_144x128_64x6_1x2_h_bz_coopA_bias_TNN                                                      
+      0.7          8734116         56    155966.4    155310.5    153151    163102       2113.4  nvjet_tst_192x144_64x5_2x1_v_bz_coopB_TNT                                                           
+      0.6          8546562        112     76308.6     76319.0     74687     77727        782.3  nvjet_tst_256x144_64x4_2x1_v_bz_coopA_splitK_TNT                                                    
+      0.6          8199785         84     97616.5     97503.0     95199    101439       1275.4  nvjet_tst_144x128_64x6_2x1_v_bz_TNN                                                                 
+      0.6          7728721        112     69006.4     68831.5     67295     71007        913.2  nvjet_tst_128x80_64x8_2x4_v_bz_TNT                                                                  
+      0.6          7512401         56    134150.0    134206.5    132095    137374       1081.5  nvjet_tst_192x208_64x4_2x1_v_bz_coopB_TNT                                                           
+      0.6          7480142        112     66787.0     66943.5     64063     68128        910.8  nvjet_tst_256x96_64x4_2x1_v_bz_coopA_splitK_TNT                                                     
+      0.6          7401568       3082      2401.5      1696.0      1088     37984       4659.5  void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std:…
+      0.5          7075596        910      7775.4      6608.0      3968     13120       2855.0  void cutlass::device_kernel<flash::FlashAttnFwdCombine<cute::tuple<cute::C<(int)8>, cute::C<(int)12…
+      0.5          7056141         56    126002.5    126014.0    123871    128734        959.9  nvjet_tst_128x160_64x5_2x1_v_bz_TNT                                                                 
+      0.5          6936598         69    100530.4    100479.0     98495    103199       1016.4  nvjet_tst_192x144_64x5_4x1_v_bz_coopB_TNT                                                           
+      0.5          6713854         56    119890.3    119967.0    117919    121630        720.8  nvjet_tst_192x176_64x4_1x2_h_bz_coopB_TNT                                                           
+      0.5          6212706        112     55470.6     55535.5     54079     56991        622.9  nvjet_tst_128x80_64x8_4x2_v_bz_splitK_TNT                                                           
+      0.5          6056675         56    108154.9    108031.0    107070    109631        602.0  nvjet_tst_192x144_64x5_1x2_h_bz_coopB_TNT                                                           
+      0.4          5864508         56    104723.4    104623.0    102687    107487       1061.9  nvjet_tst_192x176_64x4_4x1_v_bz_coopB_TNT                                                           
+      0.4          5631107         56    100555.5    100511.0     98719    102111        731.8  nvjet_tst_192x104_64x5_1x2_h_bz_TNT                                                                 
+      0.4          5609386       2362      2374.8      2048.0      1696     17792       2201.3  triton_poi_fused_4                                                                                  
+      0.4          5451592         56     97349.9     97439.0     95455     99711        930.9  nvjet_tst_192x88_64x6_1x2_h_bz_TNT                                                                  
+      0.4          5331784         56     95210.4     95151.0     93887     97087        633.4  nvjet_tst_320x64_64x4_4x1_v_bz_TNT                                                                  
+      0.4          5277614        112     47121.6     47167.5     45920     48735        669.2  nvjet_tst_64x8_64x16_2x1_v_bz_splitK_TNT                                                            
+      0.3          4609709        224     20579.1     20591.5     19008     23551        657.6  nvjet_tst_128x80_64x8_4x1_v_bz_bias_TNT                                                             
+      0.3          4150995        168     24708.3     24335.5     23424     29536       1205.3  nvjet_tst_112x128_64x7_2x1_v_bz_bias_TNN                                                            
+      0.3          4103420       3145      1304.7      1344.0      1152      2336        116.3  void at::native::vectorized_elementwise_kernel<(int)2, at::native::FillFunctor<long>, std::array<ch…
+      0.3          3882003         56     69321.5     69343.5     67967     71135        586.9  nvjet_tst_256x112_64x4_2x1_v_bz_coopA_splitK_TNT                                                    
+      0.3          3583711        224     15998.7     15920.0     14720     17440        725.1  nvjet_tst_112x64_64x9_1x2_h_bz_TNN                                                                  
+      0.2          3288254         56     58718.8     58719.5     57439     60767        673.0  nvjet_tst_64x208_64x6_4x1_v_bz_splitK_TNT                                                           
+      0.2          3258873         56     58194.2     58159.5     56832     59743        715.9  nvjet_tst_256x72_64x5_2x1_v_bz_splitK_TNT                                                           
+      0.2          3246426         56     57971.9     58047.0     56351     59200        648.9  nvjet_tst_128x96_64x7_4x2_v_bz_splitK_TNT                                                           
+      0.2          3245094        168     19316.0     19104.0     17600     22752       1132.3  nvjet_tst_112x64_64x9_2x1_v_bz_bias_TNN                                                             
+      0.2          3237498         56     57812.5     57855.0     56319     59040        696.0  nvjet_tst_256x64_64x5_2x1_v_bz_splitK_TNT                                                           
+      0.2          3209819         56     57318.2     57327.0     55999     58624        672.4  nvjet_tst_256x56_64x5_2x1_v_bz_splitK_TNT                                                           
+      0.2          3205603         56     57242.9     57087.0     55488     58879        815.7  nvjet_tst_128x104_64x7_4x2_v_bz_splitK_TNT                                                          
+      0.2          3154754         56     56334.9     56335.5     55264     58016        584.7  nvjet_tst_64x176_64x7_4x1_v_bz_splitK_TNT                                                           
+      0.2          2932098        112     26179.4     27360.0     23328     29375       2295.9  nvjet_tst_128x144_64x6_4x1_v_bz_coopA_bias_TNT                                                      
+      0.2          2796332        112     24967.3     26207.5     20928     28480       2263.0  nvjet_tst_192x64_64x6_4x1_v_bz_bias_TNT                                                             
+      0.2          2736932         28     97747.6     97775.0     96191     99519        779.7  nvjet_tst_384x104_64x3_4x1_v_bz_coopA_TNT                                                           
+      0.2          2735780         28     97706.4     97647.0     96415     99199        733.4  nvjet_tst_192x88_64x6_4x1_v_bz_TNT                                                                  
+      0.2          2729988         28     97499.6     97407.0     96191     99647       1002.4  nvjet_tst_192x80_64x6_4x1_v_bz_TNT                                                                  
+      0.2          2729540         28     97483.6     97503.0     96767     98143        381.2  nvjet_tst_192x48_64x7_4x1_v_bz_TNT                                                                  
+      0.2          2727972         28     97427.6     97327.0     95839     98751        711.5  nvjet_tst_384x96_64x3_4x1_v_bz_coopA_TNT                                                            
+      0.2          2723492        112     24316.9     24048.0     21215     28576       1546.8  nvjet_tst_144x64_64x8_2x1_v_bz_TNN                                                                  
+      0.2          2717380         28     97049.3     97055.0     96095     97887        399.4  nvjet_tst_192x40_64x7_4x1_v_bz_TNT                                                                  
+      0.2          2715108         28     96968.1     96927.0     96351     97791        380.5  nvjet_tst_192x16_64x8_4x1_v_bz_TNT                                                                  
+      0.2          2698756         28     96384.1     96511.0     95263     96927        388.5  nvjet_tst_192x32_64x7_4x1_v_bz_TNT                                                                  
+      0.2          2690276         28     96081.3     96095.0     95199     96799        407.2  nvjet_tst_192x24_64x7_4x1_v_bz_TNT                                                                  
+      0.2          2663716         28     95132.7     95039.0     93055     97759       1021.9  nvjet_tst_384x72_64x3_4x1_v_bz_coopA_TNT                                                            
+      0.2          2614980        112     23348.0     23423.5     20032     24800        610.1  nvjet_tst_128x96_64x7_4x1_v_bz_bias_TNT                                                             
+      0.2          2304399        112     20575.0     20448.0     19935     22079        381.6  nvjet_tst_80x128_64x8_4x2_v_bz_bias_TNN                                                             
+      0.2          2260648        112     20184.4     20239.5     18623     21728        781.1  nvjet_tst_128x72_64x8_4x1_v_bz_bias_TNT                                                             
+      0.2          2238408         41     54595.3     54655.0     53567     55936        571.4  nvjet_tst_64x144_64x8_4x1_v_bz_splitK_TNT                                                           
+      0.2          2037965        112     18196.1     18128.0     17056     20832        581.9  nvjet_tst_96x128_64x7_4x1_v_bz_TNN                                                                  
+      0.1          1800689        112     16077.6     15568.0     13280     19648       1908.6  nvjet_tst_96x64_64x10_4x1_v_bz_TNN                                                                  
+      0.1          1666347         56     29756.2     29792.0     11295     48928      18241.8  nvjet_tst_128x16_64x11_4x1_v_bz_splitK_TNT                                                          
+      0.1          1654638         56     29547.1     29583.0     27808     30623        574.3  nvjet_tst_192x80_64x6_4x1_v_bz_bias_TNT                                                             
+      0.1          1575957        112     14071.0     14016.0     13440     15104        277.1  nvjet_tst_64x112_64x9_4x2_v_bz_TNT                                                                  
+      0.1          1556433         28     55586.9     55471.5     54464     56767        519.4  nvjet_tst_128x104_64x7_4x1_v_bz_splitK_TNT                                                          
+      0.1          1543377         28     55120.6     54991.5     54464     56415        495.2  nvjet_tst_128x96_64x7_4x1_v_bz_splitK_TNT                                                           
+      0.1          1537589         28     54913.9     54880.0     54016     56287        600.7  nvjet_tst_128x112_64x7_4x1_v_bz_splitK_TNT                                                          
+      0.1          1519093         28     54253.3     54208.0     53120     55103        587.8  nvjet_tst_64x136_64x8_4x1_v_bz_splitK_TNT                                                           
+      0.1          1509866        112     13480.9     13440.0     12960     14112        230.4  nvjet_tst_64x104_64x10_4x2_v_bz_TNT                                                                 
+      0.1          1502478         56     26830.0     25919.5     24800     35104       2155.5  nvjet_tst_256x64_64x5_2x1_v_bz_bias_TNT                                                             
+      0.1          1495055         28     53394.8     53407.5     52351     54143        431.3  nvjet_tst_128x88_64x7_4x1_v_bz_splitK_TNT                                                           
+      0.1          1484404         28     53014.4     52960.0     51967     54079        492.3  nvjet_tst_128x72_64x8_4x1_v_bz_splitK_TNT                                                           
+      0.1          1476688         28     52738.9     52847.5     51552     53823        577.8  nvjet_tst_128x80_64x8_4x1_v_bz_splitK_TNT                                                           
+      0.1          1467824          1   1467824.0   1467824.0   1467824   1467824          0.0  nvjet_tst_320x128_64x3_1x2_h_bz_coopB_TNT                                                           
+      0.1          1439476        112     12852.5     12800.0     12288     13632        257.9  nvjet_tst_64x88_64x11_4x2_v_bz_TNT                                                                  
+      0.1          1438640         28     51380.0     51376.0     50655     52383        469.7  nvjet_tst_112x64_64x9_2x1_v_bz_splitK_TNN                                                           
+      0.1          1437361         84     17111.4     16991.5     16511     18079        404.1  nvjet_tst_72x64_64x12_1x2_h_bz_bias_TNN                                                             
+      0.1          1423477        112     12709.6     12688.0     12192     13535        240.1  nvjet_tst_64x80_64x11_4x2_v_bz_TNT                                                                  
+      0.1          1422860         28     50816.4     50879.0     50079     51615        367.0  nvjet_tst_128x56_64x9_4x1_v_bz_splitK_TNT                                                           
+      0.1          1404014         56     25071.7     25120.0     23263     26016        463.7  nvjet_tst_128x112_64x7_4x1_v_bz_bias_TNT                                                            
+      0.1          1399246         28     49973.1     49967.5     49055     50976        522.0  nvjet_tst_128x40_64x10_4x1_v_bz_splitK_TNT                                                          
+      0.1          1389300         28     49617.9     49648.0     48639     50463        469.0  nvjet_tst_128x48_64x9_4x1_v_bz_splitK_TNT                                                           
+      0.1          1367536         28     48840.6     48767.5     48159     49888        493.2  nvjet_tst_64x32_64x16_4x1_v_bz_splitK_TNT                                                           
+      0.1          1344946         28     48033.8     48047.0     47328     48863        448.5  nvjet_tst_128x24_64x11_4x1_v_bz_splitK_TNT                                                          
+      0.1          1288018        112     11500.2     11424.0     11136     12544        292.1  nvjet_tst_64x8_64x16_4x1_v_bz_TNT                                                                   
+      0.1          1180569         84     14054.4     14016.0     13728     15168        241.9  nvjet_tst_64x8_64x16_4x1_v_bz_bias_TNT                                                              
+      0.1          1154389         56     20614.1     20527.5     20063     21472        324.1  nvjet_tst_192x72_64x6_4x2_h_bz_TNT                                                                  
+      0.1          1065873         56     19033.4     19008.0     18464     19648        259.7  nvjet_tst_64x208_64x6_4x2_v_bz_TNT                                                                  
+      0.1          1064950         56     19017.0     19103.0     17887     20192        605.7  nvjet_tst_128x56_64x9_4x1_v_bz_bias_TNT                                                             
+      0.1          1052471         56     18794.1     18655.5     18336     19712        337.2  nvjet_tst_64x152_64x7_4x1_v_bz_bias_TNT                                                             
+      0.1          1051024         56     18768.3     18656.0     18144     19936        366.7  nvjet_tst_128x80_64x8_4x2_v_bz_bias_TNT                                                             
+      0.1          1027894         56     18355.3     18335.5     17696     19008        271.1  nvjet_tst_128x104_64x7_2x4_v_bz_TNT                                                                 
+      0.1           964698         56     17226.8     17216.0     16480     17920        297.7  nvjet_tst_64x176_64x7_4x2_v_bz_TNT                                                                  
+      0.1           955093         56     17055.2     16992.0     16288     17919        303.1  nvjet_tst_128x88_64x7_2x4_v_bz_TNT                                                                  
+      0.1           875289         70     12504.1     12464.0     12032     13376        255.6  nvjet_tst_64x72_64x12_4x2_v_bz_TNT                                                                  
+      0.1           865305         56     15451.9     15424.0     14912     16192        236.5  nvjet_tst_64x144_64x8_4x2_v_bz_TNT                                                                  
+      0.1           850839         56     15193.6     15168.0     14624     15872        261.0  nvjet_tst_64x136_64x8_4x2_v_bz_TNT                                                                  
+      0.1           838615          1    838615.0    838615.0    838615    838615          0.0  void at::native::<unnamed>::cunn_SoftMaxForward<(int)4, float, float, float, at::native::<unnamed>:…
+      0.1           777433         42     18510.3     18479.5     17792     19360        390.9  nvjet_tst_128x48_64x9_4x1_v_bz_bias_TNT                                                             
+      0.1           715419         56     12775.3     12688.0     12320     13664        317.6  nvjet_tst_64x56_64x14_4x2_v_bz_TNT                                                                  
+      0.1           712442         56     12722.2     12720.0     12288     13599        228.4  nvjet_tst_64x64_64x13_4x2_v_bz_TNT                                                                  
+      0.1           705274         56     12594.2     12560.0     12256     13248        232.7  nvjet_tst_64x48_64x15_4x2_v_bz_TNT                                                                  
+      0.1           701501         56     12526.8     12528.0     12256     12864        156.7  nvjet_tst_64x40_64x16_4x2_v_bz_TNT                                                                  
+      0.0           605433          1    605433.0    605433.0    605433    605433          0.0  void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<float, float, floa…
+      0.0           536250          1    536250.0    536250.0    536250    536250          0.0  void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…
+      0.0           516984         88      5874.8      3856.0      3232     87679      12389.2  triton_red_fused__to_copy_add_embedding_mean_mul_pow_rsqrt_0                                        
+      0.0           510970          1    510970.0    510970.0    510970    510970          0.0  void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator…
+      0.0           491709         28     17561.0     17408.0     17120     18368        332.1  nvjet_tst_64x136_64x8_4x1_v_bz_bias_TNT                                                             
+      0.0           471867         28     16852.4     16720.0     16320     17824        426.8  nvjet_tst_64x104_64x10_4x1_v_bz_bias_TNT                                                            
+      0.0           466877         28     16674.2     16560.0     16096     17408        396.6  nvjet_tst_64x96_64x10_4x1_v_bz_bias_TNT                                                             
+      0.0           452671        170      2662.8      2496.0      1536      7072        729.6  void at::native::vectorized_gather_kernel<(int)16, long>(char *, char *, T2 *, int, long, long, lon…
+      0.0           448379         28     16013.5     16000.0     15647     17024        241.8  nvjet_tst_64x88_64x11_4x1_v_bz_bias_TNT                                                             
+      0.0           445915         28     15925.5     15840.0     15648     16576        200.5  nvjet_tst_64x80_64x11_4x1_v_bz_bias_TNT                                                             
+      0.0           441531         88      5017.4      2768.0      1728     94175      13654.2  triton_poi_fused_1                                                                                  
+      0.0           438970         28     15677.5     15615.0     15424     16448        212.7  nvjet_tst_64x72_64x12_4x1_v_bz_bias_TNT                                                             
+      0.0           434203          2    217101.5    217101.5    214910    219293       3099.2  void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::ArgMaxOps<…
+      0.0           431612         28     15414.7     15360.0     15104     16480        303.9  nvjet_tst_64x64_64x13_4x1_v_bz_bias_TNT                                                             
+      0.0           425022         28     15179.4     15120.0     14592     16032        421.5  nvjet_tst_64x56_64x14_4x1_v_bz_bias_TNT                                                             
+      0.0           414847         28     14816.0     14720.0     14432     15744        345.5  nvjet_tst_64x48_64x15_4x1_v_bz_bias_TNT                                                             
+      0.0           411165         28     14684.5     14560.0     14464     15455        295.0  nvjet_tst_64x40_64x16_4x1_v_bz_bias_TNT                                                             
+      0.0           407223         28     14543.7     14399.5     14047     15648        414.0  nvjet_tst_64x24_64x16_4x1_v_bz_bias_TNT                                                             
+      0.0           406814         28     14529.1     14464.0     14272     15584        253.0  nvjet_tst_64x32_64x16_4x1_v_bz_bias_TNT                                                             
+      0.0           404477         28     14445.6     14400.0     14016     15136        324.7  nvjet_tst_64x16_64x16_4x1_v_bz_bias_TNT                                                             
+      0.0           379192         28     13542.6     13504.0     13248     14144        208.3  nvjet_tst_64x8_64x16_4x1_v_badd_TNT                                                                 
+      0.0           348796         28     12457.0     12448.0     12032     13248        294.2  nvjet_tst_64x32_64x16_4x2_v_bz_TNT                                                                  
+      0.0           339739         28     12133.5     12095.5     11840     12672        215.7  nvjet_tst_64x24_64x16_4x2_v_bz_TNT                                                                  
+      0.0           339550         28     12126.8     12016.0     11744     12832        306.5  nvjet_tst_64x56_64x14_4x1_v_bz_TNT                                                                  
+      0.0           338749         28     12098.2     12032.0     11648     13024        351.7  nvjet_tst_64x40_64x16_4x1_v_bz_TNT                                                                  
+      0.0           338526         28     12090.2     12112.0     11616     12576        231.2  nvjet_tst_64x16_64x16_4x2_v_bz_TNT                                                                  
+      0.0           327164         28     11684.4     11696.0     11040     12000        204.2  nvjet_tst_64x24_64x16_4x1_v_bz_TNT                                                                  
+      0.0           262141          1    262141.0    262141.0    262141    262141          0.0  void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel<float, (int)4, void at::nat…
+      0.0           205787         88      2338.5      2016.0      1632     16383       2138.4  triton_poi_fused_2                                                                                  
+      0.0           152320        118      1290.8      1344.0      1152      1760        113.9  void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<c…
+      0.0            87135         34      2562.8      2544.0      2304      3072        168.5  void flash::prepare_varlen_num_blocks_kernel<(int)16, (bool)0>(int, int, int, const int *, const in…
+      0.0            86271         65      1327.2      1312.0      1120      1664        135.2  void at::native::unrolled_elementwise_kernel<at::native::FillFunctor<int>, std::array<char *, (unsi…
+      0.0            64159         27      2376.3      2368.0      2176      2592        144.0  void flash::prepare_varlen_num_blocks_kernel<(int)8, (bool)0>(int, int, int, const int *, const int…
+      0.0            48736          1     48736.0     48736.0     48736     48736          0.0  void at::native::<unnamed>::CatArrayBatchedCopy_vectorized<at::native::<unnamed>::OpaqueType<(unsig…
+      0.0            33055          1     33055.0     33055.0     33055     33055          0.0  void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::Te…
+      0.0            27135          1     27135.0     27135.0     27135     27135          0.0  void at::native::vectorized_elementwise_kernel<(int)4, at::native::sin_kernel_cuda(at::TensorIterat…
+      0.0            22976          1     22976.0     22976.0     22976     22976          0.0  void at::native::vectorized_elementwise_kernel<(int)4, at::native::cos_kernel_cuda(at::TensorIterat…
+      0.0            21984          1     21984.0     21984.0     21984     21984          0.0  void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…
+      0.0            16928         12      1410.7      1328.0      1120      2240        289.3  void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<cha…
+      0.0            11679          4      2919.8      2959.5      2656      3104        209.4  void flash::prepare_varlen_num_blocks_kernel<(int)32, (bool)0>(int, int, int, const int *, const in…
+      0.0            11584          1     11584.0     11584.0     11584     11584          0.0  void at::native::<unnamed>::distribution_elementwise_grid_stride_kernel<float, (int)4, void at::nat…
+      0.0             7744          2      3872.0      3872.0      3456      4288        588.3  void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void …
+      0.0             5280          3      1760.0      1760.0      1728      1792         32.0  void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<bool>, std::array<ch…
+      0.0             4480          2      2240.0      2240.0      2144      2336        135.8  void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIterator…
+      0.0             4224          2      2112.0      2112.0      2048      2176         90.5  void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<float…
+      0.0             4064          2      2032.0      2032.0      1472      2592        792.0  void <unnamed>::elementwise_kernel_with_index<int, at::native::arange_cuda_out(const c10::Scalar &,…
+      0.0             3296          1      3296.0      3296.0      3296      3296          0.0  void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl<at::native::…
+      0.0             2592          1      2592.0      2592.0      2592      2592          0.0  void at::native::vectorized_elementwise_kernel<(int)2, at::native::<unnamed>::where_kernel_impl(at:…
+      0.0             2304          1      2304.0      2304.0      2304      2304          0.0  void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::n…
+      0.0             1792          1      1792.0      1792.0      1792      1792          0.0  void at::native::vectorized_elementwise_kernel<(int)4, at::native::reciprocal_kernel_cuda(at::Tenso…
+      0.0             1536          1      1536.0      1536.0      1536      1536          0.0  void at::native::vectorized_elementwise_kernel<(int)4, at::native::BUnaryFunctor<float, float, floa…
+      0.0             1376          1      1376.0      1376.0      1376      1376          0.0  void at::native::vectorized_elementwise_kernel<(int)2, at::native::FillFunctor<double>, std::array<…
+      0.0             1376          1      1376.0      1376.0      1376      1376          0.0  void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, floa…
+

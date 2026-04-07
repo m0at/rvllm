@@ -1,0 +1,16 @@
+Model: /root/models/Qwen2.5-7B
+Matched settings: output_len=128, max_model_len=4096, gpu_memory_utilization=0.85
+
+Throughput table
+N=  1: rvLLM   133.0 tok/s | vLLM   168.0 tok/s | gap  20.8%
+N= 32: rvLLM  4485.7 tok/s | vLLM  5075.2 tok/s | gap  11.6%
+N= 64: rvLLM  8497.1 tok/s | vLLM  9430.2 tok/s | gap   9.9%
+N= 96: rvLLM 10557.9 tok/s | vLLM 13178.2 tok/s | gap  19.9%
+N=128: rvLLM 13725.6 tok/s | vLLM 16687.6 tok/s | gap  17.7%
+
+Profiler read
+rvLLM: attention decode kernel, rvLLM GEMMs, RMSNorm, and SiLU pointwise still dominate.
+vLLM: larger nvjet_tst GEMMs, Triton fused SiLU*mul, FlashAttention forward, and cache update are tighter.
+
+Interpretation
+The remaining gap is compute-side. The main losses are FFN/GEMM/fused pointwise quality, not benchmark harness overhead.

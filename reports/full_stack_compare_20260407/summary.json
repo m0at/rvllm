@@ -1,0 +1,442 @@
+{
+  "model": "/root/models/Qwen2.5-7B",
+  "n_values": [
+    1,
+    32,
+    64,
+    96,
+    128
+  ],
+  "output_len": 128,
+  "profile_n_values": [
+    1,
+    32,
+    64,
+    96,
+    128
+  ],
+  "profile_output_len": 128,
+  "gpu_memory_utilization": 0.85,
+  "temperature": 0.0,
+  "engines": {
+    "rvllm": {
+      "benchmark": {
+        "1": {
+          "engine": "rvllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 1,
+          "tok_per_sec": 133.0,
+          "total_tokens": 128,
+          "elapsed_ms": 962,
+          "failed": 0
+        },
+        "32": {
+          "engine": "rvllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 32,
+          "tok_per_sec": 4485.7,
+          "total_tokens": 4096,
+          "elapsed_ms": 913,
+          "failed": 0
+        },
+        "64": {
+          "engine": "rvllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 64,
+          "tok_per_sec": 8497.1,
+          "total_tokens": 8192,
+          "elapsed_ms": 964,
+          "failed": 0
+        },
+        "96": {
+          "engine": "rvllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 96,
+          "tok_per_sec": 10557.9,
+          "total_tokens": 12288,
+          "elapsed_ms": 1163,
+          "failed": 0
+        },
+        "128": {
+          "engine": "rvllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 128,
+          "tok_per_sec": 13725.6,
+          "total_tokens": 16384,
+          "elapsed_ms": 1193,
+          "failed": 0
+        }
+      },
+      "profiles": {
+        "1": {
+          "kernels": [
+            {
+              "pct": 10.1,
+              "total_time_ns": 28111027,
+              "name": "fa3_v3_decode_gqa_kernel"
+            },
+            {
+              "pct": 5.4,
+              "total_time_ns": 15051838,
+              "name": "nvjet_hsh_192x128_64x5_1x2_h_bz_coopB_TNT"
+            },
+            {
+              "pct": 4.4,
+              "total_time_ns": 12394655,
+              "name": "fused_residual_rmsnorm_f16_kernel"
+            },
+            {
+              "pct": 3.7,
+              "total_time_ns": 10422288,
+              "name": "nvjet_hsh_112x64_64x9_1x2_h_bz_TNN"
+            },
+            {
+              "pct": 3.7,
+              "total_time_ns": 10195396,
+              "name": "silu_mul_interleaved_f16_kernel"
+            }
+          ],
+          "mem_ops": {
+            "[CUDA memcpy Host-to-Device]": {
+              "pct": 97.7
+            },
+            "[CUDA memcpy Device-to-Device]": {
+              "pct": 1.3
+            },
+            "[CUDA memset]": {
+              "pct": 1.0
+            },
+            "[CUDA memcpy Device-to-Host]": {
+              "pct": 0.0
+            }
+          }
+        },
+        "32": {
+          "kernels": [
+            {
+              "pct": 9.6,
+              "total_time_ns": 28080427,
+              "name": "fa3_v3_decode_gqa_kernel"
+            },
+            {
+              "pct": 5.1,
+              "total_time_ns": 15047417,
+              "name": "nvjet_hsh_192x128_64x5_1x2_h_bz_coopB_TNT"
+            },
+            {
+              "pct": 4.4,
+              "total_time_ns": 12932292,
+              "name": "fused_residual_rmsnorm_f16_kernel"
+            },
+            {
+              "pct": 3.9,
+              "total_time_ns": 11435714,
+              "name": "silu_mul_interleaved_f16_kernel"
+            },
+            {
+              "pct": 3.6,
+              "total_time_ns": 10472300,
+              "name": "nvjet_hsh_112x64_64x9_1x2_h_bz_TNN"
+            }
+          ],
+          "mem_ops": {
+            "[CUDA memcpy Host-to-Device]": {
+              "pct": 97.7
+            },
+            "[CUDA memcpy Device-to-Device]": {
+              "pct": 1.3
+            },
+            "[CUDA memset]": {
+              "pct": 1.0
+            },
+            "[CUDA memcpy Device-to-Host]": {
+              "pct": 0.0
+            }
+          }
+        },
+        "64": {
+          "kernels": [
+            {
+              "pct": 9.1,
+              "total_time_ns": 28085063,
+              "name": "fa3_v3_decode_gqa_kernel"
+            },
+            {
+              "pct": 5.0,
+              "total_time_ns": 15558358,
+              "name": "nvjet_hsh_144x128_64x6_2x1_v_bz_TNN"
+            },
+            {
+              "pct": 4.9,
+              "total_time_ns": 15067677,
+              "name": "nvjet_hsh_192x128_64x5_1x2_h_bz_coopB_TNT"
+            },
+            {
+              "pct": 4.3,
+              "total_time_ns": 13397146,
+              "name": "fused_residual_rmsnorm_f16_kernel"
+            },
+            {
+              "pct": 4.1,
+              "total_time_ns": 12759192,
+              "name": "silu_mul_interleaved_f16_kernel"
+            }
+          ],
+          "mem_ops": {
+            "[CUDA memcpy Host-to-Device]": {
+              "pct": 97.7
+            },
+            "[CUDA memcpy Device-to-Device]": {
+              "pct": 1.3
+            },
+            "[CUDA memset]": {
+              "pct": 0.9
+            },
+            "[CUDA memcpy Device-to-Host]": {
+              "pct": 0.0
+            }
+          }
+        },
+        "96": {
+          "kernels": [
+            {
+              "pct": 8.6,
+              "total_time_ns": 28055437,
+              "name": "fa3_v3_decode_gqa_kernel"
+            },
+            {
+              "pct": 5.5,
+              "total_time_ns": 17846936,
+              "name": "nvjet_hsh_128x232_64x4_2x1_v_bz_coopA_TNT"
+            },
+            {
+              "pct": 5.4,
+              "total_time_ns": 17561950,
+              "name": "flash_attention_3_prefill_f16io_kernel"
+            },
+            {
+              "pct": 4.6,
+              "total_time_ns": 15055507,
+              "name": "nvjet_hsh_192x128_64x5_1x2_h_bz_coopB_TNT"
+            },
+            {
+              "pct": 4.3,
+              "total_time_ns": 14070789,
+              "name": "silu_mul_interleaved_f16_kernel"
+            }
+          ],
+          "mem_ops": {
+            "[CUDA memcpy Host-to-Device]": {
+              "pct": 97.7
+            },
+            "[CUDA memcpy Device-to-Device]": {
+              "pct": 1.3
+            },
+            "[CUDA memset]": {
+              "pct": 0.9
+            },
+            "[CUDA memcpy Device-to-Host]": {
+              "pct": 0.0
+            }
+          }
+        },
+        "128": {
+          "kernels": [
+            {
+              "pct": 8.2,
+              "total_time_ns": 28081937,
+              "name": "fa3_v3_decode_gqa_kernel"
+            },
+            {
+              "pct": 6.9,
+              "total_time_ns": 23660661,
+              "name": "nvjet_hsh_192x208_64x4_2x1_v_bz_coopB_TNT"
+            },
+            {
+              "pct": 6.5,
+              "total_time_ns": 22486821,
+              "name": "flash_attention_3_prefill_f16io_kernel"
+            },
+            {
+              "pct": 4.5,
+              "total_time_ns": 15411709,
+              "name": "silu_mul_interleaved_f16_kernel"
+            },
+            {
+              "pct": 4.4,
+              "total_time_ns": 15034680,
+              "name": "nvjet_hsh_192x128_64x5_1x2_h_bz_coopB_TNT"
+            }
+          ],
+          "mem_ops": {
+            "[CUDA memcpy Host-to-Device]": {
+              "pct": 97.7
+            },
+            "[CUDA memcpy Device-to-Device]": {
+              "pct": 1.4
+            },
+            "[CUDA memset]": {
+              "pct": 0.9
+            },
+            "[CUDA memcpy Device-to-Host]": {
+              "pct": 0.0
+            }
+          }
+        }
+      }
+    },
+    "vllm": {
+      "benchmark": {
+        "1": {
+          "engine": "vllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 1,
+          "tok_per_sec": 168.0,
+          "total_tokens": 128,
+          "elapsed_ms": 762,
+          "failed": 0
+        },
+        "32": {
+          "engine": "vllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 32,
+          "tok_per_sec": 5075.2,
+          "total_tokens": 4096,
+          "elapsed_ms": 807,
+          "failed": 0
+        },
+        "64": {
+          "engine": "vllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 64,
+          "tok_per_sec": 9430.2,
+          "total_tokens": 8192,
+          "elapsed_ms": 869,
+          "failed": 0
+        },
+        "96": {
+          "engine": "vllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 96,
+          "tok_per_sec": 13178.2,
+          "total_tokens": 12288,
+          "elapsed_ms": 932,
+          "failed": 0
+        },
+        "128": {
+          "engine": "vllm",
+          "model": "/root/models/Qwen2.5-7B",
+          "output_len": 128,
+          "n": 128,
+          "tok_per_sec": 16687.6,
+          "total_tokens": 16384,
+          "elapsed_ms": 982,
+          "failed": 0
+        }
+      },
+      "profiles": {
+        "1": {
+          "kernels": [
+            {
+              "pct": 25.5,
+              "total_time_ns": 337959088,
+              "name": "nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN"
+            },
+            {
+              "pct": 13.8,
+              "total_time_ns": 182515045,
+              "name": "nvjet_tst_256x128_64x4_1x2_h_bz_coopA_TNT"
+            },
+            {
+              "pct": 5.1,
+              "total_time_ns": 67864896,
+              "name": "nvjet_tst_192x128_64x5_1x2_h_bz_coopB_TNT"
+            },
+            {
+              "pct": 4.1,
+              "total_time_ns": 54641065,
+              "name": "triton_poi_fused_mul_silu_slice_1"
+            },
+            {
+              "pct": 3.9,
+              "total_time_ns": 51608733,
+              "name": "nvjet_tst_112x128_64x7_2x1_v_bz_TNN"
+            }
+          ],
+          "mem_ops": {
+            "[CUDA memcpy Host-to-Device]": {
+              "pct": 99.9
+            },
+            "[CUDA memset]": {
+              "pct": 0.1
+            },
+            "[CUDA memcpy Device-to-Device]": {
+              "pct": 0.0
+            }
+          }
+        },
+        "32": {
+          "kernels": [
+            {
+              "pct": 25.5,
+              "total_time_ns": 336030047,
+              "name": "nvjet_tst_192x192_64x4_2x1_v_bz_coopB_TNN"
+            },
+            {
+              "pct": 13.8,
+              "total_time_ns": 181756439,
+              "name": "nvjet_tst_256x128_64x4_1x2_h_bz_coopA_TNT"
+            },
+            {
+              "pct": 5.1,
+              "total_time_ns": 67164136,
+              "name": "nvjet_tst_192x128_64x5_1x2_h_bz_coopB_TNT"
+            },
+            {
+              "pct": 4.1,
+              "total_time_ns": 54669284,
+              "name": "triton_poi_fused_mul_silu_slice_1"
+            },
+            {
+              "pct": 3.8,
+              "total_time_ns": 50275866,
+              "name": "nvjet_tst_112x128_64x7_2x1_v_bz_TNN"
+            }
+          ],
+          "mem_ops": {
+            "[CUDA memcpy Host-to-Device]": {
+              "pct": 99.9
+            },
+            "[CUDA memset]": {
+              "pct": 0.1
+            },
+            "[CUDA memcpy Device-to-Device]": {
+              "pct": 0.0
+            }
+          }
+        },
+        "64": {
+          "kernels": [],
+          "mem_ops": {}
+        },
+        "96": {
+          "kernels": [],
+          "mem_ops": {}
+        },
+        "128": {
+          "kernels": [],
+          "mem_ops": {}
+        }
+      }
+    }
+  }
+}
