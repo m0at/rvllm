@@ -18,7 +18,9 @@ use rvllm_core::prelude::{BlockId, LLMError, Result, SamplingParams, TokenId};
 use rvllm_gpu::prelude::{CublasHandle, CudaGpuAllocator, GpuStream};
 
 use rvllm_kv_cache::CacheEngine;
-use rvllm_model_runner::gpu_runner::{DecodeExecutionPlan, ForwardOutput};
+use rvllm_model_runner::gpu_runner::{
+    DecodeExecutionPlan, DecodeGraphAction, DecodeGraphRuntimeState, ForwardOutput,
+};
 use rvllm_model_runner::input::ModelInput;
 use rvllm_model_runner::ModelRunnerConfig;
 use rvllm_sampling::batch::make_rng;
@@ -1658,29 +1660,44 @@ impl GpuWorker {
                     .gpu_model_runner
                     .as_ref()
                     .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
-                let plan = runner.decode_execution_plan(batch, model_input.is_prefill, is_decode);
+                let execution =
+                    runner.decode_execution_plan(batch, model_input.is_prefill, is_decode);
+                let dispatch = runner.decode_graph_dispatch(
+                    batch,
+                    model_input.is_prefill,
+                    is_decode,
+                    DecodeGraphRuntimeState {
+                        graphs_enabled: self.graph_runner.is_enabled(),
+                        exact_graph_available: self.graph_runner.has_graph_for_exact(
+                            execution.graph_tokens,
+                        ),
+                        warmup_complete: self.forward_count > Self::GRAPH_WARMUP_CALLS,
+                        capture_attempted: self
+                            .graph_runner
+                            .was_capture_attempted(execution.graph_tokens),
+                    },
+                );
 
-                // Runner-level decode paths are not graph-safe: bypass replay/capture
-                // and let raw forward dispatch them correctly.
-                if !plan.use_graphed_decode {
-                    self.raw_gpu_forward_ex(model_input, greedy_only)
-                // 1. Check for padded graph (hot path)
-                } else if self.graph_runner.has_graph_for_exact(plan.graph_tokens) {
-                    self.gpu_forward_ex_graphed_padded(model_input, plan, greedy_only)
-                } else if self.forward_count > Self::GRAPH_WARMUP_CALLS
-                    && !self.graph_runner.was_capture_attempted(plan.graph_tokens)
-                {
-                    // 2. Past warmup? Capture a graph for this padded batch size
-                    match self.try_capture_graph_padded(model_input, plan, greedy_only) {
-                        Ok(output) => Ok(output),
-                        Err(e) => {
-                            warn!(graph_batch = plan.graph_tokens, "graph capture failed, raw forward: {e}");
-                            self.raw_gpu_forward_ex(model_input, greedy_only)
+                match dispatch.action {
+                    DecodeGraphAction::Raw => self.raw_gpu_forward_ex(model_input, greedy_only),
+                    DecodeGraphAction::Replay => self.gpu_forward_ex_graphed_padded(
+                        model_input,
+                        dispatch.execution,
+                        greedy_only,
+                    ),
+                    DecodeGraphAction::Capture => {
+                        match self.try_capture_graph_padded(
+                            model_input,
+                            dispatch.execution,
+                            greedy_only,
+                        ) {
+                            Ok(output) => Ok(output),
+                            Err(e) => {
+                                warn!(graph_batch = dispatch.execution.graph_tokens, "graph capture failed, raw forward: {e}");
+                                self.raw_gpu_forward_ex(model_input, greedy_only)
+                            }
                         }
                     }
-                } else {
-                    // 3. Fallback: raw forward (pre-warmup or capture failure)
-                    self.raw_gpu_forward_ex(model_input, greedy_only)
                 }
             }
 

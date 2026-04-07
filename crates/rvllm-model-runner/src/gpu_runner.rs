@@ -32,6 +32,27 @@ pub struct DecodeExecutionPlan {
     pub use_batched_v2: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeGraphRuntimeState {
+    pub graphs_enabled: bool,
+    pub exact_graph_available: bool,
+    pub warmup_complete: bool,
+    pub capture_attempted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeGraphAction {
+    Raw,
+    Replay,
+    Capture,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeGraphDispatch {
+    pub execution: DecodeExecutionPlan,
+    pub action: DecodeGraphAction,
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use std::cell::RefCell;
@@ -61,7 +82,10 @@ mod cuda_impl {
     use rvllm_kv_cache::engine_cuda::CudaCacheEngine;
     use rvllm_model_loader::gpu_weights::GpuModelWeights;
 
-    use super::{DecodeExecutionPlan, ForwardOutput};
+    use super::{
+        DecodeExecutionPlan, DecodeGraphAction, DecodeGraphDispatch, DecodeGraphRuntimeState,
+        ForwardOutput,
+    };
 
     /// Reusable GPU buffer that grows as needed, eliminating per-step CUDA
     /// allocations on the hot decode path.
@@ -2173,6 +2197,26 @@ mod cuda_impl {
             }
         }
 
+        pub fn decode_graph_dispatch(
+            &self,
+            num_tokens: usize,
+            is_prefill: bool,
+            is_pure_decode: bool,
+            state: DecodeGraphRuntimeState,
+        ) -> DecodeGraphDispatch {
+            let execution = self.decode_execution_plan(num_tokens, is_prefill, is_pure_decode);
+            let action = if !execution.use_graphed_decode || !state.graphs_enabled {
+                DecodeGraphAction::Raw
+            } else if state.exact_graph_available {
+                DecodeGraphAction::Replay
+            } else if state.warmup_complete && !state.capture_attempted {
+                DecodeGraphAction::Capture
+            } else {
+                DecodeGraphAction::Raw
+            };
+            DecodeGraphDispatch { execution, action }
+        }
+
         /// Whether the selected forward path can be executed by
         /// `forward_gpu_only()` and therefore participate in CUDA graph capture.
         pub fn graph_capture_supported(&self, num_tokens: usize, is_prefill: bool) -> bool {
@@ -3908,7 +3952,10 @@ pub use cuda_impl::GpuModelRunner;
 // =========================================================================
 #[cfg(not(feature = "cuda"))]
 mod mock_impl {
-    use super::{DecodeExecutionPlan, ForwardOutput};
+    use super::{
+        DecodeExecutionPlan, DecodeGraphAction, DecodeGraphDispatch, DecodeGraphRuntimeState,
+        ForwardOutput,
+    };
     use crate::bridge::{LLMError, Result};
     use crate::runner::ModelRunnerConfig;
 
@@ -3975,6 +4022,19 @@ mod mock_impl {
                 graph_tokens: num_tokens,
                 use_graphed_decode: false,
                 use_batched_v2: false,
+            }
+        }
+
+        pub fn decode_graph_dispatch(
+            &self,
+            num_tokens: usize,
+            is_prefill: bool,
+            is_pure_decode: bool,
+            _state: DecodeGraphRuntimeState,
+        ) -> DecodeGraphDispatch {
+            DecodeGraphDispatch {
+                execution: self.decode_execution_plan(num_tokens, is_prefill, is_pure_decode),
+                action: DecodeGraphAction::Raw,
             }
         }
 
