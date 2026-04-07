@@ -2616,10 +2616,10 @@ mod cuda_impl {
 
         fn resolve_forward_path(&self, num_tokens: usize, is_prefill: bool) -> ForwardPath {
             if num_tokens != 1 || is_prefill {
-                if std::env::var("RVLLM_BATCHED_PIPELINE_V2").map_or(false, |v| v == "1") {
-                    ForwardPath::BatchedV2
-                } else {
+                if std::env::var("RVLLM_BATCHED_PIPELINE_V2").map_or(false, |v| v == "0") {
                     ForwardPath::Batched
+                } else {
+                    ForwardPath::BatchedV2
                 }
             } else if let Some(path) = self.experimental_decode_path_override() {
                 path
