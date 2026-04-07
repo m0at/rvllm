@@ -35,6 +35,17 @@ use crate::config::WorkerConfig;
 use crate::graph_runner::{GraphRunner, GraphRunnerConfig};
 use crate::input;
 
+fn phase_profile_batches() -> Vec<usize> {
+    std::env::var("RVLLM_PHASE_PROFILE_BATCHES")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Output of one GPU worker step, mapping each sequence to its sampled token.
 #[derive(Debug, Clone)]
 pub struct GpuWorkerOutput {
@@ -1742,6 +1753,37 @@ impl GpuWorker {
         }
     }
 
+    fn profiled_gpu_forward_ex(
+        &self,
+        model_input: &ModelInput,
+        greedy_only: bool,
+    ) -> Result<ForwardOutput> {
+        #[cfg(feature = "cuda")]
+        {
+            let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
+                LLMError::GpuError(
+                    "GPU model runner not initialized -- build with --features cuda".into(),
+                )
+            })?;
+
+            return runner.profile_decode_bucket(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                greedy_only,
+                model_input.num_tokens(),
+            );
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (model_input, greedy_only);
+            return Err(LLMError::GpuError(
+                "GPU forward pass requires --features cuda. CPU fallback is disabled.".into(),
+            ));
+        }
+    }
+
     /// Warmup threshold: skip graph capture for the first N forward calls.
     const GRAPH_WARMUP_CALLS: usize = 3;
 
@@ -1792,7 +1834,10 @@ impl GpuWorker {
                 .iter()
                 .all(|&q| q == 1);
         let batch = model_input.num_tokens();
-        let result = if !is_decode || !self.graph_runner.is_enabled() {
+        let profile_decode = is_decode && phase_profile_batches().contains(&batch);
+        let result = if profile_decode {
+            self.profiled_gpu_forward_ex(model_input, greedy_only)
+        } else if !is_decode || !self.graph_runner.is_enabled() {
             self.raw_gpu_forward_ex(model_input, greedy_only)
         } else {
             #[cfg(feature = "cuda")]
