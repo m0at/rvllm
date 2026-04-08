@@ -30,6 +30,7 @@ struct LlamaConfig {
     head_dim: usize,
     vocab_size: usize,
     rms_norm_eps: f32,
+    rope_theta: f32,
 }
 
 struct LlamaLayer {
@@ -53,7 +54,8 @@ impl LlamaForCausalLM {
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             vocab_size: config.vocab_size,
-            rms_norm_eps: 1e-5,
+            rms_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
         };
 
         let embed_tokens = weights
@@ -157,8 +159,9 @@ impl Architecture for LlamaForCausalLM {
             let v = LinearLayer::forward(&normed, &layer.v_proj, None)?;
 
             // RoPE.
-            let (q_rot, k_rot) =
-                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
+            let (q_rot, k_rot) = RotaryEmbedding::forward_with_base(
+                &input.position_ids, &q, &k, self.config.head_dim, self.config.rope_theta,
+            )?;
 
             // Attention.
             let attn_out =

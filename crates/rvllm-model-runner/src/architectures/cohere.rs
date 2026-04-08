@@ -28,6 +28,7 @@ pub struct CohereForCausalLM {
     head_dim: usize,
     vocab_size: usize,
     layernorm_eps: f32,
+    rope_theta: f32,
     embed_tokens: GpuBuffer<f16>,
     layers: Vec<CohereLayer>,
     norm_weight: GpuBuffer<f16>,
@@ -170,7 +171,8 @@ impl CohereForCausalLM {
             num_kv_heads,
             head_dim,
             vocab_size: config.vocab_size,
-            layernorm_eps: 1e-5,
+            layernorm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
             embed_tokens,
             layers,
             norm_weight,
@@ -229,7 +231,7 @@ impl Architecture for CohereForCausalLM {
 
             // RoPE on normalized Q/K.
             let (q_rot, k_rot) =
-                RotaryEmbedding::forward(&input.position_ids, &q_normed, &k_normed, self.head_dim)?;
+                RotaryEmbedding::forward_with_base(&input.position_ids, &q_normed, &k_normed, self.head_dim, self.rope_theta)?;
 
             // Expand shared keys for MQA: replicate the single KV head(s) to match num_heads.
             let k_expanded = expand_kv_heads(

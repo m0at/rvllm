@@ -92,8 +92,19 @@ impl RotaryEmbedding {
         key: &GpuBuffer<f16>,
         head_dim: usize,
     ) -> Result<(GpuBuffer<f16>, GpuBuffer<f16>)> {
+        Self::forward_with_base(positions, query, key, head_dim, 10000.0)
+    }
+
+    /// Static forward with configurable RoPE base frequency.
+    pub fn forward_with_base(
+        positions: &[u32],
+        query: &GpuBuffer<f16>,
+        key: &GpuBuffer<f16>,
+        head_dim: usize,
+        base: f32,
+    ) -> Result<(GpuBuffer<f16>, GpuBuffer<f16>)> {
         let max_pos = positions.iter().copied().max().unwrap_or(0) as usize + 1;
-        let emb = Self::new(head_dim, max_pos, 10000.0);
+        let emb = Self::new(head_dim, max_pos, base);
         emb.apply(positions, query, key)
     }
 

@@ -32,6 +32,7 @@ struct DeepSeekConfig {
     vocab_size: usize,
     intermediate_size: usize,
     rms_norm_eps: f32,
+    rope_theta: f32,
     /// Latent dimension for MLA KV compression.
     kv_lora_rank: usize,
     /// Dimension for RoPE portion of queries in MLA.
@@ -115,7 +116,8 @@ impl DeepSeekV2ForCausalLM {
             head_dim: config.head_dim,
             vocab_size: config.vocab_size,
             intermediate_size: config.intermediate_size,
-            rms_norm_eps: 1e-6,
+            rms_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
             kv_lora_rank,
             qk_rope_head_dim,
             qk_nope_head_dim,
@@ -322,7 +324,7 @@ impl DeepSeekV2ForCausalLM {
 
         // RoPE on Q and K.
         let (q_rot, k_rot) =
-            RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
+            RotaryEmbedding::forward_with_base(&input.position_ids, &q, &k, self.config.head_dim, self.config.rope_theta)?;
 
         // Attention.
         let attn_out =

@@ -53,6 +53,7 @@ pub struct EmbeddingModel {
     #[allow(dead_code)]
     num_kv_heads: usize,
     norm_eps: f32,
+    rope_theta: f32,
     pooling: PoolingMode,
     normalize: bool,
     embed_tokens: GpuBuffer<f16>,
@@ -157,7 +158,8 @@ impl EmbeddingModel {
             head_dim,
             num_heads,
             num_kv_heads,
-            norm_eps: 1e-5,
+            norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
             pooling,
             normalize: true,
             embed_tokens,
@@ -388,7 +390,7 @@ impl Architecture for EmbeddingModel {
 
             // RoPE (no-op for BERT, but applied for E5-mistral-style models).
             let (q_rot, k_rot) = if !self.use_layer_norm {
-                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.head_dim)?
+                RotaryEmbedding::forward_with_base(&input.position_ids, &q, &k, self.head_dim, self.rope_theta)?
             } else {
                 (q, k)
             };
