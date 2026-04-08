@@ -738,6 +738,32 @@ mod inner {
             blas.hgemm_into(m, n, k, 1.0, input, weight, 0.0, out)
         }
 
+        /// Fixed f16/cuBLAS GEMM into a sub-view for the canonical BatchedV2 lane.
+        pub(crate) fn hgemm_cublas_into(
+            blas: &CublasHandle,
+            input: &CudaSlice<f16>,
+            weight: &(impl DevicePtr<f16> + DeviceSlice<f16>),
+            m: usize,
+            n: usize,
+            k: usize,
+            out: &mut CudaViewMut<'_, f16>,
+        ) -> Result<()> {
+            blas.hgemm_into(m, n, k, 1.0, input, weight, 0.0, out)
+        }
+
+        /// Fixed f16/cuBLAS GEMM into a full output buffer for the canonical BatchedV2 lane.
+        pub(crate) fn hgemm_cublas_slice_into(
+            blas: &CublasHandle,
+            input: &CudaSlice<f16>,
+            weight: &CudaSlice<f16>,
+            m: usize,
+            n: usize,
+            k: usize,
+            output: &mut CudaSlice<f16>,
+        ) -> Result<()> {
+            blas.hgemm(m, n, k, f16::ONE, input, weight, f16::ZERO, output)
+        }
+
         /// Add bias f16 in-place on a CudaViewMut.
         pub(crate) fn add_bias_f16_view(
             stream: &Arc<CudaStream>,

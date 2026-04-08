@@ -125,6 +125,7 @@ impl GpuTransformerLayer {
             gemm_strategy,
             cutlass,
             policy,
+            false,
         )
     }
 
@@ -152,6 +153,7 @@ impl GpuTransformerLayer {
             gemm_strategy,
             cutlass,
             Self::fixed_batched_v2_policy(),
+            true,
         )
     }
 
@@ -180,6 +182,7 @@ impl GpuTransformerLayer {
         gemm_strategy: GemmStrategy,
         cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
         policy: BatchedPipelinePolicy,
+        canonical_v2: bool,
     ) -> Result<()> {
         let cfg = &self.config;
         let num_tokens = input.num_tokens;
@@ -277,7 +280,16 @@ impl GpuTransformerLayer {
 
         if !used_fused_cutlass {
             self.batched_qkv_gemm(
-                weights, blas, lt, scratch, num_tokens, qkv_dim, hidden, q_dim, kv_dim,
+                weights,
+                blas,
+                lt,
+                scratch,
+                num_tokens,
+                qkv_dim,
+                hidden,
+                q_dim,
+                kv_dim,
+                canonical_v2,
             )?;
         }
         if profile_enabled {
@@ -441,19 +453,31 @@ impl GpuTransformerLayer {
                 scratch.normed,
             )?;
         } else {
-            Self::hgemm_dispatch_fp8_into(
-                &self.stream,
-                blas,
-                lt,
-                attn_out,
-                weights.o_proj,
-                num_tokens,
-                hidden,
-                q_dim,
-                &self.loader,
-                weights.o_proj_fp8,
-                scratch.o_proj,
-            )?;
+            if canonical_v2 {
+                Self::hgemm_cublas_slice_into(
+                    blas,
+                    attn_out,
+                    weights.o_proj,
+                    num_tokens,
+                    hidden,
+                    q_dim,
+                    scratch.o_proj,
+                )?;
+            } else {
+                Self::hgemm_dispatch_fp8_into(
+                    &self.stream,
+                    blas,
+                    lt,
+                    attn_out,
+                    weights.o_proj,
+                    num_tokens,
+                    hidden,
+                    q_dim,
+                    &self.loader,
+                    weights.o_proj_fp8,
+                    scratch.o_proj,
+                )?;
+            }
             Self::fused_residual_rmsnorm_f16_into(
                 &self.stream,
                 &self.loader,
@@ -510,19 +534,31 @@ impl GpuTransformerLayer {
             )
             .map_err(|e| LLMError::GpuError(e))?;
         } else {
-            Self::hgemm_dispatch_fp8_into(
-                &self.stream,
-                blas,
-                lt,
-                &*scratch.normed,
-                fused_gate_up,
-                num_tokens,
-                gate_up_dim,
-                hidden,
-                &self.loader,
-                weights.fused_gate_up_fp8,
-                scratch.gate_up,
-            )?;
+            if canonical_v2 {
+                Self::hgemm_cublas_slice_into(
+                    blas,
+                    &*scratch.normed,
+                    fused_gate_up,
+                    num_tokens,
+                    gate_up_dim,
+                    hidden,
+                    scratch.gate_up,
+                )?;
+            } else {
+                Self::hgemm_dispatch_fp8_into(
+                    &self.stream,
+                    blas,
+                    lt,
+                    &*scratch.normed,
+                    fused_gate_up,
+                    num_tokens,
+                    gate_up_dim,
+                    hidden,
+                    &self.loader,
+                    weights.fused_gate_up_fp8,
+                    scratch.gate_up,
+                )?;
+            }
             let silu_fn = self
                 .loader
                 .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
@@ -552,19 +588,31 @@ impl GpuTransformerLayer {
         if profile_enabled {
             mark_phase(|t| &mut t.gateup_silu)?;
         }
-        Self::hgemm_dispatch_fp8_into(
-            &self.stream,
-            blas,
-            lt,
-            &*scratch.silu_out,
-            weights.down_proj,
-            num_tokens,
-            hidden,
-            intermediate,
-            &self.loader,
-            weights.down_proj_fp8,
-            scratch.down,
-        )?;
+        if canonical_v2 {
+            Self::hgemm_cublas_slice_into(
+                blas,
+                &*scratch.silu_out,
+                weights.down_proj,
+                num_tokens,
+                hidden,
+                intermediate,
+                scratch.down,
+            )?;
+        } else {
+            Self::hgemm_dispatch_fp8_into(
+                &self.stream,
+                blas,
+                lt,
+                &*scratch.silu_out,
+                weights.down_proj,
+                num_tokens,
+                hidden,
+                intermediate,
+                &self.loader,
+                weights.down_proj_fp8,
+                scratch.down,
+            )?;
+        }
         if profile_enabled {
             mark_phase(|t| &mut t.down)?;
         }
@@ -655,6 +703,7 @@ impl GpuTransformerLayer {
         hidden: usize,
         q_dim: usize,
         kv_dim: usize,
+        canonical_v2: bool,
     ) -> Result<()> {
         #[allow(unused_mut, unused_assignments)]
         let mut bias_fused = false;
@@ -662,7 +711,8 @@ impl GpuTransformerLayer {
         if let Some(fused_qkv) = weights.fused_qkv {
             // Try cublasLt bias epilogue (eliminates separate add_bias kernel launches)
             #[cfg(feature = "cublaslt")]
-            if let (Some(lt_ops), Some(bias)) = (lt, weights.qkv_bias) {
+            if !canonical_v2 {
+                if let (Some(lt_ops), Some(bias)) = (lt, weights.qkv_bias) {
                 if num_tokens == 1 {
                     // N=1: write directly to qkv with bias
                     Self::hgemm_dispatch_fp8_bias_into(
@@ -720,36 +770,61 @@ impl GpuTransformerLayer {
                     }
                 }
             }
+            }
             // Fallback: GEMM without bias epilogue
             if !bias_fused {
                 if num_tokens == 1 {
-                    Self::hgemm_dispatch_fp8_into(
-                        &self.stream,
-                        blas,
-                        lt,
-                        &*scratch.normed,
-                        fused_qkv,
-                        num_tokens,
-                        qkv_dim,
-                        hidden,
-                        &self.loader,
-                        weights.fused_qkv_fp8,
-                        scratch.qkv,
-                    )?;
+                    if canonical_v2 {
+                        Self::hgemm_cublas_slice_into(
+                            blas,
+                            &*scratch.normed,
+                            fused_qkv,
+                            num_tokens,
+                            qkv_dim,
+                            hidden,
+                            scratch.qkv,
+                        )?;
+                    } else {
+                        Self::hgemm_dispatch_fp8_into(
+                            &self.stream,
+                            blas,
+                            lt,
+                            &*scratch.normed,
+                            fused_qkv,
+                            num_tokens,
+                            qkv_dim,
+                            hidden,
+                            &self.loader,
+                            weights.fused_qkv_fp8,
+                            scratch.qkv,
+                        )?;
+                    }
                 } else {
-                    Self::hgemm_dispatch_fp8_into(
-                        &self.stream,
-                        blas,
-                        lt,
-                        &*scratch.normed,
-                        fused_qkv,
-                        num_tokens,
-                        qkv_dim,
-                        hidden,
-                        &self.loader,
-                        weights.fused_qkv_fp8,
-                        scratch.gate_up,
-                    )?;
+                    if canonical_v2 {
+                        Self::hgemm_cublas_slice_into(
+                            blas,
+                            &*scratch.normed,
+                            fused_qkv,
+                            num_tokens,
+                            qkv_dim,
+                            hidden,
+                            scratch.gate_up,
+                        )?;
+                    } else {
+                        Self::hgemm_dispatch_fp8_into(
+                            &self.stream,
+                            blas,
+                            lt,
+                            &*scratch.normed,
+                            fused_qkv,
+                            num_tokens,
+                            qkv_dim,
+                            hidden,
+                            &self.loader,
+                            weights.fused_qkv_fp8,
+                            scratch.gate_up,
+                        )?;
+                    }
                     let interleaved_len = num_tokens * qkv_dim;
                     let dk = self
                         .loader
@@ -784,44 +859,80 @@ impl GpuTransformerLayer {
             let k_end_t = q_end_t + num_tokens * kv_dim;
             {
                 let mut d = scratch.qkv.slice_mut(..q_end_t);
-                Self::hgemm_dispatch_into(
-                    blas,
-                    lt,
-                    &*scratch.normed,
-                    weights.q_proj,
-                    num_tokens,
-                    q_dim,
-                    hidden,
-                    &mut d,
-                )?;
+                if canonical_v2 {
+                    Self::hgemm_cublas_into(
+                        blas,
+                        &*scratch.normed,
+                        weights.q_proj,
+                        num_tokens,
+                        q_dim,
+                        hidden,
+                        &mut d,
+                    )?;
+                } else {
+                    Self::hgemm_dispatch_into(
+                        blas,
+                        lt,
+                        &*scratch.normed,
+                        weights.q_proj,
+                        num_tokens,
+                        q_dim,
+                        hidden,
+                        &mut d,
+                    )?;
+                }
             }
             {
                 let mut d = scratch.qkv.slice_mut(q_end_t..k_end_t);
-                Self::hgemm_dispatch_into(
-                    blas,
-                    lt,
-                    &*scratch.normed,
-                    weights.k_proj,
-                    num_tokens,
-                    kv_dim,
-                    hidden,
-                    &mut d,
-                )?;
+                if canonical_v2 {
+                    Self::hgemm_cublas_into(
+                        blas,
+                        &*scratch.normed,
+                        weights.k_proj,
+                        num_tokens,
+                        kv_dim,
+                        hidden,
+                        &mut d,
+                    )?;
+                } else {
+                    Self::hgemm_dispatch_into(
+                        blas,
+                        lt,
+                        &*scratch.normed,
+                        weights.k_proj,
+                        num_tokens,
+                        kv_dim,
+                        hidden,
+                        &mut d,
+                    )?;
+                }
             }
             {
                 let mut d = scratch
                     .qkv
                     .slice_mut(k_end_t..k_end_t + num_tokens * kv_dim);
-                Self::hgemm_dispatch_into(
-                    blas,
-                    lt,
-                    &*scratch.normed,
-                    weights.v_proj,
-                    num_tokens,
-                    kv_dim,
-                    hidden,
-                    &mut d,
-                )?;
+                if canonical_v2 {
+                    Self::hgemm_cublas_into(
+                        blas,
+                        &*scratch.normed,
+                        weights.v_proj,
+                        num_tokens,
+                        kv_dim,
+                        hidden,
+                        &mut d,
+                    )?;
+                } else {
+                    Self::hgemm_dispatch_into(
+                        blas,
+                        lt,
+                        &*scratch.normed,
+                        weights.v_proj,
+                        num_tokens,
+                        kv_dim,
+                        hidden,
+                        &mut d,
+                    )?;
+                }
             }
         }
 
