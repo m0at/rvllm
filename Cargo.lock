@@ -2838,6 +2838,7 @@ dependencies = [
  "rvllm-sequence",
  "rvllm-telemetry",
  "rvllm-tokenizer",
+ "rvllm-v2",
  "serde_json",
  "tempfile",
  "tokenizers",
@@ -3201,6 +3202,29 @@ dependencies = [
  "rvllm-core",
  "rvllm-gpu",
  "tracing",
+]
+
+[[package]]
+name = "rvllm-v2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cudarc",
+ "half",
+ "rvllm-attention",
+ "rvllm-autotune",
+ "rvllm-core",
+ "rvllm-fusion",
+ "rvllm-gpu",
+ "rvllm-model-loader",
+ "rvllm-tokenizer",
+ "rvllm-tp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

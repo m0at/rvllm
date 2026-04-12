@@ -28,6 +28,7 @@ members = [
     "crates/rvllm-fusion",
     "crates/rvllm-zig",
     "crates/rvllm-autotune",
+    "crates/rvllm-v2",
 ]
 
 [workspace.package]
@@ -67,6 +68,8 @@ rvllm-tp = { version = "0.1.0", path = "crates/rvllm-tp" }
 rvllm-telemetry = { version = "0.1.0", path = "crates/rvllm-telemetry" }
 rvllm-fusion = { version = "0.1.0", path = "crates/rvllm-fusion" }
 rvllm-zig = { version = "0.1.0", path = "crates/rvllm-zig" }
+rvllm-autotune = { version = "0.1.0", path = "crates/rvllm-autotune" }
+rvllm-v2 = { version = "0.1.0", path = "crates/rvllm-v2" }
 # External dependencies
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

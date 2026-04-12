@@ -1,0 +1,408 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use cudarc::driver::{CudaContext, CudaStream};
+use tracing::trace;
+
+use rvllm_core::prelude::LLMError;
+
+use crate::input::InputBuilder;
+use crate::kv_cache::{CudaKVCache, KVCacheEngine};
+use crate::runner::GpuModelRunner;
+use crate::types::{
+    BlockOps, ForwardOutput, GpuBatchInput, RequestId, SamplingParams, StepDiff,
+    TokenId, WorkerRequest,
+};
+
+// ===================================================================
+// WorkerConfig
+// ===================================================================
+
+#[derive(Debug, Clone)]
+pub struct WorkerConfig {
+    pub block_size: usize,
+    pub max_batch_size: usize,
+    pub vocab_size: usize,
+    pub graph_enabled: bool,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            block_size: 16,
+            max_batch_size: 256,
+            vocab_size: 32000,
+            graph_enabled: true,
+        }
+    }
+}
+
+// ===================================================================
+// WorkerError
+// ===================================================================
+
+#[derive(Debug)]
+pub enum WorkerError {
+    Cuda(String),
+    Runner(String),
+    NoPending,
+}
+
+impl std::fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerError::Cuda(s) => write!(f, "CUDA error: {s}"),
+            WorkerError::Runner(s) => write!(f, "runner error: {s}"),
+            WorkerError::NoPending => write!(f, "no pending forward output"),
+        }
+    }
+}
+
+impl std::error::Error for WorkerError {}
+
+pub type Result<T> = std::result::Result<T, WorkerError>;
+
+impl From<LLMError> for WorkerError {
+    fn from(e: LLMError) -> Self {
+        WorkerError::Runner(e.to_string())
+    }
+}
+
+// ===================================================================
+// Constants
+// ===================================================================
+
+/// Number of forward calls before we begin graph capture.
+#[allow(dead_code)]
+const GRAPH_WARMUP_CALLS: usize = 3;
+
+/// Padded batch sizes for graph capture.
+#[allow(dead_code)]
+const GRAPH_BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
+
+// ===================================================================
+// PendingForward -- tracks an async launch for later collection
+// ===================================================================
+
+struct PendingForward {
+    num_seqs: usize,
+    #[allow(dead_code)]
+    sampling_params: Vec<SamplingParams>,
+}
+
+// ===================================================================
+// Worker: the stateful GPU worker
+// ===================================================================
+
+pub struct Worker {
+    // GPU infrastructure
+    #[allow(dead_code)]
+    context: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    runner: GpuModelRunner,
+    kv_cache: CudaKVCache,
+
+    // Persistent state -- vLLM-0.19 style
+    requests: HashMap<RequestId, WorkerRequest>,
+    block_size: usize,
+
+    // Input builder (reusable, cleared each step)
+    input_builder: InputBuilder,
+
+    // Graph capture state
+    forward_count: usize,
+    #[allow(dead_code)]
+    graph_enabled: bool,
+
+    // Async pipeline state
+    pending: Option<PendingForward>,
+
+    // Sampler config
+    vocab_size: usize,
+}
+
+impl Worker {
+    pub fn new(
+        runner: GpuModelRunner,
+        kv_cache: CudaKVCache,
+        input_builder: InputBuilder,
+        config: WorkerConfig,
+        context: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+    ) -> Self {
+        Self {
+            context,
+            stream,
+            runner,
+            kv_cache,
+            requests: HashMap::new(),
+            block_size: config.block_size,
+            input_builder,
+            forward_count: 0,
+            graph_enabled: config.graph_enabled,
+            pending: None,
+            vocab_size: config.vocab_size,
+        }
+    }
+
+    // =================================================================
+    // Primary step: diff in, ForwardOutput out
+    // =================================================================
+
+    /// Execute one step: apply diff, run block ops, build input, forward, sample.
+    pub fn step(&mut self, diff: &StepDiff) -> Result<ForwardOutput> {
+        // 1. Apply diff to persistent state
+        self.apply_diff(diff);
+
+        // 2. Execute block operations (copies, swaps) before forward
+        self.execute_block_ops(&diff.block_ops)?;
+
+        // 3. Early out if nothing to forward
+        if self.requests.is_empty() {
+            return Ok(ForwardOutput::default());
+        }
+
+        // 4. Build GPU input from persistent state
+        let input = self.input_builder.build(&self.requests, self.block_size).clone();
+
+        // 5. Forward + sample: GPU argmax for greedy decode, full logits for prefill
+        if input.is_all_decode {
+            let token_ids_i32 = self.runner
+                .forward_greedy(&input, &self.kv_cache)
+                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+            let token_ids: Vec<TokenId> = token_ids_i32.iter().map(|&t| t as TokenId).collect();
+            Ok(ForwardOutput {
+                token_ids,
+                logprobs: Vec::new(),
+            })
+        } else {
+            let logits = self.execute_forward(&input)?;
+            let output = self.sample_greedy(&logits, &input);
+            Ok(output)
+        }
+    }
+
+    // =================================================================
+    // Async pipeline: launch / collect
+    // =================================================================
+
+    /// Launch the forward pass asynchronously. Returns immediately.
+    /// Caller must call step_collect() to get the result.
+    pub fn step_launch(&mut self, diff: &StepDiff) -> Result<()> {
+        self.apply_diff(diff);
+        self.execute_block_ops(&diff.block_ops)?;
+
+        if self.requests.is_empty() {
+            self.pending = None;
+            return Ok(());
+        }
+
+        let input = self.input_builder.build(&self.requests, self.block_size).clone();
+        let sampling_params: Vec<SamplingParams> = input.sampling_params.clone();
+        let num_seqs = input.num_seqs;
+
+        // Launch forward (GPU work is async, returns when kernels are enqueued)
+        let _logits = self.execute_forward(&input)?;
+
+        self.pending = Some(PendingForward {
+            num_seqs,
+            sampling_params,
+        });
+
+        Ok(())
+    }
+
+    /// Collect the result of a previously launched step.
+    /// Synchronizes the GPU stream and reads back results.
+    pub fn step_collect(&mut self) -> Result<ForwardOutput> {
+        let pending = self
+            .pending
+            .take()
+            .ok_or(WorkerError::NoPending)?;
+
+        if pending.num_seqs == 0 {
+            return Ok(ForwardOutput::default());
+        }
+
+        // Synchronize stream to ensure all GPU work is complete
+        self.sync_stream()?;
+
+        // Rebuild input to sample
+        let input = self.input_builder.build(&self.requests, self.block_size).clone();
+        let logits = self.execute_forward(&input)?;
+        let output = self.sample_greedy(&logits, &input);
+        Ok(output)
+    }
+
+    pub fn requests(&self) -> &HashMap<RequestId, WorkerRequest> {
+        &self.requests
+    }
+
+    pub fn num_active_requests(&self) -> usize {
+        self.requests.len()
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    pub fn forward_count(&self) -> usize {
+        self.forward_count
+    }
+
+    // =================================================================
+    // apply_diff: the core state mutation
+    // =================================================================
+
+    fn apply_diff(&mut self, diff: &StepDiff) {
+        // Remove finished/preempted requests FIRST so IDs can be reused
+        for request_id in &diff.removed {
+            if self.requests.remove(request_id).is_some() {
+                trace!(%request_id, "removed request from worker state");
+            }
+        }
+
+        // Add new requests (prefill phase)
+        for added in &diff.added {
+            let req = WorkerRequest {
+                request_id: added.request_id,
+                seq_id: added.seq_id,
+                prompt_token_ids: added.prompt_token_ids.clone(),
+                output_token_ids: Vec::new(),
+                sampling_params: added.sampling_params.clone(),
+                block_table: added.block_table.clone(),
+                is_prefill: added.is_prefill,
+                num_computed_tokens: 0,
+                token_chunk: added.token_chunk.clone(),
+            };
+            trace!(
+                request_id = %added.request_id,
+                seq_id = %added.seq_id,
+                prompt_len = added.prompt_token_ids.len(),
+                "added request to worker state"
+            );
+            self.requests.insert(added.request_id, req);
+        }
+
+        // Update continuing decode requests
+        for cont in &diff.continued {
+            if let Some(req) = self.requests.get_mut(&cont.request_id) {
+                if cont.new_token_id != 0 {
+                    req.output_token_ids.push(cont.new_token_id);
+                }
+                if let Some(new_table) = &cont.block_table_update {
+                    req.block_table.clone_from(new_table);
+                }
+                req.is_prefill = false;
+                req.num_computed_tokens = req.seq_len();
+                req.token_chunk = 0..0;
+                trace!(
+                    request_id = %cont.request_id,
+                    new_token = cont.new_token_id,
+                    seq_len = req.seq_len(),
+                    "continued request in worker state"
+                );
+            }
+        }
+    }
+
+    // =================================================================
+    // Block operations
+    // =================================================================
+
+    fn execute_block_ops(&mut self, ops: &BlockOps) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+
+        if !ops.copies.is_empty() {
+            trace!(count = ops.copies.len(), "executing CoW block copies");
+            self.kv_cache.copy_blocks(&ops.copies);
+        }
+
+        if !ops.swap_in.is_empty() {
+            trace!(count = ops.swap_in.len(), "executing swap-in (CPU->GPU)");
+            self.kv_cache.swap_in(&ops.swap_in);
+        }
+
+        if !ops.swap_out.is_empty() {
+            trace!(count = ops.swap_out.len(), "executing swap-out (GPU->CPU)");
+            self.kv_cache.swap_out(&ops.swap_out);
+        }
+
+        Ok(())
+    }
+
+    // =================================================================
+    // Forward pass
+    // =================================================================
+
+    fn execute_forward(&mut self, input: &GpuBatchInput) -> Result<Vec<f32>> {
+        self.forward_count += 1;
+
+        // Raw forward through the model runner. The runner handles:
+        // - Embedding lookup
+        // - Packed metadata upload (single HtoD memcpy)
+        // - Layer loop with double-buffered scratch
+        // - Final RMSNorm + LM head GEMM
+        // - DtoH logits transfer
+        self.runner
+            .forward(input, &self.kv_cache)
+            .map_err(|e| WorkerError::Runner(format!("{e}")))
+    }
+
+    // =================================================================
+    // Sampling: greedy argmax on CPU (simplest correct path)
+    // =================================================================
+
+    fn sample_greedy(&self, logits: &[f32], input: &GpuBatchInput) -> ForwardOutput {
+        let vocab = self.vocab_size;
+        let num_seqs = input.num_seqs;
+        let mut token_ids = Vec::with_capacity(num_seqs);
+        let mut logprobs = Vec::with_capacity(num_seqs);
+
+        for i in 0..num_seqs {
+            let start = i * vocab;
+            let end = (start + vocab).min(logits.len());
+            if start >= logits.len() {
+                token_ids.push(0);
+                logprobs.push(f32::NEG_INFINITY);
+                continue;
+            }
+
+            let seq_logits = &logits[start..end];
+            let (best_idx, best_logit) = seq_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((0, &f32::NEG_INFINITY));
+
+            token_ids.push(best_idx as TokenId);
+            logprobs.push(*best_logit);
+        }
+
+        ForwardOutput { token_ids, logprobs }
+    }
+
+    // =================================================================
+    // Stream sync
+    // =================================================================
+
+    fn sync_stream(&self) -> Result<()> {
+        self.stream
+            .synchronize()
+            .map_err(|e| WorkerError::Cuda(format!("stream sync: {e}")))
+    }
+}
+
+// ===================================================================
+// Helper: padded batch size lookup
+// ===================================================================
+
+#[allow(dead_code)]
+fn padded_batch_size(actual: usize) -> Option<usize> {
+    GRAPH_BATCH_SIZES
+        .iter()
+        .copied()
+        .find(|&s| s >= actual)
+}

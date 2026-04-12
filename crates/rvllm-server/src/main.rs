@@ -51,6 +51,8 @@ enum Commands {
         log_level: String,
         #[arg(long)]
         disable_telemetry: bool,
+        #[arg(long)]
+        v2: bool,
     },
     /// Show system info (GPU, memory, etc.)
     Info,
@@ -82,6 +84,8 @@ enum Commands {
         /// Write a CPU flamegraph SVG for a single-batch benchmark run
         #[arg(long)]
         flamegraph_out: Option<String>,
+        #[arg(long)]
+        v2: bool,
     },
 }
 
@@ -150,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
             tokenizer,
             log_level,
             disable_telemetry,
+            v2,
         } => {
             init_tracing(&log_level);
             info!("rvllm v0.1.0");
@@ -170,9 +175,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 EngineConfig::builder()
                     .model({
-                        let mut m = ModelConfigImpl::builder()
-                            .model_path(&model)
-                            .dtype(dtype);
+                        let mut m = ModelConfigImpl::builder().model_path(&model).dtype(dtype);
                         if let Some(max_model_len) = max_model_len {
                             m = m.max_model_len(max_model_len);
                         }
@@ -229,7 +232,11 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_var("VLLM_HOST", &host);
             std::env::set_var("VLLM_PORT", port.to_string());
 
-            rvllm_api::serve(config).await?;
+            if v2 {
+                anyhow::bail!("--v2 serve path not wired yet; use `cargo run -p rvllm-v2 --bin bench` for v2 benchmarks");
+            } else {
+                rvllm_api::serve(config).await?;
+            }
         }
         Commands::Info => {
             init_tracing("info");
@@ -251,8 +258,12 @@ async fn main() -> anyhow::Result<()> {
             num_cpu_blocks,
             json,
             flamegraph_out,
+            v2,
         } => {
             init_tracing("warn");
+            if v2 {
+                anyhow::bail!("--v2 benchmark path is not wired yet");
+            }
             let multi = n.contains(',');
             if multi {
                 eprintln!("rvLLM benchmark -- direct engine, no HTTP");
@@ -276,9 +287,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 EngineConfig::builder()
                     .model({
-                        let mut m = ModelConfigImpl::builder()
-                            .model_path(&model)
-                            .dtype(dtype);
+                        let mut m = ModelConfigImpl::builder().model_path(&model).dtype(dtype);
                         if let Some(max_model_len) = max_model_len {
                             m = m.max_model_len(max_model_len);
                         }
@@ -347,15 +356,25 @@ async fn main() -> anyhow::Result<()> {
                         let mut command = std::process::Command::new(&exe);
                         command
                             .arg("benchmark")
-                            .arg("--model").arg(&model)
-                            .arg("--dtype").arg(format!("{dtype}"))
-                            .arg("--output-len").arg(format!("{output_len}"))
-                            .arg("--gpu-memory-utilization").arg(format!("{gpu_memory_utilization}"))
-                            .arg("--n").arg(format!("{batch}"))
+                            .arg("--model")
+                            .arg(&model)
+                            .arg("--dtype")
+                            .arg(format!("{dtype}"))
+                            .arg("--output-len")
+                            .arg(format!("{output_len}"))
+                            .arg("--gpu-memory-utilization")
+                            .arg(format!("{gpu_memory_utilization}"))
+                            .arg("--n")
+                            .arg(format!("{batch}"))
                             .args(if json { vec!["--json"] } else { vec![] })
-                            .env("RVLLM_PTX_DIR", std::env::var("RVLLM_PTX_DIR").unwrap_or_default());
+                            .env(
+                                "RVLLM_PTX_DIR",
+                                std::env::var("RVLLM_PTX_DIR").unwrap_or_default(),
+                            );
                         if let Some(max_model_len) = max_model_len {
-                            command.arg("--max-model-len").arg(format!("{max_model_len}"));
+                            command
+                                .arg("--max-model-len")
+                                .arg(format!("{max_model_len}"));
                         }
                         let output = command.output()?;
                         // Print child's stderr (bench results) and stdout (json)
@@ -401,12 +420,15 @@ async fn main() -> anyhow::Result<()> {
                         ..Default::default()
                     };
 
-                    let flamegraph_guard = flamegraph_out.as_ref().map(|_| {
-                        pprof::ProfilerGuardBuilder::default()
-                            .frequency(999)
-                            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-                            .build()
-                    }).transpose()?;
+                    let flamegraph_guard = flamegraph_out
+                        .as_ref()
+                        .map(|_| {
+                            pprof::ProfilerGuardBuilder::default()
+                                .frequency(999)
+                                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                                .build()
+                        })
+                        .transpose()?;
 
                     let repeat_rounds = if flamegraph_out.is_some() {
                         FLAMEGRAPH_REPEAT_ROUNDS
@@ -418,8 +440,8 @@ async fn main() -> anyhow::Result<()> {
                     let t0 = std::time::Instant::now();
                     for round in 0..repeat_rounds {
                         for i in 0..batch {
-                            let prompt =
-                                BENCH_PROMPTS[(round * batch + i) % BENCH_PROMPTS.len()].to_string();
+                            let prompt = BENCH_PROMPTS[(round * batch + i) % BENCH_PROMPTS.len()]
+                                .to_string();
                             engine.add_request_auto_id_with_emit_intermediate(
                                 prompt,
                                 params.clone(),
@@ -480,7 +502,6 @@ async fn main() -> anyhow::Result<()> {
                         }))?
                     );
                 }
-
             } // #[cfg(feature = "cuda")]
         }
     }

@@ -29,6 +29,7 @@ rvllm-engine.workspace = true
 rvllm-sequence.workspace = true
 rvllm-telemetry.workspace = true
 rvllm-tokenizer.workspace = true
+rvllm-v2.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
