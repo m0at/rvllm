@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use crate::Result;
 
-/// Default cuBLAS workspace size for graph capture (4 MiB).
-/// NVIDIA recommends at least 4 KiB; 4 MiB covers all GEMM tile configs.
-const CUBLAS_GRAPH_WORKSPACE_BYTES: usize = 4 * 1024 * 1024;
+/// Default cuBLAS workspace size for graph capture (32 MiB).
+/// Large workspace unlocks split-K algorithms for bandwidth-bound decode GEMMs.
+/// Must match the workspace budget used by the cublasLt autotuner (32 MiB).
+const CUBLAS_GRAPH_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Wrapper around cuBLAS for matrix operations.
 pub struct CublasHandle {

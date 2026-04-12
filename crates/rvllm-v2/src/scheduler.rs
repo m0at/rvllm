@@ -22,7 +22,7 @@ impl Default for SchedulerConfig {
             max_num_batched_tokens: 8192,
             max_prefill_chunk: 0,
             preemption_mode: PreemptionMode::Recompute,
-            block_size: 16,
+            block_size: 64,
         }
     }
 }

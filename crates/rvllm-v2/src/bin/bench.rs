@@ -69,6 +69,9 @@ struct Cli {
 
     #[arg(long)]
     json: bool,
+
+    #[arg(long)]
+    fp8: bool,
 }
 
 fn init_tracing() {
@@ -105,6 +108,7 @@ fn main() -> anyhow::Result<()> {
             gpu_memory_reserve_gb: cli.gpu_memory_reserve_gb,
             max_model_len: cli.max_model_len.unwrap_or(2048),
             max_num_seqs: batch.max(256),
+            fp8_weights: cli.fp8,
             ..V2EngineConfig::from_model_path(&cli.model)
         };
 

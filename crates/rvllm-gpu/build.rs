@@ -224,7 +224,7 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
                 }
             } else {
                 let mut nvcc_cmd = Command::new(nvcc);
-                nvcc_cmd.args(["-ptx", &arch_flag, "-O3"]);
+                nvcc_cmd.args(["-ptx", &arch_flag, "-O3", "--use_fast_math"]);
                 for inc in &cutlass_includes {
                     nvcc_cmd.arg(inc);
                 }

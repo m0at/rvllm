@@ -134,7 +134,7 @@ impl CublasLtOps {
     pub fn install_autotuned(&self, tuner: &crate::cublas_autotune::CublasAutotuner) {
         use std::ffi::c_void;
 
-        let handle = unsafe { *self.handle.handle() };
+        let handle = *self.handle.handle();
         let mut cache = self.f16_cache.borrow_mut();
 
         for (&(m, n, k), result) in tuner.iter() {
@@ -841,6 +841,248 @@ impl CublasLtOps {
 
             if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                 return Err(LLMError::GpuError(format!("fp8_bias matmul: {s:?}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// FP8 E4M3 GEMM with per-tensor scale pointers for both operands.
+    /// Computes: C_f16[m,n] = (a_scale * W_fp8[n,k])^T @ (b_scale * A_fp8[m,k])
+    ///
+    /// In row-major terms: C[m,n] = A_act[m,k] @ W[n,k]^T
+    /// where both operands are pre-quantized FP8 with per-tensor scales.
+    ///
+    /// cuBLASLt internally: D = alpha * (a_scale * "A") @ (b_scale * "B") + beta * C
+    /// with "A" = weight (CUBLAS_OP_T) and "B" = activation (CUBLAS_OP_N).
+    ///
+    /// Cached: layouts + algo per (m,n,k). Scale pointers are updated on the cached
+    /// descriptor before each dispatch (cheap SetAttribute, no algo re-search).
+    pub fn fp8_gemm_scaled_a_bt(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        weight_fp8_ptr: u64,     // [n, k] FP8 E4M3 weight (row-major)
+        weight_scale_ptr: u64,   // device f32 scalar: per-tensor weight scale
+        act_fp8_ptr: u64,        // [m, k] FP8 E4M3 activation (row-major)
+        act_scale_ptr: u64,      // device f32 scalar: per-tensor activation scale
+        output_f16_ptr: u64,     // [m, n] f16 output (row-major)
+    ) -> Result<()> {
+        use std::ffi::c_void;
+
+        // Separate cache namespace from unscaled fp8
+        let key = (m + 1_000_000, n, k);
+
+        if !self.fp8_cache.borrow().contains_key(&key) {
+            unsafe {
+                let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
+                let s = lt_sys::cublasLtMatmulDescCreate(
+                    &mut desc,
+                    lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    lt_sys::cudaDataType_t::CUDA_R_32F,
+                );
+                if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    return Err(LLMError::GpuError(format!("fp8_scaled desc: {s:?}")));
+                }
+
+                let trans_a = lt_sys::cublasOperation_t::CUBLAS_OP_T;
+                let trans_b = lt_sys::cublasOperation_t::CUBLAS_OP_N;
+                lt_sys::cublasLtMatmulDescSetAttribute(
+                    desc,
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                    &trans_a as *const _ as *const c_void,
+                    std::mem::size_of_val(&trans_a),
+                );
+                lt_sys::cublasLtMatmulDescSetAttribute(
+                    desc,
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                    &trans_b as *const _ as *const c_void,
+                    std::mem::size_of_val(&trans_b),
+                );
+
+                // Set initial scale pointers (will be updated before each dispatch)
+                lt_sys::cublasLtMatmulDescSetAttribute(
+                    desc,
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                    &weight_scale_ptr as *const u64 as *const c_void,
+                    std::mem::size_of::<u64>(),
+                );
+                lt_sys::cublasLtMatmulDescSetAttribute(
+                    desc,
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                    &act_scale_ptr as *const u64 as *const c_void,
+                    std::mem::size_of::<u64>(),
+                );
+
+                let mut layout_a: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
+                let mut layout_b: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
+                let mut layout_c: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
+                lt_sys::cublasLtMatrixLayoutCreate(
+                    &mut layout_a,
+                    lt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                    k as u64, n as u64, k as i64,
+                );
+                lt_sys::cublasLtMatrixLayoutCreate(
+                    &mut layout_b,
+                    lt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
+                    k as u64, m as u64, k as i64,
+                );
+                lt_sys::cublasLtMatrixLayoutCreate(
+                    &mut layout_c,
+                    lt_sys::cudaDataType_t::CUDA_R_16F,
+                    n as u64, m as u64, n as i64,
+                );
+
+                let mut pref: lt_sys::cublasLtMatmulPreference_t = std::ptr::null_mut();
+                lt_sys::cublasLtMatmulPreferenceCreate(&mut pref);
+                let ws_size: usize = FP8_WORKSPACE_SIZE;
+                lt_sys::cublasLtMatmulPreferenceSetAttribute(
+                    pref,
+                    lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                    &ws_size as *const _ as *const c_void,
+                    std::mem::size_of_val(&ws_size),
+                );
+
+                const MAX_ALGOS: usize = 16;
+                let mut heurs = [std::mem::zeroed::<lt_sys::cublasLtMatmulHeuristicResult_t>(); MAX_ALGOS];
+                let mut ret: i32 = 0;
+                let s = lt_sys::cublasLtMatmulAlgoGetHeuristic(
+                    *self.handle.handle(), desc, layout_a, layout_b, layout_c, layout_c,
+                    pref, MAX_ALGOS as i32, heurs.as_mut_ptr(), &mut ret,
+                );
+                lt_sys::cublasLtMatmulPreferenceDestroy(pref);
+
+                if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
+                    lt_sys::cublasLtMatrixLayoutDestroy(layout_a);
+                    lt_sys::cublasLtMatrixLayoutDestroy(layout_b);
+                    lt_sys::cublasLtMatrixLayoutDestroy(layout_c);
+                    lt_sys::cublasLtMatmulDescDestroy(desc);
+                    return Err(LLMError::GpuError(format!(
+                        "fp8_scaled no algo: {s:?} ret={ret} shape=({m},{n},{k})"
+                    )));
+                }
+
+                // Autotune: benchmark each candidate algorithm
+                let alpha: f32 = 1.0;
+                let beta: f32 = 0.0;
+                let handle = *self.handle.handle();
+                let cu_stream = lt_sys::cu_stream_to_cuda_stream(self.stream.cu_stream());
+                let (ws_ptr, _ws_guard) = DevicePtr::device_ptr(&self.workspace, &self.stream);
+
+                let mut best_algo = heurs[0].algo;
+                let mut best_time_ns = u64::MAX;
+                let num_candidates = (ret as usize).min(MAX_ALGOS);
+
+                // Create CUDA events for timing
+                use cudarc::driver::result::event as cu_event;
+                let ev_start = cu_event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)
+                    .map_err(|e| LLMError::GpuError(format!("event create: {e}")))?;
+                let ev_stop = cu_event::create(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)
+                    .map_err(|e| LLMError::GpuError(format!("event create: {e}")))?;
+                let raw_stream = self.stream.cu_stream();
+
+                for i in 0..num_candidates {
+                    // Warmup
+                    let s = lt_sys::cublasLtMatmul(
+                        handle, desc,
+                        &alpha as *const f32 as *const c_void,
+                        weight_fp8_ptr as *const c_void, layout_a,
+                        act_fp8_ptr as *const c_void, layout_b,
+                        &beta as *const f32 as *const c_void,
+                        output_f16_ptr as *mut c_void, layout_c,
+                        output_f16_ptr as *mut c_void, layout_c,
+                        &heurs[i].algo,
+                        ws_ptr as *mut c_void, FP8_WORKSPACE_SIZE, cu_stream,
+                    );
+                    if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                        continue;
+                    }
+
+                    // Timed run
+                    cu_event::record(ev_start, raw_stream).ok();
+                    for _ in 0..4 {
+                        lt_sys::cublasLtMatmul(
+                            handle, desc,
+                            &alpha as *const f32 as *const c_void,
+                            weight_fp8_ptr as *const c_void, layout_a,
+                            act_fp8_ptr as *const c_void, layout_b,
+                            &beta as *const f32 as *const c_void,
+                            output_f16_ptr as *mut c_void, layout_c,
+                            output_f16_ptr as *mut c_void, layout_c,
+                            &heurs[i].algo,
+                            ws_ptr as *mut c_void, FP8_WORKSPACE_SIZE, cu_stream,
+                        );
+                    }
+                    cu_event::record(ev_stop, raw_stream).ok();
+                    cu_event::synchronize(ev_stop).ok();
+
+                    let ms = cu_event::elapsed(ev_start, ev_stop).unwrap_or(f32::MAX);
+                    let time_ns = (ms * 1_000_000.0 / 4.0) as u64;
+
+                    if time_ns < best_time_ns {
+                        best_time_ns = time_ns;
+                        best_algo = heurs[i].algo;
+                    }
+                }
+
+                cu_event::destroy(ev_start).ok();
+                cu_event::destroy(ev_stop).ok();
+
+                tracing::info!(m, n, k, num_candidates, best_us = best_time_ns / 1000,
+                    "FP8 GEMM autotuned");
+
+                self.fp8_cache.borrow_mut().insert(
+                    key,
+                    Fp8Plan { desc, layout_a, layout_b, layout_c, algo: best_algo },
+                );
+            }
+        }
+
+        // Update scale pointers on cached descriptor before dispatch.
+        // Different weight matrices (same shape) have different scale addresses.
+        // Algo selection is independent of scale values, so this is safe.
+        let cache = self.fp8_cache.borrow();
+        let plan = cache.get(&key).unwrap();
+        unsafe {
+            use std::ffi::c_void;
+            lt_sys::cublasLtMatmulDescSetAttribute(
+                plan.desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                &weight_scale_ptr as *const u64 as *const c_void,
+                std::mem::size_of::<u64>(),
+            );
+            lt_sys::cublasLtMatmulDescSetAttribute(
+                plan.desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                &act_scale_ptr as *const u64 as *const c_void,
+                std::mem::size_of::<u64>(),
+            );
+        }
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            let (ws_ptr, _ws_guard) = DevicePtr::device_ptr(&self.workspace, &self.stream);
+            let s = lt_sys::cublasLtMatmul(
+                *self.handle.handle(),
+                plan.desc,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                weight_fp8_ptr as *const std::ffi::c_void,
+                plan.layout_a,
+                act_fp8_ptr as *const std::ffi::c_void,
+                plan.layout_b,
+                &beta as *const f32 as *const std::ffi::c_void,
+                output_f16_ptr as *mut std::ffi::c_void,
+                plan.layout_c,
+                output_f16_ptr as *mut std::ffi::c_void,
+                plan.layout_c,
+                &plan.algo,
+                ws_ptr as *mut std::ffi::c_void,
+                FP8_WORKSPACE_SIZE,
+                lt_sys::cu_stream_to_cuda_stream(self.stream.cu_stream()),
+            );
+            if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(LLMError::GpuError(format!("fp8_scaled matmul: {s:?}")));
             }
         }
         Ok(())

@@ -2,13 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream};
-use tracing::trace;
+use tracing::{trace, info, warn};
 
 use rvllm_core::prelude::LLMError;
 
 use crate::input::InputBuilder;
 use crate::kv_cache::{CudaKVCache, KVCacheEngine};
 use crate::runner::GpuModelRunner;
+use rvllm_gpu::cuda_graph::{CudaGraphPool, padded_batch_size};
+
 use crate::types::{
     BlockOps, ForwardOutput, GpuBatchInput, RequestId, SamplingParams, StepDiff,
     TokenId, WorkerRequest,
@@ -29,7 +31,7 @@ pub struct WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            block_size: 16,
+            block_size: 64,
             max_batch_size: 256,
             vocab_size: 32000,
             graph_enabled: true,
@@ -73,12 +75,7 @@ impl From<LLMError> for WorkerError {
 // ===================================================================
 
 /// Number of forward calls before we begin graph capture.
-#[allow(dead_code)]
 const GRAPH_WARMUP_CALLS: usize = 3;
-
-/// Padded batch sizes for graph capture.
-#[allow(dead_code)]
-const GRAPH_BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
 
 // ===================================================================
 // PendingForward -- tracks an async launch for later collection
@@ -111,11 +108,14 @@ pub struct Worker {
 
     // Graph capture state
     forward_count: usize,
-    #[allow(dead_code)]
     graph_enabled: bool,
 
     // Async pipeline state
     pending: Option<PendingForward>,
+
+    // CUDA graph pool for decode
+    graph_pool: CudaGraphPool,
+    warmup_count: HashMap<usize, usize>,
 
     // Sampler config
     vocab_size: usize,
@@ -123,13 +123,24 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(
-        runner: GpuModelRunner,
+        mut runner: GpuModelRunner,
         kv_cache: CudaKVCache,
         input_builder: InputBuilder,
         config: WorkerConfig,
         context: Arc<CudaContext>,
         stream: Arc<CudaStream>,
     ) -> Self {
+        let graph_pool = CudaGraphPool::new(config.max_batch_size);
+
+        // Pre-allocate cuBLAS workspace for graph capture
+        if config.graph_enabled {
+            if let Err(e) = runner.prepare_for_graph_capture() {
+                warn!("cuBLAS graph workspace alloc failed, disabling graphs: {e}");
+            } else {
+                info!("cuBLAS workspace ready for CUDA graph capture");
+            }
+        }
+
         Self {
             context,
             stream,
@@ -141,6 +152,8 @@ impl Worker {
             forward_count: 0,
             graph_enabled: config.graph_enabled,
             pending: None,
+            graph_pool,
+            warmup_count: HashMap::new(),
             vocab_size: config.vocab_size,
         }
     }
@@ -162,11 +175,54 @@ impl Worker {
             return Ok(ForwardOutput::default());
         }
 
-        // 4. Build GPU input from persistent state
-        let input = self.input_builder.build(&self.requests, self.block_size).clone();
+        // 4. Build GPU input from persistent state (borrow, don't clone)
+        let input_ref = self.input_builder.build(&self.requests, self.block_size);
+        let is_all_decode = input_ref.is_all_decode;
+        let num_seqs = input_ref.num_seqs;
 
-        // 5. Forward + sample: GPU argmax for greedy decode, full logits for prefill
+        // 5. Fast path: CUDA graph replay (no clone needed -- disjoint field borrows)
+        if is_all_decode && self.graph_enabled {
+            if let Some(padded) = padded_batch_size(num_seqs) {
+                if self.graph_pool.has_graph(num_seqs) {
+                    self.runner.upload_metadata_padded(input_ref, padded)?;
+                    let graph = self.graph_pool.get(num_seqs).unwrap();
+                    graph.replay_on(self.runner.cuda_stream())
+                        .map_err(|e| WorkerError::Runner(format!("graph replay: {e}")))?;
+                    let token_ids_i32 = self.runner.read_graph_output(num_seqs)?;
+                    let token_ids: Vec<TokenId> =
+                        token_ids_i32.iter().map(|&t| t as TokenId).collect();
+                    self.forward_count += 1;
+                    return Ok(ForwardOutput { token_ids, logprobs: Vec::new() });
+                }
+            }
+        }
+
+        // Slow path: clone input for methods that take &mut self on Worker
+        let input = input_ref.clone();
+
         if input.is_all_decode {
+            let actual_batch = input.num_seqs;
+
+            // Try CUDA graph capture for decode batches
+            if self.graph_enabled {
+                if let Some(padded) = padded_batch_size(actual_batch) {
+                    let count = self.warmup_count.entry(padded).or_insert(0);
+                    *count += 1;
+                    if *count == GRAPH_WARMUP_CALLS {
+                        match self.capture_decode_graph(&input, actual_batch, padded) {
+                            Ok(output) => {
+                                self.forward_count += 1;
+                                return Ok(output);
+                            }
+                            Err(e) => {
+                                warn!(padded, "graph capture failed, disabling for this bucket: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Normal forward (warmup or fallback)
             let token_ids_i32 = self.runner
                 .forward_greedy(&input, &self.kv_cache)
                 .map_err(|e| WorkerError::Runner(format!("{e}")))?;
@@ -385,6 +441,74 @@ impl Worker {
     }
 
     // =================================================================
+    // CUDA graph capture
+    // =================================================================
+
+    fn capture_decode_graph(
+        &mut self,
+        input: &GpuBatchInput,
+        actual_batch: usize,
+        padded_batch: usize,
+    ) -> Result<ForwardOutput> {
+        // Cap context for graph capture: use min(max_seq_len, 2048) to avoid
+        // excessive split-K (choose_num_splits(32768) = 16, wasteful for short contexts).
+        // Graphs are recaptured if actual context exceeds this.
+        let max_ctx = self.runner.max_seq_len().min(2048) as u32;
+
+        // Warmup forward (stabilizes cuBLAS algorithm selection)
+        self.runner.upload_metadata_padded(input, padded_batch)?;
+        self.runner
+            .forward_gpu_only(padded_batch, padded_batch, max_ctx, &self.kv_cache)?;
+        self.sync_stream()?;
+
+        // Re-upload metadata for capture
+        self.runner.upload_metadata_padded(input, padded_batch)?;
+
+        // Begin capture
+        self.graph_pool
+            .begin_capture_on(self.runner.cuda_stream())
+            .map_err(|e| WorkerError::Runner(format!("begin_capture: {e}")))?;
+
+        // Forward inside capture region
+        let fwd_result = self.runner.forward_gpu_only(
+            padded_batch,
+            padded_batch,
+            max_ctx,
+            &self.kv_cache,
+        );
+
+        match fwd_result {
+            Ok(()) => {
+                let graph = self
+                    .graph_pool
+                    .end_capture_on(self.runner.cuda_stream(), padded_batch)
+                    .map_err(|e| WorkerError::Runner(format!("end_capture: {e}")))?;
+                self.graph_pool.insert(graph);
+                info!(padded_batch, actual_batch, "CUDA graph captured for decode");
+
+                // Read output from the warmup+capture forward
+                let token_ids_i32 = self.runner.read_graph_output(actual_batch)?;
+                let token_ids: Vec<TokenId> =
+                    token_ids_i32.iter().map(|&t| t as TokenId).collect();
+                Ok(ForwardOutput {
+                    token_ids,
+                    logprobs: Vec::new(),
+                })
+            }
+            Err(e) => {
+                // End capture to clean up stream state
+                let _ = self
+                    .graph_pool
+                    .end_capture_on(self.runner.cuda_stream(), padded_batch);
+                warn!(padded_batch, "graph capture forward failed: {e}");
+                Err(WorkerError::Runner(format!(
+                    "graph capture forward failed: {e}"
+                )))
+            }
+        }
+    }
+
+    // =================================================================
     // Stream sync
     // =================================================================
 
@@ -393,16 +517,4 @@ impl Worker {
             .synchronize()
             .map_err(|e| WorkerError::Cuda(format!("stream sync: {e}")))
     }
-}
-
-// ===================================================================
-// Helper: padded batch size lookup
-// ===================================================================
-
-#[allow(dead_code)]
-fn padded_batch_size(actual: usize) -> Option<usize> {
-    GRAPH_BATCH_SIZES
-        .iter()
-        .copied()
-        .find(|&s| s >= actual)
 }

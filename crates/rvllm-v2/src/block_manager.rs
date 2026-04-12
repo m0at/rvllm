@@ -16,7 +16,7 @@ impl Default for BlockManagerConfig {
         Self {
             num_gpu_blocks: 4096,
             num_cpu_blocks: 512,
-            block_size: 16,
+            block_size: 64,
             watermark: 0.04,
             prefix_cache_blocks: 0,
         }

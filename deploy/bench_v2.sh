@@ -142,8 +142,8 @@ ls -la target/release/rvllm
 # Build v2 bench binary
 echo ""
 echo "=== Build v2 bench binary ==="
-CUDA_ARCH=\$ARCH cargo build --release --features cuda -p rvllm-v2 --bin bench 2>&1 | tail -5
-ls -la target/release/bench
+CUDA_ARCH=\$ARCH cargo build --release --features cuda-graphs -p rvllm-v2 --bin rvllm-v2-bench 2>&1 | tail -5
+ls -la target/release/rvllm-v2-bench
 
 # Download model
 echo ""
@@ -177,7 +177,7 @@ echo "  v2 BENCHMARK (direct engine, no HTTP)"
 echo "============================================"
 echo ""
 
-target/release/bench \
+target/release/rvllm-v2-bench \
     --model ${MODEL} \
     --n 1,32,64,96,128 \
     --output-len 128 \

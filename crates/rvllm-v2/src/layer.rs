@@ -9,8 +9,117 @@ use half::f16;
 use rvllm_attention::choose_num_splits;
 use rvllm_core::prelude::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
+use rvllm_gpu::cublaslt_ops::CublasLtOps;
 use rvllm_gpu::cutlass_ffi::CutlassKernels;
 use rvllm_gpu::kernel_loader::KernelLoader;
+
+// ===================================================================
+// cuBLASLt-first GEMM dispatch: autotuned cuBLASLt -> cuBLAS fallback
+// ===================================================================
+
+fn hgemm_dispatch(
+    lt_ops: Option<&CublasLtOps>,
+    cublas: &CublasHandle,
+    m: usize, n: usize, k: usize,
+    alpha: f32,
+    a: &impl cudarc::driver::DevicePtr<f16>,
+    b: &impl cudarc::driver::DevicePtr<f16>,
+    beta: f32,
+    c: &mut impl cudarc::driver::DevicePtrMut<f16>,
+) -> Result<()> {
+    if let Some(lt) = lt_ops {
+        if lt.should_use_f16_for_shape(m, n, k) {
+            return lt.hgemm_a_bt_into(m, n, k, alpha, a, b, beta, c)
+                .map_err(|e| LLMError::GpuError(format!("cublasLt hgemm: {e}")));
+        }
+    }
+    cublas.hgemm_into(m, n, k, alpha, a, b, beta, c)
+}
+
+// ===================================================================
+// FP8 GEMM dispatch: quantize activation on GPU, then cuBLASLt FP8
+// ===================================================================
+
+fn fp8_gemm_dispatch(
+    lt_ops: &CublasLtOps,
+    loader: &KernelLoader,
+    stream: &CudaStream,
+    m: usize, n: usize, k: usize,
+    act_f16: &CudaSlice<f16>,              // [m, k] f16 activation
+    weight_fp8: &CudaSlice<u8>,            // [n, k] FP8 weight
+    weight_scale: &CudaSlice<f32>,         // [1] per-tensor weight scale
+    output_f16: &mut CudaSlice<f16>,       // [m, n] f16 output
+    act_fp8_scratch: &mut CudaSlice<u8>,   // [m * k] scratch for FP8 activation
+    act_scale_scratch: &mut CudaSlice<f32>, // [1] scratch for activation scale
+    absmax_scratch: &mut CudaSlice<f32>,    // [1] scratch for absmax reduction
+) -> Result<()> {
+    let num_elements = m * k;
+
+    // Step 1: Quantize activation to FP8 on GPU (multi-block: find absmax, then quantize)
+    let absmax_kernel = loader
+        .get_func("quantize_activation_fp8", "find_absmax_fp8_kernel")
+        .map_err(|e| LLMError::GpuError(format!("find_absmax_fp8 kernel: {e}")))?;
+    let quant_kernel = loader
+        .get_func("quantize_activation_fp8", "apply_fp8_quantize_kernel")
+        .map_err(|e| LLMError::GpuError(format!("apply_fp8_quantize kernel: {e}")))?;
+
+    // Grid size: enough blocks to saturate SMs, each block handles a chunk
+    let num_blocks = ((num_elements + 1023) / 1024).min(128) as u32;
+
+    unsafe {
+        // Zero the absmax buffer (scoped borrow for memset)
+        {
+            let (abs_ptr, _g) = absmax_scratch.device_ptr_mut(stream);
+            cudarc::driver::result::memset_d8_async(
+                abs_ptr, 0, std::mem::size_of::<f32>(), stream.cu_stream(),
+            ).map_err(|e| LLMError::GpuError(format!("memset absmax: {e}")))?;
+        }
+
+        // Phase 1: find global absmax via atomicMax across blocks
+        stream
+            .launch_builder(&absmax_kernel)
+            .arg(&mut *absmax_scratch)     // global_absmax[0]
+            .arg(act_f16)
+            .arg(&(num_elements as i32))
+            .launch(LaunchConfig {
+                grid_dim: (num_blocks, 1, 1),
+                block_dim: (1024, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .map_err(|e| LLMError::GpuError(format!("find_absmax_fp8 launch: {e}")))?;
+
+        // Phase 2: quantize using computed absmax (writes scale to act_scale_scratch)
+        stream
+            .launch_builder(&quant_kernel)
+            .arg(&mut *act_fp8_scratch)    // output_fp8
+            .arg(&mut *act_scale_scratch)  // output_scale
+            .arg(act_f16)
+            .arg(&*absmax_scratch)         // global_absmax (read-only)
+            .arg(&(num_elements as i32))
+            .launch(LaunchConfig {
+                grid_dim: (num_blocks, 1, 1),
+                block_dim: (1024, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .map_err(|e| LLMError::GpuError(format!("apply_fp8_quantize launch: {e}")))?;
+    }
+
+    // Step 2: FP8 GEMM via cuBLASLt with scale pointers
+    let (w_ptr, _gw) = weight_fp8.device_ptr(stream);
+    let (ws_ptr, _gs) = weight_scale.device_ptr(stream);
+    let (afp8_ptr, _gafp8) = act_fp8_scratch.device_ptr(stream);
+    let (as_ptr, _gas) = act_scale_scratch.device_ptr(stream);
+    let (out_ptr, _gout) = output_f16.device_ptr_mut(stream);
+
+    lt_ops.fp8_gemm_scaled_a_bt(
+        m, n, k,
+        w_ptr as u64,
+        ws_ptr as u64,
+        afp8_ptr as u64,
+        as_ptr as u64,
+        out_ptr as u64,
+    ).map_err(|e| LLMError::GpuError(format!("fp8_gemm_scaled: {e}")))
+}
 
 // ===================================================================
 // GemmStrategy (defined in v2/runner.rs at runtime, mirrored here)
@@ -44,19 +153,19 @@ pub struct LayerConfig {
 }
 
 impl LayerConfig {
-    fn q_dim(&self) -> usize {
+    pub fn q_dim(&self) -> usize {
         self.num_heads * self.head_dim
     }
 
-    fn kv_dim(&self) -> usize {
+    pub fn kv_dim(&self) -> usize {
         self.num_kv_heads * self.head_dim
     }
 
-    fn qkv_dim(&self) -> usize {
+    pub fn qkv_dim(&self) -> usize {
         self.q_dim() + 2 * self.kv_dim()
     }
 
-    fn gate_up_dim(&self) -> usize {
+    pub fn gate_up_dim(&self) -> usize {
         self.intermediate_size * 2
     }
 }
@@ -72,6 +181,19 @@ pub struct LayerWeights<'a> {
     pub down_proj_weight: &'a CudaSlice<f16>,
     pub input_layernorm_weight: &'a CudaSlice<f16>,
     pub post_attention_layernorm_weight: &'a CudaSlice<f16>,
+    // FP8 quantized weights (None = use f16 path)
+    pub fp8: Option<Fp8LayerWeightRefs<'a>>,
+}
+
+pub struct Fp8LayerWeightRefs<'a> {
+    pub qkv_fp8: &'a CudaSlice<u8>,
+    pub qkv_scale: &'a CudaSlice<f32>,
+    pub o_proj_fp8: &'a CudaSlice<u8>,
+    pub o_proj_scale: &'a CudaSlice<f32>,
+    pub gate_up_fp8: &'a CudaSlice<u8>,
+    pub gate_up_scale: &'a CudaSlice<f32>,
+    pub down_proj_fp8: &'a CudaSlice<u8>,
+    pub down_proj_scale: &'a CudaSlice<f32>,
 }
 
 // ===================================================================
@@ -91,6 +213,10 @@ pub struct F16LayerScratch {
     pub attn_split_sum: CudaSlice<f32>,
     // Intermediate buffer for residual sum within a layer (input + prev_mlp)
     pub residual_tmp: CudaSlice<f16>,
+    // FP8 activation quantization scratch (shared across all GEMMs per step)
+    pub fp8_act_scratch: CudaSlice<u8>,
+    pub fp8_act_scale: CudaSlice<f32>,
+    pub fp8_absmax: CudaSlice<f32>,
 }
 
 impl F16LayerScratch {
@@ -137,6 +263,10 @@ impl F16LayerScratch {
             attn_split_max: alloc_f32(max_splits * t * num_heads)?,
             attn_split_sum: alloc_f32(max_splits * t * num_heads)?,
             residual_tmp: alloc_f16(t * hidden)?,
+            // FP8 scratch: sized for largest activation (down_proj input = t * intermediate)
+            fp8_act_scratch: alloc_u8(t * intermediate * 2)?,  // *2 for gate_up_dim
+            fp8_act_scale: alloc_f32(1)?,
+            fp8_absmax: alloc_f32(1)?,
         })
     }
 }
@@ -169,14 +299,18 @@ pub struct GpuTransformerLayer {
     config: LayerConfig,
     stream: Arc<CudaStream>,
     loader: Arc<KernelLoader>,
+    // Persistent dummy buffer for single-pass attention (avoids per-step alloc)
+    attn_dummy: CudaSlice<f32>,
 }
 
 impl GpuTransformerLayer {
     pub fn new(config: LayerConfig, stream: Arc<CudaStream>, loader: Arc<KernelLoader>) -> Self {
+        let attn_dummy = stream.alloc_zeros::<f32>(1).expect("attn_dummy alloc");
         Self {
             config,
             stream,
             loader,
+            attn_dummy,
         }
     }
 
@@ -240,6 +374,7 @@ impl GpuTransformerLayer {
         gemm_strategy: GemmStrategy,
         cutlass: Option<&CutlassKernels>,
         cublas: &CublasHandle,
+        lt_ops: Option<&CublasLtOps>,
     ) -> Result<()> {
         let cfg = &self.config;
         let num_tokens = attn.num_tokens;
@@ -275,17 +410,20 @@ impl GpuTransformerLayer {
             false
         };
 
-        self.qkv_projection(
-            &scratch.normed,
-            weights.qkv_weight,
-            num_tokens,
-            qkv_dim,
-            hidden_size,
-            &mut scratch.qkv_buf,
-            gemm_strategy,
-            cutlass,
-            cublas,
-        )?;
+        // FP8 GEMM for QKV: quantize normed activation, FP8 matmul
+        if let (Some(lt), Some(fp8w)) = (lt_ops, &weights.fp8) {
+            fp8_gemm_dispatch(
+                lt, &self.loader, &self.stream,
+                num_tokens, qkv_dim, hidden_size,
+                &scratch.normed, fp8w.qkv_fp8, fp8w.qkv_scale,
+                &mut scratch.qkv_buf,
+                &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
+                &mut scratch.fp8_absmax,
+            )?;
+        } else {
+            hgemm_dispatch(lt_ops, cublas, num_tokens, qkv_dim, hidden_size,
+                1.0, &scratch.normed, weights.qkv_weight, 0.0, &mut scratch.qkv_buf)?;
+        }
 
         self.apply_rope(&mut scratch.qkv_buf, attn, q_dim, kv_dim, q_end, num_tokens)?;
         self.kv_cache_write(&mut scratch.qkv_buf, attn, q_end, k_end, kv_dim, num_tokens)?;
@@ -301,46 +439,84 @@ impl GpuTransformerLayer {
             &mut scratch.attn_split_sum,
         )?;
 
-        // O-proj + residual add + post-attn norm -> writes residual directly to target
-        self.oproj_residual_postnorm_dispatch(
-            hidden,
-            residual_from_fused,
-            weights,
-            attn,
-            scratch,
-            residual_write,
-            num_tokens,
-            hidden_size,
-            q_dim,
-            gemm_strategy,
-            cutlass,
-            cublas,
+        // O-proj GEMM (FP8 or F16)
+        if let (Some(lt), Some(fp8w)) = (lt_ops, &weights.fp8) {
+            fp8_gemm_dispatch(
+                lt, &self.loader, &self.stream,
+                num_tokens, hidden_size, q_dim,
+                &scratch.attn_out, fp8w.o_proj_fp8, fp8w.o_proj_scale,
+                &mut scratch.o_proj_out,
+                &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
+                &mut scratch.fp8_absmax,
+            )?;
+        } else {
+            hgemm_dispatch(lt_ops, cublas, num_tokens, hidden_size, q_dim,
+                1.0, &scratch.attn_out, weights.o_proj_weight, 0.0, &mut scratch.o_proj_out)?;
+        }
+
+        // Residual add + post-attention layernorm
+        let residual_src: &CudaSlice<f16> = if residual_from_fused {
+            &scratch.residual_tmp
+        } else {
+            hidden
+        };
+        self.fused_residual_rmsnorm(
+            residual_src, &scratch.o_proj_out,
+            weights.post_attention_layernorm_weight,
+            num_tokens, hidden_size,
+            &mut scratch.normed, residual_write,
         )?;
 
-        self.gateup_silu(
-            &scratch.normed,
-            weights.gate_up_weight,
-            num_tokens,
-            hidden_size,
-            intermediate,
-            &mut scratch.gate_up_out,
-            &mut scratch.silu_out,
-            &mut scratch.gateup_workspace,
-            gemm_strategy,
-            cutlass,
-            cublas,
-        )?;
+        // GateUp GEMM (FP8 or F16)
+        let gate_up_dim = intermediate * 2;
+        if let (Some(lt), Some(fp8w)) = (lt_ops, &weights.fp8) {
+            fp8_gemm_dispatch(
+                lt, &self.loader, &self.stream,
+                num_tokens, gate_up_dim, hidden_size,
+                &scratch.normed, fp8w.gate_up_fp8, fp8w.gate_up_scale,
+                &mut scratch.gate_up_out,
+                &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
+                &mut scratch.fp8_absmax,
+            )?;
+        } else {
+            hgemm_dispatch(lt_ops, cublas, num_tokens, gate_up_dim, hidden_size,
+                1.0, &scratch.normed, weights.gate_up_weight, 0.0, &mut scratch.gate_up_out)?;
+        }
 
-        // Down projection -> writes directly to caller's target buffer
-        self.down_projection(
-            &scratch.silu_out,
-            weights.down_proj_weight,
-            num_tokens,
-            hidden_size,
-            intermediate,
-            down_write,
-            cublas,
-        )?;
+        // SiLU activation
+        let silu_fn = self.loader
+            .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
+            .map_err(|e| LLMError::GpuError(format!("silu_mul_interleaved kernel: {e}")))?;
+        let total_silu = (num_tokens * intermediate) as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&silu_fn)
+                .arg(&mut scratch.silu_out)
+                .arg(&scratch.gate_up_out)
+                .arg(&(num_tokens as i32))
+                .arg(&(intermediate as i32))
+                .launch(LaunchConfig {
+                    grid_dim: ((total_silu + 255) / 256, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| LLMError::GpuError(format!("silu_mul: {e}")))?;
+        }
+
+        // Down projection GEMM (FP8 or F16) -> writes to caller's target
+        if let (Some(lt), Some(fp8w)) = (lt_ops, &weights.fp8) {
+            fp8_gemm_dispatch(
+                lt, &self.loader, &self.stream,
+                num_tokens, hidden_size, intermediate,
+                &scratch.silu_out, fp8w.down_proj_fp8, fp8w.down_proj_scale,
+                down_write,
+                &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
+                &mut scratch.fp8_absmax,
+            )?;
+        } else {
+            hgemm_dispatch(lt_ops, cublas, num_tokens, hidden_size, intermediate,
+                1.0, &scratch.silu_out, weights.down_proj_weight, 0.0, down_write)?;
+        }
 
         Ok(())
     }
@@ -428,40 +604,12 @@ impl GpuTransformerLayer {
         qkv_dim: usize,
         hidden_size: usize,
         qkv_out: &mut CudaSlice<f16>,
-        gemm_strategy: GemmStrategy,
-        cutlass: Option<&CutlassKernels>,
+        _gemm_strategy: GemmStrategy,
+        _cutlass: Option<&CutlassKernels>,
         cublas: &CublasHandle,
+        lt_ops: Option<&CublasLtOps>,
     ) -> Result<()> {
-        match gemm_strategy {
-            GemmStrategy::Cutlass => {
-                let _ = cutlass.ok_or_else(|| {
-                    LLMError::GpuError("Cutlass strategy requires CUTLASS kernels".into())
-                })?;
-                cublas.hgemm_into(
-                    num_tokens,
-                    qkv_dim,
-                    hidden_size,
-                    1.0,
-                    normed,
-                    qkv_weight,
-                    0.0,
-                    qkv_out,
-                )?;
-            }
-            GemmStrategy::Hybrid | GemmStrategy::Cublas => {
-                cublas.hgemm_into(
-                    num_tokens,
-                    qkv_dim,
-                    hidden_size,
-                    1.0,
-                    normed,
-                    qkv_weight,
-                    0.0,
-                    qkv_out,
-                )?;
-            }
-        }
-        Ok(())
+        hgemm_dispatch(lt_ops, cublas, num_tokens, qkv_dim, hidden_size, 1.0, normed, qkv_weight, 0.0, qkv_out)
     }
 
     // =================================================================
@@ -847,8 +995,6 @@ impl GpuTransformerLayer {
                 num_seqs, num_heads, head_dim, num_splits,
             )?;
         } else {
-            let dummy = unsafe { self.stream.alloc::<f32>(1) }
-                .map_err(|e| LLMError::GpuError(format!("v3 dummy: {e}")))?;
             let launch_cfg = LaunchConfig {
                 grid_dim: (num_seqs as u32, num_kv_heads as u32, 1),
                 block_dim: (V3_THREADS, 1, 1),
@@ -858,9 +1004,9 @@ impl GpuTransformerLayer {
                 self.stream
                     .launch_builder(&v3_gqa)
                     .arg(output)
-                    .arg(&dummy)
-                    .arg(&dummy)
-                    .arg(&dummy)
+                    .arg(&self.attn_dummy)
+                    .arg(&self.attn_dummy)
+                    .arg(&self.attn_dummy)
                     .arg(q)
                     .arg(attn.key_cache)
                     .arg(attn.value_cache)
@@ -955,8 +1101,6 @@ impl GpuTransformerLayer {
                 num_seqs, num_heads, head_dim, num_splits,
             )?;
         } else {
-            let dummy = unsafe { self.stream.alloc::<f32>(1) }
-                .map_err(|e| LLMError::GpuError(format!("v3 dummy: {e}")))?;
             let launch_cfg = LaunchConfig {
                 grid_dim: (num_seqs as u32, num_heads as u32, 1),
                 block_dim: (V3_THREADS, 1, 1),
@@ -966,9 +1110,9 @@ impl GpuTransformerLayer {
                 self.stream
                     .launch_builder(&kernel)
                     .arg(output)
-                    .arg(&dummy)
-                    .arg(&dummy)
-                    .arg(&dummy)
+                    .arg(&self.attn_dummy)
+                    .arg(&self.attn_dummy)
+                    .arg(&self.attn_dummy)
                     .arg(q)
                     .arg(attn.key_cache)
                     .arg(attn.value_cache)
@@ -1045,97 +1189,32 @@ impl GpuTransformerLayer {
         num_tokens: usize,
         hidden_size: usize,
         q_dim: usize,
-        gemm_strategy: GemmStrategy,
-        cutlass: Option<&CutlassKernels>,
+        _gemm_strategy: GemmStrategy,
+        _cutlass: Option<&CutlassKernels>,
         cublas: &CublasHandle,
+        lt_ops: Option<&CublasLtOps>,
     ) -> Result<()> {
-        match gemm_strategy {
-            GemmStrategy::Cutlass => {
-                let ck = cutlass.ok_or_else(|| {
-                    LLMError::GpuError("Cutlass strategy requires CUTLASS kernels".into())
-                })?;
-                let m = num_tokens as i32;
-                let n = hidden_size as i32;
-                let k = q_dim as i32;
-                let ws_bytes = ck.oproj_residual_workspace_size(m, n, k);
-                let mut ws = self
-                    .stream
-                    .alloc_zeros::<u8>(ws_bytes.max(1))
-                    .map_err(|e| LLMError::GpuError(format!("cutlass oproj ws alloc: {e}")))?;
+        hgemm_dispatch(
+            lt_ops, cublas,
+            num_tokens, hidden_size, q_dim,
+            1.0, &scratch.attn_out, weights.o_proj_weight, 0.0,
+            &mut scratch.o_proj_out,
+        )?;
 
-                let out_ptr = {
-                    let (p, _g) =
-                        DevicePtrMut::device_ptr_mut(&mut scratch.o_proj_out, &self.stream);
-                    p
-                };
-                let in_ptr = {
-                    let (p, _g) = DevicePtr::device_ptr(&scratch.attn_out, &self.stream);
-                    p
-                };
-                let (w_ptr, _g2) = DevicePtr::device_ptr(weights.o_proj_weight, &self.stream);
-                let r_ptr = if residual_from_fused {
-                    let (p, _g) = DevicePtr::device_ptr(&scratch.residual_tmp, &self.stream);
-                    p
-                } else {
-                    let (p, _g) = DevicePtr::device_ptr(hidden, &self.stream);
-                    p
-                };
-                let ws_ptr = {
-                    let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
-                    p
-                };
-                let stream_ptr = self.stream.cu_stream() as u64;
-
-                ck.oproj_residual_gemm(
-                    out_ptr, in_ptr, w_ptr, r_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
-                )
-                .map_err(LLMError::GpuError)?;
-
-                // Write residual directly to caller's target
-                self.stream
-                    .memcpy_dtod(
-                        &scratch.o_proj_out.slice(..num_tokens * hidden_size),
-                        &mut residual_write.slice_mut(..num_tokens * hidden_size),
-                    )
-                    .map_err(|e| LLMError::GpuError(format!("oproj residual copy: {e}")))?;
-
-                self.rms_norm(
-                    residual_write,
-                    weights.post_attention_layernorm_weight,
-                    num_tokens,
-                    hidden_size,
-                    &mut scratch.normed,
-                )?;
-            }
-            GemmStrategy::Hybrid | GemmStrategy::Cublas => {
-                cublas.hgemm_into(
-                    num_tokens,
-                    hidden_size,
-                    q_dim,
-                    1.0,
-                    &scratch.attn_out,
-                    weights.o_proj_weight,
-                    0.0,
-                    &mut scratch.o_proj_out,
-                )?;
-
-                let residual_src: &CudaSlice<f16> = if residual_from_fused {
-                    &scratch.residual_tmp
-                } else {
-                    hidden
-                };
-                // Write residual directly to caller's target (no intermediate copy)
-                self.fused_residual_rmsnorm(
-                    residual_src,
-                    &scratch.o_proj_out,
-                    weights.post_attention_layernorm_weight,
-                    num_tokens,
-                    hidden_size,
-                    &mut scratch.normed,
-                    residual_write,
-                )?;
-            }
-        }
+        let residual_src: &CudaSlice<f16> = if residual_from_fused {
+            &scratch.residual_tmp
+        } else {
+            hidden
+        };
+        self.fused_residual_rmsnorm(
+            residual_src,
+            &scratch.o_proj_out,
+            weights.post_attention_layernorm_weight,
+            num_tokens,
+            hidden_size,
+            &mut scratch.normed,
+            residual_write,
+        )?;
         Ok(())
     }
 
@@ -1152,87 +1231,41 @@ impl GpuTransformerLayer {
         intermediate_size: usize,
         gate_up_out: &mut CudaSlice<f16>,
         silu_out: &mut CudaSlice<f16>,
-        gateup_workspace: &mut CudaSlice<u8>,
-        gemm_strategy: GemmStrategy,
-        cutlass: Option<&CutlassKernels>,
+        _gateup_workspace: &mut CudaSlice<u8>,
+        _gemm_strategy: GemmStrategy,
+        _cutlass: Option<&CutlassKernels>,
         cublas: &CublasHandle,
+        lt_ops: Option<&CublasLtOps>,
     ) -> Result<()> {
         let gate_up_dim = intermediate_size * 2;
 
-        match gemm_strategy {
-            GemmStrategy::Hybrid | GemmStrategy::Cutlass => {
-                let ck = cutlass.ok_or_else(|| {
-                    LLMError::GpuError("CUTLASS required for Hybrid/Cutlass gateup+silu".into())
-                })?;
-                let m = num_tokens as i32;
-                let n = gate_up_dim as i32;
-                let k = hidden_size as i32;
-                let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
+        hgemm_dispatch(
+            lt_ops, cublas,
+            num_tokens, gate_up_dim, hidden_size,
+            1.0, normed, gate_up_weight, 0.0, gate_up_out,
+        )?;
 
-                if gateup_workspace.len() < ws_bytes.max(1) {
-                    return Err(LLMError::GpuError(format!(
-                        "cutlass gateup workspace too small: need {}, have {}",
-                        ws_bytes.max(1),
-                        gateup_workspace.len()
-                    )));
-                }
+        let silu_fn = self
+            .loader
+            .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
+            .map_err(|e| {
+                LLMError::GpuError(format!("silu_mul_interleaved kernel missing: {e}"))
+            })?;
 
-                let out_ptr = {
-                    let (p, _g) = DevicePtrMut::device_ptr_mut(silu_out, &self.stream);
-                    p
-                };
-                let in_ptr = {
-                    let (p, _g) = DevicePtr::device_ptr(normed, &self.stream);
-                    p
-                };
-                let (w_ptr, _g2) = DevicePtr::device_ptr(gate_up_weight, &self.stream);
-                let ws_ptr = {
-                    let mut ws = gateup_workspace.slice_mut(..ws_bytes.max(1));
-                    let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
-                    p
-                };
-                let stream_ptr = self.stream.cu_stream() as u64;
-
-                ck.gateup_silu(
-                    out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
-                )
-                .map_err(LLMError::GpuError)?;
-            }
-            GemmStrategy::Cublas => {
-                cublas.hgemm_into(
-                    num_tokens,
-                    gate_up_dim,
-                    hidden_size,
-                    1.0,
-                    normed,
-                    gate_up_weight,
-                    0.0,
-                    gate_up_out,
-                )?;
-
-                let silu_fn = self
-                    .loader
-                    .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
-                    .map_err(|e| {
-                        LLMError::GpuError(format!("silu_mul_interleaved kernel missing: {e}"))
-                    })?;
-
-                let total = (num_tokens * intermediate_size) as u32;
-                unsafe {
-                    self.stream
-                        .launch_builder(&silu_fn)
-                        .arg(silu_out)
-                        .arg(gate_up_out)
-                        .arg(&(num_tokens as i32))
-                        .arg(&(intermediate_size as i32))
-                        .launch(LaunchConfig {
-                            grid_dim: ((total + 255) / 256, 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        })
-                        .map_err(|e| LLMError::GpuError(format!("silu_mul_interleaved: {e}")))?;
-                }
-            }
+        let total = (num_tokens * intermediate_size) as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&silu_fn)
+                .arg(silu_out)
+                .arg(gate_up_out)
+                .arg(&(num_tokens as i32))
+                .arg(&(intermediate_size as i32))
+                .launch(LaunchConfig {
+                    grid_dim: ((total + 255) / 256, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| LLMError::GpuError(format!("silu_mul_interleaved: {e}")))?;
         }
         Ok(())
     }
@@ -1250,17 +1283,8 @@ impl GpuTransformerLayer {
         intermediate_size: usize,
         down_out: &mut CudaSlice<f16>,
         cublas: &CublasHandle,
+        lt_ops: Option<&CublasLtOps>,
     ) -> Result<()> {
-        cublas.hgemm_into(
-            num_tokens,
-            hidden_size,
-            intermediate_size,
-            1.0,
-            silu_out,
-            down_proj_weight,
-            0.0,
-            down_out,
-        )?;
-        Ok(())
+        hgemm_dispatch(lt_ops, cublas, num_tokens, hidden_size, intermediate_size, 1.0, silu_out, down_proj_weight, 0.0, down_out)
     }
 }

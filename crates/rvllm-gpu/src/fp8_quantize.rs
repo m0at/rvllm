@@ -112,8 +112,53 @@ pub fn quantize_weight_fp8(weights: &[f16], out_dim: usize, in_dim: usize) -> Fp
     }
 }
 
-#[cfg(feature = "cuda")]
-use cudarc::driver::{CudaSlice, CudaStream};
+/// Result of per-tensor FP8 quantization (single scale for entire matrix).
+pub struct Fp8QuantizedWeightPerTensor {
+    /// FP8 E4M3 weight bytes, row-major [out_dim, in_dim]
+    pub data: Vec<u8>,
+    /// Single per-tensor scale factor (f32)
+    pub scale: f32,
+    pub out_dim: usize,
+    pub in_dim: usize,
+}
+
+/// Quantize an f16 weight matrix to FP8 E4M3 with a single per-tensor scale.
+/// scale = max(|W|) / 448.0, fp8_val = round(f16_val / scale)
+pub fn quantize_weight_fp8_per_tensor(
+    weights: &[f16],
+    out_dim: usize,
+    in_dim: usize,
+) -> Fp8QuantizedWeightPerTensor {
+    assert_eq!(weights.len(), out_dim * in_dim);
+
+    // Find global absmax
+    let mut absmax: f32 = 0.0;
+    for &v in weights {
+        let fv = v.to_f32().abs();
+        if fv > absmax {
+            absmax = fv;
+        }
+    }
+
+    let scale = if absmax < 1e-12 {
+        1e-12_f32
+    } else {
+        absmax / FP8_E4M3_MAX
+    };
+    let inv_scale = 1.0 / scale;
+
+    let mut data = vec![0u8; out_dim * in_dim];
+    for (i, &v) in weights.iter().enumerate() {
+        data[i] = float_to_fp8_e4m3(v.to_f32() * inv_scale);
+    }
+
+    Fp8QuantizedWeightPerTensor {
+        data,
+        scale,
+        out_dim,
+        in_dim,
+    }
+}
 
 // GPU-side quantization uses fp8_kv.cu kernels via KernelLoader.
 // CPU-side quantize_weight_fp8() above is reference/fallback only.

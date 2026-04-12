@@ -50,6 +50,7 @@ pub struct V2EngineConfig {
     pub device_id: usize,
     pub watermark: f32,
     pub graph_enabled: bool,
+    pub fp8_weights: bool,
 }
 
 impl Default for V2EngineConfig {
@@ -67,7 +68,7 @@ impl Default for V2EngineConfig {
             max_model_len: 2048,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
-            block_size: 16,
+            block_size: 64,
             gpu_memory_utilization: 0.90,
             gpu_memory_reserve_gb: 0.0,
             swap_space_gb: 4.0,
@@ -81,6 +82,7 @@ impl Default for V2EngineConfig {
             device_id: 0,
             watermark: 0.04,
             graph_enabled: true,
+            fp8_weights: false,
         }
     }
 }
@@ -250,8 +252,12 @@ pub fn init_engine(config: &V2EngineConfig) -> ConcreteEngine {
     info!(device = config.device_id, "CUDA context initialized");
 
     let runner_config = config.runner_config();
-    let runner = load_model_and_build_runner(&runner_config, &config.model_path, Arc::clone(&stream));
+    let mut runner = load_model_and_build_runner(&runner_config, &config.model_path, Arc::clone(&stream));
     info!(layers = config.num_layers, "model loaded");
+
+    if config.fp8_weights {
+        runner.enable_fp8_weights().expect("FP8 weight quantization failed");
+    }
 
     let available_gpu_bytes = query_available_gpu_memory(&context);
     let (num_gpu_blocks, num_cpu_blocks) = profile_block_counts(config, available_gpu_bytes);
@@ -439,7 +445,13 @@ fn init_cuda(
 ) {
     let ctx =
         cudarc::driver::CudaContext::new(device_id).expect("failed to create CUDA context");
-    let stream = ctx.default_stream();
+    // Disable cudarc's per-CudaSlice event tracking. It records read/write
+    // CudaEvents on every allocation, which causes
+    // CUDA_ERROR_STREAM_CAPTURE_ISOLATION during graph capture (events from
+    // pre-capture work create illegal cross-phase dependencies). We use a
+    // single stream so event-based multi-stream sync is unnecessary.
+    unsafe { ctx.disable_event_tracking(); }
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
     (ctx, stream)
 }
 
@@ -452,6 +464,8 @@ fn load_model_and_build_runner(
     use half::f16;
     use rvllm_core::prelude::LLMError;
     use rvllm_gpu::cublas::CublasHandle;
+    use rvllm_gpu::cublaslt_ops::CublasLtOps;
+    use rvllm_gpu::cublas_autotune::{CublasAutotuner, GemmDtype};
     use rvllm_gpu::kernel_loader::KernelLoader;
 
     let path = std::path::Path::new(model_path);
@@ -560,6 +574,34 @@ fn load_model_and_build_runner(
     let cublas =
         CublasHandle::new(Arc::clone(&stream)).expect("failed to create cuBLAS handle");
 
+    // 5b. cuBLASLt + autotuning for decode GEMM shapes
+    let lt_ops = {
+        let lt = CublasLtOps::new(Arc::clone(&stream)).expect("cublasLt init");
+        let q_dim = config.num_heads * config.head_dim;
+        let qkv_dim = q_dim + 2 * config.num_kv_heads * config.head_dim;
+        let gate_up_dim = config.intermediate_size * 2;
+
+        // Query GPU name for autotune cache key
+        let gpu_name = query_gpu_name();
+        info!(%gpu_name, "autotuning cublasLt algorithms for decode shapes");
+
+        let tuner = CublasAutotuner::autotune_model(
+            &lt,
+            GemmDtype::F16,
+            config.hidden_size,
+            q_dim,
+            qkv_dim,
+            config.intermediate_size,
+            gate_up_dim,
+            &gpu_name,
+        )
+        .expect("cublasLt autotune failed");
+
+        info!(algos = tuner.len(), "autotuned cublasLt algorithms");
+        lt.install_autotuned(&tuner);
+        Some(lt)
+    };
+
     // 6. Try loading CUTLASS
     let cutlass = {
         use rvllm_gpu::cutlass_ffi::CutlassKernels;
@@ -609,6 +651,7 @@ fn load_model_and_build_runner(
         layers,
         cutlass,
         cublas,
+        lt_ops,
         stream,
         loader,
         embed_tokens,
@@ -630,6 +673,15 @@ fn query_available_gpu_memory(context: &cudarc::driver::CudaContext) -> usize {
     context.bind_to_thread().expect("bind cuda context");
     let (free, _total) = cudarc::driver::result::mem_get_info().expect("cuMemGetInfo");
     free
+}
+
+fn query_gpu_name() -> String {
+    let mut name = [0i8; 256];
+    unsafe {
+        cudarc::driver::sys::cuDeviceGetName(name.as_mut_ptr(), 256, 0);
+    }
+    let bytes: Vec<u8> = name.iter().take_while(|&&b| b != 0).map(|&b| b as u8).collect();
+    String::from_utf8(bytes).unwrap_or_else(|_| "unknown_gpu".to_string())
 }
 
 /// Resolve a HuggingFace model ID (e.g. "Qwen/Qwen2.5-7B") to a local cache path.
@@ -717,7 +769,7 @@ mod tests {
     #[test]
     fn default_config_values() {
         let c = V2EngineConfig::default();
-        assert_eq!(c.block_size, 16);
+        assert_eq!(c.block_size, 64);
         assert_eq!(c.max_num_seqs, 256);
         assert_eq!(c.gpu_memory_utilization, 0.90);
         assert_eq!(c.watermark, 0.04);

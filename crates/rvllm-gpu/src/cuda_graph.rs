@@ -80,6 +80,25 @@ impl CudaGraph {
         Ok(())
     }
 
+    /// Replay on a raw `CudaStream` (for use from v2 runner which holds `Arc<CudaStream>`).
+    /// Skips bind_to_thread since we're single-GPU single-thread -- context is already bound.
+    #[cfg(feature = "cuda-graphs")]
+    pub fn replay_on(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+        unsafe {
+            cudarc::driver::result::graph::launch(self.inner.cu_graph_exec(), stream.cu_stream())
+        }.map_err(|e| LLMError::GpuError(format!("cuGraphLaunch failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Replay on raw stream (no-op when cuda-graphs feature is off).
+    #[cfg(all(feature = "cuda", not(feature = "cuda-graphs")))]
+    pub fn replay_on(&self, _stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+        trace!(batch_size = self.batch_size, "replaying CUDA graph (raw stream, no-op)");
+        self.replay_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Number of times this graph has been replayed (no-op builds only, for testing).
     #[cfg(not(feature = "cuda-graphs"))]
     pub fn replay_count(&self) -> usize {
@@ -174,7 +193,7 @@ impl CudaGraphPool {
         stream
             .cuda_stream()
             .begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
             )
             .map_err(|e| LLMError::GpuError(format!("cuStreamBeginCapture failed: {e}")))?;
         Ok(())
@@ -232,7 +251,7 @@ impl CudaGraphPool {
         debug!("beginning CUDA graph capture (raw stream)");
         stream
             .begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
             )
             .map_err(|e| LLMError::GpuError(format!("cuStreamBeginCapture failed: {e}")))?;
         Ok(())
