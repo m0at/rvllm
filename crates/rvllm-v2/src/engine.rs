@@ -356,6 +356,13 @@ impl<B: BlockManagerOps> Engine<B> {
         })
     }
 
+    /// Synchronize the GPU compute stream. Blocks until all enqueued work completes.
+    pub fn sync(&self) -> Result<(), EngineError> {
+        self.worker
+            .sync()
+            .map_err(|e| EngineError::Worker(e.to_string()))
+    }
+
     pub fn num_active_requests(&self) -> usize {
         self.requests.len()
     }

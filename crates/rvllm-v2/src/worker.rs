@@ -517,4 +517,9 @@ impl Worker {
             .synchronize()
             .map_err(|e| WorkerError::Cuda(format!("stream sync: {e}")))
     }
+
+    /// Synchronize the compute stream. Blocks until all enqueued GPU work completes.
+    pub fn sync(&self) -> Result<()> {
+        self.sync_stream()
+    }
 }

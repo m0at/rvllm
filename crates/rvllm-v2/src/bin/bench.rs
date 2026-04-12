@@ -158,6 +158,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        engine.sync().map_err(|e| anyhow::anyhow!("{e}"))?;
         let elapsed = t0.elapsed();
         let failed = batch.saturating_sub(finished);
         let tps = total_tokens as f64 / elapsed.as_secs_f64();

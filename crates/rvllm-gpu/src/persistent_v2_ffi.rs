@@ -1,10 +1,10 @@
-//! FFI bindings for persistent_layer_v2 and megakernel_v2 cubin kernels.
+//! FFI bindings for persistent_layer_decode and megakernel_decode cubin kernels.
 //!
 //! These are cooperative kernels compiled to .cubin via nvcc. They are loaded
 //! at runtime via cuModuleLoadData and launched via cuLaunchCooperativeKernel.
 //!
-//! persistent_layer_v2: executes one full transformer layer in a single launch.
-//! megakernel_v2: executes all layers + LM head in a single launch via instruction interpreter.
+//! persistent_layer_decode: executes one full transformer layer in a single launch.
+//! megakernel_decode: executes all layers + LM head in a single launch via instruction interpreter.
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -83,11 +83,12 @@ unsafe impl Send for PersistentV2Kernels {}
 unsafe impl Sync for PersistentV2Kernels {}
 
 impl PersistentV2Kernels {
-    /// Load persistent_layer_v2 and megakernel_v2 cubins from candidate paths.
+    /// Load persistent_layer_decode and megakernel_decode cubins from candidate paths.
     ///
     /// Searches in order:
-    ///   1. `kernels/sm_90/persistent_layer_v2.cubin`
-    ///   2. `kernels/sm_90/megakernel_v2.cubin`
+    ///   1. `kernels/sm_90/persistent_layer_decode.cubin`
+    ///   2. `kernels/sm_90/megakernel_decode.cubin`
+    ///   3. `kernels/sm_90/persistent_layer_v3.cubin`
     ///
     /// Returns Ok even if only one kernel is found. Returns Err only if neither
     /// cubin can be loaded.
@@ -96,13 +97,13 @@ impl PersistentV2Kernels {
             .bind_to_thread()
             .map_err(|e| format!("CUDA bind for persistent_v2 load: {e}"))?;
 
-        let layer_candidates = ["kernels/sm_90/persistent_layer_v2.cubin"];
-        let mega_candidates = ["kernels/sm_90/megakernel_v2.cubin"];
+        let layer_candidates = ["kernels/sm_90/persistent_layer_decode.cubin"];
+        let mega_candidates = ["kernels/sm_90/megakernel_decode.cubin"];
         let v3_candidates = ["kernels/sm_90/persistent_layer_v3.cubin"];
 
         let (layer_module, layer_func) =
-            Self::try_load_cubin(&layer_candidates, "persistent_layer_v2_f16");
-        let (mega_module, mega_func) = Self::try_load_cubin(&mega_candidates, "megakernel_v2_f16");
+            Self::try_load_cubin(&layer_candidates, "persistent_layer_decode_f16");
+        let (mega_module, mega_func) = Self::try_load_cubin(&mega_candidates, "megakernel_decode_f16");
         let (v3_module, v3_func) = Self::try_load_cubin(&v3_candidates, "persistent_layer_v3_f16");
 
         if layer_func.is_none() && mega_func.is_none() && v3_func.is_none() {
@@ -110,10 +111,10 @@ impl PersistentV2Kernels {
         }
 
         if layer_func.is_some() {
-            info!("persistent_layer_v2 cubin loaded");
+            info!("persistent_layer_decode cubin loaded");
         }
         if mega_func.is_some() {
-            info!("megakernel_v2 cubin loaded");
+            info!("megakernel_decode cubin loaded");
         }
         if v3_func.is_some() {
             info!("persistent_layer_v3 cubin loaded");
@@ -194,7 +195,7 @@ impl PersistentV2Kernels {
     // Scratch buffer size helpers
     // ========================================================================
 
-    /// Sync flags buffer size for a single persistent_layer_v2 launch.
+    /// Sync flags buffer size for a single persistent_layer_decode launch.
     /// PLV2_NUM_SYNCS = 6.
     pub fn layer_sync_flags_size() -> usize {
         6 * std::mem::size_of::<i32>()
@@ -226,7 +227,7 @@ impl PersistentV2Kernels {
     }
 
     // ========================================================================
-    // Launch: persistent_layer_v2_f16
+    // Launch: persistent_layer_decode_f16
     // ========================================================================
 
     /// Launch a single persistent transformer layer.
@@ -296,7 +297,7 @@ impl PersistentV2Kernels {
     ) -> Result<(), String> {
         let func = self
             .layer_func
-            .ok_or("persistent_layer_v2_f16 not loaded")?;
+            .ok_or("persistent_layer_decode_f16 not loaded")?;
 
         self.context
             .bind_to_thread()
@@ -381,14 +382,14 @@ impl PersistentV2Kernels {
                 stream,
                 &mut args,
             )
-            .map_err(|e| format!("persistent_layer_v2 cooperative launch: {e}"))?;
+            .map_err(|e| format!("persistent_layer_decode cooperative launch: {e}"))?;
         }
 
         Ok(())
     }
 
     // ========================================================================
-    // Launch: megakernel_v2_f16
+    // Launch: megakernel_decode_f16
     // ========================================================================
 
     /// Launch the megakernel that executes all layers + embedding + LM head + argmax.
@@ -465,7 +466,7 @@ impl PersistentV2Kernels {
         // Output
         output_token: u64,
     ) -> Result<(), String> {
-        let func = self.mega_func.ok_or("megakernel_v2_f16 not loaded")?;
+        let func = self.mega_func.ok_or("megakernel_decode_f16 not loaded")?;
 
         self.context
             .bind_to_thread()
@@ -557,7 +558,7 @@ impl PersistentV2Kernels {
                 stream,
                 &mut args,
             )
-            .map_err(|e| format!("megakernel_v2 cooperative launch: {e}"))?;
+            .map_err(|e| format!("megakernel_decode cooperative launch: {e}"))?;
         }
 
         Ok(())
@@ -585,7 +586,7 @@ impl PersistentV2Kernels {
         }
     }
 
-    /// Compute shared memory requirement for persistent_layer_v2 / megakernel_v2.
+    /// Compute shared memory requirement for persistent_layer_decode / megakernel_decode.
     ///
     /// Layout in GEMV phases (1/4/5/6):
     ///   normed_bytes = align128(hidden_size * 4 + WARPS * 4)
@@ -808,7 +809,7 @@ impl PersistentV2Kernels {
         Ok(())
     }
 
-    /// Compute total scratch buffer sizes for megakernel_v2 in elements (not bytes).
+    /// Compute total scratch buffer sizes for megakernel_decode in elements (not bytes).
     ///
     /// Returns (hidden_buf, mlp_buf, qkv_scratch, attn_scratch, oproj_scratch,
     ///          gateup_scratch, logits_scratch) all in f16 element counts.
