@@ -13,7 +13,7 @@ use rvllm_gpu::kernel_loader::KernelLoader;
 use rvllm_gpu::pinned_memory::PinnedBuffer;
 
 use crate::kv_cache::CudaKVCache;
-use crate::layer::{AttentionMeta, F16LayerScratch, Fp8LayerWeightRefs, GemmStrategy, GpuTransformerLayer, LayerWeights, cutlass_fp8_gemm_dispatch};
+use crate::layer::{AttentionMeta, F16LayerScratch, Fp8LayerWeightRefs, GemmStrategy, GpuTransformerLayer, LayerWeights};
 use crate::types::GpuBatchInput;
 
 #[derive(Debug, Clone)]
@@ -54,8 +54,6 @@ struct ModelWeightsStore {
     fp8_gate_up_scales: Vec<CudaSlice<f32>>,
     fp8_down: Vec<CudaSlice<u8>>,
     fp8_down_scales: Vec<CudaSlice<f32>>,
-    fp8_lm_head: Option<CudaSlice<u8>>,
-    fp8_lm_head_scale: Option<CudaSlice<f32>>,
     fp8_enabled: bool,
 }
 
@@ -107,15 +105,12 @@ pub struct GpuModelRunner {
     down_b: CudaSlice<f16>,
     final_normed: CudaSlice<f16>,
     residual_tmp: CudaSlice<f16>,
-    logits_gpu: CudaSlice<f16>,
+    logits_gpu: CudaSlice<f32>,
     embed_output: CudaSlice<f16>,
     argmax_output: CudaSlice<i32>,
     // Pinned host buffers for truly async DtoH/HtoD (pageable memory degrades to sync)
     pinned_argmax: PinnedBuffer<i32>,
     pinned_meta: PinnedBuffer<i32>,
-    // Scratch for LM head FP8 activation quantization
-    lm_head_fp8_act: CudaSlice<u8>,
-    lm_head_fp8_scale: CudaSlice<f32>,
     // Stored metadata offsets from the last upload (for forward_gpu_only)
     last_meta_offsets: Option<PackedMetaOffsets>,
 }
@@ -188,12 +183,8 @@ impl GpuModelRunner {
         let down_b = alloc_f16("down_b", max_n)?;
         let final_normed = alloc_f16("final_normed", max_n)?;
         let residual_tmp = alloc_f16("residual_tmp", max_n)?;
-        let logits_gpu = stream.alloc_zeros::<f16>(max_t * vocab_size)
+        let logits_gpu = stream.alloc_zeros::<f32>(max_t * vocab_size)
             .map_err(|e| LLMError::GpuError(format!("logits alloc: {e}")))?;
-        let lm_head_fp8_act = stream.alloc_zeros::<u8>(max_t * hidden_size)
-            .map_err(|e| LLMError::GpuError(format!("lm_head_fp8_act alloc: {e}")))?;
-        let lm_head_fp8_scale = stream.alloc_zeros::<f32>(max_t)
-            .map_err(|e| LLMError::GpuError(format!("lm_head_fp8_scale alloc: {e}")))?;
         let embed_output = alloc_f16("embed_output", max_n)?;
         let argmax_output = stream.alloc_zeros::<i32>(max_t)
             .map_err(|e| LLMError::GpuError(format!("argmax_output alloc: {e}")))?;
@@ -227,8 +218,6 @@ impl GpuModelRunner {
                 fp8_gate_up_scales: Vec::new(),
                 fp8_down: Vec::new(),
                 fp8_down_scales: Vec::new(),
-                fp8_lm_head: None,
-                fp8_lm_head_scale: None,
                 fp8_enabled: false,
             },
             embed_tokens,
@@ -251,8 +240,6 @@ impl GpuModelRunner {
             argmax_output,
             pinned_argmax,
             pinned_meta,
-            lm_head_fp8_act,
-            lm_head_fp8_scale,
             last_meta_offsets: None,
         })
     }
@@ -330,22 +317,6 @@ impl GpuModelRunner {
         self.weights.fp8_down_scales = fp8_down_scales;
         self.weights.fp8_enabled = true;
 
-        // Quantize LM head weight to FP8 (separate copy from embed_tokens)
-        {
-            let vocab_size = self.config.vocab_size;
-            let hidden_size = self.config.hidden_size;
-            let cpu_f16: Vec<f16> = self.stream.clone_dtoh(&self.lm_head_weight)
-                .map_err(|e| LLMError::GpuError(format!("lm_head DtoH: {e}")))?;
-            let q = quantize_weight_fp8_per_tensor(&cpu_f16, vocab_size, hidden_size);
-            let gpu_fp8 = self.stream.clone_htod(&q.data)
-                .map_err(|e| LLMError::GpuError(format!("lm_head fp8 HtoD: {e}")))?;
-            let gpu_scale = self.stream.clone_htod(&[q.scale])
-                .map_err(|e| LLMError::GpuError(format!("lm_head scale HtoD: {e}")))?;
-            tracing::info!(vocab_size, hidden_size, scale = q.scale, "FP8 quantized LM head");
-            self.weights.fp8_lm_head = Some(gpu_fp8);
-            self.weights.fp8_lm_head_scale = Some(gpu_scale);
-        }
-
         tracing::info!(num_layers, "FP8 weight quantization complete");
         Ok(())
     }
@@ -383,7 +354,6 @@ impl GpuModelRunner {
             ref weights,
             ref final_norm_weight,
             ref lm_head_weight,
-            ref loader,
             ref mut scratch,
             ref mut residual_a,
             ref mut residual_b,
@@ -511,45 +481,16 @@ impl GpuModelRunner {
             )?;
         }
 
-        // 6. LM head
-        if weights.fp8_enabled {
-            if let (Some(lm_fp8), Some(lm_s)) = (&weights.fp8_lm_head, &weights.fp8_lm_head_scale) {
-                let ck = cutlass_ref.ok_or_else(|| LLMError::GpuError("CUTLASS not loaded".into()))?;
-                let quant_kernel = loader.get_func("fused_rmsnorm_fp8_quant", "quantize_fp8_per_token_kernel")?;
-                let bt = hidden_size.min(1024) as u32;
-                unsafe {
-                    stream.launch_builder(&quant_kernel)
-                        .arg(&scratch.fp8_act_scratch)
-                        .arg(&scratch.fp8_act_scale)
-                        .arg(&*final_normed)
-                        .arg(&(hidden_size as i32))
-                        .launch(LaunchConfig {
-                            grid_dim: (num_tokens as u32, 1, 1),
-                            block_dim: (bt, 1, 1),
-                            shared_mem_bytes: (bt as usize * std::mem::size_of::<f32>()) as u32,
-                        })
-                        .map_err(|e| LLMError::GpuError(format!("lm_head fp8 quant: {e}")))?;
-                }
-                cutlass_fp8_gemm_dispatch(
-                    ck, autotune_ref, stream,
-                    num_tokens, vocab_size, hidden_size,
-                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                    lm_fp8, lm_s,
-                    logits_gpu, &mut scratch.cutlass_workspace,
-                )?;
-            }
-        } else {
-            cublas.hgemm(
-                num_tokens, vocab_size, hidden_size,
-                f16::from_f32(1.0), &*final_normed, lm_head_weight, f16::from_f32(0.0), logits_gpu,
-            )?;
-        }
+        // 6. LM head: f16 hidden x f16 lm_head -> f32 logits
+        cublas.hgemm_f32_output(
+            num_tokens, vocab_size, hidden_size,
+            1.0, &*final_normed, lm_head_weight, 0.0, logits_gpu,
+        )?;
 
-        // 7. DtoH logits (f16 -> f32 on CPU)
-        let logits_f16: Vec<f16> = stream
+        // 7. DtoH logits
+        let logits_cpu = stream
             .clone_dtoh(&logits_gpu.slice(..num_tokens * vocab_size))
             .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
-        let logits_cpu: Vec<f32> = logits_f16.iter().map(|x| x.to_f32()).collect();
 
         Ok(logits_cpu)
     }
@@ -708,52 +649,27 @@ impl GpuModelRunner {
             )?;
         }
 
-        // LM head + argmax
-        if weights.fp8_enabled {
-            if let (Some(lm_fp8), Some(lm_s)) = (&weights.fp8_lm_head, &weights.fp8_lm_head_scale) {
-                let quant_kernel = loader.get_func("fused_rmsnorm_fp8_quant", "quantize_fp8_per_token_kernel")?;
-                let bt = hidden_size.min(1024) as u32;
-                unsafe {
-                    stream.launch_builder(&quant_kernel)
-                        .arg(&scratch.fp8_act_scratch)
-                        .arg(&scratch.fp8_act_scale)
-                        .arg(&*final_normed)
-                        .arg(&(hidden_size as i32))
-                        .launch(LaunchConfig {
-                            grid_dim: (num_tokens as u32, 1, 1),
-                            block_dim: (bt, 1, 1),
-                            shared_mem_bytes: (bt as usize * std::mem::size_of::<f32>()) as u32,
-                        })
-                        .map_err(|e| LLMError::GpuError(format!("lm_head fp8 quant: {e}")))?;
-                }
-                let ck = cutlass_ref.ok_or_else(|| LLMError::GpuError("CUTLASS not loaded".into()))?;
-                cutlass_fp8_gemm_dispatch(
-                    ck, autotune_ref, stream,
-                    num_tokens, vocab_size, hidden_size,
-                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                    lm_fp8, lm_s,
-                    logits_gpu, &mut scratch.cutlass_workspace,
-                )?;
-            }
-        } else {
-            cublas.hgemm(
-                num_tokens, vocab_size, hidden_size,
-                f16::from_f32(1.0), &*final_normed, lm_head_weight, f16::from_f32(0.0), logits_gpu,
-            )?;
-        }
-        let argmax_kernel = loader.get_func("argmax_f16", "argmax_f16_kernel")?;
+        // LM head GEMM
+        cublas.hgemm_f32_output(
+            num_tokens, vocab_size, hidden_size,
+            1.0, &*final_normed, lm_head_weight, 0.0, logits_gpu,
+        )?;
+
+        // GPU-side argmax (no full logits DtoH)
+        let argmax_kernel = loader.get_func("argmax", "argmax_kernel")?;
         let block_dim = vocab_size.min(1024) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_tokens as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             stream
                 .launch_builder(&argmax_kernel)
                 .arg(&*logits_gpu)
                 .arg(&*argmax_output)
                 .arg(&(vocab_size as i32))
-                .launch(LaunchConfig {
-                    grid_dim: (num_tokens as u32, 1, 1),
-                    block_dim: (block_dim, 1, 1),
-                    shared_mem_bytes: 0,
-                })
+                .launch(cfg)
                 .map_err(|e| LLMError::GpuError(format!("argmax launch: {e}")))?;
         }
 
@@ -765,7 +681,7 @@ impl GpuModelRunner {
     pub fn forward_greedy(&mut self, input: &GpuBatchInput, kv_cache: &CudaKVCache) -> Result<Vec<i32>> {
         let n = self.forward_greedy_launch(input, kv_cache)?;
         if n == 0 { return Ok(Vec::new()); }
-        Ok(self.read_graph_output(n)?.to_vec())
+        self.read_graph_output(n)
     }
 
     /// Pack all metadata fields into one contiguous GPU buffer (1 memcpy).
@@ -1132,8 +1048,6 @@ impl GpuModelRunner {
             ref embed_output,
             ref loader,
             ref mut argmax_output,
-            ref mut lm_head_fp8_act,
-            ref mut lm_head_fp8_scale,
             ..
         } = *self;
 
@@ -1245,125 +1159,14 @@ impl GpuModelRunner {
             )?;
         }
 
-        // LM head + argmax
-        if self.weights.fp8_enabled {
-            let lm_fp8 = self.weights.fp8_lm_head.as_ref()
-                .ok_or_else(|| LLMError::GpuError("FP8 LM head not quantized".into()))?;
-            let lm_scale = self.weights.fp8_lm_head_scale.as_ref()
-                .ok_or_else(|| LLMError::GpuError("FP8 LM head scale missing".into()))?;
-
-            let quant_kernel = loader.get_func("fused_rmsnorm_fp8_quant", "quantize_fp8_per_token_kernel")?;
-            let block_threads = hidden_size.min(1024) as u32;
-            unsafe {
-                stream.launch_builder(&quant_kernel)
-                    .arg(&*lm_head_fp8_act)
-                    .arg(&*lm_head_fp8_scale)
-                    .arg(&*final_normed)
-                    .arg(&(hidden_size as i32))
-                    .launch(LaunchConfig {
-                        grid_dim: (num_tokens as u32, 1, 1),
-                        block_dim: (block_threads, 1, 1),
-                        shared_mem_bytes: (block_threads as usize * std::mem::size_of::<f32>()) as u32,
-                    })
-                    .map_err(|e| LLMError::GpuError(format!("lm_head fp8 quant: {e}")))?;
-            }
-
-            let ck = cutlass.as_deref()
-                .ok_or_else(|| LLMError::GpuError("CUTLASS not loaded".into()))?;
-            cutlass_fp8_gemm_dispatch(
-                ck, autotune.as_ref(), stream,
-                num_tokens, vocab_size, hidden_size,
-                &*lm_head_fp8_act, &*lm_head_fp8_scale,
-                lm_fp8, lm_scale,
-                logits_gpu, &mut scratch.cutlass_workspace,
-            )?;
-
-            let argmax_kernel = loader.get_func("argmax_f16", "argmax_f16_kernel")?;
-            let block_dim = vocab_size.min(1024) as u32;
-            unsafe {
-                stream
-                    .launch_builder(&argmax_kernel)
-                    .arg(&*logits_gpu)
-                    .arg(argmax_output)
-                    .arg(&(vocab_size as i32))
-                    .launch(LaunchConfig {
-                        grid_dim: (num_tokens as u32, 1, 1),
-                        block_dim: (block_dim, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                    .map_err(|e| LLMError::GpuError(format!("argmax launch: {e}")))?;
-            }
-        } else {
-            cublas.hgemm(
-                num_tokens, vocab_size, hidden_size,
-                f16::from_f32(1.0), &*final_normed, lm_head_weight, f16::from_f32(0.0), logits_gpu,
-            )?;
-            let argmax_kernel = loader.get_func("argmax_f16", "argmax_f16_kernel")?;
-            let block_dim = vocab_size.min(1024) as u32;
-            unsafe {
-                stream
-                    .launch_builder(&argmax_kernel)
-                    .arg(&*logits_gpu)
-                    .arg(argmax_output)
-                    .arg(&(vocab_size as i32))
-                    .launch(LaunchConfig {
-                        grid_dim: (num_tokens as u32, 1, 1),
-                        block_dim: (block_dim, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                    .map_err(|e| LLMError::GpuError(format!("argmax launch: {e}")))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// FP8 LM head GEMM + f16 argmax.
-    /// Quantizes final_normed to FP8, runs CUTLASS FP8 GEMM to f16 logits, then argmax_f16.
-    fn fp8_lm_head_argmax(&mut self, num_tokens: usize) -> Result<()> {
-        let vocab_size = self.config.vocab_size;
-        let hidden_size = self.config.hidden_size;
-
-        let lm_fp8 = self.weights.fp8_lm_head.as_ref()
-            .ok_or_else(|| LLMError::GpuError("FP8 LM head not quantized".into()))?;
-        let lm_scale = self.weights.fp8_lm_head_scale.as_ref()
-            .ok_or_else(|| LLMError::GpuError("FP8 LM head scale missing".into()))?;
-
-        // Quantize final_normed [num_tokens, hidden_size] to FP8 per-token
-        let quant_kernel = self.loader.get_func("fused_rmsnorm_fp8_quant", "quantize_fp8_per_token_kernel")?;
-        let block_threads = hidden_size.min(1024) as u32;
-        unsafe {
-            self.stream.launch_builder(&quant_kernel)
-                .arg(&self.lm_head_fp8_act)
-                .arg(&self.lm_head_fp8_scale)
-                .arg(&self.final_normed)
-                .arg(&(hidden_size as i32))
-                .launch(LaunchConfig {
-                    grid_dim: (num_tokens as u32, 1, 1),
-                    block_dim: (block_threads, 1, 1),
-                    shared_mem_bytes: (block_threads as usize * std::mem::size_of::<f32>()) as u32,
-                })
-                .map_err(|e| LLMError::GpuError(format!("lm_head fp8 quant: {e}")))?;
-        }
-
-        // FP8 CUTLASS GEMM: [num_tokens, vocab_size] = [num_tokens, hidden_size] @ [vocab_size, hidden_size]^T
-        let cutlass = self.cutlass.as_ref()
-            .ok_or_else(|| LLMError::GpuError("CUTLASS not loaded".into()))?;
-        cutlass_fp8_gemm_dispatch(
-            cutlass,
-            self.autotune.as_ref(),
-            &self.stream,
+        // LM head GEMM
+        cublas.hgemm_f32_output(
             num_tokens, vocab_size, hidden_size,
-            &self.lm_head_fp8_act,
-            &self.lm_head_fp8_scale,
-            lm_fp8,
-            lm_scale,
-            &mut self.logits_gpu,
-            &mut self.scratch.cutlass_workspace,
+            1.0, &*final_normed, lm_head_weight, 0.0, logits_gpu,
         )?;
 
-        // Argmax on f16 logits
-        let argmax_kernel = self.loader.get_func("argmax_f16", "argmax_f16_kernel")?;
+        // GPU-side argmax into pre-allocated buffer
+        let argmax_kernel = loader.get_func("argmax", "argmax_kernel")?;
         let block_dim = vocab_size.min(1024) as u32;
         let cfg = LaunchConfig {
             grid_dim: (num_tokens as u32, 1, 1),
@@ -1371,13 +1174,13 @@ impl GpuModelRunner {
             shared_mem_bytes: 0,
         };
         unsafe {
-            self.stream
+            stream
                 .launch_builder(&argmax_kernel)
-                .arg(&self.logits_gpu)
-                .arg(&self.argmax_output)
+                .arg(&*logits_gpu)
+                .arg(&*argmax_output)
                 .arg(&(vocab_size as i32))
                 .launch(cfg)
-                .map_err(|e| LLMError::GpuError(format!("argmax_f16 launch: {e}")))?;
+                .map_err(|e| LLMError::GpuError(format!("argmax launch: {e}")))?;
         }
 
         Ok(())
@@ -1385,8 +1188,7 @@ impl GpuModelRunner {
 
     /// Read the argmax token IDs from the GPU after forward_gpu_only or graph replay.
     /// Uses pinned host memory for truly async DtoH (pageable Vec is synchronous).
-    /// Returns a slice into the pinned buffer -- valid until next read_graph_output call.
-    pub fn read_graph_output(&mut self, num_tokens: usize) -> Result<&[i32]> {
+    pub fn read_graph_output(&mut self, num_tokens: usize) -> Result<Vec<i32>> {
         let bytes = num_tokens * std::mem::size_of::<i32>();
         let src_dev_ptr = {
             let (ptr, _) = self.argmax_output.device_ptr(&self.stream);
@@ -1404,7 +1206,7 @@ impl GpuModelRunner {
         }
         self.stream.synchronize()
             .map_err(|e| LLMError::GpuError(format!("stream sync: {e}")))?;
-        Ok(&self.pinned_argmax.as_slice()[..num_tokens])
+        Ok(self.pinned_argmax.as_slice()[..num_tokens].to_vec())
     }
 
     /// Returns the max_seq_len from config (for graph capture max_context_len).

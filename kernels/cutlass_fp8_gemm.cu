@@ -243,7 +243,7 @@ using SmallCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBu
     SmallClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename SmallCollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum
+    cutlass::gemm::KernelTmaWarpSpecialized
 >::CollectiveOp;
 
 using SmallGemmKernel = cutlass::gemm::kernel::GemmUniversal<

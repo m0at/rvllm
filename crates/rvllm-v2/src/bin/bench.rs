@@ -158,10 +158,16 @@ fn main() -> anyhow::Result<()> {
 
             let t0 = Instant::now();
             let mut total_tokens = 0usize;
+            let mut finished = 0usize;
 
             while engine.has_pending_work() {
                 let outputs = engine.step().map_err(|e| anyhow::anyhow!("{e}"))?;
-                total_tokens += outputs.len();
+                for out in &outputs {
+                    total_tokens += 1;
+                    if out.finished {
+                        finished += 1;
+                    }
+                }
             }
 
             engine.sync().map_err(|e| anyhow::anyhow!("{e}"))?;

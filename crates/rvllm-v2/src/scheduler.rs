@@ -91,7 +91,6 @@ pub struct Scheduler<B: BlockManagerOps> {
     running: Vec<RequestId>,
     swapped: VecDeque<RequestId>,
     requests: HashMap<RequestId, InternalRequest>,
-    seq_to_req: HashMap<SequenceId, RequestId>,
     next_seq_id: u64,
 }
 
@@ -106,7 +105,6 @@ impl<B: BlockManagerOps> Scheduler<B> {
             running: Vec::new(),
             swapped: VecDeque::new(),
             requests: HashMap::new(),
-            seq_to_req: HashMap::new(),
             next_seq_id: 1,
         }
     }
@@ -133,7 +131,6 @@ impl<B: BlockManagerOps> Scheduler<B> {
             finished: false,
         };
 
-        self.seq_to_req.insert(seq_id, request_id);
         self.requests.insert(request_id, req);
         self.waiting.push_back(request_id);
         seq_id
@@ -150,9 +147,6 @@ impl<B: BlockManagerOps> Scheduler<B> {
             }
         }
 
-        if let Some(req) = self.requests.get(&request_id) {
-            self.seq_to_req.remove(&req.seq_id);
-        }
         self.requests.remove(&request_id);
     }
 
@@ -193,11 +187,7 @@ impl<B: BlockManagerOps> Scheduler<B> {
 
     pub fn process_step_result(&mut self, results: &[(SequenceId, TokenId, bool)]) {
         for &(seq_id, token_id, finished) in results {
-            let req_id = match self.seq_to_req.get(&seq_id) {
-                Some(&id) => id,
-                None => continue,
-            };
-            let req = match self.requests.get_mut(&req_id) {
+            let req = match self.requests.values_mut().find(|r| r.seq_id == seq_id) {
                 Some(r) => r,
                 None => continue,
             };
@@ -222,22 +212,22 @@ impl<B: BlockManagerOps> Scheduler<B> {
     }
 
     fn retire_finished(&mut self, diff: &mut StepDiff) {
-        let mut i = 0;
-        while i < self.running.len() {
-            let rid = self.running[i];
+        let mut still_running = Vec::with_capacity(self.running.len());
+
+        for rid in std::mem::take(&mut self.running) {
             let finished = self.requests.get(&rid).map_or(true, |r| r.finished);
             if finished {
                 diff.removed.push(rid);
                 if let Some(req) = self.requests.get(&rid) {
                     self.block_manager.free(req.seq_id);
-                    self.seq_to_req.remove(&req.seq_id);
                 }
                 self.requests.remove(&rid);
-                self.running.swap_remove(i);
             } else {
-                i += 1;
+                still_running.push(rid);
             }
         }
+
+        self.running = still_running;
     }
 
     fn preempt_if_needed(&mut self, diff: &mut StepDiff) {

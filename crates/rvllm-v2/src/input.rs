@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 
-use crate::types::{BlockId, GpuBatchInput, RequestId, ResponseFormat, SamplingParams, WorkerRequest};
+use crate::types::{BlockId, GpuBatchInput, RequestId, ResponseFormat, WorkerRequest};
 #[cfg(test)]
-use crate::types::{SequenceId, TokenId};
+use crate::types::{SamplingParams, SequenceId, TokenId};
 
 pub struct InputBuilder {
     input: GpuBatchInput,
     block_tables_raw: Vec<Vec<u32>>,
     prefill_keys: Vec<RequestId>,
     decode_keys: Vec<RequestId>,
-    is_all_greedy: bool,
 }
 
 impl InputBuilder {
@@ -25,7 +24,7 @@ impl InputBuilder {
                 slot_mapping: Vec::with_capacity(128),
                 context_lens: Vec::with_capacity(128),
                 query_lens: Vec::with_capacity(128),
-                is_all_greedy: true,
+                sampling_params: Vec::with_capacity(128),
                 block_tables_flat: Vec::with_capacity(128 * 32),
                 max_blocks_per_seq: 0,
                 prefill_tokens: Vec::with_capacity(512),
@@ -38,7 +37,6 @@ impl InputBuilder {
             block_tables_raw: Vec::with_capacity(128),
             prefill_keys: Vec::with_capacity(64),
             decode_keys: Vec::with_capacity(64),
-            is_all_greedy: true,
         }
     }
 
@@ -60,20 +58,21 @@ impl InputBuilder {
         self.prefill_keys.sort_unstable_by_key(|id| id.0);
         self.decode_keys.sort_unstable_by_key(|id| id.0);
 
-        for i in 0..self.prefill_keys.len() {
-            let id = self.prefill_keys[i];
+        let prefill_keys: Vec<RequestId> = self.prefill_keys.clone();
+        let decode_keys: Vec<RequestId> = self.decode_keys.clone();
+
+        for &id in &prefill_keys {
             let req = &requests[&id];
             self.add_prefill_request(req, block_size);
         }
 
-        for i in 0..self.decode_keys.len() {
-            let id = self.decode_keys[i];
+        for &id in &decode_keys {
             let req = &requests[&id];
             self.add_decode_request(req, block_size);
         }
 
-        let num_prefill = self.prefill_keys.len();
-        let num_decode = self.decode_keys.len();
+        let num_prefill = prefill_keys.len();
+        let num_decode = decode_keys.len();
 
         self.flatten_block_tables();
 
@@ -83,7 +82,6 @@ impl InputBuilder {
         self.input.is_all_decode = num_prefill == 0;
         self.input.is_all_prefill = num_decode == 0;
         self.input.max_context_len = self.input.context_lens.iter().copied().max().unwrap_or(0);
-        self.input.is_all_greedy = self.is_all_greedy;
 
         &self.input
     }
@@ -95,19 +93,6 @@ impl InputBuilder {
         }
         self.prefill_keys.clear();
         self.decode_keys.clear();
-        self.is_all_greedy = true;
-    }
-
-    fn track_greedy(&mut self, p: &SamplingParams) {
-        if self.is_all_greedy
-            && (p.temperature != 0.0
-                || !matches!(p.response_format, ResponseFormat::Text)
-                || p.repetition_penalty != 1.0
-                || p.frequency_penalty != 0.0
-                || p.presence_penalty != 0.0)
-        {
-            self.is_all_greedy = false;
-        }
     }
 
     fn add_decode_request(&mut self, req: &WorkerRequest, block_size: usize) {
@@ -123,7 +108,7 @@ impl InputBuilder {
         self.input.slot_mapping.push(slot);
         self.input.context_lens.push(seq_len as u32);
         self.input.query_lens.push(1);
-        self.track_greedy(&req.sampling_params);
+        self.input.sampling_params.push(req.sampling_params.clone());
 
         self.push_block_table(&req.block_table);
     }
@@ -158,7 +143,7 @@ impl InputBuilder {
         self.input
             .context_lens
             .push(req.num_computed_tokens as u32 + chunk_len as u32);
-        self.track_greedy(&req.sampling_params);
+        self.input.sampling_params.push(req.sampling_params.clone());
 
         for pos in chunk.clone() {
             let token_id = req.prompt_token_ids[pos];
@@ -217,7 +202,13 @@ impl Default for InputBuilder {
 
 impl GpuBatchInput {
     pub fn all_greedy(&self) -> bool {
-        self.is_all_greedy
+        self.sampling_params.iter().all(|p| {
+            p.temperature == 0.0
+                && matches!(p.response_format, ResponseFormat::Text)
+                && p.repetition_penalty == 1.0
+                && p.frequency_penalty == 0.0
+                && p.presence_penalty == 0.0
+        })
     }
 
     pub fn max_context_len(&self) -> u32 {
@@ -375,9 +366,16 @@ mod tests {
     #[test]
     fn test_all_greedy() {
         let mut input = GpuBatchInput::new();
+        input.sampling_params.push(SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        });
         assert!(input.all_greedy());
 
-        input.is_all_greedy = false;
+        input.sampling_params.push(SamplingParams {
+            temperature: 0.8,
+            ..SamplingParams::default()
+        });
         assert!(!input.all_greedy());
     }
 

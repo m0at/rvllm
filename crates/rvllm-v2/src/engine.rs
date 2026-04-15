@@ -481,7 +481,15 @@ impl<B: BlockManagerOps> Engine<B> {
     }
 
     fn cleanup_finished(&mut self) {
-        self.requests.retain(|_, req| !req.finished);
+        let finished_ids: Vec<RequestId> = self
+            .requests
+            .iter()
+            .filter(|(_, req)| req.finished)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in &finished_ids {
+            self.requests.remove(id);
+        }
     }
 
     fn check_finish(&self, request_id: RequestId, token_id: TokenId) -> bool {

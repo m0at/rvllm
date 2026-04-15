@@ -126,7 +126,7 @@ pub struct GpuBatchInput {
     pub slot_mapping: Vec<u32>,
     pub context_lens: Vec<u32>,
     pub query_lens: Vec<u32>,
-    pub is_all_greedy: bool,
+    pub sampling_params: Vec<SamplingParams>,
     pub block_tables_flat: Vec<u32>,
     pub max_blocks_per_seq: usize,
     pub prefill_tokens: Vec<TokenId>,
@@ -142,30 +142,12 @@ impl GpuBatchInput {
         Self {
             is_all_decode: true,
             is_all_prefill: true,
-            is_all_greedy: true,
             ..Self::default()
         }
     }
 
     pub fn clear(&mut self) {
-        self.num_seqs = 0;
-        self.num_prefill_seqs = 0;
-        self.num_decode_seqs = 0;
-        self.seq_ids.clear();
-        self.token_ids.clear();
-        self.position_ids.clear();
-        self.slot_mapping.clear();
-        self.context_lens.clear();
-        self.query_lens.clear();
-        self.is_all_greedy = true;
-        self.block_tables_flat.clear();
-        self.max_blocks_per_seq = 0;
-        self.prefill_tokens.clear();
-        self.prefill_positions.clear();
-        self.prefill_slot_mapping.clear();
-        self.is_all_decode = true;
-        self.is_all_prefill = true;
-        self.max_context_len = 0;
+        *self = Self::new();
     }
 }
 

@@ -127,7 +127,7 @@ fn fp8_gemm_dispatch(
 // CUTLASS FP8 GEMM dispatch: pre-quantized activation + CUTLASS SM90
 // ===================================================================
 
-pub(crate) fn cutlass_fp8_gemm_dispatch(
+fn cutlass_fp8_gemm_dispatch(
     cutlass: &CutlassKernels,
     autotune: Option<&CutlassAutotuneCache>,
     stream: &CudaStream,
