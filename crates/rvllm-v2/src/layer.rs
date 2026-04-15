@@ -127,7 +127,7 @@ fn fp8_gemm_dispatch(
 // CUTLASS FP8 GEMM dispatch: pre-quantized activation + CUTLASS SM90
 // ===================================================================
 
-fn cutlass_fp8_gemm_dispatch(
+pub(crate) fn cutlass_fp8_gemm_dispatch(
     cutlass: &CutlassKernels,
     autotune: Option<&CutlassAutotuneCache>,
     stream: &CudaStream,
@@ -740,7 +740,7 @@ impl GpuTransformerLayer {
         Ok(())
     }
 
-    fn quantize_fp8_per_token(
+    pub(crate) fn quantize_fp8_per_token(
         &self,
         input: &CudaSlice<f16>,
         num_tokens: usize,
