@@ -27,6 +27,7 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         &["silu_kernel", "fused_silu_mul_kernel", "gelu_kernel"],
     ),
     ("argmax", &["argmax_kernel"]),
+    ("argmax_f16", &["argmax_f16_kernel"]),
     (
         "activation_f16",
         &[
