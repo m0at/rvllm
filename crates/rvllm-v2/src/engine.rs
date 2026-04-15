@@ -138,6 +138,8 @@ impl<B: BlockManagerOps> Engine<B> {
         };
 
         if sched_out.diff.is_empty() {
+            // Recycle the empty diff so its capacity is reused
+            self.scheduler.recycle_diff(sched_out.diff);
             return Ok(Vec::new());
         }
 
@@ -145,7 +147,10 @@ impl<B: BlockManagerOps> Engine<B> {
             .worker
             .step(&sched_out.diff)
             .map_err(|e| EngineError::Worker(e.to_string()))?;
-        Ok(self.process_forward_output(&sched_out, &fwd_output))
+        let result = self.process_forward_output(&sched_out, &fwd_output);
+        // Recycle the diff so Vec capacity is reused next step
+        self.scheduler.recycle_diff(sched_out.diff);
+        Ok(result)
     }
 
     pub fn step_launch(&mut self) -> Result<Option<StepPending>, EngineError> {
@@ -158,6 +163,7 @@ impl<B: BlockManagerOps> Engine<B> {
         };
 
         if sched_out.diff.is_empty() {
+            self.scheduler.recycle_diff(sched_out.diff);
             return Ok(None);
         }
 
@@ -197,7 +203,9 @@ impl<B: BlockManagerOps> Engine<B> {
             .worker
             .step_collect()
             .map_err(|e| EngineError::Worker(e.to_string()))?;
-        Ok(self.process_forward_output(&pending.sched_out, &fwd_output))
+        let result = self.process_forward_output(&pending.sched_out, &fwd_output);
+        self.scheduler.recycle_diff(pending.sched_out.diff);
+        Ok(result)
     }
 
     /// Speculative decode step: draft K tokens per sequence, verify in one forward pass,
@@ -333,11 +341,15 @@ impl<B: BlockManagerOps> Engine<B> {
 
             // Build output (separate borrow scope)
             if let Some(req) = self.requests.get(&cont.request_id) {
-                let output_text = self.decode_output_tokens(req);
+                let (output_text, output_token_ids) = if req.finished {
+                    (self.decode_output_tokens(req), req.output_token_ids.clone())
+                } else {
+                    (String::new(), Vec::new())
+                };
                 request_outputs.push(V2RequestOutput {
                     request_id: cont.request_id,
                     output_text,
-                    output_token_ids: req.output_token_ids.clone(),
+                    output_token_ids,
                     finished: req.finished,
                     finish_reason: req.finish_reason,
                     logprobs: Vec::new(),
@@ -437,11 +449,16 @@ impl<B: BlockManagerOps> Engine<B> {
             }
 
             if let Some(req) = self.requests.get(&added.request_id) {
-                let output_text = self.decode_output_tokens(req);
+                // Only clone full output + decode text when finished
+                let (output_text, output_token_ids) = if req.finished {
+                    (self.decode_output_tokens(req), req.output_token_ids.clone())
+                } else {
+                    (String::new(), Vec::new())
+                };
                 outputs.push(V2RequestOutput {
                     request_id: added.request_id,
                     output_text,
-                    output_token_ids: req.output_token_ids.clone(),
+                    output_token_ids,
                     finished: req.finished,
                     finish_reason: req.finish_reason,
                     logprobs: vec![logprob],
@@ -454,11 +471,16 @@ impl<B: BlockManagerOps> Engine<B> {
             token_idx += 1;
 
             if let Some(req) = self.requests.get(&cont.request_id) {
-                let output_text = self.decode_output_tokens(req);
+                // Only clone full output + decode text when finished
+                let (output_text, output_token_ids) = if req.finished {
+                    (self.decode_output_tokens(req), req.output_token_ids.clone())
+                } else {
+                    (String::new(), Vec::new())
+                };
                 outputs.push(V2RequestOutput {
                     request_id: cont.request_id,
                     output_text,
-                    output_token_ids: req.output_token_ids.clone(),
+                    output_token_ids,
                     finished: req.finished,
                     finish_reason: req.finish_reason,
                     logprobs: vec![logprob],

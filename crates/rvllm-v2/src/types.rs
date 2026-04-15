@@ -39,6 +39,16 @@ impl StepDiff {
             && self.continued.is_empty()
             && self.block_ops.is_empty()
     }
+
+    /// Clear all fields without deallocating. Vecs retain capacity for reuse.
+    pub fn clear(&mut self) {
+        self.added.clear();
+        self.removed.clear();
+        self.continued.clear();
+        self.block_ops.copies.clear();
+        self.block_ops.swap_in.clear();
+        self.block_ops.swap_out.clear();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

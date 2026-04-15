@@ -890,65 +890,46 @@ impl GpuModelRunner {
         let max_blocks = self.graph_max_blocks;
 
         self.cpu_scratch.clear();
+        let pad = padded_batch - actual;
 
-        // token_ids
+        // token_ids: bulk extend + zero-pad
         let token_ids_off = 0;
-        for i in 0..actual {
-            self.cpu_scratch.push(input.token_ids[i] as i32);
-        }
-        for _ in actual..padded_batch {
-            self.cpu_scratch.push(0i32);
-        }
+        self.cpu_scratch.extend(input.token_ids[..actual].iter().map(|&t| t as i32));
+        self.cpu_scratch.resize(self.cpu_scratch.len() + pad, 0i32);
 
-        // positions
+        // positions: bulk extend + zero-pad
         let positions_off = self.cpu_scratch.len();
-        for i in 0..actual {
-            self.cpu_scratch.push(input.position_ids[i] as i32);
-        }
-        for _ in actual..padded_batch {
-            self.cpu_scratch.push(0i32);
-        }
+        self.cpu_scratch.extend(input.position_ids[..actual].iter().map(|&p| p as i32));
+        self.cpu_scratch.resize(self.cpu_scratch.len() + pad, 0i32);
 
-        // context_lens
+        // context_lens: bulk extend + zero-pad
         let context_lens_off = self.cpu_scratch.len();
-        for i in 0..actual {
-            self.cpu_scratch.push(input.context_lens[i] as i32);
-        }
-        for _ in actual..padded_batch {
-            self.cpu_scratch.push(0i32);
-        }
+        self.cpu_scratch.extend(input.context_lens[..actual].iter().map(|&c| c as i32));
+        self.cpu_scratch.resize(self.cpu_scratch.len() + pad, 0i32);
 
         // block_tables: padded_batch * max_blocks, zero-padded
         let block_tables_off = self.cpu_scratch.len();
         let bt_len = padded_batch * max_blocks;
-        let old_len = self.cpu_scratch.len();
-        self.cpu_scratch.resize(old_len + bt_len, 0i32);
+        self.cpu_scratch.resize(self.cpu_scratch.len() + bt_len, 0i32);
         let max_blocks_input = input.max_blocks_per_seq;
+        let copy_len = max_blocks_input.min(max_blocks);
         for s in 0..actual {
             let src_start = s * max_blocks_input;
-            let copy_len = max_blocks_input.min(max_blocks);
-            for b in 0..copy_len {
-                if src_start + b < input.block_tables_flat.len() {
-                    self.cpu_scratch[block_tables_off + s * max_blocks + b] =
-                        input.block_tables_flat[src_start + b] as i32;
-                }
+            let dst_start = block_tables_off + s * max_blocks;
+            let src_end = (src_start + copy_len).min(input.block_tables_flat.len());
+            for (i, &v) in input.block_tables_flat[src_start..src_end].iter().enumerate() {
+                self.cpu_scratch[dst_start + i] = v as i32;
             }
         }
 
         // slot_mapping: actual + padding with -1
         let slot_mapping_off = self.cpu_scratch.len();
-        for i in 0..actual {
-            self.cpu_scratch.push(input.slot_mapping[i] as i32);
-        }
-        for _ in actual..padded_batch {
-            self.cpu_scratch.push(-1i32); // kernel skips slot < 0
-        }
+        self.cpu_scratch.extend(input.slot_mapping[..actual].iter().map(|&s| s as i32));
+        self.cpu_scratch.resize(self.cpu_scratch.len() + pad, -1i32);
 
-        // seq_start_pos: each decode seq has 1 token
+        // seq_start_pos: each decode seq has 1 token -> [0, 1, 2, ..., padded_batch]
         let seq_start_pos_off = self.cpu_scratch.len();
-        for i in 0..=padded_batch {
-            self.cpu_scratch.push(i as i32);
-        }
+        self.cpu_scratch.extend((0..=padded_batch as i32).map(|i| i));
 
         // Upload via pinned staging (pageable HtoD is synchronous)
         let total = self.cpu_scratch.len();

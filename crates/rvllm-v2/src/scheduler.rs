@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use crate::types::{
-    AddedRequest, BlockId, BlockOps, ContinuedRequest, RequestId, SamplingParams, SchedulerOutput,
+    AddedRequest, BlockId, ContinuedRequest, RequestId, SamplingParams, SchedulerOutput,
     SequenceId, StepDiff, TokenId,
 };
 
@@ -93,6 +93,8 @@ pub struct Scheduler<B: BlockManagerOps> {
     requests: HashMap<RequestId, InternalRequest>,
     seq_to_req: HashMap<SequenceId, RequestId>,
     next_seq_id: u64,
+    /// Reusable StepDiff -- Vecs retain capacity across steps for zero-alloc decode.
+    reusable_diff: StepDiff,
 }
 
 const MAX_PREEMPTIONS: usize = 4;
@@ -108,6 +110,7 @@ impl<B: BlockManagerOps> Scheduler<B> {
             requests: HashMap::new(),
             seq_to_req: HashMap::new(),
             next_seq_id: 1,
+            reusable_diff: StepDiff::default(),
         }
     }
 
@@ -161,12 +164,9 @@ impl<B: BlockManagerOps> Scheduler<B> {
     }
 
     pub fn schedule(&mut self) -> SchedulerOutput {
-        let mut diff = StepDiff {
-            added: Vec::new(),
-            removed: Vec::new(),
-            continued: Vec::new(),
-            block_ops: BlockOps::default(),
-        };
+        // Take the reusable diff (preserves Vec capacity from prior calls)
+        let mut diff = std::mem::take(&mut self.reusable_diff);
+        diff.clear();
         let mut num_batched_tokens = 0usize;
 
         self.retire_finished(&mut diff);
@@ -542,12 +542,8 @@ impl<B: BlockManagerOps> Scheduler<B> {
     /// entries for running decode sequences, but does NOT admit new requests or
     /// advance prefill chunks. This keeps the batch uniform and graph-capturable.
     pub fn schedule_decode_only(&mut self) -> SchedulerOutput {
-        let mut diff = StepDiff {
-            added: Vec::new(),
-            removed: Vec::new(),
-            continued: Vec::new(),
-            block_ops: BlockOps::default(),
-        };
+        let mut diff = std::mem::take(&mut self.reusable_diff);
+        diff.clear();
         let mut num_batched_tokens = 0usize;
 
         self.retire_finished(&mut diff);
@@ -591,5 +587,10 @@ impl<B: BlockManagerOps> Scheduler<B> {
             num_waiting: self.waiting.len() + self.swapped.len(),
             total_batched_tokens: num_batched_tokens,
         }
+    }
+
+    /// Return a used StepDiff so its Vec capacity can be reused next schedule call.
+    pub fn recycle_diff(&mut self, diff: StepDiff) {
+        self.reusable_diff = diff;
     }
 }

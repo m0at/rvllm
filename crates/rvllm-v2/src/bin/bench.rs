@@ -108,20 +108,23 @@ fn main() -> anyhow::Result<()> {
 
     let mut json_results = Vec::new();
 
+    // Create engine ONCE -- max_num_seqs=256 covers all batch sizes.
+    // CUDA graph captures happen lazily per batch size bucket.
+    let max_batch = *batch_sizes.iter().max().unwrap_or(&256);
+    let config = V2EngineConfig {
+        num_gpu_blocks_override: cli.num_gpu_blocks,
+        num_cpu_blocks_override: cli.num_cpu_blocks,
+        gpu_memory_utilization: cli.gpu_memory_utilization,
+        gpu_memory_reserve_gb: cli.gpu_memory_reserve_gb,
+        max_model_len: cli.max_model_len.unwrap_or(2048),
+        max_num_seqs: max_batch.max(256),
+        fp8_weights: cli.fp8,
+        ..V2EngineConfig::from_model_path(&cli.model)
+    };
+
+    let mut engine = init_engine(&config);
+
     for &batch in &batch_sizes {
-        let config = V2EngineConfig {
-            num_gpu_blocks_override: cli.num_gpu_blocks,
-            num_cpu_blocks_override: cli.num_cpu_blocks,
-            gpu_memory_utilization: cli.gpu_memory_utilization,
-            gpu_memory_reserve_gb: cli.gpu_memory_reserve_gb,
-            max_model_len: cli.max_model_len.unwrap_or(2048),
-            max_num_seqs: batch.max(256),
-            fp8_weights: cli.fp8,
-            ..V2EngineConfig::from_model_path(&cli.model)
-        };
-
-        let mut engine = init_engine(&config);
-
         // Warmup: use same output_len as bench to prime identical kernel paths
         let warmup_params = SamplingParams {
             temperature: 0.0,

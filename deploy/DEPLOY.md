@@ -97,7 +97,26 @@ vastai show instances
 
 SSH format: `ssh -p <port> root@<host>`
 
-## Previous Benchmark Baseline (April 15, 2026)
+## Current Benchmark Baseline (April 15, 2026)
 
-See docs/benchmark-history.md for the full comparison table.
-vLLM 0.19.0 FP8 numbers are already recorded there -- do NOT re-run vLLM unless params change.
+Verified on H100 SXM 80GB, Qwen2.5-7B FP8, 512 output tokens, CUDA graphs, 3 iterations.
+Commit 2678aaef2 (reverted to pre-experimental baseline), then cherry-picked 072d6dffc (FP8FastAccum + CPU hot-path fixes).
+
+rvLLM (deploy6.log, commit 2678aaef2):
+- N=1: 149.1 tok/s, N=32: 4,434.3, N=64: 11,240.0, N=128: 19,259.3
+
+vLLM 0.19.0 FP8 numbers are in docs/benchmark-history.md -- do NOT re-run vLLM unless params change.
+
+## Revert History
+
+Commits 072d6dffc and 238b9f3a7 were reverted in 2678aaef2 because 238b9f3a7 (FP8 LM head GEMM)
+caused a massive N=128 regression (19K -> 10K tok/s). The revert was too broad -- it also undid
+072d6dffc (FP8FastAccum + CPU hot-path fixes) which was independently beneficial.
+
+Cherry-pick 4bd92c789 re-applies only 072d6dffc on top of the reverted code:
+- CUTLASS small-tile schedule: KernelTmaWarpSpecialized -> PingpongFP8FastAccum
+- Scheduler: O(N^2) -> O(1) seq_to_req lookup
+- InputBuilder: eliminate Vec clones and SamplingParams copies
+- read_graph_output: return pinned slice instead of Vec alloc per step
+
+The FP8 LM head GEMM (238b9f3a7) is preserved on the `experimental-fp8-lmhead` branch for future work.

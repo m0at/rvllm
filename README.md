@@ -16,19 +16,18 @@ Results land in `bench/combined_results_h100_lifecycle.json`. The instance stays
 
 ## Current Status
 
-**rvLLM v2 reaches 78-92% of vLLM 0.19.0 FP8 throughput** on the same H100 SXM 80GB, Qwen2.5-7B, greedy decode. Gap narrows at higher batch sizes (0.92x at N=96 with 512 output tokens). Measured April 15, 2026 with both engines running FP8 E4M3, CUDA graphs, and torch.compile (vLLM side).
-
-This is an honest apples-to-apples comparison. Previous numbers in this repo compared against vLLM running F16 eager mode, which was not a fair benchmark. Those numbers have been retracted.
+**rvLLM v2 reaches ~66-85% of vLLM 0.19.0 FP8 throughput** on the same H100 SXM 80GB, Qwen2.5-7B, greedy decode. Gap narrows at higher batch sizes. Measured April 15, 2026 with rvllm-v2-bench (direct engine, no HTTP). vLLM numbers from vllm_direct_bench.py on the same GPU.
 
 What's been built:
-1. **CUTLASS 3x SM90 FP8 GEMMs** -- 32 autotuned variants including stream-K/split-K
+1. **CUTLASS 3x SM90 FP8 GEMMs** -- 32 autotuned variants including stream-K/split-K, FP8FastAccum Pingpong schedule
 2. **FlashAttention-3 SM90 paged-KV decode** -- WGMMA/TMA-accelerated via shared library, 7.5us/layer
 3. **Fused RMSNorm + FP8 quantize** and **fused SiLU*mul + FP8 quantize** -- 10 kernels/layer (down from 15)
 4. **Vectorized fused SiLU+FP8** -- 128-bit loads, 64-bit FP8 stores, register caching
 5. **GPU-resident argmax** -- greedy token selection stays on-device
+6. **CPU hot-path elimination** -- O(1) scheduler lookup, zero per-step Vec allocations, pinned-slice graph output
 
 What rvLLM does well:
-- **19,973 tok/s at N=128** (FP8, 512 output tokens) on a single H100
+- **19,259 tok/s at N=128** (FP8, 512 output tokens) on a single H100
 - **10 kernels per layer** (down from 15 with the cuBLASLt path, comparable to vLLM's 9-11)
 - **~50 MB container image** vs ~15 GB for Python vLLM
 - **35-second build from source**, no pip, no PyTorch, no `torch.compile`
@@ -36,41 +35,29 @@ What rvLLM does well:
 - **JIT fused kernels** 2-7.5x faster than our hand-written CUDA on M=1 decode microbenchmarks
 - **Safe-max VRAM control**: `--gpu-memory-reserve-gb` + explicit `--num-gpu-blocks` + `--num-cpu-blocks`
 
-The remaining gap is structural, not kernel-level. Both engines use the same CUTLASS FP8 GEMM family, and rvLLM's individual fused kernels are 2-6x faster per-call. The gap comes from CUTLASS schedule selection for small-M decode tiles, F16 LM head GEMM, extra FP8 quantization passes, and CPU overhead between steps. Fixes are landing.
+The remaining gap is structural, not kernel-level. Both engines use the same CUTLASS FP8 GEMM family, and rvLLM's individual fused kernels are 2-6x faster per-call. The gap comes from F16 LM head GEMM, extra FP8 quantization passes, per-step metadata HtoD, and stream synchronization between steps.
 
 ## Current H100 Comparison
 
-Qwen/Qwen2.5-7B on H100 SXM 80GB, greedy decode (temperature=0). Both engines on the same physical GPU, clean CUDA state. vLLM 0.19.0 with FP8, CUDA graphs, torch.compile. April 15, 2026.
+Qwen/Qwen2.5-7B on H100 SXM 80GB, FP8 E4M3, 512 output tokens, greedy decode (temperature=0), CUDA graphs enabled. rvllm-v2-bench direct engine. April 15, 2026.
 
-### FP8 vs FP8 -- 128 output tokens
+### rvLLM v2 FP8 (verified, deploy6.log commit 2678aaef2)
 
-| N | rvLLM v2 FP8 tok/s | vLLM 0.19.0 FP8 tok/s | rvLLM / vLLM |
-|---:|---:|---:|---:|
-| 1 | 192 | 247 | 0.78x |
-| 16 | 2,992 | 3,849 | 0.78x |
-| 32 | 5,930 | 7,060 | 0.84x |
-| 48 | 8,464 | 10,560 | 0.80x |
-| 64 | 11,026 | 13,624 | 0.81x |
-| 96 | 15,268 | 17,895 | 0.85x |
-| 128 | 19,743 | 22,680 | 0.87x |
+| N | tok/s | stdev |
+|---:|---:|---:|
+| 1 | 149.1 | 0.0 |
+| 4 | 582.7 | 0.2 |
+| 8 | 1,163.6 | 1.8 |
+| 16 | 2,345.0 | 3.6 |
+| 32 | 4,434.3 | 3.0 |
+| 64 | 11,240.0 | 7.1 |
+| 128 | 19,259.3 | 33.1 |
 
-### FP8 vs FP8 -- 512 output tokens
-
-| N | rvLLM v2 FP8 tok/s | vLLM 0.19.0 FP8 tok/s | rvLLM / vLLM |
-|---:|---:|---:|---:|
-| 1 | 191 | 246 | 0.78x |
-| 16 | 2,939 | 3,848 | 0.76x |
-| 32 | 5,848 | 7,022 | 0.83x |
-| 48 | 8,709 | 10,382 | 0.84x |
-| 64 | 11,204 | 13,396 | 0.84x |
-| 96 | 15,868 | 17,345 | 0.92x |
-| 128 | 19,973 | 22,486 | 0.89x |
-
-The gap is consistent at ~15-22% across batch sizes, narrowing at higher concurrency.
+vLLM 0.19.0 FP8 baseline from direct engine benchmark (vllm_direct_bench.py, same GPU, same day): see docs/benchmark-history.md for the full comparison table.
 
 ### Per-Kernel Comparison (nsys, N=32 decode)
 
-nsys profiling revealed that both engines use the same CUTLASS `cutlass_3x_gemm_sm90_fp8` kernel family for FP8 GEMMs. The "nvjet gap" hypothesis was wrong -- vLLM uses nvjet for only a single prefill GEMM. rvLLM's individual kernels are faster per-call:
+nsys profiling revealed that both engines use the same CUTLASS `cutlass_3x_gemm_sm90_fp8` kernel family for FP8 GEMMs. rvLLM's individual kernels are faster per-call:
 
 | Kernel | rvLLM | vLLM | rvLLM advantage |
 |---|---:|---:|---:|
@@ -79,12 +66,14 @@ nsys profiling revealed that both engines use the same CUTLASS `cutlass_3x_gemm_
 | FA3 SM90 attention | 8.2us | 51.1us | **6.2x faster** |
 | CUTLASS FP8 GEMM | 15.9-65.6us | 113us avg (mixed) | comparable |
 
-The 15-22% throughput gap is **structural**, not kernel-level. Root cause analysis identified:
+The throughput gap is **structural**, not kernel-level. Root cause analysis identified:
 
-1. **CUTLASS schedule selection** (est. 5-10%): default small-tile kernel used `KernelTmaWarpSpecialized` instead of `KernelTmaWarpSpecializedPingpongFP8FastAccum`. Fixed.
-2. **LM head F16 cuBLAS** (est. 3.7-4.4%): 483us/step on a [32, 152064, 3584] GEMM where vLLM uses FP8 CUTLASS. Pending.
-3. **CPU overhead** (est. 1.6-5%): O(N^2) scheduler lookup, 14 Vec reallocations/step, unnecessary SamplingParams clones. Fixed.
+1. **CUTLASS schedule selection** (est. 5-10%): small-tile kernel now uses `KernelTmaWarpSpecializedPingpongFP8FastAccum`. Fixed in 072d6dffc.
+2. **CPU hot-path allocations** (est. 1.6-5%): O(N^2) scheduler lookup, 14 Vec reallocations/step, SamplingParams clones. Fixed in 072d6dffc.
+3. **LM head F16 cuBLAS** (est. 3.7-4.4%): 483us/step on a [32, 152064, 3584] GEMM where vLLM uses FP8 CUTLASS. Pending.
 4. **Extra quantize_fp8_per_token kernel** (est. 2-4%): 28 extra HBM round-trips/step because FA3 outputs F16. Pending.
+5. **Per-step metadata HtoD** (est. 1-2%): positions, seq_lens, block_tables uploaded to GPU every decode step. Pending.
+6. **stream.synchronize()** blocks CPU after every step instead of async overlap. Pending.
 
 ### v2 FP8 Inference Stack
 
@@ -128,7 +117,7 @@ Five runtime-selectable decode strategies, each with different performance trade
 
 | Decode Path | N=1 tok/s | Selection | Notes |
 |---|---:|---|---|
-| Batched (default) | 132.7 | `T=1` unless `RVLLM_BATCHED_DECODE_1=0` | Reusable batched scratch path, current normal batch-1 decode path |
+| Batched (default) | 149.1 | `T=1` unless `RVLLM_BATCHED_DECODE_1=0` | Reusable batched scratch path, current normal batch-1 decode path |
 | MegakernelDecode | ~50 | Internal | All 28 layers in 1 kernel launch (instruction tape interpreter) |
 | PersistentDecode | ~51 | Internal | SM-DAG cooperative kernel per layer |
 | CutlassFp8Decode (v2) | auto | v2 engine | CUTLASS 3x SM90 FP8 GEMMs + fused norm/silu quantize kernels, 10 kernels/layer |
@@ -277,7 +266,7 @@ See [crates/rvllm-fusion/README.md](crates/rvllm-fusion/README.md) for the full 
 
 ### What Differs from vLLM
 
-Against vLLM 0.19.0 (April 2026), rvLLM v2 reaches 78-92% of vLLM FP8 throughput in an honest apples-to-apples comparison (both FP8, CUDA graphs, torch.compile on the vLLM side). The gap narrows at higher batch sizes.
+Against vLLM 0.19.0 (April 2026), rvLLM v2 reaches ~66-85% of vLLM FP8 throughput on the same hardware. The gap narrows at higher batch sizes.
 
 Where rvLLM is competitive or ahead:
 
@@ -287,11 +276,11 @@ Where rvLLM is competitive or ahead:
 4. **GPU-resident argmax** -- greedy token selection stays on-device, eliminating 74 MB DtoH transfer per decode step.
 5. **Rust scheduler with no GIL serialization** -- scheduling decisions run in parallel via Rayon.
 6. **Single pre-allocated memory slab** -- zero per-request allocation.
-7. **19,973 tok/s at N=128 FP8** (512 output tokens) -- and still improving.
+7. **19,259 tok/s at N=128 FP8** (512 output tokens) -- verified, still improving.
 
 Where vLLM is currently faster:
 
-1. **Structural throughput** -- both engines use CUTLASS FP8 GEMMs, but vLLM's end-to-end pipeline has less overhead per step. Key differences: FP8 LM head GEMM (vs our F16 cuBLAS), better CUTLASS schedule selection for small-M decode, and tighter CPU/GPU overlap.
+1. **Structural throughput** -- both engines use CUTLASS FP8 GEMMs, but vLLM's end-to-end pipeline has less overhead per step. Key differences: FP8 LM head GEMM (vs our F16 cuBLAS), per-step metadata HtoD, stream synchronization, and extra FP8 quantization passes.
 
 What vLLM still does better:
 

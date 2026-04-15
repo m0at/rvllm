@@ -2,49 +2,38 @@
 
 This file starts with the current public benchmark truth, then keeps older numbers only as historical context.
 
-## Current Public Comparison (April 15, 2026)
+## Verified Baseline (April 15, 2026 -- deploy6.log)
 
 Model: Qwen2.5-7B FP8 E4M3
-GPU: H100 SXM 80GB
-Harness: rvllm-v2-bench (direct engine, no HTTP) vs vLLM 0.19.0 (FP8, CUDA graphs, torch.compile)
-Greedy decode (temperature=0), 3 iterations per batch size
+GPU: H100 SXM 80GB (ssh8.vast.ai:13302)
+Harness: rvllm-v2-bench (direct engine, no HTTP)
+Commit: 2678aaef2 (reverted to pre-experimental baseline)
+Decode length: `output-len=512`, greedy (temperature=0), 3 iterations, CUDA graphs enabled
 
-### FP8 vs FP8 -- 128 output tokens
+### rvLLM v2 FP8 -- 512 output tokens (verified)
 
-| N | rvLLM v2 FP8 tok/s | vLLM 0.19.0 FP8 tok/s | rvLLM / vLLM |
-|---:|---:|---:|---:|
-| 1 | 192 | 247 | 0.78x |
-| 16 | 2,992 | 3,849 | 0.78x |
-| 32 | 5,930 | 7,060 | 0.84x |
-| 48 | 8,464 | 10,560 | 0.80x |
-| 64 | 11,026 | 13,624 | 0.81x |
-| 96 | 15,268 | 17,895 | 0.85x |
-| 128 | 19,743 | 22,680 | 0.87x |
-
-### FP8 vs FP8 -- 512 output tokens
-
-| N | rvLLM v2 FP8 tok/s | vLLM 0.19.0 FP8 tok/s | rvLLM / vLLM |
-|---:|---:|---:|---:|
-| 1 | 191 | 246 | 0.78x |
-| 16 | 2,939 | 3,848 | 0.76x |
-| 32 | 5,848 | 7,022 | 0.83x |
-| 48 | 8,709 | 10,382 | 0.84x |
-| 64 | 11,204 | 13,396 | 0.84x |
-| 96 | 15,868 | 17,345 | 0.92x |
-| 128 | 19,973 | 22,486 | 0.89x |
+| N | tok/s | stdev |
+|---:|---:|---:|
+| 1 | 149.1 | 0.0 |
+| 4 | 582.7 | 0.2 |
+| 8 | 1,163.6 | 1.8 |
+| 16 | 2,345.0 | 3.6 |
+| 32 | 4,434.3 | 3.0 |
+| 64 | 11,240.0 | 7.1 |
+| 128 | 19,259.3 | 33.1 |
 
 ### What changed since April 14
 
 1. **FlashAttention-3 SM90 paged-KV decode** -- WGMMA/TMA-accelerated via shared library (libfa3_kernels.so), 7.5us/layer
-2. **Honest vLLM baseline** -- previous comparisons ran vLLM with F16 eager mode (no CUDA graphs, no torch.compile). This comparison uses vLLM's full FP8 production config.
+2. **Revert of experimental changes** -- commits 072d6dffc (FP8FastAccum + CPU hot-path) and 238b9f3a7 (FP8 LM head GEMM) were reverted because 238b9f3a7 caused a massive N=128 regression (19K -> 10K tok/s)
+3. **Cherry-pick 4bd92c789** -- re-applies only 072d6dffc (FP8FastAccum Pingpong schedule + CPU hot-path elimination) without the FP8 LM head regression. Benchmark pending.
 
 ### Current read of the gap
 
-- Consistent ~15-22% behind vLLM across batch sizes
-- Gap narrows at higher concurrency (0.92x at N=96 512-tok)
-- Primary bottleneck: FP8 GEMM kernel speed (vLLM nvjet vs rvLLM autotuned CUTLASS)
-- FA3 SM90 attention is already competitive
-- Work is ongoing to close the GEMM gap
+- rvLLM individual kernels are 2-6x faster per-call (SiLU 3.1x, RMSNorm 2.3x, FA3 6.2x)
+- Throughput gap is structural, not kernel-level
+- Both engines use the same CUTLASS cutlass_3x_gemm_sm90_fp8 kernel family
+- Remaining bottlenecks: F16 LM head GEMM, extra FP8 quantization passes, per-step metadata HtoD, stream.synchronize()
 
 ---
 
