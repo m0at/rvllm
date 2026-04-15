@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::types::{GpuBatchInput, SamplingParams, TokenId};
+use crate::types::{GpuBatchInput, TokenId};
 
 // =================================================================
 // Config
@@ -180,7 +180,7 @@ pub fn build_verify_input(
 
         input.query_lens.push(k_plus_1 as u32);
         input.context_lens.push((seq.seq_len + k_plus_1 - 1) as u32);
-        input.sampling_params.push(SamplingParams::default());
+        // all_greedy stays true (SamplingParams::default is greedy)
 
         // Prefill token list: [last_real, d0, d1, ..., dK-1]
         // Position seq_len-1 for last_real (already has KV but we re-write -- harmless)

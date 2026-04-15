@@ -624,7 +624,7 @@ impl Worker {
                 slot_mapping: vec![0; bucket],
                 context_lens: vec![1; bucket],
                 query_lens: vec![1; bucket],
-                sampling_params: vec![SamplingParams::default(); bucket],
+                is_all_greedy: true,
                 block_tables_flat: vec![0; bucket * 8],
                 max_blocks_per_seq: 8,
                 is_all_decode: true,

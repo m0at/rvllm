@@ -681,7 +681,7 @@ impl GpuModelRunner {
     pub fn forward_greedy(&mut self, input: &GpuBatchInput, kv_cache: &CudaKVCache) -> Result<Vec<i32>> {
         let n = self.forward_greedy_launch(input, kv_cache)?;
         if n == 0 { return Ok(Vec::new()); }
-        self.read_graph_output(n)
+        Ok(self.read_graph_output(n)?.to_vec())
     }
 
     /// Pack all metadata fields into one contiguous GPU buffer (1 memcpy).
@@ -1188,7 +1188,8 @@ impl GpuModelRunner {
 
     /// Read the argmax token IDs from the GPU after forward_gpu_only or graph replay.
     /// Uses pinned host memory for truly async DtoH (pageable Vec is synchronous).
-    pub fn read_graph_output(&mut self, num_tokens: usize) -> Result<Vec<i32>> {
+    /// Returns a slice into the pinned buffer -- valid until next read_graph_output call.
+    pub fn read_graph_output(&mut self, num_tokens: usize) -> Result<&[i32]> {
         let bytes = num_tokens * std::mem::size_of::<i32>();
         let src_dev_ptr = {
             let (ptr, _) = self.argmax_output.device_ptr(&self.stream);
@@ -1206,7 +1207,7 @@ impl GpuModelRunner {
         }
         self.stream.synchronize()
             .map_err(|e| LLMError::GpuError(format!("stream sync: {e}")))?;
-        Ok(self.pinned_argmax.as_slice()[..num_tokens].to_vec())
+        Ok(&self.pinned_argmax.as_slice()[..num_tokens])
     }
 
     /// Returns the max_seq_len from config (for graph capture max_context_len).

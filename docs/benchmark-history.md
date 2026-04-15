@@ -2,7 +2,53 @@
 
 This file starts with the current public benchmark truth, then keeps older numbers only as historical context.
 
-## Latest Internal Benchmark (April 14, 2026)
+## Current Public Comparison (April 15, 2026)
+
+Model: Qwen2.5-7B FP8 E4M3
+GPU: H100 SXM 80GB
+Harness: rvllm-v2-bench (direct engine, no HTTP) vs vLLM 0.19.0 (FP8, CUDA graphs, torch.compile)
+Greedy decode (temperature=0), 3 iterations per batch size
+
+### FP8 vs FP8 -- 128 output tokens
+
+| N | rvLLM v2 FP8 tok/s | vLLM 0.19.0 FP8 tok/s | rvLLM / vLLM |
+|---:|---:|---:|---:|
+| 1 | 192 | 247 | 0.78x |
+| 16 | 2,992 | 3,849 | 0.78x |
+| 32 | 5,930 | 7,060 | 0.84x |
+| 48 | 8,464 | 10,560 | 0.80x |
+| 64 | 11,026 | 13,624 | 0.81x |
+| 96 | 15,268 | 17,895 | 0.85x |
+| 128 | 19,743 | 22,680 | 0.87x |
+
+### FP8 vs FP8 -- 512 output tokens
+
+| N | rvLLM v2 FP8 tok/s | vLLM 0.19.0 FP8 tok/s | rvLLM / vLLM |
+|---:|---:|---:|---:|
+| 1 | 191 | 246 | 0.78x |
+| 16 | 2,939 | 3,848 | 0.76x |
+| 32 | 5,848 | 7,022 | 0.83x |
+| 48 | 8,709 | 10,382 | 0.84x |
+| 64 | 11,204 | 13,396 | 0.84x |
+| 96 | 15,868 | 17,345 | 0.92x |
+| 128 | 19,973 | 22,486 | 0.89x |
+
+### What changed since April 14
+
+1. **FlashAttention-3 SM90 paged-KV decode** -- WGMMA/TMA-accelerated via shared library (libfa3_kernels.so), 7.5us/layer
+2. **Honest vLLM baseline** -- previous comparisons ran vLLM with F16 eager mode (no CUDA graphs, no torch.compile). This comparison uses vLLM's full FP8 production config.
+
+### Current read of the gap
+
+- Consistent ~15-22% behind vLLM across batch sizes
+- Gap narrows at higher concurrency (0.92x at N=96 512-tok)
+- Primary bottleneck: FP8 GEMM kernel speed (vLLM nvjet vs rvLLM autotuned CUTLASS)
+- FA3 SM90 attention is already competitive
+- Work is ongoing to close the GEMM gap
+
+---
+
+## Internal Benchmark (April 14, 2026)
 
 Model: Qwen2.5-7B FP8 E4M3
 GPU: H100 SXM 80GB
@@ -28,29 +74,14 @@ Three kernel optimizations measured against the April 12 v2 FP8 baseline:
 
 3. **FP8FastAccum schedule aliases** -- CUTLASS KernelTmaWarpSpecializedFP8FastAccum, Cooperative, and Pingpong variants in autotune pool (v15-v24).
 
-### FP8 Autotune Cache
-
-32 FP8 GEMM variants total. Standalone autotune binary benchmarks all variants per shape. Cache results (36 entries):
-
-- Down projection (K=18944): split-K=4 (v29) wins for most M values, stream-K (v25) for some
-- Gate+Up (K=3584): v0/v5 wins (already high SM occupancy, splitting doesn't help)
-- O-proj (K=3584): v0 wins
-- QKV (K=3584): v0 wins
-
-### Note on methodology
-
-These numbers use `output-len=512` vs the April 12 public comparison which used `output-len=128`. The percentage gains carry over (they're per-decode-step improvements) but the absolute tok/s numbers are not directly comparable to the head-to-head vLLM table.
-
 ---
 
-## Current Public Comparison (April 7, 2026)
+## Earlier Public Comparison (April 7, 2026) -- RETRACTED
+
+**Note**: This comparison ran vLLM with F16 eager mode (no CUDA graphs, no torch.compile, no FP8). It was not a fair apples-to-apples comparison. Kept here for historical context only. See the April 15 numbers above for the honest comparison.
 
 Model: Qwen2.5-7B f16
 GPU: H100 SXM 80GB
-Harness: direct engine
-Decode length: `output-len=128`
-
-### vLLM 0.19.0 vs rvLLM
 
 | N | vLLM 0.19.0 tok/s | rvLLM tok/s | rvLLM / vLLM |
 |---:|---:|---:|---:|
@@ -59,58 +90,6 @@ Decode length: `output-len=128`
 | 64 | 9312.6 | 8503.4 | 0.91x |
 | 96 | 13085.9 | 10530.6 | 0.80x |
 | 128 | 16825.3 | 13718.1 | 0.82x |
-
-### What changed to get here
-
-Two things matter most:
-
-1. **Batch-1 default-path fix**
-   - normal `T=1` decode now defaults to the reusable `Batched` path
-   - this is still the right architecture change even though current `N=1` is behind vLLM
-
-2. **Batched GEMM policy fix**
-   - `GemmStrategy::Hybrid` is now real instead of half-implied
-   - current hybrid policy is:
-     - QKV: cuBLAS / cublasLt
-     - O-proj: cuBLAS / cublasLt
-     - GateUp + SiLU: CUTLASS
-     - Down-proj: cuBLAS / cublasLt
-
-### Important correction
-
-The earlier `89f`-era "rvLLM beats vLLM at `N=64`" claim is no longer treated as valid.
-
-- the fast `89f` H100 run was real
-- but that path was fast because the CUTLASS gate-aux FFN branch skipped the FFN down-projection
-- the archived fast H100 CUTLASS library is still kept in the repo for forensic reproducibility
-
-So the current public baseline is the clean current-`main` table above, not the older `9589 tok/s` claim.
-
-### Earlier explicit batched strategy sweep
-
-On the same H100 for `N=64`, `output-len=128`:
-
-| Strategy | tok/s |
-|---|---:|
-| `cublas` | 7965.6 |
-| `hybrid` | 8193.3 |
-| `cutlass` | 7830.4 |
-
-That sweep is why `Hybrid` is the current default when CUTLASS is available.
-
-## Current Read of the Gap
-
-- `N=1`: materially behind vLLM
-- `N=32`: closer, but still behind
-- `N=64`: still behind
-- `N=128`: still behind by a wider margin
-
-The biggest remaining work is:
-
-- better single-stream decode
-- a correct fast Hopper FFN path that does not skip work
-- safer `cublasLt` autotune fallback when cached algos go bad
-- more efficiency at `N=64` and `N=128`
 
 ## Historical Context
 
