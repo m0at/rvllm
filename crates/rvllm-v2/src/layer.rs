@@ -753,7 +753,15 @@ impl GpuTransformerLayer {
         output_scales: &mut CudaSlice<f32>,
     ) -> Result<()> {
         let kernel = self.loader.get_func("fused_rmsnorm_fp8_quant", "quantize_fp8_per_token_kernel")?;
-        let block_threads = dim.min(1024) as u32;
+        // Vectorized kernel: uint4 loads (8 halves), register-cached with
+        // MAX_VEC_PER_THREAD=8 iters. block_dim in [ceil(dim/64), 1024],
+        // rounded to multiple of 32. dim must be a multiple of 8.
+        // Register cache (8 uint4s) caps dim at 8*8*1024 = 65536 halves.
+        debug_assert!(dim % 8 == 0, "quantize_fp8_per_token: dim must be multiple of 8 (got {dim})");
+        debug_assert!(dim <= 65536, "quantize_fp8_per_token: dim must be <= 65536 (got {dim})");
+        let vec_per_row = dim / 8;
+        let min_threads = (vec_per_row + 7) / 8;
+        let block_threads = ((min_threads.max(32) + 31) / 32 * 32).min(1024) as u32;
         unsafe {
             self.stream.launch_builder(&kernel)
                 .arg(output_fp8)
@@ -763,7 +771,7 @@ impl GpuTransformerLayer {
                 .launch(LaunchConfig {
                     grid_dim: (num_tokens as u32, 1, 1),
                     block_dim: (block_threads, 1, 1),
-                    shared_mem_bytes: (block_threads as usize * std::mem::size_of::<f32>()) as u32,
+                    shared_mem_bytes: (32 * std::mem::size_of::<f32>()) as u32,
                 })
                 .map_err(|e| LLMError::GpuError(format!("quantize_fp8_per_token: {e}")))?;
         }
