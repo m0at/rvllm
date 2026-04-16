@@ -821,7 +821,8 @@ impl GpuTransformerLayer {
         let num_tokens = attn.num_tokens;
 
         // N=1 GEMV fast path: 7 kernels/layer instead of 10-11
-        if num_tokens == 1 && !attn.is_prefill {
+        // Disabled pending profiling -- needs A/B validation vs cuBLASLt path
+        if std::env::var("RVLLM_GEMV_FP8").is_ok() && num_tokens == 1 && !attn.is_prefill {
             if let Some(fp8w) = &weights.fp8 {
                 if fp8w.gemv_qkv_scale.is_some() {
                     return self.forward_gemv_fp8(hidden, attn, weights, scratch,
@@ -1083,25 +1084,14 @@ impl GpuTransformerLayer {
                 &scratch.gate_up_out, num_tokens, intermediate,
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
-            // FP8 down-proj + residual fusion: GEMM output += residual_write
-            // Saves one HBM round-trip per layer (next layer reads fused result directly)
-            if ck.fp8_gemm_residual_variant_count() > 0 {
-                cutlass_fp8_gemm_residual_dispatch(
-                    ck, &self.stream, num_tokens, hidden_size, intermediate,
-                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                    fp8w.down_proj_fp8, fp8w.down_proj_scale,
-                    &*residual_write, down_write,
-                    &mut scratch.cutlass_workspace,
-                )?;
-                used_fused_downproj = true;
-            } else {
-                cutlass_fp8_gemm_dispatch(
-                    ck, autotune, &self.stream, num_tokens, hidden_size, intermediate,
-                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                    fp8w.down_proj_fp8, fp8w.down_proj_scale,
-                    down_write, &mut scratch.cutlass_workspace,
-                )?;
-            }
+            // Down-proj uses autotuned non-residual FP8 GEMM (residual kernel lacks
+            // autotune for K=intermediate shapes and regresses vs autotuned path)
+            cutlass_fp8_gemm_dispatch(
+                ck, autotune, &self.stream, num_tokens, hidden_size, intermediate,
+                &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                fp8w.down_proj_fp8, fp8w.down_proj_scale,
+                down_write, &mut scratch.cutlass_workspace,
+            )?;
         } else {
             // SiLU activation (skip if fused gateup+silu already wrote to silu_out)
             if !used_fused_gateup {
