@@ -50,7 +50,9 @@ const FP8_SHAPES: &[(usize, usize, &str)] = &[
 
 // FP8 GEMM + residual shapes: down-proj fused with residual add
 // C = A @ W + residual, shape (M, hidden, intermediate) = (M, 3584, 18944)
+// FP8 GEMM + residual shapes: O-proj and down-proj fused with residual add
 const FP8_RESIDUAL_SHAPES: &[(usize, usize, &str)] = &[
+    (3584, 3584, "O-proj+residual"),
     (3584, 18944, "down+residual"),
 ];
 

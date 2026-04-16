@@ -947,9 +947,9 @@ impl GpuTransformerLayer {
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
             // Try fused FP8 GEMM + residual add (eliminates o_proj_out buffer)
-            if ck.fp8_gemm_residual_variant_count() > 0 {
-                cutlass_fp8_gemm_residual_dispatch(
-                    ck, &self.stream, num_tokens, hidden_size, q_dim,
+            if let Some(variant) = autotune.and_then(|at| at.best_fp8_gemm_residual(num_tokens, hidden_size, q_dim)) {
+                cutlass_fp8_gemm_residual_autotuned(
+                    ck, variant, &self.stream, num_tokens, hidden_size, q_dim,
                     &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
                     fp8w.o_proj_fp8, fp8w.o_proj_scale,
                     residual_src, residual_write,

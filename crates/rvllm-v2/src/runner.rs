@@ -176,7 +176,7 @@ impl GpuModelRunner {
             let oproj_shapes = [(max_t, h, h), (max_t, h, inter)];
             let gateup_shapes = [(max_t, gate_up, h)];
             let fp8_shapes = [(max_t, qkv, h), (max_t, h, qkv), (max_t, gate_up, h), (max_t, h, inter), (max_t, config.vocab_size, h)];
-            let fp8_res_shapes = [(max_t, h, inter)];
+            let fp8_res_shapes = [(max_t, h, qkv), (max_t, h, inter)];
             max_workspace_size(ck, &hgemm_shapes, &oproj_shapes, &gateup_shapes, &fp8_shapes, &fp8_res_shapes)
         } else {
             4 * 1024 * 1024
