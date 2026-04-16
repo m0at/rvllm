@@ -257,7 +257,7 @@ impl Worker {
         self.execute_block_ops(&diff.block_ops)?;
 
         if self.requests.is_empty() {
-            self.pending = None;
+            self.pending = Some(PendingForward { num_seqs: 0, is_decode: true, stored_output: None });
             return Ok(());
         }
 
