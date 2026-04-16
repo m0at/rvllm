@@ -179,11 +179,12 @@ impl GpuModelRunner {
             let qkv = (config.num_heads + 2 * config.num_kv_heads) * config.head_dim;
             let gate_up = config.intermediate_size * 2;
             let inter = config.intermediate_size;
-            let hgemm_shapes = [(max_t, qkv, h), (max_t, h, qkv), (max_t, gate_up, h), (max_t, h, inter), (max_t, config.vocab_size, h)];
-            let oproj_shapes = [(max_t, h, h), (max_t, h, inter)];
+            let q = config.num_heads * config.head_dim; // q_dim (O-proj K dimension)
+            let hgemm_shapes = [(max_t, qkv, h), (max_t, h, q), (max_t, gate_up, h), (max_t, h, inter), (max_t, config.vocab_size, h)];
+            let oproj_shapes = [(max_t, h, q), (max_t, h, inter)];
             let gateup_shapes = [(max_t, gate_up, h)];
-            let fp8_shapes = [(max_t, qkv, h), (max_t, h, qkv), (max_t, gate_up, h), (max_t, h, inter), (max_t, config.vocab_size, h)];
-            let fp8_res_shapes = [(max_t, h, qkv), (max_t, h, inter)];
+            let fp8_shapes = [(max_t, qkv, h), (max_t, h, q), (max_t, gate_up, h), (max_t, h, inter), (max_t, config.vocab_size, h)];
+            let fp8_res_shapes = [(max_t, h, q), (max_t, h, inter)];
             max_workspace_size(ck, &hgemm_shapes, &oproj_shapes, &gateup_shapes, &fp8_shapes, &fp8_res_shapes)
         } else {
             4 * 1024 * 1024

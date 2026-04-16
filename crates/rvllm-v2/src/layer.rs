@@ -929,8 +929,12 @@ impl GpuTransformerLayer {
                 &scratch.attn_out, num_tokens, q_dim,
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
-            // Try fused FP8 GEMM + residual add (eliminates o_proj_out buffer)
-            if let Some(variant) = autotune.and_then(|at| at.best_fp8_gemm_residual(num_tokens, hidden_size, q_dim)) {
+            // Fused FP8 GEMM + residual add (eliminates o_proj_out buffer).
+            // Hardcode non-FP8FastAccum variants: v0 (64x128x128 WS) for M<=64,
+            // v1 (128x128x128 Coop) for M>64. FP8FastAccum variants (v4+) crash
+            // with the residual EVT epilogue on certain shapes.
+            if ck.fp8_gemm_residual_variant_count() > 0 {
+                let variant = if num_tokens <= 64 { 0 } else { 1 };
                 cutlass_fp8_gemm_residual_autotuned(
                     ck, variant, &self.stream, num_tokens, hidden_size, q_dim,
                     &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
@@ -1064,24 +1068,15 @@ impl GpuTransformerLayer {
                 &scratch.gate_up_out, num_tokens, intermediate,
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
-            // FP8 down-proj: use fused residual variant if autotuned, else plain FP8 GEMM
-            if let Some(variant) = autotune.and_then(|at| at.best_fp8_gemm_residual(num_tokens, hidden_size, intermediate)) {
-                cutlass_fp8_gemm_residual_autotuned(
-                    ck, variant, &self.stream, num_tokens, hidden_size, intermediate,
-                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                    fp8w.down_proj_fp8, fp8w.down_proj_scale,
-                    &*residual_write, down_write,
-                    &mut scratch.cutlass_workspace,
-                )?;
-                used_fused_downproj = true;
-            } else {
-                cutlass_fp8_gemm_dispatch(
-                    ck, autotune, &self.stream, num_tokens, hidden_size, intermediate,
-                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                    fp8w.down_proj_fp8, fp8w.down_proj_scale,
-                    down_write, &mut scratch.cutlass_workspace,
-                )?;
-            }
+            // Down-proj: plain autotuned FP8 GEMM (no fused residual).
+            // Fused residual with K=intermediate regresses ~24% vs autotuned non-residual
+            // path, and FP8FastAccum residual variants crash on certain shapes.
+            cutlass_fp8_gemm_dispatch(
+                ck, autotune, &self.stream, num_tokens, hidden_size, intermediate,
+                &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                fp8w.down_proj_fp8, fp8w.down_proj_scale,
+                down_write, &mut scratch.cutlass_workspace,
+            )?;
         } else {
             // SiLU activation (skip if fused gateup+silu already wrote to silu_out)
             if !used_fused_gateup {
