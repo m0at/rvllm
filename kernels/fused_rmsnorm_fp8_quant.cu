@@ -4,6 +4,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cstdint>
 
 #define FP8_E4M3_MAX 448.0f
 #define WARPS_MAX 32
