@@ -45,9 +45,16 @@ all_files = api.list_repo_files(hf_repo)
 matching = [f for f in all_files if f.startswith(prefix) and not "/obj/" in f]
 
 if not matching:
-    print(f"FATAL: No kernels found at {prefix} in {hf_repo}")
-    print(f"Available prefixes: {set('/'.join(f.split('/')[:2]) for f in all_files)}")
-    sys.exit(1)
+    # Fall back to latest/<arch>/ when exact SHA not found (kernel .cu files unchanged)
+    fallback = f"latest/{arch}/"
+    matching = [f for f in all_files if f.startswith(fallback) and not "/obj/" in f]
+    if matching:
+        prefix = fallback
+        print(f"Exact SHA not found, using latest/{arch}/ ({len(matching)} files)")
+    else:
+        print(f"FATAL: No kernels found at {sha}/{arch}/ or latest/{arch}/ in {hf_repo}")
+        print(f"Available: {set('/'.join(f.split('/')[:2]) for f in all_files)}")
+        sys.exit(1)
 
 print(f"Found {len(matching)} kernel files")
 
