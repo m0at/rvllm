@@ -96,7 +96,11 @@ impl CutlassLib {
                 let ws_c = format!("{ws_name_str}\0");
                 unsafe {
                     let f: libloading::Symbol<Fp8GemmResidualFn> =
-                        lib.get(fn_c.as_bytes()).map_err(|_| {
+                        lib.get(fn_c.as_bytes()).map_err(|e| {
+                            eprintln!(
+                                "[rvllm-cutlass] dlsym fail: name={:?} vid={} err={:?}",
+                                fn_name_str, vid.0, e
+                            );
                             variant_missing(&path, vid, "fp8_gemm_residual")
                         })?;
                     let w: libloading::Symbol<WorkspaceSizeFn> =
