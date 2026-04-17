@@ -298,8 +298,9 @@ impl Bringup {
             256,
         )?;
         // FP8 Q scratch (post-rope) consumed by FA3; f16 Q from QKV GEMM
-        // still lives at q_out (2 bytes/elem).
-        let q_fp8 = arena.region("q_fp8", (num_seqs * q_dim) as usize, 16)?;
+        // still lives at q_out (2 bytes/elem). Sized by max_tokens so
+        // prefill (num_tokens = num_seqs * prefill_len) doesn't overflow.
+        let q_fp8 = arena.region("q_fp8", (max_tokens * q_dim) as usize, 16)?;
         // Per-tensor FP8 scales shared across the whole engine. Placeholder
         // values (1.0 / 448.0 = ~0.00223) give a clean identity-ish scaling
         // for the garbage-data faux-prefill regime; a real calibration pass
