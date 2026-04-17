@@ -223,18 +223,18 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 8. O proj residual epilogue.
+    // 8. O proj with residual epilogue via cuBLASLt.
     #[cfg(feature = "cuda")]
-    cutlass.launch_fp8_gemm_residual(
-        &plans.o,
-        residual,
+    cublaslt.fp8_gemm_residual(
         scratch.attn_out_fp8,
         weights.o_fp8,
+        residual,
+        residual,
+        dims.num_tokens as i32,
+        dims.hidden as i32,
+        q_dim as i32,
         scratch.attn_out_scale,
         weights.o_scale,
-        residual,
-        scratch.cutlass_workspace,
-        scratch.cutlass_workspace_bytes,
         stream,
     )?;
 
@@ -255,17 +255,17 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 10. gate||up proj.
+    // 10. gate||up proj via cuBLASLt (no bias).
     #[cfg(feature = "cuda")]
-    cutlass.launch_fp8_gemm(
-        &plans.gate_up,
-        scratch.gate_up_out,
+    cublaslt.fp8_gemm(
         scratch.hidden_fp8,
         weights.gate_up_fp8,
+        scratch.gate_up_out,
+        dims.num_tokens as i32,
+        (2 * dims.intermediate) as i32,
+        dims.hidden as i32,
         scratch.hidden_scale,
         weights.gate_up_scale,
-        scratch.cutlass_workspace,
-        scratch.cutlass_workspace_bytes,
         stream,
     )?;
 
@@ -282,18 +282,18 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 12. Down proj residual epilogue.
+    // 12. Down proj with residual epilogue via cuBLASLt.
     #[cfg(feature = "cuda")]
-    cutlass.launch_fp8_gemm_residual(
-        &plans.down,
-        residual,
+    cublaslt.fp8_gemm_residual(
         scratch.mlp_out_fp8,
         weights.down_fp8,
+        residual,
+        residual,
+        dims.num_tokens as i32,
+        dims.hidden as i32,
+        dims.intermediate as i32,
         scratch.mlp_out_scale,
         weights.down_scale,
-        residual,
-        scratch.cutlass_workspace,
-        scratch.cutlass_workspace_bytes,
         stream,
     )?;
 

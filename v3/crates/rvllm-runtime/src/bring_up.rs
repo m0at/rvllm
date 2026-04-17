@@ -455,15 +455,15 @@ impl Bringup {
                     stream,
                 )?;
                 #[cfg(feature = "cuda")]
-                self.cutlass.launch_fp8_gemm(
-                    &plan_lm_head,
-                    logits.device_ptr(),
+                self.cublaslt.fp8_gemm(
                     hidden_fp8.device_ptr(),
                     self.model.lm_head_fp8.offset_bytes,
+                    logits.device_ptr(),
+                    num_seqs as i32,
+                    vocab as i32,
+                    hidden as i32,
                     hidden_scale.device_ptr(),
                     self.model.lm_head_fp8.scale_ptr,
-                    cutlass_ws.device_ptr(),
-                    cutlass_ws_bytes,
                     stream,
                 )?;
                 rvllm_fused::ArgmaxLaunch {

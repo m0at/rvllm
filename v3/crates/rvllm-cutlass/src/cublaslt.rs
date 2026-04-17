@@ -1,25 +1,26 @@
-//! cuBLASLt FP8 GEMM with bias epilogue.
+//! cuBLASLt FP8 GEMM wrappers.
 //!
-//! One call per QKV: the matmul multiplies FP8 E4M3 A*B, adds an f16
-//! row-broadcast bias, and writes an f16 D. One launch replaces the
-//! (cutlass_fp8_gemm → add_bias_f16) pair — 1 kernel per layer x 28
-//! layers = 28 fewer kernels per decode step.
+//! Three entry points share one dispatcher (`fp8_gemm_inner`):
+//!   - `fp8_gemm`          : D = A * B^T
+//!   - `fp8_gemm_bias`     : D = A * B^T + bias   (CUBLASLT_EPILOGUE_BIAS)
+//!   - `fp8_gemm_residual` : D = A * B^T + C      (alpha=1, beta=1; C is residual)
+//!
+//! FP8 E4M3 TN on Hopper: we pass row-major inputs and let cuBLASLt
+//! (column-major) see their transposes, swapping A/B arguments and
+//! setting transa=T, transb=N.
 
 #[cfg(feature = "cuda")]
 use cudarc::cublaslt::sys as lt;
 
 use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 
-/// Handle to a cuBLASLt library instance. Created once at engine init.
 pub struct CublasLt {
     #[cfg(feature = "cuda")]
     handle: lt::cublasLtHandle_t,
-    // Workspace for cuBLASLt (separate from CUTLASS workspace).
     workspace: u64,
     workspace_bytes: usize,
 }
 
-// cuBLASLt handles are not Send/Sync by default across threads.
 unsafe impl Send for CublasLt {}
 unsafe impl Sync for CublasLt {}
 
@@ -50,18 +51,25 @@ impl CublasLt {
         })
     }
 
-    /// FP8 E4M3 matmul with per-tensor scales and f16 row-broadcast bias.
-    ///
-    /// Layout convention (matches cuBLASLt FP8 requirement on H100):
-    /// - A is `[M, K]` row-major FP8 (the "activation" hidden_fp8)
-    /// - B is `[N, K]` row-major FP8 (the "weight" qkv_fp8), which
-    ///   cuBLASLt treats as B^T with transa=N, transb=T.
-    /// - D is `[M, N]` row-major f16 (output)
-    /// - bias is `[N]` f16 (broadcast across M rows)
-    /// - a_scale / b_scale are per-tensor f32 scalar device pointers
-    ///
-    /// # Safety
-    /// Every pointer must point at valid device memory for the call.
+    /// Plain FP8 E4M3 matmul: D = A * B^T.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fp8_gemm(
+        &self,
+        a_fp8: u64,
+        b_fp8: u64,
+        d_f16: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_scale: u64,
+        b_scale: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f16, m, n, k, a_scale, b_scale, stream, false)
+    }
+
+    /// FP8 matmul with row-broadcast f16 bias epilogue.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn fp8_gemm_bias(
@@ -77,7 +85,53 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        // Descriptors.
+        self.fp8_gemm_inner(
+            a_fp8, b_fp8, bias_f16, 0, d_f16, m, n, k, a_scale, b_scale, stream, false,
+        )
+    }
+
+    /// FP8 matmul with residual-add epilogue: D = A*B^T + residual (C).
+    /// `residual_f16` and `d_f16` may alias to do the add in place.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fp8_gemm_residual(
+        &self,
+        a_fp8: u64,
+        b_fp8: u64,
+        residual_f16: u64,
+        d_f16: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_scale: u64,
+        b_scale: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.fp8_gemm_inner(
+            a_fp8, b_fp8, 0, residual_f16, d_f16, m, n, k, a_scale, b_scale, stream, true,
+        )
+    }
+
+    /// Shared body. `bias_f16=0` means no bias epilogue. `beta_one=true`
+    /// enables the residual path with C = `c_residual` (or d_f16 if
+    /// c_residual is 0).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fp8_gemm_inner(
+        &self,
+        a_fp8: u64,
+        b_fp8: u64,
+        bias_f16: u64,
+        c_residual: u64,
+        d_f16: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_scale: u64,
+        b_scale: u64,
+        stream: u64,
+        beta_one: bool,
+    ) -> Result<()> {
         let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
         let rc = lt::cublasLtMatmulDescCreate(
             &mut desc,
@@ -88,12 +142,8 @@ impl CublasLt {
             return Err(cublaslt_err("cublasLtMatmulDescCreate"));
         }
 
-        // FP8 E4M3 on Hopper requires TN op layout. With cuBLASLt's
-        // column-major convention and row-major input buffers, we use:
-        //   transa = T, transb = N
-        // (raw i32: CUBLAS_OP_N = 0, CUBLAS_OP_T = 1).
-        let transa: i32 = 1;
-        let transb: i32 = 0;
+        let transa: i32 = 1; // T
+        let transb: i32 = 0; // N
         set_attr(
             desc,
             lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
@@ -107,21 +157,22 @@ impl CublasLt {
             std::mem::size_of_val(&transb),
         )?;
 
-        // Epilogue = bias.
-        let epi = lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
-        set_attr(
-            desc,
-            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
-            &epi as *const _ as *const _,
-            std::mem::size_of_val(&epi),
-        )?;
-        set_attr(
-            desc,
-            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-            &bias_f16 as *const _ as *const _,
-            std::mem::size_of_val(&bias_f16),
-        )?;
-        // FP8 requires A and B scale pointers on the descriptor.
+        if bias_f16 != 0 {
+            let epi = lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
+            set_attr(
+                desc,
+                lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+                &epi as *const _ as *const _,
+                std::mem::size_of_val(&epi),
+            )?;
+            set_attr(
+                desc,
+                lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                &bias_f16 as *const _ as *const _,
+                std::mem::size_of_val(&bias_f16),
+            )?;
+        }
+
         set_attr(
             desc,
             lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
@@ -135,19 +186,13 @@ impl CublasLt {
             std::mem::size_of_val(&b_scale),
         )?;
 
-        // Matrix layouts (cuBLASLt is column-major). We hand it
-        // row-major inputs by swapping the conceptual A/B and
-        // configuring transa=T:
-        //   input_a_for_cublas = weight [N, K] row-major viewed as [K, N] col-major, transa=T
-        //   input_b_for_cublas = activ  [M, K] row-major viewed as [K, M] col-major, transb=N
-        //   output           = [N, M] col-major, i.e. [M, N] row-major (our D).
+        // Layouts: col-major view of our row-major buffers, TN.
         let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut layout_d: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
-        // cublas_A := weight, col-major view of [K rows, N cols], ld = K.
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_a,
-            lt::cudaDataType::CUDA_R_8F_E4M3,
+            lt::cudaDataType_t::CUDA_R_8F_E4M3,
             k as u64,
             n as u64,
             k as i64,
@@ -155,10 +200,9 @@ impl CublasLt {
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("layout A"));
         }
-        // cublas_B := activation, col-major view of [K rows, M cols], ld = K.
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_b,
-            lt::cudaDataType::CUDA_R_8F_E4M3,
+            lt::cudaDataType_t::CUDA_R_8F_E4M3,
             k as u64,
             m as u64,
             k as i64,
@@ -166,11 +210,9 @@ impl CublasLt {
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("layout B"));
         }
-        // cublas_D := [N rows, M cols] col-major, ld = N. Memory-equivalent
-        // to our [M, N] row-major output buffer.
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_d,
-            lt::cudaDataType::CUDA_R_16F,
+            lt::cudaDataType_t::CUDA_R_16F,
             n as u64,
             m as u64,
             n as i64,
@@ -179,13 +221,12 @@ impl CublasLt {
             return Err(cublaslt_err("layout D"));
         }
 
-        // Heuristic.
         let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
         let r = lt::cublasLtMatmulPreferenceCreate(&mut pref);
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("preference create"));
         }
-        let ws_bytes = self.workspace_bytes as usize;
+        let ws_bytes = self.workspace_bytes;
         let r = lt::cublasLtMatmulPreferenceSetAttribute(
             pref,
             lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
@@ -195,6 +236,7 @@ impl CublasLt {
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("pref set workspace"));
         }
+
         let mut heur: lt::cublasLtMatmulHeuristicResult_t = std::mem::zeroed();
         let mut ret: i32 = 0;
         let r = lt::cublasLtMatmulAlgoGetHeuristic(
@@ -215,19 +257,21 @@ impl CublasLt {
 
         let one_f32: f32 = 1.0;
         let zero_f32: f32 = 0.0;
-        // Note A/B are swapped vs the logical signature: cublas "A" is
-        // the weight, cublas "B" is the activation, per the col-major
-        // trick above.
+        let c_ptr = if beta_one && c_residual != 0 {
+            c_residual as *const _
+        } else {
+            d_f16 as *const _
+        };
         let r = lt::cublasLtMatmul(
             self.handle,
             desc,
             &one_f32 as *const _ as *const _,
-            b_fp8 as *const _,  // weight
+            b_fp8 as *const _, // cublas "A" := our weight (transa=T)
             layout_a,
-            a_fp8 as *const _,  // activation
+            a_fp8 as *const _, // cublas "B" := our activation (transb=N)
             layout_b,
-            &zero_f32 as *const _ as *const _,
-            d_f16 as *const _,  // C (same buffer as D, unused at beta=0)
+            if beta_one { &one_f32 } else { &zero_f32 } as *const _ as *const _,
+            c_ptr,
             layout_d,
             d_f16 as *mut _,
             layout_d,
