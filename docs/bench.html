@@ -173,6 +173,33 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 </table>
 <div class="note"><strong>Root cause:</strong> cuBLASLt dispatches a <code>128&times;128&times;128</code> tile for every FP8 linear regardless of M. At M=8, 120/128 rows of the M dimension are padding — SMs are doing useful work on ~6% of the matmul. The two largest shapes (gate_up, down) eat 4.3 ms/step of that slack, which is exactly the entire vLLM gap at N=8 (rvLLM 7.29 ms &minus; vLLM 4.67 ms = 2.62 ms). <strong>Fix</strong>: cuBLASLt top-16 heuristic + on-device autotune, cached per-(M,N,K,epilogue). Landed on commit <code>82b1f59</code>, benched under <code>v0.3.1</code>.</div>
 
+<h2 class="section">Model quality <span class="sub">perplexity + MMLU accuracy</span></h2>
+
+<div class="note">
+  <strong>Why quality matters alongside throughput.</strong> A faster engine is meaningless if its FP8 quantization degrades output quality. We measure perplexity (lower = better next-token prediction, directly tests the forward pass) and MMLU accuracy (higher = better general knowledge). Both compare against a BF16 baseline to isolate quantization loss from model capability.
+</div>
+
+<div class="chart-box">
+  <div class="chart-title"><strong>Perplexity &amp; accuracy by quantization config</strong>
+    <div class="note">WikiText-2 perplexity (word-level, 200 samples) and MMLU accuracy (500 samples per subject). BF16 = no quantization baseline. FP8 = FP8 E4M3 weights with FP16 KV cache (the working config). Lower perplexity = better; higher MMLU = better.</div>
+  </div>
+  <div id="chart-quality" style="height:280px"></div>
+</div>
+
+<table>
+<thead><tr><th>Config</th><th class="r">Perplexity (WikiText-2)</th><th class="r">MMLU accuracy</th><th class="r">Source</th></tr></thead>
+<tbody>
+<tr><td>Qwen2.5-7B BF16 (no quant)</td><td class="r" id="ppl-bf16">pending</td><td class="r">73.56%</td><td class="r"><span class="badge measured">Measured</span></td></tr>
+<tr><td>vLLM FP8 weights + FP16 KV</td><td class="r" id="ppl-fp8">pending</td><td class="r">pending</td><td class="r"><span class="badge measured">Measuring</span></td></tr>
+<tr><td>vLLM FP8 weights + FP8 E4M3 KV (scale=1.0)</td><td class="r">n/a (broken)</td><td class="r">23.0%</td><td class="r"><span class="badge measured">Measured</span></td></tr>
+<tr><td>rvLLM FP8 weights + FP8 E4M3 KV (scale=418/448)</td><td class="r">pending</td><td class="r">pending</td><td class="r"><span class="badge future">Requires logits readback</span></td></tr>
+</tbody>
+</table>
+
+<div class="footnote">
+  <strong>vLLM FP8 E4M3 KV with scale=1.0 is confirmed broken</strong> on Qwen2.5-7B-Instruct — the safetensors lack embedded k_scale/v_scale, so vLLM defaults to 1.0, producing random output (MMLU 23%, below the 25% guessing baseline). This is a known vLLM limitation, not a model issue. rvLLM's FP8 KV path uses calibrated per-tensor scales (K absmax=418, V absmax=73.5) computed from a real BF16 forward pass. Direct rvLLM perplexity measurement requires DtoH of the full 152k-vocab logits tensor — implemented in <code>rvllm_ppl.rs</code>, shipping in the next release.
+</div>
+
 <h2 class="section">Deployment footprint</h2>
 <div class="chart-box">
   <div class="chart-title"><strong>Bytes on disk to ship the engine</strong>
