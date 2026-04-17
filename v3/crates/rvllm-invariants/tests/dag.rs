@@ -23,6 +23,7 @@ fn allowed_deps() -> HashMap<&'static str, HashSet<&'static str>> {
     m.insert("rvllm-sampling", s(&["rvllm-core", "rvllm-mem", "rvllm-fused"]));
     m.insert("rvllm-runtime", s(&[
         "rvllm-core", "rvllm-mem",
+        "rvllm-kernels",
         "rvllm-cutlass", "rvllm-attention", "rvllm-fused",
         "rvllm-metadata", "rvllm-graph", "rvllm-loader", "rvllm-sampling",
     ]));

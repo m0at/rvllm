@@ -6,12 +6,26 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# rvllm-runtime: Engine, scheduler, layer_exec. ONE step_launch/step_collect pair.
-# See v3/specs/{07,09}.md.
+# rvllm-runtime: Engine (type-state step_launch/step_collect),
+# scheduler (Request state machine, BatchPlan), layer_exec (pure fn).
+# See v3/specs/07-scheduler.md + 09-layer.md.
+
+[features]
+default = []
+cuda = [
+    "rvllm-mem/cuda",
+    "rvllm-cutlass/cuda",
+    "rvllm-attention/cuda",
+    "rvllm-fused/cuda",
+    "rvllm-metadata/cuda",
+    "rvllm-graph/cuda",
+    "rvllm-sampling/cuda",
+]
 
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
+rvllm-kernels = { workspace = true }
 rvllm-cutlass = { workspace = true }
 rvllm-attention = { workspace = true }
 rvllm-fused = { workspace = true }

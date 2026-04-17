@@ -340,6 +340,7 @@ dependencies = [
  "rvllm-cutlass",
  "rvllm-fused",
  "rvllm-graph",
+ "rvllm-kernels",
  "rvllm-loader",
  "rvllm-mem",
  "rvllm-metadata",
