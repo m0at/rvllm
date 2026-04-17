@@ -14,7 +14,7 @@ pub mod decode;
 pub mod prefill;
 
 pub use decode::{PagedDecodeFp8Launcher, PagedDecodeLauncher, PagedDecodeParams};
-pub use prefill::{PagedPrefillLauncher, PagedPrefillParams};
+pub use prefill::{PagedPrefillFp8Launcher, PagedPrefillLauncher, PagedPrefillParams};
 
 use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 

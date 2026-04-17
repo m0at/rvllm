@@ -23,7 +23,22 @@ use rvllm_fused::{
 };
 use rvllm_kernels::KernelFn;
 
-use rvllm_attention::{Fa3Kernels, PagedDecodeFp8Launcher, PagedDecodeParams};
+use rvllm_attention::{
+    Fa3Kernels, PagedDecodeFp8Launcher, PagedDecodeParams, PagedPrefillFp8Launcher,
+    PagedPrefillParams,
+};
+
+/// Which phase is this `forward()` call executing? Decode = 1 Q token
+/// per seq (FA3 paged_decode). Prefill = multi-Q per seq with causal
+/// mask (FA3 paged_prefill). GEMMs scale with dims.num_tokens in both.
+#[derive(Copy, Clone, Debug)]
+pub enum LayerPhase {
+    Decode,
+    Prefill {
+        cu_seqlens_q: u64, // [batch+1] i32 prefix sum on device
+        max_seqlen_q: u32, // longest Q seq length
+    },
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct LayerDims {
@@ -124,6 +139,37 @@ pub unsafe fn forward(
     residual: u64,
     stream: u64,
 ) -> Result<()> {
+    forward_phase(
+        dims,
+        kernels,
+        weights,
+        scratch,
+        meta,
+        plans,
+        cutlass,
+        cublaslt,
+        fa3,
+        residual,
+        stream,
+        LayerPhase::Decode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn forward_phase(
+    dims: LayerDims,
+    kernels: &LayerKernels,
+    weights: &LayerWeights,
+    scratch: &LayerScratch,
+    meta: &MetadataPtrs,
+    plans: &LayerGemmPlans,
+    cutlass: &CutlassLib,
+    cublaslt: &CublasLt,
+    fa3: &Fa3Kernels,
+    residual: u64,
+    stream: u64,
+    phase: LayerPhase,
+) -> Result<()> {
     let q_dim = dims.num_heads * dims.head_dim;
     let kv_dim = dims.num_kv_heads * dims.head_dim;
 
@@ -192,32 +238,75 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 6. FA3 paged decode (FP8 E4M3 KV; O is f16).
-    let decode = PagedDecodeFp8Launcher::new(fa3);
-    let decode_params = PagedDecodeParams {
-        num_seqs: dims.num_tokens,
-        num_heads: dims.num_heads,
-        num_kv_heads: dims.num_kv_heads,
-        head_dim: dims.head_dim,
-        block_size: dims.block_size,
-        max_blocks_per_seq: dims.max_blocks_per_seq,
-        num_blocks_total: dims.num_blocks_total,
-        scale: dims.attn_scale,
-    };
-    decode.launch(
-        decode_params,
-        scratch.attn_out,
-        scratch.q_fp8,
-        scratch.k_cache,
-        scratch.v_cache,
-        meta.block_tables,
-        meta.context_lens,
-        scratch.fa3_workspace,
-        scratch.q_scale_ptr,
-        scratch.kv_scale_ptr,
-        scratch.kv_scale_ptr,
-        stream,
-    )?;
+    // 6. FA3 attention. Decode (1 Q/seq) vs Prefill (multi-Q/seq causal).
+    match phase {
+        LayerPhase::Decode => {
+            let decode = PagedDecodeFp8Launcher::new(fa3);
+            let decode_params = PagedDecodeParams {
+                num_seqs: dims.num_tokens,
+                num_heads: dims.num_heads,
+                num_kv_heads: dims.num_kv_heads,
+                head_dim: dims.head_dim,
+                block_size: dims.block_size,
+                max_blocks_per_seq: dims.max_blocks_per_seq,
+                num_blocks_total: dims.num_blocks_total,
+                scale: dims.attn_scale,
+            };
+            decode.launch(
+                decode_params,
+                scratch.attn_out,
+                scratch.q_fp8,
+                scratch.k_cache,
+                scratch.v_cache,
+                meta.block_tables,
+                meta.context_lens,
+                scratch.fa3_workspace,
+                scratch.q_scale_ptr,
+                scratch.kv_scale_ptr,
+                scratch.kv_scale_ptr,
+                stream,
+            )?;
+        }
+        LayerPhase::Prefill {
+            cu_seqlens_q,
+            max_seqlen_q,
+        } => {
+            let prefill = PagedPrefillFp8Launcher::new(fa3);
+            // num_tokens for prefill is total_q across the batch.
+            let prefill_params = PagedPrefillParams {
+                num_tokens: dims.num_tokens,
+                // batch size: total_q / max_seqlen_q assuming uniform length
+                num_seqs: if max_seqlen_q == 0 {
+                    dims.num_tokens
+                } else {
+                    dims.num_tokens / max_seqlen_q
+                },
+                num_heads: dims.num_heads,
+                num_kv_heads: dims.num_kv_heads,
+                head_dim: dims.head_dim,
+                block_size: dims.block_size,
+                max_blocks_per_seq: dims.max_blocks_per_seq,
+                num_blocks_total: dims.num_blocks_total,
+                scale: dims.attn_scale,
+            };
+            prefill.launch(
+                prefill_params,
+                scratch.attn_out,
+                scratch.q_fp8,
+                scratch.k_cache,
+                scratch.v_cache,
+                meta.block_tables,
+                meta.context_lens,
+                cu_seqlens_q,
+                scratch.fa3_workspace,
+                scratch.q_scale_ptr,
+                scratch.kv_scale_ptr,
+                scratch.kv_scale_ptr,
+                max_seqlen_q,
+                stream,
+            )?;
+        }
+    }
 
     // 7. quantize attn_out -> fp8 (per-token).
     rvllm_fused::QuantizeFp8PerTokenLaunch {
