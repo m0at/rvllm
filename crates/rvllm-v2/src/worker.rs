@@ -279,13 +279,20 @@ impl Worker {
             if self.graph_enabled {
                 if let Some(padded) = padded_batch_size(num_seqs) {
                     if self.graph_pool.has_graph(num_seqs) {
-                        // Always do full upload for now: patch_metadata_decode skips
-                        // block_tables unless diff.block_ops.copies is non-empty, which
-                        // misses normal block-boundary growth (sequence reaches a new
-                        // page) -> captured graph reads stale block_tables -> garbage
-                        // attention. Re-introduce patch optimization with correct
-                        // block_table_changed detection.
-                        self.runner.upload_metadata_padded(input_ref, padded)?;
+                        // Patch fast-path when safe; full upload otherwise.
+                        // Block tables change on (a) CoW copies, (b) any continued seq
+                        // allocating a new page (scheduler signals via block_table_update).
+                        // Missing either signal leaves stale block_ids in the captured graph.
+                        let set_changed = !diff.added.is_empty() || !diff.removed.is_empty();
+                        let can_patch = !set_changed
+                            && self.runner.last_padded_batch() == Some(padded);
+                        let has_block_changes = !diff.block_ops.copies.is_empty()
+                            || diff.continued.iter().any(|c| c.block_table_update.is_some());
+                        if can_patch {
+                            self.runner.patch_metadata_decode(input_ref, padded, has_block_changes)?;
+                        } else {
+                            self.runner.upload_metadata_padded(input_ref, padded)?;
+                        }
                         let graph = self.graph_pool.get(num_seqs).unwrap();
                         graph.replay_on(self.runner.cuda_stream())
                             .map_err(|e| WorkerError::Runner(format!("graph replay: {e}")))?;
