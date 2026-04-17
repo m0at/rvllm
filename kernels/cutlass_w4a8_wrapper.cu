@@ -261,12 +261,10 @@ extern "C" size_t rvllm_w4a8_gemm_workspace_size(int m, int n, int k) {
 #include "cutlass/util/device_memory.h"
 #include <cuda_fp16.h>
 
-namespace {
-
 // Quantize FP16 weights to INT4 with per-group FP32 scales, both on device.
 // Writes unified-encoded INT4 (positive encoding == negative encoding except
 // sign bit) into w_int4_raw and per-group f32 scales into scales_f32.
-__global__ void quantize_sym_group_kernel(
+static __global__ void quantize_sym_group_kernel(
     const __half* __restrict__ w_fp16,  // [N, K] row-major (N rows)
     int* __restrict__ w_int4_raw,        // packed int4: [N, K/8] (8 per int32)
     float* __restrict__ scales_f32,       // [N, K/group]
@@ -326,7 +324,7 @@ __global__ void quantize_sym_group_kernel(
 // Build packed LUT scales (Array<e4m3, 8>) from per-group f32 scales.
 // For each group, the LUT contains {scale * -8, scale * -7, ..., scale * -1}
 // stored as 8 packed e4m3 values (8 bytes total per group).
-__global__ void build_packed_scales_kernel(
+static __global__ void build_packed_scales_kernel(
     const float* __restrict__ scales_f32,  // [N, scale_k]
     __nv_fp8_storage_t* __restrict__ scales_packed,  // [N, scale_k, 8] e4m3
     int n, int scale_k
@@ -342,8 +340,6 @@ __global__ void build_packed_scales_kernel(
     __nv_fp8_storage_t fp8 = __nv_cvt_float_to_fp8(lut_val, __NV_SATFINITE, __NV_E4M3);
     scales_packed[(row * scale_k + grp) * 8 + tid] = fp8;
 }
-
-}  // anon namespace
 
 // Host entry: quantize + pack weights + reorder into the kernel-expected
 // layout. Expects:
