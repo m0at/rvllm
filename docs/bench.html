@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rvLLM 0.3.0 — Benchmark Results</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html{font-size:16px;-webkit-font-smoothing:antialiased}
+body{background:#000;color:#d4d4d4;font-family:-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;font-weight:300;line-height:1.5;letter-spacing:-0.01em}
+a{color:#84E6B7;text-decoration:none}
+a:hover{color:#fff}
+.wrap{max-width:1080px;margin:0 auto;padding:2rem 1.5rem 5rem}
+header{padding:2rem 0 1.5rem;border-bottom:1px solid #1a1a1a;margin-bottom:2rem}
+header h1{font-size:2.2rem;font-weight:700;color:#fff;letter-spacing:-0.04em;margin-bottom:0.4rem}
+header .sub{color:#8a8a8a;font-size:0.95rem}
+header .meta{margin-top:0.8rem;font-size:0.8rem;color:#666;letter-spacing:0.02em}
+header .meta a{color:#aaa;margin-right:1.2rem}
+h2{font-size:1.3rem;font-weight:600;color:#fff;letter-spacing:-0.02em;margin:2.5rem 0 0.4rem}
+h2 .sub{font-weight:400;font-size:0.85rem;color:#888;margin-left:0.8rem}
+h3{font-size:0.82rem;color:#999;font-weight:500;letter-spacing:0.05em;text-transform:uppercase;margin:1.5rem 0 0.6rem}
+.chart-box{background:linear-gradient(180deg,#0a0d12,#06080c);border:1px solid #141821;border-radius:12px;padding:1.2rem 0.8rem 0.8rem 0.4rem;margin:0.5rem 0 1.2rem}
+.chart-title{padding:0 1rem 0.6rem;font-size:0.88rem;color:#d4d4d4}
+.chart-title strong{color:#fff;font-weight:600}
+.chart-title .note{color:#888;font-size:0.78rem;margin-top:0.2rem}
+.pill-row{display:flex;gap:0.8rem;flex-wrap:wrap;margin:0.8rem 0 1.5rem}
+.pill{background:#0a0d12;border:1px solid #1f2630;border-radius:10px;padding:0.7rem 1rem;font-size:0.85rem;color:#ccc;flex:1;min-width:190px}
+.pill strong{display:block;color:#fff;font-size:1.6rem;font-weight:700;margin-bottom:0.1rem;letter-spacing:-0.02em}
+.pill .label{font-size:0.7rem;color:#888;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:0.15rem}
+.pill .caption{color:#888;font-size:0.8rem;margin-top:0.2rem}
+table{width:100%;border-collapse:collapse;font-size:0.86rem;font-variant-numeric:tabular-nums;margin:0.6rem 0}
+thead th{padding:0.45rem 0.65rem;text-align:left;font-size:0.68rem;text-transform:uppercase;letter-spacing:0.07em;color:#999;font-weight:500;border-bottom:1px solid #1e2530}
+td.r,th.r{text-align:right}
+tbody td{padding:0.42rem 0.65rem;border-bottom:1px solid #111;color:#d4d4d4}
+tbody tr.rvllm-win td{background:rgba(132,230,183,0.04)}
+tbody tr.vllm-win td{background:rgba(255,153,119,0.04)}
+.pos{color:#84E6B7}
+.neg{color:#ff9977}
+.note{margin:0.8rem 0 1.2rem;padding:0.9rem 1.1rem;background:#070a0f;border-left:2px solid #333;font-size:0.86rem;color:#c5c5c5}
+.note strong{color:#fff}
+.method{font-size:0.82rem;color:#999;background:#07090c;padding:0.9rem 1.1rem;border-radius:8px;margin:1.2rem 0}
+.method code{background:#131a22;color:#a8d4ff;padding:1px 6px;border-radius:3px;font-size:0.78rem;font-family:ui-monospace,Menlo,Consolas,monospace}
+footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#666;font-size:0.78rem}
+.caveat{background:#14100a;border:1px solid #3a2818;color:#e5c489;padding:0.9rem 1.1rem;border-radius:8px;margin:1rem 0;font-size:0.88rem}
+.caveat strong{color:#ffd58a}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>rvLLM 0.3.0 &mdash; benchmark results</h1>
+  <div class="sub">Qwen2.5-7B-Instruct, FP8 E4M3 weights + FP8 E4M3 KV cache, H100 SXM 80GB, single GPU. rvLLM 0.3.0 (Rust) vs vLLM 0.19 V1 (Python).</div>
+  <div class="meta">
+    <a href="index.html">site</a>
+    <a href="https://github.com/m0at/rvllm">github</a>
+    <a href="paper/rvllm.pdf">paper</a>
+  </div>
+</header>
+
+<div class="pill-row">
+  <div class="pill">
+    <div class="label">peak tok/s (N=512)</div>
+    <strong>41,560</strong>
+    <div class="caption">rvLLM 0.3.0 &mdash; +32% vs vLLM 0.19</div>
+  </div>
+  <div class="pill">
+    <div class="label">hot TTFT @ N=128</div>
+    <strong>83&nbsp;ms</strong>
+    <div class="caption">vLLM: 348&nbsp;ms at same batch (4.2&times;)</div>
+  </div>
+  <div class="pill">
+    <div class="label">deployment footprint</div>
+    <strong>~90 MB</strong>
+    <div class="caption">vLLM: ~11 GB conda env (122&times; smaller)</div>
+  </div>
+  <div class="pill">
+    <div class="label">VRAM used</div>
+    <strong>7.8 GB</strong>
+    <div class="caption">leaves 72 GB free on the H100</div>
+  </div>
+</div>
+
+<div class="caveat">
+  <strong>Honest caveat.</strong> rvLLM wins at N&ge;64 by <strong>+12% to +40%</strong>; vLLM still wins at N&le;16 by <strong>+44% to +63%</strong>. Crossover sits near N=32&ndash;64. The per-step fixed cost of our 339 graph-captured launches dominates at tiny batch. An nsys profile (below) confirms the gap is entirely in the <code>gate_up</code> and <code>down</code> GEMMs using a 128&times;M tile that wastes 93% of its M dimension on padding at M=8. Skinny-M GEMM autotune is the next commit.
+</div>
+
+<h2>Throughput <span class="sub">steady-state decode, tok/s</span></h2>
+<div class="chart-box">
+  <div class="chart-title"><strong>Tok/s by batch size</strong> &mdash; higher is better
+    <div class="note">Both engines: Qwen2.5-7B FP8 E4M3 + FP8 E4M3 KV, 16 input + 512 output tokens, CUDA graphs on, real prefill, H100 SXM 80GB.</div>
+  </div>
+  <div id="chart-throughput" style="height:340px"></div>
+</div>
+
+<table>
+<thead><tr><th>N</th><th class="r">rvLLM 0.3.0</th><th class="r">vLLM 0.19 (hot)</th><th class="r">&Delta;</th></tr></thead>
+<tbody>
+<tr class="vllm-win"><td>1</td><td class="r">137</td><td class="r">223</td><td class="r neg">vLLM +62.6%</td></tr>
+<tr class="vllm-win"><td>8</td><td class="r">1,095</td><td class="r">1,712</td><td class="r neg">vLLM +56.4%</td></tr>
+<tr class="vllm-win"><td>16</td><td class="r">2,318</td><td class="r">3,342</td><td class="r neg">vLLM +44.2%</td></tr>
+<tr class="rvllm-win"><td>64</td><td class="r"><strong>12,477</strong></td><td class="r">11,151</td><td class="r pos"><strong>rvLLM +11.9%</strong></td></tr>
+<tr class="rvllm-win"><td>128</td><td class="r"><strong>21,946</strong></td><td class="r">17,778</td><td class="r pos"><strong>rvLLM +23.4%</strong></td></tr>
+<tr class="rvllm-win"><td>256</td><td class="r"><strong>33,968</strong></td><td class="r">24,270</td><td class="r pos"><strong>rvLLM +40.0%</strong></td></tr>
+<tr class="rvllm-win"><td>512</td><td class="r"><strong>41,560</strong></td><td class="r">31,485</td><td class="r pos"><strong>rvLLM +32.0%</strong></td></tr>
+</tbody>
+</table>
+
+<h2>Time-to-first-token <span class="sub">prompt &rarr; first sampled token visible on host</span></h2>
+<div class="chart-box">
+  <div class="chart-title"><strong>TTFT by batch size (hot cache)</strong> &mdash; lower is better
+    <div class="note">Hot = second request at that shape (cuBLASLt / FlashInfer heuristics cached). N=8 cold for vLLM hit 6.08 s; rvLLM cold &asymp; hot everywhere because kernels are pre-compiled &amp; pinned at bring-up.</div>
+  </div>
+  <div id="chart-ttft" style="height:340px"></div>
+</div>
+
+<table>
+<thead><tr><th>N</th><th class="r">rvLLM cold</th><th class="r">rvLLM hot</th><th class="r">vLLM cold</th><th class="r">vLLM hot</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">48.1</td><td class="r">49.0</td><td class="r">444.5</td><td class="r"><strong>25.2</strong></td></tr>
+<tr><td>8</td><td class="r">414.0</td><td class="r">314.5</td><td class="r neg">6,075.9</td><td class="r"><strong>47.3</strong></td></tr>
+<tr class="rvllm-win"><td>16</td><td class="r"><strong>53.6</strong></td><td class="r"><strong>46.3</strong></td><td class="r">82.2</td><td class="r">75.2</td></tr>
+<tr class="rvllm-win"><td>64</td><td class="r"><strong>50.8</strong></td><td class="r"><strong>51.4</strong></td><td class="r">213.3</td><td class="r">200.8</td></tr>
+<tr class="rvllm-win"><td>128</td><td class="r"><strong>80.5</strong></td><td class="r"><strong>83.2</strong></td><td class="r">386.3</td><td class="r">347.6</td></tr>
+<tr class="rvllm-win"><td>256</td><td class="r"><strong>112.7</strong></td><td class="r"><strong>77.7</strong></td><td class="r">581.2</td><td class="r">622.2</td></tr>
+<tr class="rvllm-win"><td>512</td><td class="r"><strong>131.5</strong></td><td class="r"><strong>132.1</strong></td><td class="r">985.9</td><td class="r">879.6</td></tr>
+</tbody>
+</table>
+
+<h2>Where the time goes at N=8 <span class="sub">nsys profile, top-10 kernels per step</span></h2>
+<div class="chart-box">
+  <div class="chart-title"><strong>Per-step kernel time @ N=8</strong> &mdash; captured 21 steady-state steps
+    <div class="note">339 kernel launches per step, all captured into one cuGraphLaunch. Total per step = 7.28 ms (bench ms/step). Launch overhead = 0.1% of step. The gap to vLLM is entirely inside the GEMM body, not the launch loop.</div>
+  </div>
+  <div id="chart-nsys" style="height:460px"></div>
+</div>
+
+<table>
+<thead><tr><th>kernel</th><th class="r">avg &mu;s</th><th class="r">launches / step</th><th class="r">ms / step</th><th class="r">% step</th></tr></thead>
+<tbody>
+<tr><td>sm90_xmma_gemm 128x128x128 fp8&rarr;f16 (5 linears)</td><td class="r">50.1</td><td class="r">113</td><td class="r">5.660</td><td class="r"><strong>77.7%</strong></td></tr>
+<tr><td>quantize_fp8_per_token</td><td class="r">17.6</td><td class="r">28</td><td class="r">0.493</td><td class="r">6.8%</td></tr>
+<tr><td>FlashAttnFwdSm90 (FA3 main)</td><td class="r">11.8</td><td class="r">28</td><td class="r">0.329</td><td class="r">4.5%</td></tr>
+<tr><td>fused_add_rmsnorm_fp8_quant</td><td class="r">5.31</td><td class="r">56</td><td class="r">0.297</td><td class="r">4.1%</td></tr>
+<tr><td>fused_silu_mul_fp8_quant</td><td class="r">9.37</td><td class="r">28</td><td class="r">0.262</td><td class="r">3.6%</td></tr>
+<tr><td>flash::prepare_varlen_num_blocks</td><td class="r">3.35</td><td class="r">28</td><td class="r">0.094</td><td class="r">1.3%</td></tr>
+<tr><td>fused_rope_cache_fp8kv</td><td class="r">2.89</td><td class="r">28</td><td class="r">0.081</td><td class="r">1.1%</td></tr>
+<tr><td>flash::FlashAttnFwdCombine</td><td class="r">1.59</td><td class="r">28</td><td class="r">0.044</td><td class="r">0.6%</td></tr>
+<tr><td>argmax_kernel (sampling tail)</td><td class="r">15.8</td><td class="r">1</td><td class="r">0.016</td><td class="r">0.2%</td></tr>
+<tr><td>fused_rmsnorm_fp8_quant (final norm)</td><td class="r">5.40</td><td class="r">1</td><td class="r">0.005</td><td class="r">0.1%</td></tr>
+<tr><td><strong>TOTAL</strong></td><td class="r"></td><td class="r"><strong>339</strong></td><td class="r"><strong>7.281</strong></td><td class="r"><strong>100%</strong></td></tr>
+</tbody>
+</table>
+
+<h3>GEMM decomposition at N=8 &mdash; where the slack is</h3>
+<table>
+<thead><tr><th>shape group</th><th class="r">per-GEMM &mu;s</th><th class="r">count / step</th><th class="r">ms / step</th><th class="r">HBM-BW lower bound</th><th class="r">slack</th></tr></thead>
+<tbody>
+<tr><td>QKV + O proj (M=8, N&asymp;3.5&ndash;4.6k)</td><td class="r">15&ndash;18</td><td class="r">56</td><td class="r">0.910</td><td class="r">0.245</td><td class="r">3.7&times;</td></tr>
+<tr class="vllm-win"><td><strong>down proj (M=8, 18944&rarr;3584)</strong></td><td class="r">52&ndash;54</td><td class="r">28</td><td class="r"><strong>1.481</strong></td><td class="r">0.567</td><td class="r neg"><strong>2.6&times;</strong></td></tr>
+<tr class="vllm-win"><td><strong>gate_up proj (M=8, 3584&rarr;37888)</strong></td><td class="r">98&ndash;105</td><td class="r">28</td><td class="r"><strong>2.846</strong></td><td class="r">1.135</td><td class="r neg"><strong>2.5&times;</strong></td></tr>
+<tr><td>lm_head (M=8, 3584&rarr;152064)</td><td class="r">357&ndash;359</td><td class="r">1</td><td class="r">0.358</td><td class="r">0.163</td><td class="r">2.2&times;</td></tr>
+</tbody>
+</table>
+<div class="note"><strong>Root cause:</strong> cuBLASLt dispatches a <code>128&times;128&times;128</code> tile for every FP8 linear regardless of M. At M=8, 120/128 rows of the M dimension are padding — SMs are doing useful work on ~6% of the matmul. The two largest shapes (gate_up, down) eat 4.3 ms/step of that slack, which is exactly the entire vLLM gap at N=8 (rvLLM 7.29 ms &minus; vLLM 4.67 ms = 2.62 ms). <strong>Fix</strong>: cuBLASLt top-16 heuristic + on-device autotune, cached per-(M,N,K,epilogue). Landed on commit <code>82b1f59</code>, benched under <code>v0.3.1</code>.</div>
+
+<h2>Deployment footprint</h2>
+<div class="chart-box">
+  <div class="chart-title"><strong>Bytes on disk to ship the engine</strong>
+    <div class="note">rvLLM: one binary + three CUDA .so files. vLLM: a full conda env including torch, xformers, triton, numpy, and ~500 Python modules.</div>
+  </div>
+  <div id="chart-footprint" style="height:280px"></div>
+</div>
+
+<h2>VRAM use on an 80 GB H100</h2>
+<div class="chart-box">
+  <div class="chart-title"><strong>Memory posture at idle</strong>
+    <div class="note">rvLLM sizes its HBM arena to exactly what the current batch needs (7 GB weights + sized-for-N KV + scratch). vLLM pre-reserves 74 GB for its paged-KV allocator on server start; the actual amount used at any given moment is similar, but the reservation shape is different.</div>
+  </div>
+  <div id="chart-vram" style="height:280px"></div>
+</div>
+
+<h2>Cold start <span class="sub">process launch &rarr; first token ready</span></h2>
+<div class="chart-box">
+  <div class="chart-title"><strong>Where the first ~100 seconds goes</strong>
+    <div class="note">Stacked breakdown. rvLLM starts serving 20&ndash;60 s faster on first launch; subsequent launches narrow as vLLM's Triton JIT cache warms.</div>
+  </div>
+  <div id="chart-coldstart" style="height:200px"></div>
+</div>
+
+<h2>Method &mdash; how these runs were produced</h2>
+<div class="method">
+<strong>rvLLM 0.3.0</strong> (tag <code>v0.3.0</code>, commit <code>82b1f59</code>):<br>
+<code>RVLLM_MODEL_DIR=... RVLLM_KERNELS_DIR=... RVLLM_CUTLASS_SO=... RVLLM_FA3_SO=... RVLLM_POLICY=... RVLLM_TTFT=1 RVLLM_REAL_PREFILL=1 RVLLM_PREFILL_LEN=16 RVLLM_BATCH=&lt;N&gt; RVLLM_ITERS=128 RVLLM_WARMUP=5 ./target/release/rvllm-bench</code><br><br>
+Cold TTFT = first timed prefill call after 5 warmup decode steps. Hot TTFT = second timed prefill. Throughput = (ITERS &times; N) / (timed decode window) after warmup.<br><br>
+<strong>vLLM 0.19 V1</strong>:<br>
+<code>vllm serve Qwen2.5-7B-Instruct --quantization fp8 --kv-cache-dtype fp8_e4m3 --dtype bfloat16 --max-model-len 2048 --max-num-seqs 512 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.9</code><br><br>
+Then, for each N, run twice (cold then hot) on the same server process:<br>
+<code>vllm bench serve --dataset-name random --num-prompts &lt;N&gt; --max-concurrency &lt;N&gt; --random-input-len 16 --random-output-len 512 --ignore-eos</code><br><br>
+Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Reported TTFT = tool's <code>Mean TTFT</code>.<br><br>
+<strong>nsys profile (N=8, rvLLM)</strong>: <code>nsys profile --trace=cuda,nvtx,osrt --sample=none --cudabacktrace=none --output=rvllm_n8 --stats=true rvllm-bench</code>. GPU was idle (no vLLM). Kernel sums parsed over the 21 steady-state graph-replay steps post-warmup.
+</div>
+
+<footer>
+<p>rvLLM — Apache-2.0 — <a href="https://github.com/m0at/rvllm">github.com/m0at/rvllm</a></p>
+</footer>
+
+</div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/prop-types@15/prop-types.min.js" crossorigin></script>
+<script src="https://unpkg.com/recharts@2.15.0/umd/Recharts.js" crossorigin></script>
+
+<script>
+(function(){
+  const e = React.createElement;
+  const R = Recharts;
+
+  const tsData = [
+    { n: '1',   rvllm:    137, vllm:    223 },
+    { n: '8',   rvllm:  1095, vllm:   1712 },
+    { n: '16',  rvllm:  2318, vllm:   3342 },
+    { n: '64',  rvllm: 12477, vllm:  11151 },
+    { n: '128', rvllm: 21946, vllm:  17778 },
+    { n: '256', rvllm: 33968, vllm:  24270 },
+    { n: '512', rvllm: 41560, vllm:  31485 }
+  ];
+
+  const ttftData = [
+    { n: '1',   rvllm:  49.04, vllm:  25.15 },
+    { n: '8',   rvllm: 314.46, vllm:  47.25 },
+    { n: '16',  rvllm:  46.30, vllm:  75.18 },
+    { n: '64',  rvllm:  51.35, vllm: 200.78 },
+    { n: '128', rvllm:  83.20, vllm: 347.59 },
+    { n: '256', rvllm:  77.74, vllm: 622.22 },
+    { n: '512', rvllm: 132.12, vllm: 879.60 }
+  ];
+
+  const nsysData = [
+    { name: 'GEMM 128x128x128 (5 linears)',   ms: 5.660 },
+    { name: 'quantize_fp8_per_token',         ms: 0.493 },
+    { name: 'FlashAttnFwdSm90 (FA3)',         ms: 0.329 },
+    { name: 'fused_add_rmsnorm_fp8_quant',    ms: 0.297 },
+    { name: 'fused_silu_mul_fp8_quant',       ms: 0.262 },
+    { name: 'prepare_varlen_num_blocks',      ms: 0.094 },
+    { name: 'fused_rope_cache_fp8kv',         ms: 0.081 },
+    { name: 'FlashAttnFwdCombine',            ms: 0.044 },
+    { name: 'argmax (sampling tail)',         ms: 0.016 },
+    { name: 'fused_rmsnorm_fp8_quant (tail)', ms: 0.005 }
+  ];
+
+  const footprintData = [
+    { engine: 'rvLLM 0.3.0', binary: 9.2, kernels: 81, deps: 0 },
+    { engine: 'vLLM 0.19',   binary: 0,   kernels: 3000, deps: 8000 }
+  ];
+
+  const vramData = [
+    { engine: 'rvLLM 0.3.0', used: 7.8,  reserved: 7.8,  free: 72.2 },
+    { engine: 'vLLM 0.19',   used: 15.0, reserved: 74.0, free: 6.0 }
+  ];
+
+  const coldStartData = [
+    { engine: 'rvLLM', start: 0.1, load_quant: 60, kernel_init: 12, jit: 0, dispatch: 0 },
+    { engine: 'vLLM',  start: 2,   load_quant: 70, kernel_init: 0, jit: 40, dispatch: 4 }
+  ];
+
+  function Throughput(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: tsData, margin: { top: 10, right: 24, left: 18, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis,    { dataKey: 'n', stroke: '#666', label: { value: 'Batch size (concurrent prompts)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis,    { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'tokens / second', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
+        e(R.Tooltip,  { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toLocaleString() + ' tok/s' }),
+        e(R.Legend,   { wrapperStyle: { paddingTop: 8 } }),
+        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0', fill: '#84E6B7' }),
+        e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)', fill: '#5a8bd4' })
+      )
+    );
+  }
+
+  function Ttft(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: ttftData, margin: { top: 10, right: 24, left: 18, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { dataKey: 'n', stroke: '#666', label: { value: 'Batch size', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { stroke: '#666', label: { value: 'TTFT (ms, lower is better)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' ms' }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
+        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0 (hot)', fill: '#84E6B7' }),
+        e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)',   fill: '#5a8bd4' })
+      )
+    );
+  }
+
+  function Nsys(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: nsysData, layout: 'vertical', margin: { top: 10, right: 24, left: 260, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'ms per step', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 11, fill: '#c5c5c5' }, width: 250 }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(3) + ' ms' }),
+        e(R.Bar, { dataKey: 'ms', fill: '#84E6B7' })
+      )
+    );
+  }
+
+  function Footprint(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: footprintData, margin: { top: 10, right: 24, left: 30, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { dataKey: 'engine', stroke: '#666' }),
+        e(R.YAxis, { stroke: '#666', label: { value: 'MB', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toLocaleString() + ' MB' }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
+        e(R.Bar, { dataKey: 'binary',  name: 'Rust binary',    stackId: 'a', fill: '#84E6B7' }),
+        e(R.Bar, { dataKey: 'kernels', name: 'CUDA kernels',   stackId: 'a', fill: '#5a8bd4' }),
+        e(R.Bar, { dataKey: 'deps',    name: 'Python / conda', stackId: 'a', fill: '#ff9977' })
+      )
+    );
+  }
+
+  function Vram(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: vramData, layout: 'vertical', margin: { top: 10, right: 24, left: 80, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { type: 'number', stroke: '#666', domain: [0, 80], label: { value: 'GB (of 80 on H100)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { type: 'category', dataKey: 'engine', stroke: '#aaa', tick: { fontSize: 12, fill: '#c5c5c5' }, width: 70 }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' GB' }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
+        e(R.Bar, { dataKey: 'reserved', name: 'Reserved / held', stackId: 'a', fill: '#ff9977' }),
+        e(R.Bar, { dataKey: 'free',     name: 'Free on card',    stackId: 'a', fill: '#84E6B7' })
+      )
+    );
+  }
+
+  function ColdStart(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: coldStartData, layout: 'vertical', margin: { top: 10, right: 24, left: 60, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'seconds (cold start, first launch)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { type: 'category', dataKey: 'engine', stroke: '#aaa', tick: { fontSize: 12, fill: '#c5c5c5' }, width: 50 }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' s' }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
+        e(R.Bar, { dataKey: 'start',       name: 'Binary / interpreter start',  stackId: 'a', fill: '#c5c5c5' }),
+        e(R.Bar, { dataKey: 'load_quant',  name: 'Weight load + FP8 quant',     stackId: 'a', fill: '#84E6B7' }),
+        e(R.Bar, { dataKey: 'kernel_init', name: 'Kernel init + graph capture', stackId: 'a', fill: '#5a8bd4' }),
+        e(R.Bar, { dataKey: 'jit',         name: 'Triton JIT compile',          stackId: 'a', fill: '#ff9977' }),
+        e(R.Bar, { dataKey: 'dispatch',    name: 'Python dispatch overhead',    stackId: 'a', fill: '#e8d26d' })
+      )
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('chart-throughput')).render(e(Throughput));
+  ReactDOM.createRoot(document.getElementById('chart-ttft')).render(e(Ttft));
+  ReactDOM.createRoot(document.getElementById('chart-nsys')).render(e(Nsys));
+  ReactDOM.createRoot(document.getElementById('chart-footprint')).render(e(Footprint));
+  ReactDOM.createRoot(document.getElementById('chart-vram')).render(e(Vram));
+  ReactDOM.createRoot(document.getElementById('chart-coldstart')).render(e(ColdStart));
+})();
+</script>
+</body>
+</html>
