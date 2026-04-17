@@ -266,9 +266,11 @@ static int fa3_sm90_paged_decode_impl(
     params.num_splits = ns;
     bool use_split = ns > 1;
 
-    // Scheduler metadata setup
-    params.varlen_sort_batches = true;   // Sort=true (non-local)
-    params.head_swizzle = false;         // LPT=false (non-causal, non-local)
+    // Scheduler metadata setup — matches upstream hopper/flash_api.cpp:
+    //   varlen_sort_batches = !is_local
+    //   head_swizzle        = is_causal || is_local
+    params.varlen_sort_batches = !params.is_local;
+    params.head_swizzle        = params.is_causal || params.is_local;
     int num_vectors = 2;  // num_splits_dynamic + num_m_blocks (always for prepare_varlen)
     if (params.varlen_sort_batches) num_vectors += 1;  // varlen_batch_idx
     if (params.head_swizzle) num_vectors += 1;          // num_nheads_in_l2
