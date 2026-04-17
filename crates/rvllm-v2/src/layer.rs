@@ -948,15 +948,30 @@ impl GpuTransformerLayer {
                 &scratch.attn_out, num_tokens, q_dim,
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
-            // Fused FP8 GEMM + residual add disabled: all variants crash with
-            // CUDA_ERROR_ILLEGAL_ADDRESS on graph replay. Fall back to non-fused
-            // path (separate o_proj_out buffer + residual add kernel).
-            cutlass_fp8_gemm_dispatch(
-                ck, autotune, &self.stream, num_tokens, hidden_size, q_dim,
-                &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                fp8w.o_proj_fp8, fp8w.o_proj_scale,
-                &mut scratch.o_proj_out, &mut scratch.cutlass_workspace,
-            )?;
+            // Fused FP8 GEMM + residual add (eliminates o_proj_out buffer).
+            // v1 (128x128x128 Coop) is the only non-FP8FastAccum variant whose
+            // mainloop schedule (Cooperative) matches the epilogue schedule
+            // (TmaWarpSpecializedCooperative, kernels/cutlass_fp8_gemm_residual.cu:100).
+            // v0 uses non-cooperative mainloop -> CUDA_ERROR_ILLEGAL_ADDRESS on replay.
+            // FP8FastAccum variants (v4+) crash with the residual EVT epilogue.
+            if ck.fp8_gemm_residual_variant_count() > 0 {
+                let variant = 1;
+                cutlass_fp8_gemm_residual_autotuned(
+                    ck, variant, &self.stream, num_tokens, hidden_size, q_dim,
+                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                    fp8w.o_proj_fp8, fp8w.o_proj_scale,
+                    residual_src, residual_write,
+                    &mut scratch.cutlass_workspace,
+                )?;
+                used_fused_oproj = true;
+            } else {
+                cutlass_fp8_gemm_dispatch(
+                    ck, autotune, &self.stream, num_tokens, hidden_size, q_dim,
+                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                    fp8w.o_proj_fp8, fp8w.o_proj_scale,
+                    &mut scratch.o_proj_out, &mut scratch.cutlass_workspace,
+                )?;
+            }
         } else if let (Some(lt), Some(fp8w)) = (lt_ops, &weights.fp8) {
             fp8_gemm_dispatch(
                 lt, &self.loader, &self.stream,
