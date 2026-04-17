@@ -280,6 +280,7 @@ dependencies = [
 name = "rvllm-graph"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
  "rvllm-core",
  "rvllm-mem",
  "rvllm-metadata",

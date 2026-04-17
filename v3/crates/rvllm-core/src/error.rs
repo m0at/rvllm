@@ -199,6 +199,8 @@ pub enum GraphError {
         cuda: CudaErrorKind,
         kernel_at_fault: Option<&'static str>,
     },
+    CaptureFailed,
+    InstantiateFailed,
 }
 
 #[derive(Debug)]
