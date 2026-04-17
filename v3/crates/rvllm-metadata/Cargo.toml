@@ -6,9 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# rvllm-metadata: ONE canonical layout per (bucket, max_blocks_per_seq).
-# Frozen at engine init. Single upload path. See v3/specs/08-metadata.md.
+# rvllm-metadata: frozen per-bucket layout + ONE upload path.
+# The April-16 CUDA_ERROR_ILLEGAL_ADDRESS root cause (prefill's
+# non-padded metadata overwriting decode's padded captured offsets)
+# is unrepresentable here: there is exactly one upload API, and the
+# MetadataLayout is keyed on (bucket, max_blocks_per_seq) with
+# offsets decided once at engine init.
+
+[features]
+default = []
+cuda = ["rvllm-mem/cuda"]
 
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
+sha2 = "0.10"

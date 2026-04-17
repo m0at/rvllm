@@ -328,6 +328,7 @@ version = "0.1.0"
 dependencies = [
  "rvllm-core",
  "rvllm-mem",
+ "sha2",
 ]
 
 [[package]]
