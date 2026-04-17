@@ -13,7 +13,7 @@ authors.workspace = true
 
 [features]
 default = []
-cuda = ["rvllm-kernels/cuda", "rvllm-mem/cuda", "dep:libloading"]
+cuda = ["rvllm-kernels/cuda", "rvllm-mem/cuda", "dep:libloading", "dep:cudarc"]
 
 [dependencies]
 rvllm-core = { workspace = true }
@@ -22,3 +22,4 @@ rvllm-kernels = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 libloading = { version = "0.8", optional = true }
+cudarc = { version = "0.19", features = ["driver", "cublaslt", "cuda-version-from-build-system"], optional = true }

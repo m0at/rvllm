@@ -13,12 +13,14 @@
 //!   authoritative number the allocator sizes against; if the runtime
 //!   hands the kernel less, `check_workspace` returns `WorkspaceTooSmall`.
 
+pub mod cublaslt;
 pub mod lib_so;
 pub mod plan;
 pub mod policy;
 pub mod schedule;
 pub mod variants;
 
+pub use cublaslt::CublasLt;
 pub use lib_so::CutlassLib;
 pub use plan::Fp8GemmPlan;
 pub use policy::{Policy, PolicyEntry, ShapeKey};

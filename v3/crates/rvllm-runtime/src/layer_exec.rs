@@ -16,7 +16,7 @@
 //! 12 launches per layer.
 
 use rvllm_core::Result;
-use rvllm_cutlass::{CutlassLib, Fp8GemmPlan};
+use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan};
 use rvllm_fused::{
     ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch,
     FusedSiluMulFp8QuantLaunch,
@@ -116,6 +116,7 @@ pub unsafe fn forward(
     meta: &MetadataPtrs,
     plans: &LayerGemmPlans,
     cutlass: &CutlassLib,
+    cublaslt: &CublasLt,
     fa3: &Fa3Kernels,
     residual: u64,
     stream: u64,
@@ -140,33 +141,29 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 2. Fused Q||K||V projection: one GEMM with N=q_dim+2*kv_dim.
-    //    Output layout [num_tokens, q_dim+2*kv_dim]:
-    //      rows[:q_dim]              -> Q
-    //      rows[q_dim:q_dim+kv_dim]  -> K
-    //      rows[q_dim+kv_dim:]       -> V
-    //    The scratch carries q_out as the packed base; k_out and v_out
-    //    are byte offsets into the same buffer (set by bring_up).
+    // 2. Fused Q||K||V projection + f16 bias via cuBLASLt (one launch
+    //    replaces cutlass_fp8_gemm + add_bias_f16). Output is packed
+    //    [num_tokens, q_dim + 2*kv_dim] f16. q_out/k_out/v_out are byte
+    //    offsets into the same buffer (set by bring_up).
     let qkv_n = dims.num_heads * dims.head_dim + 2 * dims.num_kv_heads * dims.head_dim;
     #[cfg(feature = "cuda")]
-    cutlass.launch_fp8_gemm(
-        &plans.qkv,
-        scratch.q_out,
+    cublaslt.fp8_gemm_bias(
         scratch.hidden_fp8,
         weights.qkv_fp8,
+        weights.qkv_bias,
+        scratch.q_out,
+        dims.num_tokens as i32,
+        qkv_n as i32,
+        dims.hidden as i32,
         scratch.hidden_scale,
         weights.qkv_scale,
-        scratch.cutlass_workspace,
-        scratch.cutlass_workspace_bytes,
         stream,
     )?;
-    // Bias: Qwen2.5 attention_bias=true. Add q/k/v biases to the
-    // packed qkv output in-place.
-    rvllm_fused::AddBiasF16Launch {
-        num_tokens: dims.num_tokens,
-        dim: qkv_n,
+    // Suppress unused warnings when cuda feature is off.
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (cublaslt, kernels.add_bias_f16, plans, qkv_n);
     }
-    .launch(kernels.add_bias_f16, scratch.q_out, weights.qkv_bias, stream)?;
 
     // 5. RoPE q/k in place, write k/v into paged cache.
     FusedRopeKvWriteLaunch {

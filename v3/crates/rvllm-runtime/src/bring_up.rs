@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rvllm_attention::Fa3Kernels;
 use rvllm_core::{ConfigError, Result, RvllmError};
-use rvllm_cutlass::{CutlassLib, Fp8GemmPlan, Policy};
+use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan, Policy};
 use rvllm_kernels::{manifest::KernelManifest, KernelFn, KernelLoader, LoadedModule};
 use rvllm_loader::{load_model, LoadedModel, ModelArch};
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
@@ -36,6 +36,8 @@ pub struct Bringup {
     pub fused_modules: FusedModules,
     pub fa3: Fa3Kernels,
     pub cutlass: CutlassLib,
+    pub cublaslt: CublasLt,
+    pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,
     pub arch: ModelArch,
     pub model: LoadedModel,
@@ -43,6 +45,13 @@ pub struct Bringup {
     pub stream: Stream,
     pub arena: HbmArena<'static>,
     pub ctx: Arc<CudaContextHandle>,
+}
+
+/// Marker: an arena-backed region kept alive by Bringup for the
+/// lifetime of the program. cuBLASLt workspace lives here.
+pub struct HbmArenaCheckpoint {
+    pub offset_bytes: usize,
+    pub bytes: usize,
 }
 
 /// Loaded CUDA modules + resolved kernel handles. One PTX file per
@@ -126,6 +135,19 @@ impl Bringup {
         let variants: Vec<_> = variants.into_iter().collect();
         let cutlass = CutlassLib::load(paths.cutlass_so.clone(), &variants)?;
 
+        // cuBLASLt workspace: 32 MiB is recommended for Hopper FP8.
+        let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
+        let cublaslt_ws_region =
+            arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;
+        let cublaslt = CublasLt::new(cublaslt_ws_region.device_ptr(), cublaslt_ws_bytes)?;
+        // Keep offset for audit; Region lifetime is tied to arena
+        // which lives as long as Bringup.
+        let cublaslt_ws = HbmArenaCheckpoint {
+            offset_bytes: (cublaslt_ws_region.device_ptr() - cublaslt_ws_region.device_ptr())
+                as usize,
+            bytes: cublaslt_ws_bytes,
+        };
+
         Ok(Self {
             ctx,
             arena,
@@ -134,6 +156,8 @@ impl Bringup {
             model,
             kernels,
             cutlass,
+            cublaslt,
+            cublaslt_ws,
             fa3,
             policy,
             fused_modules,
@@ -410,6 +434,7 @@ impl Bringup {
                     &meta,
                     &plans,
                     &self.cutlass,
+                    &self.cublaslt,
                     &self.fa3,
                     residual_ptr,
                     stream,

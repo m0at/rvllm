@@ -257,6 +257,7 @@ dependencies = [
 name = "rvllm-cutlass"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
  "libloading 0.8.9",
  "rvllm-core",
  "rvllm-kernels",
