@@ -337,6 +337,15 @@ impl Bringup {
         let fa3_ws = arena.region("fa3_ws", 64 * 1024 * 1024, 256)?;
 
         let residual = arena.region("residual", (max_tokens * hidden * 2) as usize, 16)?;
+        // Zero the residual so layer 0's rmsnorm doesn't read stale NaN
+        // from a prior process's HBM allocation.
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys::*;
+            unsafe {
+                cuMemsetD8_v2(residual.device_ptr(), 0, (max_tokens * hidden * 2) as usize);
+            }
+        }
 
         // Metadata: populate with valid decode-step values so FA3 walks
         // real KV pages instead of reading garbage.
