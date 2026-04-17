@@ -20,4 +20,4 @@ cuda = ["dep:cudarc"]
 [dependencies]
 rvllm-core = { workspace = true }
 half = { workspace = true }
-cudarc = { version = "0.19", features = ["driver"], optional = true }
+cudarc = { version = "0.19", features = ["driver", "cuda-version-from-build-system"], optional = true }
