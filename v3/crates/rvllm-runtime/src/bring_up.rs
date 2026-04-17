@@ -67,7 +67,7 @@ pub struct FusedModules {
     pub fn_rmsnorm: KernelFn,
     pub fn_add_rmsnorm: KernelFn,
     pub fn_quantize: KernelFn,
-    pub fn_rope_cache: KernelFn,
+    pub fn_rope_cache_fp8kv: KernelFn,
     pub fn_silu_mul: KernelFn,
     pub fn_argmax: KernelFn,
     pub fn_add_bias_f16: KernelFn,
@@ -252,12 +252,28 @@ impl Bringup {
         let num_blocks_total: u32 = 1024;
         let block_size: u32 = 64;
         let max_blocks_per_seq: u32 = 128;
-        let kv_per_layer = 2 * num_blocks_total * block_size * nkvh * head_dim * 2;
+        // FP8 E4M3 KV: 1 byte/element (was 2 for f16). Halves KV memory
+        // and doubles HBM-bandwidth efficiency on attention reads.
+        let kv_per_layer = 2 * num_blocks_total * block_size * nkvh * head_dim;
         let kv_cache = arena.region(
             "kv_cache",
             (arch.num_hidden_layers as u64 * kv_per_layer as u64) as usize,
             256,
         )?;
+        // FP8 Q scratch (post-rope) consumed by FA3; f16 Q from QKV GEMM
+        // still lives at q_out (2 bytes/elem).
+        let q_fp8 = arena.region("q_fp8", (num_seqs * q_dim) as usize, 16)?;
+        // Per-tensor FP8 scales shared across the whole engine. Placeholder
+        // values (1.0 / 448.0 = ~0.00223) give a clean identity-ish scaling
+        // for the garbage-data faux-prefill regime; a real calibration pass
+        // computes these once post-load.
+        let q_scale_region = arena.region("q_scale", 4, 4)?;
+        let kv_scale_region = arena.region("kv_scale", 4, 4)?;
+        {
+            let seed: f32 = 1.0f32 / 448.0f32;
+            q_scale_region.copy_from_host(&seed.to_le_bytes())?;
+            kv_scale_region.copy_from_host(&seed.to_le_bytes())?;
+        }
 
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
         let cutlass_ws = arena.region("cutlass_ws", cutlass_ws_bytes, 256)?;
@@ -366,7 +382,7 @@ impl Bringup {
         };
         let kernels = layer_exec::LayerKernels {
             fused_add_rmsnorm: self.fused_modules.fn_add_rmsnorm,
-            fused_rope_cache: self.fused_modules.fn_rope_cache,
+            fused_rope_cache_fp8kv: self.fused_modules.fn_rope_cache_fp8kv,
             fused_silu_mul: self.fused_modules.fn_silu_mul,
             quantize_fp8_per_token: self.fused_modules.fn_quantize,
             add_bias_f16: self.fused_modules.fn_add_bias_f16,
@@ -404,8 +420,11 @@ impl Bringup {
                     q_out: q_base,
                     k_out: k_base,
                     v_out: v_base,
+                    q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + (kv_per_layer / 2) as u64,
+                    q_scale_ptr: q_scale_region.device_ptr(),
+                    kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
                     attn_out_fp8: attn_out_fp8.device_ptr(),
                     attn_out_scale: attn_out_scale.device_ptr(),
@@ -588,7 +607,7 @@ fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
 
 fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let rmsnorm_mod = loader.load_ptx("fused_rmsnorm_fp8_quant")?;
-    let rope_mod = loader.load_ptx("fused_rope_cache_f16tbl")?;
+    let rope_mod = loader.load_ptx("fused_rope_cache_fp8kv")?;
     let silu_mod = loader.load_ptx("fused_silu_fp8_quant")?;
     let argmax_mod = loader.load_ptx("argmax")?;
     let add_bias_mod = loader.load_ptx("add_bias_f16")?;
@@ -596,7 +615,7 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let fn_rmsnorm = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_add_rmsnorm = rmsnorm_mod.get_function("fused_add_rmsnorm_fp8_quant_kernel")?;
     let fn_quantize = rmsnorm_mod.get_function("quantize_fp8_per_token_kernel")?;
-    let fn_rope_cache = rope_mod.get_function("fused_rope_cache_f16tbl_kernel")?;
+    let fn_rope_cache_fp8kv = rope_mod.get_function("fused_rope_cache_fp8kv_kernel")?;
     let fn_silu_mul = silu_mod.get_function("fused_silu_mul_fp8_quant_kernel")?;
     let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
     let fn_add_bias_f16 = add_bias_mod.get_function("add_bias_f16_kernel")?;
@@ -610,7 +629,7 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
         fn_rmsnorm,
         fn_add_rmsnorm,
         fn_quantize,
-        fn_rope_cache,
+        fn_rope_cache_fp8kv,
         fn_silu_mul,
         fn_argmax,
         fn_add_bias_f16,

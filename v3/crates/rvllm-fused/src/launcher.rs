@@ -473,6 +473,97 @@ impl AddBiasF16Launch {
     }
 }
 
+/// FP8 variant of the fused rope + KV write. Inputs are still f16 (the
+/// output of the QKV GEMM); outputs Q / K / V cache are FP8 E4M3. Two
+/// per-tensor f32 scalars (`q_scale`, `kv_scale`) carry the quantization.
+pub struct FusedRopeCacheFp8KvLaunch {
+    pub num_tokens: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+}
+
+impl FusedRopeCacheFp8KvLaunch {
+    pub fn validate(&self) -> Result<()> {
+        if self.head_dim != 128 {
+            return Err(invalid("head_dim", "v3 FA3 path requires head_dim == 128"));
+        }
+        if self.num_kv_heads == 0 || self.num_heads % self.num_kv_heads != 0 {
+            return Err(invalid(
+                "num_heads/num_kv_heads",
+                "num_heads must be a multiple of num_kv_heads",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Kernel sig:
+    /// `(q, k, v, q_fp8, key_cache, value_cache, cos, sin, positions,
+    ///   slot_mapping, q_scale_ptr, kv_scale_ptr, num_tokens, num_heads,
+    ///   num_kv_heads, head_dim)`
+    ///
+    /// # Safety
+    /// All device pointers valid for the call; scales point at single f32 scalars.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        q_in: u64,
+        k_in: u64,
+        v_in: u64,
+        q_fp8_out: u64,
+        k_cache_fp8: u64,
+        v_cache_fp8: u64,
+        cos: u64,
+        sin: u64,
+        positions: u64,
+        slot_mapping: u64,
+        q_scale_ptr: u64,
+        kv_scale_ptr: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut q_in = q_in;
+        let mut k_in = k_in;
+        let mut v_in = v_in;
+        let mut q_fp8_out = q_fp8_out;
+        let mut k_cache_fp8 = k_cache_fp8;
+        let mut v_cache_fp8 = v_cache_fp8;
+        let mut cos = cos;
+        let mut sin = sin;
+        let mut positions = positions;
+        let mut slot_mapping = slot_mapping;
+        let mut q_scale_ptr = q_scale_ptr;
+        let mut kv_scale_ptr = kv_scale_ptr;
+        let mut num_tokens = self.num_tokens as i32;
+        let mut num_heads = self.num_heads as i32;
+        let mut num_kv_heads = self.num_kv_heads as i32;
+        let mut head_dim = self.head_dim as i32;
+        let args = [
+            (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+            (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+            (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+            (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
+            (&mut k_cache_fp8) as *mut u64 as *mut core::ffi::c_void,
+            (&mut v_cache_fp8) as *mut u64 as *mut core::ffi::c_void,
+            (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+            (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+            (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+            (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+            (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+            (&mut kv_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+            (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
+            (&mut num_heads) as *mut i32 as *mut core::ffi::c_void,
+            (&mut num_kv_heads) as *mut i32 as *mut core::ffi::c_void,
+            (&mut head_dim) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let max_heads = self.num_heads.max(self.num_kv_heads);
+        let grid = (self.num_tokens, max_heads, 1);
+        let block = ((self.head_dim / 2).max(32), 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
 pub struct ResidualAddF16Launch {
     pub n: u32,
 }

@@ -13,7 +13,7 @@
 pub mod decode;
 pub mod prefill;
 
-pub use decode::{PagedDecodeLauncher, PagedDecodeParams};
+pub use decode::{PagedDecodeFp8Launcher, PagedDecodeLauncher, PagedDecodeParams};
 pub use prefill::{PagedPrefillLauncher, PagedPrefillParams};
 
 use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
@@ -51,6 +51,33 @@ pub(crate) type PagedDecodeFn = unsafe extern "C" fn(
     stream: *mut std::ffi::c_void,
 ) -> i32;
 
+// FP8 E4M3 paged decode: Q / K cache / V cache are FP8 (1 byte/elem).
+// q_descale / k_descale / v_descale point at f32 per-tensor scale scalars
+// on the device. O is fp16.
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+pub(crate) type PagedDecodeFp8Fn = unsafe extern "C" fn(
+    q_fp8_ptr: *mut std::ffi::c_void,
+    k_cache_fp8_ptr: *mut std::ffi::c_void,
+    v_cache_fp8_ptr: *mut std::ffi::c_void,
+    o_f16_ptr: *mut std::ffi::c_void,
+    block_tables_ptr: *mut std::ffi::c_void,
+    context_lens_ptr: *mut std::ffi::c_void,
+    workspace_ptr: *mut std::ffi::c_void,
+    q_descale_ptr: *mut f32,
+    k_descale_ptr: *mut f32,
+    v_descale_ptr: *mut f32,
+    scale: f32,
+    batch_size: i32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    block_size: i32,
+    max_blocks_per_seq: i32,
+    num_blocks_total: i32,
+    stream: *mut std::ffi::c_void,
+) -> i32;
+
 #[derive(Debug)]
 pub struct Fa3Kernels {
     pub so_path: std::path::PathBuf,
@@ -60,6 +87,8 @@ pub struct Fa3Kernels {
     pub(crate) fn_workspace_size: WorkspaceSizeFn,
     #[cfg(feature = "cuda")]
     pub(crate) fn_paged_decode: PagedDecodeFn,
+    #[cfg(feature = "cuda")]
+    pub(crate) fn_paged_decode_fp8: PagedDecodeFp8Fn,
 }
 
 impl Fa3Kernels {
@@ -132,13 +161,27 @@ impl Fa3Kernels {
                         },
                         bt: std::backtrace::Backtrace::capture(),
                     })?;
+                let dec_fp8_sym: libloading::Symbol<PagedDecodeFp8Fn> = _lib
+                    .get(b"fa3_sm90_paged_decode_fp8\0")
+                    .map_err(|_e| RvllmError::Attention {
+                        err: AttentionError::Fa3SoMissing { path: path.clone() },
+                        ctx: AttnCtx {
+                            op: "dlsym:fa3_sm90_paged_decode_fp8",
+                            stream: 0,
+                            num_seqs: 0,
+                            head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    })?;
                 let fn_workspace_size = *ws_sym;
                 let fn_paged_decode = *dec_sym;
+                let fn_paged_decode_fp8 = *dec_fp8_sym;
                 return Ok(Self {
                     so_path: path,
                     _lib,
                     fn_workspace_size,
                     fn_paged_decode,
+                    fn_paged_decode_fp8,
                 });
             }
         }

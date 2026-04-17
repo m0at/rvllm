@@ -12,6 +12,7 @@ NAME_TO_FILE = {
     "fused_rmsnorm_fp8_quant": "fused_rmsnorm_fp8_quant.ptx",
     "fused_rope_cache": "fused_rope_cache.ptx",
     "fused_rope_cache_f16tbl": "fused_rope_cache_f16tbl.ptx",
+    "fused_rope_cache_fp8kv": "fused_rope_cache_fp8kv.ptx",
     "add_bias_f16": "add_bias_f16.ptx",
     "fused_silu_fp8_quant": "fused_silu_fp8_quant.ptx",
     "argmax": "argmax.ptx",

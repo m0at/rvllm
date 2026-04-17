@@ -23,7 +23,7 @@ use rvllm_fused::{
 };
 use rvllm_kernels::KernelFn;
 
-use rvllm_attention::{Fa3Kernels, PagedDecodeLauncher, PagedDecodeParams};
+use rvllm_attention::{Fa3Kernels, PagedDecodeFp8Launcher, PagedDecodeParams};
 
 #[derive(Copy, Clone, Debug)]
 pub struct LayerDims {
@@ -61,11 +61,14 @@ pub struct LayerWeights {
 pub struct LayerScratch {
     pub hidden_fp8: u64,
     pub hidden_scale: u64,
-    pub q_out: u64,
-    pub k_out: u64,
-    pub v_out: u64,
-    pub k_cache: u64,
-    pub v_cache: u64,
+    pub q_out: u64,         // f16, QKV GEMM output (Q half)
+    pub k_out: u64,         // f16, QKV GEMM output (K half)
+    pub v_out: u64,         // f16, QKV GEMM output (V half)
+    pub q_fp8: u64,         // fp8, post-rope Q consumed by FA3 (FP8 KV path)
+    pub k_cache: u64,       // fp8 (1 byte/elem) paged K cache, this layer's base
+    pub v_cache: u64,       // fp8 (1 byte/elem) paged V cache, this layer's base
+    pub q_scale_ptr: u64,   // f32 per-tensor scale for Q (used by rope + FA3)
+    pub kv_scale_ptr: u64,  // f32 per-tensor scale for K and V (shared)
     pub attn_out: u64,
     pub attn_out_fp8: u64,
     pub attn_out_scale: u64,
@@ -92,7 +95,7 @@ pub struct MetadataPtrs {
 #[derive(Copy, Clone, Debug)]
 pub struct LayerKernels {
     pub fused_add_rmsnorm: KernelFn,
-    pub fused_rope_cache: KernelFn,
+    pub fused_rope_cache_fp8kv: KernelFn,
     pub fused_silu_mul: KernelFn,
     pub quantize_fp8_per_token: KernelFn,
     pub add_bias_f16: KernelFn,
@@ -165,29 +168,32 @@ pub unsafe fn forward(
         let _ = (cublaslt, kernels.add_bias_f16, plans, qkv_n);
     }
 
-    // 5. RoPE q/k in place, write k/v into paged cache.
-    FusedRopeKvWriteLaunch {
+    // 5. RoPE q/k + FP8-quantize Q + write FP8 K/V into paged cache.
+    rvllm_fused::FusedRopeCacheFp8KvLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
         num_kv_heads: dims.num_kv_heads,
         head_dim: dims.head_dim,
     }
     .launch(
-        kernels.fused_rope_cache,
+        kernels.fused_rope_cache_fp8kv,
         scratch.q_out,
         scratch.k_out,
         scratch.v_out,
+        scratch.q_fp8,
         scratch.k_cache,
         scratch.v_cache,
         meta.cos,
         meta.sin,
         meta.positions,
         meta.slot_mapping,
+        scratch.q_scale_ptr,
+        scratch.kv_scale_ptr,
         stream,
     )?;
 
-    // 6. FA3 paged decode.
-    let decode = PagedDecodeLauncher::new(fa3);
+    // 6. FA3 paged decode (FP8 E4M3 KV; O is f16).
+    let decode = PagedDecodeFp8Launcher::new(fa3);
     let decode_params = PagedDecodeParams {
         num_seqs: dims.num_tokens,
         num_heads: dims.num_heads,
@@ -201,12 +207,15 @@ pub unsafe fn forward(
     decode.launch(
         decode_params,
         scratch.attn_out,
-        scratch.q_out,
+        scratch.q_fp8,
         scratch.k_cache,
         scratch.v_cache,
         meta.block_tables,
         meta.context_lens,
         scratch.fa3_workspace,
+        scratch.q_scale_ptr,
+        scratch.kv_scale_ptr,
+        scratch.kv_scale_ptr,
         stream,
     )?;
 

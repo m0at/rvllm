@@ -143,6 +143,86 @@ impl<'a> PagedDecodeLauncher<'a> {
     }
 }
 
+/// FP8 E4M3 paged-decode launcher. Same param validation as the FP16
+/// path; dispatches the FP8 entry point and threads per-tensor scales.
+pub struct PagedDecodeFp8Launcher<'a> {
+    fa3: &'a super::Fa3Kernels,
+}
+
+impl<'a> PagedDecodeFp8Launcher<'a> {
+    pub fn new(fa3: &'a super::Fa3Kernels) -> Self {
+        Self { fa3 }
+    }
+
+    /// # Safety
+    /// Every pointer must be valid device memory; `q_descale_ptr`,
+    /// `k_descale_ptr`, `v_descale_ptr` point at single f32 scalars.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        params: PagedDecodeParams,
+        o_f16: u64,
+        q_fp8: u64,
+        k_cache_fp8: u64,
+        v_cache_fp8: u64,
+        block_tables: u64,
+        context_lens: u64,
+        workspace: u64,
+        q_descale_ptr: u64,
+        k_descale_ptr: u64,
+        v_descale_ptr: u64,
+        stream: u64,
+    ) -> Result<()> {
+        params.validate()?;
+        #[cfg(feature = "cuda")]
+        {
+            let rc = (self.fa3.fn_paged_decode_fp8)(
+                q_fp8 as *mut std::ffi::c_void,
+                k_cache_fp8 as *mut std::ffi::c_void,
+                v_cache_fp8 as *mut std::ffi::c_void,
+                o_f16 as *mut std::ffi::c_void,
+                block_tables as *mut std::ffi::c_void,
+                context_lens as *mut std::ffi::c_void,
+                workspace as *mut std::ffi::c_void,
+                q_descale_ptr as *mut f32,
+                k_descale_ptr as *mut f32,
+                v_descale_ptr as *mut f32,
+                params.scale,
+                params.num_seqs as i32,
+                params.num_heads as i32,
+                params.num_kv_heads as i32,
+                params.head_dim as i32,
+                params.block_size as i32,
+                params.max_blocks_per_seq as i32,
+                params.num_blocks_total as i32,
+                stream as *mut std::ffi::c_void,
+            );
+            if rc != 0 {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_decode_fp8",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (
+                o_f16, q_fp8, k_cache_fp8, v_cache_fp8, block_tables, context_lens,
+                workspace, q_descale_ptr, k_descale_ptr, v_descale_ptr, stream,
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
