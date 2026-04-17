@@ -1,4 +1,13 @@
-// rvllm-kernels — scaffold only. See v3/specs/01-architecture.md.
-//   pub mod loader;    // PTX/CUBIN/.so loader; consults manifest.json
-//   pub mod sigs;      // extern "C" kernel sig wrappers
-//   pub mod artifacts; // manifest.json parse/verify
+//! rvllm-kernels: manifest-verified loader + kernel signature catalog.
+//!
+//! The SHA-pinned invariant is the point of this crate. Every
+//! downstream call that touches a PTX or .so goes through
+//! `KernelLoader`, which is only constructible from a `VerifiedManifest`.
+
+pub mod loader;
+pub mod manifest;
+pub mod sigs;
+
+pub use loader::{KernelLoader, PtxBytes};
+pub use manifest::{ArtifactEntry, KernelManifest, VerifiedManifest};
+pub use sigs::{ArgKind, KernelSig, FUSED_KERNELS};

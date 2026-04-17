@@ -6,9 +6,20 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# rvllm-kernels: PTX/CUBIN/.so wrappers, kernel signatures, artifact manifest.
-# See v3/specs/01-architecture.md, 16-deploy.md.
+# rvllm-kernels: manifest-verified PTX/.so loader + kernel signature
+# descriptors. No CUDA FFI in the public surface; the actual
+# cuModuleLoad / dlopen live behind `feature = "cuda"`.
+
+[features]
+default = []
+cuda = ["dep:cudarc", "dep:libloading"]
 
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+cudarc = { version = "0.19", features = ["driver"], optional = true }
+libloading = { version = "0.8", optional = true }
