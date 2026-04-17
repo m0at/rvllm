@@ -85,37 +85,36 @@ impl CutlassLib {
         let mut fp8_gemm_residual = std::collections::BTreeMap::new();
         let mut fp8_gemm_residual_ws = std::collections::BTreeMap::new();
 
-        // The catalog separates residual variants by id range (>= 100).
-        // v2's cutlass_fp8_gemm_v{i} / cutlass_fp8_gemm_v{i}_workspace_size
-        // naming convention is preserved for drop-in compat with v2's .so.
+        // VariantId -> v2 symbol name (drop-in compat with v2's .so).
+        //   0..=99  -> cutlass_fp8_gemm[*]  (+ _workspace_size)
+        //  100..    -> cutlass_fp8_gemm_residual[*]
         for &vid in policy_variants {
-            let id = vid.0;
-            if id >= 100 {
-                // residual-fused namespace: cutlass_fp8_gemm_residual_v{i}
-                let res_id = id - 100;
-                let fn_name = format!("cutlass_fp8_gemm_residual_v{res_id}\0");
-                let ws_name = format!("cutlass_fp8_gemm_residual_v{res_id}_workspace_size\0");
+            let (fn_name_str, ws_name_str) = v2_symbol_names(vid);
+            let is_residual = vid.0 >= 100;
+            if is_residual {
+                let fn_c = format!("{fn_name_str}\0");
+                let ws_c = format!("{ws_name_str}\0");
                 unsafe {
                     let f: libloading::Symbol<Fp8GemmResidualFn> =
-                        lib.get(fn_name.as_bytes()).map_err(|_| {
+                        lib.get(fn_c.as_bytes()).map_err(|_| {
                             variant_missing(&path, vid, "fp8_gemm_residual")
                         })?;
                     let w: libloading::Symbol<WorkspaceSizeFn> =
-                        lib.get(ws_name.as_bytes()).map_err(|_| {
+                        lib.get(ws_c.as_bytes()).map_err(|_| {
                             variant_missing(&path, vid, "fp8_gemm_residual_ws")
                         })?;
                     fp8_gemm_residual.insert(vid, *f);
                     fp8_gemm_residual_ws.insert(vid, *w);
                 }
             } else {
-                let fn_name = format!("cutlass_fp8_gemm_v{id}\0");
-                let ws_name = format!("cutlass_fp8_gemm_v{id}_workspace_size\0");
+                let fn_c = format!("{fn_name_str}\0");
+                let ws_c = format!("{ws_name_str}\0");
                 unsafe {
                     let f: libloading::Symbol<Fp8GemmFn> = lib
-                        .get(fn_name.as_bytes())
+                        .get(fn_c.as_bytes())
                         .map_err(|_| variant_missing(&path, vid, "fp8_gemm"))?;
                     let w: libloading::Symbol<WorkspaceSizeFn> = lib
-                        .get(ws_name.as_bytes())
+                        .get(ws_c.as_bytes())
                         .map_err(|_| variant_missing(&path, vid, "fp8_gemm_ws"))?;
                     fp8_gemm.insert(vid, *f);
                     fp8_gemm_ws.insert(vid, *w);
@@ -248,6 +247,26 @@ impl CutlassLib {
             ));
         }
         Ok(())
+    }
+}
+
+/// Map a policy `VariantId` to the C-linkage symbol names in
+/// `libcutlass_kernels.so`. id <100 uses the `cutlass_fp8_gemm_v{id}`
+/// autotune suite; id >=100 uses `cutlass_fp8_gemm_residual_v{id-100}`.
+/// Returns a heap-allocated pair (empty when out-of-range).
+fn v2_symbol_names(vid: VariantId) -> (String, String) {
+    if vid.0 >= 100 {
+        let i = vid.0 - 100;
+        (
+            format!("cutlass_fp8_gemm_residual_v{i}"),
+            format!("cutlass_fp8_gemm_residual_v{i}_workspace_size"),
+        )
+    } else {
+        let i = vid.0;
+        (
+            format!("cutlass_fp8_gemm_v{i}"),
+            format!("cutlass_fp8_gemm_v{i}_workspace_size"),
+        )
     }
 }
 
