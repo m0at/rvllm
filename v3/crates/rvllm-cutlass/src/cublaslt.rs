@@ -89,9 +89,11 @@ impl CublasLt {
         }
 
         // Set transa = N (no transpose on A), transb = T (transpose on B)
-        // which is required for FP8 TN layout on H100.
-        let transa = lt::cublasOperation_t::CUBLAS_OP_N;
-        let transb = lt::cublasOperation_t::CUBLAS_OP_T;
+        // which is required for FP8 TN layout on H100. The cublasLt sys
+        // bindings don't re-export cublasOperation_t; use raw i32:
+        // CUBLAS_OP_N = 0, CUBLAS_OP_T = 1.
+        let transa: i32 = 0;
+        let transb: i32 = 1;
         set_attr(
             desc,
             lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
@@ -140,7 +142,7 @@ impl CublasLt {
         let mut layout_d: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_a,
-            lt::cudaDataType_t::CUDA_R_8F_E4M3,
+            lt::cudaDataType::CUDA_R_8F_E4M3,
             m as u64,
             k as u64,
             k as i64, // row-major, ld = K
@@ -150,7 +152,7 @@ impl CublasLt {
         }
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_b,
-            lt::cudaDataType_t::CUDA_R_8F_E4M3,
+            lt::cudaDataType::CUDA_R_8F_E4M3,
             n as u64,
             k as u64,
             k as i64,
@@ -160,7 +162,7 @@ impl CublasLt {
         }
         let r = lt::cublasLtMatrixLayoutCreate(
             &mut layout_d,
-            lt::cudaDataType_t::CUDA_R_16F,
+            lt::cudaDataType::CUDA_R_16F,
             m as u64,
             n as u64,
             n as i64,
@@ -175,14 +177,16 @@ impl CublasLt {
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("preference create"));
         }
-        set_attr(
-            pref as *mut _,
-            // CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES = 0
-            std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(0),
-            &self.workspace_bytes as *const _ as *const _,
+        let ws_bytes = self.workspace_bytes as usize;
+        let r = lt::cublasLtMatmulPreferenceSetAttribute(
+            pref,
+            lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &ws_bytes as *const _ as *const _,
             std::mem::size_of::<usize>(),
-        )
-        .ok();
+        );
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("pref set workspace"));
+        }
         let mut heur: lt::cublasLtMatmulHeuristicResult_t = std::mem::zeroed();
         let mut ret: i32 = 0;
         let r = lt::cublasLtMatmulAlgoGetHeuristic(
