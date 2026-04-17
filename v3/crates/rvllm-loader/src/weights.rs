@@ -35,7 +35,6 @@ pub struct Fp8Weight {
 #[derive(Debug)]
 pub struct LayerWeights {
     pub qkv: Fp8Weight,
-    pub qkv_f16: F16Weight,     // staging copy until FP8 quant runs
     pub gate_up: Fp8Weight,
     pub o_proj: Fp8Weight,
     pub down_proj: Fp8Weight,

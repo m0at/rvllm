@@ -234,11 +234,6 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
             &ln("self_attn.qkv.weight"),
             model_dir,
         )?;
-        // Keep a f16 staging offset of zero since we concatenate in RAM only.
-        let qkv_f16 = F16Weight {
-            offset_bytes: 0,
-            shape: vec![qkv_rows, qkv_cols],
-        };
 
         let o_proj = upload_fp8_from(
             arena,
@@ -296,7 +291,6 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
 
         layers.push(LayerWeights {
             qkv,
-            qkv_f16,
             gate_up,
             o_proj,
             down_proj,
