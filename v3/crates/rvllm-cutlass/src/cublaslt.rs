@@ -11,14 +11,35 @@
 
 #[cfg(feature = "cuda")]
 use cudarc::cublaslt::sys as lt;
+#[cfg(feature = "cuda")]
+use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
 
 use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
+
+/// Key for the per-shape algorithm cache. Distinguishes plain / bias /
+/// residual dispatch because the matmul descriptor differs and cuBLASLt's
+/// heuristic returns different algos.
+#[cfg(feature = "cuda")]
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+struct AlgoKey {
+    m: i32,
+    n: i32,
+    k: i32,
+    kind: u8, // 0 = plain, 1 = bias, 2 = residual (beta=1)
+}
 
 pub struct CublasLt {
     #[cfg(feature = "cuda")]
     handle: lt::cublasLtHandle_t,
     workspace: u64,
     workspace_bytes: usize,
+    /// Per-(M,N,K,kind) cache of the heuristic-picked algorithm. cuBLASLt's
+    /// algo struct is opaque but `Copy+Hash+Eq` — we reuse it on subsequent
+    /// calls with the same shape instead of re-running the heuristic.
+    #[cfg(feature = "cuda")]
+    algo_cache: Mutex<HashMap<AlgoKey, lt::cublasLtMatmulAlgo_t>>,
 }
 
 unsafe impl Send for CublasLt {}
@@ -40,6 +61,7 @@ impl CublasLt {
             handle,
             workspace,
             workspace_bytes,
+            algo_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -221,39 +243,70 @@ impl CublasLt {
             return Err(cublaslt_err("layout D"));
         }
 
-        let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
-        let r = lt::cublasLtMatmulPreferenceCreate(&mut pref);
-        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return Err(cublaslt_err("preference create"));
-        }
-        let ws_bytes = self.workspace_bytes;
-        let r = lt::cublasLtMatmulPreferenceSetAttribute(
-            pref,
-            lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-            &ws_bytes as *const _ as *const _,
-            std::mem::size_of::<usize>(),
-        );
-        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return Err(cublaslt_err("pref set workspace"));
-        }
+        // Heuristic path: check the per-shape cache first; on miss, run
+        // cublasLtMatmulAlgoGetHeuristic once and save the algo for
+        // future calls. At N=128 we hit this for 5 unique (M,N,K,kind)
+        // tuples per step — 4 repeated across 28 layers — so reuse is
+        // essentially 100% after the first step.
+        let key = AlgoKey {
+            m,
+            n,
+            k,
+            kind: if bias_f16 != 0 {
+                1
+            } else if beta_one {
+                2
+            } else {
+                0
+            },
+        };
+        let cached_algo = self
+            .algo_cache
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&key).copied());
+        let algo = if let Some(a) = cached_algo {
+            a
+        } else {
+            let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+            let r = lt::cublasLtMatmulPreferenceCreate(&mut pref);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(cublaslt_err("preference create"));
+            }
+            let ws_bytes = self.workspace_bytes;
+            let r = lt::cublasLtMatmulPreferenceSetAttribute(
+                pref,
+                lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws_bytes as *const _ as *const _,
+                std::mem::size_of::<usize>(),
+            );
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(cublaslt_err("pref set workspace"));
+            }
 
-        let mut heur: lt::cublasLtMatmulHeuristicResult_t = std::mem::zeroed();
-        let mut ret: i32 = 0;
-        let r = lt::cublasLtMatmulAlgoGetHeuristic(
-            self.handle,
-            desc,
-            layout_a,
-            layout_b,
-            layout_d,
-            layout_d,
-            pref,
-            1,
-            &mut heur,
-            &mut ret,
-        );
-        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
-            return Err(cublaslt_err("heuristic"));
-        }
+            let mut heur: lt::cublasLtMatmulHeuristicResult_t = std::mem::zeroed();
+            let mut ret: i32 = 0;
+            let r = lt::cublasLtMatmulAlgoGetHeuristic(
+                self.handle,
+                desc,
+                layout_a,
+                layout_b,
+                layout_d,
+                layout_d,
+                pref,
+                1,
+                &mut heur,
+                &mut ret,
+            );
+            lt::cublasLtMatmulPreferenceDestroy(pref);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
+                return Err(cublaslt_err("heuristic"));
+            }
+            if let Ok(mut c) = self.algo_cache.lock() {
+                c.insert(key, heur.algo);
+            }
+            heur.algo
+        };
 
         let one_f32: f32 = 1.0;
         let zero_f32: f32 = 0.0;
@@ -275,13 +328,12 @@ impl CublasLt {
             layout_d,
             d_f16 as *mut _,
             layout_d,
-            &heur.algo,
+            &algo,
             self.workspace as *mut _,
             self.workspace_bytes,
             stream as _,
         );
 
-        lt::cublasLtMatmulPreferenceDestroy(pref);
         lt::cublasLtMatrixLayoutDestroy(layout_d);
         lt::cublasLtMatrixLayoutDestroy(layout_b);
         lt::cublasLtMatrixLayoutDestroy(layout_a);
