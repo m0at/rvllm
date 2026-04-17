@@ -173,6 +173,20 @@ pub unsafe fn forward_phase(
     let q_dim = dims.num_heads * dims.head_dim;
     let kv_dim = dims.num_kv_heads * dims.head_dim;
 
+    let dbg = std::env::var("RVLLM_DEBUG_STEPS").ok().as_deref() == Some("1");
+    let check = |label: &str| {
+        if !dbg { return; }
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::{cuStreamSynchronize, CUresult};
+            let r = cuStreamSynchronize(stream as *mut _);
+            eprintln!("STEP {label} sync={r:?}");
+            if r != CUresult::CUDA_SUCCESS {
+                panic!("step {label} failed: {r:?}");
+            }
+        }
+    };
+
     // 1. rmsnorm(residual) + fp8 quant, residual updated in-place.
     FusedAddRmsnormFp8QuantLaunch {
         num_tokens: dims.num_tokens,
@@ -189,6 +203,7 @@ pub unsafe fn forward_phase(
         weights.attn_norm_gamma,
         stream,
     )?;
+    check("1.rmsnorm");
 
     // 2. Fused Q||K||V projection + f16 bias via cuBLASLt (one launch
     //    replaces cutlass_fp8_gemm + add_bias_f16). Output is packed
@@ -213,6 +228,7 @@ pub unsafe fn forward_phase(
     {
         let _ = (cublaslt, kernels.add_bias_f16, plans, qkv_n);
     }
+    check("2.qkv_gemm");
 
     // 5. RoPE q/k + FP8-quantize Q + write FP8 K/V into paged cache.
     rvllm_fused::FusedRopeCacheFp8KvLaunch {
@@ -237,6 +253,7 @@ pub unsafe fn forward_phase(
         scratch.kv_scale_ptr,
         stream,
     )?;
+    check("5.rope_cache");
 
     // 6. FA3 attention. Decode (1 Q/seq) vs Prefill (multi-Q/seq causal).
     match phase {
