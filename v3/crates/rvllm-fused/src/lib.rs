@@ -10,9 +10,11 @@
 //!   the April 16 vectorized-quantize ILLEGAL_ADDRESS hunt).
 //! - No megakernels. Each fused kernel does one recognizable composite.
 
+pub mod launch_raw;
 pub mod launcher;
 pub mod reference;
 
+pub use launch_raw::launch_raw;
 pub use launcher::{
     require_multiple, ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch,
     FusedSiluMulFp8QuantLaunch, QuantizeFp8PerTokenLaunch,

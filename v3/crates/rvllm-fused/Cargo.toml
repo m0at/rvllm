@@ -13,10 +13,11 @@ authors.workspace = true
 
 [features]
 default = []
-cuda = ["rvllm-kernels/cuda", "rvllm-mem/cuda"]
+cuda = ["rvllm-kernels/cuda", "rvllm-mem/cuda", "dep:cudarc"]
 
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
 rvllm-kernels = { workspace = true }
 half = { workspace = true }
+cudarc = { version = "0.19", features = ["driver", "cuda-version-from-build-system"], optional = true }
