@@ -106,6 +106,14 @@ footer p{font-size:0.72rem;color:#666;letter-spacing:0.02em}
 footer a{color:#666}
 footer a:hover{color:#999}
 
+.cta-row{display:flex;gap:0.6rem;flex-wrap:wrap;margin-top:1rem}
+.cta-btn{display:inline-flex;align-items:center;gap:0.4rem;padding:0.7rem 1.1rem;border-radius:10px;font-size:0.9rem;font-weight:600;text-decoration:none;letter-spacing:-0.01em;transition:all 0.15s ease}
+.cta-btn.primary{background:#84E6B7;color:#041810;border:1px solid #84E6B7}
+.cta-btn.primary:hover{background:#9ff0c6;color:#000}
+.cta-btn.ghost{background:transparent;color:#d4d4d4;border:1px solid #2a323e}
+.cta-btn.ghost:hover{background:#0d1117;color:#fff;border-color:#3a434f}
+.cta-btn .arrow{font-size:0.95em;opacity:0.85}
+
 @media(max-width:600px){
   html{font-size:13px}
   header{padding:3rem 0 2rem}
@@ -141,6 +149,11 @@ footer a:hover{color:#999}
 <div class="hero">
   <div class="big">42,030 tok/s</div>
   <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM 80GB. N=512, greedy, CUDA graph captured, FP8 E4M3 KV cache, real FA3 paged-prefill, full decode + final RMSnorm + LM head + argmax. <strong>+16.4% vs vLLM 0.19 at the same batch on the same box.</strong> Consistently 14&ndash;23% faster than vLLM across N=128 / 256 / 512. TTFT 63.8 ms at N=128. Detail below.</div>
+  <div class="cta-row">
+    <a class="cta-btn primary" href="bench.html">See the full benchmark <span class="arrow">&rarr;</span></a>
+    <a class="cta-btn ghost" href="https://github.com/m0at/rvllm">GitHub</a>
+    <a class="cta-btn ghost" href="paper/rvllm.pdf">Paper</a>
+  </div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Throughput by Batch Size</div>
     <div class="hero-graphic-sub">Same GPU, same model, same FP8 path. Greedy decode, 512 output tokens, CUDA graphs on.</div>
