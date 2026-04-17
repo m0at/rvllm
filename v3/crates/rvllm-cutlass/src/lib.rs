@@ -19,9 +19,11 @@ pub mod plan;
 pub mod policy;
 pub mod schedule;
 pub mod variants;
+pub mod w4a8;
 
 pub use cublaslt::CublasLt;
 pub use lib_so::CutlassLib;
+pub use w4a8::W4a8Lib;
 pub use plan::Fp8GemmPlan;
 pub use policy::{Policy, PolicyEntry, ShapeKey};
 pub use schedule::{Coop, Fp8Coop, Fp8WS, MatchedPair, Schedule, ScheduleTag, WS};
