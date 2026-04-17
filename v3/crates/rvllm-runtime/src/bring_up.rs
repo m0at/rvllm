@@ -284,7 +284,11 @@ impl Bringup {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(64);
-        let max_blocks_per_seq: u32 = 128;
+        // max_blocks_per_seq × num_seqs must stay within num_blocks_total
+        // so every block_tables entry points at a real page. At 1024
+        // pages and N=512, that caps max_blocks_per_seq at 2. Clamp so
+        // bigger batches don't overflow and cause FA3 illegal-access.
+        let max_blocks_per_seq: u32 = (num_blocks_total / num_seqs).max(1);
         // FP8 E4M3 KV: 1 byte/element (was 2 for f16). Halves KV memory
         // and doubles HBM-bandwidth efficiency on attention reads.
         let kv_per_layer = 2 * num_blocks_total * block_size * nkvh * head_dim;
