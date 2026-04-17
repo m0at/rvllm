@@ -1,25 +1,18 @@
 //! CUDA compute stream wrapper.
-//!
-//! One stream per worker. `Stream` is neither `Send` nor `Sync` — a
-//! worker's stream must stay pinned to the thread that created it.
-//! `Drop` fences and destroys; the rule "no handle destroyed while the
-//! stream is busy" is enforced by `CudaOwned` (see `cuda_owned.rs`).
 
 use core::marker::PhantomData;
 
 use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 
+use crate::context::CudaContextHandle;
 use crate::cuda_owned::CudaOwned;
 
-/// A CUDA compute stream. Opaque; clients see only methods.
 pub struct Stream {
     raw: u64,
-    // !Send !Sync — streams are thread-local in our runtime.
     _not_send_sync: PhantomData<*const ()>,
 }
 
 impl Stream {
-    /// Host-side stub used in tests (no CUDA). Allocates nothing.
     pub fn host_stub() -> Self {
         Self {
             raw: 0,
@@ -27,36 +20,59 @@ impl Stream {
         }
     }
 
-    /// Raw stream handle for FFI. The handle is valid for the lifetime
-    /// of `self`; the borrow checker prevents dangling use.
+    #[cfg(feature = "cuda")]
+    pub fn new(ctx: &CudaContextHandle) -> Result<Self> {
+        use cudarc::driver::sys::*;
+        let mut s: CUstream = std::ptr::null_mut();
+        let r = unsafe { cuStreamCreate(&mut s, CUstream_flags::CU_STREAM_NON_BLOCKING as u32) };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::cuda(
+                "cuStreamCreate",
+                CudaErrorKind::StreamFailed,
+                CudaCtx {
+                    stream: 0,
+                    kernel: "cuStreamCreate",
+                    launch: None,
+                    device: ctx.device(),
+                },
+            ));
+        }
+        Ok(Self {
+            raw: s as u64,
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn new(_ctx: &CudaContextHandle) -> Result<Self> {
+        Ok(Self::host_stub())
+    }
+
     pub fn raw(&self) -> u64 {
         self.raw
     }
 
-    /// Block until all enqueued work on this stream completes.
-    /// Only callable from init / shutdown / test modules — the
-    /// `no_steady_state_fence` lint denies it elsewhere (added in a
-    /// later pass when the lint is implemented).
     pub fn fence(&self) -> Result<()> {
         #[cfg(feature = "cuda")]
-        {
-            // Real impl: cudarc stream synchronize.
-            Err(RvllmError::cuda(
-                "Stream::fence",
-                CudaErrorKind::Other,
-                CudaCtx {
-                    stream: self.raw,
-                    kernel: "fence",
-                    launch: None,
-                    device: -1,
-                },
-            ))
+        unsafe {
+            use cudarc::driver::sys::*;
+            if self.raw != 0 {
+                let r = cuStreamSynchronize(self.raw as CUstream);
+                if r != CUresult::CUDA_SUCCESS {
+                    return Err(RvllmError::cuda(
+                        "cuStreamSynchronize",
+                        CudaErrorKind::StreamFailed,
+                        CudaCtx {
+                            stream: self.raw,
+                            kernel: "fence",
+                            launch: None,
+                            device: -1,
+                        },
+                    ));
+                }
+            }
         }
-        #[cfg(not(feature = "cuda"))]
-        {
-            // Host stub: nothing to fence.
-            Ok(())
-        }
+        Ok(())
     }
 }
 
@@ -68,8 +84,14 @@ impl CudaOwned for Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        // The stream owns itself; there is no separate handle to
-        // destroy. Real impl calls cuStreamDestroy here.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            if self.raw != 0 {
+                let _ = cudarc::driver::sys::cuStreamDestroy_v2(
+                    self.raw as cudarc::driver::sys::CUstream,
+                );
+            }
+        }
     }
 }
 

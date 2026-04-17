@@ -16,6 +16,7 @@
 //! machine.
 
 pub mod capture;
+pub mod context;
 pub mod cuda_owned;
 pub mod event;
 pub mod graph_safe;
@@ -26,6 +27,7 @@ pub mod stream;
 pub mod tensor;
 
 pub use capture::{record, BoundHandle, CaptureScope, HasDevicePtr};
+pub use context::CudaContextHandle;
 pub use cuda_owned::CudaOwned;
 pub use event::Event;
 pub use graph_safe::GraphSafe;
