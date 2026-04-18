@@ -612,7 +612,7 @@ impl Gemma4Bringup {
                     attn_out: attn_out.device_ptr(),
                     attn_out_fp8: attn_out_fp8.device_ptr(),
                     attn_out_scale: attn_out_scale.device_ptr(),
-                    post_attn_normed: 0,
+                    delta_f16: delta_f16.device_ptr(),
                     gate_up_out: gate_up_out.device_ptr(),
                     gate_up_fp8: gate_up_fp8.device_ptr(),
                     gate_up_scale: gate_up_scale.device_ptr(),
