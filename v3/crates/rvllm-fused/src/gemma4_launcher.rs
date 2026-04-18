@@ -266,8 +266,8 @@ impl RmsnormInplaceLaunch {
         Ok(())
     }
 
-    /// Applies RMSNorm in-place on f16 residual: x[i] = gamma * x[i] / rms(x).
-    /// Uses rmsnorm_inplace_f16_kernel (reads f16, writes f16 back).
+    /// Applies RMSNorm in-place: x[i] = gamma[i] * x[i] / rms(x).
+    /// Uses rmsnorm_inplace_f16_kernel (4 args: x, gamma, eps, hidden).
     pub unsafe fn launch(
         &self,
         kernel: KernelFn,

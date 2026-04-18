@@ -31,6 +31,7 @@ pub struct Gemma4EnginePaths {
 
 pub struct Gemma4FusedModules {
     pub rmsnorm_mod: LoadedModule,
+    pub rmsnorm_inplace_mod: LoadedModule,
     pub rope_mod: LoadedModule,
     pub gelu_mod: LoadedModule,
     pub argmax_mod: LoadedModule,
@@ -459,16 +460,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let softcap_mod = loader.load_ptx("logit_softcap")?;
     let residual_scale_mod = loader.load_ptx("residual_scale_f16")?;
 
-    // Post-norms use the fused_rmsnorm_fp8_quant kernel through the OLD
-    // 6-arg launcher path. The new 4-arg inplace launcher doesn't match
-    // this kernel's signature. For now, skip the post-norms entirely by
-    // pointing fn_rmsnorm at the same kernel but the RmsnormInplaceLaunch
-    // will need fixing. Use the inplace kernel if available.
-    let fn_rmsnorm = match loader.load_ptx("rmsnorm_inplace_f16") {
-        Ok(m) => m.get_function("rmsnorm_inplace_f16_kernel")
-            .unwrap_or_else(|_| rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel").unwrap()),
-        Err(_) => rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel").unwrap(),
-    };
+    let rmsnorm_inplace_mod = loader.load_ptx("rmsnorm_inplace_f16")?;
+    let fn_rmsnorm = rmsnorm_inplace_mod.get_function("rmsnorm_inplace_f16_kernel")?;
     let fn_rmsnorm_fp8_quant = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_quantize = rmsnorm_mod.get_function("quantize_fp8_per_token_kernel")?;
     let fn_rope_partial_fp8kv =
@@ -484,6 +477,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
 
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
+        rmsnorm_inplace_mod,
         rope_mod,
         gelu_mod,
         argmax_mod,
