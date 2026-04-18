@@ -27,7 +27,7 @@
 //!  14.  residual_scale_f16              residual *= layer_scalar
 
 use rvllm_core::Result;
-use rvllm_cutlass::CublasLt;
+use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan};
 use rvllm_fused::FusedRmsnormFp8QuantLaunch;
 use rvllm_fused::gemma4_launcher;
 use rvllm_kernels::KernelFn;
@@ -98,7 +98,17 @@ pub struct Gemma4LayerScratch {
     pub gate_up_scale: u64,
     pub mlp_out_fp8: u64,
     pub mlp_out_scale: u64,
+    pub cutlass_workspace: u64,
+    pub cutlass_workspace_bytes: usize,
     pub fa3_workspace: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Gemma4GemmPlans {
+    pub qkv: Fp8GemmPlan,
+    pub o: Fp8GemmPlan,
+    pub gate_up: Fp8GemmPlan,
+    pub down: Fp8GemmPlan,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -129,7 +139,8 @@ pub unsafe fn gemma4_forward(
     weights: &Gemma4LayerWeightPtrs,
     scratch: &Gemma4LayerScratch,
     meta: &Gemma4MetadataPtrs,
-    cublaslt: &CublasLt,
+    cutlass: &CutlassLib,
+    plans: &Gemma4GemmPlans,
     sliding_attention: &Fa3Kernels,
     global_attention: &Fa3Kernels,
     residual: u64,
@@ -154,17 +165,17 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 2. Q||K||V projection (cuBLASLt FP8 GEMM)
+    // 2. Q||K||V projection (CUTLASS FP8 GEMM with per-row activation scales)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm(
+    cutlass.launch_fp8_gemm(
+        &plans.qkv,
+        scratch.q_out,
         scratch.hidden_fp8,
         weights.qkv_fp8,
-        scratch.q_out,
-        dims.num_tokens as i32,
-        qkv_rows as i32,
-        dims.hidden as i32,
         scratch.hidden_scale,
         weights.qkv_scale,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
         stream,
     )?;
 
@@ -270,18 +281,18 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 7. O proj with residual epilogue
+    // 7. O proj with residual epilogue (CUTLASS)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_residual(
+    cutlass.launch_fp8_gemm_residual(
+        &plans.o,
+        residual,
         scratch.attn_out_fp8,
         weights.o_fp8,
-        residual,
-        residual,
-        dims.num_tokens as i32,
-        dims.hidden as i32,
-        q_dim as i32,
         scratch.attn_out_scale,
         weights.o_scale,
+        residual,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
         stream,
     )?;
 
@@ -333,17 +344,17 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 10. gate||up projection
+    // 10. gate||up projection (CUTLASS)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm(
+    cutlass.launch_fp8_gemm(
+        &plans.gate_up,
+        scratch.gate_up_out,
         scratch.hidden_fp8,
         weights.gate_up_fp8,
-        scratch.gate_up_out,
-        dims.num_tokens as i32,
-        (2 * dims.intermediate) as i32,
-        dims.hidden as i32,
         scratch.hidden_scale,
         weights.gate_up_scale,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
         stream,
     )?;
 
@@ -360,18 +371,18 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 12. Down proj with residual epilogue
+    // 12. Down proj with residual epilogue (CUTLASS)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_residual(
+    cutlass.launch_fp8_gemm_residual(
+        &plans.down,
+        residual,
         scratch.mlp_out_fp8,
         weights.down_fp8,
-        residual,
-        residual,
-        dims.num_tokens as i32,
-        dims.hidden as i32,
-        dims.intermediate as i32,
         scratch.mlp_out_scale,
         weights.down_scale,
+        residual,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
         stream,
     )?;
 
@@ -402,7 +413,7 @@ pub unsafe fn gemma4_forward(
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (cublaslt, qkv_rows, kv_dim);
+        let _ = (cutlass, plans, qkv_rows, kv_dim);
     }
     Ok(())
 }

@@ -23,6 +23,7 @@ NAME_TO_FILE = {
     "embedding_gather": "embedding_gather.ptx",
     "embedding_gather_f16": "embedding_gather_f16.ptx",
     "fp8_rescale": "fp8_rescale.ptx",
+    "rmsnorm_inplace_f16": "rmsnorm_inplace_f16.ptx",
     "fused_qk_rmsnorm": "fused_qk_rmsnorm.ptx",
     "logit_softcap": "logit_softcap.ptx",
     "residual_scale_f16": "residual_scale_f16.ptx",

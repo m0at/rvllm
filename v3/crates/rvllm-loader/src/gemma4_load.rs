@@ -99,6 +99,30 @@ pub fn load_gemma4_model(
         })
     };
 
+    // Gemma uses (1 + gamma) for RMSNorm weights. Pre-add 1.0 at load time
+    // so the kernel can use raw multiplication (same as Llama/Qwen path).
+    let upload_f16_gemma_norm = |name: &'static str, hf_name: &str| -> Result<F16Weight> {
+        let (si, e) = must_get(hf_name)?;
+        let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let n = buf.len() / 2;
+        for i in 0..n {
+            let lo = buf[2 * i];
+            let hi = buf[2 * i + 1];
+            let bits = u16::from_le_bytes([lo, hi]);
+            let v = f16::from_bits(bits);
+            let adjusted = f16::from_f32(v.to_f32() + 1.0);
+            let out = adjusted.to_le_bytes();
+            buf[2 * i] = out[0];
+            buf[2 * i + 1] = out[1];
+        }
+        let region = arena.region(name, buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        Ok(F16Weight {
+            offset_bytes: region.device_ptr(),
+            shape: e.shape.clone(),
+        })
+    };
+
     let embed_name = format!("{prefix}.embed_tokens.weight");
     let embedding = upload_f16("embedding", &embed_name)?;
 
@@ -291,16 +315,16 @@ pub fn load_gemma4_model(
         };
 
         let input_layernorm =
-            upload_f16("input_ln", &ln("input_layernorm.weight"))?;
+            upload_f16_gemma_norm("input_ln", &ln("input_layernorm.weight"))?;
         let post_attention_layernorm =
-            upload_f16("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
+            upload_f16_gemma_norm("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
         let pre_feedforward_layernorm =
-            upload_f16("pre_ff_ln", &ln("pre_feedforward_layernorm.weight"))?;
+            upload_f16_gemma_norm("pre_ff_ln", &ln("pre_feedforward_layernorm.weight"))?;
         let post_feedforward_layernorm =
-            upload_f16("post_ff_ln", &ln("post_feedforward_layernorm.weight"))?;
+            upload_f16_gemma_norm("post_ff_ln", &ln("post_feedforward_layernorm.weight"))?;
 
-        let q_norm = upload_f16("q_norm", &ln("self_attn.q_norm.weight"))?;
-        let k_norm = upload_f16("k_norm", &ln("self_attn.k_norm.weight"))?;
+        let q_norm = upload_f16_gemma_norm("q_norm", &ln("self_attn.q_norm.weight"))?;
+        let k_norm = upload_f16_gemma_norm("k_norm", &ln("self_attn.k_norm.weight"))?;
 
         let layer_scalar = upload_f16("layer_scalar", &ln("layer_scalar"))?;
 

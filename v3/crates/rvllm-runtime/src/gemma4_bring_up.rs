@@ -236,8 +236,24 @@ impl Gemma4Bringup {
 
         let logits = arena.region("logits", (num_seqs * vocab * 2) as usize, 16).unwrap();
         let sampled_tokens = arena.region("sampled_tokens", (num_seqs * 4) as usize, 16).unwrap();
+        let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
+        let cutlass_ws = arena.region("cutlass_ws_gemma4", cutlass_ws_bytes, 256).unwrap();
         let residual_ptr = residual.device_ptr();
         let kernels = self.layer_kernels();
+
+        // GEMM plans — uniform shapes across all layers (the sliding/global
+        // distinction is a runtime head reshape, weight dims are identical).
+        // Use the sliding-layer dims for the plan since those are the common case.
+        let q_dim_s = (arch.num_attention_heads * arch.head_dim_sliding) as u32;
+        let kv_dim_s = (arch.num_kv_heads_sliding * arch.head_dim_sliding) as u32;
+        let qkv_rows_s = q_dim_s + 2 * kv_dim_s;
+        use rvllm_cutlass::Fp8GemmPlan;
+        let gemm_plans = Gemma4GemmPlans {
+            qkv: Fp8GemmPlan::from_policy(&self.policy, num_seqs, qkv_rows_s, hidden, rvllm_core::DType::Fp8E4M3).unwrap(),
+            o: Fp8GemmPlan::from_policy_residual(&self.policy, num_seqs, hidden, q_dim_s, rvllm_core::DType::Fp8E4M3).unwrap(),
+            gate_up: Fp8GemmPlan::from_policy(&self.policy, num_seqs, 2 * inter, hidden, rvllm_core::DType::Fp8E4M3).unwrap(),
+            down: Fp8GemmPlan::from_policy_residual(&self.policy, num_seqs, hidden, inter, rvllm_core::DType::Fp8E4M3).unwrap(),
+        };
 
         let one_step = || -> rvllm_core::Result<()> {
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
@@ -321,6 +337,8 @@ impl Gemma4Bringup {
                     gate_up_scale: gate_up_scale.device_ptr(),
                     mlp_out_fp8: mlp_out_fp8.device_ptr(),
                     mlp_out_scale: mlp_out_scale.device_ptr(),
+                    cutlass_workspace: cutlass_ws.device_ptr(),
+                    cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
                 };
 
@@ -339,7 +357,8 @@ impl Gemma4Bringup {
                     &w,
                     &scratch,
                     &meta,
-                    &self.cublaslt,
+                    &self.cutlass,
+                    &gemm_plans,
                     &self.sliding_attention,
                     &self.global_attention,
                     residual_ptr,
@@ -441,7 +460,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let softcap_mod = loader.load_ptx("logit_softcap")?;
     let residual_scale_mod = loader.load_ptx("residual_scale_f16")?;
 
-    let fn_rmsnorm = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
+    let rmsnorm_inplace_mod = loader.load_ptx("rmsnorm_inplace_f16")?;
+    let fn_rmsnorm = rmsnorm_inplace_mod.get_function("rmsnorm_inplace_f16_kernel")?;
     let fn_rmsnorm_fp8_quant = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_quantize = rmsnorm_mod.get_function("quantize_fp8_per_token_kernel")?;
     let fn_rope_partial_fp8kv =

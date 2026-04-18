@@ -266,18 +266,8 @@ impl RmsnormInplaceLaunch {
         Ok(())
     }
 
-    /// Applies RMSNorm in-place: x[i] = gamma * x[i] / rms(x[i]).
-    /// Reuses the fused_rmsnorm kernel with the output aliased to input.
-    /// The FP8 output is discarded (written to a throwaway buffer or
-    /// the same pointer since we only care about the in-place f16 path).
-    ///
-    /// For Gemma 4 the post-attention and post-feedforward norms are
-    /// applied to the residual without producing FP8. A dedicated
-    /// "rmsnorm_inplace" PTX kernel would be cleaner (avoids the wasted
-    /// FP8 write), but reusing fused_rmsnorm works for bringup.
-    ///
-    /// # Safety
-    /// Caller owns pointers.
+    /// Applies RMSNorm in-place on f16 residual: x[i] = gamma * x[i] / rms(x).
+    /// Uses rmsnorm_inplace_f16_kernel (reads f16, writes f16 back).
     pub unsafe fn launch(
         &self,
         kernel: KernelFn,
@@ -286,26 +276,12 @@ impl RmsnormInplaceLaunch {
         stream: u64,
     ) -> Result<()> {
         self.validate()?;
-        // Reuse fused_rmsnorm_fp8_quant kernel with out_fp8 = x_inout
-        // (the FP8 output overwrites bytes we don't read again).
-        // This is safe because the kernel reads the entire row first,
-        // then writes. The FP8 output is 1 byte/elem vs 2 bytes/elem
-        // for f16 input, so it only overwrites the first half of each
-        // row -- the in-place f16 norm is the "in_hidden -> in_hidden"
-        // aliased path.
-        //
-        // TODO: write a dedicated rmsnorm_inplace.cu that avoids the
-        // FP8 output entirely. For bringup this works.
-        let mut out_fp8 = x_inout;
-        let mut scale = x_inout; // throwaway
-        let mut in_hidden = x_inout;
+        let mut x = x_inout;
         let mut gamma = gamma;
         let mut eps = self.eps;
         let mut hidden = self.hidden as i32;
         let args = [
-            (&mut out_fp8) as *mut u64 as *mut core::ffi::c_void,
-            (&mut scale) as *mut u64 as *mut core::ffi::c_void,
-            (&mut in_hidden) as *mut u64 as *mut core::ffi::c_void,
+            (&mut x) as *mut u64 as *mut core::ffi::c_void,
             (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
             (&mut eps) as *mut f32 as *mut core::ffi::c_void,
             (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
