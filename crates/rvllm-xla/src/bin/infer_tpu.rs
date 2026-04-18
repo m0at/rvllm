@@ -82,8 +82,13 @@ mod tpu_main {
         eprintln!("loaded {NUM_LAYERS} layer weight sets + embed/head in {:.1}s",
             t0.elapsed().as_secs_f32());
 
-        let prompt_ids: Vec<i32> = args.prompt.bytes().map(|b| b as i32).collect();
-        eprintln!("prompt: {:?} ({} tokens)", args.prompt, prompt_ids.len());
+        // If prompt looks like comma-separated numbers, use as token IDs directly
+        let prompt_ids: Vec<i32> = if args.prompt.contains(',') && args.prompt.chars().all(|c| c.is_ascii_digit() || c == ',' || c == ' ') {
+            args.prompt.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        } else {
+            args.prompt.bytes().map(|b| b as i32).collect()
+        };
+        eprintln!("prompt: {} tokens {:?}", prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(10)]);
 
         // Stacked KV caches: [NUM_LAYERS, NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM]
         let kv_stacked_bytes = NUM_LAYERS * NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM * 2;
@@ -133,8 +138,16 @@ mod tpu_main {
                 PjrtElementType::S32, 0).unwrap();
 
             let pos_host: Vec<i32> = (0..BATCH).map(|_| context_len).collect();
-            let slot_host: Vec<i32> = (0..BATCH).map(|i|
-                context_len * (BATCH as i32) + i as i32).collect();
+            // slot = block_index * block_size + offset_within_block
+            // For seq i: block = context_len / BLOCK_SIZE, offset = context_len % BLOCK_SIZE
+            // Slot = block_tables[i][block] * BLOCK_SIZE + offset
+            // Simplified: each seq gets its own block range starting at i * MAX_BLOCKS_PER_SEQ
+            let slot_host: Vec<i32> = (0..BATCH).map(|i| {
+                let block = context_len / BLOCK_SIZE as i32;
+                let offset = context_len % BLOCK_SIZE as i32;
+                let block_idx = (i as i32) * MAX_BLOCKS_PER_SEQ as i32 + block;
+                block_idx * BLOCK_SIZE as i32 + offset
+            }).collect();
             let ctx_host: Vec<i32> = (0..BATCH).map(|_| context_len + 1).collect();
             let pos_buf = client.buffer_from_host(
                 bytemuck::cast_slice(&pos_host), &[BATCH as i64],
