@@ -211,21 +211,6 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 </table>
 <div class="footnote"><strong>The 1.8 ms cond overhead is structural</strong> -- Gemma 4's dual attention (sliding vs global layers) requires runtime dispatch. Nested scan eliminated the cond but added more loop overhead. Flat scan + cond is the optimum for XLA's TPU compiler.</div>
 
-<h3>Gemma 4 31B FP8 on H100 <span class="badge measured">Measured</span></h3>
-<div class="note">
-  <strong>GPU path (Rust+CUDA).</strong> 60 layers with hybrid attention: 50 sliding (FA3 SM90, head_dim=256, 1024-token window) + 10 global (SM89 fallback, head_dim=512). GELU(tanh), QK-norm, dual RoPE, logit softcap.
-</div>
-<table class="mm-table">
-<thead><tr><th>N</th><th class="r">rvLLM tok/s</th><th class="r">ms/step</th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">11.2</td><td class="r">89.3</td></tr>
-<tr><td>8</td><td class="r">87</td><td class="r">91.6</td></tr>
-<tr><td>64</td><td class="r">704</td><td class="r">90.9</td></tr>
-<tr><td>128</td><td class="r pending">pending</td><td class="r">--</td></tr>
-</tbody>
-</table>
-<div class="footnote"><strong>GPU Gemma 4 bottleneck:</strong> cuBLASLt descriptor overhead at batch=1. CUDA graph capture will close the gap. The TPU path avoids this entirely -- XLA fuses all ops into one compiled loop.</div>
-
 
 <h2 class="section">GPU: H100 SXM results <span class="sub">Rust+CUDA, FP8 &mdash; throughput valid, perplexity unvalidated</span></h2>
 
@@ -307,8 +292,6 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 </tbody>
 </table>
 <div class="footnote"><strong>rvLLM beats vLLM at N&ge;64 across all tested 7-8B models.</strong> At small batch (N&le;16) vLLM leads due to rvLLM's per-step cuBLASLt descriptor overhead. CUDA graph capture closes this gap.</div>
-
-<h2>Qwen2.5-7B detailed results <span class="sub">original single-model sweep</span> <span class="badge measured">Measured</span></h2>
 
 <h2>Time-to-first-token <span class="sub">prompt &rarr; first sampled token visible on host</span> <span class="badge measured">Measured</span></h2>
 <div class="chart-box">
@@ -597,74 +580,6 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <strong>TPU kernel suite</strong> (under <code>tpu/</code>): JAX traces each CUDA kernel's logical signature via a <code>ShapeDtypeStruct</code> trace-spec, <code>jax.jit(...).lower(...).compiler_ir(dialect="stablehlo")</code> emits one <code>.mlir</code> per kernel (1,138 lines total), and <code>harness/execute_all.py</code> runs them on the active JAX backend with warmup&times;3 + median-of-20 iter timing. Kernel numbers above are from a Cloud TPU v6e-1 in <code>us-east5-b</code>; confirmed identical on a v6e-4 (2&times;2, 4 chips) in <code>us-east5-a</code>.
 </div>
 
-<h3>End-to-end throughput on v6e-4 (2&times;2)</h3>
-
-<div class="caveat">
-  <strong>Different model, different methodology.</strong> Qwen2.5-7B has no Flax implementation in HuggingFace transformers, so this bench uses <strong>OPT-1.3B</strong> via <code>FlaxOPTForCausalLM.from_pretrained(from_pt=True)</code> on a v6e-4 (4 chips, 128 GB HBM). Inference is naive autoregressive <code>model.generate()</code> with no paged KV cache, no continuous batching, and no CUDA graphs equivalent. <strong>TTFT is dominated by XLA trace-and-compile per new shape, not actual prefill.</strong> These numbers prove that real end-to-end generation runs on TPU silicon; they are not comparable to the H100 rvLLM numbers which use a production-grade engine.
-</div>
-
-<div class="pill-row">
-  <div class="pill">
-    <div class="label">peak tok/s (N=128)</div>
-    <strong>515</strong>
-    <div class="caption">OPT-1.3B bf16, naive generate()</div>
-  </div>
-  <div class="pill">
-    <div class="label">throughput scaling</div>
-    <strong>~71&times; over 128&times; N</strong>
-    <div class="caption">near-linear: 7 &rarr; 38 &rarr; 65 &rarr; 229 &rarr; 515 tok/s</div>
-  </div>
-  <div class="pill">
-    <div class="label">device</div>
-    <strong>v6e-4 (2&times;2)</strong>
-    <div class="caption">4 Trillium chips, 128 GB HBM, us-east5-a</div>
-  </div>
-</div>
-
-<table>
-<thead><tr><th>N</th><th class="r">tok/s</th><th class="r">TTFT (ms)</th><th class="r">wall (s)</th><th class="r">output tokens</th><th>notes</th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">7.23</td><td class="r neg">12,454</td><td class="r">17.7</td><td class="r">128</td><td>XLA compile dominates</td></tr>
-<tr><td>8</td><td class="r">37.75</td><td class="r neg">14,246</td><td class="r">27.1</td><td class="r">1,024</td><td></td></tr>
-<tr><td>16</td><td class="r">65.38</td><td class="r neg">16,164</td><td class="r">31.3</td><td class="r">2,048</td><td></td></tr>
-<tr><td>64</td><td class="r">229.48</td><td class="r neg">24,816</td><td class="r">35.7</td><td class="r">8,192</td><td></td></tr>
-<tr><td>128</td><td class="r"><strong>515.46</strong></td><td class="r neg">26,512</td><td class="r">31.8</td><td class="r">16,384</td><td>peak throughput</td></tr>
-</tbody>
-</table>
-
-<div class="footnote"><strong>Why TTFT is 12&ndash;27 seconds.</strong> Flax's <code>generate()</code> triggers an XLA trace + compile on every new batch shape. There is no graph caching across N values. In a production TPU engine (JetStream, MaxText, or a future rvLLM-XLA), the graph would be compiled once at startup and replayed — TTFT would collapse to the prefill compute time (~1&ndash;5 ms for a 1.3B model). The throughput numbers (tok/s) are valid post-compile and scale linearly with batch size as expected.</div>
-
-<div class="method">
-<strong>TPU e2e bench</strong>: OPT-1.3B loaded via <code>FlaxOPTForCausalLM.from_pretrained("facebook/opt-1.3b", from_pt=True, dtype=jnp.bfloat16)</code> on a Cloud TPU v6e-4 in <code>us-east5-a</code>. Each N: warmup (2 tokens), TTFT (1 token generate), throughput (128 token generate). JAX 0.6.2, transformers, torch CPU for weight conversion. VM torn down after bench. Qwen2.5-7B was attempted but has no Flax model class; vLLM-on-TPU was attempted but blocked by torch_xla/libtpu version matrix (vLLM 0.19 needs torch 2.10 + tpu_inference, which aren't co-installable on the v2-alpha-tpuv6e VM image yet).
-</div>
-
-<h2 class="section">TPU / XLA &mdash; Rust PJRT path <span class="sub">direct Rust &rarr; PJRT, no Python, no JAX</span> <span class="badge future">In progress</span></h2>
-
-<div class="note">
-  <strong>Goal:</strong> match JAX kernel latencies through a direct Rust &rarr; PJRT C API path, eliminating Python and JAX from the inference stack entirely. This is the rvLLM-XLA backend.
-</div>
-
-<div class="tpu-progress">
-  <div class="step"><span class="dot done"></span> PJRT C API FFI &mdash; compile working</div>
-  <div class="step"><span class="dot done"></span> Buffer upload to TPU device working</div>
-  <div class="step"><span class="dot active"></span> Execute fix deployed, testing pending (waiting for TPU VM capacity)</div>
-  <div class="step"><span class="dot todo"></span> End-to-end decode step through Rust PJRT</div>
-  <div class="step"><span class="dot todo"></span> Full model inference loop</div>
-</div>
-
-<h3>JAX baseline latencies (target to match) <span class="badge measured">Measured</span></h3>
-<table>
-<thead><tr><th>Operation</th><th class="r">JAX latency (&mu;s)</th><th>Notes</th></tr></thead>
-<tbody>
-<tr><td>cast_fp (fp32 &rarr; bf16)</td><td class="r">117</td><td>dispatch floor on v6e</td></tr>
-<tr><td>rms_norm</td><td class="r">122</td><td>128x4096 fp32</td></tr>
-<tr><td>gemm_bf16</td><td class="r">120</td><td>M=128 N=K=4096</td></tr>
-</tbody>
-</table>
-
-<div class="note">
-  <strong>Why this matters.</strong> The JAX kernel latencies above (117&ndash;122 &mu;s) are dominated by XLA host-to-device dispatch overhead, not compute. If rvLLM's Rust PJRT path can match these numbers, it proves the Rust FFI adds no overhead versus JAX's Python &rarr; XLA path. The real win comes later: persistent PJRT sessions eliminate per-call dispatch and should push latencies below the JAX floor for fused megakernels.
-</div>
 
 <h2>Method &mdash; how these runs were produced</h2>
 <div class="method">
