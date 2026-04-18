@@ -27,6 +27,7 @@ NAME_TO_FILE = {
     "fused_qk_rmsnorm": "fused_qk_rmsnorm.ptx",
     "logit_softcap": "logit_softcap.ptx",
     "residual_scale_f16": "residual_scale_f16.ptx",
+    "vnorm_f16": "vnorm_f16.ptx",
 }
 
 

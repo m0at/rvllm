@@ -344,6 +344,55 @@ impl ResidualScaleF16Launch {
 }
 
 // ---------------------------------------------------------------------------
+// vnorm_f16 (parameter-free RMS norm on V)
+// ---------------------------------------------------------------------------
+
+pub struct VnormF16Launch {
+    pub num_tokens: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub eps: f32,
+}
+
+impl VnormF16Launch {
+    pub fn validate(&self) -> Result<()> {
+        if self.num_tokens == 0 {
+            return Err(invalid("num_tokens", "must be > 0"));
+        }
+        if self.num_kv_heads == 0 || self.head_dim == 0 {
+            return Err(invalid("vnorm", "zero dim"));
+        }
+        Ok(())
+    }
+
+    /// Kernel sig: `(v_f16_inout, eps, head_dim)`.
+    /// Grid: (num_tokens * num_kv_heads), Block: (min(head_dim, 1024)).
+    ///
+    /// # Safety
+    /// Caller owns pointers.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        v_inout: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut v = v_inout;
+        let mut eps = self.eps;
+        let mut head_dim = self.head_dim as i32;
+        let args = [
+            (&mut v) as *mut u64 as *mut core::ffi::c_void,
+            (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+            (&mut head_dim) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let grid = (self.num_tokens * self.num_kv_heads, 1, 1);
+        let block = (self.head_dim.min(1024), 1, 1);
+        const SMEM: u32 = 32 * 4;
+        launch_raw(kernel, grid, block, SMEM, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // logit_softcap
 // ---------------------------------------------------------------------------
 
