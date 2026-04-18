@@ -134,6 +134,8 @@ pub struct Gemma4LayerKernels {
     pub vnorm_f16: KernelFn,
     pub vector_add_f16: KernelFn,
     pub bf16_to_f16_sat: KernelFn,
+    pub rmsnorm_inplace_bf16: KernelFn,
+    pub vector_add_bf16_to_f16: KernelFn,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -348,7 +350,7 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 7. O proj -> delta buffer (bf16 output, then convert to f16 with saturation)
+    // 7. O proj -> delta buffer (bf16 output to avoid f16 overflow)
     #[cfg(feature = "cuda")]
     cublaslt.fp8_gemm_bf16(
         scratch.attn_out_fp8,
@@ -361,29 +363,25 @@ pub unsafe fn gemma4_forward(
         weights.o_scale,
         stream,
     )?;
-    #[cfg(feature = "cuda")]
-    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * dims.hidden }
-        .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, scratch.delta_f16, stream)?;
 
-    // 8. post_attention_layernorm on the DELTA (not residual).
-    // HF: hidden_states = post_attn_norm(attn_output); residual += hidden_states
+    // 8. post_attention_layernorm on the DELTA (bf16 in-place)
     gemma4_launcher::RmsnormInplaceLaunch {
         num_tokens: dims.num_tokens,
         hidden: dims.hidden,
         eps: dims.rms_eps,
     }
     .launch(
-        kernels.fused_rmsnorm,
+        kernels.rmsnorm_inplace_bf16,
         scratch.delta_f16,
         weights.post_attn_norm_gamma,
         stream,
     )?;
 
-    // 8b. residual += normed delta
+    // 8b. residual(f16) += normed delta(bf16)
     gemma4_launcher::VectorAddF16Launch {
         n: dims.num_tokens * dims.hidden,
     }
-    .launch(kernels.vector_add_f16, residual, scratch.delta_f16, stream)?;
+    .launch(kernels.vector_add_bf16_to_f16, residual, scratch.delta_f16, stream)?;
 
     #[cfg(feature = "cuda")]
     probe!("after_step8_residual", residual, dims.hidden);
@@ -454,39 +452,28 @@ pub unsafe fn gemma4_forward(
         weights.down_scale,
         stream,
     )?;
-    #[cfg(feature = "cuda")]
-    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * dims.hidden }
-        .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, scratch.delta_f16, stream)?;
 
     #[cfg(feature = "cuda")]
-    probe!("step12_delta_f16", scratch.delta_f16, dims.hidden);
-    #[cfg(feature = "cuda")]
-    probe_amax!("step12_raw_delta_amax", scratch.delta_f16, dims.hidden);
+    probe!("step12_delta_bf16", scratch.delta_f16, dims.hidden);
 
-    // 13. post_feedforward_layernorm on the DELTA (not residual).
-    // HF: hidden_states = post_ff_norm(mlp_output); residual += hidden_states
+    // 13. post_feedforward_layernorm on the DELTA (bf16 in-place)
     gemma4_launcher::RmsnormInplaceLaunch {
         num_tokens: dims.num_tokens,
         hidden: dims.hidden,
         eps: dims.rms_eps,
     }
     .launch(
-        kernels.fused_rmsnorm,
+        kernels.rmsnorm_inplace_bf16,
         scratch.delta_f16,
         weights.post_ff_norm_gamma,
         stream,
     )?;
 
-    #[cfg(feature = "cuda")]
-    probe!("step13_normed_delta", scratch.delta_f16, dims.hidden);
-    #[cfg(feature = "cuda")]
-    probe_amax!("step13_normed_delta_amax", scratch.delta_f16, dims.hidden);
-
-    // 13b. residual += normed delta
+    // 13b. residual(f16) += normed delta(bf16)
     gemma4_launcher::VectorAddF16Launch {
         n: dims.num_tokens * dims.hidden,
     }
-    .launch(kernels.vector_add_f16, residual, scratch.delta_f16, stream)?;
+    .launch(kernels.vector_add_bf16_to_f16, residual, scratch.delta_f16, stream)?;
 
     #[cfg(feature = "cuda")]
     probe!("after_step13_residual", residual, dims.hidden);
