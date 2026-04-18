@@ -233,6 +233,33 @@ pub unsafe fn gemma4_forward(
     probe!("after_step1_residual", residual, dims.hidden);
     #[cfg(feature = "cuda")]
     probe_f32!("step1_hidden_scale", scratch.hidden_scale);
+    #[cfg(feature = "cuda")]
+    probe_f32!("step1_qkv_wscale", weights.qkv_scale);
+    #[cfg(feature = "cuda")]
+    {
+        if dbg_layer >= 0 {
+            cudarc::driver::sys::cuStreamSynchronize(stream as _);
+            let mut hs = [0.0f32; 1];
+            let mut ws = [0.0f32; 1];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(hs.as_mut_ptr() as *mut _, scratch.hidden_scale, 4);
+            cudarc::driver::sys::cuMemcpyDtoH_v2(ws.as_mut_ptr() as *mut _, weights.qkv_scale, 4);
+            eprintln!("    [L{} step1_scale_product] hidden*qkv = {:.6e} * {:.6e} = {:.6e}",
+                dbg_layer, hs[0], ws[0], hs[0] * ws[0]);
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        if dbg_layer >= 0 {
+            cudarc::driver::sys::cuStreamSynchronize(stream as _);
+            let mut wb = [0u8; 8];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(wb.as_mut_ptr() as *mut _, weights.qkv_fp8, 8);
+            eprintln!("    [L{} step2_qkv_fp8_bytes] first8={:?}", dbg_layer, wb);
+            let mut hb = [0u8; 8];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(hb.as_mut_ptr() as *mut _, scratch.hidden_fp8, 8);
+            eprintln!("    [L{} step2_hidden_fp8_bytes] first8={:?}", dbg_layer, hb);
+        }
+    }
 
     // 2. Q||K||V projection
     #[cfg(feature = "cuda")]
@@ -395,6 +422,10 @@ pub unsafe fn gemma4_forward(
 
     // 7. O proj -> F32 tmp -> BF16 delta buffer
     #[cfg(feature = "cuda")]
+    probe_f32!("step6_attn_out_scale", scratch.attn_out_scale);
+    #[cfg(feature = "cuda")]
+    probe_f32!("step7_o_wscale", weights.o_scale);
+    #[cfg(feature = "cuda")]
     if weights.o_f16 != 0 {
         cublaslt.f16_gemm_f32(scratch.attn_out, weights.o_f16, scratch.gemm_f32_tmp,
             dims.num_tokens as i32, dims.hidden as i32, q_dim as i32, stream)?;
@@ -494,6 +525,8 @@ pub unsafe fn gemma4_forward(
 
     // 12. Down proj -> F32 tmp -> BF16 delta buffer
     // (F16 bypass not supported here -- GELU*mul outputs FP8, so down_proj stays FP8)
+    #[cfg(feature = "cuda")]
+    probe_f32!("step12_down_wscale", weights.down_scale);
     #[cfg(feature = "cuda")]
     cublaslt.fp8_gemm_f32(
         scratch.mlp_out_fp8,
