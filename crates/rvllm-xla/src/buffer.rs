@@ -1,6 +1,9 @@
 use crate::device::XlaDeviceId;
 use crate::Result;
 
+#[cfg(feature = "tpu")]
+use crate::ffi::PjrtElementType;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XlaDtype {
     F32,
@@ -22,14 +25,28 @@ impl XlaDtype {
             Self::I64 => 8,
         }
     }
+
+    #[cfg(feature = "tpu")]
+    pub fn to_pjrt(&self) -> PjrtElementType {
+        match self {
+            Self::F32 => PjrtElementType::F32,
+            Self::F16 => PjrtElementType::F16,
+            Self::BF16 => PjrtElementType::BF16,
+            Self::U8 => PjrtElementType::U8,
+            Self::U16 => PjrtElementType::U16,
+            Self::U32 => PjrtElementType::U32,
+            Self::I32 => PjrtElementType::S32,
+            Self::I64 => PjrtElementType::S64,
+        }
+    }
 }
 
 pub struct XlaBuffer {
-    // Will hold *mut PJRT_Buffer once FFI lands.
-    // For now, the fields define the API contract.
     shape: Vec<i64>,
     dtype: XlaDtype,
     device: XlaDeviceId,
+    #[cfg(feature = "tpu")]
+    pjrt_handle: Option<crate::client::PjrtBufferHandle>,
 }
 
 impl XlaBuffer {
@@ -53,17 +70,65 @@ impl XlaBuffer {
         self.num_elements() * self.dtype.size_bytes()
     }
 
+    #[cfg(feature = "tpu")]
+    pub(crate) fn pjrt_handle(&self) -> Option<&crate::client::PjrtBufferHandle> {
+        self.pjrt_handle.as_ref()
+    }
+
+    #[cfg(feature = "tpu")]
+    pub(crate) fn from_pjrt_handle(
+        handle: crate::client::PjrtBufferHandle,
+        device_idx: usize,
+    ) -> Self {
+        Self {
+            shape: vec![],
+            dtype: XlaDtype::F32,
+            device: XlaDeviceId(device_idx),
+            pjrt_handle: Some(handle),
+        }
+    }
+
+    #[cfg(feature = "tpu")]
+    pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
+        let handle = self.pjrt_handle.as_ref().ok_or_else(|| {
+            crate::LLMError::GpuError("XlaBuffer has no PJRT handle".into())
+        })?;
+        handle.client().buffer_to_host(handle, dst)
+    }
+
+    #[cfg(not(feature = "tpu"))]
     pub fn copy_to_host(&self, _dst: &mut [u8]) -> Result<()> {
-        // Will call PJRT_Buffer_ToHostBuffer + PJRT_Event_Await.
         Err(crate::LLMError::GpuError(
-            "PJRT FFI not yet implemented -- cannot copy buffer to host".into(),
+            "PJRT FFI not enabled -- build with --features tpu".into(),
         ))
     }
 
-    pub fn copy_from_host(_src: &[u8], _shape: &[i64], _dtype: XlaDtype, _device: XlaDeviceId) -> Result<Self> {
-        // Will call PJRT_Client_BufferFromHostBuffer.
+    #[cfg(feature = "tpu")]
+    pub fn copy_from_host(
+        client: &crate::client::PjrtClientHandle,
+        src: &[u8],
+        shape: &[i64],
+        dtype: XlaDtype,
+        device: XlaDeviceId,
+    ) -> Result<Self> {
+        let handle = client.buffer_from_host(src, shape, dtype.to_pjrt(), device.0)?;
+        Ok(Self {
+            shape: shape.to_vec(),
+            dtype,
+            device,
+            pjrt_handle: Some(handle),
+        })
+    }
+
+    #[cfg(not(feature = "tpu"))]
+    pub fn copy_from_host(
+        _src: &[u8],
+        _shape: &[i64],
+        _dtype: XlaDtype,
+        _device: XlaDeviceId,
+    ) -> Result<Self> {
         Err(crate::LLMError::GpuError(
-            "PJRT FFI not yet implemented -- cannot create buffer from host".into(),
+            "PJRT FFI not enabled -- build with --features tpu".into(),
         ))
     }
 }
@@ -89,6 +154,8 @@ mod tests {
             shape: vec![128, 4096],
             dtype: XlaDtype::BF16,
             device: XlaDeviceId(0),
+            #[cfg(feature = "tpu")]
+            pjrt_handle: None,
         };
         assert_eq!(buf.num_elements(), 128 * 4096);
         assert_eq!(buf.size_bytes(), 128 * 4096 * 2);

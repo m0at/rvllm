@@ -8,9 +8,10 @@ use crate::Result;
 
 pub struct LoadedExecutable {
     name: String,
-    // Will hold *mut PJRT_LoadedExecutable once FFI lands.
     num_inputs: usize,
     num_outputs: usize,
+    #[cfg(feature = "tpu")]
+    compiled: Option<crate::client::CompiledExecutable>,
 }
 
 impl LoadedExecutable {
@@ -26,10 +27,34 @@ impl LoadedExecutable {
         self.num_outputs
     }
 
+    #[cfg(feature = "tpu")]
+    pub fn execute(&self, inputs: &[&XlaBuffer]) -> Result<Vec<XlaBuffer>> {
+        let compiled = self.compiled.as_ref().ok_or_else(|| {
+            crate::LLMError::GpuError(format!(
+                "module '{}' has no compiled executable", self.name
+            ))
+        })?;
+        let pjrt_client = compiled.client();
+        let buf_handles: Vec<&crate::client::PjrtBufferHandle> = inputs
+            .iter()
+            .map(|b| b.pjrt_handle().ok_or_else(|| {
+                crate::LLMError::GpuError("XlaBuffer has no PJRT handle".into())
+            }))
+            .collect::<Result<Vec<_>>>()?;
+        let out_handles = pjrt_client.execute(compiled, &buf_handles)?;
+        let results = out_handles
+            .into_iter()
+            .enumerate()
+            .map(|(i, h)| XlaBuffer::from_pjrt_handle(h, i))
+            .collect();
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "tpu"))]
     pub fn execute(&self, _inputs: &[&XlaBuffer]) -> Result<Vec<XlaBuffer>> {
-        // Will call PJRT_LoadedExecutable_Execute.
         Err(crate::LLMError::GpuError(format!(
-            "PJRT FFI not yet implemented -- cannot execute module '{}'",
+            "PJRT FFI not enabled -- cannot execute module '{}'. \
+             Build with --features tpu",
             self.name
         )))
     }
@@ -37,9 +62,31 @@ impl LoadedExecutable {
 
 pub struct ModuleLoader {
     modules: HashMap<String, LoadedExecutable>,
+    #[cfg(feature = "tpu")]
+    client: Option<crate::client::PjrtClientHandle>,
 }
 
 impl ModuleLoader {
+    #[cfg(feature = "tpu")]
+    pub fn new(mlir_dir: &Path) -> Result<Self> {
+        let client = crate::client::PjrtClientHandle::new()?;
+        let mut loader = Self {
+            modules: HashMap::new(),
+            client: Some(client),
+        };
+
+        if !mlir_dir.exists() || !mlir_dir.is_dir() {
+            return Err(crate::LLMError::GpuError(format!(
+                "MLIR directory '{}' does not exist",
+                mlir_dir.display()
+            )));
+        }
+
+        loader.load_directory(mlir_dir)?;
+        Ok(loader)
+    }
+
+    #[cfg(not(feature = "tpu"))]
     pub fn new(mlir_dir: &Path) -> Result<Self> {
         let mut loader = Self {
             modules: HashMap::new(),
@@ -59,16 +106,36 @@ impl ModuleLoader {
     pub fn empty() -> Self {
         Self {
             modules: HashMap::new(),
+            #[cfg(feature = "tpu")]
+            client: None,
         }
     }
 
+    #[cfg(feature = "tpu")]
     pub fn load_mlir(&mut self, name: &str, mlir_text: &str) -> Result<()> {
-        // Will:
-        // 1. Serialize mlir_text to StableHLO bytecode
-        // 2. Call PJRT_Client_Compile
-        // 3. Store the LoadedExecutable
         debug!(module = name, len = mlir_text.len(), "loading StableHLO module");
+        let (num_inputs, num_outputs) = parse_mlir_signature(mlir_text)?;
 
+        let compiled = if let Some(ref client) = self.client {
+            Some(client.compile(mlir_text)?)
+        } else {
+            None
+        };
+
+        let exe = LoadedExecutable {
+            name: name.to_string(),
+            num_inputs,
+            num_outputs,
+            compiled,
+        };
+
+        self.modules.insert(name.to_string(), exe);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "tpu"))]
+    pub fn load_mlir(&mut self, name: &str, mlir_text: &str) -> Result<()> {
+        debug!(module = name, len = mlir_text.len(), "loading StableHLO module");
         let (num_inputs, num_outputs) = parse_mlir_signature(mlir_text)?;
 
         let exe = LoadedExecutable {
