@@ -534,6 +534,7 @@ impl Bringup {
                     residual_ptr,
                     stream,
                     phase,
+                    self.arch.layer_types[layer_idx],
                 )?;
 
                 // NaN diagnostic: read 8 f16 values from residual after each layer.
@@ -1046,6 +1047,7 @@ impl Bringup {
                     &self.cutlass, &self.cublaslt, &self.fa3,
                     residual_ptr, stream,
                     layer_exec::LayerPhase::Decode,
+                    self.arch.layer_types[layer_idx],
                 )?;
             }
             // LM head (no argmax).

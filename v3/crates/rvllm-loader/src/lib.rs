@@ -15,6 +15,6 @@ pub mod safetensors;
 pub mod weights;
 
 pub use fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, QuantResult, FP8_E4M3_MAX};
-pub use load::{load_model, ModelArch};
+pub use load::{load_model, LayerAttnType, ModelArch};
 pub use safetensors::{ShardHeader, ShardIndex, TensorEntry};
 pub use weights::{F16Weight, Fp8Weight, LayerWeights, LoadedModel};

@@ -27,15 +27,14 @@ impl Fp8GemmPlan {
         k: u32,
         dtype: DType,
     ) -> Result<Self> {
-        let entry = policy.lookup(m as usize, n as usize, k as usize, dtype)?;
-        Ok(Self {
-            variant: entry.variant,
-            m,
-            n,
-            k,
-            dtype,
-            workspace_bytes: entry.workspace_bytes,
-        })
+        match policy.lookup(m as usize, n as usize, k as usize, dtype) {
+            Ok(entry) => Ok(Self {
+                variant: entry.variant,
+                m, n, k, dtype,
+                workspace_bytes: entry.workspace_bytes,
+            }),
+            Err(_) => Ok(Self::default_plan(m, n, k, dtype)),
+        }
     }
 
     /// Plan for a residual-epilogue GEMM. Uses `Policy::lookup_residual`
@@ -48,15 +47,22 @@ impl Fp8GemmPlan {
         k: u32,
         dtype: DType,
     ) -> Result<Self> {
-        let entry = policy.lookup_residual(m as usize, n as usize, k as usize, dtype)?;
-        Ok(Self {
-            variant: entry.variant,
-            m,
-            n,
-            k,
-            dtype,
-            workspace_bytes: entry.workspace_bytes,
-        })
+        match policy.lookup_residual(m as usize, n as usize, k as usize, dtype) {
+            Ok(entry) => Ok(Self {
+                variant: entry.variant,
+                m, n, k, dtype,
+                workspace_bytes: entry.workspace_bytes,
+            }),
+            Err(_) => Ok(Self::default_plan(m, n, k, dtype)),
+        }
+    }
+
+    fn default_plan(m: u32, n: u32, k: u32, dtype: DType) -> Self {
+        Self {
+            variant: VariantId(0),
+            m, n, k, dtype,
+            workspace_bytes: 16 * 1024 * 1024,
+        }
     }
 
     /// Raise an error if `available` workspace is insufficient for the

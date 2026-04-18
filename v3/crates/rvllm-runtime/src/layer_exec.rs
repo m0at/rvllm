@@ -22,6 +22,7 @@ use rvllm_fused::{
     FusedSiluMulFp8QuantLaunch,
 };
 use rvllm_kernels::KernelFn;
+pub use rvllm_loader::LayerAttnType;
 
 use rvllm_attention::{
     Fa3Kernels, PagedDecodeFp8Launcher, PagedDecodeParams, PagedPrefillFp8Launcher,
@@ -139,6 +140,7 @@ pub unsafe fn forward(
     fa3: &Fa3Kernels,
     residual: u64,
     stream: u64,
+    attn_type: LayerAttnType,
 ) -> Result<()> {
     forward_phase(
         dims,
@@ -153,6 +155,7 @@ pub unsafe fn forward(
         residual,
         stream,
         LayerPhase::Decode,
+        attn_type,
     )
 }
 
@@ -170,7 +173,17 @@ pub unsafe fn forward_phase(
     residual: u64,
     stream: u64,
     phase: LayerPhase,
+    attn_type: LayerAttnType,
 ) -> Result<()> {
+    if attn_type == LayerAttnType::Linear {
+        return Err(rvllm_core::RvllmError::Loader {
+            err: rvllm_core::LoaderError::Corrupt {
+                detail: "GDN linear attention not yet implemented -- this model uses Qwen3.5/3.6 hybrid attention".into(),
+            },
+            ctx: rvllm_core::LoaderCtx { path: std::path::PathBuf::new(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
     let q_dim = dims.num_heads * dims.head_dim;
     let kv_dim = dims.num_kv_heads * dims.head_dim;
 

@@ -16,6 +16,14 @@ use crate::fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, FP8_E4M3_MAX};
 use crate::safetensors::{ShardHeader, ShardIndex, TensorEntry};
 use crate::weights::{F16Weight, Fp8Weight, LayerWeights, LoadedModel};
 
+/// Per-layer attention type. Qwen3.5/3.6 use a hybrid pattern:
+/// 3 GDN linear attention layers, then 1 standard full attention layer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LayerAttnType {
+    Full,
+    Linear,
+}
+
 /// Minimal model config read from the loaded directory's `config.json`.
 #[derive(Clone, Debug)]
 pub struct ModelArch {
@@ -29,6 +37,7 @@ pub struct ModelArch {
     pub rope_theta: f32,
     pub max_position_embeddings: usize,
     pub attention_bias: bool,
+    pub layer_types: Vec<LayerAttnType>,
 }
 
 impl ModelArch {
@@ -61,6 +70,17 @@ impl ModelArch {
         let max_position_embeddings =
             v["max_position_embeddings"].as_u64().unwrap_or(2048) as usize;
         let attention_bias = v["attention_bias"].as_bool().unwrap_or(true);
+        let layer_types_val = v["layer_types"].as_array()
+            .or_else(|| v["text_config"]["layer_types"].as_array());
+        let layer_types: Vec<LayerAttnType> = match layer_types_val {
+            Some(arr) => arr.iter().map(|t| {
+                match t.as_str().unwrap_or("full_attention") {
+                    "linear_attention" => LayerAttnType::Linear,
+                    _ => LayerAttnType::Full,
+                }
+            }).collect(),
+            None => vec![LayerAttnType::Full; num_hidden_layers],
+        };
         let head_dim = if num_attention_heads == 0 {
             0
         } else {
@@ -91,6 +111,7 @@ impl ModelArch {
             rope_theta,
             max_position_embeddings,
             attention_bias,
+            layer_types,
         })
     }
 }
