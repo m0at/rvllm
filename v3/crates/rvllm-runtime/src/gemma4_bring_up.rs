@@ -537,6 +537,7 @@ impl Gemma4Bringup {
 
         let residual = arena.region("residual", (num_seqs * hidden * 2) as usize, 16)?;
         let logits = arena.region("logits_ppl", (num_seqs * vocab * 2) as usize, 16)?;
+        let logits_f32 = arena.region("logits_f32_ppl", (num_seqs * vocab * 4) as usize, 16)?;
         let token_ids_region = arena.region("token_ids_ppl", (num_seqs * 4) as usize, 16)?;
         let residual_ptr = residual.device_ptr();
         let kernels = self.layer_kernels();
@@ -705,11 +706,13 @@ impl Gemma4Bringup {
                 hidden_fp8.device_ptr(), hidden_scale.device_ptr(),
                 residual_ptr, self.model.final_norm.offset_bytes, stream,
             )?;
-            self.cublaslt.fp8_gemm(
+            self.cublaslt.fp8_gemm_f32(
                 hidden_fp8.device_ptr(), self.model.lm_head_fp8.offset_bytes,
-                logits.device_ptr(), num_seqs as i32, vocab as i32, hidden as i32,
+                logits_f32.device_ptr(), num_seqs as i32, vocab as i32, hidden as i32,
                 hidden_scale.device_ptr(), self.model.lm_head_fp8.scale_ptr, stream,
             )?;
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: num_seqs * vocab }
+                .launch(kernels.f32_to_f16_sat, logits.device_ptr(), logits_f32.device_ptr(), stream)?;
             logit_softcap(
                 self.fused.fn_softcap, logits.device_ptr(),
                 num_seqs, vocab, arch.logit_softcap, stream,
