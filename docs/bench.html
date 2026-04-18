@@ -429,7 +429,7 @@ td.pending{color:#b6a1e5;font-style:italic}
   <div class="chart-title"><strong>TPU v6e-1 kernel latency (&mu;s)</strong> &mdash; warmup&times;3, median of 20 iters, bf16 where applicable
     <div class="note">Single-chip Trillium. Same logical shapes as the H100 rvLLM bench &mdash; hidden=4096, heads=32, kv_heads=8, head_dim=128, intermediate=14336, block_size=16. FP8 / INT4 kernels tagged as <strong>n/a</strong> are manifest-level TODOs blocked on a StableHLO FP8 op; they do not run.</div>
   </div>
-  <div id="chart-tpu" style="height:560px"></div>
+  <div id="chart-tpu" style="height:720px"></div>
 </div>
 
 <table>
@@ -676,7 +676,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
 
   function MultiModel(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: multiModelData, margin: { top: 24, right: 24, left: 18, bottom: 8 } },
+      e(R.BarChart, { data: multiModelData, margin: { top: 38, right: 24, left: 18, bottom: 8 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { dataKey: 'model', stroke: '#ccc', tick: { fill: '#ddd', fontSize: 12 } }),
         e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'tok/s @ N=128', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
@@ -686,7 +686,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
           e(R.LabelList, { dataKey: 'vllm', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v ? v.toLocaleString() : '' })
         ),
         e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0', fill: '#84E6B7' },
-          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, formatter: v => v ? v.toLocaleString() : 'pending' })
+          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, offset: 14, formatter: v => v ? v.toLocaleString() : 'pending' })
         )
       )
     );
@@ -694,14 +694,14 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
 
   function Throughput(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: tsData, margin: { top: 10, right: 24, left: 18, bottom: 8 } },
+      e(R.BarChart, { data: tsData, margin: { top: 34, right: 24, left: 18, bottom: 8 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis,    { dataKey: 'n', stroke: '#666', label: { value: 'Batch size (concurrent prompts)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
         e(R.YAxis,    { stroke: '#666', domain: [0, 46000], tickFormatter: v => v.toLocaleString(), label: { value: 'tokens / second', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
         e(R.Tooltip,  { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toLocaleString() + ' tok/s' }),
         e(R.Legend,   { wrapperStyle: { paddingTop: 8 } }),
         e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0', fill: '#84E6B7' },
-          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, formatter: v => v.toLocaleString() })
+          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, offset: 14, formatter: v => v.toLocaleString() })
         ),
         e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)', fill: '#5a8bd4' },
           e(R.LabelList, { dataKey: 'vllm', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v.toLocaleString() })
@@ -712,14 +712,14 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
 
   function Ttft(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: ttftData, margin: { top: 10, right: 24, left: 18, bottom: 8 } },
+      e(R.BarChart, { data: ttftData, margin: { top: 34, right: 24, left: 18, bottom: 8 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { dataKey: 'n', stroke: '#666', label: { value: 'Batch size', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { stroke: '#666', label: { value: 'TTFT (ms, lower is better)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
         e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' ms' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
         e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0 (hot)', fill: '#84E6B7' },
-          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, formatter: v => v.toFixed(0) })
+          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, offset: 14, formatter: v => v.toFixed(0) })
         ),
         e(R.Bar, { dataKey: 'vllm',  name: 'vLLM 0.19 (hot)',   fill: '#5a8bd4' },
           e(R.LabelList, { dataKey: 'vllm', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v.toFixed(0) })
@@ -798,7 +798,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
 
   function TpFuture(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: tpFutureData, margin: { top: 24, right: 24, left: 30, bottom: 24 } },
+      e(R.BarChart, { data: tpFutureData, margin: { top: 30, right: 24, left: 30, bottom: 32 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { dataKey: 'model', stroke: '#ccc', label: { value: 'Model (dense parameter count, FP8)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'projected tok/s @ N=128', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
@@ -875,13 +875,13 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
 
   function Tpu(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: tpuData, layout: 'vertical', margin: { top: 10, right: 56, left: 10, bottom: 18 } },
+      e(R.BarChart, { data: tpuData, layout: 'vertical', margin: { top: 10, right: 64, left: 10, bottom: 18 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { type: 'number', stroke: '#666', scale: 'log', domain: [100, 3000], ticks: [100, 200, 500, 1000, 2000], tickFormatter: v => v.toLocaleString(), label: { value: '\u00b5s per call (log, lower is better)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
-        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 10, fill: '#c5c5c5' }, width: 250, interval: 0 }),
+        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 9, fill: '#c5c5c5' }, width: 250, interval: 0 }),
         e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' \u00b5s' }),
         e(R.Bar, { dataKey: 'us', fill: '#b6a1e5' },
-          e(R.LabelList, { dataKey: 'us', position: 'right', fill: '#d7c8f0', fontSize: 10, formatter: v => v.toFixed(0) })
+          e(R.LabelList, { dataKey: 'us', position: 'right', fill: '#d7c8f0', fontSize: 9, formatter: v => v.toFixed(0) })
         )
       )
     );
