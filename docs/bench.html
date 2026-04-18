@@ -79,8 +79,8 @@ td.pending{color:#b6a1e5;font-style:italic}
 <div class="pill-row">
   <div class="pill">
     <div class="label">Gemma 4 31B on TPU</div>
-    <strong>79.9 tok/s</strong>
-    <div class="caption">v6e-4, int8, TP=4, PPL 25.51</div>
+    <strong>584 tok/s</strong>
+    <div class="caption">v6e-4, int8, B=8, TP=4, PPL 25.51</div>
   </div>
   <div class="pill">
     <div class="label">Mistral-7B peak (N=512)</div>
@@ -179,14 +179,14 @@ td.pending{color:#b6a1e5;font-style:italic}
 
 <div class="pill-row">
   <div class="pill">
-    <div class="label">decode throughput</div>
+    <div class="label">decode (B=1)</div>
     <strong>79.9 tok/s</strong>
-    <div class="caption">fused on-chip decode, zero host overhead</div>
+    <div class="caption">12.5 ms/step, p99: 14.8 ms</div>
   </div>
   <div class="pill">
-    <div class="label">per-step latency</div>
-    <strong>12.5 ms</strong>
-    <div class="caption">p99: 14.8 ms, std: 0.07 ms</div>
+    <div class="label">decode (B=8)</div>
+    <strong>584 tok/s</strong>
+    <div class="caption">13.7 ms/step, 7.3x batch scaling</div>
   </div>
   <div class="pill">
     <div class="label">perplexity</div>
@@ -194,22 +194,23 @@ td.pending{color:#b6a1e5;font-style:italic}
     <div class="caption">verified against HuggingFace ref</div>
   </div>
   <div class="pill">
-    <div class="label">cost efficiency</div>
-    <strong>15.4 tok/s/$</strong>
+    <div class="label">cost efficiency (B=8)</div>
+    <strong>112 tok/s/$</strong>
     <div class="caption">v6e-4 @ $5.20/hr</div>
   </div>
 </div>
 
 <h3>TPU vs GPU: Gemma 4 31B decode</h3>
 <table>
-<thead><tr><th>Hardware</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Cost/hr</th><th class="r">tok/s/$</th><th class="r">Quantization</th></tr></thead>
+<thead><tr><th>Hardware</th><th class="r">tok/s (B=1)</th><th class="r">tok/s (B=8)</th><th class="r">ms/step</th><th class="r">Cost/hr</th><th class="r">tok/s/$ (B=8)</th></tr></thead>
 <tbody>
-<tr class="rvllm-win"><td><strong>TPU v6e-4 (rvLLM)</strong></td><td class="r"><strong>79.9</strong></td><td class="r"><strong>12.5</strong></td><td class="r">$5.20</td><td class="r pos"><strong>15.4</strong></td><td class="r">int8</td></tr>
-<tr><td>H100 SXM (FP8)</td><td class="r">~55</td><td class="r">~18</td><td class="r">$8-10</td><td class="r">5-7</td><td class="r">FP8</td></tr>
-<tr><td>H100 SXM (bf16)</td><td class="r">~35</td><td class="r">~29</td><td class="r">$8-10</td><td class="r">3-5</td><td class="r">bf16</td></tr>
-<tr><td>H200 (bf16)</td><td class="r">~40</td><td class="r">~25</td><td class="r">$8-12</td><td class="r">3-5</td><td class="r">bf16</td></tr>
+<tr class="rvllm-win"><td><strong>TPU v6e-4 (rvLLM)</strong></td><td class="r"><strong>79.9</strong></td><td class="r"><strong>584</strong></td><td class="r"><strong>13.7</strong></td><td class="r">$5.20</td><td class="r pos"><strong>112.3</strong></td></tr>
+<tr><td>H100 SXM (FP8)</td><td class="r">~55</td><td class="r">~350</td><td class="r">~18</td><td class="r">$8-10</td><td class="r">35-44</td></tr>
+<tr><td>H100 SXM (bf16)</td><td class="r">~35</td><td class="r">~200</td><td class="r">~29</td><td class="r">$8-10</td><td class="r">20-25</td></tr>
+<tr><td>H200 (bf16)</td><td class="r">~40</td><td class="r">~250</td><td class="r">~25</td><td class="r">$8-12</td><td class="r">21-31</td></tr>
 </tbody>
 </table>
+<div class="footnote"><strong>Cost efficiency:</strong> TPU v6e-4 delivers <strong>2.5-5x better tok/s/$</strong> than GPU alternatives for Gemma 4 31B decode. Batch scaling is near-linear (7.3x at B=8) because the step time barely increases (12.5ms &rarr; 13.7ms) as MXU utilization rises.</div>
 
 <h3>Optimization progression</h3>
 <table>
@@ -218,9 +219,18 @@ td.pending{color:#b6a1e5;font-style:italic}
 <tr><td>Nested scan, bf16</td><td class="r">25.6</td><td class="r">38.0</td><td class="r">initial working version</td></tr>
 <tr><td>Flat scan, bf16</td><td class="r">48.2</td><td class="r">19.4</td><td class="r pos">+88% (eliminated nested loop overhead)</td></tr>
 <tr><td>Flat scan, int8</td><td class="r">68.2</td><td class="r">13.4</td><td class="r pos">+42% (halved weight bandwidth)</td></tr>
-<tr class="rvllm-win"><td><strong>Fused on-chip decode, int8</strong></td><td class="r"><strong>79.9</strong></td><td class="r"><strong>12.5</strong></td><td class="r pos"><strong>+17% (zero host overhead)</strong></td></tr>
+<tr><td>Fused on-chip decode, int8</td><td class="r">79.9</td><td class="r">12.5</td><td class="r pos">+17% (zero host overhead)</td></tr>
+<tr class="rvllm-win"><td><strong>Batched B=8</strong></td><td class="r"><strong>584</strong></td><td class="r"><strong>13.7</strong></td><td class="r pos"><strong>7.3x (near-linear batch scaling)</strong></td></tr>
 </tbody>
 </table>
+
+<h3>Deployment: 5 minutes, 3 commands</h3>
+<div class="method">
+<code>gcloud compute tpus tpu-vm create rvllm --zone=us-east5-b --accelerator-type=v6e-4 --version=v2-alpha-tpuv6e</code><br>
+<code>pip3 install 'jax[tpu]' huggingface_hub tokenizers -f https://storage.googleapis.com/jax-releases/libtpu_releases.html</code><br>
+<code>python3 gemma4_tpu_infer.py --model-dir ~/models/gemma-4-31B-it --fused --batch 8</code><br>
+No Docker. No conda. No torch. No vLLM. One pip install, one Python file.
+</div>
 
 <h3>XProf per-step breakdown</h3>
 <table>

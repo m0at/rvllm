@@ -222,79 +222,126 @@ RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
 
 ## TPU: Gemma 4 31B on v6e-4
 
-rvLLM runs on Google Cloud TPU via JAX + XLA. No custom kernels -- XLA compiles the entire 60-layer forward pass to TPU machine code from a ~500 line JAX script.
+rvLLM runs on Google Cloud TPU via JAX + XLA. No custom kernels -- XLA compiles the entire 60-layer forward pass to TPU machine code from a ~500 line JAX script. Built and profiled in a single session.
 
 ### Headline numbers
 
-| Metric | Value |
+| Metric | B=1 | B=8 |
+|---|---|---|
+| **Decode throughput** | **79.9 tok/s** | **584 tok/s** |
+| **Per-step latency** | **12.5 ms** | **13.7 ms** |
+| **Latency p99** | **14.8 ms** | -- |
+| **Latency jitter (std)** | **0.07 ms** | -- |
+| **Perplexity** | **25.51** | -- |
+| **Cost efficiency** | **15.4 tok/s/$** | **112.3 tok/s/$** |
+
+| Fixed | Value |
 |---|---|
 | Model | Gemma 4 31B (google/gemma-4-31B-it) |
 | Hardware | TPU v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s) |
 | Quantization | int8 per-channel (weights), bf16 activations |
-| **Decode throughput** | **79.9 tok/s** (fused on-chip decode loop) |
-| **Per-step latency** | **12.5 ms** |
-| **Latency p99** | **14.8 ms** (zero jitter) |
-| **Perplexity** | **25.51** (verified against HuggingFace reference) |
+| Perplexity | 25.51 (verified against HuggingFace reference) |
 | Cost | ~$5.20/hr (v6e-4 on-demand) |
-| Cost efficiency | **15.4 tok/s/$** |
 
-### vs GPU comparison
+### vs GPU: Gemma 4 31B decode
 
-| Hardware | tok/s | Cost/hr | tok/s/$ |
+| Hardware | tok/s (B=1) | tok/s (B=8) | Cost/hr | tok/s/$ (B=8) |
+|---|---|---|---|---|
+| **TPU v6e-4 (rvLLM)** | **79.9** | **584** | **$5.20** | **112.3** |
+| H100 SXM (FP8) | ~55 | ~350 | $8-10 | ~35-44 |
+| H100 SXM (bf16) | ~35 | ~200 | $8-10 | ~20-25 |
+| H200 (bf16) | ~40 | ~250 | $8-12 | ~21-31 |
+
+### Optimization progression
+
+| Step | tok/s | ms/step | What changed |
 |---|---|---|---|
-| **TPU v6e-4 (rvLLM)** | **79.9** | **$5.20** | **15.4** |
-| H100 SXM (bf16) | ~35-40 | $8-10 | 3-5 |
-| H100 SXM (FP8) | ~50-60 | $8-10 | 5-7 |
-| H200 (bf16) | ~35-45 | $8-12 | 3-5 |
+| Nested scan, bf16 | 25.6 | 38.0 | Initial working version |
+| Flat scan, bf16 | 48.2 | 19.4 | +88%: eliminated nested loop overhead |
+| Flat scan, int8 | 68.2 | 13.4 | +42%: halved weight bandwidth |
+| Fused on-chip decode | 79.9 | 12.5 | +17%: zero host overhead via while_loop |
+| **B=8 batched** | **584** | **13.7** | **7.3x: near-linear batch scaling** |
 
-### Architecture
+### XProf breakdown (B=1, per decode step)
 
-Gemma 4 is a 60-layer transformer with dual attention (50 sliding + 10 global layers), QK-norm, v-norm, partial RoPE, GELU(tanh), logit softcapping, and per-layer residual scaling. Weight shapes differ between layer types (sliding: q=8192, k=4096; global: q=16384, k=2048, no v_proj due to k_eq_v).
+| Component | Time | % |
+|---|---|---|
+| 60-layer scan (single while loop) | 10.6 ms | 86% |
+| jax.lax.cond dispatch (sliding/global) | 1.8 ms | 14% |
+| ICI all-reduce (O + down proj, 4 chips) | 0.6 ms | 5% |
+| KV cache dynamic_update_slice | 1.3 ms | 10% |
+| **Total step** | **12.3 ms** | |
+| Theoretical BW limit (30 GB / 3.3 TB/s) | 9.1 ms | |
 
-The inference script uses a flat `jax.lax.scan` over 60 layers with `jax.lax.cond` to dispatch between sliding and global attention. Weights are padded to max shape so the scan body is uniform. The decode loop runs entirely on-chip via `jax.lax.while_loop` -- zero Python host overhead per step.
+HLO stats: 4 fused matmul ops, 6 all-reduces, 1 while loop, 1 conditional. XLA compiles the entire model into a single tight loop body.
+
+### Architecture details
+
+Gemma 4 is a 60-layer transformer with dual attention (50 sliding + 10 global layers). Key Gemma 4 specifics we handle:
+
+- **Dual head_dim**: sliding layers use 32 Q heads of 256, 16 KV heads of 256; global layers use 32 Q heads of 512, 4 KV heads of 512
+- **Weight shape asymmetry**: sliding q_proj=[8192,5376], global q_proj=[16384,5376]. Padded to max shape for scan uniformity
+- **QK-norm + v-norm**: per-head RMSNorm on Q/K (with learned scale), parameter-free RMSNorm on V
+- **k_eq_v**: global layers have no v_proj; V = v_norm(raw_K)
+- **Attention scaling = 1.0**: QK-norm handles magnitude, no sqrt(head_dim) division
+- **layer_scalar**: applied ONCE at the end of the full layer (not per-sublayer)
+- **Partial RoPE**: global layers rotate only 128 of 512 dims (25%), theta=1M vs theta=10k for sliding
+- **Logit softcapping**: 30 * tanh(logits / 30)
+- **GELU(tanh)** activation (not SiLU)
 
 ### The TPU stack
 
 ```
-JAX Python (trace) --> StableHLO/MLIR --> XLA compiler --> TPU machine code
-                                                              |
-                            PJRT runtime (4-chip SPMD) <------+
-                            NamedSharding + PartitionSpec for TP=4
+JAX Python (trace)
+  |
+  v
+StableHLO / MLIR
+  |
+  v
+XLA compiler --> TPU machine code (single fused while loop)
+  |
+  v
+PJRT runtime (4-chip SPMD, TP=4)
+  |-- NamedSharding + PartitionSpec for automatic weight distribution
+  |-- Buffer donation for KV cache reuse
+  `-- jax.lax.while_loop for zero-host-overhead decode
 ```
 
-No hand-written kernels. XLA generates everything. One JIT compilation, then the compiled HLO executes as a single fused while loop on the TPU.
+No hand-written kernels. No Pallas. No custom ops. XLA generates everything from pure JAX. The script is ~500 lines of Python.
 
-### XProf breakdown (per decode step)
+### Deployment
 
-| Component | Time | % |
-|---|---|---|
-| 60-layer scan (while loop) | 10.6 ms | 86% |
-| cond branch dispatch | 1.8 ms | 14% |
-| ICI all-reduce (O+down proj) | 0.6 ms | 5% |
-| KV cache dynamic updates | 1.3 ms | 10% |
-| **Total step** | **12.3 ms** | |
-| Theoretical BW limit | 9.1 ms | |
-
-### Reproduce
+Total setup time: ~5 minutes (create TPU + install JAX + download model).
 
 ```bash
-# Create TPU v6e-4
+# Create TPU v6e-4 ($5.20/hr)
 gcloud compute tpus tpu-vm create rvllm-gemma4 \
   --zone=us-east5-b --accelerator-type=v6e-4 --version=v2-alpha-tpuv6e
 
-# Install JAX + download model
+# Install (30 seconds)
 pip3 install 'jax[tpu]' huggingface_hub tokenizers \
   -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Download model (2 minutes on GCP internal network)
 huggingface-cli download google/gemma-4-31B-it --local-dir ~/models/gemma-4-31B-it
 
-# Run inference
+# Run (first call: ~5s JIT compile, then 79.9 tok/s)
 python3 tpu/harness/gemma4_tpu_infer.py \
   --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 512
 
-# Run perplexity
+# Batched (584 tok/s)
+python3 tpu/harness/gemma4_tpu_infer.py \
+  --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 512 --batch 8
+
+# Perplexity (25.51)
 python3 tpu/harness/gemma4_tpu_infer.py \
   --model-dir ~/models/gemma-4-31B-it --perplexity --max-ctx 512
+
+# Cleanup
+gcloud compute tpus tpu-vm delete rvllm-gemma4 --zone=us-east5-b --quiet
 ```
+
+No Docker. No conda. No torch. No vLLM. One pip install, one Python file, one command.
 
 ## Supported models
 
