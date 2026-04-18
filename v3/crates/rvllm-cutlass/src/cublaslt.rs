@@ -322,17 +322,19 @@ impl CublasLt {
             )?;
         }
 
+        // Scale pointers must follow the data swap: cublas A = our weight (b_fp8),
+        // cublas B = our activation (a_fp8). So A_SCALE = weight scale, B_SCALE = act scale.
         set_attr(
             desc,
             lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-            &a_scale as *const _ as *const _,
-            std::mem::size_of_val(&a_scale),
+            &b_scale as *const _ as *const _,
+            std::mem::size_of_val(&b_scale),
         )?;
         set_attr(
             desc,
             lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-            &b_scale as *const _ as *const _,
-            std::mem::size_of_val(&b_scale),
+            &a_scale as *const _ as *const _,
+            std::mem::size_of_val(&a_scale),
         )?;
 
         // Layouts: col-major view of our row-major buffers, TN.
