@@ -130,6 +130,7 @@ pub struct Gemma4LayerKernels {
     pub fused_gelu_mul: KernelFn,
     pub quantize_fp8_per_token: KernelFn,
     pub residual_scale_f16: KernelFn,
+    pub vnorm_f16: KernelFn,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,6 +178,15 @@ pub unsafe fn gemma4_forward(
         weights.qkv_scale,
         stream,
     )?;
+
+    // 2b. V-norm: parameter-free RMS normalization on V heads.
+    gemma4_launcher::VnormF16Launch {
+        num_tokens: dims.num_tokens,
+        num_kv_heads: dims.num_kv_heads,
+        head_dim: dims.head_dim,
+        eps: dims.rms_eps,
+    }
+    .launch(kernels.vnorm_f16, scratch.v_out, stream)?;
 
     // 3. QK-norm: RMSNorm on each Q head and each K head independently.
     // Input: q_out [num_tokens, num_heads, head_dim], k_out [num_tokens, num_kv_heads, head_dim]
