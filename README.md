@@ -226,14 +226,14 @@ rvLLM runs on Google Cloud TPU via JAX + XLA. No custom kernels -- XLA compiles 
 
 ### Headline numbers
 
-| Metric | B=1 | B=8 |
-|---|---|---|
-| **Decode throughput** | **79.9 tok/s** | **584 tok/s** |
-| **Per-step latency** | **12.5 ms** | **13.7 ms** |
-| **Latency p99** | **14.8 ms** | -- |
-| **Latency jitter (std)** | **0.07 ms** | -- |
-| **Perplexity** | **25.51** | -- |
-| **Cost efficiency** | **15.4 tok/s/$** | **112.3 tok/s/$** |
+| Metric | B=1 | B=8 | B=768 (peak) |
+|---|---|---|---|
+| **Decode throughput** | **79.9 tok/s** | **584 tok/s** | **13,943 tok/s** |
+| **Per-step latency** | **12.5 ms** | **13.7 ms** | **55.1 ms** |
+| **Latency p99** | **14.8 ms** | -- | -- |
+| **Latency jitter (std)** | **0.07 ms** | -- | -- |
+| **Perplexity** | **25.51** | -- | -- |
+| **Cost efficiency** | **15.4 tok/s/$** | **112 tok/s/$** | **2,681 tok/s/$** |
 
 | Fixed | Value |
 |---|---|
@@ -245,12 +245,11 @@ rvLLM runs on Google Cloud TPU via JAX + XLA. No custom kernels -- XLA compiles 
 
 ### vs GPU: Gemma 4 31B decode
 
-| Hardware | tok/s (B=1) | tok/s (B=8) | Cost/hr | tok/s/$ (B=8) |
+| Hardware | Peak tok/s | Batch | Cost/hr | tok/s/$ |
 |---|---|---|---|---|
-| **TPU v6e-4 (rvLLM)** | **79.9** | **584** | **$5.20** | **112.3** |
-| H100 SXM (FP8) | ~55 | ~350 | $8-10 | ~35-44 |
-| H100 SXM (bf16) | ~35 | ~200 | $8-10 | ~20-25 |
-| H200 (bf16) | ~40 | ~250 | $8-12 | ~21-31 |
+| **TPU v6e-4 (rvLLM)** | **13,943** | **768** | **$5.20** | **2,681** |
+| H100 SXM (FP8, projected) | ~6,000 | ~256 | $8-10 | 600-750 |
+| H200 (bf16, projected) | ~4,000 | ~128 | $8-12 | 333-500 |
 
 ### Optimization progression
 
