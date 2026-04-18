@@ -29,13 +29,11 @@ export default {
     assetUrl.pathname = p;
     const res = await env.ASSETS.fetch(new Request(assetUrl, request));
 
-    // Light cache policy:
-    //   HTML: no-cache so content updates land on next request.
-    //   PDF/PNG/CSS/JS: 1 h at the edge.
     const ct = res.headers.get('content-type') || '';
     const headers = new Headers(res.headers);
     if (ct.includes('text/html')) {
-      headers.set('Cache-Control', 'no-cache, must-revalidate');
+      headers.set('Cache-Control', 'no-store');
+      headers.set('CDN-Cache-Control', 'no-store');
     } else {
       headers.set('Cache-Control', 'public, max-age=3600');
     }
