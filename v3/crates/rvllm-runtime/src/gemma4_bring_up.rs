@@ -275,7 +275,7 @@ impl Gemma4Bringup {
                     block_size,
                     max_blocks_per_seq,
                     num_blocks_total,
-                    attn_scale: 1.0 / (hd as f32).sqrt(),
+                    attn_scale: 1.0, // Gemma 4 uses QK-norm, not 1/sqrt(d)
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
                     sliding_window: arch.sliding_window_size as u32,
@@ -357,8 +357,7 @@ impl Gemma4Bringup {
                     &w,
                     &scratch,
                     &meta,
-                    &self.cutlass,
-                    &gemm_plans,
+                    &self.cublaslt,
                     &self.sliding_attention,
                     &self.global_attention,
                     residual_ptr,

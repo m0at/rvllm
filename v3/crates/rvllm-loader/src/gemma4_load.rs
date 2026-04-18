@@ -149,7 +149,7 @@ pub fn load_gemma4_model(
     };
 
     let norm_name = format!("{prefix}.norm.weight");
-    let final_norm = upload_f16_gemma_norm("final_norm", &norm_name)?;
+    let final_norm = upload_f16("final_norm", &norm_name)?;
 
     // Detect pre-quantized FP8 weights (e.g. RedHatAI/gemma-4-31B-it-FP8-Dynamic).
     // These have F8_E4M3 linear weights + per-channel BF16 weight_scale tensors.
@@ -337,16 +337,16 @@ pub fn load_gemma4_model(
         };
 
         let input_layernorm =
-            upload_f16_gemma_norm("input_ln", &ln("input_layernorm.weight"))?;
+            upload_f16("input_ln", &ln("input_layernorm.weight"))?;
         let post_attention_layernorm =
-            upload_f16_gemma_norm("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
+            upload_f16("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
         let pre_feedforward_layernorm =
-            upload_f16_gemma_norm("pre_ff_ln", &ln("pre_feedforward_layernorm.weight"))?;
+            upload_f16("pre_ff_ln", &ln("pre_feedforward_layernorm.weight"))?;
         let post_feedforward_layernorm =
-            upload_f16_gemma_norm("post_ff_ln", &ln("post_feedforward_layernorm.weight"))?;
+            upload_f16("post_ff_ln", &ln("post_feedforward_layernorm.weight"))?;
 
-        let q_norm = upload_f16_gemma_norm("q_norm", &ln("self_attn.q_norm.weight"))?;
-        let k_norm = upload_f16_gemma_norm("k_norm", &ln("self_attn.k_norm.weight"))?;
+        let q_norm = upload_f16("q_norm", &ln("self_attn.q_norm.weight"))?;
+        let k_norm = upload_f16("k_norm", &ln("self_attn.k_norm.weight"))?;
 
         let layer_scalar = upload_f16("layer_scalar", &ln("layer_scalar"))?;
 
