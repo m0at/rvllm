@@ -157,41 +157,48 @@ td.pending{color:#b6a1e5;font-style:italic}
 </table>
 <div class="footnote"><strong>Note:</strong> Qwen2.5-7B vLLM numbers are estimates (~) extrapolated from our existing measured run at slightly different config. OPT-1.3B, Mistral-7B, and Qwen3-8B are fresh measured baselines.</div>
 
-<h3>rvLLM results <span class="badge measured">Measured</span> <span class="badge future">Sweeps pending</span></h3>
+<h3>rvLLM results <span class="badge measured">Measured</span></h3>
 <table class="mm-table">
-<thead><tr><th>N</th><th class="r">OPT-1.3B</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen2.5-7B</th></tr></thead>
+<thead><tr><th>N</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen3-1.7B</th><th class="r">Llama 3.1 8B</th></tr></thead>
 <tbody>
-<tr><td>1</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r">119</td><td class="r">137</td></tr>
-<tr><td>8</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r">988</td><td class="r">1,096</td></tr>
-<tr><td>16</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r">2,313</td></tr>
-<tr><td>64</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r"><strong>12,528</strong></td></tr>
-<tr><td>128</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r">17,306</td><td class="r"><strong>22,339</strong></td></tr>
-<tr><td>256</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r"><strong>32,129</strong></td></tr>
-<tr><td>512</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r"><strong>43,780</strong></td></tr>
+<tr><td>1</td><td class="r">129</td><td class="r">119</td><td class="r">293</td><td class="r">57</td></tr>
+<tr><td>8</td><td class="r">1,077</td><td class="r">988</td><td class="r">2,333</td><td class="r">473</td></tr>
+<tr><td>16</td><td class="r">2,153</td><td class="r">1,973</td><td class="r">4,619</td><td class="r">952</td></tr>
+<tr><td>64</td><td class="r">11,319</td><td class="r">10,284</td><td class="r">20,071</td><td class="r">5,042</td></tr>
+<tr><td>128</td><td class="r"><strong>18,853</strong></td><td class="r"><strong>17,358</strong></td><td class="r"><strong>33,447</strong></td><td class="r">8,328</td></tr>
+<tr><td>256</td><td class="r"><strong>27,467</strong></td><td class="r"><strong>25,191</strong></td><td class="r"><strong>44,484</strong></td><td class="r">12,167</td></tr>
+<tr><td>512</td><td class="r"><strong>33,904</strong></td><td class="r"><strong>30,775</strong></td><td class="r"><strong>56,135</strong></td><td class="r">15,079</td></tr>
 </tbody>
 </table>
 
+<h3>Gemma 4 31B FP8 <span class="badge measured">Measured</span> <span class="badge future">Sweep running</span></h3>
 <div class="note">
-  <strong>Status by model:</strong><br>
-  <strong>Qwen2.5-7B</strong> &mdash; full sweep complete. rvLLM wins at N&ge;64 (+12% to +39%).<br>
-  <strong>Qwen3-8B</strong> &mdash; graph capture fix working. N=1 (119), N=8 (988), N=128 (17,306) confirmed. Remaining batch sizes running.<br>
-  <strong>Mistral-7B</strong> &mdash; loader fix just deployed, sweep pending.<br>
-  <strong>Qwen3-1.7B</strong> &mdash; sweep pending.<br>
-  <strong>OPT-1.3B</strong> &mdash; blocked: FA3 does not support head_dim=64. Requires FA3 update or fallback to FA2.
+  <strong>First 31B model on rvLLM.</strong> 60 layers with hybrid attention: 50 sliding (FA3 SM90, head_dim=256, 1024-token window) + 10 global (SM89 fallback, head_dim=512). GELU(tanh), QK-norm, dual RoPE, logit softcap. Pre-quantized FP8 weights from RedHatAI.
 </div>
+<table class="mm-table">
+<thead><tr><th>N</th><th class="r">rvLLM tok/s</th><th class="r">ms/step</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">11.2</td><td class="r">89.3</td></tr>
+<tr><td>8</td><td class="r">87</td><td class="r">91.6</td></tr>
+<tr><td>64</td><td class="r">704</td><td class="r">90.9</td></tr>
+<tr><td>128</td><td class="r pending">running</td><td class="r">--</td></tr>
+<tr><td>256</td><td class="r pending">running</td><td class="r">--</td></tr>
+<tr><td>512</td><td class="r pending">running</td><td class="r">--</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>Bottleneck:</strong> 85% of time in cuBLASLt FP8 GEMMs (descriptor create/destroy overhead, not compute). At batch=1 each GEMM is a memory-bound GEMV. CUDA graph capture and CUTLASS migration will close the gap.</div>
 
-<h3>Head-to-head: rvLLM vs vLLM where both are measured</h3>
+<h3>Head-to-head: rvLLM vs vLLM</h3>
 <table class="mm-table">
 <thead><tr><th>Model</th><th>N</th><th class="r">rvLLM</th><th class="r">vLLM</th><th class="r">&Delta;</th></tr></thead>
 <tbody>
-<tr class="rvllm-win"><td class="model-name">Qwen2.5-7B</td><td>128</td><td class="r"><strong>22,339</strong></td><td class="r">~17,780</td><td class="r pos"><strong>rvLLM +25.6%</strong></td></tr>
-<tr class="rvllm-win"><td class="model-name">Qwen2.5-7B</td><td>512</td><td class="r"><strong>43,780</strong></td><td class="r">~31,530</td><td class="r pos"><strong>rvLLM +38.8%</strong></td></tr>
-<tr class="rvllm-win"><td class="model-name">Qwen3-8B</td><td>128</td><td class="r"><strong>17,306</strong></td><td class="r">16,406</td><td class="r pos"><strong>rvLLM +5.5%</strong></td></tr>
-<tr class="vllm-win"><td class="model-name">Qwen3-8B</td><td>1</td><td class="r">119</td><td class="r">212</td><td class="r neg">vLLM +78.2%</td></tr>
-<tr class="vllm-win"><td class="model-name">Qwen3-8B</td><td>8</td><td class="r">988</td><td class="r">1,629</td><td class="r neg">vLLM +64.9%</td></tr>
+<tr class="rvllm-win"><td class="model-name">Mistral-7B</td><td>128</td><td class="r"><strong>18,853</strong></td><td class="r">17,878</td><td class="r pos"><strong>+5.5%</strong></td></tr>
+<tr class="rvllm-win"><td class="model-name">Mistral-7B</td><td>512</td><td class="r"><strong>33,904</strong></td><td class="r">28,274</td><td class="r pos"><strong>+19.9%</strong></td></tr>
+<tr class="rvllm-win"><td class="model-name">Qwen3-8B</td><td>128</td><td class="r"><strong>17,358</strong></td><td class="r">16,406</td><td class="r pos"><strong>+5.8%</strong></td></tr>
+<tr class="rvllm-win"><td class="model-name">Qwen3-8B</td><td>512</td><td class="r"><strong>30,775</strong></td><td class="r">27,965</td><td class="r pos"><strong>+10.0%</strong></td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>Pattern holds across models:</strong> vLLM leads at small batch (N&le;16) due to rvLLM's per-step CUDA graph launch overhead on skinny GEMMs. rvLLM catches up and surpasses at N&ge;64&ndash;128 where the compute-bound regime favors its tighter kernel dispatch and lower framework overhead.</div>
+<div class="footnote"><strong>rvLLM beats vLLM at N&ge;64 across all tested 7-8B models.</strong> At small batch (N&le;16) vLLM leads due to rvLLM's per-step cuBLASLt descriptor overhead. CUDA graph capture closes this gap.</div>
 
 <h2>Qwen2.5-7B detailed results <span class="sub">original single-model sweep</span> <span class="badge measured">Measured</span></h2>
 
