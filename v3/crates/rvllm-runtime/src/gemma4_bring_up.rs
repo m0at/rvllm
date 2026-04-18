@@ -533,6 +533,7 @@ impl Gemma4Bringup {
             down: Fp8GemmPlan::from_policy_residual(&self.policy, num_seqs, hidden, inter, rvllm_core::DType::Fp8E4M3)?,
         };
 
+        let step_counter = std::cell::Cell::new(0u32);
         let one_step = || -> Result<()> {
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
                 let lt = arch.layer_types[layer_idx];
@@ -632,6 +633,16 @@ impl Gemma4Bringup {
                     &self.sliding_attention, &self.global_attention,
                     residual_ptr, stream,
                 )?;
+
+                if step_counter.get() == 0 && layer_idx < 3 {
+                    cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                    let mut s = [0u16; 4];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        s.as_mut_ptr() as *mut _, residual_ptr, 8,
+                    );
+                    let v: Vec<f32> = s.iter().map(|&x| f16_to_f32(x)).collect();
+                    eprintln!("  [ppl L{}] residual={:.4?}", layer_idx, v);
+                }
             }
 
             // LM head: final norm + FP8 quant + GEMM + softcap
@@ -651,6 +662,7 @@ impl Gemma4Bringup {
                 self.fused.fn_softcap, logits.device_ptr(),
                 num_seqs, vocab, arch.logit_softcap, stream,
             )?;
+            step_counter.set(step_counter.get() + 1);
             Ok(())
         };
 
