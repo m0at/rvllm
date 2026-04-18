@@ -286,7 +286,7 @@ impl PjrtClientHandle {
         let input_list: *const *mut PjrtBuffer = input_ptrs.as_ptr();
 
         // Prepare output list -- PJRT allocates output buffers
-        let mut output_ptrs: Vec<*mut PjrtBuffer> = vec![ptr::null_mut(); 16];
+        let mut output_ptrs: Vec<*mut PjrtBuffer> = vec![ptr::null_mut(); 256];
         let mut output_list: *mut *mut PjrtBuffer = output_ptrs.as_mut_ptr();
 
         let exec_options = PJRT_ExecuteOptions {

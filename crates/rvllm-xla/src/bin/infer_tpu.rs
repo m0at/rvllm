@@ -42,7 +42,7 @@ mod tpu_main {
     const VOCAB: usize = 128256;
     const BLOCK_SIZE: usize = 16;
     const NUM_BLOCKS: usize = 1024;
-    const MAX_BLOCKS_PER_SEQ: usize = 256;
+    const MAX_BLOCKS_PER_SEQ: usize = 4; // 4 blocks * 16 = 64 token context
     const BATCH: usize = 8; // padded batch from layer_decode MLIR
     const EMBED_BATCH: usize = 128; // padded batch from embedding MLIR
 
@@ -67,51 +67,35 @@ mod tpu_main {
             client.set_compile_options(opts);
         }
 
-        // Compile the modules we need
-        eprintln!("compiling modules...");
+        // Compile the fused full-step module (embed + 32 layers + head + argmax)
+        eprintln!("compiling fused decode step...");
         let t0 = Instant::now();
-
-        let embed_mlir = std::fs::read_to_string(args.mlir_dir.join("embedding_gather.mlir"))
-            .expect("embedding_gather.mlir");
-        let layer_mlir = std::fs::read_to_string(args.mlir_dir.join("persistent_layer_decode.mlir"))
-            .expect("persistent_layer_decode.mlir");
-        let head_mlir = std::fs::read_to_string(args.mlir_dir.join("fused_lm_head_argmax.mlir"))
-            .expect("fused_lm_head_argmax.mlir");
-        let norm_mlir = std::fs::read_to_string(args.mlir_dir.join("fused_residual_rmsnorm.mlir"))
-            .expect("fused_residual_rmsnorm.mlir");
-
-        let embed_exe = client.compile(&embed_mlir).expect("compile embedding");
-        let layer_exe = client.compile(&layer_mlir).expect("compile layer");
-        let head_exe = client.compile(&head_mlir).expect("compile lm_head");
-        let norm_exe = client.compile(&norm_mlir).expect("compile norm");
-        eprintln!("compiled 4 modules in {:.1}s", t0.elapsed().as_secs_f32());
+        let step_mlir = std::fs::read_to_string(args.mlir_dir.join("full_decode_step.mlir"))
+            .expect("full_decode_step.mlir");
+        let step_exe = client.compile(&step_mlir).expect("compile full_decode_step");
+        eprintln!("compiled in {:.1}s", t0.elapsed().as_secs_f32());
 
         // Load model weights from safetensors
         eprintln!("loading weights from {:?}...", args.model_dir);
         let t0 = Instant::now();
         let weights = load_weights(&client, &args.model_dir);
-        eprintln!("loaded {} layer weight sets + embed/head in {:.1}s",
-            weights.layers.len(), t0.elapsed().as_secs_f32());
+        eprintln!("loaded {NUM_LAYERS} layer weight sets + embed/head in {:.1}s",
+            t0.elapsed().as_secs_f32());
 
-        // Tokenize prompt (simple: just use bytes as token IDs for now,
-        // real tokenizer would go here)
         let prompt_ids: Vec<i32> = args.prompt.bytes().map(|b| b as i32).collect();
         eprintln!("prompt: {:?} ({} tokens)", args.prompt, prompt_ids.len());
 
-        // Initialize KV caches (zeros)
-        let kv_bytes = NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM * 2; // bf16
-        let kv_shape: Vec<i64> = vec![NUM_BLOCKS as i64, BLOCK_SIZE as i64,
-            NUM_KV_HEADS as i64, HEAD_DIM as i64];
-        let zero_kv = vec![0u8; kv_bytes];
+        // Stacked KV caches: [NUM_LAYERS, NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM]
+        let kv_stacked_bytes = NUM_LAYERS * NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM * 2;
+        let kv_stacked_shape: Vec<i64> = vec![NUM_LAYERS as i64, NUM_BLOCKS as i64,
+            BLOCK_SIZE as i64, NUM_KV_HEADS as i64, HEAD_DIM as i64];
+        let zero_kv = vec![0u8; kv_stacked_bytes];
+        let mut k_cache_stacked = client.buffer_from_host(
+            &zero_kv, &kv_stacked_shape, PjrtElementType::BF16, 0).unwrap();
+        let mut v_cache_stacked = client.buffer_from_host(
+            &zero_kv, &kv_stacked_shape, PjrtElementType::BF16, 0).unwrap();
 
-        let mut k_caches: Vec<_> = (0..NUM_LAYERS)
-            .map(|_| client.buffer_from_host(&zero_kv, &kv_shape, PjrtElementType::BF16, 0).unwrap())
-            .collect();
-        let mut v_caches: Vec<_> = (0..NUM_LAYERS)
-            .map(|_| client.buffer_from_host(&zero_kv, &kv_shape, PjrtElementType::BF16, 0).unwrap())
-            .collect();
-
-        // Block tables: each seq gets sequential blocks
+        // Block tables
         let mut bt_host = vec![0i32; BATCH * MAX_BLOCKS_PER_SEQ];
         for seq in 0..BATCH {
             for b in 0..MAX_BLOCKS_PER_SEQ {
@@ -129,7 +113,6 @@ mod tpu_main {
         let mut ttft_ns: Option<u128> = None;
         let mut decode_start: Option<Instant> = None;
 
-        // Process prompt tokens one at a time (decode mode)
         eprintln!("--- inference ---");
         let prompt_start = Instant::now();
         let total_steps = prompt_ids.len() + args.max_tokens;
@@ -140,128 +123,76 @@ mod tpu_main {
                 *generated.last().unwrap_or(&0)
             };
 
-            // Embedding uses EMBED_BATCH=128, layer uses BATCH=8
-            let mut tok_batch = vec![0i32; EMBED_BATCH];
+            let step_start = Instant::now();
+
+            // Metadata buffers (small HtoD, unavoidable)
+            let mut tok_batch = vec![0i32; BATCH];
             tok_batch[0] = token_id;
-
             let tok_buf = client.buffer_from_host(
-                bytemuck::cast_slice(&tok_batch),
-                &[EMBED_BATCH as i64],
-                PjrtElementType::S32, 0,
-            ).unwrap();
+                bytemuck::cast_slice(&tok_batch), &[BATCH as i64],
+                PjrtElementType::S32, 0).unwrap();
 
-            // Embedding gather -> [EMBED_BATCH, HIDDEN] f32
-            let embed_out = client.execute(&embed_exe, &[&weights.embedding, &tok_buf]).unwrap();
-            let hidden_f32 = &embed_out[0];
-
-            // DtoH full embed output, convert to bf16, take first BATCH rows
-            let embed_f32_bytes = EMBED_BATCH * HIDDEN * 4;
-            let mut hidden_bytes = vec![0u8; embed_f32_bytes];
-            client.buffer_to_host(hidden_f32, &mut hidden_bytes).unwrap();
-            // Take only first BATCH rows
-            let batch_f32_bytes = &hidden_bytes[..BATCH * HIDDEN * 4];
-            let hidden_bf16 = f32_bytes_to_bf16(batch_f32_bytes);
-            let hidden_buf = client.buffer_from_host(
-                &hidden_bf16,
-                &[BATCH as i64, HIDDEN as i64],
-                PjrtElementType::BF16, 0,
-            ).unwrap();
-
-            // Residual starts as hidden
-            let mut residual_buf = client.buffer_from_host(
-                &vec![0u8; BATCH * HIDDEN * 2],
-                &[BATCH as i64, HIDDEN as i64],
-                PjrtElementType::BF16, 0,
-            ).unwrap();
-            let mut current_hidden = hidden_buf;
-
-            // Positions and slot mapping
             let pos_host: Vec<i32> = (0..BATCH).map(|_| context_len).collect();
-            let slot_host: Vec<i32> = (0..BATCH).map(|i| {
-                context_len * (BATCH as i32) + i as i32
-            }).collect();
+            let slot_host: Vec<i32> = (0..BATCH).map(|i|
+                context_len * (BATCH as i32) + i as i32).collect();
             let ctx_host: Vec<i32> = (0..BATCH).map(|_| context_len + 1).collect();
-
             let pos_buf = client.buffer_from_host(
                 bytemuck::cast_slice(&pos_host), &[BATCH as i64],
-                PjrtElementType::S32, 0,
-            ).unwrap();
+                PjrtElementType::S32, 0).unwrap();
             let slot_buf = client.buffer_from_host(
                 bytemuck::cast_slice(&slot_host), &[BATCH as i64],
-                PjrtElementType::S32, 0,
-            ).unwrap();
+                PjrtElementType::S32, 0).unwrap();
             let ctx_buf = client.buffer_from_host(
                 bytemuck::cast_slice(&ctx_host), &[BATCH as i64],
-                PjrtElementType::S32, 0,
-            ).unwrap();
+                PjrtElementType::S32, 0).unwrap();
 
-            // Run all layers
-            for layer in 0..NUM_LAYERS {
-                let layer_out = client.execute(&layer_exe, &[
-                    &current_hidden,  // arg0: hidden [8, 4096] bf16
-                    &residual_buf,    // arg1: residual [8, 4096] bf16
-                    &weights.layers[layer].input_norm, // arg2: norm gamma [4096] bf16
-                    &weights.layers[layer].qkv,        // arg3: QKV [4096, 6144] bf16
-                    &weights.layers[layer].o_proj,      // arg4: O [4096, 4096] bf16
-                    &weights.layers[layer].mlp_norm,    // arg5: mlp norm [4096] bf16
-                    &weights.layers[layer].gate_up,     // arg6: gate_up [4096, 28672] bf16
-                    &weights.layers[layer].down,        // arg7: down [14336, 4096] bf16
-                    &weights.rope_cos,                  // arg8: cos [4096, 64] f32
-                    &weights.rope_sin,                  // arg9: sin [4096, 64] f32
-                    &pos_buf,                           // arg10: positions [8] i32
-                    &slot_buf,                          // arg11: slot_mapping [8] i32
-                    &k_caches[layer],                   // arg12: k_cache
-                    &v_caches[layer],                   // arg13: v_cache
-                    &bt_buf,                            // arg14: block_tables [8, 256] i32
-                    &ctx_buf,                           // arg15: context_lens [8] i32
-                ]).unwrap();
+            // 18 inputs: 10 globals + 6 stacked weights + 2 stacked KV caches
+            let t_exec = Instant::now();
+            let inputs: Vec<&rvllm_xla::client::PjrtBufferHandle> = vec![
+                &tok_buf,
+                &weights.embedding,
+                &weights.final_norm,
+                &weights.lm_head_bf16,
+                &weights.rope_cos,
+                &weights.rope_sin,
+                &pos_buf,
+                &slot_buf,
+                &bt_buf,
+                &ctx_buf,
+                &weights.all_n1g,
+                &weights.all_qkv,
+                &weights.all_o,
+                &weights.all_n2g,
+                &weights.all_gu,
+                &weights.all_down,
+                &k_cache_stacked,
+                &v_cache_stacked,
+            ];
 
-                // Outputs: [hidden, residual, k_cache, v_cache]
-                let mut outs = layer_out.into_iter();
-                current_hidden = outs.next().unwrap();
-                residual_buf = outs.next().unwrap();
-                k_caches[layer] = outs.next().unwrap();
-                v_caches[layer] = outs.next().unwrap();
-            }
+            // ONE execute: embed + scan(32 layers) + head + argmax
+            let step_out = client.execute(&step_exe, &inputs).unwrap();
+            let exec_us = t_exec.elapsed().as_micros();
 
-            // Final norm + LM head + argmax
-            // lm_head module expects [EMBED_BATCH, HIDDEN] f16.
-            // Read bf16 hidden, convert to f16, pad to EMBED_BATCH.
-            let mut hid_bytes = vec![0u8; BATCH * HIDDEN * 2]; // bf16
-            client.buffer_to_host(&current_hidden, &mut hid_bytes).unwrap();
-            let hid_f16 = bf16_bytes_to_f16(&hid_bytes);
-            // Pad to EMBED_BATCH
-            let mut padded_f16 = vec![0u8; EMBED_BATCH * HIDDEN * 2];
-            padded_f16[..hid_f16.len()].copy_from_slice(&hid_f16);
-            let hid_f16_buf = client.buffer_from_host(
-                &padded_f16,
-                &[EMBED_BATCH as i64, HIDDEN as i64],
-                PjrtElementType::F16, 0,
-            ).unwrap();
+            // Output: (token_ids, stacked_k_caches, stacked_v_caches)
+            let mut outs = step_out.into_iter();
+            let token_buf = outs.next().unwrap();
+            k_cache_stacked = outs.next().unwrap();
+            v_cache_stacked = outs.next().unwrap();
 
-            let head_out = client.execute(&head_exe, &[
-                &hid_f16_buf,
-                &weights.lm_head_f16,
-            ]).unwrap();
+            // Only DtoH: 32 bytes of token IDs
+            let t_dtoh = Instant::now();
+            let mut token_bytes = vec![0u8; BATCH * 4];
+            client.buffer_to_host(&token_buf, &mut token_bytes).unwrap();
+            let dtoh_us = t_dtoh.elapsed().as_micros();
 
-            // Read sampled token (EMBED_BATCH tokens, take first)
-            let mut token_bytes = vec![0u8; EMBED_BATCH * 4];
-            client.buffer_to_host(&head_out[0], &mut token_bytes).unwrap();
             let tokens: &[i32] = bytemuck::cast_slice(&token_bytes);
             let sampled = tokens[0];
+            let step_us = step_start.elapsed().as_micros();
 
-            // Debug: on first decode step, dump hidden and sampled info
-            if step == prompt_ids.len() {
-                eprintln!("[DEBUG] first decode: sampled={} tokens[0..4]={:?}",
-                    sampled, &tokens[..4.min(tokens.len())]);
-                // Read hidden state to check if nonzero
-                let mut dbg_bytes = vec![0u8; BATCH * HIDDEN * 2];
-                client.buffer_to_host(&current_hidden, &mut dbg_bytes).unwrap();
-                let first8: Vec<f32> = (0..8).map(|i| {
-                    let bits = u16::from_le_bytes([dbg_bytes[2*i], dbg_bytes[2*i+1]]);
-                    half::bf16::from_bits(bits).to_f32()
-                }).collect();
-                eprintln!("[DEBUG] hidden[0..8] = {:?}", first8);
+            if step >= prompt_ids.len() && step < prompt_ids.len() + 3 {
+                let ds = step - prompt_ids.len();
+                eprintln!("[PROFILE] decode step {} total={}us exec={}us dtoh={}us",
+                    ds, step_us, exec_us, dtoh_us);
             }
 
             context_len += 1;
@@ -310,21 +241,19 @@ mod tpu_main {
         eprintln!("generated:        {:?}", &generated[..generated.len().min(20)]);
     }
 
-    struct LayerWeights {
-        input_norm: rvllm_xla::client::PjrtBufferHandle,
-        qkv: rvllm_xla::client::PjrtBufferHandle,
-        o_proj: rvllm_xla::client::PjrtBufferHandle,
-        mlp_norm: rvllm_xla::client::PjrtBufferHandle,
-        gate_up: rvllm_xla::client::PjrtBufferHandle,
-        down: rvllm_xla::client::PjrtBufferHandle,
-    }
-
     struct ModelWeights {
         embedding: rvllm_xla::client::PjrtBufferHandle,
-        lm_head_f16: rvllm_xla::client::PjrtBufferHandle,
+        final_norm: rvllm_xla::client::PjrtBufferHandle,
+        lm_head_bf16: rvllm_xla::client::PjrtBufferHandle,
         rope_cos: rvllm_xla::client::PjrtBufferHandle,
         rope_sin: rvllm_xla::client::PjrtBufferHandle,
-        layers: Vec<LayerWeights>,
+        // Stacked [NUM_LAYERS, ...] tensors for scan
+        all_n1g: rvllm_xla::client::PjrtBufferHandle,
+        all_qkv: rvllm_xla::client::PjrtBufferHandle,
+        all_o: rvllm_xla::client::PjrtBufferHandle,
+        all_n2g: rvllm_xla::client::PjrtBufferHandle,
+        all_gu: rvllm_xla::client::PjrtBufferHandle,
+        all_down: rvllm_xla::client::PjrtBufferHandle,
     }
 
     fn load_weights(client: &PjrtClientHandle, model_dir: &PathBuf) -> ModelWeights {
@@ -412,94 +341,90 @@ mod tpu_main {
                 .unwrap_or_else(|e| panic!("upload {name}: {e}"))
         };
 
-        // Embedding [vocab, hidden] f32 (MLIR module expects f32)
-        let embedding = upload_f32("model.embed_tokens.weight",
+        // Embedding [vocab, hidden] bf16 (fused step uses bf16)
+        let embedding = upload_bf16("model.embed_tokens.weight",
             &[VOCAB as i64, HIDDEN as i64]);
 
-        // LM head [vocab, hidden] f16
-        let lm_head_f16 = if tensor_data.contains_key("lm_head.weight") {
-            upload_f16("lm_head.weight", &[VOCAB as i64, HIDDEN as i64])
+        // Final norm [hidden] bf16
+        let final_norm = upload_bf16("model.norm.weight", &[HIDDEN as i64]);
+
+        // LM head [vocab, hidden] bf16
+        let lm_head_bf16 = if tensor_data.contains_key("lm_head.weight") {
+            upload_bf16("lm_head.weight", &[VOCAB as i64, HIDDEN as i64])
         } else {
-            upload_f16("model.embed_tokens.weight", &[VOCAB as i64, HIDDEN as i64])
+            upload_bf16("model.embed_tokens.weight", &[VOCAB as i64, HIDDEN as i64])
         };
 
         // RoPE cos/sin [max_pos, head_dim/2] f32
         let rope_cos = precompute_rope_cos(client, 10000.0);
         let rope_sin = precompute_rope_sin(client, 10000.0);
 
-        // Per-layer weights
-        let mut layers = Vec::with_capacity(NUM_LAYERS);
+        // Stack per-layer weights into [NUM_LAYERS, ...] tensors for scan
+        let qkv_dim = NUM_HEADS * HEAD_DIM + 2 * NUM_KV_HEADS * HEAD_DIM;
+        let mut all_n1g_bytes = Vec::new();
+        let mut all_qkv_bytes = Vec::new();
+        let mut all_o_bytes = Vec::new();
+        let mut all_n2g_bytes = Vec::new();
+        let mut all_gu_bytes = Vec::new();
+        let mut all_down_bytes = Vec::new();
+
         for l in 0..NUM_LAYERS {
             let ln = |s: &str| format!("model.layers.{l}.{s}");
 
-            let input_norm = upload_bf16(&ln("input_layernorm.weight"),
-                &[HIDDEN as i64]);
+            let (_, n1g) = get_bf16(&tensor_data, &ln("input_layernorm.weight"));
+            all_n1g_bytes.extend_from_slice(&n1g);
 
-            // Concat Q + K + V, transpose to [hidden, q_dim+2*kv_dim]
-            // Safetensors: q=[q_dim, hidden], k=[kv_dim, hidden], v=[kv_dim, hidden]
-            // MLIR expects: [hidden, q_dim+kv_dim+kv_dim] (contracting on dim 0 of weight = hidden)
             let q_name = ln("self_attn.q_proj.weight");
             let k_name = ln("self_attn.k_proj.weight");
             let v_name = ln("self_attn.v_proj.weight");
-            let qkv_dim = NUM_HEADS * HEAD_DIM + 2 * NUM_KV_HEADS * HEAD_DIM;
-            let qkv_bytes = concat_and_transpose_bf16(
-                &tensor_data, &[&q_name, &k_name, &v_name], HIDDEN,
-            );
-            let qkv = client.buffer_from_host(&qkv_bytes,
-                &[HIDDEN as i64, qkv_dim as i64],
-                PjrtElementType::BF16, 0).unwrap();
+            let qkv = concat_and_transpose_bf16(&tensor_data, &[&q_name, &k_name, &v_name], HIDDEN);
+            all_qkv_bytes.extend_from_slice(&qkv);
 
-            // O proj: safetensors [hidden, q_dim] -> MLIR [hidden, hidden]
-            // dot_general contracts input[1] x weight[0], so weight is [q_dim, hidden]
-            // safetensors stores [hidden, q_dim] -- need transpose
-            let o_name = ln("self_attn.o_proj.weight");
-            let o_bytes = transpose_bf16(&tensor_data, &o_name);
-            let o_proj = client.buffer_from_host(&o_bytes,
-                &[HIDDEN as i64, HIDDEN as i64],
-                PjrtElementType::BF16, 0).unwrap();
+            let o = transpose_bf16(&tensor_data, &ln("self_attn.o_proj.weight"));
+            all_o_bytes.extend_from_slice(&o);
 
-            let mlp_norm = upload_bf16(&ln("post_attention_layernorm.weight"),
-                &[HIDDEN as i64]);
+            let (_, n2g) = get_bf16(&tensor_data, &ln("post_attention_layernorm.weight"));
+            all_n2g_bytes.extend_from_slice(&n2g);
 
-            // gate+up: safetensors each [inter, hidden] -> MLIR [hidden, 2*inter]
             let g_name = ln("mlp.gate_proj.weight");
             let u_name = ln("mlp.up_proj.weight");
-            let gate_up_bytes = concat_and_transpose_bf16(
-                &tensor_data, &[&g_name, &u_name], HIDDEN,
-            );
-            let gate_up = client.buffer_from_host(&gate_up_bytes,
-                &[HIDDEN as i64, (2 * INTERMEDIATE) as i64],
-                PjrtElementType::BF16, 0).unwrap();
+            let gu = concat_and_transpose_bf16(&tensor_data, &[&g_name, &u_name], HIDDEN);
+            all_gu_bytes.extend_from_slice(&gu);
 
-            // down: safetensors [hidden, inter] -> MLIR [inter, hidden]
-            let d_name = ln("mlp.down_proj.weight");
-            let down_bytes = transpose_bf16(&tensor_data, &d_name);
-            let down = client.buffer_from_host(&down_bytes,
-                &[INTERMEDIATE as i64, HIDDEN as i64],
-                PjrtElementType::BF16, 0).unwrap();
+            let d = transpose_bf16(&tensor_data, &ln("mlp.down_proj.weight"));
+            all_down_bytes.extend_from_slice(&d);
 
             if l == 0 || l == NUM_LAYERS - 1 {
-                eprintln!("  layer {l} loaded");
+                eprintln!("  layer {l} stacked");
             } else if l == 1 {
                 eprintln!("  ...");
             }
-
-            layers.push(LayerWeights {
-                input_norm,
-                qkv,
-                o_proj,
-                mlp_norm,
-                gate_up,
-                down,
-            });
         }
+
+        let nl = NUM_LAYERS as i64;
+        let h = HIDDEN as i64;
+        let qd = qkv_dim as i64;
+        let inter = INTERMEDIATE as i64;
+
+        let all_n1g = client.buffer_from_host(&all_n1g_bytes, &[nl, h], PjrtElementType::BF16, 0).unwrap();
+        let all_qkv = client.buffer_from_host(&all_qkv_bytes, &[nl, h, qd], PjrtElementType::BF16, 0).unwrap();
+        let all_o = client.buffer_from_host(&all_o_bytes, &[nl, h, h], PjrtElementType::BF16, 0).unwrap();
+        let all_n2g = client.buffer_from_host(&all_n2g_bytes, &[nl, h], PjrtElementType::BF16, 0).unwrap();
+        let all_gu = client.buffer_from_host(&all_gu_bytes, &[nl, h, 2 * inter], PjrtElementType::BF16, 0).unwrap();
+        let all_down = client.buffer_from_host(&all_down_bytes, &[nl, inter, h], PjrtElementType::BF16, 0).unwrap();
 
         ModelWeights {
             embedding,
-            lm_head_f16,
+            final_norm,
+            lm_head_bf16,
             rope_cos,
             rope_sin,
-            layers,
+            all_n1g,
+            all_qkv,
+            all_o,
+            all_n2g,
+            all_gu,
+            all_down,
         }
     }
 
