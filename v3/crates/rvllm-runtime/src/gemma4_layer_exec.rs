@@ -147,8 +147,28 @@ pub unsafe fn gemma4_forward(
     stream: u64,
 ) -> Result<()> {
     let q_dim = dims.num_heads * dims.head_dim;
-    let kv_dim = dims.num_kv_heads * dims.head_dim;
+    let _kv_dim = dims.num_kv_heads * dims.head_dim;
     let qkv_rows = (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim;
+
+    #[cfg(feature = "cuda")]
+    let dbg = {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static DBG_CTR: AtomicU32 = AtomicU32::new(0);
+        let cnt = DBG_CTR.fetch_add(1, Ordering::Relaxed);
+        cnt == 0 && std::env::var("RVLLM_DBG_LAYER").is_ok()
+    };
+    #[cfg(feature = "cuda")]
+    macro_rules! probe {
+        ($label:expr, $ptr:expr, $n:expr) => {
+            if dbg {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let mut s = [0u16; 4];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, $ptr, 8);
+                let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
+                eprintln!("    [L0 {}] first4={:.4?}", $label, v);
+            }
+        };
+    }
 
     // 1. input_layernorm -> FP8 quant
     FusedRmsnormFp8QuantLaunch {
@@ -164,6 +184,9 @@ pub unsafe fn gemma4_forward(
         weights.attn_norm_gamma,
         stream,
     )?;
+
+    #[cfg(feature = "cuda")]
+    probe!("after_step1_residual", residual, dims.hidden);
 
     // 2. Q||K||V projection (cuBLASLt FP8 GEMM)
     #[cfg(feature = "cuda")]
@@ -305,6 +328,9 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
+    #[cfg(feature = "cuda")]
+    probe!("after_step7_residual", residual, dims.hidden);
+
     // 8. post_attention_layernorm (norm-only, applied to residual in-place
     //    for Gemma's pre-post norm structure). This is a norm without FP8
     //    quant -- it feeds into the pre_feedforward_layernorm which does quant.
@@ -326,6 +352,9 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
+    #[cfg(feature = "cuda")]
+    probe!("after_step8_residual", residual, dims.hidden);
+
     // 8b. residual *= layer_scalar (per-layer learnable scale)
     gemma4_launcher::ResidualScaleF16Launch {
         num_tokens: dims.num_tokens,
@@ -337,6 +366,9 @@ pub unsafe fn gemma4_forward(
         weights.layer_scalar_ptr,
         stream,
     )?;
+
+    #[cfg(feature = "cuda")]
+    probe!("after_step8b_residual", residual, dims.hidden);
 
     // 9. pre_feedforward_layernorm -> FP8 quant
     FusedRmsnormFp8QuantLaunch {
@@ -394,6 +426,9 @@ pub unsafe fn gemma4_forward(
         weights.down_scale,
         stream,
     )?;
+
+    #[cfg(feature = "cuda")]
+    probe!("after_step12_residual", residual, dims.hidden);
 
     // 13. post_feedforward_layernorm (norm-only, in-place on residual)
     gemma4_launcher::RmsnormInplaceLaunch {
