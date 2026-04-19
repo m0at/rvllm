@@ -275,49 +275,12 @@ pub struct Fa2PtxKernels {
     pub flash_attention_mod: rvllm_kernels::LoadedModule,
     #[cfg(feature = "cuda")]
     pub fn_decode: rvllm_kernels::KernelFn,
-    /// `flash_attention_2_decode_f16io_kernel` — f16 I/O decode against
-    /// an f16 paged KV cache. Matches the `PagedDecodeLauncher` ABI so
-    /// sm_121 can serve `RVLLM_F16_KV=1` without f32<->f16 scratch.
-    /// Head-dim is capped at 256 by the smem budget (BC=32 with
-    /// head_dim=512 overflows the 99 KB opt-in ceiling); head_dim > 256
-    /// returns `FeatureNotAvailable` — that arm is Gemma 4 global
-    /// attention which must use FP8 KV today.
     #[cfg(feature = "cuda")]
-    pub fn_decode_f16io: rvllm_kernels::KernelFn,
+    pub fn_decode_f16kv: rvllm_kernels::KernelFn,
     #[cfg(feature = "cuda")]
     pub fn_prefill: rvllm_kernels::KernelFn,
     #[cfg(feature = "cuda")]
     pub fn_prefill_f16kv: rvllm_kernels::KernelFn,
-    /// `flash_attention_2_decode_fp8kv_kernel` — Gemma 4 decode path
-    /// on sm_121, FP8 E4M3 KV cache, f16 output. Matches the
-    /// `PagedDecodeFp8Launcher` ABI. BC=16 (see flash_attention.cu);
-    /// head_dim=512 could not fit BC=32 on sm_121`s 99 KB opt-in
-    /// smem cap, and head_dim=256 measurably benefits from BC=16
-    /// occupancy (2+ blocks/SM vs 1 at BC=32), so sm_121 converged
-    /// on BC=16 for all head_dims.
-    #[cfg(feature = "cuda")]
-    pub fn_decode_fp8kv: rvllm_kernels::KernelFn,
-    /// `flash_attention_2_prefill_fp8kv_unified_kernel` — multi-query
-    /// FP8-KV prefill. Port of vLLM's
-    /// `kernel_unified_attention_2d`; see
-    /// `v3/UNIFIED_PREFILL_SPEC.md`. Replaces the per-token decode
-    /// loop currently used by
-    /// `gemma4_layer_exec::Gemma4Phase::Prefill`, which is the
-    /// dominant TTFT cost on sm_121 (≈30× slower than vLLM on a
-    /// 1836-token prompt).
-    ///
-    /// Loaded from a separate PTX module
-    /// (`flash_attention_unified_prefill.ptx`) so we can iterate on
-    /// the kernel without reflashing the full
-    /// `flash_attention.ptx`. Optional until the kernel body lands
-    /// — `None` routes callers to the per-qi decode fallback.
-    #[cfg(feature = "cuda")]
-    pub fn_prefill_fp8kv_unified: Option<rvllm_kernels::KernelFn>,
-    /// The owning PTX module for `fn_prefill_fp8kv_unified`. Kept
-    /// alive alongside the function handle so `cuModuleUnload` only
-    /// fires at drop.
-    #[cfg(feature = "cuda")]
-    pub unified_prefill_mod: Option<rvllm_kernels::LoadedModule>,
 }
 
 impl Fa2PtxKernels {
@@ -346,61 +309,24 @@ impl Fa2PtxKernels {
         {
             let flash_attention_mod = loader.load_ptx("flash_attention")?;
             let fn_decode = flash_attention_mod.get_function("flash_attention_2_decode_kernel")?;
-            let fn_decode_f16io =
-                flash_attention_mod.get_function("flash_attention_2_decode_f16io_kernel")?;
+            let fn_decode_f16kv =
+                flash_attention_mod.get_function("flash_attention_2_decode_f16kv_kernel")?;
             let fn_prefill = flash_attention_mod.get_function("flash_attention_2_kernel")?;
             let fn_prefill_f16kv =
                 flash_attention_mod.get_function("flash_attention_2_f16kv_kernel")?;
-            let fn_decode_fp8kv =
-                flash_attention_mod.get_function("flash_attention_2_decode_fp8kv_kernel")?;
-
-            // Optional: the unified prefill PTX module is added in
-            // Phase A of `UNIFIED_PREFILL_SPEC.md` and its body lands
-            // in Phase B. Treat a missing module / missing symbol as
-            // "not available" rather than fatal so bring-up survives
-            // until the body compiles.
-            let (unified_prefill_mod, fn_prefill_fp8kv_unified) =
-                match loader.load_ptx("flash_attention_unified_prefill") {
-                    Ok(m) => {
-                        let f = m
-                            .get_function("flash_attention_2_prefill_fp8kv_unified_kernel")
-                            .ok();
-                        (Some(m), f)
-                    }
-                    Err(_) => (None, None),
-                };
             Ok(Self {
                 head_dim,
                 flash_attention_mod,
                 fn_decode,
-                fn_decode_f16io,
+                fn_decode_f16kv,
                 fn_prefill,
                 fn_prefill_f16kv,
-                fn_decode_fp8kv,
-                fn_prefill_fp8kv_unified,
-                unified_prefill_mod,
             })
         }
         #[cfg(not(feature = "cuda"))]
         {
             let _ = loader;
             Ok(Self { head_dim })
-        }
-    }
-
-    /// Convenience: is the unified multi-Q FP8 prefill kernel
-    /// available for this head_dim? Returns `false` when the PTX
-    /// module is missing (Phase A/B not built yet) or the function
-    /// symbol didn't resolve. Callers that can fall back to the
-    /// decode-per-qi loop gate on this.
-    pub fn has_unified_prefill(&self) -> bool {
-        #[cfg(feature = "cuda")]
-        {
-            self.fn_prefill_fp8kv_unified.is_some()
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            false
         }
     }
 }

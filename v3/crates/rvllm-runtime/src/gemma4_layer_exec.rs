@@ -33,7 +33,10 @@ use rvllm_fused::gemma4_launcher;
 use rvllm_fused::FusedRmsnormFp8QuantLaunch;
 use rvllm_kernels::KernelFn;
 
-use rvllm_attention::{AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams};
+use rvllm_attention::{
+    AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams,
+    PagedPrefillFp8Launcher, PagedPrefillParams,
+};
 
 use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
@@ -229,7 +232,7 @@ pub unsafe fn gemma4_forward(
     scratch: &Gemma4LayerScratch,
     meta: &Gemma4MetadataPtrs,
     cublaslt: &CublasLt,
-    cutlass: &CutlassBackend,
+    cutlass: &CutlassLib,
     sliding_attention: &AttentionBackend,
     global_attention: &AttentionBackend,
     residual: u64,
@@ -247,7 +250,7 @@ pub unsafe fn gemma4_forward_phase(
     scratch: &Gemma4LayerScratch,
     meta: &Gemma4MetadataPtrs,
     cublaslt: &CublasLt,
-    cutlass: &CutlassBackend,
+    cutlass: &CutlassLib,
     sliding_attention: &AttentionBackend,
     global_attention: &AttentionBackend,
     residual: u64,

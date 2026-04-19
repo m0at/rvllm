@@ -710,13 +710,6 @@ fn upload_fp8_from(
 ///
 /// Panics on any other layout — better a clear panic at load-time than
 /// silent miscalibration at inference.
-///
-/// **Use `read_blockscale_bf16` instead** when the consumer's kernel
-/// ABI expects a 2-D blockscale tensor (e.g. `Fp8GemvF16InLaunch`).
-/// This function collapses the 2-D source to a per-row projection
-/// which is the wrong shape for those kernels; calling them with a
-/// projected vector walks off the end of the buffer into neighbouring
-/// weights' memory.
 fn read_channelscale_bf16(
     scale_entry: &(usize, TensorEntry),
     shards: &[ShardMap],
@@ -767,98 +760,6 @@ fn read_channelscale_bf16(
     );
 }
 
-/// Pure-function core of `read_blockscale_bf16`: bf16-LE bytes →
-/// `Vec<f32>`. Lifted out so we can unit-test the decode path
-/// without constructing a `ShardMap` (which needs a real mmap'd
-/// file). The outer `read_blockscale_bf16` wrapper handles the
-/// shape dispatch + ShardMap slicing.
-fn decode_blockscale_bytes(raw: &[u8], rows_blocks: usize, cols_blocks: usize) -> Option<Vec<f32>> {
-    let n = raw.len() / 2;
-    if n != rows_blocks * cols_blocks {
-        return None;
-    }
-    let bf16_le_to_f32 = |lo: u8, hi: u8| f32::from_bits(u32::from_le_bytes([0, 0, lo, hi]));
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        out.push(bf16_le_to_f32(raw[2 * i], raw[2 * i + 1]));
-    }
-    Some(out)
-}
-
-/// Read a 2-D blockwise FP8 scale tensor into a raw f32 buffer
-/// preserving its `[rows_blocks, cols_blocks]` shape. Returns
-/// `None` when the source is per-channel 1-D (not blockscale).
-///
-/// Use for consumers whose kernel ABI is `[N_blocks, K_blocks]`
-/// (e.g. CUTLASS SFB, `fp8_gemv_blockwise_wpr_*`). For the
-/// compatibility per-row projection, call `read_channelscale_bf16`.
-fn read_blockscale_bf16(
-    scale_entry: &(usize, TensorEntry),
-    shards: &[ShardMap],
-) -> Option<(Vec<f32>, usize, usize)> {
-    let (si, e) = scale_entry;
-    if e.shape.len() != 2 {
-        return None;
-    }
-    let rows_blocks = e.shape[0];
-    let cols_blocks = e.shape[1];
-    let raw = &shards[*si].bytes()[e.file_offset as usize..(e.file_offset + e.nbytes) as usize];
-    let decoded = decode_blockscale_bytes(raw, rows_blocks, cols_blocks)?;
-    Some((decoded, rows_blocks, cols_blocks))
-}
-
-#[cfg(test)]
-mod blockscale_tests {
-    use super::*;
-
-    // bf16 = upper 16 bits of f32.
-    fn f32_to_bf16_le(x: f32) -> [u8; 2] {
-        let bits = x.to_bits();
-        let hi = ((bits >> 16) & 0xFFFF) as u16;
-        hi.to_le_bytes()
-    }
-
-    #[test]
-    fn decode_blockscale_roundtrips_representative_values() {
-        // Two row-blocks × three col-blocks = 6 bf16 scales. Values
-        // chosen so they survive bf16 round-trip exactly (powers of 2
-        // + simple fractions).
-        let src = [0.25_f32, 0.5, 1.0, 2.0, 4.0, 0.125];
-        let mut raw = Vec::with_capacity(src.len() * 2);
-        for v in &src { raw.extend_from_slice(&f32_to_bf16_le(*v)); }
-
-        let out = decode_blockscale_bytes(&raw, 2, 3).expect("shape fits");
-        assert_eq!(out, src);
-    }
-
-    #[test]
-    fn decode_blockscale_rejects_shape_mismatch() {
-        // 8 bytes = 4 bf16 values, but caller claims 2x3 = 6. Should
-        // reject rather than silently read garbage.
-        let raw = vec![0u8; 8];
-        assert!(decode_blockscale_bytes(&raw, 2, 3).is_none());
-    }
-
-    #[test]
-    fn decode_blockscale_preserves_layout_order() {
-        // Regression guard: read order must be row-major, matching the
-        // on-disk safetensors layout. This is the exact bug the PR
-        // reviewer flagged — `channelscale_ptr` projected the 2-D
-        // tensor to per-row via `rb * cols_blocks` indexing. Check
-        // the full blockscale preserves column ordering too.
-        let src: Vec<f32> = (0..6).map(|i| (i as f32) * 0.5).collect();
-        let raw: Vec<u8> = src.iter().flat_map(|v| f32_to_bf16_le(*v)).collect();
-        let out = decode_blockscale_bytes(&raw, 2, 3).unwrap();
-        // Expect row 0: [0.0, 0.5, 1.0], row 1: [1.5, 2.0, 2.5].
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[1], 0.5);
-        assert_eq!(out[2], 1.0);
-        assert_eq!(out[3], 1.5);
-        assert_eq!(out[4], 2.0);
-        assert_eq!(out[5], 2.5);
-    }
-}
-
 /// Upload pre-quantized FP8 weight with per-channel BF16 scales.
 /// Raw FP8 bytes go straight to GPU. Per-channel scales uploaded as f32
 /// vector. Weight scalar scale set to 1.0 -- channelscale applied post-GEMM.
@@ -878,8 +779,8 @@ fn upload_fp8_direct_channelscale(
     let region = arena.region(region_name, raw.len(), 16)?;
     unsafe { region.copy_from_host(raw)? };
     if let Some(se) = scale_entry {
-        // Legacy per-row channelscale vector (compat path for cuBLASLt
-        // OUTER_VEC_32F + any consumer that only knows per-row).
+        // `read_channelscale_bf16` guarantees `len() == rows` for both
+        // per-channel and blockwise layouts — see its docs.
         let ch_scales = read_channelscale_bf16(se, shards, rows);
         let scale_bytes: Vec<u8> = ch_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
         let cs_r = arena.region("fp8_chscale", scale_bytes.len(), 16)?;

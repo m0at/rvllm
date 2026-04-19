@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rvllm_attention::Fa3Kernels;
+use rvllm_attention::{AttentionBackend, Fa3Kernels};
 #[cfg(feature = "cuda")]
 use rvllm_core::CompileTarget;
 use rvllm_core::{ConfigError, Result, RvllmError};
@@ -37,7 +37,7 @@ pub struct EnginePaths {
 pub struct Bringup {
     pub fused_modules: FusedModules,
     pub fa3: AttentionBackend,
-    pub cutlass: CutlassBackend,
+    pub cutlass: CutlassLib,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,

@@ -95,29 +95,27 @@ pub struct Gemma4FusedModules {
     pub fn_scale_cols_f16: KernelFn,
     pub scale_cols_f16_mod: LoadedModule,
 
-    // `fp8_gemv.ptx` — GB10 warp-per-row FP8 GEMV kernels. Loaded at
-    // bringup so the Sm121 decode fast path (`launch_fp8_gemv_f16in`
-    // in `gemma4_layer_exec.rs`) can call it without a per-step
-    // module load. Only the f16-input variant is resolved — the
-    // other enum variants in `Fp8GemvVariant` document what ships in
-    // the PTX but nothing in the runtime path calls them.
+    // `fp8_gemv.ptx` — the GB10-focused unfused FP8 GEMV kernels. Loaded
+    // at bringup so the eventual FP8-GEMV dispatcher (see
+    // `rvllm_kernels::gb10_dispatch`) can call `select_variant` per
+    // launch without any per-step module load. Nothing in the current
+    // decode path touches these yet — this is the additive landing for
+    // the wiring that swaps in on a follow-up PR.
     pub fp8_gemv_mod: LoadedModule,
+    pub fn_fp8_gemv_wpr_lut: KernelFn,
     /// `None` when the live device is not Blackwell (sm_100+) — the
     /// native-CVT entry is gated on `__CUDA_ARCH__ >= 1000` in
-    /// `kernels/fp8_gemv.cu`, so the symbol is absent from
-    /// pre-Blackwell PTX. `Fp8GemvVariant::available_for(target)` is
-    /// the source of truth for this gate. Used by the Sm121 decode
-    /// path to run projection GEMMs (QKV / O / gate_up / down)
-    /// directly off f16 activations, skipping the FP8 activation-
-    /// quant step that cuBLASLt requires.
-    pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    /// `kernels/fp8_gemv.cu`, so the symbol is absent from pre-Blackwell
+    /// PTX. `Fp8GemvVariant::available_for(target)` is the source of
+    /// truth for this gate.
+    pub fn_fp8_gemv_wpr_native: Option<KernelFn>,
 }
 
 pub struct Gemma4Bringup {
     pub fused: Gemma4FusedModules,
     pub sliding_attention: AttentionBackend,
     pub global_attention: AttentionBackend,
-    pub cutlass: CutlassBackend,
+    pub cutlass: CutlassLib,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,
@@ -132,26 +130,17 @@ pub struct Gemma4Bringup {
 impl Gemma4Bringup {
     pub fn load(paths: Gemma4EnginePaths, arena_bytes: usize) -> Result<Self> {
         let ctx = Arc::new(CudaContextHandle::init(0)?);
-        // Resolve the compile target once per bring-up and thread it
-        // through — every call to `ctx.compute_capability()` + the
-        // lookup costs nothing individually but spreading it across 5
-        // sites means "which CC are we on?" reads inconsistent if a
-        // future refactor accidentally shadows `ctx`.
-        #[cfg(feature = "cuda")]
-        let compile_target: Option<rvllm_core::CompileTarget> = {
-            let (major, minor) = ctx.compute_capability();
-            rvllm_core::CompileTarget::from_compute_capability(major, minor)
-        };
-        #[cfg(not(feature = "cuda"))]
-        let compile_target: Option<rvllm_core::CompileTarget> = None;
-
         // Arena backing picked per compute capability — see `Bringup::load`
         // in bring_up.rs for the full rationale (GB10 has no dedicated HBM,
         // cuMemAllocManaged is the right allocator there).
         let arena = {
             #[cfg(feature = "gb10")]
             {
-                if matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121)) {
+                let target = rvllm_core::CompileTarget::from_compute_capability(
+                    ctx.compute_capability().0,
+                    ctx.compute_capability().1,
+                );
+                if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
                     rvllm_mem::UnifiedArena::new(&ctx, arena_bytes)?.into_inner()
                 } else {
                     HbmArena::new(&ctx, arena_bytes)?
@@ -185,7 +174,13 @@ impl Gemma4Bringup {
         // `Fa3SoMissing`. See `rvllm_attention::Fa2PtxKernels` docs.
         let (sliding_attention, global_attention) = {
             #[cfg(feature = "gb10")]
-            let is_gb10 = matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121));
+            let is_gb10 = matches!(
+                rvllm_core::CompileTarget::from_compute_capability(
+                    ctx.compute_capability().0,
+                    ctx.compute_capability().1,
+                ),
+                Some(rvllm_core::CompileTarget::Sm121),
+            );
             #[cfg(not(feature = "gb10"))]
             let is_gb10 = false;
             if is_gb10 {
@@ -267,11 +262,26 @@ impl Gemma4Bringup {
             bytes: cublaslt_ws_bytes,
         };
 
-        // `compile_target` is also what the fused loader uses to gate
-        // `Fp8GemvVariant::WprNative` (sm_100+ only). `Some(None)` vs
-        // `None` is distinct: it means "probe succeeded but CC isn't
-        // in our target matrix", which falls back to `WprLut`.
-        let fused = load_gemma4_fused(&kernels, compile_target)?;
+        // Live-device target is needed by the fused loader to decide
+        // whether `Fp8GemvVariant::WprNative` should be resolved (it's
+        // sm_100+ only). Under `feature = "cuda"` we have a real
+        // compute-capability reading; otherwise default to `None` and
+        // let the loader resolve only the universally-available
+        // variant. `Some(None)` vs `None` is distinct: it means
+        // "probe succeeded but CC isn't in our target matrix", which
+        // should still fall back to `WprLut`.
+        let fp8_target = {
+            #[cfg(feature = "cuda")]
+            {
+                let (major, minor) = ctx.compute_capability();
+                rvllm_core::CompileTarget::from_compute_capability(major, minor)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                None
+            }
+        };
+        let fused = load_gemma4_fused(&kernels, fp8_target)?;
 
         Ok(Self {
             ctx,
@@ -2051,15 +2061,16 @@ fn load_gemma4_fused(
     let fn_fused_rope_partial_f16kv =
         fused_rope_partial_f16kv_mod.get_function("fused_rope_partial_f16kv_kernel")?;
 
-    // `fp8_gemv.ptx` — see struct docs. The f16-input native-CVT
-    // entry is gated on `__CUDA_ARCH__ >= 1000` in
-    // `kernels/fp8_gemv.cu`, so we only resolve it when
+    // `fp8_gemv.ptx` — see struct docs. Both WPR variants live in the
+    // same module; the native-CVT entry is gated on `__CUDA_ARCH__ >=
+    // 1000`, so we only attempt to resolve it when
     // `Fp8GemvVariant::available_for(target)` says yes.
     let fp8_gemv_mod = loader.load_ptx(rvllm_kernels::FP8_GEMV_PTX_STEM)?;
-    let fn_fp8_gemv_wpr_native_f16in = match target {
-        Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t) => Some(
-            fp8_gemv_mod
-                .get_function(rvllm_kernels::Fp8GemvVariant::WprNativeF16In.entry_point())?,
+    let fn_fp8_gemv_wpr_lut =
+        fp8_gemv_mod.get_function(rvllm_kernels::Fp8GemvVariant::WprLut.entry_point())?;
+    let fn_fp8_gemv_wpr_native = match target {
+        Some(t) if rvllm_kernels::Fp8GemvVariant::WprNative.available_for(t) => Some(
+            fp8_gemv_mod.get_function(rvllm_kernels::Fp8GemvVariant::WprNative.entry_point())?,
         ),
         _ => None,
     };
@@ -2133,6 +2144,7 @@ fn load_gemma4_fused(
         fn_scale_cols_f16,
         scale_cols_f16_mod,
         fp8_gemv_mod,
-        fn_fp8_gemv_wpr_native_f16in,
+        fn_fp8_gemv_wpr_lut,
+        fn_fp8_gemv_wpr_native,
     })
 }
