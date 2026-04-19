@@ -24,3 +24,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  gb10-check:
+    # Compile-check the GB10 / sm_121 target path without CUDA. No GPU
+    # in CI — this guards that the `gb10` feature compiles and the new
+    # GB10-specific crates (arch detection, UnifiedArena, fp8_gemv
+    # dispatch) stay consistent with each other. Hardware validation
+    # runs off-CI on a real DGX Spark.
+    name: GB10 compile-check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: v3
+      - name: cargo check (gb10 feature on rvllm-mem)
+        run: cargo check -p rvllm-mem --features gb10
+      - name: cargo check (rvllm-core arch module)
+        run: cargo check -p rvllm-core
+      - name: cargo check (rvllm-kernels + gb10_dispatch)
+        run: cargo check -p rvllm-kernels
+      - name: cargo test (GB10 unit tests)
+        run: |
+          cargo test -p rvllm-core --lib
+          cargo test -p rvllm-mem --features gb10 --lib
+          cargo test -p rvllm-kernels --lib

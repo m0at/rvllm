@@ -143,9 +143,12 @@ Commits in the `rusty_sm121` branch (as of the current state):
       symbol names are test-pinned against `kernels/fp8_gemv.cu`.
       Wiring into the actual kernel-launch path is downstream work
       (no `fp8_gemv` dispatcher exists on any arch yet).
-- [ ] CI: `cargo check --workspace` cross-compile for `sm_121` target
-      gated by `feature = "gb10"` (compile-check only; no hardware in
-      CI).
+- [x] ~~CI compile-check for GB10 path~~ — new `gb10-check` job in
+      `.github/workflows/ci.yml` runs `cargo check` on `rvllm-mem`
+      (with `--features gb10`), `rvllm-core`, and `rvllm-kernels`,
+      followed by their lib tests (43 total across the three crates).
+      No CUDA / no GPU needed; guards that the GB10-specific modules
+      stay mutually consistent. Hardware validation runs off-CI.
 - [ ] Bench harness: `rvllm-bench` should log `clocks.sm` +
       `power.draw` at 1 Hz during a run so the clock-regime paradox
       shows up in numbers, not just comments.
