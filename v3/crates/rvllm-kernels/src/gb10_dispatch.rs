@@ -41,16 +41,17 @@ pub enum Fp8GemvVariant {
     WprNative,
 }
 
-impl Fp8GemvVariant {
-    /// The PTX logical name (stem) as it appears in `manifest.json`.
-    pub const fn kernel_name(self) -> &'static str {
-        match self {
-            Fp8GemvVariant::WprLut => "fp8_gemv",      // fp8_gemv_blockwise_wpr_lut_kernel
-            Fp8GemvVariant::WprNative => "fp8_gemv",   // same PTX, different entry
-        }
-    }
+/// Logical PTX name (stem as it appears in `manifest.json`). Both
+/// variants live in the same `fp8_gemv.ptx` module — they differ only
+/// in their `__global__` entry-point symbol. Kept as a plain constant
+/// rather than a per-variant method so callers don't accidentally
+/// treat the two variants as separate modules.
+pub const FP8_GEMV_PTX_STEM: &str = "fp8_gemv";
 
-    /// The `__global__` function symbol inside the PTX module.
+impl Fp8GemvVariant {
+    /// The `__global__` function symbol inside the `fp8_gemv.ptx`
+    /// module. Paired with `FP8_GEMV_PTX_STEM` to resolve a variant
+    /// through the kernel loader.
     pub const fn entry_point(self) -> &'static str {
         match self {
             Fp8GemvVariant::WprLut => "fp8_gemv_blockwise_wpr_lut_kernel",
@@ -201,6 +202,7 @@ mod tests {
         // These symbol names must track the __global__ function names
         // in kernels/fp8_gemv.cu. If those names change, this test
         // forces an audit.
+        assert_eq!(FP8_GEMV_PTX_STEM, "fp8_gemv");
         assert_eq!(
             Fp8GemvVariant::WprLut.entry_point(),
             "fp8_gemv_blockwise_wpr_lut_kernel",
