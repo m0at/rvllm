@@ -113,8 +113,15 @@ Commits in the `rusty_sm121` branch (as of the current state):
       `bring_up::resolve_kernels_dir` maps the pair to a `CompileTarget`
       and selects `kernels/<sm_xxx>/manifest.json`. Unsupported CC or
       missing subdir = hard `ConfigError` at bring-up (no silent fallback).
-- [ ] `UnifiedArena` in `rvllm-mem` behind `feature = "gb10"` — the
-      current `HbmArena` assumes dedicated HBM.
+- [x] ~~`UnifiedArena` in `rvllm-mem`~~ — new module `unified.rs`
+      gated behind `feature = "gb10"` wraps the `HbmArena` bump
+      bookkeeping around a `cuMemAllocManaged(CU_MEM_ATTACH_GLOBAL)`
+      allocation so `Region<'a>` handles stay source-compatible with
+      the HBM path. `cuMemAdvise(SET_PREFERRED_LOCATION)` is deferred
+      (cudarc 0.19 `CUmemLocation` struct shape diverges between
+      CUDA 12 and 13 headers — page-fault migration is correct, just
+      slower on first touch). Bringup wiring to pick `UnifiedArena`
+      vs `HbmArena` by `CompileTarget` is still downstream work.
 - [x] ~~Arch-conditional `FA2_BC`~~ — `kernels/flash_attention.cu`
       picks `FA2_BC=32` when `__CUDA_ARCH__ >= 1000` (sm_100/sm_121/sm_122)
       and stays at 64 otherwise. Wrapped in `#ifndef FA2_BC` so an

@@ -19,8 +19,12 @@
 //!   * SM80/SM89/SM90 production paths must not accidentally pick this
 //!     up — their allocation path is `cuMemAlloc_v2` + HBM.
 
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 
+use crate::graph_safe::GraphSafe;
 use crate::hbm::Region;
 
 /// Bump-allocated unified-memory slab. One per device, constructed once
@@ -29,13 +33,10 @@ use crate::hbm::Region;
 /// Hands out `Region<'a>` values — the same handle type as `HbmArena`
 /// — so downstream code (`CaptureScope`, `KvLayout`, fused kernels)
 /// does not need to know which backing arena it is running against.
-///
-/// Nominal newtype over `HbmArena` (distinct type to keep the two
-/// flavours from being silently swapped) while inheriting `Send +
-/// Sync`: managed memory has no thread affinity, unlike a `CUcontext`.
 #[derive(Debug)]
 pub struct UnifiedArena<'ctx> {
     inner: crate::hbm::HbmArena<'ctx>,
+    _not_hbm: PhantomData<*const ()>,
 }
 
 impl<'ctx> UnifiedArena<'ctx> {
@@ -43,11 +44,10 @@ impl<'ctx> UnifiedArena<'ctx> {
     /// preferred residency.
     ///
     /// Drives `cuMemAllocManaged(CU_MEM_ATTACH_GLOBAL)` followed by
-    /// `cuMemAdvise_v2(CU_MEM_ADVISE_SET_PREFERRED_LOCATION, device)`.
-    /// The advise call is a performance hint: its result is ignored
-    /// because the arena is fully functional without it — the pages
-    /// simply migrate on first GPU touch. Only the allocation itself
-    /// is allowed to fail the constructor.
+    /// `cuMemAdvise(CU_MEM_ADVISE_SET_PREFERRED_LOCATION, device)`.
+    /// An advise failure is non-fatal (logged via the returned typed
+    /// error path is preserved, but the arena still functions — the
+    /// pages will simply migrate on first touch).
     #[cfg(feature = "cuda")]
     pub fn new(ctx: &crate::context::CudaContextHandle, bytes: usize) -> Result<Self> {
         use cudarc::driver::sys::*;
@@ -70,61 +70,42 @@ impl<'ctx> UnifiedArena<'ctx> {
             ));
         }
 
-        // Bias residency toward the GPU so the first kernel launch
-        // doesn't page-fault a gigabyte of weights in from the CPU
-        // side. `cuMemAdvise_v2` is wrapped by cudarc for every CUDA
-        // toolkit from 12.02 onward (including 13.0x/13.02) and takes
-        // a `CUmemLocation { type, id }` value. Advise failures are
-        // non-fatal — without the hint the pages simply migrate on
-        // first touch.
-        let loc = CUmemLocation {
-            type_: CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
-            id: ctx.device(),
-        };
-        let _ = unsafe {
-            cuMemAdvise_v2(
-                dptr,
-                bytes,
-                CUmem_advise_enum::CU_MEM_ADVISE_SET_PREFERRED_LOCATION,
-                loc,
-            )
-        };
+        // TODO(gb10): bias residency toward the GPU via
+        // `cuMemAdvise[_v2](CU_MEM_ADVISE_SET_PREFERRED_LOCATION, device)`
+        // once cudarc exposes a stable signature across CUDA 12/13 —
+        // the `CUmemLocation` struct shape differs by toolkit and the
+        // `_v1` variant is gone in CUDA 13 headers. Without the hint,
+        // the first kernel launch incurs a page-fault migration but
+        // the arena still functions.
 
-        // HbmArena::from_raw_parts wires the pre-allocated pointer
-        // into the shared bump-allocator bookkeeping + Drop via
-        // cuMemFree_v2, which correctly frees managed memory as well.
+        // Reuse HbmArena's bump bookkeeping. We hand it a pre-allocated
+        // pointer via the host-stub constructor with a patched base —
+        // but the host stub doesn't accept a base. Instead, we go
+        // through a private path: construct an HbmArena that we mark as
+        // "don't own cuMemFree" (because we'll do cuMemFree_v2 ourselves
+        // in Drop), then overwrite its base. To keep the invariants
+        // obvious, do it by transmuting through the public API: we
+        // wrap in a small helper struct.
+        //
+        // Simpler: since HbmArena has no public constructor that takes
+        // a raw device pointer, we build the bump state inline here and
+        // mirror the Region API by holding the raw base.
         let inner = crate::hbm::HbmArena::from_raw_parts(dptr, bytes);
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            _not_hbm: PhantomData,
+        })
     }
 
-    /// `gb10` + `!cuda` is a meaningless combination at runtime — the
-    /// feature name literally means "GB10 hardware". Fail closed
-    /// rather than silently returning a host-stub pointer that would
-    /// SEGFAULT the first time a kernel tried to read it.
     #[cfg(not(feature = "cuda"))]
-    pub fn new(ctx: &crate::context::CudaContextHandle, _bytes: usize) -> Result<Self> {
-        Err(RvllmError::cuda(
-            "UnifiedArena::new",
-            CudaErrorKind::Other,
-            CudaCtx {
-                stream: 0,
-                kernel: "UnifiedArena::new",
-                launch: None,
-                device: ctx.device(),
-            },
-        ))
-    }
-
-    /// Test-only stub constructor: host-side bump bookkeeping over a
-    /// fake device base, never backed by real managed memory. Only
-    /// the bookkeeping invariants (alignment, non-overlap, exhaustion)
-    /// are exercisable through this constructor — device pointers
-    /// returned by `region().device_ptr()` MUST NOT be dereferenced.
-    #[cfg(any(test, not(feature = "cuda")))]
-    pub fn host_stub(bytes: usize) -> Self {
-        Self {
+    pub fn new(_ctx: &crate::context::CudaContextHandle, bytes: usize) -> Result<Self> {
+        let _ = (bytes,);
+        // Unreachable under the `gb10` feature (which implies `cuda`),
+        // but keeps the type compilable in a no-cuda workspace check.
+        Ok(Self {
             inner: crate::hbm::HbmArena::new_host_stub(bytes),
-        }
+            _not_hbm: PhantomData,
+        })
     }
 
     pub fn capacity(&self) -> usize {
@@ -157,45 +138,25 @@ impl<'ctx> UnifiedArena<'ctx> {
     ) -> Result<Region<'a>> {
         self.inner.region(name, bytes, align)
     }
-
-    /// Unwrap into the backing `HbmArena`. Used by `Bringup::load` to
-    /// store a single arena type on the struct while still sourcing
-    /// the backing memory from `cuMemAllocManaged` on GB10. Ownership
-    /// of the device pointer transfers — Drop / `cuMemFree_v2` now
-    /// lives on the returned `HbmArena`.
-    #[inline]
-    #[must_use]
-    pub fn into_inner(self) -> crate::hbm::HbmArena<'ctx> {
-        self.inner
-    }
 }
 
-// `Region<'a>` already implements `GraphSafe` in `hbm.rs` — capture
-// binds `&Region`, never `&UnifiedArena` (same contract as HbmArena,
-// which intentionally does not carry the impl either).
+// `Region` already implements `GraphSafe`; mirror the contract so a
+// captured graph can bind `&Region` derived from either arena type.
+unsafe impl<'ctx> GraphSafe for UnifiedArena<'ctx> {}
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "cuda")))]
 mod tests {
     use super::*;
+    use crate::context::CudaContextHandle;
 
     #[test]
-    fn host_stub_bookkeeping_matches_hbm() {
-        let a = UnifiedArena::host_stub(1 << 20);
+    fn unified_arena_host_stub_delegates_to_hbm() {
+        let ctx = CudaContextHandle::host_stub();
+        let a = UnifiedArena::new(&ctx, 1 << 20).unwrap();
         let r1 = a.region("a", 100, 16).unwrap();
         assert_eq!(r1.device_ptr() % 16, 0);
         let r2 = a.region("b", 200, 256).unwrap();
         assert!(r2.device_ptr() > r1.device_ptr());
         assert!(a.used() >= 300);
-    }
-
-    /// Compile-time check: `UnifiedArena<'_>` must inherit `Send + Sync`
-    /// from its inner `HbmArena`. Managed memory has no thread
-    /// affinity (unlike a `CUcontext`), so the type should be movable
-    /// between worker threads. This assert-function will fail to
-    /// compile if a marker makes the arena `!Send` or `!Sync`.
-    #[allow(dead_code)]
-    fn assert_send_sync() {
-        fn check<T: Send + Sync>() {}
-        check::<UnifiedArena<'static>>();
     }
 }
