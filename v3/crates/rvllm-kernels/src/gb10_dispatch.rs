@@ -32,8 +32,24 @@
 //!     reading of `clocks.sm`,
 //!   * a `ClockRegime` value constructed directly for test / override
 //!     paths.
+//!
+//! ## Integration
+//!
+//! This module ships the policy only; no call site exists yet. The
+//! future runtime FP8-GEMV dispatcher is the intended consumer:
+//!
+//! 1. At bring-up, resolve `CompileTarget` from
+//!    `CudaContextHandle::compute_capability()` →
+//!    `CompileTarget::from_compute_capability()`.
+//! 2. Per kernel launch (or per decode step), compute the current
+//!    `ClockRegime` from whichever probe is cheapest in that path.
+//! 3. Call `select_variant(regime, target)`. The returned variant's
+//!    `entry_point()` is guaranteed to resolve through
+//!    `KernelLoader::load_function(FP8_GEMV_PTX_STEM, variant.entry_point())`.
 
 use core::time::Duration;
+
+use rvllm_core::CompileTarget;
 
 /// Which `fp8_gemv_blockwise_wpr_*_kernel` variant to dispatch on GB10.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -70,6 +86,29 @@ impl Fp8GemvVariant {
             Fp8GemvVariant::WprNative => "fp8_gemv_blockwise_wpr_native_kernel",
         }
     }
+
+    /// Whether this variant's entry point is actually present in the
+    /// PTX built for `target`. Single source of truth for the
+    /// `#if __CUDA_ARCH__ >= 1000` gate around the native-CVT kernel
+    /// in `kernels/fp8_gemv.cu`. `select_variant` uses this so the
+    /// policy can never hand back a symbol the loader won't resolve.
+    pub const fn available_for(self, target: CompileTarget) -> bool {
+        match self {
+            // Branchless LUT decode compiles on every arch we build.
+            Fp8GemvVariant::WprLut => true,
+            // Native CVT requires Blackwell PTX ISA (compute cap >= 10.0).
+            Fp8GemvVariant::WprNative => matches!(target, CompileTarget::Sm121),
+        }
+    }
+}
+
+/// Default: `WprLut`. Runs on every arch, carries no throttle
+/// assumptions — the right choice when no probe has constrained the
+/// pick yet.
+impl Default for Fp8GemvVariant {
+    fn default() -> Self {
+        Fp8GemvVariant::WprLut
+    }
 }
 
 /// Current clock regime on GB10.
@@ -95,14 +134,26 @@ pub enum ClockRegime {
 
 /// Pure dispatch policy.
 ///
-/// Given a regime signal, picks the variant. Keep this function free
-/// of I/O so it's trivially unit-testable; the I/O side (probing the
-/// clock, reading a wall-clock elapsed) lives in the helpers below.
-pub const fn select_variant(regime: ClockRegime) -> Fp8GemvVariant {
+/// Given a clock regime and the target the runtime is compiled for,
+/// returns a variant whose entry point is guaranteed to be present in
+/// the loaded PTX. `target` is the output of
+/// `CompileTarget::from_compute_capability` on the live device; a
+/// caller on sm_80/sm_89/sm_90 with a Sustained regime (e.g. a test
+/// override) gets `WprLut` rather than a `WprNative` pick that would
+/// 404 at `KernelLoader::load_function`.
+///
+/// Keep this function free of I/O so it stays trivially unit-testable
+/// — the I/O side (probing the clock, reading a wall-clock elapsed)
+/// lives in the helpers below.
+pub const fn select_variant(regime: ClockRegime, target: CompileTarget) -> Fp8GemvVariant {
+    // Only pick `WprNative` when the regime argues for it AND the
+    // target actually has it. Everything else falls through to the
+    // universally-available `WprLut`.
     match regime {
-        ClockRegime::Sustained => Fp8GemvVariant::WprNative,
-        ClockRegime::Throttled => Fp8GemvVariant::WprLut,
-        ClockRegime::Unknown => Fp8GemvVariant::WprLut,
+        ClockRegime::Sustained if Fp8GemvVariant::WprNative.available_for(target) => {
+            Fp8GemvVariant::WprNative
+        }
+        _ => Fp8GemvVariant::WprLut,
     }
 }
 
@@ -153,29 +204,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sustained_picks_native() {
+    fn sustained_on_sm121_picks_native() {
         assert_eq!(
-            select_variant(ClockRegime::Sustained),
+            select_variant(ClockRegime::Sustained, CompileTarget::Sm121),
             Fp8GemvVariant::WprNative,
         );
     }
 
     #[test]
-    fn throttled_picks_lut() {
-        assert_eq!(
-            select_variant(ClockRegime::Throttled),
-            Fp8GemvVariant::WprLut,
-        );
+    fn sustained_on_pre_blackwell_downgrades_to_lut() {
+        // WprNative isn't compiled for sm_80/sm_89/sm_90 (gated on
+        // __CUDA_ARCH__ >= 1000). Even with a Sustained regime the
+        // policy must pick an available variant.
+        for t in [CompileTarget::Sm80, CompileTarget::Sm89, CompileTarget::Sm90] {
+            assert_eq!(
+                select_variant(ClockRegime::Sustained, t),
+                Fp8GemvVariant::WprLut,
+                "target {t:?} should fall back to WprLut",
+            );
+        }
+    }
+
+    #[test]
+    fn throttled_picks_lut_on_every_target() {
+        for t in [
+            CompileTarget::Sm80,
+            CompileTarget::Sm89,
+            CompileTarget::Sm90,
+            CompileTarget::Sm121,
+        ] {
+            assert_eq!(
+                select_variant(ClockRegime::Throttled, t),
+                Fp8GemvVariant::WprLut,
+            );
+        }
     }
 
     #[test]
     fn unknown_falls_back_to_lut() {
-        // Safe default: LUT runs on every arch (no sm_100+ gate) and
-        // is robust under throttle. Never regresses accuracy.
-        assert_eq!(
-            select_variant(ClockRegime::Unknown),
-            Fp8GemvVariant::WprLut,
-        );
+        for t in [
+            CompileTarget::Sm80,
+            CompileTarget::Sm89,
+            CompileTarget::Sm90,
+            CompileTarget::Sm121,
+        ] {
+            assert_eq!(
+                select_variant(ClockRegime::Unknown, t),
+                Fp8GemvVariant::WprLut,
+            );
+        }
+    }
+
+    #[test]
+    fn available_for_tracks_arch_gate() {
+        // WprLut is built for every arch.
+        for t in [
+            CompileTarget::Sm80,
+            CompileTarget::Sm89,
+            CompileTarget::Sm90,
+            CompileTarget::Sm121,
+        ] {
+            assert!(Fp8GemvVariant::WprLut.available_for(t));
+        }
+        // WprNative is sm_100+ only — today that means Sm121.
+        assert!(!Fp8GemvVariant::WprNative.available_for(CompileTarget::Sm80));
+        assert!(!Fp8GemvVariant::WprNative.available_for(CompileTarget::Sm89));
+        assert!(!Fp8GemvVariant::WprNative.available_for(CompileTarget::Sm90));
+        assert!(Fp8GemvVariant::WprNative.available_for(CompileTarget::Sm121));
+    }
+
+    #[test]
+    fn default_variant_is_wpr_lut() {
+        assert_eq!(Fp8GemvVariant::default(), Fp8GemvVariant::WprLut);
     }
 
     #[test]
