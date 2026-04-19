@@ -481,9 +481,9 @@ pub unsafe fn gemma4_forward_phase(
         )?;
     } else if weights.qkv_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
-            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
+            cutlass, cublaslt, kernels.f32_to_f16_sat,
             scratch.q_out, scratch.hidden_fp8, weights.qkv_fp8,
-            scratch.hidden_scale, weights.qkv_chscale, weights.qkv_blockscale, weights.qkv_scale,
+            scratch.hidden_scale, weights.qkv_chscale, weights.qkv_scale,
             dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
             scratch.gemm_f32_tmp,
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
@@ -1015,9 +1015,9 @@ pub unsafe fn gemma4_forward_phase(
         )?;
     } else if weights.gate_up_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
-            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
+            cutlass, cublaslt, kernels.f32_to_f16_sat,
             scratch.gate_up_out, scratch.hidden_fp8, weights.gate_up_fp8,
-            scratch.hidden_scale, weights.gate_up_chscale, weights.gate_up_blockscale, weights.gate_up_scale,
+            scratch.hidden_scale, weights.gate_up_chscale, weights.gate_up_scale,
             dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
             scratch.gemm_f32_tmp,
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
@@ -1193,10 +1193,73 @@ unsafe fn launch_scale_cols_f32(
     rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
 }
 
-/// Post-GEMM per-row scale RATIO correction: `data[m, n] *=
-/// scale[m] / scale[0]` for an MxN f32 row-major buffer. Used to
-/// fix up cuBLASLt FP8 GEMM output when the B_SCALE was a per-token
-/// array but cuBLASLt ran in SCALAR mode (sm_121's only option).
+/// CUTLASS FP8 GEMM with row×col scale epilogue + sm_121 fallback.
+///
+/// On SM80/89/90 this delegates straight to the CUTLASS `.so`
+/// wrapper (`cutlass_fp8_gemm_channelscale`), which applies the full
+/// per-token row scale × per-channel column scale epilogue.
+///
+/// On sm_121 (`CutlassBackend::Absent`) cuBLASLt's FP8
+/// `OUTER_VEC_32F` channelscale path doesn't produce a matmul
+/// heuristic for Blackwell consumer (`heuristic LaunchFailed`), so
+/// we fall back to the **scalar-scaled** FP8 matmul:
+/// `cublaslt.fp8_gemm(..., a_scale, b_scale_scalar)`. The
+/// per-channel b_chscale vector is intentionally dropped — this
+/// incurs a known PPL regression vs the CUTLASS path, documented
+/// as a follow-up. A proper channelscale kernel for sm_121 (native
+/// mma.sync + column-scale epilogue) is the next GB10 perf PR.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fp8_gemm_channelscale_or_fallback(
+    cutlass: &CutlassBackend,
+    cublaslt: &CublasLt,
+    fn_f32_to_f16: KernelFn,
+    output_f16: u64,
+    a_fp8: u64,
+    b_fp8: u64,
+    a_scale: u64,
+    b_chscale: u64,
+    b_scale_scalar: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    scratch_f32: u64,
+    cutlass_workspace: u64,
+    cutlass_workspace_bytes: usize,
+    stream: u64,
+) -> Result<()> {
+    let _ = (fn_f32_to_f16, b_chscale, scratch_f32); // only used by future f32+cast path
+    match cutlass {
+        CutlassBackend::So(_) => cutlass.launch_fp8_gemm_channelscale(
+            output_f16,
+            a_fp8,
+            b_fp8,
+            a_scale,
+            b_chscale,
+            m,
+            n,
+            k,
+            cutlass_workspace,
+            cutlass_workspace_bytes,
+            stream,
+        ),
+        CutlassBackend::Absent => cublaslt.fp8_gemm(
+            a_fp8,
+            b_fp8,
+            output_f16,
+            m,
+            n,
+            k,
+            a_scale,
+            b_scale_scalar,
+            stream,
+        ),
+        // Exhaustiveness for #[non_exhaustive] CutlassBackend — a
+        // future variant should be an explicit audit.
+        _ => unreachable!("unexpected CutlassBackend variant in channelscale fallback"),
+    }
+}
+
 #[cfg(feature = "cuda")]
 unsafe fn launch_scale_rows_f32_ratio(
     kernel: KernelFn,
