@@ -88,6 +88,7 @@ impl Fp8GemvVariant {
     /// module. Paired with `FP8_GEMV_PTX_STEM` to resolve a variant
     /// through the kernel loader.
     #[inline]
+    #[must_use]
     pub const fn entry_point(self) -> &'static str {
         match self {
             Fp8GemvVariant::WprLut => "fp8_gemv_blockwise_wpr_lut_kernel",
@@ -100,6 +101,17 @@ impl Fp8GemvVariant {
     /// `#if __CUDA_ARCH__ >= 1000` gate around the native-CVT kernel
     /// in `kernels/fp8_gemv.cu`. `select_variant` uses this so the
     /// policy can never hand back a symbol the loader won't resolve.
+    ///
+    /// **Maintenance:** the native-CVT `__CUDA_ARCH__ >= 1000` gate
+    /// covers every Blackwell arch (sm_100, sm_121, sm_122, …), but
+    /// `CompileTarget` today only models `Sm121`. When additional
+    /// Blackwell variants are added to `CompileTarget`, extend the
+    /// `WprNative` arm to include them — otherwise this returns
+    /// `false` for a target whose PTX actually does expose the
+    /// native entry symbol, and `select_variant` silently
+    /// down-picks to `WprLut`. A matching test case in
+    /// `available_for_tracks_arch_gate` catches the oversight if
+    /// updated in the same PR.
     #[inline]
     #[must_use]
     pub const fn available_for(self, target: CompileTarget) -> bool {
@@ -107,6 +119,8 @@ impl Fp8GemvVariant {
             // Branchless LUT decode compiles on every arch we build.
             Fp8GemvVariant::WprLut => true,
             // Native CVT requires Blackwell PTX ISA (compute cap >= 10.0).
+            // See the maintenance note above — extend this when Sm100 /
+            // Sm120 / Sm122 land in `CompileTarget`.
             Fp8GemvVariant::WprNative => matches!(target, CompileTarget::Sm121),
         }
     }
