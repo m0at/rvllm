@@ -883,10 +883,12 @@ def load_model(model_dir, mesh, max_ctx):
     embed = put(get(f'{prefix}.embed_tokens.weight'), P(None, None))
     final_norm = put(get(f'{prefix}.norm.weight'), P(None))
 
-    # Load all 60 layers, split into sliding (50) and global (10)
-    print("  stacking 60 layers -> 50 sliding + 10 global (int8 quantized)...", file=sys.stderr)
+    # Load all layers, split into sliding and global
+    print(f"  stacking {NL} layers -> {N_SLIDING} sliding + {N_GLOBAL} global (int8 quantized)...", file=sys.stderr)
     matmul_keys = ['qw','kw','vw','ow','gw','uw','dw']
     bf16_keys = ['qn','kn','ln1','ln2','ln3','ln4','ls']
+    if ENABLE_MOE:
+        bf16_keys += ['ln3_moe', 'ln4_moe', 'ln4_combine']
 
     # Separate stacks for sliding and global
     sl_i8 = {k: [] for k in matmul_keys}
@@ -896,6 +898,11 @@ def load_model(model_dir, mesh, max_ctx):
     gl_i8 = {k: [] for k in matmul_keys}
     gl_sc = {k+'_s': [] for k in matmul_keys}
     gl_bf = {k: [] for k in bf16_keys}
+
+    # MoE weight stacks (split by sliding/global)
+    moe_keys = ['router_w', 'router_s', 'router_ps', 'expert_gu', 'expert_dw']
+    sl_moe = {k: [] for k in moe_keys} if ENABLE_MOE else {}
+    gl_moe = {k: [] for k in moe_keys} if ENABLE_MOE else {}
 
     for i in range(NL):
         lp = f'{prefix}.layers.{i}'
@@ -935,6 +942,18 @@ def load_model(model_dir, mesh, max_ctx):
         target_bf['ln4'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm.weight')))
         target_bf['ls'].append(to_np_bf16(get(f'{lp}.layer_scalar')) if has(f'{lp}.layer_scalar') else np.array([1.0], dtype=ml_dtypes.bfloat16))
 
+        if ENABLE_MOE:
+            target_bf['ln3_moe'].append(to_np_bf16(get(f'{lp}.pre_feedforward_layernorm_2.weight')))
+            target_bf['ln4_moe'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm_1.weight')))
+            target_bf['ln4_combine'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm_2.weight')))
+            target_moe = gl_moe if is_global else sl_moe
+            target_moe['router_w'].append(to_np_bf16(get(f'{lp}.router.proj.weight')))
+            rs = to_np_bf16(get(f'{lp}.router.scale'))
+            target_moe['router_s'].append(rs.reshape(1) if rs.ndim == 0 else rs)
+            target_moe['router_ps'].append(to_np_bf16(get(f'{lp}.router.per_expert_scale')))
+            target_moe['expert_gu'].append(to_np_bf16(get(f'{lp}.experts.gate_up_proj')))
+            target_moe['expert_dw'].append(to_np_bf16(get(f'{lp}.experts.down_proj')))
+
         if i % 15 == 0:
             print(f"    layer {i} ({'global' if is_global else 'sliding'})", file=sys.stderr)
 
@@ -953,7 +972,7 @@ def load_model(model_dir, mesh, max_ctx):
     def put_i8(arr, spec):
         return jax.device_put(jnp.array(arr, dtype=jnp.int8), NamedSharding(mesh, spec))
 
-    # Build sliding_weights [50, ...]
+    # Build sliding_weights [N_SLIDING, ...]
     print(f"  building sliding_weights ({N_SLIDING} layers)...", file=sys.stderr)
     sliding_weights = {}
     for k in matmul_keys:
@@ -966,8 +985,20 @@ def load_model(model_dir, mesh, max_ctx):
         arr = np.stack(sl_bf[k])
         sliding_weights[k] = put(arr, P(None, None))
         print(f"    sl.{k}: {arr.shape} bf16", file=sys.stderr)
+    if ENABLE_MOE:
+        for k in moe_keys:
+            arr = np.stack(sl_moe[k])
+            ndim = arr.ndim
+            if ndim == 2:
+                spec = P(None, None)
+            elif ndim == 3:
+                spec = P(None, None, None)
+            else:
+                spec = P(None, None, None, None)
+            sliding_weights[k] = jax.device_put(jnp.array(arr, dtype=jnp.bfloat16), NamedSharding(mesh, spec))
+            print(f"    sl.moe.{k}: {arr.shape} bf16", file=sys.stderr)
 
-    # Build global_weights [10, ...]
+    # Build global_weights [N_GLOBAL, ...]
     print(f"  building global_weights ({N_GLOBAL} layers)...", file=sys.stderr)
     global_weights = {}
     for k in matmul_keys:
@@ -980,6 +1011,18 @@ def load_model(model_dir, mesh, max_ctx):
         arr = np.stack(gl_bf[k])
         global_weights[k] = put(arr, P(None, None))
         print(f"    gl.{k}: {arr.shape} bf16", file=sys.stderr)
+    if ENABLE_MOE:
+        for k in moe_keys:
+            arr = np.stack(gl_moe[k])
+            ndim = arr.ndim
+            if ndim == 2:
+                spec = P(None, None)
+            elif ndim == 3:
+                spec = P(None, None, None)
+            else:
+                spec = P(None, None, None, None)
+            global_weights[k] = jax.device_put(jnp.array(arr, dtype=jnp.bfloat16), NamedSharding(mesh, spec))
+            print(f"    gl.moe.{k}: {arr.shape} bf16", file=sys.stderr)
 
     # Sliding caches: [50, WINDOW, dim] -- tiny
     kv_sh = NamedSharding(mesh, P(None, None, 'tp'))
@@ -1007,6 +1050,8 @@ def load_model(model_dir, mesh, max_ctx):
     print(f"  total KV cache: {total_mem/1e6:.0f}MB (was {NL*max_ctx*MAX_KV*2/1e6:.0f}MB)", file=sys.stderr)
 
     del all_t, sl_i8, sl_sc, sl_bf, gl_i8, gl_sc, gl_bf
+    if ENABLE_MOE:
+        del sl_moe, gl_moe
     print("  done loading", file=sys.stderr)
     return embed, final_norm, sliding_weights, global_weights, sliding_caches, global_caches
 
