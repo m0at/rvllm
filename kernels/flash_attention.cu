@@ -32,7 +32,21 @@
 // Tile sizes for K/V streaming. Br = rows of Q per tile, Bc = cols of K per tile.
 // For decode (single query token), Br=1 is optimal.
 // For prefill, Br=64 or 128 is typical.
-#define FA2_BC 64          // K/V tile width (number of KV positions per tile)
+//
+// Bc default is 64 (SM80 / SM89 / SM90). Blackwell consumer targets (sm_100,
+// sm_121) have tighter static-smem budgets per block; head_dim=256 with Bc=64
+// overflows the 48 KB default limit on sm_121 (PR#28 bring-up). Halve Bc to
+// 32 on those arches so the per-block smem footprint stays within limits
+// without changing the SM90 production path. An explicit `-DFA2_BC=<n>` on
+// the nvcc command line still wins — the build system can override per-arch
+// if future tuning wants a different value.
+#ifndef FA2_BC
+#  if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+#    define FA2_BC 32      // sm_100 / sm_121 / sm_122 — smem-budget safe
+#  else
+#    define FA2_BC 64      // sm_80 / sm_89 / sm_90 — unchanged baseline
+#  endif
+#endif
 #define FA2_THREADS 128    // Threads per block
 
 // ============================================================================
