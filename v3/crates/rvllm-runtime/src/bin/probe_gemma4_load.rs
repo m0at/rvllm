@@ -173,6 +173,53 @@ fn run() -> Result<(), String> {
     }
 
     eprintln!("\n✓ all GB10 bring-up invariants hold");
+
+    // =============================================================
+    // Optional: run generate + measure tok/s
+    // =============================================================
+    if std::env::var_os("RVLLM_GENERATE").is_some() {
+        eprintln!("\n[C] run_generate smoke (RVLLM_GENERATE set):");
+        // Load embedding kernel handle.
+        let embed_mod = bringup
+            .kernels
+            .load_ptx("embedding_gather_f16")
+            .map_err(|e| format!("load embedding_gather_f16: {e}"))?;
+        let fn_embed = embed_mod
+            .get_function("embedding_gather_f16_kernel")
+            .map_err(|e| format!("get embedding_gather_f16_kernel: {e}"))?;
+        let fn_argmax = bringup.fused.fn_argmax;
+
+        // Tiny prompt (ids are placeholders — this is a throughput
+        // probe, not a correctness test; we discard the outputs).
+        let prompt_ids: Vec<u32> = vec![2, 108, 109, 110, 111, 112, 113, 114];
+        let max_new: usize = std::env::var("RVLLM_MAX_NEW")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        let eos_ids: Vec<u32> = vec![1, 107];
+
+        eprintln!(
+            "    prompt_len={}, max_new={}",
+            prompt_ids.len(),
+            max_new
+        );
+
+        let t_gen = std::time::Instant::now();
+        let output_ids = unsafe {
+            bringup
+                .run_generate(fn_embed, fn_argmax, &prompt_ids, max_new, &eos_ids)
+                .map_err(|e| format!("run_generate: {e}"))?
+        };
+        let elapsed = t_gen.elapsed();
+
+        let new_tokens = output_ids.len().saturating_sub(prompt_ids.len());
+        let tok_per_s = (new_tokens as f64) / elapsed.as_secs_f64();
+        eprintln!(
+            "    generated {} new tokens in {:.2}s → {:.2} tok/s",
+            new_tokens,
+            elapsed.as_secs_f64(),
+            tok_per_s,
+        );
+    }
+
     Ok(())
 }
 
