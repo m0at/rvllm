@@ -157,19 +157,27 @@ Commits in the `rusty_sm121` branch (as of the current state):
       rather than aborting the run. Parser is unit-tested on realistic
       sustained/throttled sample lines; an e2e test self-skips when
       `nvidia-smi` is absent.
-- [~] **Partial hardware validation on GB10** —
-      `tests/gb10_hw_smoke.rs` (gated on `gb10,cuda`) runs on the
-      DGX Spark: `CudaContextHandle::init` via primary-context retain
-      succeeds on CUDA 13.2, compute-cap probe returns `(12, 1)` →
-      `CompileTarget::Sm121`, `UnifiedArena` allocates 64 MiB of
-      managed memory and hands out 3 aligned non-overlapping
-      `Region`s. All 61 `sm_121` PTX artifacts build clean with
-      auto-generated SHA-pinned manifest.
-      **Still open:** end-to-end FP8 precision check (`|ref - fp8| / |ref|`
-      vs f16 HGEMM reference) + Gemma-4 PPL on sm_121 — needs the
-      reference path wired up first. Tracked as a follow-up; the
-      bring-up infrastructure this PR lands is what that work will
-      run on top of.
+- [x] ~~Hardware validation on GB10~~ — two layers:
+      1. **Rust bring-up smoke** (`tests/gb10_hw_smoke.rs`, gated on
+         `gb10,cuda`): primary-context retain succeeds on CUDA 13.2,
+         compute-cap probe returns `(12, 1)` → `CompileTarget::Sm121`,
+         `UnifiedArena` allocates 64 MiB managed memory, bump
+         allocator hands out aligned non-overlapping `Region`s.
+      2. **FP8-GEMV numerical check** (`v3/tools/fp8_precision_check.py`,
+         cuda-python + numpy): loads `kernels/sm_121/fp8_gemv.ptx`,
+         launches `fp8_gemv_blockwise_wpr_lut_kernel` against random
+         FP8 weights + blockwise scales + f32 input, compares against
+         a pure-numpy fp64 reference that dequantises with the same
+         E4M3 → f32 mapping. Result over 5 seeds on GB10:
+         `scale_rel.max ≤ 9e-5`, `band ratio ≤ 2.0` — well under the
+         `1e-3` / `5.0` gate thresholds. A deliberate scale-axis poison
+         (flip row order in the reference) drives `scale_rel` to `5.0`
+         and FAILs, proving the detector is sensitive to the axis-bug
+         signature from v3/SPEC.
+
+      Gemma-4 PPL end-to-end on sm_121 is a follow-up that needs the
+      runtime's fp8_gemv launch path wired up first (no dispatcher
+      exists yet on any arch — see Punkt 5 caveat).
 
 ### Upstream fix bundled with this branch
 
