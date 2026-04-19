@@ -75,17 +75,27 @@ stays in place as defence-in-depth — under throttle the `WprLut`
 fallback is still the theoretically right call — but in practice on
 this board **`WprNative` is the correct default**.
 
-## Power-profile paradox
+## Power-profile paradox (PR #28 historical context — not reproduced)
 
-At 507 MHz throttled, instruction issue rate caps memory bandwidth
-utilisation. In this regime, *more* instructions per byte can be better
-because they keep more loads in flight (LPDDR5X needs 20+ iterations
-per thread to saturate bandwidth). At 851 MHz sustained, *fewer*
-instructions win because less power draw lets the firmware keep the
-clock high. Kernel selection is therefore clock-regime-dependent.
+**Note — see "Empirical numbers" above.** The clock-regime paradox
+below is the original PR #28 reporter's model of GB10 behaviour. We
+built the `WprLut` / `WprNative` variants + a dispatch policy
+(`rvllm-kernels::gb10_dispatch`) on top of it. On this DGX Spark
+(driver 595.58.03, CUDA 13.2) the described 851 → 507 MHz firmware
+throttle **did not trigger** during 15 s of continuous GEMV looping
+— clocks stayed at ~2520 MHz the whole time. `WprNative` wins
+unconditionally on observed hardware. The policy stays as
+defence-in-depth in case a future firmware/driver combination
+re-introduces the throttle.
 
-Measured baseline (PR #28 quotes): the branchless FP8→f32 path holds
-851 MHz, whereas the native CVT path drops to 507 MHz after ~3 s.
+Original model (PR #28): at 507 MHz throttled, instruction issue
+rate caps memory bandwidth utilisation — *more* instructions per
+byte can be better because they keep more loads in flight (LPDDR5X
+needs 20+ iterations per thread to saturate bandwidth). At 851 MHz
+sustained, *fewer* instructions win because less power draw lets
+the firmware keep the clock high. The PR #28 reporter measured the
+branchless FP8→f32 path holding 851 MHz while the native CVT path
+dropped to 507 MHz after ~3 s.
 
 ## Memory model
 
