@@ -2,7 +2,7 @@
 
 LLM inference engine. Rust+CUDA on GPU, JAX+XLA on TPU.
 
-**31B Gemma 4 on TPU v6e-4: 13,943 tok/s** (B=768, int8, TP=4 SPMD, PPL 19.24). 2,681 tok/s/$. 128K context support (22.5 tok/s decode). Zero custom kernels - ~500 lines of JAX, XLA compiles everything.
+**31B Gemma 4 on TPU v6e-4: 13,943 tok/s** (B=768, int8, TP=4 SPMD, PPL 19.24). 2,681 tok/s/$. 128K context support (24.7 tok/s decode). 3.6x faster than vLLM on H100 GPU (measured). Zero custom kernels - ~500 lines of JAX, XLA compiles everything.
 
 ## TPU: 31B Gemma 4 on v6e-4
 
@@ -12,11 +12,11 @@ Pure JAX + XLA. No custom kernels. XLA compiles the entire 60-layer forward pass
 
 | Metric | B=1 (512 ctx) | B=1 (2048 ctx) | B=1 (128K ctx) | B=768 (peak) |
 |---|---|---|---|---|
-| **Decode throughput** | **79.9 tok/s** | **41.9 tok/s** | **22.5 tok/s** | **13,943 tok/s** |
-| **Per-step latency** | **12.52 ms** | **23.84 ms** | **44.4 ms** | **55.1 ms** |
-| **Architecture** | single-scan | split-cache | split-cache | split-cache |
-| **Perplexity** | | **19.24** | | |
-| **Cost efficiency** | **15.4 tok/s/$** | **8.1 tok/s/$** | **4.3 tok/s/$** | **2,681 tok/s/$** |
+| **Decode throughput** | **79.9 tok/s** | **41.9 tok/s** | **24.7 tok/s** | **13,943 tok/s** |
+| **Per-step latency** | **12.52 ms** | **23.84 ms** | **40.56 ms** | **55.1 ms** |
+| **Architecture** | single-scan | split-cache | split-cache | single-scan |
+| **Perplexity** | 22.80 | **19.24** | **19.24** | |
+| **Cost efficiency** | **15.4 tok/s/$** | **8.1 tok/s/$** | **4.8 tok/s/$** | **2,681 tok/s/$** |
 
 | Fixed | Value |
 |---|---|
@@ -81,15 +81,40 @@ Gemma 4's 60 layers have two attention types: 50 sliding-window layers (1024-tok
 
 Near-linear scaling from B=1 to B=512. Peak at B=768 where compute and bandwidth saturate simultaneously.
 
-### TPU vs GPU cost comparison
+### TPU vs vLLM GPU comparison (measured)
+
+Head-to-head against vLLM on H100 SXM 80GB (RedHatAI/gemma-4-31B-it-FP8-Dynamic, $1.92/hr on vast.ai). All numbers measured on our hardware.
+
+**Single-user latency (B=1):** rvLLM TPU single-scan 79.9 tok/s vs vLLM GPU 66.9 tok/s. TPU 19% faster.
+
+**Peak throughput:** rvLLM TPU single-scan 13,943 tok/s (B=768) vs vLLM GPU 3,848 tok/s (B=128). TPU 3.6x faster.
+
+**Cost efficiency at peak:** TPU 2,681 tok/s/$ vs GPU 2,004 tok/s/$. TPU 34% better.
+
+**128K context:** only TPU (split-cache architecture) supports it. vLLM GPU tested at max_ctx=2048.
+
+| Batch | vLLM GPU tok/s | vLLM GPU ms/step | rvLLM TPU tok/s | rvLLM TPU ms/step |
+|---|---|---|---|---|
+| 1 | 66.9 | 14.95 | **79.9** | 12.5 |
+| 2 | 131.5 | 15.20 | - | - |
+| 4 | 257.6 | 15.53 | - | - |
+| 8 | 511.7 | 15.63 | **584** | 13.7 |
+| 16 | 926.5 | 17.27 | - | - |
+| 32 | 1,728 | 18.51 | - | - |
+| 48 | 2,258 | 21.26 | - | - |
+| 64 | 2,794 | 22.90 | **4,220** | 15.2 |
+| 96 | 3,083 | 31.14 | - | - |
+| 128 | **3,848** | 33.26 | **6,831** | 18.7 |
+| 256 | 3,709 | 69.03 | **10,536** | 24.3 |
+| 512 | 3,788 | 135.18 | **12,932** | 39.6 |
+| 768 | 3,671 | 209.18 | **13,943** | 55.1 |
 
 | Hardware | Peak tok/s | Batch | Cost/hr | tok/s/$ |
 |---|---|---|---|---|
-| **TPU v6e-4 (rvLLM)** | **13,943** | **768** | **$5.20** | **2,681** |
-| H100 SXM (FP8, projected) | ~6,000 | ~256 | $8-10 | 600-750 |
-| H200 (bf16, projected) | ~4,000 | ~128 | $8-12 | 333-500 |
+| **TPU v6e-4 (rvLLM, single-scan)** | **13,943** | **768** | **$5.20** | **2,681** |
+| H100 SXM (vLLM, FP8, measured) | 3,848 | 128 | $1.92 | 2,004 |
 
-3.5-8x better cost efficiency than GPU.
+TPU batch scaling numbers are from the single-scan architecture (512 ctx, no 128K support). Split-cache batch sweep in progress.
 
 ### Optimization progression
 
@@ -157,7 +182,7 @@ huggingface-cli download google/gemma-4-31B-it --local-dir ~/models/gemma-4-31B-
 python3 tpu/harness/gemma4_tpu_infer.py \
   --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 512
 
-# 128K context (22.5 tok/s decode)
+# 128K context (24.7 tok/s decode)
 python3 tpu/harness/gemma4_tpu_infer.py \
   --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 131072
 

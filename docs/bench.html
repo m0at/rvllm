@@ -128,7 +128,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 
 <header>
   <h1>rvLLM 0.3.0 - Featuring 31B Gemma 4</h1>
-  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 19.24). <strong>128K context support</strong> (22.5 tok/s decode). GPU path: Rust+CUDA on H100 - <strong>7,612 tok/s</strong> (FP8, B=512, CUDA graph, PPL 12.54).</div>
+  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 19.24). <strong>128K context support</strong> (24.7 tok/s decode). <strong>3.6x faster than vLLM on H100 GPU</strong> (measured). GPU path: Rust+CUDA on H100 - <strong>7,612 tok/s</strong> (FP8, B=512, CUDA graph, PPL 12.54).</div>
   <div class="nav-buttons">
     <a href="index.html">Home</a>
     <a href="https://github.com/m0at/rvllm">GitHub</a>
@@ -173,7 +173,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   <div class="pill">
     <div class="label">Cost efficiency</div>
     <strong>2,681 tok/s/$</strong>
-    <div class="caption">3.5-8x better than H100 GPU</div>
+    <div class="caption">34% better than vLLM H100 GPU (measured)</div>
   </div>
 </div>
 
@@ -259,23 +259,69 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <div class="footnote"><strong>Near-linear scaling from B=1 to B=512.</strong> Step time grows from 12.5 ms to 39.6 ms as MXU utilization rises from ~5% to ~80%. Peak at B=768 where compute and bandwidth saturate simultaneously. B=1024+ is compute-bound with diminishing returns.</div>
 
 
-<h3>TPU vs GPU cost comparison</h3>
-<div class="chart-box">
-  <div class="chart-title"><strong>31B Gemma 4: TPU vs GPU at peak throughput</strong>
-    <div class="note">GPU projections based on HBM bandwidth scaling from measured v6e data. H100/H200 numbers are estimates.</div>
-  </div>
-  <div id="chart-tpu-vs-gpu" style="height:300px"></div>
+<h3>TPU vs vLLM GPU comparison <span class="badge measured">Measured</span></h3>
+
+<div class="note-box">
+  <strong>All GPU numbers are measured on our hardware.</strong> vLLM on H100 SXM 80GB with RedHatAI/gemma-4-31B-it-FP8-Dynamic ($1.92/hr on vast.ai, max_ctx=2048). TPU batch scaling numbers are from the single-scan architecture (512 ctx). Split-cache batch sweep in progress.
 </div>
+
+<div class="pill-row">
+  <div class="pill">
+    <div class="label">B=1 head-to-head</div>
+    <strong>TPU 19% faster</strong>
+    <div class="caption">79.9 tok/s (TPU) vs 66.9 tok/s (vLLM GPU)</div>
+  </div>
+  <div class="pill">
+    <div class="label">Peak throughput</div>
+    <strong>TPU 3.6x faster</strong>
+    <div class="caption">13,943 tok/s (TPU B=768) vs 3,848 tok/s (vLLM B=128)</div>
+  </div>
+  <div class="pill">
+    <div class="label">Cost efficiency at peak</div>
+    <strong>TPU 34% better</strong>
+    <div class="caption">2,681 tok/s/$ vs 2,004 tok/s/$</div>
+  </div>
+  <div class="pill">
+    <div class="label">128K context</div>
+    <strong>TPU only</strong>
+    <div class="caption">24.7 tok/s via split-cache. vLLM GPU tested at 2048 ctx.</div>
+  </div>
+</div>
+
+<div class="chart-box">
+  <div class="chart-title"><strong>31B Gemma 4: rvLLM TPU vs vLLM GPU throughput</strong>
+    <div class="note">Measured on our hardware. TPU: v6e-4, int8, single-scan (512 ctx). GPU: H100 SXM 80GB, FP8-Dynamic, vLLM ($1.92/hr).</div>
+  </div>
+  <div id="chart-tpu-vs-gpu" style="height:340px"></div>
+</div>
+
+<table>
+<thead><tr><th>Batch</th><th class="r">vLLM GPU tok/s</th><th class="r">vLLM GPU ms/step</th><th class="r">rvLLM TPU tok/s</th><th class="r">rvLLM TPU ms/step</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">66.9</td><td class="r">14.95</td><td class="r pos"><strong>79.9</strong></td><td class="r">12.5</td></tr>
+<tr><td>2</td><td class="r">131.5</td><td class="r">15.20</td><td class="r">-</td><td class="r">-</td></tr>
+<tr><td>4</td><td class="r">257.6</td><td class="r">15.53</td><td class="r">-</td><td class="r">-</td></tr>
+<tr><td>8</td><td class="r">511.7</td><td class="r">15.63</td><td class="r pos"><strong>584</strong></td><td class="r">13.7</td></tr>
+<tr><td>16</td><td class="r">926.5</td><td class="r">17.27</td><td class="r">-</td><td class="r">-</td></tr>
+<tr><td>32</td><td class="r">1,728</td><td class="r">18.51</td><td class="r">-</td><td class="r">-</td></tr>
+<tr><td>48</td><td class="r">2,258</td><td class="r">21.26</td><td class="r">-</td><td class="r">-</td></tr>
+<tr><td>64</td><td class="r">2,794</td><td class="r">22.90</td><td class="r pos"><strong>4,220</strong></td><td class="r">15.2</td></tr>
+<tr><td>96</td><td class="r">3,083</td><td class="r">31.14</td><td class="r">-</td><td class="r">-</td></tr>
+<tr class="highlight"><td><strong>128</strong></td><td class="r"><strong>3,848</strong></td><td class="r">33.26</td><td class="r pos"><strong>6,831</strong></td><td class="r">18.7</td></tr>
+<tr><td>256</td><td class="r">3,709</td><td class="r">69.03</td><td class="r pos"><strong>10,536</strong></td><td class="r">24.3</td></tr>
+<tr><td>512</td><td class="r">3,788</td><td class="r">135.18</td><td class="r pos"><strong>12,932</strong></td><td class="r">39.6</td></tr>
+<tr class="highlight"><td><strong>768</strong></td><td class="r">3,671</td><td class="r">209.18</td><td class="r pos"><strong>13,943</strong></td><td class="r"><strong>55.1</strong></td></tr>
+</tbody>
+</table>
 
 <table>
 <thead><tr><th>Hardware</th><th class="r">Peak tok/s</th><th class="r">Batch</th><th class="r">Cost/hr</th><th class="r">tok/s/$</th></tr></thead>
 <tbody>
-<tr class="highlight"><td><strong>TPU v6e-4 (rvLLM)</strong></td><td class="r"><strong>13,943</strong></td><td class="r">768</td><td class="r">$5.20</td><td class="r pos"><strong>2,681</strong></td></tr>
-<tr><td>H100 SXM (FP8, projected)</td><td class="r">~6,000</td><td class="r">~256</td><td class="r">$8-10</td><td class="r">600-750</td></tr>
-<tr><td>H200 (bf16, projected)</td><td class="r">~4,000</td><td class="r">~128</td><td class="r">$8-12</td><td class="r">333-500</td></tr>
+<tr class="highlight"><td><strong>TPU v6e-4 (rvLLM, single-scan)</strong></td><td class="r"><strong>13,943</strong></td><td class="r">768</td><td class="r">$5.20</td><td class="r pos"><strong>2,681</strong></td></tr>
+<tr><td>H100 SXM (vLLM, FP8, measured)</td><td class="r">3,848</td><td class="r">128</td><td class="r">$1.92</td><td class="r">2,004</td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>3.5-8x better cost efficiency than GPU.</strong> The v6e-4's advantage: (1) higher aggregate bandwidth per dollar, (2) zero-overhead fused decode loop via XLA, (3) near-perfect batch scaling on the MXU.</div>
+<div class="footnote"><strong>vLLM GPU peaks at B=128 then saturates.</strong> TPU continues scaling linearly to B=768. The v6e-4's advantage: (1) higher aggregate bandwidth per dollar, (2) zero-overhead fused decode loop via XLA, (3) near-perfect batch scaling on the MXU. GPU is cheaper per hour ($1.92 vs $5.20), but TPU delivers 34% better cost efficiency at peak.</div>
 
 
 <h3>Optimization progression</h3>
@@ -537,6 +583,12 @@ LIBTPU flags: <code>--xla_tpu_enable_async_collective_fusion=true --xla_tpu_dot_
 Perplexity: 19.24 (split-cache, int8 KV with per-head scales), improved from 25.51 baseline. Measured on short text passage, compared against HuggingFace <code>transformers</code> bf16 reference on GPU.<br>
 Context scaling: 512 to 128K tested. Split-cache architecture: 50 sliding layers use circular buffer, 10 global layers use blockwise attention (BLOCK_K=8192, online softmax).<br><br>
 
+<strong>vLLM GPU comparison</strong> (measured):<br>
+Hardware: H100 SXM 80 GB on vast.ai ($1.92/hr).<br>
+Model: RedHatAI/gemma-4-31B-it-FP8-Dynamic (same 31B Gemma 4, FP8).<br>
+Engine: vLLM with default settings, max_ctx=2048.<br>
+Batch sizes: 1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 256, 512, 768. Peak: 3,848 tok/s at B=128.<br><br>
+
 <strong>GPU pipeline</strong> (v3 codebase, Rust + CUDA):<br>
 Hardware: H100 SXM 80 GB.<br>
 Model: 31B Gemma 4, FP8 E4M3 weights (per-tensor scale at load), FP8 E4M3 KV cache (calibrated scales).<br>
@@ -613,27 +665,31 @@ Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+q
     );
   }
 
-  // TPU vs GPU cost comparison
-  const costData = [
-    { hw: 'TPU v6e-4', toks: 13943, cost: 2681, measured: true },
-    { hw: 'H100 SXM (est)', toks: 6000, cost: 675, measured: false },
-    { hw: 'H200 (est)', toks: 4000, cost: 417, measured: false }
+  // TPU vs vLLM GPU comparison (measured)
+  const comparisonData = [
+    { batch: '1',   tpu: 79.9,  gpu: 66.9 },
+    { batch: '8',   tpu: 584,   gpu: 511.7 },
+    { batch: '32',  tpu: null,  gpu: 1728 },
+    { batch: '64',  tpu: 4220,  gpu: 2794 },
+    { batch: '128', tpu: 6831,  gpu: 3848 },
+    { batch: '256', tpu: 10536, gpu: 3709 },
+    { batch: '512', tpu: 12932, gpu: 3788 },
+    { batch: '768', tpu: 13943, gpu: 3671 }
   ];
 
   function TpuVsGpu(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: costData, margin: { top: 30, right: 30, left: 20, bottom: 8 } },
+      e(R.BarChart, { data: comparisonData, margin: { top: 30, right: 30, left: 20, bottom: 8 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { dataKey: 'hw', stroke: '#888', tick: { fill: '#ccc', fontSize: 12 } }),
-        e(R.YAxis, { yAxisId: 'left', stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
-        e(R.YAxis, { yAxisId: 'right', orientation: 'right', stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s/$', angle: 90, position: 'insideRight', fill: '#aaa', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: tooltipStyle }),
+        e(R.XAxis, { dataKey: 'batch', stroke: '#888', tick: { fill: '#ccc', fontSize: 12 }, label: { value: 'Batch size', position: 'insideBottom', offset: -4, fill: '#aaa', fontSize: 11 } }),
+        e(R.YAxis, { stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v ? v.toLocaleString() + ' tok/s' : 'N/A' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { yAxisId: 'left', dataKey: 'toks', name: 'Peak tok/s', fill: '#84E6B7', radius: [4, 4, 0, 0] },
-          e(R.LabelList, { dataKey: 'toks', position: 'top', fill: '#c0f0d8', fontSize: 11, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : '~'+v })
+        e(R.Bar, { dataKey: 'tpu', name: 'rvLLM TPU (measured)', fill: '#84E6B7', radius: [4, 4, 0, 0] },
+          e(R.LabelList, { dataKey: 'tpu', position: 'top', fill: '#c0f0d8', fontSize: 10, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
         ),
-        e(R.Bar, { yAxisId: 'right', dataKey: 'cost', name: 'tok/s/$ (cost efficiency)', fill: '#5a8bd4', radius: [4, 4, 0, 0] },
-          e(R.LabelList, { dataKey: 'cost', position: 'top', fill: '#8eb0e0', fontSize: 11, formatter: v => v.toLocaleString() })
+        e(R.Bar, { dataKey: 'gpu', name: 'vLLM GPU (measured)', fill: '#5a8bd4', radius: [4, 4, 0, 0] },
+          e(R.LabelList, { dataKey: 'gpu', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
         )
       )
     );

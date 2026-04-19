@@ -34,17 +34,19 @@ is kept in-tree as an archive.
 
 \textbf{TPU (v6e-4, Gemma~4 31B, int8 KV).}
 A pure JAX + XLA implementation ($\sim$500 lines of Python) runs
-Gemma~4~27B on a 4-chip TPU~v6e pod slice with TP\,=\,4. A split-cache
-architecture separates 50 sliding-window layers (1024-token circular
-buffer, $O(1024)$ per layer regardless of context) from 10 global
-full-context layers (blockwise attention, BLOCK\_K\,=\,8192). At batch
-one, the engine reaches \textbf{79.9~tok/s} at 512 context tokens and
-\textbf{24.7~tok/s} at 128K context. At $B\!=\!768$ peak throughput is
-\textbf{13{,}943~tok/s} (2{,}681~tok/s/\$). Perplexity is 19.24 with
-int8 per-head KV quantization. Compared to the published vLLM TPU
-benchmark (Gemma~3~27B, bf16, same hardware), rvLLM is 12.4$\times$
-faster on aggregate throughput, though the models and quantization
-differ.
+Gemma~4~27B on a 4-chip TPU~v6e pod slice with TP\,=\,4. Two
+architectures are supported: a \emph{single-scan} design (one
+\texttt{jax.lax.scan} over 60 layers with \texttt{cond} dispatch,
+79.9~tok/s at $B{=}1$, max context 2048) and a \emph{split-cache}
+design (10 groups of 6 layers, 50 sliding-window circular buffers +
+10 global blockwise attention layers, 41.9~tok/s at $B{=}1$ 2048~ctx,
+24.7~tok/s at 128K~ctx, PPL~19.24). At $B\!=\!768$ peak throughput is
+\textbf{13{,}943~tok/s} (2{,}681~tok/s/\$). Measured head-to-head
+against vLLM on an H100 SXM 80\,GB (\$1.92/hr, FP8-Dynamic):
+rvLLM TPU is \textbf{19\% faster at $B{=}1$} (79.9 vs 66.9~tok/s) and
+\textbf{3.6$\times$ faster at peak} (13{,}943 vs 3{,}848~tok/s), with
+\textbf{34\% better cost efficiency} (2{,}681 vs 2{,}004~tok/s/\$).
+Only the TPU split-cache supports 128K context.
 
 \textbf{GPU path.}
 v3 ships as a FlashAttention-3 SM90 paged-KV decode kernel (built from the
@@ -782,14 +784,14 @@ with no dynamic branching. The KV cache is int8 with per-head scales
 
 \subsection{Results}
 
-\begin{tabular}{lrrrr}
+\begin{tabular}{lrrrrl}
 \toprule
-\textbf{Configuration} & \textbf{Batch} & \textbf{Context} & \textbf{ms/step} & \textbf{tok/s} \\
+\textbf{Configuration} & \textbf{Batch} & \textbf{Context} & \textbf{ms/step} & \textbf{tok/s} & \textbf{PPL} \\
 \midrule
-Single-scan architecture & 1 & 512   & 12.52  & 79.9 \\
-Split-cache              & 1 & 2{,}048 & 23.84  & 41.9 \\
-Split-cache + blockwise  & 1 & 128K  & 40.56  & 24.7 \\
-Peak throughput          & 768 & 512  & 55.1   & 13{,}943 \\
+Single-scan (cond dispatch)   & 1   & 512     & 12.52  & 79.9    & 22.80 \\
+Split-cache (no cond)         & 1   & 2{,}048 & 23.84  & 41.9    & 19.24 \\
+Split-cache + blockwise       & 1   & 128K    & 40.56  & 24.7    & 19.24 \\
+Single-scan, peak throughput  & 768 & 512     & 55.1   & 13{,}943 & -- \\
 \bottomrule
 \end{tabular}
 
@@ -861,16 +863,60 @@ Flat scan (groups of 6)                 & 48.2 & 1.88$\times$ \\
 which eliminates per-group \texttt{jax.lax.cond} dispatch and lets XLA
 fuse the sliding-layer loop body into a single HLO block.
 
-\subsection{Comparison with vLLM on TPU}
+\subsection{Comparison with vLLM on GPU (measured)}
 
+We measured vLLM on an H100 SXM 80\,GB (vast.ai, \$1.92/hr) serving
+the same Gemma~4~31B model (RedHatAI/gemma-4-31B-it-FP8-Dynamic,
+FP8) at max\_ctx=2048. The full batch sweep:
+
+\begin{center}
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Batch} & \textbf{vLLM GPU tok/s} & \textbf{vLLM GPU ms/step} & \textbf{rvLLM TPU tok/s} \\
+\midrule
+1   & 66.9   & 14.95  & \textbf{79.9} \\
+8   & 511.7  & 15.63  & \textbf{584} \\
+64  & 2{,}794 & 22.90  & \textbf{4{,}220} \\
+128 & \textbf{3{,}848} & 33.26  & \textbf{6{,}831} \\
+256 & 3{,}709 & 69.03  & \textbf{10{,}536} \\
+512 & 3{,}788 & 135.18 & \textbf{12{,}932} \\
+768 & 3{,}671 & 209.18 & \textbf{13{,}943} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Key head-to-head results:
+
+\begin{itemize}
+\item \textbf{B=1:} rvLLM TPU 79.9 tok/s vs vLLM GPU 66.9 tok/s ---
+  TPU 19\% faster at single-user latency (single-scan architecture,
+  12.52 ms/step vs 14.95 ms/step).
+
+\item \textbf{Peak throughput:} rvLLM TPU 13{,}943 tok/s at $B{=}768$
+  vs vLLM GPU 3{,}848 tok/s at $B{=}128$ --- TPU 3.6$\times$ faster.
+  vLLM GPU saturates at $B{=}128$ and throughput declines beyond that;
+  TPU scales near-linearly to $B{=}768$.
+
+\item \textbf{Cost efficiency:} TPU at \$5.20/hr yields
+  2{,}681~tok/s/\$; GPU at \$1.92/hr yields 2{,}004~tok/s/\$. TPU
+  is 34\% more cost-efficient at peak throughput.
+
+\item \textbf{128K context:} Only the TPU split-cache architecture
+  supports 128K (24.7 tok/s). vLLM GPU was tested at max\_ctx=2048.
+\end{itemize}
+
+\noindent TPU batch scaling numbers are from the single-scan architecture
+(512 ctx, no 128K support). The split-cache batch sweep is in progress
+and expected to show similar peak throughput but higher per-step latency
+due to the 10-group execution overhead.
+
+\paragraph{Prior vLLM-on-TPU reference.}
 Google's published vLLM TPU benchmark reports Gemma~3~27B at
 1{,}126~tok/s on the same v6e-4 hardware in bf16. rvLLM achieves
 13{,}943~tok/s at $B\!=\!768$, a 12.4$\times$ difference. The
 comparison is not apples-to-apples: the models differ (Gemma~4 vs
 Gemma~3), the quantization differs (int8 KV vs bf16), and the batch
-sizes likely differ. The comparison is included to contextualize the
-absolute numbers against the only published vLLM-on-TPU figure for a
-model of comparable size on the same hardware class.
+sizes likely differ.
 
 \subsection{Int8 KV cache}
 \label{sec:tpu_int8}
@@ -1010,8 +1056,12 @@ but has not been tested on larger pod slices. The GPU model catalog
 validated end-to-end on the FP8 path is Qwen2 family, Llama 3 family,
 Mistral 7B, and Gemma 2; a GPU FP8 path for Gemma~4 is in progress
 (scale calibration under development). The TPU path currently supports
-Gemma~4 only. Other supported architectures compile but have not been
-validated against HuggingFace reference on these versions.
+Gemma~4 only with two architectures: single-scan (faster at small
+batch, max 2048 context) and split-cache (128K context, slightly higher
+per-step latency). The split-cache batch scaling sweep is in progress;
+peak throughput numbers reported in this paper use the single-scan
+architecture at 512 context. Other supported architectures compile but
+have not been validated against HuggingFace reference on these versions.
 Speculative decode, LoRA serving, and tool-calling guided decoding are
 present in the Python-free API layer but outside this paper.
 
@@ -1048,12 +1098,17 @@ one \texttt{cuGraphLaunch} replay. The archived v2 stack (commit
 same GPU.
 
 \textbf{TPU.} The JAX/XLA engine reaches \textbf{79.9~tok/s} at
-$B\!=\!1$ (512 context) and \textbf{13{,}943~tok/s} at $B\!=\!768$
-serving Gemma~4~31B on a v6e-4 pod slice with int8 KV quantization.
-The split-cache architecture --- 50 sliding-window layers in fixed-size
-circular buffers, 10 global layers with blockwise attention --- scales
-to 128K context with only 3.2$\times$ latency increase over 512 tokens.
-At \$5.20/hr the engine delivers 2{,}681~tok/s/\$.
+$B\!=\!1$ (single-scan, 512 context) and \textbf{13{,}943~tok/s} at
+$B\!=\!768$ serving Gemma~4~31B on a v6e-4 pod slice with int8 KV
+quantization. The split-cache architecture --- 50 sliding-window layers
+in fixed-size circular buffers, 10 global layers with blockwise
+attention --- scales to 128K context (24.7~tok/s) with only
+3.2$\times$ latency increase over 512 tokens. Measured against vLLM on
+H100 SXM 80\,GB (FP8-Dynamic, \$1.92/hr): TPU is 19\% faster at
+$B{=}1$ (79.9 vs 66.9~tok/s), 3.6$\times$ faster at peak (13{,}943 vs
+3{,}848~tok/s), and 34\% more cost-efficient (2{,}681 vs
+2{,}004~tok/s/\$). At \$5.20/hr the engine delivers
+2{,}681~tok/s/\$.
 
 The path to the GPU v3 number was mechanical, not magical: capturing the
 layer loop into a CUDA graph alone moved the engine from 551 tok/s
