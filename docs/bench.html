@@ -120,7 +120,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 }
 
 .section-block{transition:opacity 0.2s ease}
-.section-block.hidden{display:none}
+.hidden{display:none}
 </style>
 </head>
 <body>
@@ -144,7 +144,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   <button class="filter-btn" onclick="filterView('gpu')">GPU</button>
 </div>
 
-<div class="pill-row">
+<div id="pills-tpu" class="pill-row">
   <div class="pill">
     <div class="label">TPU peak throughput</div>
     <strong>13,943 tok/s</strong>
@@ -154,11 +154,6 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
     <div class="label">B=1 decode (512 ctx)</div>
     <strong>78.2 tok/s</strong>
     <div class="caption">12.79 ms, single-scan bf16 KV</div>
-  </div>
-  <div class="pill">
-    <div class="label">B=1 decode (2048 ctx)</div>
-    <strong>~70 tok/s</strong>
-    <div class="caption">~14 ms, single-scan bf16 KV</div>
   </div>
   <div class="pill">
     <div class="label">128K context</div>
@@ -174,6 +169,33 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
     <div class="label">Cost efficiency</div>
     <strong>2,681 tok/s/$</strong>
     <div class="caption">34% better than vLLM H100 GPU (measured)</div>
+  </div>
+</div>
+<div id="pills-gpu" class="pill-row hidden">
+  <div class="pill">
+    <div class="label">GPU peak throughput</div>
+    <strong>7,943 tok/s</strong>
+    <div class="caption">H100 SXM, FP8, B=512, CUDA graph</div>
+  </div>
+  <div class="pill">
+    <div class="label">B=1 decode</div>
+    <strong>52 tok/s</strong>
+    <div class="caption">19.2 ms, ~1400 graph nodes</div>
+  </div>
+  <div class="pill">
+    <div class="label">Perplexity</div>
+    <strong>13.53</strong>
+    <div class="caption">FP8-Dynamic + fused channelscale, F16 KV</div>
+  </div>
+  <div class="pill">
+    <div class="label">128K context</div>
+    <strong>supported</strong>
+    <div class="caption">per-layer KV sizing, 11.6 GB KV cache</div>
+  </div>
+  <div class="pill">
+    <div class="label">Kernel fusion</div>
+    <strong>1776 -> ~1400 nodes</strong>
+    <div class="caption">21% reduction, 3 fusion passes</div>
   </div>
 </div>
 
@@ -757,6 +779,8 @@ function filterView(mode) {
   var tpu = document.getElementById('section-tpu');
   var eagle3 = document.getElementById('section-eagle3');
   var gpu = document.getElementById('section-gpu');
+  var pillsTpu = document.getElementById('pills-tpu');
+  var pillsGpu = document.getElementById('pills-gpu');
   var dividers = document.querySelectorAll('.section-divider');
   var btns = document.querySelectorAll('.filter-btn');
 
@@ -767,21 +791,29 @@ function filterView(mode) {
     tpu.classList.remove('hidden');
     eagle3.classList.remove('hidden');
     gpu.classList.remove('hidden');
+    pillsTpu.classList.remove('hidden');
+    pillsGpu.classList.add('hidden');
     dividers.forEach(function(d){ d.classList.remove('hidden'); });
   } else if (mode === 'tpu') {
     tpu.classList.remove('hidden');
     eagle3.classList.add('hidden');
     gpu.classList.add('hidden');
+    pillsTpu.classList.remove('hidden');
+    pillsGpu.classList.add('hidden');
     dividers.forEach(function(d){ d.classList.add('hidden'); });
   } else if (mode === 'eagle3') {
     tpu.classList.add('hidden');
     eagle3.classList.remove('hidden');
     gpu.classList.add('hidden');
+    pillsTpu.classList.add('hidden');
+    pillsGpu.classList.add('hidden');
     dividers.forEach(function(d){ d.classList.add('hidden'); });
   } else if (mode === 'gpu') {
     tpu.classList.add('hidden');
     eagle3.classList.add('hidden');
     gpu.classList.remove('hidden');
+    pillsTpu.classList.add('hidden');
+    pillsGpu.classList.remove('hidden');
     dividers.forEach(function(d){ d.classList.add('hidden'); });
   }
 }
