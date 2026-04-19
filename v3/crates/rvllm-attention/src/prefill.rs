@@ -55,12 +55,12 @@ impl PagedPrefillParams {
 }
 
 pub struct PagedPrefillLauncher<'a> {
-    _fa3: &'a super::Fa3Kernels,
+    _backend: &'a super::AttentionBackend,
 }
 
 impl<'a> PagedPrefillLauncher<'a> {
-    pub fn new(fa3: &'a super::Fa3Kernels) -> Self {
-        Self { _fa3: fa3 }
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { _backend: backend }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -85,13 +85,14 @@ impl<'a> PagedPrefillLauncher<'a> {
 
 /// FP8 E4M3 paged-prefill launcher. Q / K / V are FP8 with per-tensor
 /// descales. Multi-query self-attention with a per-seq causal mask.
+/// `Fa2Ptx` backend returns `FeatureNotAvailable` — see decode.rs.
 pub struct PagedPrefillFp8Launcher<'a> {
-    fa3: &'a super::Fa3Kernels,
+    backend: &'a super::AttentionBackend,
 }
 
 impl<'a> PagedPrefillFp8Launcher<'a> {
-    pub fn new(fa3: &'a super::Fa3Kernels) -> Self {
-        Self { fa3 }
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { backend }
     }
 
     /// # Safety
@@ -120,10 +121,28 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         params.validate()?;
         #[cfg(feature = "cuda")]
         {
-            let Some(f) = self.fa3.fn_paged_prefill_fp8 else {
+            let fa3 = match self.backend {
+                super::AttentionBackend::Fa3(fa3) => fa3,
+                super::AttentionBackend::Fa2Ptx(_) => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "Fa2Ptx",
+                            op: "paged_prefill_fp8",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_prefill_fp8",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            let Some(f) = fa3.fn_paged_prefill_fp8 else {
                 return Err(RvllmError::Attention {
                     err: AttentionError::Fa3SoMissing {
-                        path: self.fa3.so_path.clone(),
+                        path: fa3.so_path.clone(),
                     },
                     ctx: AttnCtx {
                         op: "paged_prefill_fp8 symbol missing from .so (rebuild fa3)",
@@ -202,6 +221,7 @@ mod tests {
             max_blocks_per_seq: 33,
             num_blocks_total: 1024,
             scale: 1.0,
+            window_size_left: -1,
         };
         assert!(p.validate().is_err());
     }
@@ -218,6 +238,7 @@ mod tests {
             max_blocks_per_seq: 33,
             num_blocks_total: 1024,
             scale: 1.0 / (256f32).sqrt(),
+            window_size_left: -1,
         };
         assert!(p.validate().is_ok());
     }

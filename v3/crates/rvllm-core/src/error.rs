@@ -155,6 +155,11 @@ pub enum AttentionError {
     GqaRatioInvalid { num_heads: u32, num_kv_heads: u32 },
     ContextExceedsBucket { context: u32, max: u32 },
     KernelLaunchFailed { cuda: CudaErrorKind },
+    /// The selected `AttentionBackend` does not implement this launch
+    /// path. Used on sm_121 (Fa2Ptx variant) when callers reach for
+    /// FP8-KV paged-decode / paged-prefill — those translate from
+    /// FA3's parameter set and will land in a follow-up PR.
+    FeatureNotAvailable { backend: &'static str, op: &'static str },
 }
 
 #[derive(Debug)]

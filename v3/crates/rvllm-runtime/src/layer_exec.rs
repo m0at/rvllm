@@ -24,7 +24,7 @@ use rvllm_kernels::KernelFn;
 pub use rvllm_loader::{LayerAttnType, MlpActivation};
 
 use rvllm_attention::{
-    Fa3Kernels, PagedDecodeFp8Launcher, PagedDecodeParams, PagedPrefillFp8Launcher,
+    AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams, PagedPrefillFp8Launcher,
     PagedPrefillParams,
 };
 
@@ -138,7 +138,7 @@ pub unsafe fn forward(
     plans: &LayerGemmPlans,
     cutlass: &CutlassLib,
     cublaslt: &CublasLt,
-    fa3: &Fa3Kernels,
+    fa3: &AttentionBackend,
     residual: u64,
     stream: u64,
     attn_type: LayerAttnType,
@@ -170,7 +170,7 @@ pub unsafe fn forward_phase(
     plans: &LayerGemmPlans,
     cutlass: &CutlassLib,
     cublaslt: &CublasLt,
-    fa3: &Fa3Kernels,
+    fa3: &AttentionBackend,
     residual: u64,
     stream: u64,
     phase: LayerPhase,

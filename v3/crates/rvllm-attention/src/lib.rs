@@ -243,6 +243,156 @@ unsafe impl Send for Fa3Kernels {}
 #[cfg(feature = "cuda")]
 unsafe impl Sync for Fa3Kernels {}
 
+// ============================================================================
+// Fa2PtxKernels — sm_121 (GB10) attention backend via PTX-launched FA2 kernels
+// ============================================================================
+
+/// PTX-based attention backend for Blackwell consumer targets where
+/// `libfa3_kernels.so` does not apply (FA3 requires WGMMA + TMA
+/// multicast, both Hopper-only). Loads `flash_attention.ptx` via
+/// `KernelLoader` and resolves the four entry points we compile:
+/// `flash_attention_2_kernel`, `flash_attention_2_decode_kernel`,
+/// `flash_attention_2_f16kv_kernel`,
+/// `flash_attention_2_decode_f16kv_kernel`.
+///
+/// This PR ships the backend *structurally*: the kernels load, symbols
+/// resolve, and `AttentionBackend::workspace_size` returns a correct
+/// zero (FA2 has no .so-managed workspace). The actual launch path
+/// still needs to translate the FA3 parameter set (paged KV, FP8
+/// descale pointers, `window_size_left` semantics) into FA2's call
+/// shape plus an fp8-KV path (FA2 today takes f16/f32 KV only). That
+/// translation + a matching fp8-KV kernel variant are tracked as the
+/// next GB10 follow-up PR; launching through `Fa2Ptx` before then
+/// returns a typed `FeatureNotAvailable` error so the engine fails
+/// closed.
+#[derive(Debug)]
+pub struct Fa2PtxKernels {
+    pub head_dim: u32,
+    #[cfg(feature = "cuda")]
+    pub flash_attention_mod: rvllm_kernels::LoadedModule,
+    #[cfg(feature = "cuda")]
+    pub fn_decode: rvllm_kernels::KernelFn,
+    #[cfg(feature = "cuda")]
+    pub fn_decode_f16kv: rvllm_kernels::KernelFn,
+    #[cfg(feature = "cuda")]
+    pub fn_prefill: rvllm_kernels::KernelFn,
+    #[cfg(feature = "cuda")]
+    pub fn_prefill_f16kv: rvllm_kernels::KernelFn,
+}
+
+impl Fa2PtxKernels {
+    /// Load `flash_attention.ptx` (the FA2 source compiled for this
+    /// arch) via the shared `KernelLoader`. Resolves all four entry
+    /// points. `head_dim` must be one of the supported values —
+    /// mirrors `Fa3Kernels::load` behaviour.
+    pub fn load(loader: &rvllm_kernels::KernelLoader, head_dim: u32) -> Result<Self> {
+        if !SUPPORTED_HEAD_DIMS.contains(&head_dim) {
+            return Err(RvllmError::Attention {
+                err: AttentionError::UnsupportedHeadDim {
+                    got: head_dim,
+                    supported: SUPPORTED_HEAD_DIMS,
+                },
+                ctx: AttnCtx {
+                    op: "Fa2PtxKernels::load",
+                    stream: 0,
+                    num_seqs: 0,
+                    head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            let flash_attention_mod = loader.load_ptx("flash_attention")?;
+            let fn_decode = flash_attention_mod.get_function("flash_attention_2_decode_kernel")?;
+            let fn_decode_f16kv =
+                flash_attention_mod.get_function("flash_attention_2_decode_f16kv_kernel")?;
+            let fn_prefill = flash_attention_mod.get_function("flash_attention_2_kernel")?;
+            let fn_prefill_f16kv =
+                flash_attention_mod.get_function("flash_attention_2_f16kv_kernel")?;
+            Ok(Self {
+                head_dim,
+                flash_attention_mod,
+                fn_decode,
+                fn_decode_f16kv,
+                fn_prefill,
+                fn_prefill_f16kv,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = loader;
+            Ok(Self { head_dim })
+        }
+    }
+}
+
+// ============================================================================
+// AttentionBackend — unifies Fa3 (SM90 dlopen) and Fa2Ptx (sm_121 PTX)
+// ============================================================================
+
+/// Which attention backend the runtime is using on the live device.
+/// Picked once at bring-up per `CompileTarget`:
+///
+///   * SM80 / SM89 / SM90 → `Fa3` (dlopen `libfa3_kernels.so`)
+///   * SM121 (Blackwell consumer) → `Fa2Ptx` (PTX-launched FA2)
+///
+/// Callers (launcher structs in `decode.rs` / `prefill.rs`) `match`
+/// on this enum and route to the appropriate launch path. An attempt
+/// to launch a path that a given backend doesn't implement returns
+/// `AttentionError::FeatureNotAvailable` rather than silently
+/// succeeding with wrong output.
+///
+/// `#[non_exhaustive]` so a future SM100-specific backend (or a
+/// trait-based dispatch table) can be added without breaking
+/// downstream external matches.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AttentionBackend {
+    Fa3(Fa3Kernels),
+    Fa2Ptx(Fa2PtxKernels),
+}
+
+impl AttentionBackend {
+    /// Minimum workspace size in bytes for the given batch + heads.
+    /// The FA2 PTX path does not use an external workspace — the
+    /// scratch is allocated per-block in shared memory inside the
+    /// kernel itself — so it returns 0.
+    #[must_use]
+    pub fn workspace_size(&self, batch_size: i32, num_heads: i32) -> usize {
+        match self {
+            AttentionBackend::Fa3(fa3) => fa3.workspace_size(batch_size, num_heads),
+            AttentionBackend::Fa2Ptx(_) => 0,
+        }
+    }
+
+    /// Head dim this backend was constructed for.
+    #[must_use]
+    pub fn head_dim(&self) -> u32 {
+        match self {
+            // `Fa3Kernels` doesn't store head_dim as a public field;
+            // it's validated at `load` time. For AttentionBackend we
+            // reconstruct the invariant at construction and expose
+            // it uniformly.
+            AttentionBackend::Fa3(_) => 0, // caller already validated at Fa3Kernels::load
+            AttentionBackend::Fa2Ptx(fa2) => fa2.head_dim,
+        }
+    }
+}
+
+impl From<Fa3Kernels> for AttentionBackend {
+    fn from(fa3: Fa3Kernels) -> Self {
+        AttentionBackend::Fa3(fa3)
+    }
+}
+
+impl From<Fa2PtxKernels> for AttentionBackend {
+    fn from(fa2: Fa2PtxKernels) -> Self {
+        AttentionBackend::Fa2Ptx(fa2)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

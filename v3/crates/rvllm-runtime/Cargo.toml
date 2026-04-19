@@ -22,6 +22,19 @@ cuda = [
     "rvllm-sampling/cuda",
     "dep:cudarc",
 ]
+# GB10 / sm_121: `Bringup::load` picks `UnifiedArena`
+# (`cuMemAllocManaged`) instead of `HbmArena` (`cuMemAlloc_v2`) when
+# the live device is a Blackwell consumer part. Implies `cuda`.
+gb10 = ["cuda", "rvllm-mem/gb10"]
+
+# `probe-gemma4-load` requires a real CUDA device + Gemma 4 fp8 model
+# artifacts. Kept as an opt-in `[[bin]]` guarded by
+# `required-features = ["gb10"]` so `cargo build` never picks it up —
+# the GB10 bring-up validation is an explicit operator action.
+[[bin]]
+name = "probe-gemma4-load"
+path = "src/bin/probe_gemma4_load.rs"
+required-features = ["gb10"]
 
 [dependencies]
 rvllm-core = { workspace = true }

@@ -34,7 +34,7 @@ use rvllm_fused::FusedRmsnormFp8QuantLaunch;
 use rvllm_kernels::KernelFn;
 
 use rvllm_attention::{
-    Fa3Kernels, PagedDecodeFp8Launcher, PagedDecodeParams,
+    AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams,
     PagedPrefillFp8Launcher, PagedPrefillParams,
 };
 
@@ -178,8 +178,8 @@ pub unsafe fn gemma4_forward(
     meta: &Gemma4MetadataPtrs,
     cublaslt: &CublasLt,
     cutlass: &CutlassLib,
-    sliding_attention: &Fa3Kernels,
-    global_attention: &Fa3Kernels,
+    sliding_attention: &AttentionBackend,
+    global_attention: &AttentionBackend,
     residual: u64,
     stream: u64,
 ) -> Result<()> {
@@ -196,8 +196,8 @@ pub unsafe fn gemma4_forward_phase(
     meta: &Gemma4MetadataPtrs,
     cublaslt: &CublasLt,
     cutlass: &CutlassLib,
-    sliding_attention: &Fa3Kernels,
-    global_attention: &Fa3Kernels,
+    sliding_attention: &AttentionBackend,
+    global_attention: &AttentionBackend,
     residual: u64,
     stream: u64,
     phase: Gemma4Phase,

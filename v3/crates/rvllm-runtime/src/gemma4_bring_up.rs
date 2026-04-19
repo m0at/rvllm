@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rvllm_attention::Fa3Kernels;
+use rvllm_attention::{AttentionBackend, Fa3Kernels};
 use rvllm_core::Result;
 use rvllm_cutlass::{CublasLt, CutlassLib, Policy};
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
@@ -77,12 +77,27 @@ pub struct Gemma4FusedModules {
     pub fused_qkv_rmsnorm_mod: LoadedModule,
     pub fn_scale_cols_f16: KernelFn,
     pub scale_cols_f16_mod: LoadedModule,
+
+    // `fp8_gemv.ptx` — the GB10-focused unfused FP8 GEMV kernels. Loaded
+    // at bringup so the eventual FP8-GEMV dispatcher (see
+    // `rvllm_kernels::gb10_dispatch`) can call `select_variant` per
+    // launch without any per-step module load. Nothing in the current
+    // decode path touches these yet — this is the additive landing for
+    // the wiring that swaps in on a follow-up PR.
+    pub fp8_gemv_mod: LoadedModule,
+    pub fn_fp8_gemv_wpr_lut: KernelFn,
+    /// `None` when the live device is not Blackwell (sm_100+) — the
+    /// native-CVT entry is gated on `__CUDA_ARCH__ >= 1000` in
+    /// `kernels/fp8_gemv.cu`, so the symbol is absent from pre-Blackwell
+    /// PTX. `Fp8GemvVariant::available_for(target)` is the source of
+    /// truth for this gate.
+    pub fn_fp8_gemv_wpr_native: Option<KernelFn>,
 }
 
 pub struct Gemma4Bringup {
     pub fused: Gemma4FusedModules,
-    pub sliding_attention: Fa3Kernels,
-    pub global_attention: Fa3Kernels,
+    pub sliding_attention: AttentionBackend,
+    pub global_attention: AttentionBackend,
     pub cutlass: CutlassLib,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
@@ -98,7 +113,27 @@ pub struct Gemma4Bringup {
 impl Gemma4Bringup {
     pub fn load(paths: Gemma4EnginePaths, arena_bytes: usize) -> Result<Self> {
         let ctx = Arc::new(CudaContextHandle::init(0)?);
-        let arena = HbmArena::new(&ctx, arena_bytes)?;
+        // Arena backing picked per compute capability — see `Bringup::load`
+        // in bring_up.rs for the full rationale (GB10 has no dedicated HBM,
+        // cuMemAllocManaged is the right allocator there).
+        let arena = {
+            #[cfg(feature = "gb10")]
+            {
+                let target = rvllm_core::CompileTarget::from_compute_capability(
+                    ctx.compute_capability().0,
+                    ctx.compute_capability().1,
+                );
+                if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+                    rvllm_mem::UnifiedArena::new(&ctx, arena_bytes)?.into_inner()
+                } else {
+                    HbmArena::new(&ctx, arena_bytes)?
+                }
+            }
+            #[cfg(not(feature = "gb10"))]
+            {
+                HbmArena::new(&ctx, arena_bytes)?
+            }
+        };
         let arena: HbmArena<'static> = unsafe { std::mem::transmute(arena) };
         let stream = Stream::new(&ctx)?;
 
@@ -111,16 +146,55 @@ impl Gemma4Bringup {
         let manifest = rvllm_kernels::manifest::KernelManifest::load_and_verify(&manifest_path)?;
         let kernels = Arc::new(KernelLoader::new(manifest));
 
-        // Sliding layers use the FA3 SM90 backend at head_dim=256.
-        let sliding_attention =
-            Fa3Kernels::load(paths.fa3_so.clone(), arch.head_dim_sliding as u32)?;
-        // Global layers use the generic fallback paged attention path.
-        // Default location is next to the FA3 .so; an explicit override
-        // keeps bench/deploy flows flexible while avoiding a new required flag.
-        let global_attention_so = std::env::var_os("RVLLM_FA_FALLBACK_SO")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| paths.fa3_so.with_file_name("libfa_sm89_kernels.so"));
-        let global_attention = Fa3Kernels::load(global_attention_so, arch.head_dim_global as u32)?;
+        // Attention backend selection. On SM80/SM89/SM90 we stick with
+        // the FA3 `.so` (WGMMA + TMA). On sm_121 (GB10) FA3 cannot
+        // load — WGMMA doesn't exist on Blackwell consumer silicon —
+        // so we route through the PTX-launched FA2 kernels we already
+        // compile for every arch. The FA2 launch body is still a
+        // follow-up (the decode/prefill launchers return
+        // `FeatureNotAvailable` for the `Fa2Ptx` variant), but
+        // bring-up now completes on GB10 without a hard fail on
+        // `Fa3SoMissing`. See `rvllm_attention::Fa2PtxKernels` docs.
+        let (sliding_attention, global_attention) = {
+            #[cfg(feature = "gb10")]
+            let is_gb10 = matches!(
+                rvllm_core::CompileTarget::from_compute_capability(
+                    ctx.compute_capability().0,
+                    ctx.compute_capability().1,
+                ),
+                Some(rvllm_core::CompileTarget::Sm121),
+            );
+            #[cfg(not(feature = "gb10"))]
+            let is_gb10 = false;
+            if is_gb10 {
+                let sliding = AttentionBackend::Fa2Ptx(rvllm_attention::Fa2PtxKernels::load(
+                    &kernels,
+                    arch.head_dim_sliding as u32,
+                )?);
+                let global = AttentionBackend::Fa2Ptx(rvllm_attention::Fa2PtxKernels::load(
+                    &kernels,
+                    arch.head_dim_global as u32,
+                )?);
+                (sliding, global)
+            } else {
+                // Sliding layers use the FA3 SM90 backend at head_dim=256.
+                let sliding = AttentionBackend::Fa3(Fa3Kernels::load(
+                    paths.fa3_so.clone(),
+                    arch.head_dim_sliding as u32,
+                )?);
+                // Global layers use the generic fallback paged attention path.
+                // Default location is next to the FA3 .so; an explicit override
+                // keeps bench/deploy flows flexible while avoiding a new required flag.
+                let global_attention_so = std::env::var_os("RVLLM_FA_FALLBACK_SO")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| paths.fa3_so.with_file_name("libfa_sm89_kernels.so"));
+                let global = AttentionBackend::Fa3(Fa3Kernels::load(
+                    global_attention_so,
+                    arch.head_dim_global as u32,
+                )?);
+                (sliding, global)
+            }
+        };
 
         let policy_bytes =
             std::fs::read(&paths.policy_json).map_err(|source| rvllm_core::RvllmError::Io {
@@ -153,7 +227,26 @@ impl Gemma4Bringup {
             bytes: cublaslt_ws_bytes,
         };
 
-        let fused = load_gemma4_fused(&kernels)?;
+        // Live-device target is needed by the fused loader to decide
+        // whether `Fp8GemvVariant::WprNative` should be resolved (it's
+        // sm_100+ only). Under `feature = "cuda"` we have a real
+        // compute-capability reading; otherwise default to `None` and
+        // let the loader resolve only the universally-available
+        // variant. `Some(None)` vs `None` is distinct: it means
+        // "probe succeeded but CC isn't in our target matrix", which
+        // should still fall back to `WprLut`.
+        let fp8_target = {
+            #[cfg(feature = "cuda")]
+            {
+                let (major, minor) = ctx.compute_capability();
+                rvllm_core::CompileTarget::from_compute_capability(major, minor)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                None
+            }
+        };
+        let fused = load_gemma4_fused(&kernels, fp8_target)?;
 
         Ok(Self {
             ctx,
@@ -1541,7 +1634,10 @@ fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
 
-fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
+fn load_gemma4_fused(
+    loader: &KernelLoader,
+    target: Option<rvllm_core::CompileTarget>,
+) -> Result<Gemma4FusedModules> {
     let rmsnorm_mod = loader.load_ptx("fused_rmsnorm_fp8_quant")?;
     let rope_mod = loader.load_ptx("fused_rope_partial_fp8kv")?;
     let gelu_mod = loader.load_ptx("fused_gelu_mul_fp8_quant")?;
@@ -1589,6 +1685,20 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let fused_rope_partial_f16kv_mod = loader.load_ptx("fused_rope_partial_f16kv")?;
     let fn_fused_rope_partial_f16kv =
         fused_rope_partial_f16kv_mod.get_function("fused_rope_partial_f16kv_kernel")?;
+
+    // `fp8_gemv.ptx` — see struct docs. Both WPR variants live in the
+    // same module; the native-CVT entry is gated on `__CUDA_ARCH__ >=
+    // 1000`, so we only attempt to resolve it when
+    // `Fp8GemvVariant::available_for(target)` says yes.
+    let fp8_gemv_mod = loader.load_ptx(rvllm_kernels::FP8_GEMV_PTX_STEM)?;
+    let fn_fp8_gemv_wpr_lut =
+        fp8_gemv_mod.get_function(rvllm_kernels::Fp8GemvVariant::WprLut.entry_point())?;
+    let fn_fp8_gemv_wpr_native = match target {
+        Some(t) if rvllm_kernels::Fp8GemvVariant::WprNative.available_for(t) => Some(
+            fp8_gemv_mod.get_function(rvllm_kernels::Fp8GemvVariant::WprNative.entry_point())?,
+        ),
+        _ => None,
+    };
 
     let fused_norm_add_residual_mod = loader.load_ptx("fused_norm_add_residual")?;
     let fn_fused_norm_add_residual =
@@ -1653,5 +1763,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fused_qkv_rmsnorm_mod,
         fn_scale_cols_f16,
         scale_cols_f16_mod,
+        fp8_gemv_mod,
+        fn_fp8_gemv_wpr_lut,
+        fn_fp8_gemv_wpr_native,
     })
 }

@@ -62,15 +62,17 @@ impl PagedDecodeParams {
     }
 }
 
-/// Launcher. Construction from `&Fa3Kernels` guarantees the .so is
-/// loaded and head_dim is supported by the backend.
+/// Launcher. Constructed from `&AttentionBackend`. The `Fa3` variant
+/// goes through the SM90 `.so` dispatch; the `Fa2Ptx` variant returns
+/// `AttentionError::FeatureNotAvailable` until the sm_121 FA2 launch
+/// path is wired up (next GB10 follow-up PR).
 pub struct PagedDecodeLauncher<'a> {
-    fa3: &'a super::Fa3Kernels,
+    backend: &'a super::AttentionBackend,
 }
 
 impl<'a> PagedDecodeLauncher<'a> {
-    pub fn new(fa3: &'a super::Fa3Kernels) -> Self {
-        Self { fa3 }
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { backend }
     }
 
     /// Validate params + issue the launch.
@@ -96,7 +98,25 @@ impl<'a> PagedDecodeLauncher<'a> {
         params.validate()?;
         #[cfg(feature = "cuda")]
         {
-            let rc = (self.fa3.fn_paged_decode)(
+            let fa3 = match self.backend {
+                super::AttentionBackend::Fa3(fa3) => fa3,
+                super::AttentionBackend::Fa2Ptx(_) => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "Fa2Ptx",
+                            op: "paged_decode",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_decode",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            let rc = (fa3.fn_paged_decode)(
                 q_ptr as *mut std::ffi::c_void,
                 k_cache_ptr as *mut std::ffi::c_void,
                 v_cache_ptr as *mut std::ffi::c_void,
@@ -149,13 +169,15 @@ impl<'a> PagedDecodeLauncher<'a> {
 
 /// FP8 E4M3 paged-decode launcher. Same param validation as the FP16
 /// path; dispatches the FP8 entry point and threads per-tensor scales.
+/// `Fa2Ptx` backend returns `FeatureNotAvailable` — the FA2 kernels
+/// today only accept f16/f32 KV cache, not fp8.
 pub struct PagedDecodeFp8Launcher<'a> {
-    fa3: &'a super::Fa3Kernels,
+    backend: &'a super::AttentionBackend,
 }
 
 impl<'a> PagedDecodeFp8Launcher<'a> {
-    pub fn new(fa3: &'a super::Fa3Kernels) -> Self {
-        Self { fa3 }
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { backend }
     }
 
     /// # Safety
@@ -180,7 +202,25 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
         params.validate()?;
         #[cfg(feature = "cuda")]
         {
-            let rc = (self.fa3.fn_paged_decode_fp8)(
+            let fa3 = match self.backend {
+                super::AttentionBackend::Fa3(fa3) => fa3,
+                super::AttentionBackend::Fa2Ptx(_) => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "Fa2Ptx",
+                            op: "paged_decode_fp8",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_decode_fp8",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            let rc = (fa3.fn_paged_decode_fp8)(
                 q_fp8 as *mut std::ffi::c_void,
                 k_cache_fp8 as *mut std::ffi::c_void,
                 v_cache_fp8 as *mut std::ffi::c_void,
@@ -242,6 +282,7 @@ mod tests {
             max_blocks_per_seq: 33,
             num_blocks_total: 1024,
             scale: 1.0 / (128f32).sqrt(),
+            window_size_left: -1,
         }
     }
 

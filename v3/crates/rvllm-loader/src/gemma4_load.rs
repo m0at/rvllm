@@ -459,7 +459,7 @@ pub fn load_gemma4_model(
                         let cols = entry.nbytes as usize / rows;
                         let scale_name = format!("{}_scale", entry.name);
                         let ch_scales = if let Some(se) = get_tensor(&scale_name) {
-                            read_channelscale_bf16(&se, &shards)
+                            read_channelscale_bf16(&se, &shards, rows)
                         } else {
                             vec![1.0 / 448.0; rows]
                         };
@@ -705,20 +705,71 @@ fn upload_fp8_from(
     )
 }
 
-/// Read per-channel BF16 scales [rows, 1] into an f32 vec.
+/// Read an FP8 weight's BF16 scale entry into a per-row f32 vector of
+/// length `rows`. Two on-disk layouts are recognized:
+///
+///   * **Per-channel:** `shape = [rows]` or `[rows, 1]`. Returned flat.
+///   * **Blockwise:** `shape = [rows_blocks, cols_blocks]` where
+///     `rows_blocks * 128 >= rows`. Expanded to a per-row vector by
+///     broadcasting each row-block's first column-block scale over 128
+///     rows. This loses the column-block variation — the resulting
+///     vector is a compatibility shim for the cuBLASLt
+///     `OUTER_VEC_32F` path, which only consumes per-row scales.
+///     Full-fidelity consumption of blockwise scales requires a
+///     block-scale GEMV launcher (see `rvllm-kernels::gb10_dispatch` +
+///     `fp8_gemv_blockwise_wpr_*_kernel`), which is not wired into the
+///     runtime's launch path yet.
+///
+/// Panics on any other layout — better a clear panic at load-time than
+/// silent miscalibration at inference.
 fn read_channelscale_bf16(
     scale_entry: &(usize, TensorEntry),
     shards: &[ShardMap],
+    rows: usize,
 ) -> Vec<f32> {
     let (si, e) = scale_entry;
     let raw = &shards[*si].bytes()[e.file_offset as usize..(e.file_offset + e.nbytes) as usize];
     let n = raw.len() / 2;
-    let mut scales = Vec::with_capacity(n);
-    for i in 0..n {
-        let as_f32 = f32::from_bits(u32::from_le_bytes([0, 0, raw[2 * i], raw[2 * i + 1]]));
-        scales.push(as_f32);
+    // bf16 → f32: place bf16 in upper half of u32, zero lower.
+    let bf16_le_to_f32 = |lo: u8, hi: u8| f32::from_bits(u32::from_le_bytes([0, 0, lo, hi]));
+
+    // Case 1: per-channel (1-D or trivially [rows, 1]).
+    if n == rows && (e.shape.len() == 1 || (e.shape.len() == 2 && e.shape[1] == 1)) {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(bf16_le_to_f32(raw[2 * i], raw[2 * i + 1]));
+        }
+        return out;
     }
-    scales
+
+    // Case 2: 2-D block-scale `[rows_blocks, cols_blocks]`.
+    if e.shape.len() == 2 {
+        let rows_blocks = e.shape[0];
+        let cols_blocks = e.shape[1];
+        const BLOCK: usize = 128;
+        assert_eq!(
+            n,
+            rows_blocks * cols_blocks,
+            "block-scale flat count {n} != rows_blocks {rows_blocks} * cols_blocks {cols_blocks}",
+        );
+        assert!(
+            rows_blocks * BLOCK >= rows,
+            "block-scale rows_blocks {rows_blocks} * {BLOCK} < weight rows {rows}",
+        );
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let rb = r / BLOCK;
+            // First column-block's scale for this row-block.
+            let idx = rb * cols_blocks;
+            out.push(bf16_le_to_f32(raw[2 * idx], raw[2 * idx + 1]));
+        }
+        return out;
+    }
+
+    panic!(
+        "unrecognized FP8 scale layout for {:?}: shape={:?}, flat_count={n}, expected rows={rows}",
+        e.name, e.shape
+    );
 }
 
 /// Upload pre-quantized FP8 weight with per-channel BF16 scales.
@@ -740,8 +791,9 @@ fn upload_fp8_direct_channelscale(
     let region = arena.region(region_name, raw.len(), 16)?;
     unsafe { region.copy_from_host(raw)? };
     if let Some(se) = scale_entry {
-        let ch_scales = read_channelscale_bf16(se, shards);
-        assert_eq!(ch_scales.len(), rows);
+        // `read_channelscale_bf16` guarantees `len() == rows` for both
+        // per-channel and blockwise layouts — see its docs.
+        let ch_scales = read_channelscale_bf16(se, shards, rows);
         let scale_bytes: Vec<u8> = ch_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
         let cs_r = arena.region("fp8_chscale", scale_bytes.len(), 16)?;
         unsafe { cs_r.copy_from_host(&scale_bytes)? };
@@ -793,8 +845,9 @@ fn fuse_fp8_direct_channelscale(
         fused_bytes.extend_from_slice(raw);
         let rows = entry.shape[0];
         if let Some(se) = scale_entries.get(i).and_then(|x| x.as_ref()) {
-            let ch = read_channelscale_bf16(se, shards);
-            assert_eq!(ch.len(), rows);
+            // `read_channelscale_bf16` guarantees `len() == rows` for
+            // both per-channel and blockwise layouts — see its docs.
+            let ch = read_channelscale_bf16(se, shards, rows);
             fused_scales.extend_from_slice(&ch);
             has_scales = true;
         } else {

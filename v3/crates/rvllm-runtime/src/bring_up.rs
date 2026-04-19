@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rvllm_attention::Fa3Kernels;
+use rvllm_attention::{AttentionBackend, Fa3Kernels};
 #[cfg(feature = "cuda")]
 use rvllm_core::CompileTarget;
 use rvllm_core::{ConfigError, Result, RvllmError};
@@ -36,7 +36,7 @@ pub struct EnginePaths {
 /// is last.
 pub struct Bringup {
     pub fused_modules: FusedModules,
-    pub fa3: Fa3Kernels,
+    pub fa3: AttentionBackend,
     pub cutlass: CutlassLib,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
@@ -82,13 +82,40 @@ impl Bringup {
         // 1. CUDA context + stream.
         let ctx = Arc::new(CudaContextHandle::init(0)?);
 
-        // SAFETY: arena lifetime 'static via leak — engine owns it for program lifetime.
-        let arena = HbmArena::new(&ctx, arena_bytes)?;
-        // The 'static lifetime gymnastics: HbmArena<'ctx> borrows from ctx.
-        // The Arc keeps ctx alive. We transmute the lifetime to 'static
-        // because Bringup owns both. This is sound as long as `ctx`
-        // outlives `arena` — which it does (they live in the same
-        // struct and ctx is the last dropped).
+        // Pick arena backing per device compute capability. On GB10
+        // (sm_121) — which has no dedicated HBM — route through
+        // `UnifiedArena::new` (`cuMemAllocManaged(ATTACH_GLOBAL)` +
+        // `cuMemAdvise(SET_PREFERRED_LOCATION, device)`), then unwrap
+        // back to `HbmArena` so the storage type on `Bringup` stays
+        // uniform. Everywhere else we keep the original
+        // `cuMemAlloc_v2` fast path (`HbmArena::new`). Both call
+        // `cuMemFree_v2` on Drop, which correctly releases either
+        // allocation.
+        //
+        // Gated on `feature = "gb10"` so pre-Blackwell / non-GB10
+        // builds don't pay for managed-memory overhead they don't
+        // need.
+        let arena = {
+            #[cfg(feature = "gb10")]
+            {
+                let target = rvllm_core::CompileTarget::from_compute_capability(
+                    ctx.compute_capability().0,
+                    ctx.compute_capability().1,
+                );
+                if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+                    rvllm_mem::UnifiedArena::new(&ctx, arena_bytes)?.into_inner()
+                } else {
+                    HbmArena::new(&ctx, arena_bytes)?
+                }
+            }
+            #[cfg(not(feature = "gb10"))]
+            {
+                HbmArena::new(&ctx, arena_bytes)?
+            }
+        };
+        // SAFETY: arena lifetime 'static via transmute — engine owns it for program lifetime.
+        // HbmArena<'ctx> borrows from ctx; the Arc keeps ctx alive. This is sound
+        // as long as `ctx` outlives `arena` — which it does (same struct, ctx dropped last).
         let arena: HbmArena<'static> = unsafe { std::mem::transmute(arena) };
 
         let stream = Stream::new(&ctx)?;
@@ -107,8 +134,14 @@ impl Bringup {
         let kernels = Arc::new(KernelLoader::new(manifest));
         let fused_modules = load_fused(&kernels)?;
 
-        // 4. FA3 .so.
-        let fa3 = Fa3Kernels::load(paths.fa3_so.clone(), arch.head_dim as u32)?;
+        // 4. Attention backend.
+        //    Non-Gemma4 architectures currently always use the FA3 .so.
+        //    The Gemma4 bring-up branches on CompileTarget; if you add a
+        //    non-Gemma4 sm_121 model, wire the same branch here.
+        let fa3 = AttentionBackend::Fa3(Fa3Kernels::load(
+            paths.fa3_so.clone(),
+            arch.head_dim as u32,
+        )?);
 
         // 5. Policy + CUTLASS .so (resolve every variant referenced in
         //    the policy).

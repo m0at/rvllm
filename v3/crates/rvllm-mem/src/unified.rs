@@ -157,6 +157,17 @@ impl<'ctx> UnifiedArena<'ctx> {
     ) -> Result<Region<'a>> {
         self.inner.region(name, bytes, align)
     }
+
+    /// Unwrap into the backing `HbmArena`. Used by `Bringup::load` to
+    /// store a single arena type on the struct while still sourcing
+    /// the backing memory from `cuMemAllocManaged` on GB10. Ownership
+    /// of the device pointer transfers — Drop / `cuMemFree_v2` now
+    /// lives on the returned `HbmArena`.
+    #[inline]
+    #[must_use]
+    pub fn into_inner(self) -> crate::hbm::HbmArena<'ctx> {
+        self.inner
+    }
 }
 
 // `Region<'a>` already implements `GraphSafe` in `hbm.rs` — capture
