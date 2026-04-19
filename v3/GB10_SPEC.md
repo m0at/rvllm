@@ -115,8 +115,11 @@ Commits in the `rusty_sm121` branch (as of the current state):
       missing subdir = hard `ConfigError` at bring-up (no silent fallback).
 - [ ] `UnifiedArena` in `rvllm-mem` behind `feature = "gb10"` — the
       current `HbmArena` assumes dedicated HBM.
-- [ ] Arch-conditional `FA2_BC` — need a `-DFA2_BC=32` branch when
-      building for `sm_121` / `sm_100` while SM90 stays at 64.
+- [x] ~~Arch-conditional `FA2_BC`~~ — `kernels/flash_attention.cu`
+      picks `FA2_BC=32` when `__CUDA_ARCH__ >= 1000` (sm_100/sm_121/sm_122)
+      and stays at 64 otherwise. Wrapped in `#ifndef FA2_BC` so an
+      explicit `-DFA2_BC=<n>` on the nvcc command line still wins.
+      Verified via `nvcc -E`: sm_90 expands to 64, sm_121 to 32.
 - [x] ~~Manifest SHA-pinning~~ — `kernels/gen_manifest.sh` is invoked
       from `build.sh` after every per-arch compile loop, writing
       `kernels/<sm_xxx>/manifest.json` with `{revision, arch, entries}`
