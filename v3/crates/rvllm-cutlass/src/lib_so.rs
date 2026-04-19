@@ -328,6 +328,213 @@ impl CutlassLib {
     }
 }
 
+// ============================================================================
+// CutlassBackend — unifies `So(CutlassLib)` (SM80/89/90) and `Absent` (sm_121)
+// ============================================================================
+
+/// Which CUTLASS backend the runtime is using on the live device.
+///
+///   * SM80 / SM89 / SM90 → `So(CutlassLib)` — dlopen
+///     `libcutlass_kernels.so`, fn-ptr table keyed by `VariantId`.
+///   * SM121 (Blackwell consumer) → `Absent` — rvllm's CUTLASS source
+///     uses Hopper WGMMA + TMA multicast which don't exist on sm_121.
+///     The `.so` is skipped entirely; FP8 GEMM launches fall through
+///     to cuBLASLt (handled one level up in `Bringup`) or return a
+///     typed `CutlassError::FeatureNotAvailable` when no alternative
+///     path exists. Wiring a sm_121-native FP8 GEMM kernel in place
+///     of `Absent` is the next GB10 follow-up.
+///
+/// `#[non_exhaustive]` leaves room for a future
+/// `SmBlackwellPtx(CutlassSm121Kernels)` variant.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CutlassBackend {
+    So(CutlassLib),
+    Absent,
+}
+
+impl CutlassBackend {
+    /// Construct a backend per device `CompileTarget`. `path` and
+    /// `policy_variants` are only consulted for the `So` path — when
+    /// the live device is sm_121 we skip `.so` loading entirely.
+    #[cfg(feature = "cuda")]
+    pub fn load_for(
+        target: Option<rvllm_core::CompileTarget>,
+        path: PathBuf,
+        policy_variants: &[VariantId],
+    ) -> Result<Self> {
+        if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+            return Ok(CutlassBackend::Absent);
+        }
+        Ok(CutlassBackend::So(CutlassLib::load(path, policy_variants)?))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn load_for(
+        target: Option<rvllm_core::CompileTarget>,
+        path: PathBuf,
+        policy_variants: &[VariantId],
+    ) -> Result<Self> {
+        if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+            return Ok(CutlassBackend::Absent);
+        }
+        Ok(CutlassBackend::So(CutlassLib::load(path, policy_variants)?))
+    }
+
+    /// Path the `.so` was (or would be) loaded from — exposed for
+    /// probe / diagnostic output. Empty `PathBuf` on the `Absent`
+    /// variant.
+    #[must_use]
+    pub fn so_path(&self) -> std::path::PathBuf {
+        match self {
+            CutlassBackend::So(lib) => lib.so_path.clone(),
+            CutlassBackend::Absent => PathBuf::new(),
+        }
+    }
+
+    /// Dispatch `launch_fp8_gemm` to the underlying backend.
+    ///
+    /// # Safety
+    /// Same as `CutlassLib::launch_fp8_gemm`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_fp8_gemm(
+        &self,
+        plan: &crate::plan::Fp8GemmPlan,
+        output: u64,
+        a: u64,
+        b: u64,
+        a_scales: u64,
+        b_scale: u64,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            CutlassBackend::So(lib) => lib.launch_fp8_gemm(
+                plan,
+                output,
+                a,
+                b,
+                a_scales,
+                b_scale,
+                workspace,
+                workspace_size,
+                stream,
+            ),
+            CutlassBackend::Absent => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "fp8_gemm (CutlassBackend::Absent — sm_121 has no CUTLASS .so)",
+                },
+                CutlassCtx {
+                    kernel: "fp8_gemm",
+                    stream,
+                },
+            )),
+        }
+    }
+
+    /// Dispatch `launch_fp8_gemm_residual` to the underlying backend.
+    ///
+    /// # Safety
+    /// Same as `CutlassLib::launch_fp8_gemm_residual`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_fp8_gemm_residual(
+        &self,
+        plan: &crate::plan::Fp8GemmPlan,
+        output: u64,
+        a: u64,
+        b: u64,
+        a_scales: u64,
+        b_scale: u64,
+        residual: u64,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            CutlassBackend::So(lib) => lib.launch_fp8_gemm_residual(
+                plan,
+                output,
+                a,
+                b,
+                a_scales,
+                b_scale,
+                residual,
+                workspace,
+                workspace_size,
+                stream,
+            ),
+            CutlassBackend::Absent => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "fp8_gemm_residual (CutlassBackend::Absent — sm_121 has no CUTLASS .so)",
+                },
+                CutlassCtx {
+                    kernel: "fp8_gemm_residual",
+                    stream,
+                },
+            )),
+        }
+    }
+}
+
+impl CutlassBackend {
+    /// Dispatch `launch_fp8_gemm_channelscale` — upstream added this
+    /// as a row×col-scale epilogue variant. `Absent` has no
+    /// equivalent kernel; it returns `FeatureNotAvailable`.
+    ///
+    /// # Safety
+    /// Same as `CutlassLib::launch_fp8_gemm_channelscale`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_fp8_gemm_channelscale(
+        &self,
+        output: u64,
+        a: u64,
+        b: u64,
+        row_scale: u64,
+        col_scale: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            CutlassBackend::So(lib) => lib.launch_fp8_gemm_channelscale(
+                output,
+                a,
+                b,
+                row_scale,
+                col_scale,
+                m,
+                n,
+                k,
+                workspace,
+                workspace_size,
+                stream,
+            ),
+            CutlassBackend::Absent => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "fp8_gemm_channelscale (CutlassBackend::Absent — sm_121 has no CUTLASS .so)",
+                },
+                CutlassCtx {
+                    kernel: "fp8_gemm_channelscale",
+                    stream,
+                },
+            )),
+        }
+    }
+}
+
+impl From<CutlassLib> for CutlassBackend {
+    fn from(lib: CutlassLib) -> Self {
+        CutlassBackend::So(lib)
+    }
+}
+
 /// Map a policy `VariantId` to the C-linkage symbol names in
 /// `libcutlass_kernels.so`. id <100 uses the `cutlass_fp8_gemm_v{id}`
 /// autotune suite; id >=100 uses `cutlass_fp8_gemm_residual_v{id-100}`.

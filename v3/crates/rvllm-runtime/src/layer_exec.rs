@@ -16,7 +16,7 @@
 //! 12 launches per layer.
 
 use rvllm_core::Result;
-use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan};
+use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan};
 use rvllm_fused::{
     ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch, FusedSiluMulFp8QuantLaunch,
 };
@@ -136,7 +136,7 @@ pub unsafe fn forward(
     scratch: &LayerScratch,
     meta: &MetadataPtrs,
     plans: &LayerGemmPlans,
-    cutlass: &CutlassLib,
+    cutlass: &CutlassBackend,
     cublaslt: &CublasLt,
     fa3: &AttentionBackend,
     residual: u64,
@@ -168,7 +168,7 @@ pub unsafe fn forward_phase(
     scratch: &LayerScratch,
     meta: &MetadataPtrs,
     plans: &LayerGemmPlans,
-    cutlass: &CutlassLib,
+    cutlass: &CutlassBackend,
     cublaslt: &CublasLt,
     fa3: &AttentionBackend,
     residual: u64,

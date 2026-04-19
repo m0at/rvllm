@@ -146,6 +146,14 @@ pub enum CutlassError {
         variant: u32,
         cuda: CudaErrorKind,
     },
+    /// The selected `CutlassBackend` does not implement this launch
+    /// path. Used on sm_121 (`Absent` variant) — Blackwell consumer
+    /// has no SM90 CUTLASS `.so` to dlopen, so actual FP8 GEMM launches
+    /// fall to cuBLASLt or a future sm_121-native path (next GB10
+    /// follow-up). Bring-up itself succeeds; only launches into the
+    /// absent backend fail, and fail closed with this typed error
+    /// instead of a silent miscomputation.
+    FeatureNotAvailable { op: &'static str },
 }
 
 #[derive(Debug)]

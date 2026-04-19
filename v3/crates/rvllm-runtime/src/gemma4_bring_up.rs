@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use rvllm_attention::{AttentionBackend, Fa3Kernels};
 use rvllm_core::Result;
-use rvllm_cutlass::{CublasLt, CutlassLib, Policy};
+use rvllm_cutlass::{CublasLt, CutlassBackend, Policy};
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
@@ -98,7 +98,7 @@ pub struct Gemma4Bringup {
     pub fused: Gemma4FusedModules,
     pub sliding_attention: AttentionBackend,
     pub global_attention: AttentionBackend,
-    pub cutlass: CutlassLib,
+    pub cutlass: CutlassBackend,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,
@@ -217,7 +217,21 @@ impl Gemma4Bringup {
             variants.insert(rvllm_cutlass::VariantId(v));
         }
         let variants: Vec<_> = variants.into_iter().collect();
-        let cutlass = CutlassLib::load(paths.cutlass_so.clone(), &variants)?;
+        // CUTLASS backend selection — see `bring_up::Bringup::load`
+        // for the full rationale (sm_121 has no compatible `.so`).
+        let cutlass_target = {
+            #[cfg(feature = "cuda")]
+            {
+                let (maj, min) = ctx.compute_capability();
+                rvllm_core::CompileTarget::from_compute_capability(maj, min)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                None
+            }
+        };
+        let cutlass =
+            CutlassBackend::load_for(cutlass_target, paths.cutlass_so.clone(), &variants)?;
 
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
         let cublaslt_ws_region = arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;

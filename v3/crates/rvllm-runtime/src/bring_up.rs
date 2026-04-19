@@ -12,7 +12,7 @@ use rvllm_attention::{AttentionBackend, Fa3Kernels};
 #[cfg(feature = "cuda")]
 use rvllm_core::CompileTarget;
 use rvllm_core::{ConfigError, Result, RvllmError};
-use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan, Policy};
+use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan, Policy};
 use rvllm_kernels::{manifest::KernelManifest, KernelFn, KernelLoader, LoadedModule};
 use rvllm_loader::{load_model, LoadedModel, ModelArch};
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
@@ -37,7 +37,7 @@ pub struct EnginePaths {
 pub struct Bringup {
     pub fused_modules: FusedModules,
     pub fa3: AttentionBackend,
-    pub cutlass: CutlassLib,
+    pub cutlass: CutlassBackend,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,
@@ -171,7 +171,25 @@ impl Bringup {
             variants.insert(rvllm_cutlass::VariantId(v));
         }
         let variants: Vec<_> = variants.into_iter().collect();
-        let cutlass = CutlassLib::load(paths.cutlass_so.clone(), &variants)?;
+        // CUTLASS backend selection — sm_121 has no compatible `.so`
+        // (CUTLASS SM90 collectives rely on WGMMA + TMA multicast,
+        // both Hopper-only). On sm_121 we route through
+        // `CutlassBackend::Absent`; FP8 GEMM launches return
+        // `CutlassError::FeatureNotAvailable` until a sm_121-native
+        // GEMM path lands (next GB10 follow-up).
+        let cutlass_target = {
+            #[cfg(feature = "cuda")]
+            {
+                let (maj, min) = ctx.compute_capability();
+                rvllm_core::CompileTarget::from_compute_capability(maj, min)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                None
+            }
+        };
+        let cutlass =
+            CutlassBackend::load_for(cutlass_target, paths.cutlass_so.clone(), &variants)?;
 
         // cuBLASLt workspace: 32 MiB is recommended for Hopper FP8.
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;

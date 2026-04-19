@@ -28,7 +28,7 @@
 //!  14.  residual_scale_f16              residual *= layer_scalar (once)
 
 use rvllm_core::Result;
-use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan};
+use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan};
 use rvllm_fused::gemma4_launcher;
 use rvllm_fused::FusedRmsnormFp8QuantLaunch;
 use rvllm_kernels::KernelFn;
@@ -177,7 +177,7 @@ pub unsafe fn gemma4_forward(
     scratch: &Gemma4LayerScratch,
     meta: &Gemma4MetadataPtrs,
     cublaslt: &CublasLt,
-    cutlass: &CutlassLib,
+    cutlass: &CutlassBackend,
     sliding_attention: &AttentionBackend,
     global_attention: &AttentionBackend,
     residual: u64,
@@ -195,7 +195,7 @@ pub unsafe fn gemma4_forward_phase(
     scratch: &Gemma4LayerScratch,
     meta: &Gemma4MetadataPtrs,
     cublaslt: &CublasLt,
-    cutlass: &CutlassLib,
+    cutlass: &CutlassBackend,
     sliding_attention: &AttentionBackend,
     global_attention: &AttentionBackend,
     residual: u64,
