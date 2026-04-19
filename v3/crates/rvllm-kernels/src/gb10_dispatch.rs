@@ -68,8 +68,9 @@ pub enum ClockRegime {
     /// Clock is known to be at or below the 507 MHz throttle.
     Throttled,
     /// Regime is unknown; caller has no probe. Policy falls back to a
-    /// conservative default (`WprLut`) which is the safe bet because
-    /// it never triggers the throttle cascade faster than already.
+    /// conservative default (`WprLut`) — it runs on every arch
+    /// (`WprNative` is sm_100+ only) and stays correct under throttle
+    /// if one ever materialises on this hardware.
     Unknown,
 }
 

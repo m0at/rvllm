@@ -15,7 +15,7 @@
 #
 # Output: text table + one JSONL record per iter to bench_<variant>.jsonl.
 
-import os, sys, pathlib, subprocess, json, time
+import sys, pathlib, subprocess, json, time
 import numpy as np
 from cuda.bindings import driver as drv
 

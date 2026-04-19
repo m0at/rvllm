@@ -109,6 +109,10 @@ for arch in $ARCHS; do
 done
 
 # Also compile a default set (sm_80) in the root for backward compat
+# with old bench scripts that look at `kernels/*.ptx`. Only run when
+# the caller didn't specifically ask for a single arch — otherwise
+# the explicit arch wins and we don't leave stale top-level artifacts.
+if [ -z "$1" ] && [ -z "$CUDA_ARCH" ]; then
 echo ""
 echo "=== Default PTX (sm_80) ==="
 for cu in "$DIR"/*.cu; do
@@ -118,6 +122,7 @@ for cu in "$DIR"/*.cu; do
     echo "  $base.cu -> $base.ptx"
     compile_kernel "$cu" "sm_80" "$ptx" || true
 done
+fi   # end: default sm_80 loop (skipped when specific arch requested)
 
 echo ""
 echo "Done. PTX files in: $DIR/<arch>/*.ptx"

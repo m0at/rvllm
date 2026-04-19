@@ -26,71 +26,47 @@ pub struct CudaContextHandle {
     _not_send_sync: core::marker::PhantomData<*const ()>,
 }
 
+/// Build a typed CUDA error. Every call site in this module passes
+/// `stream: 0` + `launch: None` — the module is context-setup only,
+/// not a launch path. Factored out so the error plumbing stays at
+/// one line per failure branch.
+fn cuda_err(op: &'static str, device: i32) -> RvllmError {
+    RvllmError::cuda(
+        op,
+        CudaErrorKind::Other,
+        CudaCtx {
+            stream: 0,
+            kernel: op,
+            launch: None,
+            device,
+        },
+    )
+}
+
 impl CudaContextHandle {
     #[cfg(feature = "cuda")]
     pub fn init(device: i32) -> Result<Self> {
         use cudarc::driver::sys::*;
-        let init_res = unsafe { cuInit(0) };
-        if init_res != CUresult::CUDA_SUCCESS {
-            return Err(RvllmError::cuda(
-                "cuInit",
-                CudaErrorKind::Other,
-                CudaCtx {
-                    stream: 0,
-                    kernel: "cuInit",
-                    launch: None,
-                    device,
-                },
-            ));
+        if unsafe { cuInit(0) } != CUresult::CUDA_SUCCESS {
+            return Err(cuda_err("cuInit", device));
         }
         let mut dev: CUdevice = 0;
-        let r = unsafe { cuDeviceGet(&mut dev, device) };
-        if r != CUresult::CUDA_SUCCESS {
-            return Err(RvllmError::cuda(
-                "cuDeviceGet",
-                CudaErrorKind::Other,
-                CudaCtx {
-                    stream: 0,
-                    kernel: "cuDeviceGet",
-                    launch: None,
-                    device,
-                },
-            ));
+        if unsafe { cuDeviceGet(&mut dev, device) } != CUresult::CUDA_SUCCESS {
+            return Err(cuda_err("cuDeviceGet", device));
         }
         // Retain the primary context (ref-counted; Release in Drop) and
         // make it current on this thread. Modern replacement for
         // `cuCtxCreate_v2` — see module docs.
         let mut ctx: CUcontext = std::ptr::null_mut();
-        let r = unsafe { cuDevicePrimaryCtxRetain(&mut ctx, dev) };
-        if r != CUresult::CUDA_SUCCESS {
-            return Err(RvllmError::cuda(
-                "cuDevicePrimaryCtxRetain",
-                CudaErrorKind::Other,
-                CudaCtx {
-                    stream: 0,
-                    kernel: "cuDevicePrimaryCtxRetain",
-                    launch: None,
-                    device,
-                },
-            ));
+        if unsafe { cuDevicePrimaryCtxRetain(&mut ctx, dev) } != CUresult::CUDA_SUCCESS {
+            return Err(cuda_err("cuDevicePrimaryCtxRetain", device));
         }
-        let r = unsafe { cuCtxSetCurrent(ctx) };
-        if r != CUresult::CUDA_SUCCESS {
-            // Release the ref we just took so we don't leak on the
-            // error path.
+        if unsafe { cuCtxSetCurrent(ctx) } != CUresult::CUDA_SUCCESS {
+            // Release the ref we just took so we don't leak on error.
             unsafe {
                 let _ = cuDevicePrimaryCtxRelease_v2(dev);
             }
-            return Err(RvllmError::cuda(
-                "cuCtxSetCurrent",
-                CudaErrorKind::Other,
-                CudaCtx {
-                    stream: 0,
-                    kernel: "cuCtxSetCurrent",
-                    launch: None,
-                    device,
-                },
-            ));
+            return Err(cuda_err("cuCtxSetCurrent", device));
         }
         Ok(Self {
             device,
@@ -125,67 +101,36 @@ impl CudaContextHandle {
 
     /// Query the device's compute capability as `(major, minor)`.
     ///
-    /// Drives `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_{MAJOR,MINOR})`.
-    /// Callers use this to pick the matching `kernels/<sm_*>/` subdirectory; a
-    /// device whose compute capability has no PTX build should be rejected at
+    /// Drives `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_{MAJOR,MINOR})`
+    /// against the `CUdevice` handle we already resolved in `init` (so
+    /// there's no redundant `cuDeviceGet` per call). Callers use this
+    /// to pick the matching `kernels/<sm_*>/` subdirectory; a device
+    /// whose compute capability has no PTX build should be rejected at
     /// bring-up (no silent fallback).
     #[cfg(feature = "cuda")]
     pub fn compute_capability(&self) -> Result<(i32, i32)> {
         use cudarc::driver::sys::*;
-        let ordinal = self.device;
-        let mut dev: CUdevice = 0;
-        let r = unsafe { cuDeviceGet(&mut dev, ordinal) };
-        if r != CUresult::CUDA_SUCCESS {
-            return Err(RvllmError::cuda(
-                "cuDeviceGet",
-                CudaErrorKind::Other,
-                CudaCtx {
-                    stream: 0,
-                    kernel: "cuDeviceGet",
-                    launch: None,
-                    device: ordinal,
-                },
-            ));
-        }
         let mut major: i32 = 0;
-        let r = unsafe {
+        if unsafe {
             cuDeviceGetAttribute(
                 &mut major,
                 CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                dev,
+                self.cu_device,
             )
-        };
-        if r != CUresult::CUDA_SUCCESS {
-            return Err(RvllmError::cuda(
-                "cuDeviceGetAttribute(CC_MAJOR)",
-                CudaErrorKind::Other,
-                CudaCtx {
-                    stream: 0,
-                    kernel: "cuDeviceGetAttribute",
-                    launch: None,
-                    device: ordinal,
-                },
-            ));
+        } != CUresult::CUDA_SUCCESS
+        {
+            return Err(cuda_err("cuDeviceGetAttribute(CC_MAJOR)", self.device));
         }
         let mut minor: i32 = 0;
-        let r = unsafe {
+        if unsafe {
             cuDeviceGetAttribute(
                 &mut minor,
                 CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                dev,
+                self.cu_device,
             )
-        };
-        if r != CUresult::CUDA_SUCCESS {
-            return Err(RvllmError::cuda(
-                "cuDeviceGetAttribute(CC_MINOR)",
-                CudaErrorKind::Other,
-                CudaCtx {
-                    stream: 0,
-                    kernel: "cuDeviceGetAttribute",
-                    launch: None,
-                    device: ordinal,
-                },
-            ));
+        } != CUresult::CUDA_SUCCESS
+        {
+            return Err(cuda_err("cuDeviceGetAttribute(CC_MINOR)", self.device));
         }
         Ok((major, minor))
     }
@@ -194,16 +139,7 @@ impl CudaContextHandle {
     /// a real CC must run under `feature = "cuda"`.
     #[cfg(not(feature = "cuda"))]
     pub fn compute_capability(&self) -> Result<(i32, i32)> {
-        Err(RvllmError::cuda(
-            "compute_capability",
-            CudaErrorKind::Other,
-            CudaCtx {
-                stream: 0,
-                kernel: "compute_capability",
-                launch: None,
-                device: self.device,
-            },
-        ))
+        Err(cuda_err("compute_capability", self.device))
     }
 }
 

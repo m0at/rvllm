@@ -36,7 +36,7 @@
 #     in 128-row bands. A random-looking per-row error distribution is
 #     the signal that scale indexing is correct.
 
-import os, sys, struct, math, pathlib
+import sys, pathlib
 import numpy as np
 from cuda.bindings import driver as drv
 

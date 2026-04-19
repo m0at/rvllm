@@ -59,8 +59,7 @@ fn gb10_end_to_end_bring_up() {
     assert!(r3.device_ptr() > r2.device_ptr());
 
     // And within the arena.
-    let base = r1.device_ptr() - 0;
-    assert!(r3.device_ptr() + r3.len() as u64 <= base + BYTES as u64);
+    assert!(r3.device_ptr() + r3.len() as u64 <= r1.device_ptr() + BYTES as u64);
 
     eprintln!(
         "UnifiedArena OK: {} MiB allocated, 3 regions carved",
