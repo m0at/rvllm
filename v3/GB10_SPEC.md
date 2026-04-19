@@ -153,8 +153,10 @@ Commits in the `rusty_sm121` branch (as of the current state):
    subdir = hard `ConfigError` at bring-up (no silent fallback).
 2. **`UnifiedArena` in `rvllm-mem`** — new module `unified.rs` gated
    behind `feature = "gb10"`, wraps the `HbmArena` bump bookkeeping
-   around `cuMemAllocManaged(CU_MEM_ATTACH_GLOBAL)`. `Region<'a>`
-   handles stay source-compatible with the HBM path.
+   around `cuMemAllocManaged(CU_MEM_ATTACH_GLOBAL)` followed by
+   `cuMemAdvise_v2(SET_PREFERRED_LOCATION, device)` so pages stay on
+   the GPU side of the unified pool. `Region<'a>` handles stay
+   source-compatible with the HBM path.
 3. **Arch-conditional `FA2_BC`** — `kernels/flash_attention.cu` picks
    `FA2_BC=32` when `__CUDA_ARCH__ >= 1000` and stays at 64 otherwise,
    behind `#ifndef FA2_BC` so `-DFA2_BC=<n>` still overrides. Verified
@@ -184,6 +186,19 @@ Commits in the `rusty_sm121` branch (as of the current state):
       `wpr_native 4e-7` — both far under the `1e-3` gate. Axis-bug
       detector proven sensitive via scale-row-flip poison (drives
       `scale_rel` to 5.0, triggers FAIL).
+   c. **FA2 decode numerical check** (`v3/tools/fa2_precision_check.py`):
+      launches `flash_attention_2_decode_kernel` with the sm_121
+      `FA2_BC = 32` arch-conditional tile width against a naive
+      fp64 attention reference. On GB10, 4 shape configurations all
+      pass at the f32 epsilon floor:
+        head_dim=128 ctx=64    scale_rel.max 1.8e-6
+        head_dim=128 ctx=512   scale_rel.max 1.4e-6
+        head_dim=256 ctx=128   scale_rel.max 1.1e-6   (uses opt-in
+                                                       dynamic smem)
+        head_dim=256 ctx=1024  scale_rel.max 1.5e-6   (Gemma 4
+                                                       sliding realistic)
+      Closes the validation gap for the FA2_BC arch change — it was
+      only compile-verified before.
 8. **FP8-GEMV microbench** (`v3/tools/fp8_gemv_bench.py`): cuda-events
    latency + 10 Hz nvidia-smi sampling. Measured on GB10 (driver
    595.58.03, CUDA 13.2):
@@ -213,9 +228,6 @@ Commits in the `rusty_sm121` branch (as of the current state):
   based on `CompileTarget`, gated by `feature = "gb10"` on the
   runtime crate.
 - End-to-end Gemma-4 PPL on sm_121 once the launch path is in place.
-- `cuMemAdvise(SET_PREFERRED_LOCATION)` in `UnifiedArena` once
-  cudarc exposes a stable `CUmemLocation` signature across CUDA
-  12/13 (currently deferred — perf optimisation, not correctness).
 - Fix the two pre-existing upstream bugs that still block
   `cargo check --workspace`: `Gemma4Bringup::{run_ppl, run_bench,
   run_generate}` missing, and
