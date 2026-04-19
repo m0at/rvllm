@@ -22,6 +22,7 @@ INTER  = 21504
 VOCAB  = 262144
 NL     = 60
 WINDOW = 1024
+BLOCK_K = 1024
 SOFTCAP_VAL = 30.0
 EPS    = 1e-6
 B      = 1  # batch size; set via --batch flag
@@ -102,14 +103,20 @@ def _sliding_attn(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, kc_s, vc
     vc = vc.at[pos].set(vi8.reshape(S_KV))
     kc_s = kc_s.at[pos].set(jnp.pad(ks, (0, MAX_KVH - S_KVH)))
     vc_s = vc_s.at[pos].set(jnp.pad(vs, (0, MAX_KVH - S_KVH)))
-    k_ctx = _dequant_kv(kc[:max_ctx].reshape(max_ctx, S_KVH, S_HD),
-                         kc_s[:max_ctx, :S_KVH])
-    v_ctx = _dequant_kv(vc[:max_ctx].reshape(max_ctx, S_KVH, S_HD),
-                         vc_s[:max_ctx, :S_KVH])
+    win_start = jnp.maximum(0, pos - WINDOW + 1)
+    kc_win = jax.lax.dynamic_slice(kc, [win_start, 0], [WINDOW, MAX_KV])
+    vc_win = jax.lax.dynamic_slice(vc, [win_start, 0], [WINDOW, MAX_KV])
+    kc_s_win = jax.lax.dynamic_slice(kc_s, [win_start, 0], [WINDOW, MAX_KVH])
+    vc_s_win = jax.lax.dynamic_slice(vc_s, [win_start, 0], [WINDOW, MAX_KVH])
+    k_ctx = _dequant_kv(kc_win[:, :S_KV].reshape(WINDOW, S_KVH, S_HD),
+                         kc_s_win[:, :S_KVH])
+    v_ctx = _dequant_kv(vc_win[:, :S_KV].reshape(WINDOW, S_KVH, S_HD),
+                         vc_s_win[:, :S_KVH])
     q_g = q.reshape(B, S_KVH, S_GQA, S_HD)
     sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_ctx.astype(jnp.float32))
-    t = jnp.arange(max_ctx)
-    valid = (t < ctx) & (t >= jnp.maximum(0, pos - WINDOW + 1))
+    t = jnp.arange(WINDOW)
+    abs_pos = win_start + t
+    valid = (abs_pos < ctx) & (abs_pos >= win_start)
     sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
     p = jax.nn.softmax(sc, axis=-1).astype(q.dtype)
     out = jnp.einsum('bght,tgd->bghd', p, v_ctx).reshape(B, S_Q)
@@ -132,16 +139,34 @@ def _global_attn(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, kc_s, vc_
     vc = vc.at[pos].set(vi8_pad)
     kc_s = kc_s.at[pos].set(jnp.pad(ks, (0, MAX_KVH - G_KVH)))
     vc_s = vc_s.at[pos].set(jnp.pad(vs, (0, MAX_KVH - G_KVH)))
-    k_ctx = _dequant_kv(kc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD),
-                         kc_s[:max_ctx, :G_KVH])
-    v_ctx = _dequant_kv(vc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD),
-                         vc_s[:max_ctx, :G_KVH])
     q_g = q.reshape(B, G_KVH, G_GQA, G_HD)
-    sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_ctx.astype(jnp.float32))
-    valid = jnp.arange(max_ctx) < ctx
-    sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
-    p = jax.nn.softmax(sc, axis=-1).astype(q.dtype)
-    out = jnp.einsum('bght,tgd->bghd', p, v_ctx).reshape(B, G_Q)
+    num_blocks = max_ctx // BLOCK_K
+
+    def block_fn(carry, block_idx):
+        m_prev, l_prev, o_prev = carry
+        start = block_idx * BLOCK_K
+        kb = jax.lax.dynamic_slice(kc, [start, 0], [BLOCK_K, MAX_KV])
+        vb = jax.lax.dynamic_slice(vc, [start, 0], [BLOCK_K, MAX_KV])
+        kbs = jax.lax.dynamic_slice(kc_s, [start, 0], [BLOCK_K, MAX_KVH])
+        vbs = jax.lax.dynamic_slice(vc_s, [start, 0], [BLOCK_K, MAX_KVH])
+        k_block = _dequant_kv(kb[:, :G_KV].reshape(BLOCK_K, G_KVH, G_HD), kbs[:, :G_KVH])
+        v_block = _dequant_kv(vb[:, :G_KV].reshape(BLOCK_K, G_KVH, G_HD), vbs[:, :G_KVH])
+        sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_block.astype(jnp.float32))
+        abs_pos = start + jnp.arange(BLOCK_K)
+        valid = abs_pos < ctx
+        sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
+        m_new = jnp.maximum(m_prev, jnp.max(sc, axis=-1, keepdims=True))
+        exp_sc = jnp.exp(sc - m_new)
+        scale = jnp.exp(m_prev - m_new)
+        l_new = l_prev * scale + jnp.sum(exp_sc, axis=-1, keepdims=True)
+        o_new = o_prev * scale + jnp.einsum('bght,tgd->bghd', exp_sc.astype(jnp.bfloat16), v_block)
+        return (m_new, l_new, o_new), None
+
+    init = (jnp.full((B, G_KVH, G_GQA, 1), -1e30, dtype=jnp.float32),
+            jnp.zeros((B, G_KVH, G_GQA, 1), dtype=jnp.float32),
+            jnp.zeros((B, G_KVH, G_GQA, G_HD), dtype=jnp.float32))
+    (_, l_final, o_final), _ = jax.lax.scan(block_fn, init, jnp.arange(num_blocks))
+    out = (o_final / l_final).reshape(B, G_Q).astype(jnp.bfloat16)
     return out, kc, vc, kc_s, vc_s
 
 # ── flat scan body ──
@@ -162,7 +187,7 @@ def one_layer(carry, xs):
     def do_sliding(args):
         q, k, v, qn, kn, kc, vc, kc_s, vc_s = args
         out, kc2, vc2, kcs2, vcs2 = _sliding_attn(q, k, v, qn, kn, cos_s, sin_s, kc, vc, kc_s, vc_s, pos, ctx, max_ctx)
-        return jnp.pad(out, ((0,0),(0, MAX_Q - S_Q))), kc2, vc2, kcs2, vcs2
+        return jnp.pad(out, ((0,0),(0, MAX_Q - S_Q))).astype(jnp.bfloat16), kc2, vc2, kcs2, vcs2
 
     def do_global(args):
         q, k, v, qn, kn, kc, vc, kc_s, vc_s = args
@@ -307,6 +332,17 @@ def quantize_int8_perchannel(arr_bf16):
     w_int8 = np.round(w / scale).clip(-127, 127).astype(np.int8)
     return w_int8, scale.squeeze(-1).astype(ml_dtypes.bfloat16)
 
+def _sharded_zeros(shape, dtype, sharding):
+    def _cb(idx):
+        local_shape = []
+        for i, s in enumerate(idx):
+            if s.start is None:
+                local_shape.append(shape[i])
+            else:
+                local_shape.append(s.stop - s.start)
+        return np.zeros(local_shape, dtype=dtype)
+    return jax.make_array_from_callback(shape, sharding, _cb)
+
 def int8_matmul(x, w_int8, scale):
     return (x @ w_int8.astype(jnp.bfloat16).T) * scale
 
@@ -422,11 +458,12 @@ def load_model(model_dir, mesh, max_ctx):
 
     kv_sh = NamedSharding(mesh, P(None, None, 'tp'))
     kvs_sh = NamedSharding(mesh, P(None, None, None))
+
     caches = {
-        'kc': jax.device_put(jnp.zeros((NL, max_ctx, MAX_KV), dtype=jnp.int8), kv_sh),
-        'vc': jax.device_put(jnp.zeros((NL, max_ctx, MAX_KV), dtype=jnp.int8), kv_sh),
-        'kc_s': jax.device_put(jnp.zeros((NL, max_ctx, MAX_KVH), dtype=jnp.bfloat16), kvs_sh),
-        'vc_s': jax.device_put(jnp.zeros((NL, max_ctx, MAX_KVH), dtype=jnp.bfloat16), kvs_sh),
+        'kc': _sharded_zeros((NL, max_ctx, MAX_KV), np.int8, kv_sh),
+        'vc': _sharded_zeros((NL, max_ctx, MAX_KV), np.int8, kv_sh),
+        'kc_s': _sharded_zeros((NL, max_ctx, MAX_KVH), ml_dtypes.bfloat16, kvs_sh),
+        'vc_s': _sharded_zeros((NL, max_ctx, MAX_KVH), ml_dtypes.bfloat16, kvs_sh),
     }
 
     del all_t, stacked_i8, stacked_sc, stacked_bf
@@ -527,10 +564,10 @@ def run_fused(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_
     kv_sh = NamedSharding(mesh, P(None, None, 'tp'))
     kvs_sh = NamedSharding(mesh, P(None, None, None))
     caches2 = {
-        'kc': jax.device_put(jnp.zeros((NL, args.max_ctx, MAX_KV), dtype=jnp.int8), kv_sh),
-        'vc': jax.device_put(jnp.zeros((NL, args.max_ctx, MAX_KV), dtype=jnp.int8), kv_sh),
-        'kc_s': jax.device_put(jnp.zeros((NL, args.max_ctx, MAX_KVH), dtype=jnp.bfloat16), kvs_sh),
-        'vc_s': jax.device_put(jnp.zeros((NL, args.max_ctx, MAX_KVH), dtype=jnp.bfloat16), kvs_sh),
+        'kc': _sharded_zeros((NL, args.max_ctx, MAX_KV), np.int8, kv_sh),
+        'vc': _sharded_zeros((NL, args.max_ctx, MAX_KV), np.int8, kv_sh),
+        'kc_s': _sharded_zeros((NL, args.max_ctx, MAX_KVH), ml_dtypes.bfloat16, kvs_sh),
+        'vc_s': _sharded_zeros((NL, args.max_ctx, MAX_KVH), ml_dtypes.bfloat16, kvs_sh),
     }
     t0 = time.time()
     gen2 = fused_jit(prompt_arr, embed, final_norm, weights, caches2, cos_s, sin_s, cos_g, sin_g)
@@ -603,7 +640,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model-dir', required=True)
     parser.add_argument('--max-tokens', type=int, default=32)
-    parser.add_argument('--max-ctx', type=int, default=2048)
+    parser.add_argument('--max-ctx', type=int, default=131072)
     parser.add_argument('--prompt', default='2')
     parser.add_argument('--perplexity', action='store_true')
     parser.add_argument('--ppl-file', default=None)
@@ -618,6 +655,7 @@ def main():
     print(f"mesh: {mesh}", file=sys.stderr)
 
     max_ctx = args.max_ctx
+    assert max_ctx % BLOCK_K == 0, f"max_ctx={max_ctx} must be divisible by BLOCK_K={BLOCK_K}"
     embed, final_norm, weights, caches = load_model(args.model_dir, mesh, max_ctx)
 
     cos_s, sin_s = precompute_rope(10000.0, S_HD, max_ctx)
