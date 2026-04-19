@@ -60,7 +60,6 @@ impl CompileTarget {
             CompileTarget::Sm121 => "sm_121",
         }
     }
-
 }
 
 #[cfg(test)]
