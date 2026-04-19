@@ -32,17 +32,20 @@ pub struct CudaContextHandle {
     _not_send_sync: core::marker::PhantomData<*const ()>,
 }
 
-/// Build a typed CUDA error. Every call site in this module passes
-/// `stream: 0` + `launch: None` — the module is context-setup only,
-/// not a launch path. Factored out so the error plumbing stays at
-/// one line per failure branch.
-fn cuda_err(op: &'static str, device: i32) -> RvllmError {
+/// Build a typed CUDA error for a failing driver call (context init,
+/// device attribute read, primary-context release, …). All call sites
+/// in this module share `stream: 0` + `launch: None` because none of
+/// them are on the kernel-launch path. `driver_call` is the CUDA
+/// function name that failed — it flows into both `op` (rvllm's
+/// operation label) and `CudaCtx.kernel` because for a driver call
+/// there is no separate "kernel" identity.
+fn cuda_err(driver_call: &'static str, device: i32) -> RvllmError {
     RvllmError::cuda(
-        op,
+        driver_call,
         CudaErrorKind::Other,
         CudaCtx {
             stream: 0,
-            kernel: op,
+            kernel: driver_call,
             launch: None,
             device,
         },
