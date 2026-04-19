@@ -46,6 +46,7 @@ NAME_TO_SOURCE = {
     "fused_norm_add_residual": SCRIPT_DIR / "fused_norm_add_residual.cu",
     "fused_norm_add_residual_f16": SCRIPT_DIR / "fused_norm_add_residual_f16.cu",
     "fused_qkv_rmsnorm": SCRIPT_DIR / "fused_qkv_rmsnorm.cu",
+    "scale_cols_f16": SCRIPT_DIR / "scale_cols_f16.cu",
     "vector_add_f16": SCRIPT_DIR / "vector_add_f16.cu",
     "bf16_to_f16_sat": SCRIPT_DIR / "bf16_to_f16_sat.cu",
     "f32_to_bf16": SCRIPT_DIR / "f32_to_bf16.cu",
