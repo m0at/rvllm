@@ -115,7 +115,7 @@ pub struct Gemma4Bringup {
     pub fused: Gemma4FusedModules,
     pub sliding_attention: AttentionBackend,
     pub global_attention: AttentionBackend,
-    pub cutlass: CutlassLib,
+    pub cutlass: CutlassBackend,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,
@@ -242,17 +242,36 @@ impl Gemma4Bringup {
                     "policy.json",
                 )
             })?;
-            let mut variants: std::collections::BTreeSet<_> =
-                policy.entries.values().map(|e| e.variant).collect();
-            for v in 0..16u32 {
-                variants.insert(rvllm_cutlass::VariantId(v));
-            }
-            (policy, variants.into_iter().collect())
-        };
+        let policy: Policy = serde_json::from_slice(&policy_bytes).map_err(|e| {
+            rvllm_core::RvllmError::config(
+                rvllm_core::ConfigError::Inconsistent {
+                    reasons: vec![format!("policy.json parse: {e}")],
+                },
+                "policy.json",
+            )
+        })?;
+
+        let mut variants: std::collections::BTreeSet<_> =
+            policy.entries.values().map(|e| e.variant).collect();
+        for v in 0..16u32 {
+            variants.insert(rvllm_cutlass::VariantId(v));
+        }
+        let variants: Vec<_> = variants.into_iter().collect();
         // CUTLASS backend selection — see `bring_up::Bringup::load`
         // for the full rationale (sm_121 has no compatible `.so`).
+        let cutlass_target = {
+            #[cfg(feature = "cuda")]
+            {
+                let (maj, min) = ctx.compute_capability();
+                rvllm_core::CompileTarget::from_compute_capability(maj, min)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                None
+            }
+        };
         let cutlass =
-            CutlassBackend::load_for(compile_target, paths.cutlass_so.clone(), &variants)?;
+            CutlassBackend::load_for(cutlass_target, paths.cutlass_so.clone(), &variants)?;
 
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
         let cublaslt_ws_region = arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;

@@ -37,7 +37,7 @@ pub struct EnginePaths {
 pub struct Bringup {
     pub fused_modules: FusedModules,
     pub fa3: AttentionBackend,
-    pub cutlass: CutlassLib,
+    pub cutlass: CutlassBackend,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,

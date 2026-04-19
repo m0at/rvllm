@@ -17,7 +17,9 @@
 
 use rvllm_core::Result;
 use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan};
-use rvllm_fused::{ArgmaxLaunch, FusedSiluMulFp8QuantLaunch};
+use rvllm_fused::{
+    ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch, FusedSiluMulFp8QuantLaunch,
+};
 use rvllm_kernels::KernelFn;
 pub use rvllm_loader::{LayerAttnType, MlpActivation};
 
@@ -165,8 +167,8 @@ pub unsafe fn forward_phase(
     weights: &LayerWeights,
     scratch: &LayerScratch,
     meta: &MetadataPtrs,
-    _plans: &LayerGemmPlans,
-    _cutlass: &CutlassBackend,
+    plans: &LayerGemmPlans,
+    cutlass: &CutlassBackend,
     cublaslt: &CublasLt,
     fa3: &AttentionBackend,
     residual: u64,
