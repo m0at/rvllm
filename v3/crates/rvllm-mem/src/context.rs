@@ -27,7 +27,7 @@ pub struct CudaContextHandle {
     /// (manifest resolver, kernel dispatcher, bench harness) ask
     /// repeatedly.
     #[cfg(feature = "cuda")]
-    pub(crate) cu_compute_cap: (i32, i32),
+    pub(crate) compute_cap: (i32, i32),
     // Pin to creating thread — context is not Send/Sync.
     _not_send_sync: core::marker::PhantomData<*const ()>,
 }
@@ -117,7 +117,7 @@ impl CudaContextHandle {
             device,
             cu_device: dev,
             _ctx: ctx,
-            cu_compute_cap: (cc_major, cc_minor),
+            compute_cap: (cc_major, cc_minor),
             _not_send_sync: core::marker::PhantomData,
         })
     }
@@ -138,12 +138,13 @@ impl CudaContextHandle {
             #[cfg(feature = "cuda")]
             _ctx: std::ptr::null_mut(),
             #[cfg(feature = "cuda")]
-            cu_compute_cap: (0, 0),
+            compute_cap: (0, 0),
             _not_send_sync: core::marker::PhantomData,
         }
     }
 
     #[inline]
+    #[must_use]
     pub fn device(&self) -> i32 {
         self.device
     }
@@ -162,8 +163,9 @@ impl CudaContextHandle {
     /// bring-up path fails closed.
     #[cfg(feature = "cuda")]
     #[inline]
+    #[must_use]
     pub fn compute_capability(&self) -> (i32, i32) {
-        self.cu_compute_cap
+        self.compute_cap
     }
 }
 

@@ -47,6 +47,7 @@ impl CompileTarget {
     /// (the runtime refuses to boot on an unsupported device rather than
     /// falling back to a generic path).
     #[inline]
+    #[must_use]
     pub const fn from_compute_capability(major: i32, minor: i32) -> Option<Self> {
         match (major, minor) {
             (8, 0) => Some(CompileTarget::Sm80),
@@ -60,6 +61,7 @@ impl CompileTarget {
     /// The `sm_XYZ` string as accepted by `nvcc -arch=` and used as the
     /// kernel subdirectory name (e.g. `kernels/sm_121/fp8_gemv.ptx`).
     #[inline]
+    #[must_use]
     pub const fn as_sm_str(self) -> &'static str {
         match self {
             CompileTarget::Sm80 => "sm_80",
