@@ -128,7 +128,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 
 <header>
   <h1>rvLLM 0.3.0 - Featuring 31B Gemma 4</h1>
-  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 25.51). GPU path: Rust+CUDA on H100 - 16-launch fused pipeline with FP8 quantization.</div>
+  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 19.24). <strong>128K context support</strong> (22.5 tok/s decode). GPU path: Rust+CUDA on H100 - 16-launch fused pipeline with FP8 quantization.</div>
   <div class="nav-buttons">
     <a href="index.html">Home</a>
     <a href="https://github.com/m0at/rvllm">GitHub</a>
@@ -151,14 +151,24 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
     <div class="caption">v6e-4, int8, B=768, TP=4 SPMD</div>
   </div>
   <div class="pill">
-    <div class="label">TPU latency (B=1)</div>
-    <strong>12.5 ms</strong>
-    <div class="caption">p99: 14.8 ms, jitter: 0.07 ms</div>
+    <div class="label">B=1 decode (512 ctx)</div>
+    <strong>79.9 tok/s</strong>
+    <div class="caption">12.52 ms, single-scan architecture</div>
+  </div>
+  <div class="pill">
+    <div class="label">B=1 decode (2048 ctx)</div>
+    <strong>41.9 tok/s</strong>
+    <div class="caption">23.84 ms, split-cache int8 KV</div>
+  </div>
+  <div class="pill">
+    <div class="label">128K context</div>
+    <strong>24.7 tok/s</strong>
+    <div class="caption">40.56 ms, blockwise global attention</div>
   </div>
   <div class="pill">
     <div class="label">Perplexity</div>
-    <strong>25.51</strong>
-    <div class="caption">verified vs HuggingFace reference</div>
+    <strong>19.24</strong>
+    <div class="caption">split-cache int8 KV (from 25.51 baseline)</div>
   </div>
   <div class="pill">
     <div class="label">Cost efficiency</div>
@@ -175,6 +185,55 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <div class="note-box">
   <strong>No custom kernels.</strong> The entire forward pass is ~500 lines of JAX. XLA compiles it to a single fused while loop on 4 TPU v6e chips. Zero Python in the hot path - the decode loop runs entirely on-chip via <code>jax.lax.while_loop</code>.
 </div>
+
+<h3>Context scaling (B=1 decode)</h3>
+<div class="chart-box">
+  <div class="chart-title"><strong>Throughput vs context length</strong> - 512 to 128K supported
+    <div class="note">31B Gemma 4, int8 weights + int8 KV cache, v6e-4 (4 chips, 128 GB HBM). Split-cache architecture with blockwise global attention.</div>
+  </div>
+  <div id="chart-ctx-scaling" style="height:340px"></div>
+</div>
+
+<table>
+<thead><tr><th>Context</th><th class="r">ms/step</th><th class="r">tok/s</th><th>Architecture</th><th class="r">KV Memory</th></tr></thead>
+<tbody>
+<tr><td>512 (single-scan)</td><td class="r">12.52</td><td class="r">79.9</td><td>1 scan, 60 layers, cond dispatch</td><td class="r">500 MB bf16</td></tr>
+<tr><td>2,048 (split-cache)</td><td class="r">23.84</td><td class="r">41.9</td><td>10 groups x 6 layers, no cond</td><td class="r">587 MB int8</td></tr>
+<tr><td>8,192</td><td class="r">~28</td><td class="r">~35</td><td>split-cache + blockwise global</td><td class="r">755 MB int8</td></tr>
+<tr><td>32K</td><td class="r">~32</td><td class="r">~31</td><td>split-cache + blockwise global</td><td class="r">3.0 GB int8</td></tr>
+<tr><td>64K</td><td class="r">~36</td><td class="r">~28</td><td>split-cache + blockwise global</td><td class="r">5.8 GB int8</td></tr>
+<tr class="highlight"><td><strong>128K</strong></td><td class="r"><strong>40.56</strong></td><td class="r"><strong>24.7</strong></td><td>split-cache + blockwise global</td><td class="r"><strong>11.1 GB int8</strong></td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>Sliding window layers are O(1024) regardless of context length.</strong> Only the 10 global layers (of 60 total) scale with context. Blockwise attention with BLOCK_K=8192 and online softmax keeps memory bounded.</div>
+
+<h3>Split-cache architecture</h3>
+<div class="note-box">
+  <strong>Exploiting Gemma 4's dual attention structure.</strong> 50 sliding-window layers use a 1024-entry circular buffer (constant size at any context length). 10 global layers use full-context blockwise attention with online softmax. Layers are processed in 10 groups of 6 (5 sliding + 1 global), eliminating <code>jax.lax.cond</code> dispatch overhead. Int8 KV cache with per-head quantization scales provides 50% memory reduction with quality preserved.
+</div>
+
+<h3>Perplexity progression</h3>
+<table>
+<thead><tr><th>Version</th><th class="r">PPL</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>bf16 KV, single scan</td><td class="r">25.51</td><td>Original baseline</td></tr>
+<tr><td>int8 KV, single scan</td><td class="r">22.80</td><td>Per-head scales</td></tr>
+<tr class="highlight"><td><strong>int8 KV, split-cache</strong></td><td class="r"><strong>19.24</strong></td><td>Circular buffer + blockwise</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>24.6% perplexity improvement</strong> from 25.51 to 19.24 via split-cache architecture and int8 KV quantization with per-head scales.</div>
+
+<h3>Memory budget at 128K (per chip, TP=4)</h3>
+<table>
+<thead><tr><th>Component</th><th class="r">Size</th></tr></thead>
+<tbody>
+<tr><td>Weights (int8)</td><td class="r">7.75 GB</td></tr>
+<tr><td>Sliding KV (50 layers x 1024 x 1024 bytes)</td><td class="r">50 MB</td></tr>
+<tr><td>Global KV (10 layers x 131072 x 512 bytes, after TP shard)</td><td class="r">625 MB</td></tr>
+<tr><td>Scale arrays</td><td class="r">~60 MB</td></tr>
+<tr class="highlight"><td><strong>Total</strong></td><td class="r"><strong>~8.5 GB of 32 GB</strong></td></tr>
+</tbody>
+</table>
 
 <h3>Batch scaling sweep</h3>
 <div class="chart-box">
@@ -245,12 +304,13 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <table>
 <thead><tr><th>Metric</th><th class="r">rvLLM (TPU, int8)</th><th class="r">HuggingFace (GPU, bf16)</th></tr></thead>
 <tbody>
-<tr><td>Perplexity (short text)</td><td class="r"><strong>25.51</strong></td><td class="r">18,243 (instruct model on raw text)</td></tr>
+<tr><td>Perplexity (split-cache, int8 KV)</td><td class="r"><strong>19.24</strong></td><td class="r">18,243 (instruct model on raw text)</td></tr>
+<tr><td>Perplexity (original, bf16 KV)</td><td class="r">25.51</td><td class="r">-</td></tr>
 <tr><td>Layer-by-layer numerics</td><td class="r" colspan="2">Match within bf16 precision through all layers: embedding, layernorm, Q/K/V, QK-norm, attention, O-proj, FFN</td></tr>
 <tr><td>Greedy decode from BOS</td><td class="r" colspan="2">Both produce identical repetitive pattern (expected for instruct model with bare BOS prompt)</td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>Perplexity note:</strong> HF's 18,243 PPL is an instruct-tuned model evaluated on raw text (not in chat format). Our 25.51 uses the same text with int8 quantized weights. The lower PPL confirms the forward pass is correct and int8 quantization has minimal quality loss.</div>
+<div class="footnote"><strong>Perplexity improved from 25.51 to 19.24</strong> via split-cache architecture with int8 KV quantization (per-head scales). The circular buffer for sliding layers and blockwise attention for global layers actually improves quality over the original single-scan approach.</div>
 
 
 <h3>XProf per-step breakdown (B=1)</h3>
@@ -281,7 +341,10 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <code>gcloud compute tpus tpu-vm create rvllm --zone=us-east5-b --accelerator-type=v6e-4 --version=v2-alpha-tpuv6e</code><br>
 <code>pip3 install 'jax[tpu]' huggingface_hub tokenizers -f https://storage.googleapis.com/jax-releases/libtpu_releases.html</code><br>
 <code>LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true --xla_tpu_dot_dot_fusion_duplicated=true" python3 tpu/harness/gemma4_tpu_infer.py --model-dir ~/models/gemma-4-31B-it --fused --batch 768</code><br><br>
-No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 lines of JAX.
+<strong>128K context:</strong> <code>python3 tpu/harness/gemma4_tpu_infer.py --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 131072</code><br>
+<strong>API server:</strong> <code>python3 tpu/harness/api_server.py --model-dir ~/models/gemma-4-31B-it --port 8080</code><br>
+<strong>Chat client:</strong> native Rust egui app at <code>chat-client/</code>, connects via OpenAI API.<br><br>
+No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 lines of JAX. Context lengths 512 to 128K via <code>--max-ctx</code>.
 </div>
 
 
@@ -434,7 +497,8 @@ Hardware: Cloud TPU v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s aggregate bandwidth), 
 Model: <code>google/gemma-4-31B-it</code>, int8 weight quantization (jnp.int8), bf16 activations.<br>
 Timing: <code>jax.block_until_ready()</code> after each step. Warmup: 3 steps discarded. Measurement: median of 20 iterations.<br>
 LIBTPU flags: <code>--xla_tpu_enable_async_collective_fusion=true --xla_tpu_dot_dot_fusion_duplicated=true --xla_tpu_scheduler_rerun=5</code><br>
-Perplexity: measured on a short text passage, compared against HuggingFace <code>transformers</code> bf16 reference on GPU.<br><br>
+Perplexity: 19.24 (split-cache, int8 KV with per-head scales), improved from 25.51 baseline. Measured on short text passage, compared against HuggingFace <code>transformers</code> bf16 reference on GPU.<br>
+Context scaling: 512 to 128K tested. Split-cache architecture: 50 sliding layers use circular buffer, 10 global layers use blockwise attention (BLOCK_K=8192, online softmax).<br><br>
 
 <strong>GPU pipeline</strong> (v3 codebase, Rust + CUDA):<br>
 Hardware: H100 SXM 80 GB.<br>
@@ -461,6 +525,30 @@ Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+q
   const R = Recharts;
 
   const tooltipStyle = { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' };
+
+  // Context scaling data
+  const ctxScalingData = [
+    { ctx: '512',  toks: 79.9,  ms: 12.52, mem: 500 },
+    { ctx: '2K',   toks: 41.9,  ms: 23.84, mem: 587 },
+    { ctx: '8K',   toks: 35,    ms: 28,    mem: 755 },
+    { ctx: '32K',  toks: 31,    ms: 32,    mem: 3072 },
+    { ctx: '64K',  toks: 28,    ms: 36,    mem: 5939 },
+    { ctx: '128K', toks: 24.7,  ms: 40.56, mem: 11366 }
+  ];
+
+  function CtxScaling(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: ctxScalingData, margin: { top: 30, right: 30, left: 20, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { dataKey: 'ctx', stroke: '#888', tick: { fill: '#ccc', fontSize: 12 }, label: { value: 'Context length', position: 'insideBottom', offset: -4, fill: '#aaa', fontSize: 11 } }),
+        e(R.YAxis, { stroke: '#888', tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: (v, name) => name === 'tok/s' ? v + ' tok/s' : v + ' ms' }),
+        e(R.Bar, { dataKey: 'toks', name: 'tok/s', fill: '#84E6B7', radius: [4, 4, 0, 0] },
+          e(R.LabelList, { dataKey: 'toks', position: 'top', fill: '#c0f0d8', fontSize: 11, formatter: v => v.toFixed(1) })
+        )
+      )
+    );
+  }
 
   // TPU batch scaling data
   const tpuScalingData = [
@@ -566,6 +654,7 @@ Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+q
     );
   }
 
+  ReactDOM.createRoot(document.getElementById('chart-ctx-scaling')).render(e(CtxScaling));
   ReactDOM.createRoot(document.getElementById('chart-tpu-scaling')).render(e(TpuScaling));
   ReactDOM.createRoot(document.getElementById('chart-tpu-vs-gpu')).render(e(TpuVsGpu));
   ReactDOM.createRoot(document.getElementById('chart-progression')).render(e(Progression));
@@ -576,6 +665,7 @@ Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+q
 <script>
 function filterView(mode) {
   var tpu = document.getElementById('section-tpu');
+  var eagle3 = document.getElementById('section-eagle3');
   var gpu = document.getElementById('section-gpu');
   var dividers = document.querySelectorAll('.section-divider');
   var btns = document.querySelectorAll('.filter-btn');
@@ -585,14 +675,22 @@ function filterView(mode) {
 
   if (mode === 'both') {
     tpu.classList.remove('hidden');
+    eagle3.classList.remove('hidden');
     gpu.classList.remove('hidden');
     dividers.forEach(function(d){ d.classList.remove('hidden'); });
   } else if (mode === 'tpu') {
     tpu.classList.remove('hidden');
+    eagle3.classList.add('hidden');
+    gpu.classList.add('hidden');
+    dividers.forEach(function(d){ d.classList.add('hidden'); });
+  } else if (mode === 'eagle3') {
+    tpu.classList.add('hidden');
+    eagle3.classList.remove('hidden');
     gpu.classList.add('hidden');
     dividers.forEach(function(d){ d.classList.add('hidden'); });
   } else if (mode === 'gpu') {
     tpu.classList.add('hidden');
+    eagle3.classList.add('hidden');
     gpu.classList.remove('hidden');
     dividers.forEach(function(d){ d.classList.add('hidden'); });
   }

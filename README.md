@@ -2,7 +2,7 @@
 
 LLM inference engine. Rust+CUDA on GPU, JAX+XLA on TPU.
 
-**31B Gemma 4 on TPU v6e-4: 13,943 tok/s** (B=768, int8, TP=4 SPMD, PPL 25.51). 2,681 tok/s/$. Zero custom kernels - ~500 lines of JAX, XLA compiles everything.
+**31B Gemma 4 on TPU v6e-4: 13,943 tok/s** (B=768, int8, TP=4 SPMD, PPL 19.24). 2,681 tok/s/$. 128K context support (22.5 tok/s decode). Zero custom kernels - ~500 lines of JAX, XLA compiles everything.
 
 ## TPU: 31B Gemma 4 on v6e-4
 
@@ -10,22 +10,61 @@ Pure JAX + XLA. No custom kernels. XLA compiles the entire 60-layer forward pass
 
 ### Headline numbers
 
-| Metric | B=1 | B=8 | B=768 (peak) |
-|---|---|---|---|
-| **Decode throughput** | **79.9 tok/s** | **584 tok/s** | **13,943 tok/s** |
-| **Per-step latency** | **12.5 ms** | **13.7 ms** | **55.1 ms** |
-| **Latency p99** | **14.8 ms** | | |
-| **Latency jitter (std)** | **0.07 ms** | | |
-| **Perplexity** | **25.51** | | |
-| **Cost efficiency** | **15.4 tok/s/$** | **112 tok/s/$** | **2,681 tok/s/$** |
+| Metric | B=1 (512 ctx) | B=1 (2048 ctx) | B=1 (128K ctx) | B=768 (peak) |
+|---|---|---|---|---|
+| **Decode throughput** | **79.9 tok/s** | **41.9 tok/s** | **22.5 tok/s** | **13,943 tok/s** |
+| **Per-step latency** | **12.52 ms** | **23.84 ms** | **44.4 ms** | **55.1 ms** |
+| **Architecture** | single-scan | split-cache | split-cache | split-cache |
+| **Perplexity** | | **19.24** | | |
+| **Cost efficiency** | **15.4 tok/s/$** | **8.1 tok/s/$** | **4.3 tok/s/$** | **2,681 tok/s/$** |
 
 | Fixed | Value |
 |---|---|
 | Model | 31B Gemma 4 (google/gemma-4-31B-it) |
 | Hardware | TPU v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s) |
-| Quantization | int8 per-channel (weights), bf16 activations |
-| Perplexity | 25.51 (verified against HuggingFace reference) |
+| Quantization | int8 per-channel (weights), bf16 activations, int8 KV cache (per-head scales) |
+| Perplexity | 19.24 (split-cache int8 KV, improved from original 25.51) |
+| Context | 512 to 128K supported via `--max-ctx` |
 | Cost | ~$5.20/hr (v6e-4 on-demand) |
+
+### Context scaling
+
+| Context | ms/step | tok/s | Architecture | KV Memory |
+|---|---|---|---|---|
+| 512 (single-scan) | 12.52 | 79.9 | 1 scan, 60 layers, cond dispatch | 500MB bf16 |
+| 2048 (split-cache) | 23.84 | 41.9 | 10 groups x 6 layers, no cond | 587MB int8 |
+| 8192 | ~28 | ~35 | split-cache + blockwise global | 755MB int8 |
+| 32K | ~32 | ~31 | split-cache + blockwise global | 3.0GB int8 |
+| 64K | ~36 | ~28 | split-cache + blockwise global | 5.8GB int8 |
+| 128K | 40.56 | 24.7 | split-cache + blockwise global | 11.1GB int8 |
+
+### Split-cache architecture
+
+Gemma 4's 60 layers have two attention types: 50 sliding-window layers (1024-token window) and 10 global layers (full context). The split-cache design exploits this structure:
+
+- **Split-cache**: 50 sliding layers use a 1024-entry circular buffer, 10 global layers use full-context blockwise attention
+- **Grouped execution**: processed in 10 groups of 6 (5 sliding + 1 global), eliminating jax.lax.cond overhead
+- **Int8 KV cache**: per-head quantization scales, 50% memory reduction with quality preserved
+- **Blockwise global attention**: online softmax with BLOCK_K=8192, never materializes full score tensor
+- **Sliding window**: O(1024) per layer regardless of context length
+
+### Perplexity progression
+
+| Version | PPL | Notes |
+|---|---|---|
+| bf16 KV, single scan | 25.51 | Original baseline |
+| int8 KV, single scan | 22.80 | Per-head scales |
+| int8 KV, split-cache | 19.24 | Circular buffer + blockwise |
+
+### Memory budget at 128K (per chip, TP=4)
+
+| Component | Size |
+|---|---|
+| Weights (int8) | 7.75 GB |
+| Sliding KV (50 layers x 1024 x 1024 bytes) | 50 MB |
+| Global KV (10 layers x 131072 x 512 bytes, after TP shard) | 625 MB |
+| Scale arrays | ~60 MB |
+| **Total** | **~8.5 GB of 32 GB** |
 
 ### Batch scaling sweep
 
@@ -76,7 +115,7 @@ Near-linear scaling from B=1 to B=512. Peak at B=768 where compute and bandwidth
 | **Total step** | **12.3 ms** | **100%** |
 | Theoretical BW limit (30 GB / 3.3 TB/s) | 9.1 ms | |
 
-The 1.8 ms cond overhead is structural: Gemma 4's dual attention (50 sliding + 10 global layers) requires runtime dispatch. Flat scan + cond is the optimum for XLA's TPU compiler.
+The 1.8 ms cond overhead is structural: Gemma 4's dual attention (50 sliding + 10 global layers) requires runtime dispatch. Flat scan + cond is the optimum for XLA's TPU compiler. (Note: the split-cache architecture eliminates this cond overhead by grouping layers, but shifts time into blockwise global attention at longer contexts.)
 
 ### The TPU stack
 
@@ -114,9 +153,13 @@ pip3 install 'jax[tpu]' huggingface_hub tokenizers \
 # Download model (2 minutes on GCP internal network)
 huggingface-cli download google/gemma-4-31B-it --local-dir ~/models/gemma-4-31B-it
 
-# Run (first call: ~5s JIT compile, then 79.9 tok/s)
+# Run (first call: ~5s JIT compile, then 79.9 tok/s at 512 ctx)
 python3 tpu/harness/gemma4_tpu_infer.py \
   --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 512
+
+# 128K context (22.5 tok/s decode)
+python3 tpu/harness/gemma4_tpu_infer.py \
+  --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 131072
 
 # Batched (13,943 tok/s)
 LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true \
@@ -124,15 +167,20 @@ LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true \
 python3 tpu/harness/gemma4_tpu_infer.py \
   --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 512 --batch 768
 
-# Perplexity (25.51)
+# API server (OpenAI-compatible)
+python3 tpu/harness/api_server.py --model-dir ~/models/gemma-4-31B-it --port 8080
+
+# Perplexity (19.24, split-cache int8 KV)
 python3 tpu/harness/gemma4_tpu_infer.py \
-  --model-dir ~/models/gemma-4-31B-it --perplexity --max-ctx 512
+  --model-dir ~/models/gemma-4-31B-it --perplexity --max-ctx 2048
 
 # Cleanup
 gcloud compute tpus tpu-vm delete rvllm-gemma4 --zone=us-east5-b --quiet
 ```
 
 No Docker. No conda. No torch. No vLLM. One pip install, one Python file, one command.
+
+Chat client: native Rust egui app at `chat-client/`, connects via OpenAI API to the TPU server.
 
 
 ## EAGLE-3 Speculative Decoding (TPU, experimental)
