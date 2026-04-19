@@ -272,10 +272,16 @@ Commits in the `rusty_sm121` branch (as of the current state):
 - Switch `kernels/build.sh` to `-arch=sm_121f` (family-mode) when a
   future kernel needs FP8 tensor-core MMA or MXFP4 hardware paths.
   Not required for anything on this branch (see "Arch suffix").
-- Fix the two pre-existing upstream bugs that still block
-  `cargo check --workspace`: `Gemma4Bringup::{run_ppl, run_bench,
-  run_generate}` missing, and
-  `PagedDecode/PrefillParams.window_size_left` missing.
+- ~~Fix the two pre-existing upstream bugs that blocked
+  `cargo check --workspace`~~: `PagedDecode/PrefillParams.window_size_left`
+  landed upstream. The three `Gemma4Bringup::{run_ppl, run_bench,
+  run_generate}` "missing" methods actually existed (gated
+  `#[cfg(feature = "cuda")]`); the bin [[bin]] entries now carry
+  `required-features = ["cuda"]` so default `cargo check --workspace`
+  skips them cleanly. Also replaced `rvllm_eval.rs`'s inline
+  `cuCtxCreate_v2` probe (CUDA 13 resolution failure) with
+  `CudaContextHandle::init` — same primary-context-retain fix as
+  in `rvllm-mem::context`.
 
 ## Non-goals (explicitly not in this branch)
 

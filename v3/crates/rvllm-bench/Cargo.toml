@@ -9,17 +9,27 @@ authors.workspace = true
 # rvllm-bench: deterministic prompts, per-bucket tok/s + p50/p99 latency,
 # JSON output consumed by tools/bench-gate. See v3/specs/{15,16}.md.
 
+# All three binaries drive `Gemma4Bringup::run_{bench,ppl,generate}`,
+# which are `#[cfg(feature = "cuda")]` in the impl. Without
+# `required-features` here, a default `cargo check --workspace` would
+# try to compile the bins with `cuda` off and fail with E0599 on the
+# three missing methods. Gating them on the cuda feature is the right
+# semantics anyway — they all require a GPU to run.
+
 [[bin]]
 name = "rvllm-bench"
 path = "src/main.rs"
+required-features = ["cuda"]
 
 [[bin]]
 name = "rvllm-eval"
 path = "src/bin/rvllm_eval.rs"
+required-features = ["cuda"]
 
 [[bin]]
 name = "rvllm-ppl"
 path = "src/bin/rvllm_ppl.rs"
+required-features = ["cuda"]
 
 [features]
 default = []

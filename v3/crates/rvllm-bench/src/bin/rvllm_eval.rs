@@ -93,15 +93,19 @@ fn run() -> Result<(), String> {
             let free = {
                 let mut free: usize = 0;
                 let mut total: usize = 0;
+                // Borrow a context just long enough to probe free memory.
+                // `CudaContextHandle::init` uses primary-context retain
+                // (works on CUDA 11/12/13 — see rvllm-mem/src/context.rs
+                // module docs); the legacy `cuCtxCreate_v2` this code
+                // used to call directly is unwrapped by cudarc only for
+                // CUDA ≤ 12.09, so on CUDA 13 hosts the old path
+                // failed to resolve.
+                let _probe_ctx = rvllm_mem::context::CudaContextHandle::init(0)
+                    .map_err(|e| format!("probe ctx: {e}"))?;
                 unsafe {
-                    cudarc::driver::sys::cuInit(0);
-                    let mut dev: cudarc::driver::sys::CUdevice = 0;
-                    cudarc::driver::sys::cuDeviceGet(&mut dev, 0);
-                    let mut ctx: cudarc::driver::sys::CUcontext = std::ptr::null_mut();
-                    cudarc::driver::sys::cuCtxCreate_v2(&mut ctx, 0, dev);
                     cudarc::driver::sys::cuMemGetInfo_v2(&mut free as *mut _, &mut total as *mut _);
-                    cudarc::driver::sys::cuCtxDestroy_v2(ctx);
                 }
+                drop(_probe_ctx);
                 free
             };
             let reserve = 512 * 1024 * 1024; // 512MB headroom
