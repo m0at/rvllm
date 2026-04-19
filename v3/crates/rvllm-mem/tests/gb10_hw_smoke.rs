@@ -51,15 +51,21 @@ fn gb10_end_to_end_bring_up() {
     let r2 = arena.region("kv_fake", 8192, 256).expect("region r2");
     let r3 = arena.region("scratch_fake", 1024, 16).expect("region r3");
 
-    // Pointers must be aligned + strictly increasing (bump allocator).
+    // Pointers must be aligned + strictly non-overlapping (bump allocator
+    // carves in request order, each region begins ≥ previous region's
+    // end).
     assert_eq!(r1.device_ptr() % 256, 0);
     assert_eq!(r2.device_ptr() % 256, 0);
     assert_eq!(r3.device_ptr() % 16, 0);
-    assert!(r2.device_ptr() > r1.device_ptr());
-    assert!(r3.device_ptr() > r2.device_ptr());
+    assert!(r2.device_ptr() >= r1.device_ptr() + r1.len() as u64);
+    assert!(r3.device_ptr() >= r2.device_ptr() + r2.len() as u64);
 
-    // And within the arena.
-    assert!(r3.device_ptr() + r3.len() as u64 <= r1.device_ptr() + BYTES as u64);
+    // Arena bookkeeping: `used` is at least the sum of requested sizes
+    // (can be larger due to alignment padding) and never exceeds the
+    // capacity. This doesn't depend on r1 sitting at offset 0.
+    let requested_total = (r1.len() + r2.len() + r3.len()) as usize;
+    assert!(arena.used() >= requested_total);
+    assert!(arena.used() <= arena.capacity());
 
     eprintln!(
         "UnifiedArena OK: {} MiB allocated, 3 regions carved",

@@ -19,8 +19,6 @@
 //!   * SM80/SM89/SM90 production paths must not accidentally pick this
 //!     up — their allocation path is `cuMemAlloc_v2` + HBM.
 
-use core::marker::PhantomData;
-
 use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 
 use crate::hbm::Region;
@@ -31,10 +29,13 @@ use crate::hbm::Region;
 /// Hands out `Region<'a>` values — the same handle type as `HbmArena`
 /// — so downstream code (`CaptureScope`, `KvLayout`, fused kernels)
 /// does not need to know which backing arena it is running against.
+///
+/// Nominal newtype over `HbmArena` (distinct type to keep the two
+/// flavours from being silently swapped) while inheriting `Send +
+/// Sync`: managed memory has no thread affinity, unlike a `CUcontext`.
 #[derive(Debug)]
 pub struct UnifiedArena<'ctx> {
     inner: crate::hbm::HbmArena<'ctx>,
-    _not_hbm: PhantomData<*const ()>,
 }
 
 impl<'ctx> UnifiedArena<'ctx> {
@@ -42,10 +43,11 @@ impl<'ctx> UnifiedArena<'ctx> {
     /// preferred residency.
     ///
     /// Drives `cuMemAllocManaged(CU_MEM_ATTACH_GLOBAL)` followed by
-    /// `cuMemAdvise(CU_MEM_ADVISE_SET_PREFERRED_LOCATION, device)`.
-    /// An advise failure is non-fatal (logged via the returned typed
-    /// error path is preserved, but the arena still functions — the
-    /// pages will simply migrate on first touch).
+    /// `cuMemAdvise_v2(CU_MEM_ADVISE_SET_PREFERRED_LOCATION, device)`.
+    /// The advise call is a performance hint: its result is ignored
+    /// because the arena is fully functional without it — the pages
+    /// simply migrate on first GPU touch. Only the allocation itself
+    /// is allowed to fail the constructor.
     #[cfg(feature = "cuda")]
     pub fn new(ctx: &crate::context::CudaContextHandle, bytes: usize) -> Result<Self> {
         use cudarc::driver::sys::*;
@@ -92,21 +94,37 @@ impl<'ctx> UnifiedArena<'ctx> {
         // into the shared bump-allocator bookkeeping + Drop via
         // cuMemFree_v2, which correctly frees managed memory as well.
         let inner = crate::hbm::HbmArena::from_raw_parts(dptr, bytes);
-        Ok(Self {
-            inner,
-            _not_hbm: PhantomData,
-        })
+        Ok(Self { inner })
     }
 
+    /// `gb10` + `!cuda` is a meaningless combination at runtime — the
+    /// feature name literally means "GB10 hardware". Fail closed
+    /// rather than silently returning a host-stub pointer that would
+    /// SEGFAULT the first time a kernel tried to read it.
     #[cfg(not(feature = "cuda"))]
-    pub fn new(_ctx: &crate::context::CudaContextHandle, bytes: usize) -> Result<Self> {
-        // No managed-memory allocator available without `cuda`; fall
-        // back to the host-stub bookkeeping so the type stays
-        // constructible in no-cuda workspace checks and unit tests.
-        Ok(Self {
+    pub fn new(ctx: &crate::context::CudaContextHandle, _bytes: usize) -> Result<Self> {
+        Err(RvllmError::cuda(
+            "UnifiedArena::new",
+            CudaErrorKind::Other,
+            CudaCtx {
+                stream: 0,
+                kernel: "UnifiedArena::new",
+                launch: None,
+                device: ctx.device(),
+            },
+        ))
+    }
+
+    /// Test-only stub constructor: host-side bump bookkeeping over a
+    /// fake device base, never backed by real managed memory. Only
+    /// the bookkeeping invariants (alignment, non-overlap, exhaustion)
+    /// are exercisable through this constructor — device pointers
+    /// returned by `region().device_ptr()` MUST NOT be dereferenced.
+    #[cfg(any(test, not(feature = "cuda")))]
+    pub fn host_stub(bytes: usize) -> Self {
+        Self {
             inner: crate::hbm::HbmArena::new_host_stub(bytes),
-            _not_hbm: PhantomData,
-        })
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -145,19 +163,28 @@ impl<'ctx> UnifiedArena<'ctx> {
 // binds `&Region`, never `&UnifiedArena` (same contract as HbmArena,
 // which intentionally does not carry the impl either).
 
-#[cfg(all(test, not(feature = "cuda")))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::CudaContextHandle;
 
     #[test]
-    fn unified_arena_host_stub_delegates_to_hbm() {
-        let ctx = CudaContextHandle::host_stub();
-        let a = UnifiedArena::new(&ctx, 1 << 20).unwrap();
+    fn host_stub_bookkeeping_matches_hbm() {
+        let a = UnifiedArena::host_stub(1 << 20);
         let r1 = a.region("a", 100, 16).unwrap();
         assert_eq!(r1.device_ptr() % 16, 0);
         let r2 = a.region("b", 200, 256).unwrap();
         assert!(r2.device_ptr() > r1.device_ptr());
         assert!(a.used() >= 300);
+    }
+
+    /// Compile-time check: `UnifiedArena<'_>` must inherit `Send + Sync`
+    /// from its inner `HbmArena`. Managed memory has no thread
+    /// affinity (unlike a `CUcontext`), so the type should be movable
+    /// between worker threads. This assert-function will fail to
+    /// compile if a marker makes the arena `!Send` or `!Sync`.
+    #[allow(dead_code)]
+    fn assert_send_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<UnifiedArena<'static>>();
     }
 }

@@ -1,43 +1,55 @@
 //! GB10 clock-regime dispatch for `fp8_gemv` variants.
 //!
-//! GB10 / DGX Spark exhibits a power-governed clock regime shift:
-//! ~851 MHz sustained for the first few seconds of a workload, then
-//! firmware drops to ~507 MHz once the power budget is exhausted. The
-//! throttle is not defeatable via `nvidia-smi -lgc` — it's enforced in
-//! firmware.
+//! Picks between two warp-per-row kernels in `fp8_gemv.ptx`:
 //!
-//! This asymmetry inverts the usual "fewer instructions = faster"
-//! heuristic, because at 507 MHz the instruction issue rate caps
-//! memory-bandwidth utilisation: *more* ALU per byte keeps more loads
-//! in flight. Consequently:
+//!   * `WprNative` — native `cvt.rn.f16x2.e4m3x2` PTX (sm_100+ only),
+//!     ~3 ALU instructions per FP8 byte.
+//!   * `WprLut` — branchless shared-memory LUT, ~24 ALU per byte.
+//!     Works on every arch, including sm_80/sm_89/sm_90.
 //!
-//!   * Sustained regime (851 MHz): `wpr_native` wins — native
-//!     `cvt.rn.f16x2.e4m3x2` PTX = 3 instructions / byte, less power
-//!     draw, keeps the clock up longer.
-//!   * Throttled regime (507 MHz): `wpr_lut` wins — branchless LUT =
-//!     24 instructions / byte, but at 507 MHz the extra ALU is free
-//!     and the pipeline depth saturates LPDDR5X better.
+//! **Empirical result on measured GB10 (driver 595.58.03, CUDA 13.2,
+//! see `v3/GB10_SPEC.md`):** the SM clock stays at ~2520 MHz under
+//! sustained GEMV load and `WprNative` wins unconditionally — ~2× over
+//! `WprLut` in the L2-hot regime and tied at the LPDDR5X limit
+//! otherwise.
 //!
-//! This module exposes the policy as a pure function so it can be unit
-//! tested without hardware. The clock-regime signal can come from any
-//! of:
-//!   * an explicit override (`ClockRegime::Forced`)
-//!   * a time-window heuristic (works today, no NVML required)
-//!   * a runtime clock probe (requires NVML; future work)
+//! The clock-regime machinery below (`ClockRegime` + the two
+//! classifiers + `select_variant`) exists as defence-in-depth. It
+//! encodes the behaviour PR #28 originally reported — a
+//! firmware-enforced 851 MHz → 507 MHz throttle after ~3 s of
+//! sustained compute, where the instruction-rate cap would invert the
+//! usual "fewer instructions = faster" heuristic: at 507 MHz `WprLut`
+//! would saturate LPDDR5X better, at 851 MHz `WprNative` would hold
+//! the clock by drawing less power. We couldn't reproduce that
+//! plateau on this DGX Spark, so the policy routes every probed
+//! regime other than a definite Sustained-at-high-clock to `WprLut`
+//! out of caution.
+//!
+//! A caller can feed the regime from any of:
+//!   * `regime_from_elapsed(Duration)` — time-window heuristic, no
+//!     NVML required,
+//!   * `regime_from_clock_mhz(u32)` — from an NVML / `nvidia-smi`
+//!     reading of `clocks.sm`,
+//!   * a `ClockRegime` value constructed directly for test / override
+//!     paths.
 
 use core::time::Duration;
 
 /// Which `fp8_gemv_blockwise_wpr_*_kernel` variant to dispatch on GB10.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Fp8GemvVariant {
-    /// `fp8_gemv_blockwise_wpr_lut_kernel` — branchless LUT dequant,
-    /// 24 ALU instructions per FP8 byte. Best under the 507 MHz
-    /// throttle regime.
+    /// `fp8_gemv_blockwise_wpr_lut_kernel` — branchless shared-memory
+    /// LUT dequant, ~24 ALU instructions per FP8 byte. Runs on every
+    /// target arch (sm_80 through sm_121). Theoretically the right
+    /// pick if the device enters the PR #28 throttle plateau where
+    /// issue rate caps memory throughput — not observed on this DGX
+    /// Spark (see module docs).
     WprLut,
     /// `fp8_gemv_blockwise_wpr_native_kernel` — native
-    /// `cvt.rn.f16x2.e4m3x2` PTX (sm_100+), ~3 instructions per byte.
-    /// Best under the 851 MHz sustained regime. Compiled only for
-    /// `__CUDA_ARCH__ >= 1000`.
+    /// `cvt.rn.f16x2.e4m3x2` PTX, ~3 ALU instructions per byte. Only
+    /// present when compiled for `__CUDA_ARCH__ >= 1000` (sm_100,
+    /// sm_121, sm_122). Unconditionally wins on observed GB10
+    /// hardware (SM clock stays ~2520 MHz under load).
     WprNative,
 }
 
@@ -61,16 +73,23 @@ impl Fp8GemvVariant {
 }
 
 /// Current clock regime on GB10.
+///
+/// Reflects the PR #28 model (which didn't reproduce on our hardware —
+/// see module docs). Retained so the policy stays robust if a future
+/// firmware revives the described plateaus.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ClockRegime {
-    /// Clock is known to be near the 851 MHz cap.
+    /// Clock is known to be above `SUSTAINED_CLOCK_THRESHOLD_MHZ`
+    /// (observed plateau on this DGX Spark is ~2520 MHz; PR #28
+    /// reported 851 MHz).
     Sustained,
-    /// Clock is known to be at or below the 507 MHz throttle.
+    /// Clock is known to be below the sustained threshold. Under the
+    /// PR #28 model this was 507 MHz.
     Throttled,
-    /// Regime is unknown; caller has no probe. Policy falls back to a
-    /// conservative default (`WprLut`) — it runs on every arch
-    /// (`WprNative` is sm_100+ only) and stays correct under throttle
-    /// if one ever materialises on this hardware.
+    /// Regime is unknown (no probe, or probe returned an unreadable
+    /// value). Policy falls back to `WprLut`, which runs on every
+    /// arch — `WprNative` is sm_100+ only, so picking it blindly
+    /// here would fail to resolve on sm_80/sm_89/sm_90.
     Unknown,
 }
 
