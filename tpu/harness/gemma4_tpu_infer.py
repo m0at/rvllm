@@ -39,6 +39,12 @@ G_Q = G_KV = G_HD = G_KVH = G_GQA = 0
 MAX_KVH = 0
 LAYER_IS_GLOBAL = np.array([], dtype=np.int32)
 
+# MoE globals (set by load_config when enable_moe_block is True)
+ENABLE_MOE = False
+NUM_EXPERTS = 0
+TOP_K_EXPERTS = 0
+MOE_INTER = 0
+
 
 def load_config(model_dir):
     """Read config.json, handle text_config nesting, set all model globals."""
@@ -48,6 +54,7 @@ def load_config(model_dir):
     global S_Q, S_KV, S_HD, S_KVH, S_GQA
     global G_Q, G_KV, G_HD, G_KVH, G_GQA
     global MAX_KVH, LAYER_IS_GLOBAL
+    global ENABLE_MOE, NUM_EXPERTS, TOP_K_EXPERTS, MOE_INTER
 
     cfg_path = os.path.join(model_dir, 'config.json')
     with open(cfg_path) as f:
@@ -133,12 +140,21 @@ def load_config(model_dir):
     MAX_NORM_HD = max(S_HD, G_HD)
     MAX_KVH = max(S_KVH, G_KVH)
 
+    # MoE detection
+    ENABLE_MOE = bool(tc.get('enable_moe_block', False))
+    if ENABLE_MOE:
+        NUM_EXPERTS = tc['num_experts']
+        TOP_K_EXPERTS = tc['top_k_experts']
+        MOE_INTER = tc['moe_intermediate_size']
+
     print(f"config: H={H} NH={NH} NL={NL} INTER={INTER} VOCAB={VOCAB} WINDOW={WINDOW}", file=sys.stderr)
     print(f"  sliding: HD={S_HD} KVH={S_KVH} Q={S_Q} KV={S_KV} GQA={S_GQA}", file=sys.stderr)
     print(f"  global:  HD={G_HD} KVH={G_KVH} Q={G_Q} KV={G_KV} GQA={G_GQA}", file=sys.stderr)
     print(f"  groups={N_GROUPS} sliding/group={SLIDING_PER_GROUP} "
           f"global_layers={N_GLOBAL} sliding_layers={N_SLIDING}", file=sys.stderr)
     print(f"  MAX_Q={MAX_Q} MAX_KV={MAX_KV} MAX_NORM_HD={MAX_NORM_HD}", file=sys.stderr)
+    if ENABLE_MOE:
+        print(f"  MoE: experts={NUM_EXPERTS} top_k={TOP_K_EXPERTS} moe_inter={MOE_INTER}", file=sys.stderr)
 
 def make_mesh():
     devs = jax.devices()
@@ -187,6 +203,40 @@ def _dequant_kv(ki8, scale):
 
 def int8_matmul(x, w_int8, scale):
     return (x @ w_int8.astype(jnp.bfloat16).T) * scale
+
+# -- MoE FFN --
+
+def moe_ffn(x, router_w, router_scale, per_expert_scale, expert_gate_up, expert_down):
+    """Mixture-of-Experts FFN with top-k routing.
+
+    Args:
+        x: [B, H] input (bf16)
+        router_w: [NUM_EXPERTS, H] router projection (bf16)
+        router_scale: scalar (bf16)
+        per_expert_scale: [NUM_EXPERTS] per-expert scale (bf16)
+        expert_gate_up: [NUM_EXPERTS, 2*MOE_INTER, H] fused gate+up (bf16)
+        expert_down: [NUM_EXPERTS, H, MOE_INTER] down projection (bf16)
+    Returns:
+        [B, H] MoE output (bf16)
+    """
+    logits = (x @ router_w.T) * router_scale          # [B, NUM_EXPERTS]
+    logits = logits * per_expert_scale                 # per-expert scaling
+    topk_vals, topk_idx = jax.lax.top_k(logits, TOP_K_EXPERTS)  # [B, TOP_K]
+    weights = jax.nn.softmax(topk_vals.astype(jnp.float32), axis=-1).astype(x.dtype)  # [B, TOP_K]
+
+    # Unrolled loop over top-k experts (8 iterations, traced at compile time)
+    out = jnp.zeros_like(x)  # [B, H]
+    for e in range(TOP_K_EXPERTS):
+        idx_e = topk_idx[:, e]                          # [B] expert indices
+        gu_e = expert_gate_up[idx_e[0]]                 # [2*MOE_INTER, H] (B=1)
+        d_e = expert_down[idx_e[0]]                     # [H, MOE_INTER]
+        h_gu = x @ gu_e.T                               # [B, 2*MOE_INTER]
+        gate_e = h_gu[:, :MOE_INTER]
+        up_e = h_gu[:, MOE_INTER:]
+        h_e = jax.nn.gelu(gate_e, approximate=True) * up_e  # [B, MOE_INTER]
+        d_out = h_e @ d_e.T                             # [B, H]
+        out = out + weights[:, e:e+1] * d_out
+    return out
 
 # -- sliding attention (WINDOW-sized circular buffer) --
 
@@ -302,14 +352,32 @@ def sliding_one_layer(carry, xs):
     h = rms_norm(h, xs['ln2'])
     x = residual + h
 
-    residual = x
-    h = rms_norm(x, xs['ln3'])
-    gate = int8_matmul(h, xs['gw'], xs['gw_s'])
-    up = int8_matmul(h, xs['uw'], xs['uw_s'])
-    h = jax.nn.gelu(gate, approximate=True) * up
-    h = int8_matmul(h, xs['dw'], xs['dw_s'])
-    h = rms_norm(h, xs['ln4'])
-    x = (residual + h) * xs['ls']
+    if ENABLE_MOE:
+        residual = x
+        h_dense = rms_norm(x, xs['ln3'])
+        gate = int8_matmul(h_dense, xs['gw'], xs['gw_s'])
+        up = int8_matmul(h_dense, xs['uw'], xs['uw_s'])
+        h_dense = jax.nn.gelu(gate, approximate=True) * up
+        h_dense = int8_matmul(h_dense, xs['dw'], xs['dw_s'])
+        h_dense = rms_norm(h_dense, xs['ln4'])
+
+        h_moe = rms_norm(x, xs['ln3_moe'])
+        h_moe = moe_ffn(h_moe, xs['router_w'], xs['router_s'],
+                         xs['router_ps'], xs['expert_gu'], xs['expert_dw'])
+        h_moe = rms_norm(h_moe, xs['ln4_moe'])
+
+        x = residual + h_dense + h_moe
+        x = rms_norm(x, xs['ln4_combine'])
+        x = x * xs['ls']
+    else:
+        residual = x
+        h = rms_norm(x, xs['ln3'])
+        gate = int8_matmul(h, xs['gw'], xs['gw_s'])
+        up = int8_matmul(h, xs['uw'], xs['uw_s'])
+        h = jax.nn.gelu(gate, approximate=True) * up
+        h = int8_matmul(h, xs['dw'], xs['dw_s'])
+        h = rms_norm(h, xs['ln4'])
+        x = (residual + h) * xs['ls']
 
     return (x, pos, cos_s, sin_s), {'kc': kc, 'vc': vc, 'kc_s': kc_s, 'vc_s': vc_s}
 
@@ -332,14 +400,32 @@ def global_one_layer(x, pos, ctx, cos_g, sin_g, max_ctx, ws):
     h = rms_norm(h, ws['ln2'])
     x = residual + h
 
-    residual = x
-    h = rms_norm(x, ws['ln3'])
-    gate = int8_matmul(h, ws['gw'], ws['gw_s'])
-    up = int8_matmul(h, ws['uw'], ws['uw_s'])
-    h = jax.nn.gelu(gate, approximate=True) * up
-    h = int8_matmul(h, ws['dw'], ws['dw_s'])
-    h = rms_norm(h, ws['ln4'])
-    x = (residual + h) * ws['ls']
+    if ENABLE_MOE:
+        residual = x
+        h_dense = rms_norm(x, ws['ln3'])
+        gate = int8_matmul(h_dense, ws['gw'], ws['gw_s'])
+        up = int8_matmul(h_dense, ws['uw'], ws['uw_s'])
+        h_dense = jax.nn.gelu(gate, approximate=True) * up
+        h_dense = int8_matmul(h_dense, ws['dw'], ws['dw_s'])
+        h_dense = rms_norm(h_dense, ws['ln4'])
+
+        h_moe = rms_norm(x, ws['ln3_moe'])
+        h_moe = moe_ffn(h_moe, ws['router_w'], ws['router_s'],
+                         ws['router_ps'], ws['expert_gu'], ws['expert_dw'])
+        h_moe = rms_norm(h_moe, ws['ln4_moe'])
+
+        x = residual + h_dense + h_moe
+        x = rms_norm(x, ws['ln4_combine'])
+        x = x * ws['ls']
+    else:
+        residual = x
+        h = rms_norm(x, ws['ln3'])
+        gate = int8_matmul(h, ws['gw'], ws['gw_s'])
+        up = int8_matmul(h, ws['uw'], ws['uw_s'])
+        h = jax.nn.gelu(gate, approximate=True) * up
+        h = int8_matmul(h, ws['dw'], ws['dw_s'])
+        h = rms_norm(h, ws['ln4'])
+        x = (residual + h) * ws['ls']
 
     return x, kc, vc, kc_s, vc_s
 
@@ -358,6 +444,11 @@ def _build_sliding_xs(sw, sc, g):
         xs[k + '_s'] = _slice_weight(sw[k + '_s'], s, SLIDING_PER_GROUP)
     for k in ('qn', 'kn', 'ln1', 'ln2', 'ln3', 'ln4', 'ls'):
         xs[k] = _slice_weight(sw[k], s, SLIDING_PER_GROUP)
+    if ENABLE_MOE:
+        for k in ('ln3_moe', 'ln4_moe', 'ln4_combine'):
+            xs[k] = _slice_weight(sw[k], s, SLIDING_PER_GROUP)
+        for k in ('router_w', 'router_s', 'router_ps', 'expert_gu', 'expert_dw'):
+            xs[k] = _slice_weight(sw[k], s, SLIDING_PER_GROUP)
     xs['kc'] = _slice_weight(sc['kc'], s, SLIDING_PER_GROUP)
     xs['vc'] = _slice_weight(sc['vc'], s, SLIDING_PER_GROUP)
     xs['kc_s'] = _slice_weight(sc['kc_s'], s, SLIDING_PER_GROUP)
@@ -372,6 +463,11 @@ def _build_global_ws(gw, gc, g):
         ws[k + '_s'] = gw[k + '_s'][g]
     for k in ('qn', 'kn', 'ln1', 'ln2', 'ln3', 'ln4', 'ls'):
         ws[k] = gw[k][g]
+    if ENABLE_MOE:
+        for k in ('ln3_moe', 'ln4_moe', 'ln4_combine'):
+            ws[k] = gw[k][g]
+        for k in ('router_w', 'router_s', 'router_ps', 'expert_gu', 'expert_dw'):
+            ws[k] = gw[k][g]
     ws['kc'] = gc['kc'][g]
     ws['vc'] = gc['vc'][g]
     ws['kc_s'] = gc['kc_s'][g]
@@ -583,14 +679,35 @@ def one_layer_unified(carry, xs):
     h = rms_norm(h, xs['ln2'])
     x = residual + h
 
-    residual = x
-    h = rms_norm(x, xs['ln3'])
-    gate = int8_matmul(h, xs['gw'], xs['gw_s'])
-    up = int8_matmul(h, xs['uw'], xs['uw_s'])
-    h = jax.nn.gelu(gate, approximate=True) * up
-    h = int8_matmul(h, xs['dw'], xs['dw_s'])
-    h = rms_norm(h, xs['ln4'])
-    x = (residual + h) * xs['ls']
+    if ENABLE_MOE:
+        residual = x
+        # Dense FFN
+        h_dense = rms_norm(x, xs['ln3'])
+        gate = int8_matmul(h_dense, xs['gw'], xs['gw_s'])
+        up = int8_matmul(h_dense, xs['uw'], xs['uw_s'])
+        h_dense = jax.nn.gelu(gate, approximate=True) * up
+        h_dense = int8_matmul(h_dense, xs['dw'], xs['dw_s'])
+        h_dense = rms_norm(h_dense, xs['ln4'])
+
+        # MoE FFN
+        h_moe = rms_norm(x, xs['ln3_moe'])
+        h_moe = moe_ffn(h_moe, xs['router_w'], xs['router_s'],
+                         xs['router_ps'], xs['expert_gu'], xs['expert_dw'])
+        h_moe = rms_norm(h_moe, xs['ln4_moe'])
+
+        # Combine dense + MoE + residual, then post-combine norm
+        x = residual + h_dense + h_moe
+        x = rms_norm(x, xs['ln4_combine'])
+        x = x * xs['ls']
+    else:
+        residual = x
+        h = rms_norm(x, xs['ln3'])
+        gate = int8_matmul(h, xs['gw'], xs['gw_s'])
+        up = int8_matmul(h, xs['uw'], xs['uw_s'])
+        h = jax.nn.gelu(gate, approximate=True) * up
+        h = int8_matmul(h, xs['dw'], xs['dw_s'])
+        h = rms_norm(h, xs['ln4'])
+        x = (residual + h) * xs['ls']
 
     return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g), {'kc': kc, 'vc': vc}
 
@@ -940,13 +1057,18 @@ def load_model_unified(model_dir, mesh, max_ctx):
     embed = put(get(f'{prefix}.embed_tokens.weight'), P(None, None))
     final_norm = put(get(f'{prefix}.norm.weight'), P(None))
 
-    print("  stacking 60 layers (padded, int8 quantized, unified)...", file=sys.stderr)
+    print(f"  stacking {NL} layers (padded, int8 quantized, unified)...", file=sys.stderr)
     matmul_keys = ['qw','kw','vw','ow','gw','uw','dw']
     bf16_keys = ['qn','kn','ln1','ln2','ln3','ln4','ls']
+    if ENABLE_MOE:
+        bf16_keys += ['ln3_moe', 'ln4_moe', 'ln4_combine']
     stacked_i8 = {k: [] for k in matmul_keys}
     stacked_sc = {k+'_s': [] for k in matmul_keys}
     stacked_bf = {k: [] for k in bf16_keys}
     stacked_ig = []
+    # MoE weight stacks (bf16, NOT int8 -- sparse access)
+    moe_keys = ['router_w', 'router_s', 'router_ps', 'expert_gu', 'expert_dw']
+    stacked_moe = {k: [] for k in moe_keys} if ENABLE_MOE else {}
 
     for i in range(NL):
         lp = f'{prefix}.layers.{i}'
@@ -982,6 +1104,18 @@ def load_model_unified(model_dir, mesh, max_ctx):
         stacked_bf['ls'].append(to_np_bf16(get(f'{lp}.layer_scalar')) if has(f'{lp}.layer_scalar') else np.array([1.0], dtype=ml_dtypes.bfloat16))
         stacked_ig.append(np.array(is_global, dtype=np.int32))
 
+        if ENABLE_MOE:
+            stacked_bf['ln3_moe'].append(to_np_bf16(get(f'{lp}.pre_feedforward_layernorm_2.weight')))
+            stacked_bf['ln4_moe'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm_1.weight')))
+            stacked_bf['ln4_combine'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm_2.weight')))
+            stacked_moe['router_w'].append(to_np_bf16(get(f'{lp}.router.proj.weight')))
+            # router.scale is a scalar -- read and wrap as 1-elem array for stacking
+            rs = to_np_bf16(get(f'{lp}.router.scale'))
+            stacked_moe['router_s'].append(rs.reshape(1) if rs.ndim == 0 else rs)
+            stacked_moe['router_ps'].append(to_np_bf16(get(f'{lp}.router.per_expert_scale')))
+            stacked_moe['expert_gu'].append(to_np_bf16(get(f'{lp}.experts.gate_up_proj')))
+            stacked_moe['expert_dw'].append(to_np_bf16(get(f'{lp}.experts.down_proj')))
+
         if i % 15 == 0:
             print(f"    layer {i}", file=sys.stderr)
 
@@ -1012,6 +1146,22 @@ def load_model_unified(model_dir, mesh, max_ctx):
         print(f"    {k}: {arr.shape} bf16", file=sys.stderr)
     weights['ig'] = jax.device_put(jnp.array(np.array(stacked_ig)), NamedSharding(mesh, P(None)))
 
+    if ENABLE_MOE:
+        # MoE weights: replicated on all chips (NOT TP-sharded -- gathered sparsely)
+        rep = NamedSharding(mesh, P(None, None))
+        rep3 = NamedSharding(mesh, P(None, None, None))
+        rep4 = NamedSharding(mesh, P(None, None, None, None))
+        for k in moe_keys:
+            arr = np.stack(stacked_moe[k])
+            ndim = arr.ndim
+            if ndim == 2:
+                weights[k] = jax.device_put(jnp.array(arr, dtype=jnp.bfloat16), rep)
+            elif ndim == 3:
+                weights[k] = jax.device_put(jnp.array(arr, dtype=jnp.bfloat16), rep3)
+            elif ndim == 4:
+                weights[k] = jax.device_put(jnp.array(arr, dtype=jnp.bfloat16), rep4)
+            print(f"    moe.{k}: {arr.shape} bf16", file=sys.stderr)
+
     kv_sh = NamedSharding(mesh, P(None, None, 'tp'))
     kv_mem = NL * max_ctx * MAX_KV * 2 * 2
     print(f"  unified KV cache: {NL} x {max_ctx} x {MAX_KV} bf16 = {kv_mem/1e6:.0f}MB", file=sys.stderr)
@@ -1021,6 +1171,8 @@ def load_model_unified(model_dir, mesh, max_ctx):
     }
 
     del all_t, stacked_i8, stacked_sc, stacked_bf
+    if ENABLE_MOE:
+        del stacked_moe
     print("  done loading (unified)", file=sys.stderr)
     return embed, final_norm, weights, caches
 
