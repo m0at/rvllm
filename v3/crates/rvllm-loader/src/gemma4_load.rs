@@ -322,39 +322,116 @@ pub fn load_gemma4_model(
                 };
                 (dummy.clone(), dummy.clone(), dummy.clone(), dummy.clone())
             } else {
-                let qkv_f16_bytes = concat_tensors(
-                    &[&q_tensor, &k_tensor, &v_tensor],
-                    &shards,
-                    model_dir,
-                )?;
-                let qkv = upload_fp8(
-                    arena, "qkv", &qkv_f16_bytes,
-                    &[qkv_rows, arch.hidden_size],
-                    &ln("self_attn.qkv.weight"), model_dir,
-                )?;
-                let o_proj = upload_fp8_from(
-                    arena, "o_proj",
-                    &must_get(&ln("self_attn.o_proj.weight"))?,
-                    &shards, model_dir,
-                )?;
-                let gate_up_f16_bytes = concat_tensors(
-                    &[
-                        &must_get(&ln("mlp.gate_proj.weight"))?,
-                        &must_get(&ln("mlp.up_proj.weight"))?,
-                    ],
-                    &shards, model_dir,
-                )?;
-                let gate_up = upload_fp8(
-                    arena, "gate_up", &gate_up_f16_bytes,
-                    &[2 * arch.intermediate_size, arch.hidden_size],
-                    &ln("mlp.gate_up.weight"), model_dir,
-                )?;
-                let down_proj = upload_fp8_from(
-                    arena, "down_proj",
-                    &must_get(&ln("mlp.down_proj.weight"))?,
-                    &shards, model_dir,
-                )?;
-                (qkv, o_proj, gate_up, down_proj)
+                let split_fp8 = std::env::var("RVLLM_SPLIT_QKV").map_or(true, |v| v != "0");
+
+                if split_fp8 {
+                    // Split quantization: Q, K, V get separate per-tensor FP8 scales,
+                    // then concatenate bytes + build a per-row channelscale vector.
+                    let q_f16 = tensor_to_f16_bytes(&q_tensor.1, bytes_of(q_tensor.0, &q_tensor.1), model_dir)?;
+                    let k_f16 = tensor_to_f16_bytes(&k_tensor.1, bytes_of(k_tensor.0, &k_tensor.1), model_dir)?;
+                    let v_f16 = tensor_to_f16_bytes(&v_tensor.1, bytes_of(v_tensor.0, &v_tensor.1), model_dir)?;
+
+                    let q_f32 = f16_bytes_to_f32(&q_f16);
+                    let k_f32 = f16_bytes_to_f32(&k_f16);
+                    let v_f32 = f16_bytes_to_f32(&v_f16);
+
+                    let q_q = quantize_per_tensor_ref(&q_f32);
+                    let k_q = quantize_per_tensor_ref(&k_f32);
+                    let v_q = quantize_per_tensor_ref(&v_f32);
+
+                    if l == 0 {
+                        eprintln!("[loader] split QKV scales: q={:.6e} k={:.6e} v={:.6e}",
+                            q_q.scale, k_q.scale, v_q.scale);
+                    }
+
+                    let q_rows = q_tensor.1.shape[0];
+                    let k_rows = k_tensor.1.shape[0];
+                    let v_rows = v_tensor.1.shape[0];
+
+                    let q_fp8 = quantize_to_fp8_bytes(&q_f32, q_q.scale);
+                    let k_fp8 = quantize_to_fp8_bytes(&k_f32, k_q.scale);
+                    let v_fp8 = quantize_to_fp8_bytes(&v_f32, v_q.scale);
+
+                    let mut fused_bytes = Vec::with_capacity(q_fp8.len() + k_fp8.len() + v_fp8.len());
+                    fused_bytes.extend_from_slice(&q_fp8);
+                    fused_bytes.extend_from_slice(&k_fp8);
+                    fused_bytes.extend_from_slice(&v_fp8);
+
+                    let region = arena.region("qkv", fused_bytes.len(), 16)?;
+                    unsafe { region.copy_from_host(&fused_bytes)? };
+
+                    // Per-row channelscale: each row gets its sub-matrix's scale
+                    let mut chscales: Vec<f32> = Vec::with_capacity(q_rows + k_rows + v_rows);
+                    chscales.extend(std::iter::repeat(q_q.scale).take(q_rows));
+                    chscales.extend(std::iter::repeat(k_q.scale).take(k_rows));
+                    chscales.extend(std::iter::repeat(v_q.scale).take(v_rows));
+                    let cs_bytes: Vec<u8> = chscales.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let cs_r = arena.region("qkv_chscale", cs_bytes.len(), 16)?;
+                    unsafe { cs_r.copy_from_host(&cs_bytes)? };
+
+                    let one = 1.0f32;
+                    let one_r = arena.region("qkv_scale_one", 4, 4)?;
+                    unsafe { one_r.copy_from_host(&one.to_le_bytes())? };
+
+                    let qkv = Fp8Weight {
+                        offset_bytes: region.device_ptr(),
+                        scale_ptr: one_r.device_ptr(),
+                        shape: vec![qkv_rows, arch.hidden_size],
+                        scale: 1.0,
+                        clamp_ppm: 0.0,
+                        dtype: DType::Fp8E4M3,
+                        channelscale_ptr: Some(cs_r.device_ptr()),
+                    };
+
+                    // gate_up: same split treatment
+                    let gate_entry = must_get(&ln("mlp.gate_proj.weight"))?;
+                    let up_entry = must_get(&ln("mlp.up_proj.weight"))?;
+                    let gate_f16 = tensor_to_f16_bytes(&gate_entry.1, bytes_of(gate_entry.0, &gate_entry.1), model_dir)?;
+                    let up_f16 = tensor_to_f16_bytes(&up_entry.1, bytes_of(up_entry.0, &up_entry.1), model_dir)?;
+                    let gate_f32 = f16_bytes_to_f32(&gate_f16);
+                    let up_f32 = f16_bytes_to_f32(&up_f16);
+                    let gate_qq = quantize_per_tensor_ref(&gate_f32);
+                    let up_qq = quantize_per_tensor_ref(&up_f32);
+                    let gate_rows = gate_entry.1.shape[0];
+                    let up_rows = up_entry.1.shape[0];
+                    let gate_fp8 = quantize_to_fp8_bytes(&gate_f32, gate_qq.scale);
+                    let up_fp8_bytes = quantize_to_fp8_bytes(&up_f32, up_qq.scale);
+                    let mut gu_bytes = Vec::with_capacity(gate_fp8.len() + up_fp8_bytes.len());
+                    gu_bytes.extend_from_slice(&gate_fp8);
+                    gu_bytes.extend_from_slice(&up_fp8_bytes);
+                    let gu_r = arena.region("gate_up", gu_bytes.len(), 16)?;
+                    unsafe { gu_r.copy_from_host(&gu_bytes)? };
+                    let mut gu_scales: Vec<f32> = Vec::with_capacity(gate_rows + up_rows);
+                    gu_scales.extend(std::iter::repeat(gate_qq.scale).take(gate_rows));
+                    gu_scales.extend(std::iter::repeat(up_qq.scale).take(up_rows));
+                    let gus_bytes: Vec<u8> = gu_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let gus_r = arena.region("gu_chscale", gus_bytes.len(), 16)?;
+                    unsafe { gus_r.copy_from_host(&gus_bytes)? };
+                    let gu_one_r = arena.region("gu_scale_one", 4, 4)?;
+                    unsafe { gu_one_r.copy_from_host(&one.to_le_bytes())? };
+                    let gate_up = Fp8Weight {
+                        offset_bytes: gu_r.device_ptr(),
+                        scale_ptr: gu_one_r.device_ptr(),
+                        shape: vec![2 * arch.intermediate_size, arch.hidden_size],
+                        scale: 1.0, clamp_ppm: 0.0, dtype: DType::Fp8E4M3,
+                        channelscale_ptr: Some(gus_r.device_ptr()),
+                    };
+
+                    // O-proj and down-proj: single matrix, per-tensor is fine
+                    let o_proj = upload_fp8_from(arena, "o_proj", &must_get(&ln("self_attn.o_proj.weight"))?, &shards, model_dir)?;
+                    let down_proj = upload_fp8_from(arena, "down_proj", &must_get(&ln("mlp.down_proj.weight"))?, &shards, model_dir)?;
+
+                    (qkv, o_proj, gate_up, down_proj)
+                } else {
+                    // Original fused path
+                    let qkv_f16_bytes = concat_tensors(&[&q_tensor, &k_tensor, &v_tensor], &shards, model_dir)?;
+                    let qkv = upload_fp8(arena, "qkv", &qkv_f16_bytes, &[qkv_rows, arch.hidden_size], &ln("self_attn.qkv.weight"), model_dir)?;
+                    let o_proj = upload_fp8_from(arena, "o_proj", &must_get(&ln("self_attn.o_proj.weight"))?, &shards, model_dir)?;
+                    let gate_up_f16_bytes = concat_tensors(&[&must_get(&ln("mlp.gate_proj.weight"))?, &must_get(&ln("mlp.up_proj.weight"))?], &shards, model_dir)?;
+                    let gate_up = upload_fp8(arena, "gate_up", &gate_up_f16_bytes, &[2 * arch.intermediate_size, arch.hidden_size], &ln("mlp.gate_up.weight"), model_dir)?;
+                    let down_proj = upload_fp8_from(arena, "down_proj", &must_get(&ln("mlp.down_proj.weight"))?, &shards, model_dir)?;
+                    (qkv, o_proj, gate_up, down_proj)
+                }
             }
         };
 
