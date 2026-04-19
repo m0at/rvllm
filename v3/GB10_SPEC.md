@@ -157,9 +157,30 @@ Commits in the `rusty_sm121` branch (as of the current state):
       rather than aborting the run. Parser is unit-tested on realistic
       sustained/throttled sample lines; an e2e test self-skips when
       `nvidia-smi` is absent.
-- [ ] Validation: run `fp8_precision_check.py` on GB10 hardware to
-      confirm the FP8 scale tensor axis — the open GPU PPL bug (v3/SPEC)
-      likely interacts with sm_121 in unknown ways.
+- [~] **Partial hardware validation on GB10** —
+      `tests/gb10_hw_smoke.rs` (gated on `gb10,cuda`) runs on the
+      DGX Spark: `CudaContextHandle::init` via primary-context retain
+      succeeds on CUDA 13.2, compute-cap probe returns `(12, 1)` →
+      `CompileTarget::Sm121`, `UnifiedArena` allocates 64 MiB of
+      managed memory and hands out 3 aligned non-overlapping
+      `Region`s. All 61 `sm_121` PTX artifacts build clean with
+      auto-generated SHA-pinned manifest.
+      **Still open:** end-to-end FP8 precision check (`|ref - fp8| / |ref|`
+      vs f16 HGEMM reference) + Gemma-4 PPL on sm_121 — needs the
+      reference path wired up first. Tracked as a follow-up; the
+      bring-up infrastructure this PR lands is what that work will
+      run on top of.
+
+### Upstream fix bundled with this branch
+
+- `CudaContextHandle::init` now uses `cuDevicePrimaryCtxRetain` +
+  `cuCtxSetCurrent` instead of `cuCtxCreate_v2`. Reason: cudarc 0.19
+  only cfg-wraps `cuCtxCreate_v2` for CUDA 11.07..12.09, so the
+  symbol is missing on CUDA 13. Primary-context retain is ABI-stable
+  across CUDA 11/12/13 and is what the CUDA runtime uses internally,
+  so this unblocks the whole `feature = "cuda"` path on CUDA 13
+  hardware — not just the GB10 work. No behavioural change on SM90:
+  rvllm has always held exactly one context for the process lifetime.
 
 ## Non-goals (explicitly not in this branch)
 

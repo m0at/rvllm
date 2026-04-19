@@ -1,14 +1,25 @@
 //! CUDA context initialization.
 //!
 //! Called once at engine init. Under `feature = "cuda"`, drives
-//! `cuInit(0)` + `cuDeviceGet` + `cuCtxCreate_v2`. Under no-cuda it's
-//! a trivial host value so the types compile.
+//! `cuInit(0)` + `cuDeviceGet` + primary-context retain. Under no-cuda
+//! it's a trivial host value so the types compile.
+//!
+//! Uses `cuDevicePrimaryCtxRetain` + `cuCtxSetCurrent` instead of
+//! legacy `cuCtxCreate_v2`. Rationale: cudarc 0.19 only cfg-wraps
+//! `cuCtxCreate_v2` for CUDA toolkits 11.07..12.09, so building with
+//! `feature = "cuda"` on a CUDA 13 host fails to resolve that symbol.
+//! Primary-context retain is the modern API (what the CUDA runtime
+//! itself uses), has no cudarc cfg gate, and is ABI-stable across
+//! CUDA 11 / 12 / 13. No behavioural change for the engine — rvllm
+//! uses exactly one context for the lifetime of the process anyway.
 
 use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 
 #[derive(Debug)]
 pub struct CudaContextHandle {
     pub(crate) device: i32,
+    #[cfg(feature = "cuda")]
+    pub(crate) cu_device: cudarc::driver::sys::CUdevice,
     #[cfg(feature = "cuda")]
     pub(crate) _ctx: cudarc::driver::sys::CUcontext,
     // Pin to creating thread — context is not Send/Sync.
@@ -46,15 +57,36 @@ impl CudaContextHandle {
                 },
             ));
         }
+        // Retain the primary context (ref-counted; Release in Drop) and
+        // make it current on this thread. Modern replacement for
+        // `cuCtxCreate_v2` — see module docs.
         let mut ctx: CUcontext = std::ptr::null_mut();
-        let r = unsafe { cuCtxCreate_v2(&mut ctx, 0, dev) };
+        let r = unsafe { cuDevicePrimaryCtxRetain(&mut ctx, dev) };
         if r != CUresult::CUDA_SUCCESS {
             return Err(RvllmError::cuda(
-                "cuCtxCreate_v2",
+                "cuDevicePrimaryCtxRetain",
                 CudaErrorKind::Other,
                 CudaCtx {
                     stream: 0,
-                    kernel: "cuCtxCreate_v2",
+                    kernel: "cuDevicePrimaryCtxRetain",
+                    launch: None,
+                    device,
+                },
+            ));
+        }
+        let r = unsafe { cuCtxSetCurrent(ctx) };
+        if r != CUresult::CUDA_SUCCESS {
+            // Release the ref we just took so we don't leak on the
+            // error path.
+            unsafe {
+                let _ = cuDevicePrimaryCtxRelease_v2(dev);
+            }
+            return Err(RvllmError::cuda(
+                "cuCtxSetCurrent",
+                CudaErrorKind::Other,
+                CudaCtx {
+                    stream: 0,
+                    kernel: "cuCtxSetCurrent",
                     launch: None,
                     device,
                 },
@@ -62,6 +94,7 @@ impl CudaContextHandle {
         }
         Ok(Self {
             device,
+            cu_device: dev,
             _ctx: ctx,
             _not_send_sync: core::marker::PhantomData,
         })
@@ -78,6 +111,8 @@ impl CudaContextHandle {
     pub fn host_stub() -> Self {
         Self {
             device: -1,
+            #[cfg(feature = "cuda")]
+            cu_device: 0,
             #[cfg(feature = "cuda")]
             _ctx: std::ptr::null_mut(),
             _not_send_sync: core::marker::PhantomData,
@@ -176,8 +211,11 @@ impl CudaContextHandle {
 impl Drop for CudaContextHandle {
     fn drop(&mut self) {
         if !self._ctx.is_null() {
+            // Release our ref on the primary context (matches the
+            // Retain in `init`). The host_stub path leaves cu_device=0
+            // and _ctx=null, so this branch never runs for stubs.
             unsafe {
-                let _ = cudarc::driver::sys::cuCtxDestroy_v2(self._ctx);
+                let _ = cudarc::driver::sys::cuDevicePrimaryCtxRelease_v2(self.cu_device);
             }
         }
     }

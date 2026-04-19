@@ -20,7 +20,6 @@
 //!     up — their allocation path is `cuMemAlloc_v2` + HBM.
 
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 
