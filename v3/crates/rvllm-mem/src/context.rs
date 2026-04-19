@@ -81,37 +81,40 @@ impl CudaContextHandle {
         if unsafe { cuDeviceGet(&mut dev, device) } != CUresult::CUDA_SUCCESS {
             return Err(cuda_err("cuDeviceGet", device));
         }
-
-        // Read compute capability now — it's immutable for the
-        // device, and downstream code (arch resolver, kernel picker)
-        // asks repeatedly. One FFI round trip at init beats one per
-        // call site forever.
-        let cc_major = device_attr(
-            dev,
-            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-            device,
-            "cuDeviceGetAttribute(CC_MAJOR)",
-        )?;
-        let cc_minor = device_attr(
-            dev,
-            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-            device,
-            "cuDeviceGetAttribute(CC_MINOR)",
-        )?;
-
         // Retain the primary context (ref-counted; Release in Drop) and
         // make it current on this thread. Modern replacement for
         // `cuCtxCreate_v2` — see module docs.
         let mut ctx: CUcontext = std::ptr::null_mut();
-        if unsafe { cuDevicePrimaryCtxRetain(&mut ctx, dev) } != CUresult::CUDA_SUCCESS {
-            return Err(cuda_err("cuDevicePrimaryCtxRetain", device));
+        let r = unsafe { cuDevicePrimaryCtxRetain(&mut ctx, dev) };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::cuda(
+                "cuDevicePrimaryCtxRetain",
+                CudaErrorKind::Other,
+                CudaCtx {
+                    stream: 0,
+                    kernel: "cuDevicePrimaryCtxRetain",
+                    launch: None,
+                    device,
+                },
+            ));
         }
-        if unsafe { cuCtxSetCurrent(ctx) } != CUresult::CUDA_SUCCESS {
-            // Release the ref we just took so we don't leak on error.
+        let r = unsafe { cuCtxSetCurrent(ctx) };
+        if r != CUresult::CUDA_SUCCESS {
+            // Release the ref we just took so we don't leak on the
+            // error path.
             unsafe {
                 let _ = cuDevicePrimaryCtxRelease_v2(dev);
             }
-            return Err(cuda_err("cuCtxSetCurrent", device));
+            return Err(RvllmError::cuda(
+                "cuCtxSetCurrent",
+                CudaErrorKind::Other,
+                CudaCtx {
+                    stream: 0,
+                    kernel: "cuCtxSetCurrent",
+                    launch: None,
+                    device,
+                },
+            ));
         }
         Ok(Self {
             device,
