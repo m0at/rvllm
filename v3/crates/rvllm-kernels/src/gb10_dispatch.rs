@@ -106,16 +106,23 @@ pub fn regime_from_elapsed(elapsed_since_warmup: Duration) -> ClockRegime {
 
 /// Clock-probe heuristic: classify a measured SM clock in MHz.
 ///
-/// Thresholds are set generously around the two known firmware
-/// plateaus (507 / 851) so jitter doesn't flip the regime every
-/// iteration.
+/// The two plateaus originally documented (507 MHz throttled /
+/// 851 MHz sustained) came from PR #28's reporter environment. On
+/// this DGX Spark with driver 595.58.03 / CUDA 13.2 the SM clock
+/// instead sits around **~2520 MHz** under both idle and sustained
+/// GEMV load (see `v3/GB10_SPEC.md`, "Empirical numbers"). The
+/// threshold is set at **1500 MHz**: well above anything that would
+/// be called a "throttled" regime on any Blackwell consumer part,
+/// and well below the observed ~2500 MHz sustained. If a future
+/// firmware revision revives the PR #28 throttle plateaus, a
+/// reading in the 500-850 MHz range still classifies as `Throttled`.
 pub fn regime_from_clock_mhz(sm_clock_mhz: u32) -> ClockRegime {
-    if sm_clock_mhz >= 700 {
-        ClockRegime::Sustained
-    } else if sm_clock_mhz > 0 {
-        ClockRegime::Throttled
-    } else {
+    if sm_clock_mhz == 0 {
         ClockRegime::Unknown
+    } else if sm_clock_mhz >= 1500 {
+        ClockRegime::Sustained
+    } else {
+        ClockRegime::Throttled
     }
 }
 
@@ -171,14 +178,22 @@ mod tests {
 
     #[test]
     fn clock_heuristic_plateaus() {
-        // 507 MHz throttle regime.
-        assert_eq!(regime_from_clock_mhz(507), ClockRegime::Throttled);
-        // Just below the sustained threshold.
-        assert_eq!(regime_from_clock_mhz(699), ClockRegime::Throttled);
-        // Sustained plateau.
-        assert_eq!(regime_from_clock_mhz(851), ClockRegime::Sustained);
         // Zero = no probe data available.
         assert_eq!(regime_from_clock_mhz(0), ClockRegime::Unknown);
+
+        // PR #28 historical plateau: 507 MHz → still `Throttled`.
+        assert_eq!(regime_from_clock_mhz(507), ClockRegime::Throttled);
+        // PR #28 historical plateau: 851 MHz → still `Throttled`
+        // under the 1500 MHz boundary (well below observed sustained).
+        assert_eq!(regime_from_clock_mhz(851), ClockRegime::Throttled);
+
+        // Just below the 1500 MHz boundary.
+        assert_eq!(regime_from_clock_mhz(1499), ClockRegime::Throttled);
+        // At the boundary.
+        assert_eq!(regime_from_clock_mhz(1500), ClockRegime::Sustained);
+
+        // Observed DGX Spark GEMV-load clock (~2520 MHz in bench).
+        assert_eq!(regime_from_clock_mhz(2520), ClockRegime::Sustained);
     }
 
     #[test]

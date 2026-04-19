@@ -2,12 +2,20 @@
 # Usage:
 #   ~/.venv/bin/python3 v3/tools/fp8_precision_check.py [sm_xxx]
 #
-# Validates kernels/<sm_xxx>/fp8_gemv.ptx against a torch reference.
-# Loads the PTX via cuda-python's driver bindings, allocates managed
-# memory, uploads random FP8 weights + scales + f32 input, runs
-# `fp8_gemv_blockwise_wpr_lut_kernel`, DtoH's the output, computes the
-# same GEMV in fp64 on CPU (fully dequantised reference), and reports
-# max / mean relative + absolute error.
+# Validates kernels/<sm_xxx>/fp8_gemv.ptx against a pure-numpy reference.
+# Loads the PTX via cuda-python's driver bindings, allocates device
+# memory, uploads random FP8 weights + scales + f32 input, runs both
+# warp-per-row variants —
+#   * `fp8_gemv_blockwise_wpr_lut_kernel`   (runs on every arch)
+#   * `fp8_gemv_blockwise_wpr_native_kernel` (sm_100+ only,
+#                                             uses cvt.rn.f16x2.e4m3x2)
+# — DtoH's the output of each, computes the same GEMV in fp64 on CPU
+# (fully dequantised reference), and reports max / mean relative +
+# absolute error. Both variants must pass.
+#
+# The two kernels use independent decode paths (shared-memory LUT vs
+# native Blackwell PTX instruction) — a bug in one will NOT show up in
+# the other, which is why we test both against the same reference.
 #
 # Why this test exists:
 #   * GB10 has no reference FP8 GEMM in cuBLAS we can compare against
@@ -70,8 +78,19 @@ print(f"device: cc {cc_major}.{cc_minor}, PTX: {PTX.name} ({ARCH})")
 
 ptx_bytes = PTX.read_bytes() + b"\0"
 mod = CHECK(drv.cuModuleLoadData(ptx_bytes), "cuModuleLoadData")
-fn = CHECK(drv.cuModuleGetFunction(mod, b"fp8_gemv_blockwise_wpr_lut_kernel"),
-           "cuModuleGetFunction")
+
+ENTRY_POINTS = [
+    b"fp8_gemv_blockwise_wpr_lut_kernel",
+    b"fp8_gemv_blockwise_wpr_native_kernel",
+]
+fns = {}
+for e in ENTRY_POINTS:
+    try:
+        fns[e] = CHECK(drv.cuModuleGetFunction(mod, e), "cuModuleGetFunction")
+    except SystemExit:
+        # Native kernel is gated `#if __CUDA_ARCH__ >= 1000`; on
+        # sm_80/sm_89/sm_90 the PTX omits the symbol. Report and skip.
+        print(f"  skip {e.decode()}: not present in {ARCH} PTX")
 
 # -------- Test case ---------------------------------------------------------
 # Blockwise scales: one scalar per (128-row block, 128-col block).
@@ -154,72 +173,71 @@ params = [
 ]
 param_ptrs = np.array([p.ctypes.data for p in params], dtype=np.uint64)
 
-CHECK(drv.cuLaunchKernel(
-    fn,
-    grid_x, M, 1,
-    block_x, 1, 1,
-    0,                       # shared mem
-    0,                       # default stream
-    param_ptrs.ctypes.data,  # kernel_params
-    0,                       # extra
-), "cuLaunchKernel")
-CHECK(drv.cuCtxSynchronize(), "cuCtxSynchronize")
-
-# -------- DtoH + compare ----------------------------------------------------
-
-out = np.empty((M, N), dtype=np.float32)
-CHECK(drv.cuMemcpyDtoH(out.ctypes.data, d_output, out.nbytes), "DtoH")
-
-abs_err = np.abs(out - ref)
-# Pointwise rel-err blows up on near-zero cells due to cancellation —
-# that's a property of the input, not the kernel. The stable signal is
-# abs_err normalised by the *typical* output magnitude.
-ref_mean_abs = float(np.abs(ref).mean())
-scale_rel = abs_err / max(ref_mean_abs, 1e-30)
-
-# Per-cell rel-err is still useful as a diagnostic, just not as a gate.
-denom = np.maximum(np.abs(ref), ref_mean_abs * 1e-3)  # floor at 0.1% of mean
-rel_err = abs_err / denom
-
-print(f"shapes: M={M} N={N} K={K}  scales=[{BN},{BK}]")
-print(f"ref    range: [{ref.min():+.4e}, {ref.max():+.4e}], |ref| mean {ref_mean_abs:.4e}")
-print(f"kernel range: [{out.min():+.4e}, {out.max():+.4e}]")
-print(f"abs_err:        max {abs_err.max():.4e}  mean {abs_err.mean():.4e}")
-print(f"scale_rel:      max {scale_rel.max():.4e}  mean {scale_rel.mean():.4e}   (abs_err / mean|ref|)")
-print(f"rel_err floored:max {rel_err.max():.4e}  mean {rel_err.mean():.4e}   (floor 0.1%*mean|ref|)")
-
-# Per-row rel-err + scale-axis-bug detector.
-# If the kernel indexes `scale[col_block, row_block]` (wrong axis), the
-# per-128-row-band mean error becomes bimodal instead of uniform.
-row_rel = rel_err.reshape(-1, N)[0]  # M=1
-worst_rows = np.argsort(row_rel)[-5:][::-1]
-print("worst 5 rows: " + ", ".join(f"{r}: {row_rel[r]:.3e}" for r in worst_rows))
-
-band_means = np.array([row_rel[b * 128 : (b + 1) * 128].mean() for b in range(BN)])
-band_max = band_means.max()
-band_min = band_means.min()
-band_ratio = band_max / max(band_min, 1e-30)
-print(f"band mean rel_err (per 128-row block): {band_means}")
-print(f"band max/min ratio: {band_ratio:.2f}  (axis-bug signal if >> 1)")
-
-# Gate on the cancellation-robust metric (scale_rel) + the axis-bug band
-# ratio. f32 accumulation floor for K=512 is ~sqrt(K)*eps ≈ 2.7e-6, so
+# Gate thresholds (cancellation-robust scale_rel + axis-bug band ratio)
+# f32 accumulation floor for K=512 is ~sqrt(K)*eps ≈ 2.7e-6, so
 # scale_rel up to ~1e-4 is normal f32 noise; we gate at 1e-3.
 THRESHOLD_SCALE_REL = 1e-3
 THRESHOLD_BAND_RATIO = 5.0
 
-fail = []
-if scale_rel.max() > THRESHOLD_SCALE_REL:
-    fail.append(
-        f"max scale_rel {scale_rel.max():.4e} > {THRESHOLD_SCALE_REL:.0e}"
-    )
-if band_ratio > THRESHOLD_BAND_RATIO:
-    fail.append(
-        f"band max/min ratio {band_ratio:.2f} > {THRESHOLD_BAND_RATIO} "
-        "(possible scale-axis bug)"
-    )
-if fail:
-    print("\nFAIL: " + "; ".join(fail))
+def run_and_check(entry: bytes, fn) -> bool:
+    """Launch `fn` and compare against the fp64 reference.
+    Returns True on pass, False on fail; prints a per-variant summary."""
+    # Zero the output so a short kernel doesn't leave stale data
+    # from the previous variant's launch.
+    CHECK(drv.cuMemsetD8(d_output, 0, M * N * 4), "cuMemsetD8")
+    CHECK(drv.cuLaunchKernel(
+        fn,
+        grid_x, M, 1,
+        block_x, 1, 1,
+        0, 0,
+        param_ptrs.ctypes.data,
+        0,
+    ), f"cuLaunchKernel({entry.decode()})")
+    CHECK(drv.cuCtxSynchronize(), "cuCtxSynchronize")
+
+    out = np.empty((M, N), dtype=np.float32)
+    CHECK(drv.cuMemcpyDtoH(out.ctypes.data, d_output, out.nbytes), "DtoH")
+
+    abs_err = np.abs(out - ref)
+    ref_mean_abs = float(np.abs(ref).mean())
+    scale_rel = abs_err / max(ref_mean_abs, 1e-30)
+    denom = np.maximum(np.abs(ref), ref_mean_abs * 1e-3)
+    rel_err = abs_err / denom
+
+    row_rel = rel_err.reshape(-1, N)[0]
+    band_means = np.array([row_rel[b * 128 : (b + 1) * 128].mean() for b in range(BN)])
+    band_ratio = float(band_means.max() / max(band_means.min(), 1e-30))
+
+    print(f"\n--- {entry.decode()} ---")
+    print(f"kernel range: [{out.min():+.4e}, {out.max():+.4e}]   ref |·|mean {ref_mean_abs:.4e}")
+    print(f"abs_err:    max {abs_err.max():.4e}  mean {abs_err.mean():.4e}")
+    print(f"scale_rel:  max {scale_rel.max():.4e}  mean {scale_rel.mean():.4e}   (abs_err / mean|ref|)")
+    print(f"band mean rel_err per 128-row block: {band_means}")
+    print(f"band max/min ratio: {band_ratio:.2f}  (axis-bug signal if >> 1)")
+
+    fails = []
+    if scale_rel.max() > THRESHOLD_SCALE_REL:
+        fails.append(f"max scale_rel {scale_rel.max():.4e} > {THRESHOLD_SCALE_REL:.0e}")
+    if band_ratio > THRESHOLD_BAND_RATIO:
+        fails.append(
+            f"band max/min ratio {band_ratio:.2f} > {THRESHOLD_BAND_RATIO} (axis-bug signal)"
+        )
+    if fails:
+        print(f"  FAIL: " + "; ".join(fails))
+        return False
+    print(f"  OK: scale_rel.max {scale_rel.max():.4e} <= {THRESHOLD_SCALE_REL:.0e}, "
+          f"band ratio {band_ratio:.2f} <= {THRESHOLD_BAND_RATIO}")
+    return True
+
+print(f"\nshapes: M={M} N={N} K={K}  scales=[{BN},{BK}]")
+print(f"ref range: [{ref.min():+.4e}, {ref.max():+.4e}]")
+
+results = {entry.decode(): run_and_check(entry, fn) for entry, fn in fns.items()}
+
+print("\n" + "=" * 60)
+all_pass = all(results.values())
+for name, ok in results.items():
+    print(f"  {'OK  ' if ok else 'FAIL'}  {name}")
+if not all_pass:
     sys.exit(1)
-print(f"\nOK: scale_rel.max {scale_rel.max():.4e} <= {THRESHOLD_SCALE_REL:.0e}, "
-      f"band ratio {band_ratio:.2f} <= {THRESHOLD_BAND_RATIO}")
+print("\nall variants pass")

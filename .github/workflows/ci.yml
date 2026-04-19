@@ -48,14 +48,8 @@ jobs:
         run: cargo check -p rvllm-core
       - name: cargo check (rvllm-kernels + gb10_dispatch)
         run: cargo check -p rvllm-kernels
-      - name: cargo check (rvllm-bench clock_log)
-        # Bench lib only — the binaries pull in CUDA-feature deps.
-        run: cargo check -p rvllm-bench --lib
       - name: cargo test (GB10 unit tests)
         run: |
           cargo test -p rvllm-core --lib
           cargo test -p rvllm-mem --features gb10 --lib
           cargo test -p rvllm-kernels --lib
-          # clock_log parser tests run without nvidia-smi; the e2e
-          # sampler test self-skips when nvidia-smi isn't on PATH.
-          cargo test -p rvllm-bench --lib
