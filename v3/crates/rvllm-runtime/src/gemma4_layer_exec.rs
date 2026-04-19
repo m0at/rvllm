@@ -150,6 +150,7 @@ pub struct Gemma4LayerKernels {
     pub scale_cols_f32: KernelFn,
     pub compute_qkv_scales: KernelFn,
     pub fused_gelu_mul_f16: KernelFn,
+    pub fused_rope_partial_f16kv: KernelFn,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -352,41 +353,11 @@ pub unsafe fn gemma4_forward(
     #[cfg(feature = "cuda")]
     probe!("step3_k_norm", scratch.k_normed, dims.hidden);
 
-    // 4. Partial RoPE + FP8 quantize Q + paged KV cache write
-    gemma4_launcher::FusedRopePartialFp8KvLaunch {
-        num_tokens: dims.num_tokens,
-        num_heads: dims.num_heads,
-        num_kv_heads: dims.num_kv_heads,
-        head_dim: dims.head_dim,
-        rotary_dim: dims.rotary_dim,
-    }
-    .launch(
-        kernels.fused_rope_partial_fp8kv,
-        scratch.q_normed,
-        scratch.k_normed,
-        scratch.v_out,
-        scratch.q_fp8,
-        scratch.k_cache,
-        scratch.v_cache,
-        meta.cos,
-        meta.sin,
-        meta.positions,
-        meta.slot_mapping,
-        scratch.q_scale_ptr,
-        scratch.kv_scale_ptr,
-        stream,
-    )?;
-
-    // 5. Attention backend selection:
-    //    - sliding layers: FA3 SM90 at head_dim=256
-    //    - global layers: fallback paged attention at head_dim=512
-    // For sliding layers: context_lens should be clamped to
-    // min(real_ctx, sliding_window) by the scheduler before this call.
+    // 4-5. RoPE + attention (F16 or FP8 KV cache)
     let attention = match dims.layer_type {
         Gemma4LayerType::SlidingAttention => sliding_attention,
         Gemma4LayerType::GlobalAttention => global_attention,
     };
-    let decode = PagedDecodeFp8Launcher::new(attention);
     let window_size_left: i32 = match dims.layer_type {
         Gemma4LayerType::SlidingAttention => (dims.sliding_window as i32) - 1,
         Gemma4LayerType::GlobalAttention => -1,
@@ -402,36 +373,122 @@ pub unsafe fn gemma4_forward(
         scale: dims.attn_scale,
         window_size_left,
     };
-    decode.launch(
-        decode_params,
-        scratch.attn_out,
-        scratch.q_fp8,
-        scratch.k_cache,
-        scratch.v_cache,
-        meta.block_tables,
-        meta.context_lens,
-        scratch.fa3_workspace,
-        scratch.q_scale_ptr,
-        scratch.kv_scale_ptr,
-        scratch.kv_scale_ptr,
-        stream,
-    )?;
+
+    #[cfg(feature = "cuda")]
+    if weights.down_f16 != 0 {
+        // F16 KV cache path: RoPE outputs F16 Q and F16 KV cache
+        {
+            let mut q_in = scratch.q_normed;
+            let mut k_in = scratch.k_normed;
+            let mut v_in = scratch.v_out;
+            let mut q_out = scratch.q_normed; // in-place for Q (RoPE doesn't change size)
+            let mut k_cache = scratch.k_cache;
+            let mut v_cache = scratch.v_cache;
+            let mut cos = meta.cos;
+            let mut sin = meta.sin;
+            let mut positions = meta.positions;
+            let mut slot_mapping = meta.slot_mapping;
+            let mut nt = dims.num_tokens as i32;
+            let mut nh = dims.num_heads as i32;
+            let mut nkvh = dims.num_kv_heads as i32;
+            let mut hd = dims.head_dim as i32;
+            let mut rd = dims.rotary_dim as i32;
+            let args = [
+                (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+                (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+                (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let max_heads = dims.num_heads.max(dims.num_kv_heads);
+            let grid = (dims.num_tokens, max_heads, 1);
+            let block = ((dims.head_dim / 2).max(32), 1, 1);
+            rvllm_fused::launch_raw(
+                kernels.fused_rope_partial_f16kv, grid, block, 0, stream, &args,
+            )?;
+        }
+        // F16 attention (no FP8 scales needed)
+        let decode = rvllm_attention::PagedDecodeLauncher::new(attention);
+        decode.launch(
+            decode_params,
+            scratch.attn_out,
+            scratch.q_normed, // F16 Q (RoPE applied in-place)
+            scratch.k_cache,
+            scratch.v_cache,
+            meta.block_tables,
+            meta.context_lens,
+            scratch.fa3_workspace,
+            stream,
+        )?;
+    } else {
+        // FP8 KV cache path (original)
+        gemma4_launcher::FusedRopePartialFp8KvLaunch {
+            num_tokens: dims.num_tokens,
+            num_heads: dims.num_heads,
+            num_kv_heads: dims.num_kv_heads,
+            head_dim: dims.head_dim,
+            rotary_dim: dims.rotary_dim,
+        }
+        .launch(
+            kernels.fused_rope_partial_fp8kv,
+            scratch.q_normed,
+            scratch.k_normed,
+            scratch.v_out,
+            scratch.q_fp8,
+            scratch.k_cache,
+            scratch.v_cache,
+            meta.cos,
+            meta.sin,
+            meta.positions,
+            meta.slot_mapping,
+            scratch.q_scale_ptr,
+            scratch.kv_scale_ptr,
+            stream,
+        )?;
+        let decode = PagedDecodeFp8Launcher::new(attention);
+        decode.launch(
+            decode_params,
+            scratch.attn_out,
+            scratch.q_fp8,
+            scratch.k_cache,
+            scratch.v_cache,
+            meta.block_tables,
+            meta.context_lens,
+            scratch.fa3_workspace,
+            scratch.q_scale_ptr,
+            scratch.kv_scale_ptr,
+            scratch.kv_scale_ptr,
+            stream,
+        )?;
+    }
 
     #[cfg(feature = "cuda")]
     probe!("step5_attn_out", scratch.attn_out, q_dim);
 
-    // 6. quantize attn_out -> fp8 per-token
-    rvllm_fused::QuantizeFp8PerTokenLaunch {
-        num_tokens: dims.num_tokens,
-        dim: q_dim,
+    // 6. quantize attn_out -> fp8 per-token (skip in F16 mode)
+    if weights.down_f16 == 0 {
+        rvllm_fused::QuantizeFp8PerTokenLaunch {
+            num_tokens: dims.num_tokens,
+            dim: q_dim,
+        }
+        .launch(
+            kernels.quantize_fp8_per_token,
+            scratch.attn_out_fp8,
+            scratch.attn_out_scale,
+            scratch.attn_out,
+            stream,
+        )?;
     }
-    .launch(
-        kernels.quantize_fp8_per_token,
-        scratch.attn_out_fp8,
-        scratch.attn_out_scale,
-        scratch.attn_out,
-        stream,
-    )?;
 
     // 7. O proj -> F32 tmp -> BF16 delta buffer
     #[cfg(feature = "cuda")]

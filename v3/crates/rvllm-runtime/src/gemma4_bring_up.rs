@@ -48,6 +48,7 @@ pub struct Gemma4FusedModules {
     pub scale_cols_f32_mod: LoadedModule,
     pub compute_qkv_scales_mod: LoadedModule,
     pub fused_gelu_mul_f16_mod: LoadedModule,
+    pub fused_rope_partial_f16kv_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
@@ -67,6 +68,7 @@ pub struct Gemma4FusedModules {
     pub fn_scale_cols_f32: KernelFn,
     pub fn_compute_qkv_scales: KernelFn,
     pub fn_fused_gelu_mul_f16: KernelFn,
+    pub fn_fused_rope_partial_f16kv: KernelFn,
 }
 
 pub struct Gemma4Bringup {
@@ -211,6 +213,7 @@ impl Gemma4Bringup {
 
         // Uniform KV dim across layer types (sliding 16*256=4096, global 4*512=2048 but
         // k_eq_v doubles it back). Use max for allocation.
+        let kv_bytes_per_elem: u32 = 1; // bench path always FP8
         let kv_elem_per_layer = 2 * num_blocks_total * block_size * max_nkvh * max_hd;
         let kv_cache = arena.region(
             "kv_cache",
@@ -307,8 +310,9 @@ impl Gemma4Bringup {
 
                 let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
                 let v_out = k_out + (num_seqs as u64) * (kv_dim as u64) * 2;
+                let kv_layer_bytes = (kv_elem_per_layer as u64) * (kv_bytes_per_elem as u64);
                 let layer_kv_base = kv_cache.device_ptr()
-                    + (layer_idx as u64) * (kv_elem_per_layer as u64);
+                    + (layer_idx as u64) * kv_layer_bytes;
 
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (
@@ -357,7 +361,7 @@ impl Gemma4Bringup {
                     k_normed: k_normed.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
-                    v_cache: layer_kv_base + (kv_elem_per_layer / 2) as u64,
+                    v_cache: layer_kv_base + kv_layer_bytes / 2,
                     q_scale_ptr: q_scale_region.device_ptr(),
                     kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
@@ -526,16 +530,12 @@ impl Gemma4Bringup {
         let gemm_f32_max_n = std::cmp::max(max_qkv_rows, 2 * inter);
         let gemm_f32_tmp = arena.region("gemm_f32_tmp_ppl", (num_seqs * gemm_f32_max_n * 4) as usize, 16)?;
 
+        let f16_only = std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1");
+        let kv_bytes_per_elem: u32 = if f16_only { 2 } else { 1 };
         let kv_elem_per_layer = 2 * num_blocks_total * block_size * max_nkvh * max_hd;
-        let kv_cache = arena.region(
-            "kv_cache",
-            (arch.num_hidden_layers as u64 * kv_elem_per_layer as u64) as usize,
-            256,
-        )?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            kv_cache.device_ptr(), 0,
-            (arch.num_hidden_layers as u64 * kv_elem_per_layer as u64) as usize,
-        );
+        let kv_cache_bytes = arch.num_hidden_layers as u64 * kv_elem_per_layer as u64 * kv_bytes_per_elem as u64;
+        let kv_cache = arena.region("kv_cache", kv_cache_bytes as usize, 256)?;
+        cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_cache_bytes as usize);
 
         let q_scale_region = arena.region("q_scale", 4, 4)?;
         let kv_scale_region = arena.region("kv_scale", 4, 4)?;
@@ -608,8 +608,9 @@ impl Gemma4Bringup {
 
                 let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
                 let v_out = k_out + (num_seqs as u64) * (kv_dim as u64) * 2;
+                let kv_layer_bytes = (kv_elem_per_layer as u64) * (kv_bytes_per_elem as u64);
                 let layer_kv_base = kv_cache.device_ptr()
-                    + (layer_idx as u64) * (kv_elem_per_layer as u64);
+                    + (layer_idx as u64) * kv_layer_bytes;
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (
                         self.model.rope_cos_sliding.offset_bytes,
@@ -657,7 +658,7 @@ impl Gemma4Bringup {
                     k_normed: k_normed.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
-                    v_cache: layer_kv_base + (kv_elem_per_layer / 2) as u64,
+                    v_cache: layer_kv_base + kv_layer_bytes / 2,
                     q_scale_ptr: q_scale_region.device_ptr(),
                     kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
@@ -1139,6 +1140,7 @@ impl Gemma4Bringup {
             scale_cols_f32: self.fused.fn_scale_cols_f32,
             compute_qkv_scales: self.fused.fn_compute_qkv_scales,
             fused_gelu_mul_f16: self.fused.fn_fused_gelu_mul_f16,
+            fused_rope_partial_f16kv: self.fused.fn_fused_rope_partial_f16kv,
         }
     }
 }
@@ -1194,6 +1196,9 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let fused_gelu_mul_f16_mod = loader.load_ptx("fused_gelu_mul_f16")?;
     let fn_fused_gelu_mul_f16 = fused_gelu_mul_f16_mod.get_function("fused_gelu_mul_f16_kernel")?;
 
+    let fused_rope_partial_f16kv_mod = loader.load_ptx("fused_rope_partial_f16kv")?;
+    let fn_fused_rope_partial_f16kv = fused_rope_partial_f16kv_mod.get_function("fused_rope_partial_f16kv_kernel")?;
+
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
         rmsnorm_inplace_mod,
@@ -1213,6 +1218,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         scale_cols_f32_mod,
         compute_qkv_scales_mod,
         fused_gelu_mul_f16_mod,
+        fused_rope_partial_f16kv_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
@@ -1232,5 +1238,6 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_scale_cols_f32,
         fn_compute_qkv_scales,
         fn_fused_gelu_mul_f16,
+        fn_fused_rope_partial_f16kv,
     })
 }
