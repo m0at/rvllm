@@ -108,18 +108,21 @@ Commits in the `rusty_sm121` branch (as of the current state):
 
 ## Still TODO (not in this branch yet)
 
-- [ ] Runtime arch detection: `rvllm-runtime` needs to call
-      `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_*)`,
-      map to `CompileTarget`, and select the matching `kernels/<arch>/`
-      subdirectory at bring_up. Today the v3 runtime hardcodes `sm_90`
-      in the manifest fixtures.
+- [x] ~~Runtime arch detection~~ — `CudaContextHandle::compute_capability()`
+      drives `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_*)`;
+      `bring_up::resolve_kernels_dir` maps the pair to a `CompileTarget`
+      and selects `kernels/<sm_xxx>/manifest.json`. Unsupported CC or
+      missing subdir = hard `ConfigError` at bring-up (no silent fallback).
 - [ ] `UnifiedArena` in `rvllm-mem` behind `feature = "gb10"` — the
       current `HbmArena` assumes dedicated HBM.
 - [ ] Arch-conditional `FA2_BC` — need a `-DFA2_BC=32` branch when
       building for `sm_121` / `sm_100` while SM90 stays at 64.
-- [ ] Manifest entries: SHA-pinning for the three new kernels under
-      `rvllm-kernels/manifest.toml` (and a parallel
-      `manifest_sm_121.toml` once the arch split lands).
+- [x] ~~Manifest SHA-pinning~~ — `kernels/gen_manifest.sh` is invoked
+      from `build.sh` after every per-arch compile loop, writing
+      `kernels/<sm_xxx>/manifest.json` with `{revision, arch, entries}`
+      keyed by PTX stem (matches `KernelLoader::load_ptx(name)`).
+      All new kernels (`fp8_gemv`, `int4_gemv`, `dequant_fp8`) are
+      auto-included.
 - [ ] GB10-specific dispatch policy in `fp8_gemv`: pick between
       `wpr_lut` (throttled) and `wpr_native` (sustained) based on the
       measured clock or a time-window heuristic.

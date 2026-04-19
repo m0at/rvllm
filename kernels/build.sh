@@ -81,6 +81,8 @@ compile_kernel() {
     $NVCC -ptx -arch="$arch" -O3 $extra_flags -o "$ptx" "$cu" 2>/dev/null
 }
 
+REVISION=$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo "dev")
+
 for arch in $ARCHS; do
     echo "=== Compiling for $arch ==="
     OUTDIR="$DIR/$arch"
@@ -95,6 +97,10 @@ for arch in $ARCHS; do
             echo "  WARNING: $base.cu failed for $arch (may need newer CUDA toolkit)"
         }
     done
+
+    "$DIR/gen_manifest.sh" "$OUTDIR" "$REVISION" || {
+        echo "  WARNING: manifest generation failed for $arch"
+    }
 done
 
 # Also compile a default set (sm_80) in the root for backward compat
