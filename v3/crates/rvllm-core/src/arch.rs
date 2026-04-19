@@ -61,14 +61,6 @@ impl CompileTarget {
         }
     }
 
-    /// Whether this target uses the legacy top-level `kernels/*.ptx` layout
-    /// (default sm_80 artifacts) or the per-arch subdirectory layout.
-    ///
-    /// Currently every target uses the per-arch subdirectory (the top-level
-    /// default is kept only for backward-compat with old bench scripts).
-    pub const fn uses_arch_subdir(self) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]

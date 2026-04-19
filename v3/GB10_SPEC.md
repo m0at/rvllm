@@ -144,89 +144,82 @@ Commits in the `rusty_sm121` branch (as of the current state):
    `round_f32_to_bf16_kernel`). Adds to the file without touching the
    existing kernels.
 
-## Still TODO (not in this branch yet)
+## Landed on this branch
 
-- [x] ~~Runtime arch detection~~ — `CudaContextHandle::compute_capability()`
-      drives `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_*)`;
-      `bring_up::resolve_kernels_dir` maps the pair to a `CompileTarget`
-      and selects `kernels/<sm_xxx>/manifest.json`. Unsupported CC or
-      missing subdir = hard `ConfigError` at bring-up (no silent fallback).
-- [x] ~~`UnifiedArena` in `rvllm-mem`~~ — new module `unified.rs`
-      gated behind `feature = "gb10"` wraps the `HbmArena` bump
-      bookkeeping around a `cuMemAllocManaged(CU_MEM_ATTACH_GLOBAL)`
-      allocation so `Region<'a>` handles stay source-compatible with
-      the HBM path. `cuMemAdvise(SET_PREFERRED_LOCATION)` is deferred
-      (cudarc 0.19 `CUmemLocation` struct shape diverges between
-      CUDA 12 and 13 headers — page-fault migration is correct, just
-      slower on first touch). Bringup wiring to pick `UnifiedArena`
-      vs `HbmArena` by `CompileTarget` is still downstream work.
-- [x] ~~Arch-conditional `FA2_BC`~~ — `kernels/flash_attention.cu`
-      picks `FA2_BC=32` when `__CUDA_ARCH__ >= 1000` (sm_100/sm_121/sm_122)
-      and stays at 64 otherwise. Wrapped in `#ifndef FA2_BC` so an
-      explicit `-DFA2_BC=<n>` on the nvcc command line still wins.
-      Verified via `nvcc -E`: sm_90 expands to 64, sm_121 to 32.
-- [x] ~~Manifest SHA-pinning~~ — `kernels/gen_manifest.sh` is invoked
-      from `build.sh` after every per-arch compile loop, writing
-      `kernels/<sm_xxx>/manifest.json` with `{revision, arch, entries}`
-      keyed by PTX stem (matches `KernelLoader::load_ptx(name)`).
-      All new kernels (`fp8_gemv`, `int4_gemv`, `dequant_fp8`) are
-      auto-included.
-- [x] ~~GB10 fp8_gemv dispatch policy~~ — `rvllm-kernels::gb10_dispatch`
-      exposes `Fp8GemvVariant { WprLut, WprNative }`, the pure
-      `select_variant(ClockRegime)` policy (`Sustained → WprNative`,
-      `Throttled|Unknown → WprLut`), plus two regime-classifier
-      helpers: `regime_from_elapsed(Duration)` (time-window, 2.5 s
-      onset — usable today without NVML) and `regime_from_clock_mhz(u32)`
-      (threshold 700 MHz between the two firmware plateaus). Entry-point
-      symbol names are test-pinned against `kernels/fp8_gemv.cu`.
-      Wiring into the actual kernel-launch path is downstream work
-      (no `fp8_gemv` dispatcher exists on any arch yet).
-- [x] ~~CI compile-check for GB10 path~~ — new `gb10-check` job in
-      `.github/workflows/ci.yml` runs `cargo check` on `rvllm-mem`
-      (with `--features gb10`), `rvllm-core`, and `rvllm-kernels`,
-      followed by their lib tests (43 total across the three crates).
-      No CUDA / no GPU needed; guards that the GB10-specific modules
-      stay mutually consistent. Hardware validation runs off-CI.
-- [x] ~~Bench-harness clock logging~~ — `rvllm_bench::ClockLog` spawns
-      a background thread that shells out to `nvidia-smi
-      --query-gpu=clocks.sm,power.draw` once per second and appends one
-      JSONL record per sample (`{t_ms, clocks_sm_mhz, power_draw_w}`).
-      No NVML dep. Transient nvidia-smi failures get logged inline
-      rather than aborting the run. Parser is unit-tested on realistic
-      sustained/throttled sample lines; an e2e test self-skips when
-      `nvidia-smi` is absent.
-- [x] ~~Hardware validation on GB10~~ — two layers:
-      1. **Rust bring-up smoke** (`tests/gb10_hw_smoke.rs`, gated on
-         `gb10,cuda`): primary-context retain succeeds on CUDA 13.2,
-         compute-cap probe returns `(12, 1)` → `CompileTarget::Sm121`,
-         `UnifiedArena` allocates 64 MiB managed memory, bump
-         allocator hands out aligned non-overlapping `Region`s.
-      2. **FP8-GEMV numerical check** (`v3/tools/fp8_precision_check.py`,
-         cuda-python + numpy): loads `kernels/sm_121/fp8_gemv.ptx`,
-         launches `fp8_gemv_blockwise_wpr_lut_kernel` against random
-         FP8 weights + blockwise scales + f32 input, compares against
-         a pure-numpy fp64 reference that dequantises with the same
-         E4M3 → f32 mapping. Result over 5 seeds on GB10:
-         `scale_rel.max ≤ 9e-5`, `band ratio ≤ 2.0` — well under the
-         `1e-3` / `5.0` gate thresholds. A deliberate scale-axis poison
-         (flip row order in the reference) drives `scale_rel` to `5.0`
-         and FAILs, proving the detector is sensitive to the axis-bug
-         signature from v3/SPEC.
-
-      Gemma-4 PPL end-to-end on sm_121 is a follow-up that needs the
-      runtime's fp8_gemv launch path wired up first (no dispatcher
-      exists yet on any arch — see Punkt 5 caveat).
+1. **Runtime arch detection** — `CudaContextHandle::compute_capability()`
+   drives `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_*)`;
+   `bring_up::resolve_kernels_dir` maps the pair to a `CompileTarget` and
+   selects `kernels/<sm_xxx>/manifest.json`. Unsupported CC or missing
+   subdir = hard `ConfigError` at bring-up (no silent fallback).
+2. **`UnifiedArena` in `rvllm-mem`** — new module `unified.rs` gated
+   behind `feature = "gb10"`, wraps the `HbmArena` bump bookkeeping
+   around `cuMemAllocManaged(CU_MEM_ATTACH_GLOBAL)`. `Region<'a>`
+   handles stay source-compatible with the HBM path.
+3. **Arch-conditional `FA2_BC`** — `kernels/flash_attention.cu` picks
+   `FA2_BC=32` when `__CUDA_ARCH__ >= 1000` and stays at 64 otherwise,
+   behind `#ifndef FA2_BC` so `-DFA2_BC=<n>` still overrides. Verified
+   via `nvcc -E`: sm_90 expands to 64, sm_121 to 32.
+4. **Manifest SHA-pinning** — `kernels/gen_manifest.sh` is invoked from
+   `build.sh` after every per-arch compile loop, writing
+   `kernels/<sm_xxx>/manifest.json` with `{revision, arch, entries}`
+   keyed by PTX stem. All new kernels auto-included.
+5. **`fp8_gemv` dispatch policy** — `rvllm-kernels::gb10_dispatch`
+   exposes `Fp8GemvVariant { WprLut, WprNative }` + pure
+   `select_variant(ClockRegime)` + two regime classifiers
+   (`regime_from_elapsed`, `regime_from_clock_mhz` with 1500 MHz
+   threshold calibrated to observed hardware). Entry-point symbols
+   test-pinned against `kernels/fp8_gemv.cu`.
+6. **CI compile-check** — new `gb10-check` job in
+   `.github/workflows/ci.yml` runs `cargo check` + lib tests for
+   `rvllm-core`, `rvllm-mem --features gb10`, and `rvllm-kernels`
+   (43 tests). No CUDA needed.
+7. **Hardware validation on GB10** — two layers:
+   a. **Rust bring-up smoke** (`tests/gb10_hw_smoke.rs`, gated on
+      `gb10,cuda`, `#[ignore]`): primary-context retain on CUDA 13.2,
+      compute-cap probe → `(12, 1)` → `CompileTarget::Sm121`,
+      `UnifiedArena` 64 MiB managed alloc + 3 non-overlapping regions.
+   b. **FP8-GEMV numerical check** (`v3/tools/fp8_precision_check.py`):
+      launches both `wpr_lut` and `wpr_native` against a pure-numpy
+      fp64 reference. On GB10: `wpr_lut scale_rel.max 7e-5`,
+      `wpr_native 4e-7` — both far under the `1e-3` gate. Axis-bug
+      detector proven sensitive via scale-row-flip poison (drives
+      `scale_rel` to 5.0, triggers FAIL).
+8. **FP8-GEMV microbench** (`v3/tools/fp8_gemv_bench.py`): cuda-events
+   latency + 10 Hz nvidia-smi sampling. Measured on GB10 (driver
+   595.58.03, CUDA 13.2):
+   - Memory-bound (256 MB weight, L2-overflow): all three WPR
+     variants converge to **~240 GB/s ≈ 88% of LPDDR5X peak**.
+   - L2-hot (10.5 MB weight): `wpr_native 20 µs / 518 GB/s` wins 2×
+     against `wpr_lut 41 µs / 257 GB/s`.
+   - Clocks stay at ~2520 MHz throughout; no firmware throttle
+     triggered (see "Power-profile paradox" section for historical
+     PR #28 model).
 
 ### Upstream fix bundled with this branch
 
-- `CudaContextHandle::init` now uses `cuDevicePrimaryCtxRetain` +
-  `cuCtxSetCurrent` instead of `cuCtxCreate_v2`. Reason: cudarc 0.19
-  only cfg-wraps `cuCtxCreate_v2` for CUDA 11.07..12.09, so the
+- `CudaContextHandle::init` uses `cuDevicePrimaryCtxRetain` +
+  `cuCtxSetCurrent` instead of `cuCtxCreate_v2`. cudarc 0.19 only
+  cfg-wraps `cuCtxCreate_v2` for CUDA 11.07..12.09, so the legacy
   symbol is missing on CUDA 13. Primary-context retain is ABI-stable
-  across CUDA 11/12/13 and is what the CUDA runtime uses internally,
-  so this unblocks the whole `feature = "cuda"` path on CUDA 13
-  hardware — not just the GB10 work. No behavioural change on SM90:
-  rvllm has always held exactly one context for the process lifetime.
+  across CUDA 11/12/13, unblocking the whole `feature = "cuda"`
+  path on CUDA 13 — not just the GB10 work. No behavioural change
+  on SM90: rvllm always holds one context for the process lifetime.
+
+## Remaining follow-ups (explicitly NOT on this branch)
+
+- Wire `gb10_dispatch::Fp8GemvVariant` selection into the runtime
+  launch path (no FP8 GEMV dispatcher exists on any arch today).
+- Switch `Bringup::load` to select `UnifiedArena` vs `HbmArena`
+  based on `CompileTarget`, gated by `feature = "gb10"` on the
+  runtime crate.
+- End-to-end Gemma-4 PPL on sm_121 once the launch path is in place.
+- `cuMemAdvise(SET_PREFERRED_LOCATION)` in `UnifiedArena` once
+  cudarc exposes a stable `CUmemLocation` signature across CUDA
+  12/13 (currently deferred — perf optimisation, not correctness).
+- Fix the two pre-existing upstream bugs that still block
+  `cargo check --workspace`: `Gemma4Bringup::{run_ppl, run_bench,
+  run_generate}` missing, and
+  `PagedDecode/PrefillParams.window_size_left` missing.
 
 ## Non-goals (explicitly not in this branch)
 
