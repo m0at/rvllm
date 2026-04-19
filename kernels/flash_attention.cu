@@ -859,6 +859,375 @@ __global__ void flash_attention_2_decode_f16kv_kernel(
     }
 }
 
+// ============================================================================
+// FP8 E4M3 paged-decode variant — matches the PagedDecodeFp8Launcher ABI
+// ============================================================================
+//
+// Drop-in replacement for `fa3_sm90_paged_decode_fp8` on targets where
+// FA3 doesn't apply (sm_121). Q, K, V are all FP8 E4M3 with per-tensor
+// scalar descales; output is f16 to match the FA3 .so ABI.
+//
+// Internal math stays in f32 for numerical stability. On-load dequant
+// per byte:
+//     val_f32 = fp8_e4m3_to_float(byte) * *descale
+// `window_size_left` is accepted but treated as `-1` (full context) for
+// now — sliding-window attention on the FP8-KV path is a follow-up.
+
+__device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
+    // Mirrors `fp8_e4m3_to_float` in kernels/fp8_kv.cu — kept inline here
+    // to avoid a cross-TU include (every .cu compiles stand-alone to PTX
+    // in this project).
+    float sign = (b & 0x80) ? -1.0f : 1.0f;
+    int exp = (b >> 3) & 0xF;
+    int mant = b & 0x7;
+    if (exp == 0) {
+        if (mant == 0) return 0.0f;
+        return sign * (float)mant * 1.953125e-3f; // subnormal: mantissa * 2^-9
+    }
+    // Normal: (1 + mant/8) * 2^(exp - 7)
+    float biased = (1.0f + (float)mant * 0.125f);
+    int e = exp - 7;
+    return sign * biased * ldexpf(1.0f, e);
+}
+
+extern "C"
+__global__ void flash_attention_2_decode_fp8kv_kernel(
+    __half* __restrict__ output,                 // [num_seqs, num_heads, head_dim] f16
+    const unsigned char* __restrict__ query,     // [num_seqs, num_heads, head_dim] fp8
+    const unsigned char* __restrict__ key_cache, // [num_blocks, block_size, num_kv_heads, head_dim] fp8
+    const unsigned char* __restrict__ value_cache,
+    const int* __restrict__ block_tables,        // [num_seqs, max_blocks_per_seq]
+    const int* __restrict__ context_lens,        // [num_seqs]
+    const float* __restrict__ q_descale,         // single scalar
+    const float* __restrict__ k_descale,         // single scalar
+    const float* __restrict__ v_descale,         // single scalar
+    float scale,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq,
+    int /*window_size_left*/                     // TODO: sliding window
+) {
+    const int seq_idx  = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid      = threadIdx.x;
+
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+
+    const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx
+                                                         : (head_idx / (num_heads / num_kv_heads));
+
+    const float q_scale = *q_descale;
+    const float k_scale = *k_descale;
+    const float v_scale = *v_descale;
+
+    extern __shared__ float smem[];
+    float* s_key    = smem;
+    float* s_val    = smem + FA2_BC * head_dim;
+    float* s_score  = smem + 2 * FA2_BC * head_dim;
+    float* s_reduce = smem + 2 * FA2_BC * head_dim + FA2_BC;
+
+    const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
+    const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
+
+    // Load Q row with descale + attention scale folded in.
+    float q_reg[8];
+    for (int r = 0; r < dims_per_thread && r < 8; r++) {
+        int d = tid + r * FA2_THREADS;
+        if (d < head_dim) {
+            unsigned char qb = query[(seq_idx * num_heads + head_idx) * head_dim + d];
+            q_reg[r] = fp8kv_decode_byte(qb) * q_scale * scale;
+        } else {
+            q_reg[r] = 0.0f;
+        }
+    }
+
+    float row_max = -FLT_MAX;
+    float row_sum = 0.0f;
+    float acc[8];
+    for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] = 0.0f;
+
+    for (int tile = 0; tile < num_kv_tiles; tile++) {
+        const int tile_start = tile * FA2_BC;
+        const int tile_len = min(FA2_BC, context_len - tile_start);
+
+        // Load K tile: fp8 cache -> f32 shared mem (apply k_descale on load).
+        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
+            int t = idx / head_dim;
+            int d = idx % head_dim;
+            int kv_pos = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            unsigned char kb = key_cache[
+                ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
+            ];
+            s_key[t * head_dim + d] = fp8kv_decode_byte(kb) * k_scale;
+        }
+        __syncthreads();
+
+        // Q * K^T per tile column.
+        for (int t = 0; t < tile_len; t++) {
+            float dot = 0.0f;
+            for (int r = 0; r < dims_per_thread && r < 8; r++) {
+                int d = tid + r * FA2_THREADS;
+                if (d < head_dim) {
+                    dot += q_reg[r] * s_key[t * head_dim + d];
+                }
+            }
+            dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
+            if (tid == 0) s_score[t] = dot;
+            __syncthreads();
+        }
+
+        // Online softmax update.
+        float tile_max = -FLT_MAX;
+        if (tid == 0) {
+            for (int t = 0; t < tile_len; t++) tile_max = fmaxf(tile_max, s_score[t]);
+            s_reduce[0] = tile_max;
+        }
+        __syncthreads();
+        tile_max = s_reduce[0];
+        __syncthreads();
+
+        float prev_max = row_max;
+        float new_max = fmaxf(row_max, tile_max);
+        if (new_max > prev_max && prev_max > -FLT_MAX) {
+            float correction = expf(prev_max - new_max);
+            for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] *= correction;
+            row_sum *= correction;
+        }
+        row_max = new_max;
+
+        if (tid == 0) {
+            float tsum = 0.0f;
+            for (int t = 0; t < tile_len; t++) {
+                float v = expf(s_score[t] - row_max);
+                s_score[t] = v;
+                tsum += v;
+            }
+            s_reduce[0] = tsum;
+        }
+        __syncthreads();
+        row_sum += s_reduce[0];
+        __syncthreads();
+
+        // Load V tile: fp8 cache -> f32 shared mem (apply v_descale on load).
+        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
+            int t = idx / head_dim;
+            int d = idx % head_dim;
+            int kv_pos = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            unsigned char vb = value_cache[
+                ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
+            ];
+            s_val[t * head_dim + d] = fp8kv_decode_byte(vb) * v_scale;
+        }
+        __syncthreads();
+
+        // Accumulate P * V.
+        for (int r = 0; r < dims_per_thread && r < 8; r++) {
+            int d = tid + r * FA2_THREADS;
+            if (d < head_dim) {
+                float val_acc = 0.0f;
+                for (int t = 0; t < tile_len; t++) {
+                    val_acc += s_score[t] * s_val[t * head_dim + d];
+                }
+                acc[r] += val_acc;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Normalize + cast f32 -> f16 output.
+    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+    for (int r = 0; r < dims_per_thread && r < 8; r++) {
+        int d = tid + r * FA2_THREADS;
+        if (d < head_dim) {
+            output[(seq_idx * num_heads + head_idx) * head_dim + d] =
+                __float2half(acc[r] * inv_sum);
+        }
+    }
+}
+
+// ============================================================================
+// FP8 E4M3 paged-decode variant — BC=16 for head_dim=512 (smem-budget fit)
+// ============================================================================
+//
+// Same kernel as above but with `FA2_BC = 16` instead of the
+// arch-default 32. Needed on sm_121 for Gemma 4 *global-attention*
+// layers (head_dim=512): BC=32 gives a 128 KB smem request, beyond the
+// 99 KB `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`
+// ceiling on Blackwell consumer silicon. BC=16 drops the tile to
+// 64 KB which fits.
+//
+// Dispatcher selects between the two at launch time based on
+// `params.head_dim`. Duplicated rather than templated because all the
+// smem offsets use the BC macro directly and the kernel is already
+// long — one copy-paste-and-rename is the lower-entropy fix.
+
+extern "C"
+__global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
+    __half* __restrict__ output,
+    const unsigned char* __restrict__ query,
+    const unsigned char* __restrict__ key_cache,
+    const unsigned char* __restrict__ value_cache,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ context_lens,
+    const float* __restrict__ q_descale,
+    const float* __restrict__ k_descale,
+    const float* __restrict__ v_descale,
+    float scale,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq,
+    int /*window_size_left*/
+) {
+    const int seq_idx  = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid      = threadIdx.x;
+
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+
+    const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx
+                                                         : (head_idx / (num_heads / num_kv_heads));
+
+    const float q_scale = *q_descale;
+    const float k_scale = *k_descale;
+    const float v_scale = *v_descale;
+
+    extern __shared__ float smem[];
+    // BC=16 layout: [16 * head_dim K tile, 16 * head_dim V tile, 16 scores, smem reduce]
+    float* s_key    = smem;
+    float* s_val    = smem + 16 * head_dim;
+    float* s_score  = smem + 2 * 16 * head_dim;
+    float* s_reduce = smem + 2 * 16 * head_dim + 16;
+
+    const int num_kv_tiles = (context_len + 16 - 1) / 16;
+    const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
+
+    float q_reg[8];
+    for (int r = 0; r < dims_per_thread && r < 8; r++) {
+        int d = tid + r * FA2_THREADS;
+        if (d < head_dim) {
+            unsigned char qb = query[(seq_idx * num_heads + head_idx) * head_dim + d];
+            q_reg[r] = fp8kv_decode_byte(qb) * q_scale * scale;
+        } else {
+            q_reg[r] = 0.0f;
+        }
+    }
+
+    float row_max = -FLT_MAX;
+    float row_sum = 0.0f;
+    float acc[8];
+    for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] = 0.0f;
+
+    for (int tile = 0; tile < num_kv_tiles; tile++) {
+        const int tile_start = tile * 16;
+        const int tile_len = min(16, context_len - tile_start);
+
+        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
+            int t = idx / head_dim;
+            int d = idx % head_dim;
+            int kv_pos = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            unsigned char kb = key_cache[
+                ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
+            ];
+            s_key[t * head_dim + d] = fp8kv_decode_byte(kb) * k_scale;
+        }
+        __syncthreads();
+
+        for (int t = 0; t < tile_len; t++) {
+            float dot = 0.0f;
+            for (int r = 0; r < dims_per_thread && r < 8; r++) {
+                int d = tid + r * FA2_THREADS;
+                if (d < head_dim) {
+                    dot += q_reg[r] * s_key[t * head_dim + d];
+                }
+            }
+            dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
+            if (tid == 0) s_score[t] = dot;
+            __syncthreads();
+        }
+
+        float tile_max = -FLT_MAX;
+        if (tid == 0) {
+            for (int t = 0; t < tile_len; t++) tile_max = fmaxf(tile_max, s_score[t]);
+            s_reduce[0] = tile_max;
+        }
+        __syncthreads();
+        tile_max = s_reduce[0];
+        __syncthreads();
+
+        float prev_max = row_max;
+        float new_max = fmaxf(row_max, tile_max);
+        if (new_max > prev_max && prev_max > -FLT_MAX) {
+            float correction = expf(prev_max - new_max);
+            for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] *= correction;
+            row_sum *= correction;
+        }
+        row_max = new_max;
+
+        if (tid == 0) {
+            float tsum = 0.0f;
+            for (int t = 0; t < tile_len; t++) {
+                float v = expf(s_score[t] - row_max);
+                s_score[t] = v;
+                tsum += v;
+            }
+            s_reduce[0] = tsum;
+        }
+        __syncthreads();
+        row_sum += s_reduce[0];
+        __syncthreads();
+
+        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
+            int t = idx / head_dim;
+            int d = idx % head_dim;
+            int kv_pos = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            unsigned char vb = value_cache[
+                ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
+            ];
+            s_val[t * head_dim + d] = fp8kv_decode_byte(vb) * v_scale;
+        }
+        __syncthreads();
+
+        for (int r = 0; r < dims_per_thread && r < 8; r++) {
+            int d = tid + r * FA2_THREADS;
+            if (d < head_dim) {
+                float val_acc = 0.0f;
+                for (int t = 0; t < tile_len; t++) {
+                    val_acc += s_score[t] * s_val[t * head_dim + d];
+                }
+                acc[r] += val_acc;
+            }
+        }
+        __syncthreads();
+    }
+
+    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+    for (int r = 0; r < dims_per_thread && r < 8; r++) {
+        int d = tid + r * FA2_THREADS;
+        if (d < head_dim) {
+            output[(seq_idx * num_heads + head_idx) * head_dim + d] =
+                __float2half(acc[r] * inv_sum);
+        }
+    }
+}
+
 // Fully f16 I/O variant: f16 query, f16 KV cache, f16 output.
 // All internal math remains f32 for numerical stability.
 // This eliminates the f32<->f16 casts around the attention kernel.

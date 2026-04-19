@@ -636,6 +636,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 name = "rvllm-attention"
 version = "0.3.0"
 dependencies = [
+ "cudarc",
  "libloading 0.8.9",
  "rvllm-core",
  "rvllm-kernels",

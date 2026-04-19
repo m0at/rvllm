@@ -278,6 +278,18 @@ pub struct Fa2PtxKernels {
     pub fn_prefill: rvllm_kernels::KernelFn,
     #[cfg(feature = "cuda")]
     pub fn_prefill_f16kv: rvllm_kernels::KernelFn,
+    /// `flash_attention_2_decode_fp8kv_kernel` — Gemma 4 decode path
+    /// on sm_121, FP8 E4M3 KV cache, f16 output. Matches the
+    /// `PagedDecodeFp8Launcher` ABI. BC=32 variant; used for
+    /// head_dim ≤ 256.
+    #[cfg(feature = "cuda")]
+    pub fn_decode_fp8kv: rvllm_kernels::KernelFn,
+    /// BC=16 variant for head_dim=512 (Gemma 4 global-attention).
+    /// With BC=32 the smem request for head_dim=512 overflows the
+    /// 99 KB opt-in ceiling on sm_121; BC=16 halves the tile to fit.
+    /// Launcher picks between the two based on `params.head_dim`.
+    #[cfg(feature = "cuda")]
+    pub fn_decode_fp8kv_bc16: rvllm_kernels::KernelFn,
 }
 
 impl Fa2PtxKernels {
@@ -311,6 +323,10 @@ impl Fa2PtxKernels {
             let fn_prefill = flash_attention_mod.get_function("flash_attention_2_kernel")?;
             let fn_prefill_f16kv =
                 flash_attention_mod.get_function("flash_attention_2_f16kv_kernel")?;
+            let fn_decode_fp8kv =
+                flash_attention_mod.get_function("flash_attention_2_decode_fp8kv_kernel")?;
+            let fn_decode_fp8kv_bc16 = flash_attention_mod
+                .get_function("flash_attention_2_decode_fp8kv_bc16_kernel")?;
             Ok(Self {
                 head_dim,
                 flash_attention_mod,
@@ -318,6 +334,8 @@ impl Fa2PtxKernels {
                 fn_decode_f16kv,
                 fn_prefill,
                 fn_prefill_f16kv,
+                fn_decode_fp8kv,
+                fn_decode_fp8kv_bc16,
             })
         }
         #[cfg(not(feature = "cuda"))]
