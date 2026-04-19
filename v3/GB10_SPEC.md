@@ -149,9 +149,14 @@ Commits in the `rusty_sm121` branch (as of the current state):
       followed by their lib tests (43 total across the three crates).
       No CUDA / no GPU needed; guards that the GB10-specific modules
       stay mutually consistent. Hardware validation runs off-CI.
-- [ ] Bench harness: `rvllm-bench` should log `clocks.sm` +
-      `power.draw` at 1 Hz during a run so the clock-regime paradox
-      shows up in numbers, not just comments.
+- [x] ~~Bench-harness clock logging~~ — `rvllm_bench::ClockLog` spawns
+      a background thread that shells out to `nvidia-smi
+      --query-gpu=clocks.sm,power.draw` once per second and appends one
+      JSONL record per sample (`{t_ms, clocks_sm_mhz, power_draw_w}`).
+      No NVML dep. Transient nvidia-smi failures get logged inline
+      rather than aborting the run. Parser is unit-tested on realistic
+      sustained/throttled sample lines; an e2e test self-skips when
+      `nvidia-smi` is absent.
 - [ ] Validation: run `fp8_precision_check.py` on GB10 hardware to
       confirm the FP8 scale tensor axis — the open GPU PPL bug (v3/SPEC)
       likely interacts with sm_121 in unknown ways.
