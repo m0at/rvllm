@@ -145,6 +145,35 @@ pub enum ClockRegime {
 /// Keep this function free of I/O so it stays trivially unit-testable
 /// — the I/O side (probing the clock, reading a wall-clock elapsed)
 /// lives in the helpers below.
+///
+/// # Example
+///
+/// Full integration sketch for a future FP8-GEMV dispatcher:
+///
+/// ```
+/// use rvllm_kernels::{select_variant, ClockRegime, FP8_GEMV_PTX_STEM};
+/// use rvllm_core::CompileTarget;
+///
+/// // 1. Arch resolved once at bring-up.
+/// let target = CompileTarget::Sm121;
+///
+/// // 2. Regime sampled per launch (here: we assume sustained).
+/// let regime = ClockRegime::Sustained;
+///
+/// // 3. Policy picks an always-available variant.
+/// let variant = select_variant(regime, target);
+/// assert_eq!(variant.entry_point(), "fp8_gemv_blockwise_wpr_native_kernel");
+///
+/// // 4. PTX stem + entry point feed the kernel loader.
+/// assert_eq!(FP8_GEMV_PTX_STEM, "fp8_gemv");
+///
+/// // Same call on pre-Blackwell falls back to WprLut (WprNative
+/// // isn't compiled for sm_80/sm_89/sm_90).
+/// assert_eq!(
+///     select_variant(ClockRegime::Sustained, CompileTarget::Sm90).entry_point(),
+///     "fp8_gemv_blockwise_wpr_lut_kernel",
+/// );
+/// ```
 pub const fn select_variant(regime: ClockRegime, target: CompileTarget) -> Fp8GemvVariant {
     // Only pick `WprNative` when the regime argues for it AND the
     // target actually has it. Everything else falls through to the
@@ -170,8 +199,12 @@ pub const THROTTLE_ONSET: Duration = Duration::from_millis(2_500);
 /// the engine started executing inference work (NOT since process
 /// start). Resetting the timer after any idle window > ~2 s is the
 /// caller's responsibility (the clock recovers during idle).
-pub fn regime_from_elapsed(elapsed_since_warmup: Duration) -> ClockRegime {
-    if elapsed_since_warmup < THROTTLE_ONSET {
+///
+/// Implemented via `Duration::as_millis()` rather than `PartialOrd`
+/// so the function stays `const fn` (Duration's comparison traits
+/// are not yet const-stable).
+pub const fn regime_from_elapsed(elapsed_since_warmup: Duration) -> ClockRegime {
+    if elapsed_since_warmup.as_millis() < THROTTLE_ONSET.as_millis() {
         ClockRegime::Sustained
     } else {
         ClockRegime::Throttled
@@ -189,7 +222,7 @@ pub const SUSTAINED_CLOCK_THRESHOLD_MHZ: u32 = 1500;
 
 /// Clock-probe heuristic: classify a measured SM clock in MHz using
 /// `SUSTAINED_CLOCK_THRESHOLD_MHZ`.
-pub fn regime_from_clock_mhz(sm_clock_mhz: u32) -> ClockRegime {
+pub const fn regime_from_clock_mhz(sm_clock_mhz: u32) -> ClockRegime {
     if sm_clock_mhz == 0 {
         ClockRegime::Unknown
     } else if sm_clock_mhz >= SUSTAINED_CLOCK_THRESHOLD_MHZ {
@@ -277,6 +310,18 @@ mod tests {
     fn default_variant_is_wpr_lut() {
         assert_eq!(Fp8GemvVariant::default(), Fp8GemvVariant::WprLut);
     }
+
+    // Compile-time regression guard: `select_variant`, the two regime
+    // classifiers, and the helpers must stay `const fn` so callers can
+    // materialise a variant at compile time. This block fails to
+    // compile if a future change drops the `const` qualifier.
+    const _CONST_CALLABLE: () = {
+        let _ = select_variant(ClockRegime::Sustained, CompileTarget::Sm121);
+        let _ = regime_from_clock_mhz(2520);
+        let _ = regime_from_elapsed(Duration::from_millis(0));
+        let _ = Fp8GemvVariant::WprNative.entry_point();
+        let _ = Fp8GemvVariant::WprLut.available_for(CompileTarget::Sm90);
+    };
 
     #[test]
     fn elapsed_heuristic_crosses_at_2s5() {
