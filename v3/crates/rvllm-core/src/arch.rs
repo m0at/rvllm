@@ -19,13 +19,7 @@ use serde::{Deserialize, Serialize};
 /// Add a new variant when we need to support a new architecture; update
 /// `from_compute_capability`, `as_sm_str`, and the build system's kernel
 /// output directories in the same PR.
-///
-/// `#[non_exhaustive]` so future arches (sm_100, sm_120, sm_122, …) can
-/// join without breaking downstream `match` expressions. Internal
-/// matches inside this crate stay exhaustive by design.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
-#[non_exhaustive]
-#[must_use]
 pub enum CompileTarget {
     /// Ampere A100/A800 — original baseline.
     Sm80,
@@ -46,8 +40,6 @@ impl CompileTarget {
     /// The caller is responsible for turning that `None` into a hard error
     /// (the runtime refuses to boot on an unsupported device rather than
     /// falling back to a generic path).
-    #[inline]
-    #[must_use]
     pub const fn from_compute_capability(major: i32, minor: i32) -> Option<Self> {
         match (major, minor) {
             (8, 0) => Some(CompileTarget::Sm80),
@@ -60,8 +52,6 @@ impl CompileTarget {
 
     /// The `sm_XYZ` string as accepted by `nvcc -arch=` and used as the
     /// kernel subdirectory name (e.g. `kernels/sm_121/fp8_gemv.ptx`).
-    #[inline]
-    #[must_use]
     pub const fn as_sm_str(self) -> &'static str {
         match self {
             CompileTarget::Sm80 => "sm_80",
@@ -69,6 +59,15 @@ impl CompileTarget {
             CompileTarget::Sm90 => "sm_90",
             CompileTarget::Sm121 => "sm_121",
         }
+    }
+
+    /// Whether this target uses the legacy top-level `kernels/*.ptx` layout
+    /// (default sm_80 artifacts) or the per-arch subdirectory layout.
+    ///
+    /// Currently every target uses the per-arch subdirectory (the top-level
+    /// default is kept only for backward-compat with old bench scripts).
+    pub const fn uses_arch_subdir(self) -> bool {
+        true
     }
 }
 
