@@ -10,7 +10,9 @@ pub mod manifest;
 pub mod module;
 pub mod sigs;
 
-pub use gb10_dispatch::{Fp8GemvVariant, FP8_GEMV_PTX_STEM};
+pub use gb10_dispatch::{
+    regime_from_clock_mhz, regime_from_elapsed, select_variant, ClockRegime, Fp8GemvVariant,
+};
 pub use loader::{KernelLoader, PtxBytes};
 pub use manifest::{ArtifactEntry, KernelManifest, VerifiedManifest};
 pub use module::{KernelFn, LoadedModule};

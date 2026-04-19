@@ -133,9 +133,16 @@ Commits in the `rusty_sm121` branch (as of the current state):
       keyed by PTX stem (matches `KernelLoader::load_ptx(name)`).
       All new kernels (`fp8_gemv`, `int4_gemv`, `dequant_fp8`) are
       auto-included.
-- [ ] GB10-specific dispatch policy in `fp8_gemv`: pick between
-      `wpr_lut` (throttled) and `wpr_native` (sustained) based on the
-      measured clock or a time-window heuristic.
+- [x] ~~GB10 fp8_gemv dispatch policy~~ — `rvllm-kernels::gb10_dispatch`
+      exposes `Fp8GemvVariant { WprLut, WprNative }`, the pure
+      `select_variant(ClockRegime)` policy (`Sustained → WprNative`,
+      `Throttled|Unknown → WprLut`), plus two regime-classifier
+      helpers: `regime_from_elapsed(Duration)` (time-window, 2.5 s
+      onset — usable today without NVML) and `regime_from_clock_mhz(u32)`
+      (threshold 700 MHz between the two firmware plateaus). Entry-point
+      symbol names are test-pinned against `kernels/fp8_gemv.cu`.
+      Wiring into the actual kernel-launch path is downstream work
+      (no `fp8_gemv` dispatcher exists on any arch yet).
 - [ ] CI: `cargo check --workspace` cross-compile for `sm_121` target
       gated by `feature = "gb10"` (compile-check only; no hardware in
       CI).
