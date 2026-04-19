@@ -47,6 +47,47 @@ These were found the hard way (kernel hangs, not compile errors):
    path wins. There is no single "best" kernel for GB10 — the dispatcher
    picks based on clock regime.
 
+## SM121 hardware feature matrix
+
+Concrete limits vs Hopper that shape what kernels we can port.
+Collected from NVIDIA CUDA docs + cross-referenced against
+external SM121 write-ups (e.g. the spark-vllm-mxfp4-docker
+SM121 technical guide).
+
+| Feature                 | SM90 (Hopper)                | SM121 (GB10)                 |
+|-------------------------|------------------------------|------------------------------|
+| MMA instruction         | `wgmma.mma_async` (async WG) | `mma.sync.aligned` (sync)    |
+| MMA tile size           | 64×N×32 async                | 16×8×32 sync                 |
+| TMA                     | full (load + multicast)      | load only, **no multicast**  |
+| DSMEM                   | ✅                           | ❌                           |
+| Thread-block cluster    | up to 16 blocks              | **1×1×1 only**               |
+| FA3 (WGMMA+TMA)         | native                       | not applicable (we use FA2)  |
+
+Consequence for this branch: our sm_121 kernels use traditional
+`mma.sync`-style tiling, scalar loads, no cluster features. The FA2
+`FA2_BC=32` change (vs SM90's 64) is arch-conditional precisely
+because Blackwell-consumer smem and tile budgets differ.
+
+## Arch suffix (`-arch=sm_121` vs `sm_121a` vs `sm_121f`)
+
+`kernels/build.sh` currently compiles with `-arch=sm_121`. This
+produces a PTX target without the `__CUDA_ARCH_FAMILY_SPECIFIC__`
+macro. Family-specific instructions that need it include:
+
+- `mma.kind::mxf4.block_scale` (MXFP4 block-scaled MMA)
+- `ldmatrix.b8x16.b4x16_p64` (FP4 ldmatrix with format conversion)
+- `cvt.e2m1x2` (FP4 ↔ FP16 scalar conversion)
+
+Our current FP8 scalar CVT path (`cvt.rn.f16x2.e4m3x2`) works on
+plain `sm_121` — the numerical precision check confirms it. No
+switch required for what ships on this branch.
+
+**Follow-up trigger:** when we add FP8 tensor-core MMA
+(`mma.sync.aligned.m16n8k16.row.col.f32.e4m3.e4m3.f32`) or any MXFP4
+path, switch `build.sh` to `-arch=sm_121f` (family mode, Blackwell
+consumer) to enable the hardware paths. `sm_121a` also works but
+`sm_121f` is the recommended form going forward.
+
 ## Empirical numbers (this DGX Spark, driver 595.58.03, CUDA 13.2)
 
 Measured with `v3/tools/fp8_gemv_bench.py` on M=1 GEMV, three variants:
@@ -228,6 +269,9 @@ Commits in the `rusty_sm121` branch (as of the current state):
   based on `CompileTarget`, gated by `feature = "gb10"` on the
   runtime crate.
 - End-to-end Gemma-4 PPL on sm_121 once the launch path is in place.
+- Switch `kernels/build.sh` to `-arch=sm_121f` (family-mode) when a
+  future kernel needs FP8 tensor-core MMA or MXFP4 hardware paths.
+  Not required for anything on this branch (see "Arch suffix").
 - Fix the two pre-existing upstream bugs that still block
   `cargo check --workspace`: `Gemma4Bringup::{run_ppl, run_bench,
   run_generate}` missing, and
