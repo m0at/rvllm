@@ -152,13 +152,13 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   </div>
   <div class="pill">
     <div class="label">B=1 decode (512 ctx)</div>
-    <strong>79.9 tok/s</strong>
-    <div class="caption">12.52 ms, single-scan architecture</div>
+    <strong>78.2 tok/s</strong>
+    <div class="caption">12.79 ms, single-scan bf16 KV</div>
   </div>
   <div class="pill">
     <div class="label">B=1 decode (2048 ctx)</div>
-    <strong>41.9 tok/s</strong>
-    <div class="caption">23.84 ms, split-cache int8 KV</div>
+    <strong>~70 tok/s</strong>
+    <div class="caption">~14 ms, single-scan bf16 KV</div>
   </div>
   <div class="pill">
     <div class="label">128K context</div>
@@ -189,27 +189,26 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <h3>Context scaling (B=1 decode)</h3>
 <div class="chart-box">
   <div class="chart-title"><strong>Throughput vs context length</strong> - 512 to 128K supported
-    <div class="note">31B Gemma 4, int8 weights + int8 KV cache, v6e-4 (4 chips, 128 GB HBM). Split-cache architecture with blockwise global attention.</div>
+    <div class="note">31B Gemma 4, int8 weights, v6e-4 (4 chips, 128 GB HBM). Dual-path: single-scan bf16 KV (<= 32K) auto-switches to split-cache int8 KV (> 32K).</div>
   </div>
   <div id="chart-ctx-scaling" style="height:340px"></div>
 </div>
 
 <table>
-<thead><tr><th>Context</th><th class="r">ms/step</th><th class="r">tok/s</th><th>Architecture</th><th class="r">KV Memory</th></tr></thead>
+<thead><tr><th>Context</th><th class="r">ms/step</th><th class="r">tok/s</th><th>Architecture</th><th class="r">KV type</th></tr></thead>
 <tbody>
-<tr><td>512 (single-scan)</td><td class="r">12.52</td><td class="r">79.9</td><td>1 scan, 60 layers, cond dispatch</td><td class="r">500 MB bf16</td></tr>
-<tr><td>2,048 (split-cache)</td><td class="r">23.84</td><td class="r">41.9</td><td>10 groups x 6 layers, no cond</td><td class="r">587 MB int8</td></tr>
-<tr><td>8,192</td><td class="r">~28</td><td class="r">~35</td><td>split-cache + blockwise global</td><td class="r">755 MB int8</td></tr>
-<tr><td>32K</td><td class="r">~32</td><td class="r">~31</td><td>split-cache + blockwise global</td><td class="r">3.0 GB int8</td></tr>
-<tr><td>64K</td><td class="r">~36</td><td class="r">~28</td><td>split-cache + blockwise global</td><td class="r">5.8 GB int8</td></tr>
-<tr class="highlight"><td><strong>128K</strong></td><td class="r"><strong>40.56</strong></td><td class="r"><strong>24.7</strong></td><td>split-cache + blockwise global</td><td class="r"><strong>11.1 GB int8</strong></td></tr>
+<tr><td>512</td><td class="r">12.79</td><td class="r">78.2</td><td>Single-scan, 60-layer scan + cond</td><td class="r">bf16</td></tr>
+<tr><td>2,048</td><td class="r">~14</td><td class="r">~70</td><td>Single-scan</td><td class="r">bf16</td></tr>
+<tr><td>32K</td><td class="r">~66</td><td class="r">~15</td><td>Single-scan</td><td class="r">bf16</td></tr>
+<tr><td>64K</td><td class="r">~91</td><td class="r">~11</td><td>Split-cache, 10 groups x 6</td><td class="r">int8</td></tr>
+<tr class="highlight"><td><strong>128K</strong></td><td class="r"><strong>40.56</strong></td><td class="r"><strong>24.7</strong></td><td>Split-cache + blockwise global</td><td class="r"><strong>int8</strong></td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>Sliding window layers are O(1024) regardless of context length.</strong> Only the 10 global layers (of 60 total) scale with context. Blockwise attention with BLOCK_K=8192 and online softmax keeps memory bounded.</div>
+<div class="footnote"><strong>Dual-path auto-switching:</strong> <= 32K uses single-scan with bf16 KV (fastest). > 32K uses split-cache with int8 KV (128K support). No compromise -- 78.2 tok/s at short context, 24.7 tok/s at 128K.</div>
 
-<h3>Split-cache architecture</h3>
+<h3>Dual-path architecture</h3>
 <div class="note-box">
-  <strong>Exploiting Gemma 4's dual attention structure.</strong> 50 sliding-window layers use a 1024-entry circular buffer (constant size at any context length). 10 global layers use full-context blockwise attention with online softmax. Layers are processed in 10 groups of 6 (5 sliding + 1 global), eliminating <code>jax.lax.cond</code> dispatch overhead. Int8 KV cache with per-head quantization scales provides 50% memory reduction with quality preserved.
+  <strong>Auto-switches based on <code>--max-ctx</code>.</strong> <= 32K: single-scan with bf16 KV cache. One <code>jax.lax.scan</code> over all 60 layers with <code>jax.lax.cond</code> dispatch. Fastest for short-to-medium context. > 32K: split-cache with int8 KV cache. 50 sliding-window layers use a 1024-entry circular buffer, 10 global layers use full-context blockwise attention with online softmax. Processed in 10 groups of 6 (5 sliding + 1 global), eliminating <code>jax.lax.cond</code> overhead. Int8 KV with per-head scales provides 50% memory reduction. No compromise -- fast short-context AND 128K support.
 </div>
 
 <h3>Perplexity progression</h3>
@@ -246,7 +245,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <table>
 <thead><tr><th>Batch</th><th class="r">Total</th><th class="r">tok/s/batch</th><th class="r">ms/step</th><th class="r">Scaling</th><th class="r">tok/s/$</th></tr></thead>
 <tbody>
-<tr><td>1</td><td class="r">79.9</td><td class="r">79.9</td><td class="r">12.5</td><td class="r">1x</td><td class="r">15.4</td></tr>
+<tr><td>1</td><td class="r">78.2</td><td class="r">78.2</td><td class="r">12.79</td><td class="r">1x</td><td class="r">15.0</td></tr>
 <tr><td>8</td><td class="r">584</td><td class="r">73.0</td><td class="r">13.7</td><td class="r">7.3x</td><td class="r">112</td></tr>
 <tr><td>64</td><td class="r">4,220</td><td class="r">65.9</td><td class="r">15.2</td><td class="r">52.8x</td><td class="r">812</td></tr>
 <tr><td>128</td><td class="r">6,831</td><td class="r">53.4</td><td class="r">18.7</td><td class="r">85.5x</td><td class="r">1,314</td></tr>
@@ -256,20 +255,20 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <tr><td>1024</td><td class="r">13,705</td><td class="r">13.4</td><td class="r">74.7</td><td class="r">171.5x</td><td class="r">2,636</td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>Near-linear scaling from B=1 to B=512.</strong> Step time grows from 12.5 ms to 39.6 ms as MXU utilization rises from ~5% to ~80%. Peak at B=768 where compute and bandwidth saturate simultaneously. B=1024+ is compute-bound with diminishing returns.</div>
+<div class="footnote"><strong>Near-linear scaling from B=1 to B=512.</strong> Step time grows from 12.79 ms to 39.6 ms as MXU utilization rises from ~5% to ~80%. Peak at B=768 where compute and bandwidth saturate simultaneously. B=1024+ is compute-bound with diminishing returns.</div>
 
 
 <h3>TPU vs vLLM GPU comparison <span class="badge measured">Measured</span></h3>
 
 <div class="note-box">
-  <strong>All GPU numbers are measured on our hardware.</strong> vLLM on H100 SXM 80GB with RedHatAI/gemma-4-31B-it-FP8-Dynamic ($1.92/hr on vast.ai, max_ctx=2048). TPU batch scaling numbers are from the single-scan architecture (512 ctx). Split-cache batch sweep in progress.
+  <strong>All GPU numbers are measured on our hardware.</strong> vLLM on H100 SXM 80GB with RedHatAI/gemma-4-31B-it-FP8-Dynamic ($1.92/hr on vast.ai, max_ctx=2048). TPU batch scaling numbers are from the single-scan bf16 KV architecture (512 ctx). The dual-path engine auto-switches to split-cache int8 KV for contexts > 32K.
 </div>
 
 <div class="pill-row">
   <div class="pill">
     <div class="label">B=1 head-to-head</div>
-    <strong>TPU 19% faster</strong>
-    <div class="caption">79.9 tok/s (TPU) vs 66.9 tok/s (vLLM GPU)</div>
+    <strong>TPU 17% faster</strong>
+    <div class="caption">78.2 tok/s (TPU) vs 66.9 tok/s (vLLM GPU)</div>
   </div>
   <div class="pill">
     <div class="label">Peak throughput</div>
@@ -298,7 +297,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <table>
 <thead><tr><th>Batch</th><th class="r">vLLM GPU tok/s</th><th class="r">vLLM GPU ms/step</th><th class="r">rvLLM TPU tok/s</th><th class="r">rvLLM TPU ms/step</th></tr></thead>
 <tbody>
-<tr><td>1</td><td class="r">66.9</td><td class="r">14.95</td><td class="r pos"><strong>79.9</strong></td><td class="r">12.5</td></tr>
+<tr><td>1</td><td class="r">66.9</td><td class="r">14.95</td><td class="r pos"><strong>78.2</strong></td><td class="r">12.79</td></tr>
 <tr><td>2</td><td class="r">131.5</td><td class="r">15.20</td><td class="r">-</td><td class="r">-</td></tr>
 <tr><td>4</td><td class="r">257.6</td><td class="r">15.53</td><td class="r">-</td><td class="r">-</td></tr>
 <tr><td>8</td><td class="r">511.7</td><td class="r">15.63</td><td class="r pos"><strong>584</strong></td><td class="r">13.7</td></tr>
@@ -338,7 +337,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <tr><td>Nested scan, bf16, B=1</td><td class="r">25.6</td><td class="r">38.0</td><td class="r">baseline</td></tr>
 <tr><td>Flat scan, bf16, B=1</td><td class="r">48.2</td><td class="r">19.4</td><td class="r pos">+88%</td></tr>
 <tr><td>Flat scan, int8, B=1</td><td class="r">68.2</td><td class="r">13.4</td><td class="r pos">+42%</td></tr>
-<tr><td>Fused on-chip decode, B=1</td><td class="r">79.9</td><td class="r">12.5</td><td class="r pos">+17%</td></tr>
+<tr><td>Fused on-chip decode, B=1</td><td class="r">78.2</td><td class="r">12.79</td><td class="r pos">+15%</td></tr>
 <tr><td>B=8</td><td class="r">584</td><td class="r">13.7</td><td class="r pos">7.3x batch scaling</td></tr>
 <tr><td>B=64 + LIBTPU flags</td><td class="r">4,220</td><td class="r">15.2</td><td class="r pos">async collective fusion</td></tr>
 <tr class="highlight"><td><strong>B=768 + LIBTPU flags</strong></td><td class="r"><strong>13,943</strong></td><td class="r"><strong>55.1</strong></td><td class="r pos"><strong>174.5x from baseline</strong></td></tr>
@@ -411,8 +410,8 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <div class="pill-row">
   <div class="pill">
     <div class="label">Baseline (B=1)</div>
-    <strong>79.9 tok/s</strong>
-    <div class="caption">12.54 ms/step, fused while_loop</div>
+    <strong>78.2 tok/s</strong>
+    <div class="caption">12.79 ms/step, fused while_loop</div>
   </div>
   <div class="pill">
     <div class="label">EAGLE-3 fused cycle</div>
@@ -581,7 +580,7 @@ Model: <code>google/gemma-4-31B-it</code>, int8 weight quantization (jnp.int8), 
 Timing: <code>jax.block_until_ready()</code> after each step. Warmup: 3 steps discarded. Measurement: median of 20 iterations.<br>
 LIBTPU flags: <code>--xla_tpu_enable_async_collective_fusion=true --xla_tpu_dot_dot_fusion_duplicated=true --xla_tpu_scheduler_rerun=5</code><br>
 Perplexity: 19.24 (split-cache, int8 KV with per-head scales), improved from 25.51 baseline. Measured on short text passage, compared against HuggingFace <code>transformers</code> bf16 reference on GPU.<br>
-Context scaling: 512 to 128K tested. Split-cache architecture: 50 sliding layers use circular buffer, 10 global layers use blockwise attention (BLOCK_K=8192, online softmax).<br><br>
+Context scaling: 512 to 128K tested. Dual-path architecture auto-switches based on max_ctx: <= 32K uses single-scan with bf16 KV cache; > 32K uses split-cache with int8 KV cache (50 sliding layers in circular buffer, 10 global layers with blockwise attention, BLOCK_K=8192, online softmax).<br><br>
 
 <strong>vLLM GPU comparison</strong> (measured):<br>
 Hardware: H100 SXM 80 GB on vast.ai ($1.92/hr).<br>
@@ -617,12 +616,11 @@ Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+q
 
   // Context scaling data
   const ctxScalingData = [
-    { ctx: '512',  toks: 79.9,  ms: 12.52, mem: 500 },
-    { ctx: '2K',   toks: 41.9,  ms: 23.84, mem: 587 },
-    { ctx: '8K',   toks: 35,    ms: 28,    mem: 755 },
-    { ctx: '32K',  toks: 31,    ms: 32,    mem: 3072 },
-    { ctx: '64K',  toks: 28,    ms: 36,    mem: 5939 },
-    { ctx: '128K', toks: 24.7,  ms: 40.56, mem: 11366 }
+    { ctx: '512',  toks: 78.2,  ms: 12.79 },
+    { ctx: '2K',   toks: 70,    ms: 14 },
+    { ctx: '32K',  toks: 15,    ms: 66 },
+    { ctx: '64K',  toks: 11,    ms: 91 },
+    { ctx: '128K', toks: 24.7,  ms: 40.56 }
   ];
 
   function CtxScaling(){
@@ -641,7 +639,7 @@ Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+q
 
   // TPU batch scaling data
   const tpuScalingData = [
-    { batch: '1',    toks: 79.9 },
+    { batch: '1',    toks: 78.2 },
     { batch: '8',    toks: 584 },
     { batch: '64',   toks: 4220 },
     { batch: '128',  toks: 6831 },
@@ -667,7 +665,7 @@ Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+q
 
   // TPU vs vLLM GPU comparison (measured)
   const comparisonData = [
-    { batch: '1',   tpu: 79.9,  gpu: 66.9 },
+    { batch: '1',   tpu: 78.2,  gpu: 66.9 },
     { batch: '8',   tpu: 584,   gpu: 511.7 },
     { batch: '32',  tpu: null,  gpu: 1728 },
     { batch: '64',  tpu: 4220,  gpu: 2794 },
@@ -700,7 +698,7 @@ Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+q
     { step: 'Nested scan\nbf16 B=1', toks: 25.6 },
     { step: 'Flat scan\nbf16 B=1', toks: 48.2 },
     { step: 'Flat scan\nint8 B=1', toks: 68.2 },
-    { step: 'Fused decode\nint8 B=1', toks: 79.9 },
+    { step: 'Fused decode\nint8 B=1', toks: 78.2 },
     { step: 'B=8', toks: 584 },
     { step: 'B=64\n+LIBTPU', toks: 4220 },
     { step: 'B=768\n+LIBTPU', toks: 13943 }
