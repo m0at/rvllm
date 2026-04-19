@@ -168,45 +168,6 @@ impl Gemma4Bringup {
         let arch = rvllm_loader::gemma4_arch::Gemma4Arch::from_dir(&paths.model_dir)?;
         let model = rvllm_loader::gemma4_load::load_gemma4_model(&paths.model_dir, &arena, &arch)?;
 
-        // On sm_121 the arena is `cuMemAllocManaged` pages that fault
-        // to the GPU on first touch. After the weight upload the
-        // populated region (~30 GiB for Gemma 4 31B) hasn't faulted
-        // yet — prefetching it here removes the page-fault storm
-        // from the first decode iteration, so first-token latency
-        // stops carrying 30 GiB of H→D page migration cost. CUDA 13
-        // dropped the single-arg `cuMemPrefetchAsync` in favour of
-        // `_v2` with a `CUmemLocation`; cudarc 0.19 only wraps the
-        // v2 form for cuda-13. Best-effort: a non-zero RC is logged
-        // but doesn't fail bring-up.
-        #[cfg(all(feature = "gb10", feature = "cuda"))]
-        unsafe {
-            if matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121)) {
-                let prefetch_bytes = arena.used();
-                if prefetch_bytes > 0 {
-                    let loc = cudarc::driver::sys::CUmemLocation {
-                        type_: cudarc::driver::sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
-                        id: 0,
-                    };
-                    let rc = cudarc::driver::sys::cuMemPrefetchAsync_v2(
-                        arena.base_ptr(),
-                        prefetch_bytes,
-                        loc,
-                        0,
-                        stream.raw() as _,
-                    );
-                    if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                        tracing::warn!(
-                            "cuMemPrefetchAsync_v2({prefetch_bytes} bytes) rc={rc:?} — first-token latency may spike"
-                        );
-                    } else {
-                        let _ = cudarc::driver::sys::cuStreamSynchronize(
-                            stream.raw() as _,
-                        );
-                    }
-                }
-            }
-        }
-
         // Per-arch kernel subdirectory resolution — see `resolve_kernels_dir`.
         let kernels_dir = crate::bring_up::resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
         let manifest_path = kernels_dir.join("manifest.json");
