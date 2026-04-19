@@ -49,6 +49,7 @@ pub struct Gemma4FusedModules {
     pub compute_qkv_scales_mod: LoadedModule,
     pub fused_gelu_mul_f16_mod: LoadedModule,
     pub fused_rope_partial_f16kv_mod: LoadedModule,
+    pub fused_norm_add_residual_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
@@ -69,6 +70,7 @@ pub struct Gemma4FusedModules {
     pub fn_compute_qkv_scales: KernelFn,
     pub fn_fused_gelu_mul_f16: KernelFn,
     pub fn_fused_rope_partial_f16kv: KernelFn,
+    pub fn_fused_norm_add_residual: KernelFn,
 }
 
 pub struct Gemma4Bringup {
@@ -1409,6 +1411,7 @@ impl Gemma4Bringup {
             compute_qkv_scales: self.fused.fn_compute_qkv_scales,
             fused_gelu_mul_f16: self.fused.fn_fused_gelu_mul_f16,
             fused_rope_partial_f16kv: self.fused.fn_fused_rope_partial_f16kv,
+            fused_norm_add_residual: self.fused.fn_fused_norm_add_residual,
         }
     }
 }
@@ -1466,6 +1469,10 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let fn_fused_rope_partial_f16kv =
         fused_rope_partial_f16kv_mod.get_function("fused_rope_partial_f16kv_kernel")?;
 
+    let fused_norm_add_residual_mod = loader.load_ptx("fused_norm_add_residual")?;
+    let fn_fused_norm_add_residual =
+        fused_norm_add_residual_mod.get_function("fused_norm_add_residual_kernel")?;
+
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
         rmsnorm_inplace_mod,
@@ -1486,6 +1493,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         compute_qkv_scales_mod,
         fused_gelu_mul_f16_mod,
         fused_rope_partial_f16kv_mod,
+        fused_norm_add_residual_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
@@ -1506,5 +1514,6 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_compute_qkv_scales,
         fn_fused_gelu_mul_f16,
         fn_fused_rope_partial_f16kv,
+        fn_fused_norm_add_residual,
     })
 }

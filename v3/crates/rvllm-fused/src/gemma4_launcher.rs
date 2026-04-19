@@ -423,6 +423,43 @@ impl VectorAddF16Launch {
 }
 
 // ---------------------------------------------------------------------------
+// fused_norm_add_residual: f32->bf16 + rmsnorm + add-to-residual(f16)
+// ---------------------------------------------------------------------------
+
+pub struct FusedNormAddResidualLaunch {
+    pub num_tokens: u32,
+    pub hidden: u32,
+    pub eps: f32,
+}
+
+impl FusedNormAddResidualLaunch {
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        gemm_out: u64,
+        gamma: u64,
+        residual: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut gemm_out = gemm_out;
+        let mut gamma = gamma;
+        let mut residual = residual;
+        let mut hidden = self.hidden as i32;
+        let mut eps = self.eps;
+        let args = [
+            (&mut gemm_out) as *mut u64 as *mut core::ffi::c_void,
+            (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
+            (&mut residual) as *mut u64 as *mut core::ffi::c_void,
+            (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
+            (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+        ];
+        let block = (self.hidden.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bf16_to_f16_sat (bf16 -> f16 with saturation clamp)
 // ---------------------------------------------------------------------------
 
