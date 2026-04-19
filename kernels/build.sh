@@ -93,25 +93,7 @@ compile_kernel() {
     $NVCC -ptx -arch="$arch" -O3 $extra_flags -o "$ptx" "$cu" 2>/dev/null
 }
 
-# Revision pinned into the generated manifest.json. Precedence:
-#   1. $REVISION env var (tarball / CI shallow-clone builds where
-#      git isn't available or history is detached)
-#   2. git short HEAD
-#   3. literal "dev" (local hack build)
-REVISION="${REVISION:-$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo "dev")}"
-
-# Secondary kernel tree: `v3/kernels/`. Upstream shipped a second
-# source tree with Gemma-4-specific fused kernels (RoPE partial, norm
-# + add-residual, qk-rmsnorm, etc.) separately from this top-level
-# tree. Runtime loaders reference both sets under the same manifest,
-# so the per-arch OUTDIR must contain PTX for both. We co-locate the
-# output in OUTDIR (no name collisions verified at branch authoring
-# time; a collision would overwrite silently — audit if one appears).
-#
-# `$DIR/../v3/kernels` is optional — if the upstream tree ever moves
-# or the v3 prefix changes, this falls through without breaking the
-# top-level build.
-V3_KERNELS_DIR="$DIR/../v3/kernels"
+REVISION=$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo "dev")
 
 for arch in $ARCHS; do
     echo "=== Compiling for $arch ==="
@@ -127,18 +109,6 @@ for arch in $ARCHS; do
             echo "  WARNING: $base.cu failed for $arch (may need newer CUDA toolkit)"
         }
     done
-
-    if [ -d "$V3_KERNELS_DIR" ]; then
-        for cu in "$V3_KERNELS_DIR"/*.cu; do
-            [ -f "$cu" ] || continue
-            base=$(basename "$cu" .cu)
-            ptx="$OUTDIR/${base}.ptx"
-            echo "  (v3) $base.cu -> $arch/$base.ptx"
-            compile_kernel "$cu" "$arch" "$ptx" || {
-                echo "  WARNING: v3/$base.cu failed for $arch (may need newer CUDA toolkit)"
-            }
-        done
-    fi
 
     "$DIR/gen_manifest.sh" "$OUTDIR" "$REVISION" || {
         echo "  WARNING: manifest generation failed for $arch"
