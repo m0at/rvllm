@@ -12,7 +12,7 @@ pub mod sigs;
 
 pub use gb10_dispatch::{
     regime_from_clock_mhz, regime_from_elapsed, select_variant, ClockRegime, Fp8GemvVariant,
-    FP8_GEMV_PTX_STEM,
+    FP8_GEMV_PTX_STEM, SUSTAINED_CLOCK_THRESHOLD_MHZ, THROTTLE_ONSET,
 };
 pub use loader::{KernelLoader, PtxBytes};
 pub use manifest::{ArtifactEntry, KernelManifest, VerifiedManifest};

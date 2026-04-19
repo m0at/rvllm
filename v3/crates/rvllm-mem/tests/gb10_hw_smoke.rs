@@ -29,7 +29,7 @@ fn gb10_end_to_end_bring_up() {
     let ctx = CudaContextHandle::init(0).expect("CudaContextHandle::init");
 
     // Step 2 — compute capability → CompileTarget.
-    let (major, minor) = ctx.compute_capability().expect("compute_capability");
+    let (major, minor) = ctx.compute_capability();
     let target = CompileTarget::from_compute_capability(major, minor).unwrap_or_else(|| {
         panic!("unsupported compute cap {major}.{minor} — extend CompileTarget enum");
     });

@@ -23,7 +23,6 @@ use core::marker::PhantomData;
 
 use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 
-use crate::graph_safe::GraphSafe;
 use crate::hbm::Region;
 
 /// Bump-allocated unified-memory slab. One per device, constructed once
@@ -101,9 +100,9 @@ impl<'ctx> UnifiedArena<'ctx> {
 
     #[cfg(not(feature = "cuda"))]
     pub fn new(_ctx: &crate::context::CudaContextHandle, bytes: usize) -> Result<Self> {
-        let _ = (bytes,);
-        // Unreachable under the `gb10` feature (which implies `cuda`),
-        // but keeps the type compilable in a no-cuda workspace check.
+        // No managed-memory allocator available without `cuda`; fall
+        // back to the host-stub bookkeeping so the type stays
+        // constructible in no-cuda workspace checks and unit tests.
         Ok(Self {
             inner: crate::hbm::HbmArena::new_host_stub(bytes),
             _not_hbm: PhantomData,
@@ -142,9 +141,9 @@ impl<'ctx> UnifiedArena<'ctx> {
     }
 }
 
-// `Region` already implements `GraphSafe`; mirror the contract so a
-// captured graph can bind `&Region` derived from either arena type.
-unsafe impl<'ctx> GraphSafe for UnifiedArena<'ctx> {}
+// `Region<'a>` already implements `GraphSafe` in `hbm.rs` — capture
+// binds `&Region`, never `&UnifiedArena` (same contract as HbmArena,
+// which intentionally does not carry the impl either).
 
 #[cfg(all(test, not(feature = "cuda")))]
 mod tests {
