@@ -361,16 +361,9 @@ impl CublasLt {
         if b_channelscale.is_some() {
             let scale_mode: u32 = 3; // OUTER_VEC_32F
             let attr_a_scale_mode: u32 = 31; // CUBLASLT_MATMUL_DESC_A_SCALE_MODE
-            let attr_b_scale_mode: u32 = 32; // CUBLASLT_MATMUL_DESC_B_SCALE_MODE
             set_attr(
                 desc,
                 unsafe { std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(attr_a_scale_mode) },
-                &scale_mode as *const _ as *const _,
-                std::mem::size_of_val(&scale_mode),
-            )?;
-            set_attr(
-                desc,
-                unsafe { std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(attr_b_scale_mode) },
                 &scale_mode as *const _ as *const _,
                 std::mem::size_of_val(&scale_mode),
             )?;
