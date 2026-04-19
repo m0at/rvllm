@@ -47,6 +47,34 @@ These were found the hard way (kernel hangs, not compile errors):
    path wins. There is no single "best" kernel for GB10 — the dispatcher
    picks based on clock regime.
 
+## Empirical numbers (this DGX Spark, driver 595.58.03, CUDA 13.2)
+
+Measured with `v3/tools/fp8_gemv_bench.py` on M=1 GEMV, three variants:
+
+**Memory-bound regime (N=32768, K=8192 → 256 MB weight, L2-overflow):**
+- All three variants: **p50 ≈ 1.09 ms, 247 GB/s effective** — that's
+  91% of the 273 GB/s LPDDR5X advertised peak. Kernel choice does
+  not matter at this size.
+
+**L2-hot regime (N=2048, K=5120 → 10.5 MB weight, fits in L2):**
+- `wpr_native` (cvt.rn.f16x2.e4m3x2):      p50 **20.2 µs** / 518 GB/s
+- `wpr` (scalar branchless decode):        p50  28.6 µs  / 367 GB/s
+- `wpr_lut` (shared-mem LUT):              p50  40.8 µs  / 257 GB/s
+
+Native wins ~2× against LUT when we're compute-bound on the decode
+path — a regime entered whenever the weight tile is cache-resident.
+
+**Clock-regime observation:** Over 15 s of continuous looping, SM
+clock stayed at ~2510-2527 MHz, power 42-57 W. The 851 → 507 MHz
+firmware throttle documented below did **not** trigger on either
+workload size with the current driver / firmware combination. Either
+the throttle depends on a thermal envelope that micro-benching
+doesn't reach, or it was firmware-specific to the PR #28 reporter's
+environment. The dispatch policy in `rvllm-kernels::gb10_dispatch`
+stays in place as defence-in-depth — under throttle the `WprLut`
+fallback is still the theoretically right call — but in practice on
+this board **`WprNative` is the correct default**.
+
 ## Power-profile paradox
 
 At 507 MHz throttled, instruction issue rate caps memory bandwidth
