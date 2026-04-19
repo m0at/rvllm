@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 # Usage:
-#   ~/.venv/bin/python3 v3/tools/fp8_gemv_bench.py [sm_xxx] [duration_s]
+#   ~/.venv/bin/python3 v3/tools/fp8_gemv_bench.py \
+#       [sm_xxx] [duration_s] [N] [K]
 #
 # Microbench for the three warp-per-row fp8_gemv variants:
 #   * fp8_gemv_blockwise_wpr_kernel        — baseline WPR, scalar decode
 #   * fp8_gemv_blockwise_wpr_lut_kernel    — WPR + shared-mem LUT (throttle-friendly)
 #   * fp8_gemv_blockwise_wpr_native_kernel — WPR + native cvt.rn.f16x2.e4m3x2 (sm_100+)
 #
-# For each variant:
-#   1. Warm-up (100 launches, discarded)
-#   2. Tight loop for `duration_s` seconds
-#   3. Per-iter: cuda-event latency in µs, nvidia-smi clocks.sm + power.draw
-#   4. Summary: first-second vs last-second mean latency (shows the
-#      GB10 firmware clock-regime shift if it exists on this workload)
-#
-# Shape is Gemma-4-ish: M=1 (decode), N=2048 (a down_proj-ish output dim),
-# K=5120 (hidden size). Weight bytes = 10.5 MB per variant — big enough
-# to saturate LPDDR5X bandwidth, small enough to not swap.
+# Default shape: N=32768, K=8192 — weight bytes = 256 MB, forces
+# LPDDR5X reads every iteration (L2 on GB10 is ~100 MB). Override to
+# N=2048 K=5120 (~10.5 MB) to enter the L2-hot regime where the
+# kernel's decode path (not LPDDR5X bandwidth) dominates.
 #
 # Output: text table + one JSONL record per iter to bench_<variant>.jsonl.
 
@@ -27,16 +22,15 @@ from cuda.bindings import driver as drv
 REPO = pathlib.Path(__file__).resolve().parent.parent.parent
 ARCH = sys.argv[1] if len(sys.argv) > 1 else "sm_121"
 DURATION = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
+N_DEFAULT, K_DEFAULT = 32768, 8192   # 256 MB weight, LPDDR5X-bound
+N = int(sys.argv[3]) if len(sys.argv) > 3 else N_DEFAULT
+K = int(sys.argv[4]) if len(sys.argv) > 4 else K_DEFAULT
+M = 1
+assert N % 128 == 0 and K % 128 == 0 and N % 8 == 0
+BN, BK = N // 128, K // 128
 PTX = REPO / "kernels" / ARCH / "fp8_gemv.ptx"
 OUT_DIR = REPO / "v3" / "tools" / "bench_out"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# Shape: M=1 decode token. N/K chosen so weight bytes > L2 cache
-# (on GB10 L2 is ~100 MB, so pick 256 MB weight to force LPDDR5X reads
-# every iteration).  N=32768, K=8192 → 256 MB of FP8 weight.
-M, N, K = 1, 32768, 8192
-assert N % 128 == 0 and K % 128 == 0 and N % 8 == 0
-BN, BK = N // 128, K // 128
 
 VARIANTS = [
     "fp8_gemv_blockwise_wpr_kernel",
