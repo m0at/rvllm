@@ -1512,17 +1512,27 @@ pub fn resolve_kernels_dir(
     ctx: &CudaContextHandle,
     kernels_root: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
+    // Under `not(feature = "cuda")` we have no device to query, so
+    // fall through to the root directory unchanged (host-stub builds
+    // run invariant-level tests only — they never load kernels).
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ctx;
+        return Ok(kernels_root.to_path_buf());
+    }
+
     #[cfg(feature = "cuda")]
     {
-        let (major, minor) = ctx.compute_capability()?;
+        let (major, minor) = ctx.compute_capability();
         let target = CompileTarget::from_compute_capability(major, minor).ok_or_else(|| {
             RvllmError::config(
-                ConfigError::Inconsistent {
-                    reasons: vec![format!(
+                ConfigError::InvalidField {
+                    name: "compute_capability",
+                    reason: format!(
                         "unsupported CUDA compute capability {major}.{minor} \
                          (no PTX build in kernels/). Add a `CompileTarget` \
                          variant and rebuild kernels for this arch."
-                    )],
+                    ),
                 },
                 "compute_capability",
             )
@@ -1530,22 +1540,18 @@ pub fn resolve_kernels_dir(
         let sub = kernels_root.join(target.as_sm_str());
         if !sub.is_dir() {
             return Err(RvllmError::config(
-                ConfigError::Inconsistent {
-                    reasons: vec![format!(
+                ConfigError::InvalidField {
+                    name: "kernels_dir",
+                    reason: format!(
                         "kernel subdirectory {} for compute capability {major}.{minor} \
                          does not exist; run `kernels/build.sh {}`",
                         sub.display(),
                         target.as_sm_str(),
-                    )],
+                    ),
                 },
                 "kernels_dir",
             ));
         }
         Ok(sub)
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = ctx;
-        Ok(kernels_root.to_path_buf())
     }
 }

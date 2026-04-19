@@ -22,6 +22,12 @@ pub struct CudaContextHandle {
     pub(crate) cu_device: cudarc::driver::sys::CUdevice,
     #[cfg(feature = "cuda")]
     pub(crate) _ctx: cudarc::driver::sys::CUcontext,
+    /// Compute capability `(major, minor)`. Queried once in `init` and
+    /// cached — it can't change over the handle's lifetime, and callers
+    /// (manifest resolver, kernel dispatcher, bench harness) ask
+    /// repeatedly.
+    #[cfg(feature = "cuda")]
+    pub(crate) cu_compute_cap: (i32, i32),
     // Pin to creating thread — context is not Send/Sync.
     _not_send_sync: core::marker::PhantomData<*const ()>,
 }
@@ -43,6 +49,24 @@ fn cuda_err(op: &'static str, device: i32) -> RvllmError {
     )
 }
 
+/// One-shot driver call: read a device attribute into an `i32`.
+/// Factored out because we query two CC attributes + could grow more
+/// later. Returns the typed `RvllmError` that `init` propagates.
+#[cfg(feature = "cuda")]
+fn device_attr(
+    cu_device: cudarc::driver::sys::CUdevice,
+    attr: cudarc::driver::sys::CUdevice_attribute,
+    device_ordinal: i32,
+    op: &'static str,
+) -> Result<i32> {
+    use cudarc::driver::sys::*;
+    let mut value: i32 = 0;
+    if unsafe { cuDeviceGetAttribute(&mut value, attr, cu_device) } != CUresult::CUDA_SUCCESS {
+        return Err(cuda_err(op, device_ordinal));
+    }
+    Ok(value)
+}
+
 impl CudaContextHandle {
     #[cfg(feature = "cuda")]
     pub fn init(device: i32) -> Result<Self> {
@@ -54,6 +78,24 @@ impl CudaContextHandle {
         if unsafe { cuDeviceGet(&mut dev, device) } != CUresult::CUDA_SUCCESS {
             return Err(cuda_err("cuDeviceGet", device));
         }
+
+        // Read compute capability now — it's immutable for the
+        // device, and downstream code (arch resolver, kernel picker)
+        // asks repeatedly. One FFI round trip at init beats one per
+        // call site forever.
+        let cc_major = device_attr(
+            dev,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            device,
+            "cuDeviceGetAttribute(CC_MAJOR)",
+        )?;
+        let cc_minor = device_attr(
+            dev,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            device,
+            "cuDeviceGetAttribute(CC_MINOR)",
+        )?;
+
         // Retain the primary context (ref-counted; Release in Drop) and
         // make it current on this thread. Modern replacement for
         // `cuCtxCreate_v2` — see module docs.
@@ -72,6 +114,7 @@ impl CudaContextHandle {
             device,
             cu_device: dev,
             _ctx: ctx,
+            cu_compute_cap: (cc_major, cc_minor),
             _not_send_sync: core::marker::PhantomData,
         })
     }
@@ -91,6 +134,8 @@ impl CudaContextHandle {
             cu_device: 0,
             #[cfg(feature = "cuda")]
             _ctx: std::ptr::null_mut(),
+            #[cfg(feature = "cuda")]
+            cu_compute_cap: (0, 0),
             _not_send_sync: core::marker::PhantomData,
         }
     }
@@ -99,47 +144,21 @@ impl CudaContextHandle {
         self.device
     }
 
-    /// Query the device's compute capability as `(major, minor)`.
-    ///
-    /// Drives `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_{MAJOR,MINOR})`
-    /// against the `CUdevice` handle we already resolved in `init` (so
-    /// there's no redundant `cuDeviceGet` per call). Callers use this
+    /// Device compute capability `(major, minor)`, read once at init and
+    /// cached. Cheap field access — no FFI on the call path. Callers
+    /// pass this pair through `CompileTarget::from_compute_capability`
     /// to pick the matching `kernels/<sm_*>/` subdirectory; a device
     /// whose compute capability has no PTX build should be rejected at
     /// bring-up (no silent fallback).
+    ///
+    /// Only defined under `feature = "cuda"` — every call site is
+    /// already cuda-gated (no-cuda builds don't have a real device to
+    /// query). A `host_stub()` under cuda returns `(0, 0)`, which
+    /// `CompileTarget::from_compute_capability` maps to `None` so the
+    /// bring-up path fails closed.
     #[cfg(feature = "cuda")]
-    pub fn compute_capability(&self) -> Result<(i32, i32)> {
-        use cudarc::driver::sys::*;
-        let mut major: i32 = 0;
-        if unsafe {
-            cuDeviceGetAttribute(
-                &mut major,
-                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                self.cu_device,
-            )
-        } != CUresult::CUDA_SUCCESS
-        {
-            return Err(cuda_err("cuDeviceGetAttribute(CC_MAJOR)", self.device));
-        }
-        let mut minor: i32 = 0;
-        if unsafe {
-            cuDeviceGetAttribute(
-                &mut minor,
-                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                self.cu_device,
-            )
-        } != CUresult::CUDA_SUCCESS
-        {
-            return Err(cuda_err("cuDeviceGetAttribute(CC_MINOR)", self.device));
-        }
-        Ok((major, minor))
-    }
-
-    /// Host-stub compute capability. Returns an error: callers that need
-    /// a real CC must run under `feature = "cuda"`.
-    #[cfg(not(feature = "cuda"))]
-    pub fn compute_capability(&self) -> Result<(i32, i32)> {
-        Err(cuda_err("compute_capability", self.device))
+    pub fn compute_capability(&self) -> (i32, i32) {
+        self.cu_compute_cap
     }
 }
 

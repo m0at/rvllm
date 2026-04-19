@@ -87,18 +87,20 @@ pub const fn select_variant(regime: ClockRegime) -> Fp8GemvVariant {
     }
 }
 
-/// Time-window heuristic: before the firmware throttle kicks in
-/// (~3 s of sustained compute on GB10), assume `Sustained`; after,
-/// assume `Throttled`.
+/// Onset of the PR #28 firmware throttle — ~3 s of sustained compute,
+/// padded by ~500 ms so time-window callers land on the stable side
+/// either way. Re-exported so a monitoring harness or CI gate can
+/// assert the same boundary the runtime uses.
+pub const THROTTLE_ONSET: Duration = Duration::from_millis(2_500);
+
+/// Time-window heuristic: before `THROTTLE_ONSET` assume `Sustained`;
+/// after, assume `Throttled`.
 ///
 /// Caller tracks `elapsed_since_warmup` — the wall-clock time since
 /// the engine started executing inference work (NOT since process
 /// start). Resetting the timer after any idle window > ~2 s is the
 /// caller's responsibility (the clock recovers during idle).
 pub fn regime_from_elapsed(elapsed_since_warmup: Duration) -> ClockRegime {
-    // Firmware transition measured at ~3 s of sustained load; pad by
-    // ~500 ms to land on the stable side either way.
-    const THROTTLE_ONSET: Duration = Duration::from_millis(2_500);
     if elapsed_since_warmup < THROTTLE_ONSET {
         ClockRegime::Sustained
     } else {
@@ -106,22 +108,21 @@ pub fn regime_from_elapsed(elapsed_since_warmup: Duration) -> ClockRegime {
     }
 }
 
-/// Clock-probe heuristic: classify a measured SM clock in MHz.
-///
-/// The two plateaus originally documented (507 MHz throttled /
-/// 851 MHz sustained) came from PR #28's reporter environment. On
-/// this DGX Spark with driver 595.58.03 / CUDA 13.2 the SM clock
-/// instead sits around **~2520 MHz** under both idle and sustained
-/// GEMV load (see `v3/GB10_SPEC.md`, "Empirical numbers"). The
-/// threshold is set at **1500 MHz**: well above anything that would
-/// be called a "throttled" regime on any Blackwell consumer part,
-/// and well below the observed ~2500 MHz sustained. If a future
-/// firmware revision revives the PR #28 throttle plateaus, a
-/// reading in the 500-850 MHz range still classifies as `Throttled`.
+/// SM-clock boundary between `Sustained` and `Throttled`. Set at
+/// **1500 MHz**: well above anything that would be called a
+/// "throttled" regime on any Blackwell consumer part, well below the
+/// ~2520 MHz observed on this DGX Spark under sustained GEMV load.
+/// The PR #28 historical plateaus (507 MHz throttled / 851 MHz
+/// sustained) both classify as `Throttled` under this boundary, so
+/// the policy stays correct if a future firmware revives them.
+pub const SUSTAINED_CLOCK_THRESHOLD_MHZ: u32 = 1500;
+
+/// Clock-probe heuristic: classify a measured SM clock in MHz using
+/// `SUSTAINED_CLOCK_THRESHOLD_MHZ`.
 pub fn regime_from_clock_mhz(sm_clock_mhz: u32) -> ClockRegime {
     if sm_clock_mhz == 0 {
         ClockRegime::Unknown
-    } else if sm_clock_mhz >= 1500 {
+    } else if sm_clock_mhz >= SUSTAINED_CLOCK_THRESHOLD_MHZ {
         ClockRegime::Sustained
     } else {
         ClockRegime::Throttled
