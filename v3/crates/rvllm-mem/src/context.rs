@@ -87,6 +87,89 @@ impl CudaContextHandle {
     pub fn device(&self) -> i32 {
         self.device
     }
+
+    /// Query the device's compute capability as `(major, minor)`.
+    ///
+    /// Drives `cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_{MAJOR,MINOR})`.
+    /// Callers use this to pick the matching `kernels/<sm_*>/` subdirectory; a
+    /// device whose compute capability has no PTX build should be rejected at
+    /// bring-up (no silent fallback).
+    #[cfg(feature = "cuda")]
+    pub fn compute_capability(&self) -> Result<(i32, i32)> {
+        use cudarc::driver::sys::*;
+        let ordinal = self.device;
+        let mut dev: CUdevice = 0;
+        let r = unsafe { cuDeviceGet(&mut dev, ordinal) };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::cuda(
+                "cuDeviceGet",
+                CudaErrorKind::Other,
+                CudaCtx {
+                    stream: 0,
+                    kernel: "cuDeviceGet",
+                    launch: None,
+                    device: ordinal,
+                },
+            ));
+        }
+        let mut major: i32 = 0;
+        let r = unsafe {
+            cuDeviceGetAttribute(
+                &mut major,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                dev,
+            )
+        };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::cuda(
+                "cuDeviceGetAttribute(CC_MAJOR)",
+                CudaErrorKind::Other,
+                CudaCtx {
+                    stream: 0,
+                    kernel: "cuDeviceGetAttribute",
+                    launch: None,
+                    device: ordinal,
+                },
+            ));
+        }
+        let mut minor: i32 = 0;
+        let r = unsafe {
+            cuDeviceGetAttribute(
+                &mut minor,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                dev,
+            )
+        };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::cuda(
+                "cuDeviceGetAttribute(CC_MINOR)",
+                CudaErrorKind::Other,
+                CudaCtx {
+                    stream: 0,
+                    kernel: "cuDeviceGetAttribute",
+                    launch: None,
+                    device: ordinal,
+                },
+            ));
+        }
+        Ok((major, minor))
+    }
+
+    /// Host-stub compute capability. Returns an error: callers that need
+    /// a real CC must run under `feature = "cuda"`.
+    #[cfg(not(feature = "cuda"))]
+    pub fn compute_capability(&self) -> Result<(i32, i32)> {
+        Err(RvllmError::cuda(
+            "compute_capability",
+            CudaErrorKind::Other,
+            CudaCtx {
+                stream: 0,
+                kernel: "compute_capability",
+                launch: None,
+                device: self.device,
+            },
+        ))
+    }
 }
 
 #[cfg(feature = "cuda")]

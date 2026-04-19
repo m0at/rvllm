@@ -105,7 +105,9 @@ impl Gemma4Bringup {
         let arch = rvllm_loader::gemma4_arch::Gemma4Arch::from_dir(&paths.model_dir)?;
         let model = rvllm_loader::gemma4_load::load_gemma4_model(&paths.model_dir, &arena, &arch)?;
 
-        let manifest_path = paths.kernels_dir.join("manifest.json");
+        // Per-arch kernel subdirectory resolution — see `resolve_kernels_dir`.
+        let kernels_dir = crate::bring_up::resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
+        let manifest_path = kernels_dir.join("manifest.json");
         let manifest = rvllm_kernels::manifest::KernelManifest::load_and_verify(&manifest_path)?;
         let kernels = Arc::new(KernelLoader::new(manifest));
 

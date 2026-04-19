@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_attention::Fa3Kernels;
+#[cfg(feature = "cuda")]
+use rvllm_core::CompileTarget;
 use rvllm_core::{ConfigError, Result, RvllmError};
 use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan, Policy};
 use rvllm_kernels::{manifest::KernelManifest, KernelFn, KernelLoader, LoadedModule};
@@ -96,7 +98,11 @@ impl Bringup {
         let model = load_model(&paths.model_dir, &arena, &arch)?;
 
         // 3. Kernel manifest -> loader -> modules.
-        let manifest_path = paths.kernels_dir.join("manifest.json");
+        //    Resolve the per-arch kernel subdirectory from the device's
+        //    compute capability. A device we don't build PTX for is a
+        //    hard error — no silent fallback to a generic arch.
+        let kernels_dir = resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
+        let manifest_path = kernels_dir.join("manifest.json");
         let manifest = KernelManifest::load_and_verify(&manifest_path)?;
         let kernels = Arc::new(KernelLoader::new(manifest));
         let fused_modules = load_fused(&kernels)?;
@@ -1491,4 +1497,55 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
         fn_argmax,
         fn_add_bias_f16,
     })
+}
+
+/// Resolve `<kernels_root>/<sm_xxx>/` for the CUDA device backing `ctx`.
+///
+/// Queries the device's compute capability, maps it to a `CompileTarget`,
+/// and returns the matching per-arch subdirectory. Rejects devices whose
+/// compute capability is not in our PTX build matrix and rejects missing
+/// subdirectories (no silent fallback to the legacy top-level layout).
+///
+/// Under `not(feature = "cuda")` this falls back to `kernels_root` as-is
+/// so host-stub builds still compile.
+pub fn resolve_kernels_dir(
+    ctx: &CudaContextHandle,
+    kernels_root: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    #[cfg(feature = "cuda")]
+    {
+        let (major, minor) = ctx.compute_capability()?;
+        let target = CompileTarget::from_compute_capability(major, minor).ok_or_else(|| {
+            RvllmError::config(
+                ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "unsupported CUDA compute capability {major}.{minor} \
+                         (no PTX build in kernels/). Add a `CompileTarget` \
+                         variant and rebuild kernels for this arch."
+                    )],
+                },
+                "compute_capability",
+            )
+        })?;
+        let sub = kernels_root.join(target.as_sm_str());
+        if !sub.is_dir() {
+            return Err(RvllmError::config(
+                ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "kernel subdirectory {} for compute capability {major}.{minor} \
+                         does not exist; run `kernels/build.sh {}`",
+                        sub.display(),
+                        target.as_sm_str(),
+                    )],
+                },
+                "kernels_dir",
+            ));
+        }
+        Ok(sub)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ctx;
+        Ok(kernels_root.to_path_buf())
+    }
 }
