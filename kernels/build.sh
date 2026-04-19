@@ -93,7 +93,12 @@ compile_kernel() {
     $NVCC -ptx -arch="$arch" -O3 $extra_flags -o "$ptx" "$cu" 2>/dev/null
 }
 
-REVISION=$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo "dev")
+# Revision pinned into the generated manifest.json. Precedence:
+#   1. $REVISION env var (tarball / CI shallow-clone builds where
+#      git isn't available or history is detached)
+#   2. git short HEAD
+#   3. literal "dev" (local hack build)
+REVISION="${REVISION:-$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo "dev")}"
 
 for arch in $ARCHS; do
     echo "=== Compiling for $arch ==="

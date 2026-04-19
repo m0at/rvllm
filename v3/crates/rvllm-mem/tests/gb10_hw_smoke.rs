@@ -9,10 +9,10 @@
 //!      a handful of `Region`s out of it; verify the bump allocator
 //!      hands out non-overlapping, aligned device pointers.
 //!
-//! Only compiled when BOTH `gb10` and `cuda` features are on. Skipped
-//! at integration-test level when no GPU is present (the CUDA init
-//! itself returns an error rather than panicking, and we convert that
-//! to an `eprintln!` skip).
+//! Marked `#[ignore]` because it requires a real CUDA device. Run with
+//!     cargo test -p rvllm-mem --features gb10,cuda \
+//!         --test gb10_hw_smoke -- --ignored --nocapture
+//! Only compiled when BOTH `gb10` and `cuda` features are on.
 
 #![cfg(all(feature = "gb10", feature = "cuda"))]
 
@@ -21,15 +21,12 @@ use rvllm_mem::context::CudaContextHandle;
 use rvllm_mem::unified::UnifiedArena;
 
 #[test]
+#[ignore = "requires a real CUDA device; run with `--ignored`"]
 fn gb10_end_to_end_bring_up() {
-    // Step 1 — CUDA context. If this is not a CUDA machine, skip.
-    let ctx = match CudaContextHandle::init(0) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("skipping gb10 hw smoke: CUDA init failed ({e})");
-            return;
-        }
-    };
+    // CUDA context — on a GPU-less machine this would panic via the
+    // expect below, which is what we want under `--ignored` (the whole
+    // test is opt-in to hardware presence).
+    let ctx = CudaContextHandle::init(0).expect("CudaContextHandle::init");
 
     // Step 2 — compute capability → CompileTarget.
     let (major, minor) = ctx.compute_capability().expect("compute_capability");
