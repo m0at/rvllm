@@ -144,7 +144,6 @@ impl CudaContextHandle {
     }
 
     #[inline]
-    #[must_use]
     pub fn device(&self) -> i32 {
         self.device
     }
@@ -162,6 +161,7 @@ impl CudaContextHandle {
     /// `CompileTarget::from_compute_capability` maps to `None` so the
     /// bring-up path fails closed.
     #[cfg(feature = "cuda")]
+    #[inline]
     pub fn compute_capability(&self) -> (i32, i32) {
         self.cu_compute_cap
     }

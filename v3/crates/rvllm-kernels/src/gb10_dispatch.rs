@@ -52,7 +52,14 @@ use core::time::Duration;
 use rvllm_core::CompileTarget;
 
 /// Which `fp8_gemv_blockwise_wpr_*_kernel` variant to dispatch on GB10.
+///
+/// `#[non_exhaustive]` so adding a future variant (e.g. an FP8
+/// tensor-core MMA kernel) isn't a breaking change for external
+/// `match` expressions. Internal matches inside this crate stay
+/// exhaustive by design.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+#[must_use]
 pub enum Fp8GemvVariant {
     /// `fp8_gemv_blockwise_wpr_lut_kernel` — branchless shared-memory
     /// LUT dequant, ~24 ALU instructions per FP8 byte. Runs on every
@@ -80,6 +87,7 @@ impl Fp8GemvVariant {
     /// The `__global__` function symbol inside the `fp8_gemv.ptx`
     /// module. Paired with `FP8_GEMV_PTX_STEM` to resolve a variant
     /// through the kernel loader.
+    #[inline]
     pub const fn entry_point(self) -> &'static str {
         match self {
             Fp8GemvVariant::WprLut => "fp8_gemv_blockwise_wpr_lut_kernel",
@@ -92,6 +100,8 @@ impl Fp8GemvVariant {
     /// `#if __CUDA_ARCH__ >= 1000` gate around the native-CVT kernel
     /// in `kernels/fp8_gemv.cu`. `select_variant` uses this so the
     /// policy can never hand back a symbol the loader won't resolve.
+    #[inline]
+    #[must_use]
     pub const fn available_for(self, target: CompileTarget) -> bool {
         match self {
             // Branchless LUT decode compiles on every arch we build.
@@ -116,7 +126,13 @@ impl Default for Fp8GemvVariant {
 /// Reflects the PR #28 model (which didn't reproduce on our hardware —
 /// see module docs). Retained so the policy stays robust if a future
 /// firmware revives the described plateaus.
+///
+/// `#[non_exhaustive]` leaves room for future regime labels (e.g. a
+/// cold-clock warm-up state or a thermal-slowdown state) without a
+/// breaking match-arm change downstream.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+#[must_use]
 pub enum ClockRegime {
     /// Clock is known to be above `SUSTAINED_CLOCK_THRESHOLD_MHZ`
     /// (observed plateau on this DGX Spark is ~2520 MHz; PR #28
@@ -174,6 +190,7 @@ pub enum ClockRegime {
 ///     "fp8_gemv_blockwise_wpr_lut_kernel",
 /// );
 /// ```
+#[inline]
 pub const fn select_variant(regime: ClockRegime, target: CompileTarget) -> Fp8GemvVariant {
     // Only pick `WprNative` when the regime argues for it AND the
     // target actually has it. Everything else falls through to the
@@ -203,6 +220,7 @@ pub const THROTTLE_ONSET: Duration = Duration::from_millis(2_500);
 /// Implemented via `Duration::as_millis()` rather than `PartialOrd`
 /// so the function stays `const fn` (Duration's comparison traits
 /// are not yet const-stable).
+#[inline]
 pub const fn regime_from_elapsed(elapsed_since_warmup: Duration) -> ClockRegime {
     if elapsed_since_warmup.as_millis() < THROTTLE_ONSET.as_millis() {
         ClockRegime::Sustained
@@ -222,6 +240,7 @@ pub const SUSTAINED_CLOCK_THRESHOLD_MHZ: u32 = 1500;
 
 /// Clock-probe heuristic: classify a measured SM clock in MHz using
 /// `SUSTAINED_CLOCK_THRESHOLD_MHZ`.
+#[inline]
 pub const fn regime_from_clock_mhz(sm_clock_mhz: u32) -> ClockRegime {
     if sm_clock_mhz == 0 {
         ClockRegime::Unknown
@@ -231,6 +250,19 @@ pub const fn regime_from_clock_mhz(sm_clock_mhz: u32) -> ClockRegime {
         ClockRegime::Throttled
     }
 }
+
+// Compile-time regression guard: `select_variant`, the two regime
+// classifiers, and the helpers must stay `const fn` so callers can
+// materialise a variant at compile time. Evaluated on every build
+// (not just under `cargo test`), so dropping a `const` qualifier
+// fails compilation instead of only breaking tests.
+const _CONST_CALLABLE: () = {
+    let _ = select_variant(ClockRegime::Sustained, CompileTarget::Sm121);
+    let _ = regime_from_clock_mhz(2520);
+    let _ = regime_from_elapsed(Duration::from_millis(0));
+    let _ = Fp8GemvVariant::WprNative.entry_point();
+    let _ = Fp8GemvVariant::WprLut.available_for(CompileTarget::Sm90);
+};
 
 #[cfg(test)]
 mod tests {
@@ -310,18 +342,6 @@ mod tests {
     fn default_variant_is_wpr_lut() {
         assert_eq!(Fp8GemvVariant::default(), Fp8GemvVariant::WprLut);
     }
-
-    // Compile-time regression guard: `select_variant`, the two regime
-    // classifiers, and the helpers must stay `const fn` so callers can
-    // materialise a variant at compile time. This block fails to
-    // compile if a future change drops the `const` qualifier.
-    const _CONST_CALLABLE: () = {
-        let _ = select_variant(ClockRegime::Sustained, CompileTarget::Sm121);
-        let _ = regime_from_clock_mhz(2520);
-        let _ = regime_from_elapsed(Duration::from_millis(0));
-        let _ = Fp8GemvVariant::WprNative.entry_point();
-        let _ = Fp8GemvVariant::WprLut.available_for(CompileTarget::Sm90);
-    };
 
     #[test]
     fn elapsed_heuristic_crosses_at_2s5() {
