@@ -152,6 +152,15 @@ pub struct Gemma4LayerKernels {
     pub fused_rope_partial_f16kv: KernelFn,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum Gemma4Phase {
+    Decode,
+    Prefill {
+        cu_seqlens_q: u64,
+        max_seqlen_q: u32,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemma4_forward(
     dims: Gemma4LayerDims,
@@ -164,6 +173,24 @@ pub unsafe fn gemma4_forward(
     global_attention: &Fa3Kernels,
     residual: u64,
     stream: u64,
+) -> Result<()> {
+    gemma4_forward_phase(dims, kernels, weights, scratch, meta, cublaslt,
+        sliding_attention, global_attention, residual, stream, Gemma4Phase::Decode)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemma4_forward_phase(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    weights: &Gemma4LayerWeightPtrs,
+    scratch: &Gemma4LayerScratch,
+    meta: &Gemma4MetadataPtrs,
+    cublaslt: &CublasLt,
+    sliding_attention: &Fa3Kernels,
+    global_attention: &Fa3Kernels,
+    residual: u64,
+    stream: u64,
+    phase: Gemma4Phase,
 ) -> Result<()> {
     let q_dim = dims.num_heads * dims.head_dim;
     let _kv_dim = dims.num_kv_heads * dims.head_dim;
