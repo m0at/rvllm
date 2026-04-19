@@ -18,8 +18,9 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gemma4_tpu_infer import (
     load_model, load_tokenizer, make_mesh, precompute_rope,
-    forward, forward_step,
+    forward_step,
     H, S_HD, NL, MAX_KV, MAX_KVH, SOFTCAP_VAL, B,
+    _sharded_zeros, N_SLIDING, N_GLOBAL, WINDOW, S_KV, G_KV, S_KVH, G_KVH,
 )
 
 # ── globals set at startup ──
@@ -27,7 +28,8 @@ MODEL_NAME = "gemma-4-31B-it"
 MESH = None
 EMBED = None
 FINAL_NORM = None
-WEIGHTS = None
+SL_WEIGHTS = None
+GL_WEIGHTS = None
 COS_S = COS_G = SIN_S = SIN_G = None
 TOKENIZER = None
 MAX_CTX = 2048
@@ -63,15 +65,22 @@ def tokenize_prompt(text):
 
 
 def make_fresh_caches():
-    """Allocate zeroed KV caches on device."""
+    """Allocate split KV caches: sliding (WINDOW) + global (MAX_CTX)."""
     kv_sh = NamedSharding(MESH, P(None, None, 'tp'))
     kvs_sh = NamedSharding(MESH, P(None, None, None))
-    return {
-        'kc': jax.device_put(jnp.zeros((NL, MAX_CTX, MAX_KV), dtype=jnp.int8), kv_sh),
-        'vc': jax.device_put(jnp.zeros((NL, MAX_CTX, MAX_KV), dtype=jnp.int8), kv_sh),
-        'kc_s': jax.device_put(jnp.zeros((NL, MAX_CTX, MAX_KVH), dtype=jnp.bfloat16), kvs_sh),
-        'vc_s': jax.device_put(jnp.zeros((NL, MAX_CTX, MAX_KVH), dtype=jnp.bfloat16), kvs_sh),
+    sl = {
+        'kc': _sharded_zeros((N_SLIDING, WINDOW, S_KV), np.int8, kv_sh),
+        'vc': _sharded_zeros((N_SLIDING, WINDOW, S_KV), np.int8, kv_sh),
+        'kc_s': _sharded_zeros((N_SLIDING, WINDOW, S_KVH), ml_dtypes.bfloat16, kvs_sh),
+        'vc_s': _sharded_zeros((N_SLIDING, WINDOW, S_KVH), ml_dtypes.bfloat16, kvs_sh),
     }
+    gl = {
+        'kc': _sharded_zeros((N_GLOBAL, MAX_CTX, G_KV), np.int8, kv_sh),
+        'vc': _sharded_zeros((N_GLOBAL, MAX_CTX, G_KV), np.int8, kv_sh),
+        'kc_s': _sharded_zeros((N_GLOBAL, MAX_CTX, G_KVH), ml_dtypes.bfloat16, kvs_sh),
+        'vc_s': _sharded_zeros((N_GLOBAL, MAX_CTX, G_KVH), ml_dtypes.bfloat16, kvs_sh),
+    }
+    return sl, gl
 
 
 def sample_token(logits, temperature):
@@ -86,8 +95,8 @@ def sample_token(logits, temperature):
 
 def generate(prompt_ids, max_tokens, temperature, stop_sequences):
     """Token-by-token generation. Yields (token_id, token_text) pairs."""
-    fwd_jit = jax.jit(forward, donate_argnums=(6,))
-    caches = make_fresh_caches()
+    fwd_jit = jax.jit(forward_step)
+    sl_caches, gl_caches = make_fresh_caches()
     num_prompt = len(prompt_ids)
 
     # Prefill: feed prompt tokens one at a time
@@ -95,24 +104,12 @@ def generate(prompt_ids, max_tokens, temperature, stop_sequences):
         tok_arr = jnp.array([prompt_ids[step]], dtype=jnp.int32)
         pos = jnp.int32(step)
         ctx = jnp.int32(step + 1)
-        if step == num_prompt - 1:
-            next_tok, log_probs, caches = fwd_jit(
-                tok_arr, pos, ctx, EMBED, FINAL_NORM, WEIGHTS, caches,
-                COS_S, SIN_S, COS_G, SIN_G)
-        else:
-            _, _, caches = fwd_jit(
-                tok_arr, pos, ctx, EMBED, FINAL_NORM, WEIGHTS, caches,
-                COS_S, SIN_S, COS_G, SIN_G)
+        next_tok, sl_caches, gl_caches = fwd_jit(
+            tok_arr, pos, ctx, EMBED, FINAL_NORM,
+            SL_WEIGHTS, GL_WEIGHTS, sl_caches, gl_caches,
+            COS_S, SIN_S, COS_G, SIN_G)
 
-    # First decode token from last prefill logits
-    if temperature <= 0:
-        sampled = int(jnp.argmax(log_probs, axis=-1)[0])  # greedy from full logits dim
-    else:
-        sampled = sample_token(log_probs, temperature)
-
-    # Actually use the argmax already computed by forward()
     sampled = int(next_tok[0])
-
     accumulated = ""
     generated_count = 0
 
@@ -125,7 +122,6 @@ def generate(prompt_ids, max_tokens, temperature, stop_sequences):
         if sampled in EOS_TOKENS:
             return
 
-        # Check stop sequences
         if stop_sequences:
             for ss in stop_sequences:
                 if ss in accumulated:
@@ -134,19 +130,16 @@ def generate(prompt_ids, max_tokens, temperature, stop_sequences):
         if num_prompt + decode_step + 1 >= MAX_CTX - 1:
             return
 
-        # Next forward step
         step = num_prompt + decode_step
         tok_arr = jnp.array([sampled], dtype=jnp.int32)
         pos = jnp.int32(step)
         ctx = jnp.int32(step + 1)
-        next_tok, log_probs, caches = fwd_jit(
-            tok_arr, pos, ctx, EMBED, FINAL_NORM, WEIGHTS, caches,
+        next_tok, sl_caches, gl_caches = fwd_jit(
+            tok_arr, pos, ctx, EMBED, FINAL_NORM,
+            SL_WEIGHTS, GL_WEIGHTS, sl_caches, gl_caches,
             COS_S, SIN_S, COS_G, SIN_G)
 
-        if temperature <= 0:
-            sampled = int(next_tok[0])
-        else:
-            sampled = sample_token(log_probs, temperature)
+        sampled = int(next_tok[0])
 
 
 def make_chunk(request_id, model, delta_content=None, finish_reason=None):
@@ -347,7 +340,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global MESH, EMBED, FINAL_NORM, WEIGHTS, COS_S, SIN_S, COS_G, SIN_G
+    global MESH, EMBED, FINAL_NORM, SL_WEIGHTS, GL_WEIGHTS, COS_S, SIN_S, COS_G, SIN_G
     global TOKENIZER, MAX_CTX, MODEL_NAME
 
     parser = argparse.ArgumentParser(description="rvLLM OpenAI-compatible API server")
@@ -374,7 +367,7 @@ def main():
     # Load model
     MESH = make_mesh()
     print(f"mesh: {MESH}", file=sys.stderr)
-    EMBED, FINAL_NORM, WEIGHTS, _ = load_model(args.model_dir, MESH, MAX_CTX)
+    EMBED, FINAL_NORM, SL_WEIGHTS, GL_WEIGHTS, _, _ = load_model(args.model_dir, MESH, MAX_CTX)
 
     # Precompute RoPE
     cos_s, sin_s = precompute_rope(10000.0, S_HD, MAX_CTX)
@@ -387,15 +380,15 @@ def main():
     # Warm up JIT with a dummy forward pass
     print("warming up JIT...", file=sys.stderr, flush=True)
     t0 = time.time()
-    dummy_caches = make_fresh_caches()
-    fwd_jit = jax.jit(forward, donate_argnums=(6,))
+    sl_c, gl_c = make_fresh_caches()
+    fwd_jit = jax.jit(forward_step)
     tok = jnp.array([BOS_TOKEN], dtype=jnp.int32)
-    _, _, _ = fwd_jit(tok, jnp.int32(0), jnp.int32(1),
-                      EMBED, FINAL_NORM, WEIGHTS, dummy_caches,
-                      COS_S, SIN_S, COS_G, SIN_G)
+    _, sl_c, gl_c = fwd_jit(tok, jnp.int32(0), jnp.int32(1),
+                             EMBED, FINAL_NORM, SL_WEIGHTS, GL_WEIGHTS, sl_c, gl_c,
+                             COS_S, SIN_S, COS_G, SIN_G)
     jax.effects_barrier()
     print(f"JIT warm-up: {time.time() - t0:.1f}s", file=sys.stderr)
-    del dummy_caches
+    del sl_c, gl_c
 
     # Start server
     server = HTTPServer((args.host, args.port), APIHandler)
