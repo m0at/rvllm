@@ -226,7 +226,7 @@ impl Gemma4Bringup {
         let q_scale_region = arena.region("q_scale", 4, 4).unwrap();
         let kv_scale_region = arena.region("kv_scale", 4, 4).unwrap();
         {
-            let scale: f32 = 418.0 / 448.0;
+            let scale: f32 = 16.0 / 448.0;
             q_scale_region.copy_from_host(&scale.to_le_bytes()).unwrap();
             kv_scale_region.copy_from_host(&scale.to_le_bytes()).unwrap();
         }
@@ -538,7 +538,7 @@ impl Gemma4Bringup {
         let q_scale_region = arena.region("q_scale", 4, 4)?;
         let kv_scale_region = arena.region("kv_scale", 4, 4)?;
         {
-            let scale: f32 = 418.0 / 448.0;
+            let scale: f32 = 16.0 / 448.0;
             q_scale_region.copy_from_host(&scale.to_le_bytes())?;
             kv_scale_region.copy_from_host(&scale.to_le_bytes())?;
         }
@@ -947,7 +947,7 @@ impl Gemma4Bringup {
 
         let q_scale_region = arena.region("gen_q_scale", 4, 4)?;
         let kv_scale_region = arena.region("gen_kv_scale", 4, 4)?;
-        { let s: f32 = 418.0 / 448.0; q_scale_region.copy_from_host(&s.to_le_bytes())?; kv_scale_region.copy_from_host(&s.to_le_bytes())?; }
+        { let s: f32 = 16.0 / 448.0; q_scale_region.copy_from_host(&s.to_le_bytes())?; kv_scale_region.copy_from_host(&s.to_le_bytes())?; }
 
         let fa3_ws = arena.region("gen_fa3_ws", 16 * 1024 * 1024, 256)?;
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
