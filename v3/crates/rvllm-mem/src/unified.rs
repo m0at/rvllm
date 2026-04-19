@@ -69,26 +69,29 @@ impl<'ctx> UnifiedArena<'ctx> {
             ));
         }
 
-        // TODO(gb10): bias residency toward the GPU via
-        // `cuMemAdvise[_v2](CU_MEM_ADVISE_SET_PREFERRED_LOCATION, device)`
-        // once cudarc exposes a stable signature across CUDA 12/13 —
-        // the `CUmemLocation` struct shape differs by toolkit and the
-        // `_v1` variant is gone in CUDA 13 headers. Without the hint,
-        // the first kernel launch incurs a page-fault migration but
-        // the arena still functions.
+        // Bias residency toward the GPU so the first kernel launch
+        // doesn't page-fault a gigabyte of weights in from the CPU
+        // side. `cuMemAdvise_v2` is wrapped by cudarc for every CUDA
+        // toolkit from 12.02 onward (including 13.0x/13.02) and takes
+        // a `CUmemLocation { type, id }` value. Advise failures are
+        // non-fatal — without the hint the pages simply migrate on
+        // first touch.
+        let loc = CUmemLocation {
+            type_: CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
+            id: ctx.device(),
+        };
+        let _ = unsafe {
+            cuMemAdvise_v2(
+                dptr,
+                bytes,
+                CUmem_advise_enum::CU_MEM_ADVISE_SET_PREFERRED_LOCATION,
+                loc,
+            )
+        };
 
-        // Reuse HbmArena's bump bookkeeping. We hand it a pre-allocated
-        // pointer via the host-stub constructor with a patched base —
-        // but the host stub doesn't accept a base. Instead, we go
-        // through a private path: construct an HbmArena that we mark as
-        // "don't own cuMemFree" (because we'll do cuMemFree_v2 ourselves
-        // in Drop), then overwrite its base. To keep the invariants
-        // obvious, do it by transmuting through the public API: we
-        // wrap in a small helper struct.
-        //
-        // Simpler: since HbmArena has no public constructor that takes
-        // a raw device pointer, we build the bump state inline here and
-        // mirror the Region API by holding the raw base.
+        // HbmArena::from_raw_parts wires the pre-allocated pointer
+        // into the shared bump-allocator bookkeeping + Drop via
+        // cuMemFree_v2, which correctly frees managed memory as well.
         let inner = crate::hbm::HbmArena::from_raw_parts(dptr, bytes);
         Ok(Self {
             inner,
