@@ -120,6 +120,15 @@ impl<'ctx> HbmArena<'ctx> {
         self.capacity
     }
 
+    /// Device base pointer of the arena slab. All `Region`s live in
+    /// `[base_ptr, base_ptr + capacity)`. Stable for the lifetime of
+    /// the arena. Exposed for whole-arena operations like
+    /// `cuMemPrefetchAsync` — per-region callers should use
+    /// `Region::device_ptr()` instead.
+    pub fn base_ptr(&self) -> u64 {
+        self.base
+    }
+
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)
     }
