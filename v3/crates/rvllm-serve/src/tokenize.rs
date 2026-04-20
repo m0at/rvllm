@@ -41,6 +41,11 @@ struct TokenizerInner {
     /// rendered string is then re-tokenized so the BOS id pops out
     /// naturally. Stored for diagnostics only.
     bos_token_str: Option<String>,
+    /// Resolved `<bos>` id. `None` if the tokenizer has no BOS.
+    /// Exposed so the raw-prompt encode path can prepend it (Gemma 4
+    /// ships an empty `TemplateProcessing` so `add_special_tokens`
+    /// does not add BOS by itself).
+    bos_token_id: Option<u32>,
     /// Tokens that should end generation. Populated from
     /// `tokenizer_config.json` (`eos_token`) plus any `<end_of_turn>`
     /// / `<turn|>` style markers we resolve against the vocab.
@@ -71,6 +76,9 @@ impl TokenizerHandle {
 
         let bos_token_str = extract_token_str(&cfg, "bos_token");
         let eos_token_str = extract_token_str(&cfg, "eos_token");
+        let bos_token_id = bos_token_str
+            .as_deref()
+            .and_then(|s| tokenizer.token_to_id(s));
 
         // 3. Resolve EOS (+ companions) against the vocab.
         let mut eos_token_ids: Vec<u32> = Vec::new();
@@ -140,22 +148,38 @@ impl TokenizerHandle {
                 tokenizer,
                 chat_template,
                 bos_token_str,
+                bos_token_id,
                 eos_token_ids,
             }),
         })
     }
 
-    /// Encode raw text. `add_special_tokens=false` — the chat template
-    /// is responsible for any BOS/turn markers. Plain completion
-    /// (`/v1/completions`) callers who want a BOS can prepend it to
-    /// the prompt string themselves.
+    /// Encode raw text. Prepends `<bos>` if the tokenizer's
+    /// `post_processor` doesn't add it (Gemma 4 ships an empty
+    /// TemplateProcessing, so `add_special_tokens=true` is a no-op
+    /// for this model). Without BOS, Gemma 4 greedy-decodes a
+    /// degenerate all-`<pad>` sequence — confirmed on GB10 by
+    /// logging the raw generated ids. The [`ChatMessage`] path
+    /// doesn't use this — its template emits `<bos>` explicitly at
+    /// the start of the rendered string.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, ApiError> {
         let enc = self
             .inner
             .tokenizer
-            .encode(text, false)
+            .encode(text, true)
             .map_err(|e| ApiError::Tokenize(format!("{e}")))?;
-        Ok(enc.get_ids().to_vec())
+        let mut ids = enc.get_ids().to_vec();
+        if let Some(bos_id) = self.inner.bos_token_id {
+            if ids.first().copied() != Some(bos_id) {
+                ids.insert(0, bos_id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Token id of `<bos>` (if the tokenizer knows one).
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.inner.bos_token_id
     }
 
     /// Render the chat template around `messages` and return prompt

@@ -78,9 +78,19 @@ pub async fn spawn_cuda_worker(
                 }
             };
 
+            // Snapshot the arena's bump pointer here — everything
+            // after this point (scratch regions allocated inside
+            // `run_generate`) will be released back to this mark at
+            // the end of each request. Without this the bump pointer
+            // grows monotonically across requests and we'd hit
+            // `HbmArena::region AllocFailed` after a handful of
+            // calls (each `run_generate` allocates ~a dozen named
+            // scratch regions sized for max_tokens + KV cache).
+            let scratch_ck = bringup.arena.checkpoint();
             tracing::info!(
                 compute_cap = ?bringup.ctx.compute_capability(),
                 arena_mib = bringup.arena.capacity() / (1024 * 1024),
+                scratch_checkpoint = scratch_ck,
                 "cuda worker ready",
             );
             let _ = ready_tx.send(Ok(()));
@@ -88,6 +98,12 @@ pub async fn spawn_cuda_worker(
             // Main serve loop. One request at a time (single-seq).
             while let Some(req) = req_rx.blocking_recv() {
                 run_one(&bringup, &kernels_ctx, req);
+                // SAFETY: `run_one` fully consumes the `Region`s it
+                // allocated inside `bringup.run_generate` — they're
+                // function-local there and drop before we return.
+                // No region reference above the checkpoint survives,
+                // so rewinding the bump pointer is safe.
+                unsafe { bringup.arena.restore(scratch_ck); }
             }
 
             tracing::info!("cuda worker queue closed, exiting");
@@ -143,6 +159,12 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         return;
     }
 
+    tracing::debug!(
+        request_id = %req.request_id,
+        prompt_tokens = req.prompt_ids.len(),
+        max_new = req.max_new_tokens,
+        "calling run_generate",
+    );
     let result = unsafe {
         bringup.run_generate(
             kernels.fn_embed,
