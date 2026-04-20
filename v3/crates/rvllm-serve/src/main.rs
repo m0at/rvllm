@@ -76,6 +76,12 @@ struct Cli {
     /// Per-request timeout, seconds.
     #[arg(long, env = "RVLLM_REQUEST_TIMEOUT_SECS", default_value_t = 300)]
     request_timeout_secs: u64,
+
+    /// Graceful shutdown drain window, seconds. After the shutdown
+    /// signal this is the max time we wait for in-flight requests
+    /// before forcing process exit.
+    #[arg(long, env = "RVLLM_SHUTDOWN_DRAIN_SECS", default_value_t = 30)]
+    shutdown_drain_secs: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -103,6 +109,7 @@ async fn main() -> anyhow_compat::Result<()> {
         max_queue_depth: cli.max_queue_depth,
         max_new_tokens_cap: cli.max_new_tokens_cap,
         request_timeout: Duration::from_secs(cli.request_timeout_secs),
+        shutdown_drain_timeout: Duration::from_secs(cli.shutdown_drain_secs),
         ..ServerConfig::default()
     };
     config.validate().map_err(|e| anyhow_compat::err(format!("config: {e}")))?;
@@ -126,12 +133,38 @@ async fn main() -> anyhow_compat::Result<()> {
         .await
         .map_err(|e| anyhow_compat::err(format!("bind {}: {e}", config.bind)))?;
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| anyhow_compat::err(format!("axum serve: {e}")))?;
+    // Graceful shutdown with a bounded drain window.
+    // axum::serve's `with_graceful_shutdown` stops accepting new
+    // connections when the signal fires, then waits for in-flight
+    // handlers to complete. Without a ceiling a pinned CUDA worker
+    // + a long max_new_tokens could keep us up for minutes — wrap
+    // the serve future in a select!(..., sleep(drain_timeout)) so
+    // we always return to the operator within a known bound.
+    let drain_timeout = config.shutdown_drain_timeout;
+    let serve = axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal());
+
+    tokio::select! {
+        res = serve => {
+            res.map_err(|e| anyhow_compat::err(format!("axum serve: {e}")))?;
+        }
+        _ = forced_drain_watchdog(drain_timeout) => {
+            tracing::warn!(
+                drain_timeout_secs = drain_timeout.as_secs(),
+                "drain timeout exceeded — forcing shutdown",
+            );
+        }
+    }
 
     Ok(())
+}
+
+/// Parks until the shutdown signal fires, then waits `drain_timeout`.
+/// If `axum::serve` hasn't exited by then, the outer `select!` returns
+/// through this branch to force the process down.
+async fn forced_drain_watchdog(drain_timeout: std::time::Duration) {
+    shutdown_signal().await;
+    tokio::time::sleep(drain_timeout).await;
 }
 
 #[cfg(feature = "cuda")]

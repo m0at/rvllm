@@ -32,6 +32,12 @@ pub struct ServerConfig {
     pub request_timeout: Duration,
     /// SSE keep-alive interval. Proxies drop idle TCP.
     pub sse_keepalive: Duration,
+    /// After the shutdown signal, wait at most this long for
+    /// in-flight requests to finish before forcing the server down.
+    pub shutdown_drain_timeout: Duration,
+    /// `Retry-After` seconds returned on 429. Stays small so clients
+    /// reconnect quickly once the queue drains.
+    pub retry_after_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -44,6 +50,8 @@ impl Default for ServerConfig {
             max_new_tokens_cap: 4096,
             request_timeout: Duration::from_secs(300),
             sse_keepalive: Duration::from_secs(15),
+            shutdown_drain_timeout: Duration::from_secs(30),
+            retry_after_secs: 1,
         }
     }
 }

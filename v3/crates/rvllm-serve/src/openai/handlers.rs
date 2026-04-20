@@ -33,6 +33,25 @@ type SseStream = std::pin::Pin<
     Box<dyn Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static>,
 >;
 
+/// Flips the `cancelled` flag on drop. Covers two paths:
+///   * non-streaming: axum cancels the handler future when the client
+///     disconnects mid-request → our local is dropped → flag set →
+///     worker breaks out at the next boundary.
+///   * normal completion: flag set after Done is already sent → the
+///     worker has nothing left to notice, the set is a no-op.
+///
+/// Borrows the `Arc<AtomicBool>` shared with the worker; no
+/// allocation on the drop path.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.0.swap(true, Ordering::Relaxed) {
+            tracing::debug!("request dropped, cancellation requested");
+        }
+    }
+}
+
 use crate::error::{ApiError, ApiResult};
 use crate::openai::chat::{
     ChatAssistantMessage, ChatChoice, ChatChunkChoice, ChatCompletionChunk,
@@ -59,6 +78,14 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> ApiResult<ChatCompletionsResponse> {
+    let request_id = Uuid::new_v4();
+    let span = tracing::info_span!(
+        "chat_completions",
+        request_id = %request_id,
+        stream = req.stream,
+    );
+    let _enter = span.enter();
+
     ensure_model_matches(&state, &req.model)?;
     reject_v1_unsupported_chat(&req)?;
 
@@ -82,28 +109,41 @@ pub async fn chat_completions(
     // enough to absorb a slow client without starving the GPU.
     let (events_tx, events_rx) = mpsc::channel::<GenerateEvent>(64);
     let cancelled = Arc::new(AtomicBool::new(false));
-    let request_id = Uuid::new_v4();
-
+    // Drop guard fires on any handler exit (normal, error, client
+    // disconnect mid-non-stream) and flips `cancelled`. SSE path
+    // has its own Ctx::Drop, so don't arm this one on the streaming
+    // branch.
     let gen_req = GenerateRequest {
         request_id,
-        prompt_ids,
+        prompt_ids: prompt_ids.clone(),
         sampling,
         max_new_tokens: max_new,
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         events_tx,
         cancelled: cancelled.clone(),
     };
+    tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
 
     let model_id = state.config.model_id.clone();
     let tokenizer = state.tokenizer.clone();
+    let request_timeout = state.config.request_timeout;
 
     if req.stream {
         Ok(ChatCompletionsResponse::Stream(chat_stream_sse(
-            model_id, tokenizer, events_rx, cancelled, state.config.sse_keepalive,
+            model_id,
+            tokenizer,
+            events_rx,
+            cancelled,
+            state.config.sse_keepalive,
+            request_timeout,
         )))
     } else {
-        let body = chat_collect(&model_id, &tokenizer, events_rx).await?;
+        let _cancel_guard = CancelOnDrop(cancelled.clone());
+        let body = chat_collect(
+            &model_id, &tokenizer, events_rx, cancelled, request_timeout,
+        )
+        .await?;
         Ok(ChatCompletionsResponse::Json(Json(body)))
     }
 }
@@ -130,22 +170,38 @@ async fn chat_collect(
     model_id: &str,
     tokenizer: &crate::tokenize::TokenizerHandle,
     mut events_rx: mpsc::Receiver<GenerateEvent>,
+    cancelled: Arc<AtomicBool>,
+    request_timeout: std::time::Duration,
 ) -> ApiResult<ChatCompletionResponse> {
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
     let mut usage = Usage::default();
 
-    while let Some(ev) = events_rx.recv().await {
-        match ev {
-            GenerateEvent::Token { id, .. } => token_ids.push(id),
-            GenerateEvent::Done { finish: f, prompt_tokens, completion_tokens } => {
-                finish = Some(f);
-                usage = Usage::new(prompt_tokens, completion_tokens);
-                break;
+    // Drain loop with wall-clock deadline. Deadline fires → flip
+    // cancellation + return 504. Channel close (worker gone) also
+    // breaks us out cleanly.
+    let deadline = tokio::time::Instant::now() + request_timeout;
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                cancelled.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    secs = request_timeout.as_secs(),
+                    "request timeout — cancelling worker",
+                );
+                return Err(ApiError::Timeout { secs: request_timeout.as_secs() });
             }
-            GenerateEvent::Error(msg) => {
-                return Err(ApiError::Internal(msg));
-            }
+            ev = events_rx.recv() => match ev {
+                Some(GenerateEvent::Token { id, .. }) => token_ids.push(id),
+                Some(GenerateEvent::Done { finish: f, prompt_tokens, completion_tokens }) => {
+                    finish = Some(f);
+                    usage = Usage::new(prompt_tokens, completion_tokens);
+                    break;
+                }
+                Some(GenerateEvent::Error(msg)) => return Err(ApiError::Internal(msg)),
+                None => break, // worker channel closed
+            },
         }
     }
 
@@ -170,11 +226,13 @@ fn chat_stream_sse(
     events_rx: mpsc::Receiver<GenerateEvent>,
     cancelled: Arc<AtomicBool>,
     keepalive: std::time::Duration,
+    request_timeout: std::time::Duration,
 ) -> axum::response::Response {
     let id = new_chat_completion_id();
     let created = unix_now_secs();
     let model_for_chunk = model_id.clone();
     let decoder = tokenizer.stream_decoder();
+    let deadline = tokio::time::Instant::now() + request_timeout;
 
     // State transitions:
     //   Role       — emit the first `delta.role = assistant` chunk
@@ -199,6 +257,7 @@ fn chat_stream_sse(
         created: u64,
         model: String,
         cancelled: Arc<AtomicBool>,
+        deadline: tokio::time::Instant,
     }
 
     impl Drop for Ctx {
@@ -215,6 +274,7 @@ fn chat_stream_sse(
         created,
         model: model_for_chunk,
         cancelled,
+        deadline,
     };
     ctx.state = S::Content { rx: events_rx, decoder };
     let _ = tokenizer; // keep for clone clarity
@@ -242,7 +302,19 @@ fn chat_stream_sse(
                     return Some((Ok(ev), ctx));
                 }
                 S::Content { mut rx, mut decoder } => {
-                    match rx.recv().await {
+                    let deadline = ctx.deadline;
+                    let ev = tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(deadline) => {
+                            ctx.cancelled.store(true, Ordering::Relaxed);
+                            tracing::warn!("sse request timeout — cancelling worker");
+                            // Emit a terminal Length chunk + [DONE].
+                            ctx.state = S::Finish(FinishReason::Length);
+                            continue;
+                        }
+                        ev = rx.recv() => ev,
+                    };
+                    match ev {
                         Some(GenerateEvent::Token { id, .. }) => {
                             match decoder.step(id) {
                                 Ok(text) if text.is_empty() => {
@@ -334,6 +406,14 @@ pub async fn completions(
     State(state): State<AppState>,
     Json(req): Json<CompletionRequest>,
 ) -> ApiResult<CompletionsResponse> {
+    let request_id = Uuid::new_v4();
+    let span = tracing::info_span!(
+        "completions",
+        request_id = %request_id,
+        stream = req.stream,
+    );
+    let _enter = span.enter();
+
     ensure_model_matches(&state, &req.model)?;
     reject_v1_unsupported_completions(&req)?;
 
@@ -375,18 +455,20 @@ pub async fn completions(
     let cancelled = Arc::new(AtomicBool::new(false));
 
     let gen_req = GenerateRequest {
-        request_id: Uuid::new_v4(),
-        prompt_ids,
+        request_id,
+        prompt_ids: prompt_ids.clone(),
         sampling,
         max_new_tokens: max_new,
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         events_tx,
         cancelled: cancelled.clone(),
     };
+    tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
 
     let model_id = state.config.model_id.clone();
     let tokenizer = state.tokenizer.clone();
+    let request_timeout = state.config.request_timeout;
 
     if req.stream {
         Ok(CompletionsResponse::Stream(completion_stream_sse(
@@ -395,9 +477,18 @@ pub async fn completions(
             events_rx,
             cancelled,
             state.config.sse_keepalive,
+            request_timeout,
         )))
     } else {
-        let body = completion_collect(&model_id, &tokenizer, events_rx).await?;
+        let _cancel_guard = CancelOnDrop(cancelled.clone());
+        let body = completion_collect(
+            &model_id,
+            &tokenizer,
+            events_rx,
+            cancelled,
+            request_timeout,
+        )
+        .await?;
         Ok(CompletionsResponse::Json(Json(body)))
     }
 }
@@ -420,20 +511,35 @@ async fn completion_collect(
     model_id: &str,
     tokenizer: &crate::tokenize::TokenizerHandle,
     mut events_rx: mpsc::Receiver<GenerateEvent>,
+    cancelled: Arc<AtomicBool>,
+    request_timeout: std::time::Duration,
 ) -> ApiResult<CompletionResponse> {
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
     let mut usage = Usage::default();
 
-    while let Some(ev) = events_rx.recv().await {
-        match ev {
-            GenerateEvent::Token { id, .. } => token_ids.push(id),
-            GenerateEvent::Done { finish: f, prompt_tokens, completion_tokens } => {
-                finish = Some(f);
-                usage = Usage::new(prompt_tokens, completion_tokens);
-                break;
+    let deadline = tokio::time::Instant::now() + request_timeout;
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                cancelled.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    secs = request_timeout.as_secs(),
+                    "request timeout — cancelling worker",
+                );
+                return Err(ApiError::Timeout { secs: request_timeout.as_secs() });
             }
-            GenerateEvent::Error(msg) => return Err(ApiError::Internal(msg)),
+            ev = events_rx.recv() => match ev {
+                Some(GenerateEvent::Token { id, .. }) => token_ids.push(id),
+                Some(GenerateEvent::Done { finish: f, prompt_tokens, completion_tokens }) => {
+                    finish = Some(f);
+                    usage = Usage::new(prompt_tokens, completion_tokens);
+                    break;
+                }
+                Some(GenerateEvent::Error(msg)) => return Err(ApiError::Internal(msg)),
+                None => break,
+            },
         }
     }
     let text = tokenizer.decode(&token_ids)?;
@@ -458,9 +564,11 @@ fn completion_stream_sse(
     events_rx: mpsc::Receiver<GenerateEvent>,
     cancelled: Arc<AtomicBool>,
     keepalive: std::time::Duration,
+    request_timeout: std::time::Duration,
 ) -> axum::response::Response {
     let id = new_completion_id();
     let created = unix_now_secs();
+    let deadline = tokio::time::Instant::now() + request_timeout;
 
     enum S {
         Content {
@@ -478,6 +586,7 @@ fn completion_stream_sse(
         created: u64,
         model: String,
         cancelled: Arc<AtomicBool>,
+        deadline: tokio::time::Instant,
     }
 
     impl Drop for Ctx {
@@ -492,12 +601,25 @@ fn completion_stream_sse(
         created,
         model: model_id,
         cancelled,
+        deadline,
     };
 
     let stream = stream::unfold(ctx, |mut ctx| async move {
         loop {
             match std::mem::replace(&mut ctx.state, S::End) {
-                S::Content { mut rx, mut decoder } => match rx.recv().await {
+                S::Content { mut rx, mut decoder } => {
+                    let deadline = ctx.deadline;
+                    let ev = tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(deadline) => {
+                            ctx.cancelled.store(true, Ordering::Relaxed);
+                            tracing::warn!("sse request timeout — cancelling worker");
+                            ctx.state = S::Finish(FinishReason::Length);
+                            continue;
+                        }
+                        ev = rx.recv() => ev,
+                    };
+                    match ev {
                     Some(GenerateEvent::Token { id, .. }) => match decoder.step(id) {
                         Ok(text) if text.is_empty() => {
                             ctx.state = S::Content { rx, decoder };
@@ -532,7 +654,8 @@ fn completion_stream_sse(
                         ctx.state = S::Finish(FinishReason::Stop);
                         continue;
                     }
-                },
+                    }
+                }
                 S::Finish(reason) => {
                     let chunk = CompletionChunk {
                         id: ctx.id.clone(),

@@ -13,7 +13,7 @@
 //! status-code ↔ error-type table.
 
 use axum::{
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -41,9 +41,20 @@ pub enum ApiError {
     ModelNotFound(String),
 
     /// 429 — admission control: request queue is full. Maps to
-    /// OpenAI `rate_limit_exceeded`.
+    /// OpenAI `rate_limit_exceeded`. Response carries `Retry-After`.
     #[error("server busy: {0}")]
     Busy(String),
+
+    /// 504 — request exceeded the per-request deadline (caller or
+    /// worker can't stop a running `run_generate` mid-call, but the
+    /// client doesn't need to keep waiting).
+    #[error("request timeout after {secs}s")]
+    Timeout { secs: u64 },
+
+    /// 499 — client disconnected mid-request (non-standard status,
+    /// OpenAI SDK also ignores the body). Mainly a log marker.
+    #[error("client disconnected")]
+    ClientDisconnect,
 
     /// 503 — model not yet ready (worker still loading weights).
     #[error("service unavailable: {0}")]
@@ -88,6 +99,13 @@ impl ApiError {
             }
             ApiError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Busy(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            // 499 Client Closed Request — non-standard (nginx) but
+            // widely understood; keeps logs actionable vs a generic
+            // 500.
+            ApiError::ClientDisconnect => {
+                StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
+            }
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -100,8 +118,21 @@ impl ApiError {
             }
             ApiError::ModelNotFound(_) => "invalid_request_error",
             ApiError::Busy(_) => "rate_limit_exceeded",
+            ApiError::Timeout { .. } => "request_timeout",
+            ApiError::ClientDisconnect => "client_disconnect",
             ApiError::Unavailable(_) => "service_unavailable",
             ApiError::Internal(_) => "server_error",
+        }
+    }
+
+    /// `Retry-After` seconds for 429 responses. `None` for other
+    /// statuses. The config-derived value is passed via the layer
+    /// that wraps handlers; this method supplies the *default* used
+    /// by raw `IntoResponse` calls that don't have config access.
+    fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            ApiError::Busy(_) => Some(1),
+            _ => None,
         }
     }
 
@@ -137,14 +168,16 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        // Log server-side for correlation; clients never see stack.
         if matches!(self, ApiError::Internal(_) | ApiError::Unavailable(_)) {
             tracing::error!(error = %self, "request failed");
+        } else if matches!(self, ApiError::ClientDisconnect) {
+            tracing::debug!("client disconnected mid-request");
         } else {
             tracing::warn!(error = %self, "request rejected");
         }
 
         let status = self.status();
+        let retry_after = self.retry_after_secs();
         let body = ErrorEnvelope {
             error: ErrorBody {
                 message: self.to_string(),
@@ -153,7 +186,13 @@ impl IntoResponse for ApiError {
                 code: self.code(),
             },
         };
-        (status, Json(body)).into_response()
+        let mut resp = (status, Json(body)).into_response();
+        if let Some(secs) = retry_after {
+            if let Ok(hv) = HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert(axum::http::header::RETRY_AFTER, hv);
+            }
+        }
+        resp
     }
 }
 
@@ -192,5 +231,36 @@ mod tests {
         let e = ApiError::Internal("boom".into());
         assert_eq!(e.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(e.error_type(), "server_error");
+    }
+
+    #[test]
+    fn timeout_is_504_with_request_timeout_type() {
+        let e = ApiError::Timeout { secs: 42 };
+        assert_eq!(e.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(e.error_type(), "request_timeout");
+        assert!(e.to_string().contains("42"));
+    }
+
+    #[test]
+    fn client_disconnect_is_499() {
+        let e = ApiError::ClientDisconnect;
+        assert_eq!(e.status().as_u16(), 499);
+        assert_eq!(e.error_type(), "client_disconnect");
+    }
+
+    #[test]
+    fn busy_response_carries_retry_after_header() {
+        let e = ApiError::Busy("queue".into());
+        let resp = e.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let ra = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
+        assert_eq!(ra.and_then(|v| v.to_str().ok().map(String::from)).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn invalid_request_has_no_retry_after() {
+        let e = ApiError::invalid("bad", "x");
+        let resp = e.into_response();
+        assert!(resp.headers().get(axum::http::header::RETRY_AFTER).is_none());
     }
 }

@@ -17,6 +17,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
 
 use crate::config::ServerConfig;
 use crate::tokenize::TokenizerHandle;
@@ -36,7 +37,21 @@ pub struct AppState {
 }
 
 /// Build the top-level router with all endpoints attached.
+///
+/// Wraps every request in a `TraceLayer` so `tracing::info!` spans
+/// emit one line per request with method + path + status + latency,
+/// plus a sub-span inside each handler carrying the generated
+/// `request_id`. Failures go through `DefaultOnFailure` at `ERROR`
+/// so a missing model → 404 emits a single warn line and CUDA
+/// launch failures → 500 emit error with the `request_id` attached.
 pub fn build_router(state: AppState) -> Router {
+    let trace = TraceLayer::new_for_http()
+        .make_span_with(
+            DefaultMakeSpan::new().level(tracing::Level::INFO).include_headers(false),
+        )
+        .on_response(DefaultOnResponse::new().level(tracing::Level::INFO))
+        .on_failure(DefaultOnFailure::new().level(tracing::Level::ERROR));
+
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(crate::openai::models::list_models))
@@ -48,6 +63,7 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/completions",
             post(crate::openai::handlers::completions),
         )
+        .layer(trace)
         .with_state(state)
 }
 
