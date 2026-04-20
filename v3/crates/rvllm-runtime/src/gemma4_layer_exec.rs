@@ -1101,8 +1101,19 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
             stream,
         ),
         // Exhaustiveness for #[non_exhaustive] CutlassBackend — a
-        // future variant should be an explicit audit.
-        _ => unreachable!("unexpected CutlassBackend variant in channelscale fallback"),
+        // future variant lands here with a typed error rather than
+        // aborting the process, so adding a new backend can never
+        // silently panic in prod. The explicit arms above stay the
+        // source of truth; this is the default-deny for unknowns.
+        _ => Err(rvllm_core::RvllmError::cutlass(
+            rvllm_core::CutlassError::FeatureNotAvailable {
+                op: "fp8_gemm_channelscale (unknown CutlassBackend variant)",
+            },
+            rvllm_core::CutlassCtx {
+                kernel: "fp8_gemm_channelscale",
+                stream,
+            },
+        )),
     }
 }
 
