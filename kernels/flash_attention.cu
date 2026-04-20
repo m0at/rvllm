@@ -961,17 +961,30 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
         const int tile_len = min(FA2_BC, context_len - tile_start);
 
         // Load K tile: fp8 cache -> f32 shared mem (apply k_descale on load).
-        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-            int t = idx / head_dim;
-            int d = idx % head_dim;
-            int kv_pos = tile_start + t;
-            int page_idx = kv_pos / block_size;
-            int page_off = kv_pos % block_size;
-            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            unsigned char kb = key_cache[
-                ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
-            ];
-            s_key[t * head_dim + d] = fp8kv_decode_byte(kb) * k_scale;
+        // Vectorized by 8: each thread pulls one u64 = 8 FP8 bytes.
+        // head_dim is always a multiple of 8 for the shapes we support
+        // (128 / 256 / 512), so the tile_len*head_dim/8 work divides
+        // cleanly across the 128 threads.
+        {
+            const int vec_total = tile_len * (head_dim / 8);
+            for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                int t = vi / (head_dim / 8);
+                int d_base = (vi % (head_dim / 8)) * 8;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                const unsigned char* k_row = key_cache
+                    + ((phys_block * block_size + page_off) * num_kv_heads
+                        + kv_head_idx) * head_dim;
+                unsigned long long k8 = __ldg(
+                    reinterpret_cast<const unsigned long long*>(k_row + d_base));
+                float* s = s_key + t * head_dim + d_base;
+                #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    s[b] = fp8kv_decode_byte((unsigned char)(k8 >> (b * 8))) * k_scale;
+                }
+            }
         }
         __syncthreads();
 
@@ -1022,17 +1035,27 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
         __syncthreads();
 
         // Load V tile: fp8 cache -> f32 shared mem (apply v_descale on load).
-        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-            int t = idx / head_dim;
-            int d = idx % head_dim;
-            int kv_pos = tile_start + t;
-            int page_idx = kv_pos / block_size;
-            int page_off = kv_pos % block_size;
-            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            unsigned char vb = value_cache[
-                ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
-            ];
-            s_val[t * head_dim + d] = fp8kv_decode_byte(vb) * v_scale;
+        // Vectorized by 8 (see K load comment).
+        {
+            const int vec_total = tile_len * (head_dim / 8);
+            for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                int t = vi / (head_dim / 8);
+                int d_base = (vi % (head_dim / 8)) * 8;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                const unsigned char* v_row = value_cache
+                    + ((phys_block * block_size + page_off) * num_kv_heads
+                        + kv_head_idx) * head_dim;
+                unsigned long long v8 = __ldg(
+                    reinterpret_cast<const unsigned long long*>(v_row + d_base));
+                float* s = s_val + t * head_dim + d_base;
+                #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    s[b] = fp8kv_decode_byte((unsigned char)(v8 >> (b * 8))) * v_scale;
+                }
+            }
         }
         __syncthreads();
 
@@ -1140,17 +1163,27 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
         const int tile_start = tile * 16;
         const int tile_len = min(16, context_len - tile_start);
 
-        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-            int t = idx / head_dim;
-            int d = idx % head_dim;
-            int kv_pos = tile_start + t;
-            int page_idx = kv_pos / block_size;
-            int page_off = kv_pos % block_size;
-            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            unsigned char kb = key_cache[
-                ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
-            ];
-            s_key[t * head_dim + d] = fp8kv_decode_byte(kb) * k_scale;
+        // Vectorized-by-8 K load (see BC=32 kernel comment).
+        {
+            const int vec_total = tile_len * (head_dim / 8);
+            for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                int t = vi / (head_dim / 8);
+                int d_base = (vi % (head_dim / 8)) * 8;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                const unsigned char* k_row = key_cache
+                    + ((phys_block * block_size + page_off) * num_kv_heads
+                        + kv_head_idx) * head_dim;
+                unsigned long long k8 = __ldg(
+                    reinterpret_cast<const unsigned long long*>(k_row + d_base));
+                float* s = s_key + t * head_dim + d_base;
+                #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    s[b] = fp8kv_decode_byte((unsigned char)(k8 >> (b * 8))) * k_scale;
+                }
+            }
         }
         __syncthreads();
 
@@ -1198,17 +1231,27 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
         row_sum += s_reduce[0];
         __syncthreads();
 
-        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-            int t = idx / head_dim;
-            int d = idx % head_dim;
-            int kv_pos = tile_start + t;
-            int page_idx = kv_pos / block_size;
-            int page_off = kv_pos % block_size;
-            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            unsigned char vb = value_cache[
-                ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
-            ];
-            s_val[t * head_dim + d] = fp8kv_decode_byte(vb) * v_scale;
+        // Vectorized-by-8 V load (see BC=32 kernel comment).
+        {
+            const int vec_total = tile_len * (head_dim / 8);
+            for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                int t = vi / (head_dim / 8);
+                int d_base = (vi % (head_dim / 8)) * 8;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                const unsigned char* v_row = value_cache
+                    + ((phys_block * block_size + page_off) * num_kv_heads
+                        + kv_head_idx) * head_dim;
+                unsigned long long v8 = __ldg(
+                    reinterpret_cast<const unsigned long long*>(v_row + d_base));
+                float* s = s_val + t * head_dim + d_base;
+                #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    s[b] = fp8kv_decode_byte((unsigned char)(v8 >> (b * 8))) * v_scale;
+                }
+            }
         }
         __syncthreads();
 
@@ -1470,18 +1513,27 @@ __global__ void flash_attention_2_prefill_fp8kv_kernel(
             const int tile_start = tile * FA2_BC;
             const int tile_len = min(FA2_BC, context_len - tile_start);
 
-            // Load K tile.
-            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-                int t = idx / head_dim;
-                int d = idx % head_dim;
-                int kv_pos = tile_start + t;
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                unsigned char kb = key_cache[
-                    ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
-                ];
-                s_key[t * head_dim + d] = fp8kv_decode_byte(kb) * k_scale;
+            // Load K tile (vectorized-by-8; see decode kernel).
+            {
+                const int vec_total = tile_len * (head_dim / 8);
+                for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                    int t = vi / (head_dim / 8);
+                    int d_base = (vi % (head_dim / 8)) * 8;
+                    int kv_pos = tile_start + t;
+                    int page_idx = kv_pos / block_size;
+                    int page_off = kv_pos % block_size;
+                    int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                    const unsigned char* k_row = key_cache
+                        + ((phys_block * block_size + page_off) * num_kv_heads
+                            + kv_head_idx) * head_dim;
+                    unsigned long long k8 = __ldg(
+                        reinterpret_cast<const unsigned long long*>(k_row + d_base));
+                    float* s = s_key + t * head_dim + d_base;
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        s[b] = fp8kv_decode_byte((unsigned char)(k8 >> (b * 8))) * k_scale;
+                    }
+                }
             }
             __syncthreads();
 
@@ -1537,18 +1589,27 @@ __global__ void flash_attention_2_prefill_fp8kv_kernel(
             row_sum += s_reduce[0];
             __syncthreads();
 
-            // Load V tile.
-            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-                int t = idx / head_dim;
-                int d = idx % head_dim;
-                int kv_pos = tile_start + t;
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                unsigned char vb = value_cache[
-                    ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
-                ];
-                s_val[t * head_dim + d] = fp8kv_decode_byte(vb) * v_scale;
+            // Load V tile (vectorized-by-8; see decode kernel).
+            {
+                const int vec_total = tile_len * (head_dim / 8);
+                for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                    int t = vi / (head_dim / 8);
+                    int d_base = (vi % (head_dim / 8)) * 8;
+                    int kv_pos = tile_start + t;
+                    int page_idx = kv_pos / block_size;
+                    int page_off = kv_pos % block_size;
+                    int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                    const unsigned char* v_row = value_cache
+                        + ((phys_block * block_size + page_off) * num_kv_heads
+                            + kv_head_idx) * head_dim;
+                    unsigned long long v8 = __ldg(
+                        reinterpret_cast<const unsigned long long*>(v_row + d_base));
+                    float* s = s_val + t * head_dim + d_base;
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        s[b] = fp8kv_decode_byte((unsigned char)(v8 >> (b * 8))) * v_scale;
+                    }
+                }
             }
             __syncthreads();
 
@@ -1651,17 +1712,27 @@ __global__ void flash_attention_2_prefill_fp8kv_bc16_kernel(
             const int tile_start = tile * 16;
             const int tile_len = min(16, context_len - tile_start);
 
-            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-                int t = idx / head_dim;
-                int d = idx % head_dim;
-                int kv_pos = tile_start + t;
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                unsigned char kb = key_cache[
-                    ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
-                ];
-                s_key[t * head_dim + d] = fp8kv_decode_byte(kb) * k_scale;
+            // Vectorized-by-8 K load (see decode kernel).
+            {
+                const int vec_total = tile_len * (head_dim / 8);
+                for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                    int t = vi / (head_dim / 8);
+                    int d_base = (vi % (head_dim / 8)) * 8;
+                    int kv_pos = tile_start + t;
+                    int page_idx = kv_pos / block_size;
+                    int page_off = kv_pos % block_size;
+                    int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                    const unsigned char* k_row = key_cache
+                        + ((phys_block * block_size + page_off) * num_kv_heads
+                            + kv_head_idx) * head_dim;
+                    unsigned long long k8 = __ldg(
+                        reinterpret_cast<const unsigned long long*>(k_row + d_base));
+                    float* s = s_key + t * head_dim + d_base;
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        s[b] = fp8kv_decode_byte((unsigned char)(k8 >> (b * 8))) * k_scale;
+                    }
+                }
             }
             __syncthreads();
 
@@ -1713,17 +1784,27 @@ __global__ void flash_attention_2_prefill_fp8kv_bc16_kernel(
             row_sum += s_reduce[0];
             __syncthreads();
 
-            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-                int t = idx / head_dim;
-                int d = idx % head_dim;
-                int kv_pos = tile_start + t;
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                unsigned char vb = value_cache[
-                    ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d
-                ];
-                s_val[t * head_dim + d] = fp8kv_decode_byte(vb) * v_scale;
+            // Vectorized-by-8 V load (see decode kernel).
+            {
+                const int vec_total = tile_len * (head_dim / 8);
+                for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                    int t = vi / (head_dim / 8);
+                    int d_base = (vi % (head_dim / 8)) * 8;
+                    int kv_pos = tile_start + t;
+                    int page_idx = kv_pos / block_size;
+                    int page_off = kv_pos % block_size;
+                    int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                    const unsigned char* v_row = value_cache
+                        + ((phys_block * block_size + page_off) * num_kv_heads
+                            + kv_head_idx) * head_dim;
+                    unsigned long long v8 = __ldg(
+                        reinterpret_cast<const unsigned long long*>(v_row + d_base));
+                    float* s = s_val + t * head_dim + d_base;
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        s[b] = fp8kv_decode_byte((unsigned char)(v8 >> (b * 8))) * v_scale;
+                    }
+                }
             }
             __syncthreads();
 
