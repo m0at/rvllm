@@ -6,15 +6,55 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# rvllm-serve: HTTP serving loop. Reuses step_launch/step_collect.
-# OpenAI-compatible API. See v3/specs/05-concurrency.md for the tokio -> worker channel design.
+# rvllm-serve — OpenAI-compatible HTTP inference server.
+# See v3/INFERENCE_SERVER_PLAN.md for the architecture and phase plan.
+# Tokio frontend (axum) bridges to a single dedicated OS thread that
+# owns Gemma4Bringup (Worker: !Send, per v3/specs/05-concurrency.md).
 
 [[bin]]
 name = "rvllm-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Pulls in the real Gemma4Bringup worker. Without this feature the
+# crate compiles + tests run against a mock worker (no CUDA needed).
+cuda = ["rvllm-runtime/cuda"]
+gb10 = ["cuda", "rvllm-runtime/gb10"]
+
 [dependencies]
 rvllm-core = { workspace = true }
+rvllm-kernels = { workspace = true }
 rvllm-runtime = { workspace = true }
+
+# Async + HTTP
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+
+# Serde
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Tokenizer + chat template
+tokenizers = { workspace = true }
+minijinja = { workspace = true }
+
+# Misc
+uuid = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints.clippy]
+# Enforce the "no unwrap in request paths" invariant from the plan.
+# main.rs opts out at its top with a module-local allow.
+unwrap_used = "deny"
+expect_used = "warn"
