@@ -6,7 +6,7 @@
 //!   * default build (no features): mock worker (no CUDA), emits
 //!     canned tokens. Useful for HTTP/tokenizer/CI dev.
 //!   * `--features cuda` / `--features gb10`: real worker backed by
-//!     `Gemma4Bringup::run_generate`.
+//!     `Gemma4Bringup::run_generate` on a dedicated OS thread.
 
 // main.rs does need a handful of unwrap-on-startup paths (CLI parse,
 // listener bind). The library crate itself stays `deny(unwrap_used)`.
@@ -105,7 +105,7 @@ async fn main() -> anyhow_compat::Result<()> {
     let config = ServerConfig {
         bind: cli.bind,
         model_dir: cli.model_dir.clone(),
-        model_id: model_id.clone(),
+        model_id,
         max_queue_depth: cli.max_queue_depth,
         max_new_tokens_cap: cli.max_new_tokens_cap,
         request_timeout: Duration::from_secs(cli.request_timeout_secs),
@@ -133,13 +133,6 @@ async fn main() -> anyhow_compat::Result<()> {
         .await
         .map_err(|e| anyhow_compat::err(format!("bind {}: {e}", config.bind)))?;
 
-    // Graceful shutdown with a bounded drain window.
-    // axum::serve's `with_graceful_shutdown` stops accepting new
-    // connections when the signal fires, then waits for in-flight
-    // handlers to complete. Without a ceiling a pinned CUDA worker
-    // + a long max_new_tokens could keep us up for minutes — wrap
-    // the serve future in a select!(..., sleep(drain_timeout)) so
-    // we always return to the operator within a known bound.
     let drain_timeout = config.shutdown_drain_timeout;
     let serve = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal());
@@ -159,9 +152,6 @@ async fn main() -> anyhow_compat::Result<()> {
     Ok(())
 }
 
-/// Parks until the shutdown signal fires, then waits `drain_timeout`.
-/// If `axum::serve` hasn't exited by then, the outer `select!` returns
-/// through this branch to force the process down.
 async fn forced_drain_watchdog(drain_timeout: std::time::Duration) {
     shutdown_signal().await;
     tokio::time::sleep(drain_timeout).await;
@@ -219,9 +209,7 @@ async fn spawn_worker(
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c().await.ok();
-    };
+    let ctrl_c = async { tokio::signal::ctrl_c().await.ok(); };
     #[cfg(unix)]
     let term = async {
         if let Ok(mut sig) =
@@ -241,8 +229,6 @@ async fn shutdown_signal() {
     }
 }
 
-/// Tiny inline `anyhow`-like error wrapper. Avoids adding `anyhow`
-/// as a dep just for main.rs.
 mod anyhow_compat {
     pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     pub fn err<S: Into<String>>(s: S) -> Box<dyn std::error::Error + Send + Sync> {

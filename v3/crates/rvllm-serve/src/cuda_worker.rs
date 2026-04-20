@@ -7,9 +7,15 @@
 //! streaming is phase 5 (requires breaking `run_generate` apart into
 //! `prefill()` + `decode_one()`).
 //!
-//! This is a deliberate trade-off: end-to-end path lands today, SSE
-//! delivers tokens (just all at once, not as they emerge), and the
-//! API surface doesn't change when phase 5 swaps in real streaming.
+//! ## RAII gotcha fixed here
+//!
+//! `LoadedModule` is RAII: its `Drop` calls `cuModuleUnload`. A
+//! `KernelFn` is only an opaque handle into that module. If the
+//! module drops while the handle lives, the next `cuLaunchKernel`
+//! on the handle fails with `LaunchFailed`. [`GenerateKernels`]
+//! holds the module alongside the fn-handles to anchor its lifetime
+//! — the first Gemma 4 chat request on GB10 died with exactly that
+//! error before this fix.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -38,13 +44,9 @@ pub struct CudaWorkerConfig {
 /// Spawn the CUDA worker on a dedicated OS thread.
 ///
 /// Returns once `Gemma4Bringup::load` has completed — the returned
-/// `WorkerHandle` is immediately usable. `load` takes ~20 s for
+/// `WorkerHandle` is immediately usable. `load` takes ~25 s for
 /// Gemma 4 31B; the caller should render a "loading" log line before
 /// awaiting.
-///
-/// The `JoinHandle` must be held by the caller for the lifetime of
-/// the server; dropping it + all `WorkerHandle` clones closes the
-/// worker's queue, causing the thread to exit cleanly.
 pub async fn spawn_cuda_worker(
     cfg: CudaWorkerConfig,
 ) -> Result<(WorkerHandle, std::thread::JoinHandle<()>), ApiError> {
@@ -66,7 +68,8 @@ pub async fn spawn_cuda_worker(
                 }
             };
 
-            // Resolve kernel function pointers once.
+            // Resolve kernel function pointers once. See the struct
+            // doc — the LoadedModule MUST outlive the KernelFn.
             let kernels_ctx = match resolve_generate_kernels(&bringup) {
                 Ok(k) => k,
                 Err(msg) => {
@@ -100,9 +103,18 @@ pub async fn spawn_cuda_worker(
     }
 }
 
+/// Held together intentionally: `LoadedModule` is RAII, its `Drop`
+/// calls `cuModuleUnload` — if we drop the module but keep the
+/// `KernelFn` around, the next `cuLaunchKernel` dereferences a
+/// freed handle and fails with `LaunchFailed` (how this bug first
+/// surfaced on the GB10 live-test smoke). Struct owns the module
+/// to keep it alive alongside the function handles.
 struct GenerateKernels {
     fn_embed: rvllm_kernels::KernelFn,
     fn_argmax: rvllm_kernels::KernelFn,
+    // Never read — its lifetime anchors the module so `fn_embed`
+    // stays valid across run_generate calls.
+    _embed_mod: rvllm_kernels::LoadedModule,
 }
 
 fn resolve_generate_kernels(
@@ -116,14 +128,12 @@ fn resolve_generate_kernels(
         .get_function("embedding_gather_f16_kernel")
         .map_err(|e| format!("resolve embedding_gather_f16_kernel: {e}"))?;
     let fn_argmax = bringup.fused.fn_argmax;
-    Ok(GenerateKernels { fn_embed, fn_argmax })
+    Ok(GenerateKernels { fn_embed, fn_argmax, _embed_mod: embed_mod })
 }
 
 fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequest) {
     let prompt_len = req.prompt_ids.len() as u32;
 
-    // Cancellation check before we even start (client might have
-    // given up while we were dequeuing).
     if req.cancelled.load(Ordering::Relaxed) {
         let _ = req.events_tx.blocking_send(GenerateEvent::Done {
             finish: FinishReason::Cancelled,
@@ -145,16 +155,12 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
 
     match result {
         Ok(all_token_ids) => {
-            // `run_generate` returns prompt + generated ids. Trim the
-            // prompt prefix so the handler gets completion tokens only.
             let generated = all_token_ids
                 .get(req.prompt_ids.len()..)
                 .unwrap_or(&[]);
 
             let mut emitted: u32 = 0;
             for (i, &id) in generated.iter().enumerate() {
-                // Honour cancellation at the boundary, even though
-                // run_generate can't be interrupted mid-call today.
                 if req.cancelled.load(Ordering::Relaxed) {
                     let _ = req.events_tx.blocking_send(GenerateEvent::Done {
                         finish: FinishReason::Cancelled,
@@ -168,16 +174,11 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
                     .blocking_send(GenerateEvent::Token { id, position: i as u32 })
                     .is_err()
                 {
-                    // Handler dropped the receiver — nothing more to do.
                     return;
                 }
                 emitted += 1;
             }
 
-            // Distinguish "hit EOS" from "hit max_new_tokens":
-            //   run_generate stops early on EOS OR max_new, but doesn't
-            //   tell us which. Infer from the emitted count + last-id
-            //   against the stop set.
             let finish = if generated
                 .last()
                 .is_some_and(|id| req.stop_token_ids.contains(id))
@@ -186,8 +187,6 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             } else if emitted >= req.max_new_tokens {
                 FinishReason::Length
             } else {
-                // Stopped short without an EOS match — unexpected but
-                // treat as stop.
                 FinishReason::Stop
             };
 
