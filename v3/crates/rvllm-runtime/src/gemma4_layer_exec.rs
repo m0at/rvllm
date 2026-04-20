@@ -275,7 +275,7 @@ pub unsafe fn gemma4_forward_phase(
     }
 
     // 1. input_layernorm -> FP8 quant
-    // Sm121 decode fast path for QKV writes f16 into delta_f16 via its
+    // Sm121 fast path for QKV writes f16 into delta_f16 via its
     // own rmsnorm — `scratch.hidden_fp8`/`hidden_scale` go unused. Skip
     // the quant-rmsnorm in that case to avoid the duplicate work.
     #[cfg(feature = "cuda")]
@@ -388,7 +388,7 @@ pub unsafe fn gemma4_forward_phase(
         && dims.num_tokens == 1
         && kernels.fp8_gemv_wpr_native_f16in.is_some()
     {
-        // sm_121 decode fast path: skip the activation FP8-quant entirely
+        // sm_121 fast path: skip the activation FP8-quant entirely
         // and run `fp8_gemv_blockwise_wpr_native_f16in_kernel` directly
         // against the f16 rmsnorm output. Wins over the
         // `fp8_gemm_channelscale_or_fallback` path on two axes:
@@ -606,7 +606,7 @@ pub unsafe fn gemma4_forward_phase(
     probe!("step5_attn_out", scratch.attn_out, q_dim);
 
     // 6. quantize attn_out -> fp8 per-token (skip when F16 KV + F16 O-proj,
-    // or when the Sm121 decode fast path will read `scratch.attn_out`
+    // or when the Sm121 fast path will read `scratch.attn_out`
     // as f16 directly in step 7).
     #[cfg(feature = "cuda")]
     let skip_o_quant = dims.num_tokens == 1
@@ -644,7 +644,7 @@ pub unsafe fn gemma4_forward_phase(
         && dims.num_tokens == 1
         && kernels.fp8_gemv_wpr_native_f16in.is_some()
     {
-        // sm_121 decode fast path for O projection.
+        // sm_121 fast path for O projection.
         // `scratch.attn_out` is already f16 (attention output), no
         // pre-rmsnorm needed — post-attn-norm runs in the epilogue via
         // `fused_norm_add_residual_f16in`. We write the GEMV result
@@ -776,7 +776,7 @@ pub unsafe fn gemma4_forward_phase(
         && dims.num_tokens == 1
         && kernels.fp8_gemv_wpr_native_f16in.is_some()
     {
-        // sm_121 decode fast path for gate||up projection. Mirrors
+        // sm_121 fast path for gate||up projection. Mirrors
         // the QKV fast path: f16 rmsnorm into delta_f16 (pre-FF norm
         // gamma this time), then f16-input fp8_gemv direct to
         // gate_up_out. Downstream `fused_gelu_mul` reads gate_up_out
@@ -863,7 +863,7 @@ pub unsafe fn gemma4_forward_phase(
         && dims.num_tokens == 1
         && kernels.fp8_gemv_wpr_native_f16in.is_some()
     {
-        // sm_121 decode fast path for down projection.
+        // sm_121 fast path for down projection.
         // Skip FP8 GELU-quant — run f16 GELU into `gate_up_fp8`
         // scratch (same aliasing trick as the f16-weights branch),
         // then f16-input fp8_gemv writes f16 directly to
