@@ -72,6 +72,10 @@ pub struct Gemma4FusedModules {
     pub fn_fused_rope_partial_f16kv: KernelFn,
     pub fn_fused_norm_add_residual: KernelFn,
     pub fn_fused_norm_add_residual_f16: KernelFn,
+    /// Variant that reads f16 input and skips channelscale; used by the
+    /// Sm121 decode fast path after `fp8_gemv_wpr_native_f16in` has
+    /// already applied the per-channel scale in the GEMV epilogue.
+    pub fn_fused_norm_add_residual_f16in: KernelFn,
     pub fused_norm_add_residual_f16_mod: LoadedModule,
     pub fn_fused_qkv_rmsnorm: KernelFn,
     pub fused_qkv_rmsnorm_mod: LoadedModule,
@@ -92,6 +96,11 @@ pub struct Gemma4FusedModules {
     /// PTX. `Fp8GemvVariant::available_for(target)` is the source of
     /// truth for this gate.
     pub fn_fp8_gemv_wpr_native: Option<KernelFn>,
+    /// F16-input variant of `fn_fp8_gemv_wpr_native`. Same arch gate
+    /// (sm_100+). Used by the Sm121 decode path to run projection
+    /// GEMMs (QKV / O / gate_up / down) directly off f16 activations,
+    /// skipping the FP8 activation-quant step that cuBLASLt requires.
+    pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
 }
 
 pub struct Gemma4Bringup {
@@ -1638,8 +1647,10 @@ impl Gemma4Bringup {
             fused_rope_partial_f16kv: self.fused.fn_fused_rope_partial_f16kv,
             fused_norm_add_residual: self.fused.fn_fused_norm_add_residual,
             fused_norm_add_residual_f16: self.fused.fn_fused_norm_add_residual_f16,
+            fused_norm_add_residual_f16in: self.fused.fn_fused_norm_add_residual_f16in,
             fused_qkv_rmsnorm: self.fused.fn_fused_qkv_rmsnorm,
             scale_cols_f16: self.fused.fn_scale_cols_f16,
+            fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,
         }
     }
 }
@@ -1713,6 +1724,13 @@ fn load_gemma4_fused(
         ),
         _ => None,
     };
+    let fn_fp8_gemv_wpr_native_f16in = match target {
+        Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t) => Some(
+            fp8_gemv_mod
+                .get_function(rvllm_kernels::Fp8GemvVariant::WprNativeF16In.entry_point())?,
+        ),
+        _ => None,
+    };
 
     let fused_norm_add_residual_mod = loader.load_ptx("fused_norm_add_residual")?;
     let fn_fused_norm_add_residual =
@@ -1721,6 +1739,8 @@ fn load_gemma4_fused(
     let fused_norm_add_residual_f16_mod = loader.load_ptx("fused_norm_add_residual_f16")?;
     let fn_fused_norm_add_residual_f16 =
         fused_norm_add_residual_f16_mod.get_function("fused_norm_add_residual_f16_kernel")?;
+    let fn_fused_norm_add_residual_f16in =
+        fused_norm_add_residual_f16_mod.get_function("fused_norm_add_residual_f16in_kernel")?;
 
     let fused_qkv_rmsnorm_mod = loader.load_ptx("fused_qkv_rmsnorm")?;
     let fn_fused_qkv_rmsnorm =
@@ -1772,6 +1792,7 @@ fn load_gemma4_fused(
         fn_fused_rope_partial_f16kv,
         fn_fused_norm_add_residual,
         fn_fused_norm_add_residual_f16,
+        fn_fused_norm_add_residual_f16in,
         fused_norm_add_residual_f16_mod,
         fn_fused_qkv_rmsnorm,
         fused_qkv_rmsnorm_mod,
@@ -1780,5 +1801,6 @@ fn load_gemma4_fused(
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_lut,
         fn_fp8_gemv_wpr_native,
+        fn_fp8_gemv_wpr_native_f16in,
     })
 }

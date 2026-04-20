@@ -569,6 +569,50 @@ impl FusedNormAddResidualF16Launch {
 }
 
 // ---------------------------------------------------------------------------
+// fused_norm_add_residual_f16in: f16-input variant for the Sm121 decode
+// fast path. Reads f16 gemm output directly, no channelscale broadcast
+// (the preceding `fp8_gemv_wpr_native_f16in` already baked the per-
+// channel scale into its output).
+// ---------------------------------------------------------------------------
+
+pub struct FusedNormAddResidualF16InLaunch {
+    pub num_tokens: u32,
+    pub hidden: u32,
+    pub eps: f32,
+}
+
+impl FusedNormAddResidualF16InLaunch {
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        gemm_out_f16: u64,
+        gamma: u64,
+        residual: u64,
+        layer_scalar: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut gemm_out_f16 = gemm_out_f16;
+        let mut gamma = gamma;
+        let mut residual = residual;
+        let mut layer_scalar = layer_scalar;
+        let mut hidden = self.hidden as i32;
+        let mut eps = self.eps;
+        let args = [
+            (&mut gemm_out_f16) as *mut u64 as *mut core::ffi::c_void,
+            (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
+            (&mut residual) as *mut u64 as *mut core::ffi::c_void,
+            (&mut layer_scalar) as *mut u64 as *mut core::ffi::c_void,
+            (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
+            (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+        ];
+        let block = (self.hidden.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        let smem = self.hidden * 4;
+        launch_raw(kernel, grid, block, smem, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bf16_to_f16_sat (bf16 -> f16 with saturation clamp)
 // ---------------------------------------------------------------------------
 

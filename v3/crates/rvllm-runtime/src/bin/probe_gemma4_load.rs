@@ -50,12 +50,44 @@ fn env_gb(name: &str, default_gb: u64) -> Result<u64, String> {
 }
 
 fn run() -> Result<(), String> {
+    // On sm_121 the CUTLASS `.so` and FA3 `.so` are never opened —
+    // `CutlassBackend::load_for` short-circuits to `Absent` on sm_121,
+    // and the attention layer takes `AttentionBackend::Fa2Ptx` instead
+    // of `Fa3`. For convenience on GB10 bring-up we let the operator
+    // skip the corresponding env vars entirely; the paths are only
+    // "required" on pre-Blackwell targets. `policy.json` is still
+    // parsed, but a dummy-minimal policy is enough because sm_121 has
+    // no CUTLASS entries to look up.
+    let model_dir = env_path("RVLLM_MODEL_DIR")?;
+    let kernels_dir = env_path("RVLLM_KERNELS_DIR")?;
+    let cutlass_so = env_path("RVLLM_CUTLASS_SO")
+        .unwrap_or_else(|_| PathBuf::from("/dev/null-cutlass-sm121-absent"));
+    let fa3_so = env_path("RVLLM_FA3_SO")
+        .unwrap_or_else(|_| PathBuf::from("/dev/null-fa3-sm121-absent"));
+    let policy_json = match env_path("RVLLM_POLICY") {
+        Ok(p) => p,
+        Err(_) => {
+            // Write a minimal policy into the system temp dir. The
+            // fields are parsed but never consulted on sm_121 (the
+            // CUTLASS backend is `Absent` so variant lookups never
+            // happen).
+            let tmp = std::env::temp_dir().join("rvllm-probe-minimal-policy.json");
+            if !tmp.exists() {
+                std::fs::write(
+                    &tmp,
+                    r#"{"revision":"probe-sm121","arch":"sm_121","variants":[],"entries":{}}"#,
+                )
+                .map_err(|e| format!("write minimal policy {}: {e}", tmp.display()))?;
+            }
+            tmp
+        }
+    };
     let paths = Gemma4EnginePaths {
-        model_dir: env_path("RVLLM_MODEL_DIR")?,
-        kernels_dir: env_path("RVLLM_KERNELS_DIR")?,
-        cutlass_so: env_path("RVLLM_CUTLASS_SO")?,
-        fa3_so: env_path("RVLLM_FA3_SO")?,
-        policy_json: env_path("RVLLM_POLICY")?,
+        model_dir,
+        kernels_dir,
+        cutlass_so,
+        fa3_so,
+        policy_json,
     };
     let arena_gb = env_gb("RVLLM_ARENA_GB", 4)?;
     let arena_bytes = (arena_gb as usize) * 1024 * 1024 * 1024;

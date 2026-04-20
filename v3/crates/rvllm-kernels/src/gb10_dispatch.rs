@@ -74,6 +74,14 @@ pub enum Fp8GemvVariant {
     /// sm_121, sm_122). Unconditionally wins on observed GB10
     /// hardware (SM clock stays ~2520 MHz under load).
     WprNative,
+    /// `fp8_gemv_blockwise_wpr_native_f16in_kernel` — same as
+    /// `WprNative` but takes f16 activations and writes f16 output.
+    /// Enables routing Gemma 4 decode projections (QKV / O / gate_up /
+    /// down) through fp8_gemv without an extra activation-quant pass:
+    /// the M=1 decode activation stays in f16, the kernel does the
+    /// f16→f32 promotion inline via hardware `cvt.f32.f16`. sm_100+
+    /// only, same `__CUDA_ARCH__` gate as `WprNative`.
+    WprNativeF16In,
 }
 
 /// Logical PTX name (stem as it appears in `manifest.json`). Both
@@ -93,6 +101,9 @@ impl Fp8GemvVariant {
         match self {
             Fp8GemvVariant::WprLut => "fp8_gemv_blockwise_wpr_lut_kernel",
             Fp8GemvVariant::WprNative => "fp8_gemv_blockwise_wpr_native_kernel",
+            Fp8GemvVariant::WprNativeF16In => {
+                "fp8_gemv_blockwise_wpr_native_f16in_kernel"
+            }
         }
     }
 
@@ -122,6 +133,8 @@ impl Fp8GemvVariant {
             // See the maintenance note above — extend this when Sm100 /
             // Sm120 / Sm122 land in `CompileTarget`.
             Fp8GemvVariant::WprNative => matches!(target, CompileTarget::Sm121),
+            // Same __CUDA_ARCH__ >= 1000 gate as WprNative.
+            Fp8GemvVariant::WprNativeF16In => matches!(target, CompileTarget::Sm121),
         }
     }
 }
