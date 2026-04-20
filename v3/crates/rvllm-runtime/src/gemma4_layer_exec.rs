@@ -37,6 +37,86 @@ use rvllm_attention::{AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParam
 
 use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
+/// Storage dtype of the paged KV cache. Picked once at bring-up time
+/// per the `RVLLM_NVFP4_KV` / `RVLLM_F16_KV` env-flag priority and
+/// threaded through on every attention launch.
+///
+///   * `F16`  — 2 bytes per element, dense. CPU-host-visible path,
+///              still the engine default when no env flag is set.
+///   * `Fp8`  — 1 byte per element, per-tensor E4M3 descale. Current
+///              sm_121 hot path (`RVLLM_F16_KV=0`).
+///   * `Nvfp4`— 4 bits per element packed two-per-byte + 1 E4M3
+///              microscale per 16 elements. `RVLLM_NVFP4_KV=1`.
+///              Storage = elements × 0.5 bytes, scale region =
+///              elements × 0.0625 bytes, total 4.5 effective bits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KvDtype {
+    F16,
+    Fp8,
+    Nvfp4,
+}
+
+impl KvDtype {
+    /// Main-cache bytes per element (scale region is separate).
+    #[must_use]
+    pub fn cache_bytes_per_elem(&self) -> u32 {
+        match self {
+            KvDtype::F16 => 2,
+            KvDtype::Fp8 => 1,
+            // Packed 4-bit → 0.5 byte per element. Callers that need
+            // an integer byte count should compute on multiples of 16
+            // elements (which NVFP4 requires anyway for the scale
+            // block). Returned here as `0` to force the caller to
+            // explicitly use `nvfp4_total_bytes` below.
+            KvDtype::Nvfp4 => 0,
+        }
+    }
+
+    /// Scale-region bytes per element. 0 for F16/Fp8 (per-tensor
+    /// descale lives in a separate 4-byte f32). For NVFP4, 1 E4M3
+    /// scale per 16 elements → 1/16 byte/elem.
+    #[must_use]
+    pub fn scale_bytes_per_elem_x16(&self) -> u32 {
+        match self {
+            KvDtype::Nvfp4 => 1,
+            _ => 0,
+        }
+    }
+
+    /// Is this an NVFP4 packed layout?
+    #[must_use]
+    pub fn is_nvfp4(&self) -> bool {
+        matches!(self, KvDtype::Nvfp4)
+    }
+
+    /// Is the cache dense F16 (no descale)?
+    #[must_use]
+    pub fn is_f16(&self) -> bool {
+        matches!(self, KvDtype::F16)
+    }
+
+    /// Resolve from the engine env flags. Precedence:
+    ///   1. `RVLLM_NVFP4_KV=1`   → Nvfp4
+    ///   2. `RVLLM_F16_KV=0`     → Fp8
+    ///   3. anything else or unset → F16 (engine default).
+    /// `f16_only` short-circuits to F16 — used by the bench path
+    /// when the caller explicitly asks for f16 regardless of env.
+    #[must_use]
+    pub fn from_env(f16_only: bool) -> Self {
+        if f16_only {
+            return KvDtype::F16;
+        }
+        if std::env::var("RVLLM_NVFP4_KV").map(|v| v != "0").unwrap_or(false) {
+            return KvDtype::Nvfp4;
+        }
+        if std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0") {
+            KvDtype::F16
+        } else {
+            KvDtype::Fp8
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Gemma4LayerDims {
     pub num_tokens: u32,
@@ -53,7 +133,10 @@ pub struct Gemma4LayerDims {
     pub rms_eps: f32,
     pub layer_type: Gemma4LayerType,
     pub sliding_window: u32,
+    /// Retained for existing branches that still key on the bool
+    /// (rope_f16kv vs rope_fp8kv). Equivalent to `kv_dtype.is_f16()`.
     pub f16_kv: bool,
+    pub kv_dtype: KvDtype,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -114,6 +197,11 @@ pub struct Gemma4LayerScratch {
     pub q_fp8: u64,
     pub k_cache: u64,
     pub v_cache: u64,
+    /// NVFP4 scale regions. 0 when `kv_dtype != Nvfp4`. Sized at
+    /// `layer_elems / 16 * 1` bytes per layer; offsets mirror the
+    /// main `k_cache` / `v_cache` layer layout.
+    pub k_cache_scale: u64,
+    pub v_cache_scale: u64,
     pub q_scale_ptr: u64,
     pub kv_scale_ptr: u64,
     /// Per-slot-per-head f32 K scale cache, shape
@@ -170,6 +258,12 @@ pub struct Gemma4LayerKernels {
     pub fused_rmsnorm_fp8_quant: KernelFn,
     pub fused_qk_rmsnorm: KernelFn,
     pub fused_rope_partial_fp8kv: KernelFn,
+    /// RoPE + NVFP4-packed KV write. `None` when the NVFP4 PTX
+    /// module isn't built into `$KERNELS_DIR` (pre-NVFP4 branches
+    /// or TPU-focused kernel trees). Populated iff
+    /// `Fa2PtxKernels::fn_rope_nvfp4kv` is `Some`. Layer-exec
+    /// dispatch guards on this when `kv_dtype == Nvfp4`.
+    pub fused_rope_partial_nvfp4kv: Option<KernelFn>,
     pub fused_gelu_mul: KernelFn,
     pub quantize_fp8_per_token: KernelFn,
     pub residual_scale_f16: KernelFn,
@@ -577,44 +671,103 @@ pub unsafe fn gemma4_forward_phase(
                 scale: dims.attn_scale,
                 window_size_left,
             };
-            if dims.f16_kv {
-                // F16 KV cache path: RoPE outputs F16 Q and F16 KV cache
-                rope_f16kv(dims, kernels, scratch, meta, stream)?;
-                let decode = rvllm_attention::PagedDecodeLauncher::new(attention);
-                decode.launch(
-                    decode_params,
-                    scratch.attn_out,
-                    scratch.q_normed,
-                    scratch.k_cache,
-                    scratch.v_cache,
-                    meta.block_tables,
-                    meta.context_lens,
-                    scratch.fa3_workspace,
-                    stream,
-                )?;
-            } else {
-                rope_fp8kv(dims, kernels, scratch, meta, stream)?;
-                let decode = PagedDecodeFp8Launcher::new(attention);
-                decode.launch(
-                    decode_params,
+            match dims.kv_dtype {
+                KvDtype::F16 => {
+                    // F16 KV cache path: RoPE outputs F16 Q and F16 KV cache.
+                    rope_f16kv(dims, kernels, scratch, meta, stream)?;
+                    let decode = rvllm_attention::PagedDecodeLauncher::new(attention);
+                    decode.launch(
+                        decode_params,
+                        scratch.attn_out,
+                        scratch.q_normed,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        meta.block_tables,
+                        meta.context_lens,
+                        scratch.fa3_workspace,
+                        stream,
+                    )?;
+                }
+                KvDtype::Fp8 => {
+                    // FP8 path with F-series per-slot scale signature.
+                    rope_fp8kv(dims, kernels, scratch, meta, stream)?;
+                    let decode = PagedDecodeFp8Launcher::new(attention);
+                    decode.launch(
+                        decode_params,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_scale_cache,
+                        scratch.v_scale_cache,
+                        scratch.q_scale_cache,
+                        0, // k_descale_fallback (unused when per-slot populated)
+                        0, // v_descale_fallback
+                        meta.block_tables,
+                        meta.context_lens,
+                        scratch.fa3_workspace,
+                        scratch.q_scale_ptr,
+                        stream,
+                    )?;
+                }
+                KvDtype::Nvfp4 => {
+                    // NVFP4 path: dedicated RoPE + dedicated decode launcher.
+                    rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
+                    let decode = rvllm_attention::PagedDecodeNvfp4Launcher::new(attention);
+                    decode.launch(
+                        decode_params,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_cache_scale,
+                        scratch.v_cache_scale,
+                        meta.block_tables,
+                        meta.context_lens,
+                        scratch.q_scale_ptr,
+                        stream,
+                    )?;
+                }
+            }
+        }
+        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q, num_seqs: _ } => {
+            // NVFP4 prefill is a single-call dedicated launcher — no
+            // unified/decode-per-qi path. Handled upfront; FP8/F16 fall
+            // through to F-series' unified-or-fallback structure below.
+            if dims.kv_dtype == KvDtype::Nvfp4 {
+                rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
+                let prefill_params = rvllm_attention::PagedPrefillParams {
+                    num_tokens: dims.num_tokens,
+                    num_seqs: 1,
+                    num_heads: dims.num_heads,
+                    num_kv_heads: dims.num_kv_heads,
+                    head_dim: dims.head_dim,
+                    block_size: dims.block_size,
+                    max_blocks_per_seq: dims.max_blocks_per_seq,
+                    num_blocks_total: dims.num_blocks_total,
+                    scale: dims.attn_scale,
+                    window_size_left,
+                };
+                let prefill = rvllm_attention::PagedPrefillNvfp4Launcher::new(attention);
+                prefill.launch(
+                    prefill_params,
                     scratch.attn_out,
                     scratch.q_fp8,
                     scratch.k_cache,
                     scratch.v_cache,
-                    scratch.k_scale_cache,
-                    scratch.v_scale_cache,
-                    scratch.q_scale_cache,
-                    0, // k_descale_fallback (unused when per-slot populated)
-                    0, // v_descale_fallback
+                    scratch.k_cache_scale,
+                    scratch.v_cache_scale,
                     meta.block_tables,
                     meta.context_lens,
-                    scratch.fa3_workspace,
+                    cu_seqlens_q,
                     scratch.q_scale_ptr,
+                    max_seqlen_q,
                     stream,
                 )?;
+                return Ok(());
             }
-        }
-        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q: _, num_seqs: _ } => {
+            // FP8 / F16 prefill: share the FP8 write path (no F16 prefill
+            // kernel on sm_121). F-series unified-or-fallback structure:
             // Prefill always uses FP8 KV path (no F16 prefill kernel).
             rope_fp8kv(dims, kernels, scratch, meta, stream)?;
 
@@ -1525,6 +1678,83 @@ unsafe fn rope_fp8kv(
         scratch.q_scale_ptr,
         stream,
     )
+}
+
+/// RoPE + NVFP4 paged-KV write. Mirrors `rope_fp8kv` but writes the
+/// K/V cache as packed 4-bit bytes + per-16-element E4M3 microscale
+/// into the separate `k_cache_scale` / `v_cache_scale` regions. Q
+/// still lands in `q_fp8` per-tensor (the FA2 NVFP4 decode/prefill
+/// kernels read Q as FP8).
+#[cfg(feature = "cuda")]
+unsafe fn rope_nvfp4kv(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    scratch: &Gemma4LayerScratch,
+    meta: &Gemma4MetadataPtrs,
+    stream: u64,
+) -> Result<()> {
+    // `fused_rope_partial_nvfp4kv` is `None` when the NVFP4 PTX isn't
+    // built into $KERNELS_DIR. That means the operator asked for
+    // `RVLLM_NVFP4_KV=1` but their kernel tree predates the NVFP4
+    // branch — fail clean with a typed attention error (closest
+    // match in rvllm-core; we don't have a KernelError variant).
+    let kernel = kernels.fused_rope_partial_nvfp4kv.ok_or_else(|| {
+        rvllm_core::RvllmError::Attention {
+            err: rvllm_core::AttentionError::FeatureNotAvailable {
+                backend: "Fa2Ptx",
+                op: "rope_nvfp4kv (fused_rope_partial_nvfp4kv.ptx not in $KERNELS_DIR)",
+            },
+            ctx: rvllm_core::AttnCtx {
+                op: "rope_nvfp4kv",
+                stream,
+                num_seqs: dims.num_tokens,
+                head_dim: dims.head_dim,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        }
+    })?;
+    let mut q_in = scratch.q_normed;
+    let mut k_in = scratch.k_normed;
+    let mut v_in = scratch.v_out;
+    let mut q_out = scratch.q_fp8;
+    let mut k_packed = scratch.k_cache;
+    let mut v_packed = scratch.v_cache;
+    let mut k_scale = scratch.k_cache_scale;
+    let mut v_scale = scratch.v_cache_scale;
+    let mut cos = meta.cos;
+    let mut sin = meta.sin;
+    let mut positions = meta.positions;
+    let mut slot_mapping = meta.slot_mapping;
+    let mut q_scale_ptr = scratch.q_scale_ptr;
+    let mut nt = dims.num_tokens as i32;
+    let mut nh = dims.num_heads as i32;
+    let mut nkvh = dims.num_kv_heads as i32;
+    let mut hd = dims.head_dim as i32;
+    let mut rd = dims.rotary_dim as i32;
+    let args = [
+        (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_packed) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_packed) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_scale) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_scale) as *mut u64 as *mut core::ffi::c_void,
+        (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+        (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+        (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+        (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+        (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let max_heads = dims.num_heads.max(dims.num_kv_heads);
+    let grid = (dims.num_tokens, max_heads, 1);
+    let block = (dims.head_dim, 1, 1);
+    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
 }
 
 pub unsafe fn logit_softcap(

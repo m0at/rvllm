@@ -470,6 +470,172 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
     }
 }
 
+/// NVFP4 KV-cache paged-decode launcher. Same shape as
+/// `PagedDecodeFp8Launcher` but threads per-block E4M3 microscale
+/// pointers instead of per-tensor descales, and the K/V cache
+/// pointers reference the packed 4-bit byte layout.
+///
+/// Only the `Fa2Ptx` backend implements this — FA3 (SM90) has no
+/// NVFP4 path and returns `FeatureNotAvailable`.
+pub struct PagedDecodeNvfp4Launcher<'a> {
+    backend: &'a super::AttentionBackend,
+}
+
+impl<'a> PagedDecodeNvfp4Launcher<'a> {
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { backend }
+    }
+
+    /// # Safety
+    /// Every pointer must be valid device memory.
+    ///   * `k_cache_packed` / `v_cache_packed`: packed 4-bit bytes
+    ///     `[num_blocks * block_size * num_kv_heads * head_dim/2]`.
+    ///   * `k_cache_scale` / `v_cache_scale`: `__nv_fp8_e4m3`
+    ///     `[num_blocks * block_size * num_kv_heads * head_dim/16]`.
+    ///   * `q_descale_ptr`: single f32 scalar (Q stays FP8 per-tensor).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        params: PagedDecodeParams,
+        o_f16: u64,
+        q_fp8: u64,
+        k_cache_packed: u64,
+        v_cache_packed: u64,
+        k_cache_scale: u64,
+        v_cache_scale: u64,
+        block_tables: u64,
+        context_lens: u64,
+        q_descale_ptr: u64,
+        stream: u64,
+    ) -> Result<()> {
+        params.validate()?;
+        #[cfg(feature = "cuda")]
+        {
+            let fa2 = match self.backend {
+                super::AttentionBackend::Fa2Ptx(fa2) => fa2,
+                _ => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "non-Fa2Ptx",
+                            op: "paged_decode_nvfp4",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_decode_nvfp4",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            use cudarc::driver::sys::*;
+            const FA2_THREADS: i32 = 128;
+            let hd = params.head_dim as i32;
+            let (kernel_opt, fa2_bc) = if hd > 256 {
+                (fa2.fn_decode_nvfp4kv_bc16, 16)
+            } else {
+                (fa2.fn_decode_nvfp4kv, 32)
+            };
+            let kernel_fn = kernel_opt.ok_or_else(|| RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "Fa2Ptx",
+                    op: "paged_decode_nvfp4 (kernel missing from PTX — rebuild kernels/ with rusty_sm121_nvfp4)",
+                },
+                ctx: AttnCtx {
+                    op: "paged_decode_nvfp4",
+                    stream,
+                    num_seqs: params.num_seqs,
+                    head_dim: params.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })?;
+
+            let smem_bytes =
+                2 * fa2_bc * hd * 4 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
+            if smem_bytes as u32 >= 48 * 1024 {
+                let _ = cuFuncSetAttribute(
+                    kernel_fn.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes,
+                );
+            }
+
+            let scale = params.scale;
+            let num_heads = params.num_heads as i32;
+            let num_kv_heads = params.num_kv_heads as i32;
+            let head_dim = params.head_dim as i32;
+            let block_size = params.block_size as i32;
+            let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+            let window_size_left = params.window_size_left;
+
+            let mut arg_out = o_f16;
+            let mut arg_q = q_fp8;
+            let mut arg_kp = k_cache_packed;
+            let mut arg_vp = v_cache_packed;
+            let mut arg_ks = k_cache_scale;
+            let mut arg_vs = v_cache_scale;
+            let mut arg_bt = block_tables;
+            let mut arg_cl = context_lens;
+            let mut arg_qd = q_descale_ptr;
+
+            let args: [*mut core::ffi::c_void; 16] = [
+                &mut arg_out as *mut _ as *mut _,
+                &mut arg_q   as *mut _ as *mut _,
+                &mut arg_kp  as *mut _ as *mut _,
+                &mut arg_vp  as *mut _ as *mut _,
+                &mut arg_ks  as *mut _ as *mut _,
+                &mut arg_vs  as *mut _ as *mut _,
+                &mut arg_bt  as *mut _ as *mut _,
+                &mut arg_cl  as *mut _ as *mut _,
+                &mut arg_qd  as *mut _ as *mut _,
+                &scale as *const _ as *mut _,
+                &num_heads as *const _ as *mut _,
+                &num_kv_heads as *const _ as *mut _,
+                &head_dim as *const _ as *mut _,
+                &block_size as *const _ as *mut _,
+                &max_blocks_per_seq as *const _ as *mut _,
+                &window_size_left as *const _ as *mut _,
+            ];
+
+            let rc = cuLaunchKernel(
+                kernel_fn.raw() as CUfunction,
+                params.num_seqs as u32,
+                params.num_heads as u32,
+                1,
+                FA2_THREADS as u32,
+                1,
+                1,
+                smem_bytes as u32,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_decode_nvfp4 (Fa2Ptx)",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (o_f16, q_fp8, k_cache_packed, v_cache_packed,
+                     k_cache_scale, v_cache_scale, block_tables,
+                     context_lens, q_descale_ptr, stream);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
