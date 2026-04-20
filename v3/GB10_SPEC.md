@@ -313,30 +313,20 @@ a scalar weight scale.
 - End-to-end Gemma-4 PPL on sm_121 — probe run validates 32-token
   decode numerically, a full PPL sweep is the next measurement
   milestone.
-- **Native sm_121 FP8 GEMM with row×column-scale epilogue**. The
-  current `fp8_gemm_channelscale_or_fallback` on sm_121 falls back to
-  `cublaslt.fp8_gemm(..., a_scale, b_scale_scalar)` because cuBLASLt's
-  FP8 channelscale heuristic `LaunchFailed`s on Blackwell consumer —
-  that drops the per-channel weight scale and costs PPL on the
-  prefill / M>1 path. Decode M=1 is already fixed by the f16-input
-  GEMV fast path. A proper fix needs its own scoped PR:
-
-    * `mma.sync.m16n8k32.f32.e4m3.e4m3.f32` with multi-stage cp.async
-      tiled K/V loads (Blackwell-native FP8 tensor-core MMA).
-    * Row×column-scale epilogue (a_scale[M] × b_blockscale[N_blk, K_blk]).
-    * Numerical validation against a fp64 reference (new
-      `v3/tools/fp8_gemm_channelscale_check.py`) before the perf pass.
-    * Tile-shape autotune across the 4 Gemma 4 projection shapes
-      (QKV 4608×5376, O 5376×3584, gate_up 41152×5376,
-      down 5376×20576).
-    * Microbench against the scalar cuBLASLt fallback to confirm
-      both **lower PPL** and **not-slower prefill TTFT** — the
-      intermediate "extend the f16-input GEMV to M>1" shortcut was
-      tried on this branch and regressed prefill ~7× (GEMV parallelism
-      collapses at M=8 vs tensor-core mma), so the replacement must
-      be real mma.sync, not an extended GEMV.
-    * Scope estimate: 2-3 days, ~500-1000 LOC CUDA + validation +
-      bench + wiring. Explicitly out of scope for this branch.
+- ~~**Native sm_121 FP8 GEMM with row×column-scale epilogue**~~:
+  landed as CUTLASS 4.4.2 `CollectiveBuilder<Sm120, ...>` blockwise
+  kernel in `kernels/cutlass_fp8_gemm_blockscale_sm120.cu`, built
+  via `kernels/build_cutlass_sm120_so.sh sm_121a` into
+  `kernels/sm_121/libcutlass_sm120.so`. Wired through
+  `CutlassBackend::SoSm120(CutlassSm120Lib)` + opt-in runtime
+  dispatch (`RVLLM_FP8_GEMM_CUTLASS_SM120=1`) in
+  `fp8_gemm_channelscale_or_fallback`. Kernel gates on M≥128 (the
+  CUTLASS cooperative schedule hard-asserts this); small-batch
+  decode still routes through cuBLASLt scalar. Isolated shape
+  101.8 TFLOPS at Gemma 4 QKV prefill (M=128, N=4608, K=5376),
+  135.9 TFLOPS at M=256. End-to-end Gemma 4 31B decode on GB10:
+  925 tok/s at batch=256 (attention/LM-head-bound; CUTLASS path
+  is on par with cuBLASLt at live shapes, no regression).
 - Switch `kernels/build.sh` to `-arch=sm_121f` (family-mode) when a
   future kernel needs FP8 tensor-core MMA or MXFP4 hardware paths.
   Not required for anything on this branch (see "Arch suffix").

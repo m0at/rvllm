@@ -111,15 +111,6 @@ pub struct Gemma4FusedModules {
     /// directly off f16 activations, skipping the FP8 activation-
     /// quant step that cuBLASLt requires.
     pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
-    /// `fp8_gemm_channelscale_sm121_kernel` — native mma.sync FP8
-    /// GEMM with row×col-block-scale epilogue. Replaces the
-    /// cuBLASLt scalar-fallback on the Sm121 prefill / M>1 path.
-    /// Gated on `__CUDA_ARCH__ >= 1000` in the kernel source, so
-    /// `None` on pre-Blackwell targets. Kept on the struct + owning
-    /// module to anchor the LoadedModule lifetime so `fn` handles
-    /// stay valid across run_generate calls.
-    pub fn_fp8_gemm_channelscale: Option<KernelFn>,
-    pub fp8_gemm_channelscale_mod: Option<LoadedModule>,
 }
 
 pub struct Gemma4Bringup {
@@ -2070,7 +2061,6 @@ impl Gemma4Bringup {
             fused_qkv_rmsnorm: self.fused.fn_fused_qkv_rmsnorm,
             scale_cols_f16: self.fused.fn_scale_cols_f16,
             fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,
-            fp8_gemm_channelscale_sm121: self.fused.fn_fp8_gemm_channelscale,
         }
     }
 }
@@ -2147,31 +2137,6 @@ fn load_gemma4_fused(
         _ => None,
     };
 
-    // Native sm_121 FP8 GEMM with row × col-block-scale epilogue.
-    // PTX is emitted by `kernels/fp8_gemm_channelscale_sm121.cu` only
-    // under `__CUDA_ARCH__ >= 1000`; the LoadedModule lifetime lives
-    // on the struct so the resolved `KernelFn` stays valid across
-    // `run_generate` calls (same RAII invariant as the other fused
-    // kernels).
-    let (fn_fp8_gemm_channelscale, fp8_gemm_channelscale_mod) = match target {
-        Some(rvllm_core::CompileTarget::Sm121) => {
-            match loader.load_ptx("fp8_gemm_channelscale_sm121") {
-                Ok(m) => match m.get_function("fp8_gemm_channelscale_sm121_kernel") {
-                    Ok(f) => (Some(f), Some(m)),
-                    Err(e) => {
-                        tracing::warn!(?e, "fp8_gemm_channelscale symbol missing from PTX");
-                        (None, None)
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(?e, "fp8_gemm_channelscale PTX missing");
-                    (None, None)
-                }
-            }
-        }
-        _ => (None, None),
-    };
-
     let fused_norm_add_residual_mod = loader.load_ptx("fused_norm_add_residual")?;
     let fn_fused_norm_add_residual =
         fused_norm_add_residual_mod.get_function("fused_norm_add_residual_kernel")?;
@@ -2242,7 +2207,5 @@ fn load_gemma4_fused(
         scale_cols_f16_mod,
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_native_f16in,
-        fn_fp8_gemm_channelscale,
-        fp8_gemm_channelscale_mod,
     })
 }
