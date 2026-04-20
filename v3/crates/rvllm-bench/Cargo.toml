@@ -34,6 +34,10 @@ required-features = ["cuda"]
 [features]
 default = []
 cuda = ["rvllm-runtime/cuda", "rvllm-fused/cuda", "rvllm-mem/cuda", "dep:cudarc"]
+# Forward the runtime's `gb10` feature so GB10-only bringup paths (FA2
+# PTX attention, sm_121 CUTLASS .so resolution) are enabled when the
+# bench is built for DGX Spark / consumer Blackwell.
+gb10 = ["cuda", "rvllm-runtime/gb10"]
 
 [dependencies]
 rvllm-core = { workspace = true }
