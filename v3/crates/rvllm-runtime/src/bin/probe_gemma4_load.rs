@@ -172,45 +172,47 @@ fn run() -> Result<(), String> {
     }
 
     // ======================================================================
-    // Validate (B) — fp8_gemv.ptx loaded + entry points resolved.
+    // Validate (B) — fp8_gemv.ptx loaded + the f16-input native-CVT
+    // entry point (the one the Sm121 decode fast path actually calls)
+    // resolved correctly for the live target.
     // ======================================================================
     eprintln!("\n[B] fp8_gemv.ptx kernel-resolve check:");
     let fused = &bringup.fused;
     if fused.fp8_gemv_mod.raw() == 0 {
         return Err("fp8_gemv_mod.raw() == 0 (module not loaded)".into());
     }
-    eprintln!("    fp8_gemv_mod          = loaded ({} path)", fused.fp8_gemv_mod.path().display());
-    if fused.fn_fp8_gemv_wpr_lut.raw() == 0 {
-        return Err("fn_fp8_gemv_wpr_lut.raw() == 0 (symbol not resolved)".into());
-    }
     eprintln!(
-        "    fn_fp8_gemv_wpr_lut   = resolved ({})",
-        rvllm_kernels::Fp8GemvVariant::WprLut.entry_point(),
+        "    fp8_gemv_mod              = loaded ({})",
+        fused.fp8_gemv_mod.path().display(),
     );
 
-    let native_expected =
-        target.is_some_and(|t| rvllm_kernels::Fp8GemvVariant::WprNative.available_for(t));
-    match (&fused.fn_fp8_gemv_wpr_native, native_expected) {
+    let f16in_expected = target
+        .is_some_and(|t| rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t));
+    match (&fused.fn_fp8_gemv_wpr_native_f16in, f16in_expected) {
         (Some(f), true) => {
             if f.raw() == 0 {
-                return Err("fn_fp8_gemv_wpr_native is Some but raw() == 0".into());
+                return Err(
+                    "fn_fp8_gemv_wpr_native_f16in is Some but raw() == 0".into(),
+                );
             }
             eprintln!(
-                "    fn_fp8_gemv_wpr_native= resolved ({})",
-                rvllm_kernels::Fp8GemvVariant::WprNative.entry_point(),
+                "    fn_fp8_gemv_wpr_native_f16in = resolved ({})",
+                rvllm_kernels::Fp8GemvVariant::WprNativeF16In.entry_point(),
             );
         }
         (None, false) => {
-            eprintln!("    fn_fp8_gemv_wpr_native= None (expected: sm_100+ only)");
+            eprintln!(
+                "    fn_fp8_gemv_wpr_native_f16in = None (expected: sm_100+ only)",
+            );
         }
         (Some(_), false) => {
             return Err(format!(
-                "fn_fp8_gemv_wpr_native unexpectedly Some on non-Blackwell target {target:?}"
+                "fn_fp8_gemv_wpr_native_f16in unexpectedly Some on non-Blackwell target {target:?}"
             ));
         }
         (None, true) => {
             return Err(format!(
-                "fn_fp8_gemv_wpr_native unexpectedly None on target {target:?} — \
+                "fn_fp8_gemv_wpr_native_f16in unexpectedly None on target {target:?} — \
                  available_for says it should be resolved"
             ));
         }

@@ -96,23 +96,20 @@ pub struct Gemma4FusedModules {
     pub scale_cols_f16_mod: LoadedModule,
 
     // `fp8_gemv.ptx` — GB10 warp-per-row FP8 GEMV kernels. Loaded at
-    // bringup so the decode fast path (`launch_fp8_gemv_f16in` in
-    // `gemma4_layer_exec.rs`) can call them without a per-step module
-    // load. `fn_fp8_gemv_wpr_native_f16in` is the only one the
-    // runtime path actually calls; `_lut` / `_native` are resolved
-    // for the `probe-gemma4-load` symbol-validity check.
+    // bringup so the Sm121 decode fast path (`launch_fp8_gemv_f16in`
+    // in `gemma4_layer_exec.rs`) can call it without a per-step
+    // module load. Only the f16-input variant is resolved — the
+    // other enum variants in `Fp8GemvVariant` document what ships in
+    // the PTX but nothing in the runtime path calls them.
     pub fp8_gemv_mod: LoadedModule,
-    pub fn_fp8_gemv_wpr_lut: KernelFn,
     /// `None` when the live device is not Blackwell (sm_100+) — the
     /// native-CVT entry is gated on `__CUDA_ARCH__ >= 1000` in
-    /// `kernels/fp8_gemv.cu`, so the symbol is absent from pre-Blackwell
-    /// PTX. `Fp8GemvVariant::available_for(target)` is the source of
-    /// truth for this gate.
-    pub fn_fp8_gemv_wpr_native: Option<KernelFn>,
-    /// F16-input variant of `fn_fp8_gemv_wpr_native`. Same arch gate
-    /// (sm_100+). Used by the Sm121 decode path to run projection
-    /// GEMMs (QKV / O / gate_up / down) directly off f16 activations,
-    /// skipping the FP8 activation-quant step that cuBLASLt requires.
+    /// `kernels/fp8_gemv.cu`, so the symbol is absent from
+    /// pre-Blackwell PTX. `Fp8GemvVariant::available_for(target)` is
+    /// the source of truth for this gate. Used by the Sm121 decode
+    /// path to run projection GEMMs (QKV / O / gate_up / down)
+    /// directly off f16 activations, skipping the FP8 activation-
+    /// quant step that cuBLASLt requires.
     pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
 }
 
@@ -2127,19 +2124,11 @@ fn load_gemma4_fused(
     let fn_fused_rope_partial_f16kv =
         fused_rope_partial_f16kv_mod.get_function("fused_rope_partial_f16kv_kernel")?;
 
-    // `fp8_gemv.ptx` — see struct docs. Both WPR variants live in the
-    // same module; the native-CVT entry is gated on `__CUDA_ARCH__ >=
-    // 1000`, so we only attempt to resolve it when
+    // `fp8_gemv.ptx` — see struct docs. The f16-input native-CVT
+    // entry is gated on `__CUDA_ARCH__ >= 1000` in
+    // `kernels/fp8_gemv.cu`, so we only resolve it when
     // `Fp8GemvVariant::available_for(target)` says yes.
     let fp8_gemv_mod = loader.load_ptx(rvllm_kernels::FP8_GEMV_PTX_STEM)?;
-    let fn_fp8_gemv_wpr_lut =
-        fp8_gemv_mod.get_function(rvllm_kernels::Fp8GemvVariant::WprLut.entry_point())?;
-    let fn_fp8_gemv_wpr_native = match target {
-        Some(t) if rvllm_kernels::Fp8GemvVariant::WprNative.available_for(t) => Some(
-            fp8_gemv_mod.get_function(rvllm_kernels::Fp8GemvVariant::WprNative.entry_point())?,
-        ),
-        _ => None,
-    };
     let fn_fp8_gemv_wpr_native_f16in = match target {
         Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t) => Some(
             fp8_gemv_mod
@@ -2217,8 +2206,6 @@ fn load_gemma4_fused(
         fn_scale_cols_f16,
         scale_cols_f16_mod,
         fp8_gemv_mod,
-        fn_fp8_gemv_wpr_lut,
-        fn_fp8_gemv_wpr_native,
         fn_fp8_gemv_wpr_native_f16in,
     })
 }
