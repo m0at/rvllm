@@ -1291,7 +1291,7 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     cutlass_workspace_bytes: usize,
     stream: u64,
 ) -> Result<()> {
-    let _ = (fn_f32_to_f16, scratch_f32); // only used by future f32+cast path
+    let _ = fn_f32_to_f16; // only used by future f32+cast path
     // Prefer the native sm_121 channelscale kernel when available.
     // Opt-in via `RVLLM_FP8_GEMM_SM121=1` until we've measured PPL +
     // perf end-to-end against the scalar fallback — precision harness
@@ -1304,6 +1304,45 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
             );
         }
     }
+    // CUTLASS SM120 blockwise path — opt-in via
+    // `RVLLM_FP8_GEMM_CUTLASS_SM120=1`. Requires a `SoSm120` backend
+    // with all four prep symbols present (SFA bytes/SFB bytes/prep
+    // SFA/prep SFB); older `libcutlass_sm120.so` builds without the
+    // prep helpers fall through to cuBLASLt.
+    // The CUTLASS cooperative blockwise kernel is built with a 128×128
+    // MMA tile and hard-asserts `M >= 128` (sm90_gemm_tma_warpspecialized_
+    // cooperative.hpp:371). Gate the dispatch so small-batch decode
+    // (M=num_seqs < 128) still gets routed through the cuBLASLt
+    // fallback below. Prefill / large-batch decode (M >= 128) takes
+    // the CUTLASS path when opted in.
+    if m >= 128 && std::env::var_os("RVLLM_FP8_GEMM_CUTLASS_SM120").is_some() {
+        if let CutlassBackend::SoSm120(lib) = cutlass {
+            if lib.prep_sfa.is_some() && lib.prep_sfb.is_some() {
+                let sfa_bytes = lib.sfa_bytes(m, k);
+                let _sfb_bytes = lib.sfb_bytes(n, k);
+                // 16-byte-align the SFB offset inside scratch_f32.
+                let sfa_aligned = (sfa_bytes + 15) & !15;
+                let sfa_ptr = scratch_f32;
+                let sfb_ptr = scratch_f32 + sfa_aligned as u64;
+                lib.launch_prep_sfa(a_scale, sfa_ptr, m, k, stream)?;
+                lib.launch_prep_sfb(b_chscale, sfb_ptr, n, k, stream)?;
+                return cutlass.launch_fp8_gemm_blockscale_sm120(
+                    output_f16,
+                    a_fp8,
+                    b_fp8,
+                    sfa_ptr,
+                    sfb_ptr,
+                    m,
+                    n,
+                    k,
+                    cutlass_workspace,
+                    cutlass_workspace_bytes,
+                    stream,
+                );
+            }
+        }
+    }
+    let _ = scratch_f32;
     match cutlass {
         CutlassBackend::So(_) => cutlass.launch_fp8_gemm_channelscale(
             output_f16,
@@ -1319,6 +1358,24 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
             stream,
         ),
         CutlassBackend::Absent => cublaslt.fp8_gemm(
+            a_fp8,
+            b_fp8,
+            output_f16,
+            m,
+            n,
+            k,
+            a_scale,
+            b_scale_scalar,
+            stream,
+        ),
+        // CUTLASS SM120 blockwise kernel — the .so is loaded and
+        // dispatchable, but its SFA ABI wants a [ceil(M/128), K/128] f32
+        // tensor, not the per-M a_scale vector we have here. That
+        // broadcast has to be staged by the caller (future: prefill
+        // scratch region + a K/128-wide broadcast kernel), so for now
+        // we route through cuBLASLt (same path as `Absent`). The hand-
+        // rolled sm_121 kernel remains the opt-in path above.
+        CutlassBackend::SoSm120(_) => cublaslt.fp8_gemm(
             a_fp8,
             b_fp8,
             output_f16,
