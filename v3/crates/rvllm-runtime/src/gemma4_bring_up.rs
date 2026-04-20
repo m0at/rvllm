@@ -132,17 +132,26 @@ pub struct Gemma4Bringup {
 impl Gemma4Bringup {
     pub fn load(paths: Gemma4EnginePaths, arena_bytes: usize) -> Result<Self> {
         let ctx = Arc::new(CudaContextHandle::init(0)?);
+        // Resolve the compile target once per bring-up and thread it
+        // through — every call to `ctx.compute_capability()` + the
+        // lookup costs nothing individually but spreading it across 5
+        // sites means "which CC are we on?" reads inconsistent if a
+        // future refactor accidentally shadows `ctx`.
+        #[cfg(feature = "cuda")]
+        let compile_target: Option<rvllm_core::CompileTarget> = {
+            let (major, minor) = ctx.compute_capability();
+            rvllm_core::CompileTarget::from_compute_capability(major, minor)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let compile_target: Option<rvllm_core::CompileTarget> = None;
+
         // Arena backing picked per compute capability — see `Bringup::load`
         // in bring_up.rs for the full rationale (GB10 has no dedicated HBM,
         // cuMemAllocManaged is the right allocator there).
         let arena = {
             #[cfg(feature = "gb10")]
             {
-                let target = rvllm_core::CompileTarget::from_compute_capability(
-                    ctx.compute_capability().0,
-                    ctx.compute_capability().1,
-                );
-                if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+                if matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121)) {
                     rvllm_mem::UnifiedArena::new(&ctx, arena_bytes)?.into_inner()
                 } else {
                     HbmArena::new(&ctx, arena_bytes)?
@@ -171,10 +180,7 @@ impl Gemma4Bringup {
         // but doesn't fail bring-up.
         #[cfg(all(feature = "gb10", feature = "cuda"))]
         unsafe {
-            let (major, minor) = ctx.compute_capability();
-            let target =
-                rvllm_core::CompileTarget::from_compute_capability(major, minor);
-            if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+            if matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121)) {
                 let prefetch_bytes = arena.used();
                 if prefetch_bytes > 0 {
                     let loc = cudarc::driver::sys::CUmemLocation {
@@ -218,13 +224,7 @@ impl Gemma4Bringup {
         // `Fa3SoMissing`. See `rvllm_attention::Fa2PtxKernels` docs.
         let (sliding_attention, global_attention) = {
             #[cfg(feature = "gb10")]
-            let is_gb10 = matches!(
-                rvllm_core::CompileTarget::from_compute_capability(
-                    ctx.compute_capability().0,
-                    ctx.compute_capability().1,
-                ),
-                Some(rvllm_core::CompileTarget::Sm121),
-            );
+            let is_gb10 = matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121));
             #[cfg(not(feature = "gb10"))]
             let is_gb10 = false;
             if is_gb10 {
@@ -303,19 +303,8 @@ impl Gemma4Bringup {
         let variants: Vec<_> = variants.into_iter().collect();
         // CUTLASS backend selection — see `bring_up::Bringup::load`
         // for the full rationale (sm_121 has no compatible `.so`).
-        let cutlass_target = {
-            #[cfg(feature = "cuda")]
-            {
-                let (maj, min) = ctx.compute_capability();
-                rvllm_core::CompileTarget::from_compute_capability(maj, min)
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                None
-            }
-        };
         let cutlass =
-            CutlassBackend::load_for(cutlass_target, paths.cutlass_so.clone(), &variants)?;
+            CutlassBackend::load_for(compile_target, paths.cutlass_so.clone(), &variants)?;
 
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
         let cublaslt_ws_region = arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;
@@ -325,26 +314,11 @@ impl Gemma4Bringup {
             bytes: cublaslt_ws_bytes,
         };
 
-        // Live-device target is needed by the fused loader to decide
-        // whether `Fp8GemvVariant::WprNative` should be resolved (it's
-        // sm_100+ only). Under `feature = "cuda"` we have a real
-        // compute-capability reading; otherwise default to `None` and
-        // let the loader resolve only the universally-available
-        // variant. `Some(None)` vs `None` is distinct: it means
-        // "probe succeeded but CC isn't in our target matrix", which
-        // should still fall back to `WprLut`.
-        let fp8_target = {
-            #[cfg(feature = "cuda")]
-            {
-                let (major, minor) = ctx.compute_capability();
-                rvllm_core::CompileTarget::from_compute_capability(major, minor)
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                None
-            }
-        };
-        let fused = load_gemma4_fused(&kernels, fp8_target)?;
+        // `compile_target` is also what the fused loader uses to gate
+        // `Fp8GemvVariant::WprNative` (sm_100+ only). `Some(None)` vs
+        // `None` is distinct: it means "probe succeeded but CC isn't
+        // in our target matrix", which falls back to `WprLut`.
+        let fused = load_gemma4_fused(&kernels, compile_target)?;
 
         Ok(Self {
             ctx,
