@@ -415,10 +415,10 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gemm_f32_tmp,
             stream,
         )?;
-    } else if weights.qkv_chscale != 0
-        && dims.num_tokens == 1
-        && kernels.fp8_gemv_wpr_native_f16in.is_some()
-    {
+    } else if let (true, Some(fn_gemv)) = (
+        weights.qkv_chscale != 0 && dims.num_tokens == 1,
+        kernels.fp8_gemv_wpr_native_f16in,
+    ) {
         // sm_121 fast path: skip the activation FP8-quant entirely
         // and run `fp8_gemv_blockwise_wpr_native_f16in_kernel` directly
         // against the f16 rmsnorm output. Wins over the
@@ -458,7 +458,7 @@ pub unsafe fn gemma4_forward_phase(
             k: dims.hidden,
         }
         .launch(
-            kernels.fp8_gemv_wpr_native_f16in.unwrap(),
+            fn_gemv,
             scratch.q_out,
             weights.qkv_fp8,
             weights.qkv_chscale,
@@ -805,10 +805,10 @@ pub unsafe fn gemma4_forward_phase(
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
         }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
-    } else if weights.o_chscale != 0
-        && dims.num_tokens == 1
-        && kernels.fp8_gemv_wpr_native_f16in.is_some()
-    {
+    } else if let (true, Some(fn_gemv)) = (
+        weights.o_chscale != 0 && dims.num_tokens == 1,
+        kernels.fp8_gemv_wpr_native_f16in,
+    ) {
         // sm_121 fast path for O projection.
         // `scratch.attn_out` is already f16 (attention output), no
         // pre-rmsnorm needed — post-attn-norm runs in the epilogue via
@@ -821,7 +821,7 @@ pub unsafe fn gemma4_forward_phase(
             k: q_dim,
         }
         .launch(
-            kernels.fp8_gemv_wpr_native_f16in.unwrap(),
+            fn_gemv,
             scratch.gemm_f32_tmp,
             weights.o_fp8,
             weights.o_chscale,
@@ -977,10 +977,10 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gemm_f32_tmp,
             stream,
         )?;
-    } else if weights.gate_up_chscale != 0
-        && dims.num_tokens == 1
-        && kernels.fp8_gemv_wpr_native_f16in.is_some()
-    {
+    } else if let (true, Some(fn_gemv)) = (
+        weights.gate_up_chscale != 0 && dims.num_tokens == 1,
+        kernels.fp8_gemv_wpr_native_f16in,
+    ) {
         // sm_121 fast path for gate||up projection. Mirrors
         // the QKV fast path: f16 rmsnorm into delta_f16 (pre-FF norm
         // gamma this time), then f16-input fp8_gemv direct to
@@ -1009,7 +1009,7 @@ pub unsafe fn gemma4_forward_phase(
             k: dims.hidden,
         }
         .launch(
-            kernels.fp8_gemv_wpr_native_f16in.unwrap(),
+            fn_gemv,
             scratch.gate_up_out,
             weights.gate_up_fp8,
             weights.gate_up_chscale,
@@ -1064,10 +1064,10 @@ pub unsafe fn gemma4_forward_phase(
             dims.intermediate as i32,
             stream,
         )?;
-    } else if weights.down_chscale != 0
-        && dims.num_tokens == 1
-        && kernels.fp8_gemv_wpr_native_f16in.is_some()
-    {
+    } else if let (true, Some(fn_gemv)) = (
+        weights.down_chscale != 0 && dims.num_tokens == 1,
+        kernels.fp8_gemv_wpr_native_f16in,
+    ) {
         // sm_121 fast path for down projection.
         // Skip FP8 GELU-quant — run f16 GELU into `gate_up_fp8`
         // scratch (same aliasing trick as the f16-weights branch),
@@ -1094,7 +1094,7 @@ pub unsafe fn gemma4_forward_phase(
             k: dims.intermediate,
         }
         .launch(
-            kernels.fp8_gemv_wpr_native_f16in.unwrap(),
+            fn_gemv,
             scratch.gemm_f32_tmp,
             weights.down_fp8,
             weights.down_chscale,
