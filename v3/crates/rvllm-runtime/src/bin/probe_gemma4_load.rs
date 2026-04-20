@@ -49,6 +49,35 @@ fn env_gb(name: &str, default_gb: u64) -> Result<u64, String> {
     }
 }
 
+/// Marker path used for `RVLLM_CUTLASS_SO` / `RVLLM_FA3_SO` when the
+/// operator skipped them on a sm_121 run. These files never get
+/// opened on sm_121 (CUTLASS backend is `Absent`, attention goes
+/// through `Fa2Ptx`), so any unique non-existent path works — the
+/// name is what shows up in the probe banner.
+const UNUSED_PATH_MARKER: &str = "<unused-on-sm121>";
+
+/// Minimal `policy.json` written when `RVLLM_POLICY` is unset. Parsed
+/// successfully by `rvllm_cutlass::Policy` but contains no entries
+/// — sm_121's `CutlassBackend::Absent` never looks entries up.
+const MINIMAL_POLICY_JSON: &str =
+    r#"{"revision":"probe-sm121","arch":"sm_121","variants":[],"entries":{}}"#;
+
+/// Resolve `RVLLM_POLICY`, materialising a minimal policy file if
+/// the env var is unset. Written into a cache-dir path derived from
+/// `kernels_dir` so we don't pollute `/tmp` across runs and don't
+/// stomp on a real policy the user left in place.
+fn resolve_policy_path(kernels_dir: &std::path::Path) -> Result<PathBuf, String> {
+    if let Ok(p) = env_path("RVLLM_POLICY") {
+        return Ok(p);
+    }
+    let target = kernels_dir.join(".probe-minimal-policy.json");
+    if !target.exists() {
+        std::fs::write(&target, MINIMAL_POLICY_JSON)
+            .map_err(|e| format!("write minimal policy {}: {e}", target.display()))?;
+    }
+    Ok(target)
+}
+
 fn run() -> Result<(), String> {
     // On sm_121 the CUTLASS `.so` and FA3 `.so` are never opened —
     // `CutlassBackend::load_for` short-circuits to `Absent` on sm_121,
@@ -61,27 +90,10 @@ fn run() -> Result<(), String> {
     let model_dir = env_path("RVLLM_MODEL_DIR")?;
     let kernels_dir = env_path("RVLLM_KERNELS_DIR")?;
     let cutlass_so = env_path("RVLLM_CUTLASS_SO")
-        .unwrap_or_else(|_| PathBuf::from("/dev/null-cutlass-sm121-absent"));
+        .unwrap_or_else(|_| PathBuf::from(UNUSED_PATH_MARKER));
     let fa3_so = env_path("RVLLM_FA3_SO")
-        .unwrap_or_else(|_| PathBuf::from("/dev/null-fa3-sm121-absent"));
-    let policy_json = match env_path("RVLLM_POLICY") {
-        Ok(p) => p,
-        Err(_) => {
-            // Write a minimal policy into the system temp dir. The
-            // fields are parsed but never consulted on sm_121 (the
-            // CUTLASS backend is `Absent` so variant lookups never
-            // happen).
-            let tmp = std::env::temp_dir().join("rvllm-probe-minimal-policy.json");
-            if !tmp.exists() {
-                std::fs::write(
-                    &tmp,
-                    r#"{"revision":"probe-sm121","arch":"sm_121","variants":[],"entries":{}}"#,
-                )
-                .map_err(|e| format!("write minimal policy {}: {e}", tmp.display()))?;
-            }
-            tmp
-        }
-    };
+        .unwrap_or_else(|_| PathBuf::from(UNUSED_PATH_MARKER));
+    let policy_json = resolve_policy_path(&kernels_dir)?;
     let paths = Gemma4EnginePaths {
         model_dir,
         kernels_dir,

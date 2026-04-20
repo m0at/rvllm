@@ -111,23 +111,21 @@ firmware throttle documented below did **not** trigger on either
 workload size with the current driver / firmware combination. Either
 the throttle depends on a thermal envelope that micro-benching
 doesn't reach, or it was firmware-specific to the PR #28 reporter's
-environment. The dispatch policy in `rvllm-kernels::gb10_dispatch`
-stays in place as defence-in-depth — under throttle the `WprLut`
-fallback is still the theoretically right call — but in practice on
-this board **`WprNative` is the correct default**.
+environment. On this board **`WprNative` is the correct default**;
+the regime-routing machinery was removed as dead code.
 
 ## Power-profile paradox (PR #28 historical context — not reproduced)
 
 **Note — see "Empirical numbers" above.** The clock-regime paradox
 below is the original PR #28 reporter's model of GB10 behaviour. We
-built the `WprLut` / `WprNative` variants + a dispatch policy
-(`rvllm-kernels::gb10_dispatch`) on top of it. On this DGX Spark
-(driver 595.58.03, CUDA 13.2) the described 851 → 507 MHz firmware
-throttle **did not trigger** during 15 s of continuous GEMV looping
-— clocks stayed at ~2520 MHz the whole time. `WprNative` wins
-unconditionally on observed hardware. The policy stays as
-defence-in-depth in case a future firmware/driver combination
-re-introduces the throttle.
+built the `WprLut` / `WprNative` variants on top of it. On this
+DGX Spark (driver 595.58.03, CUDA 13.2) the described 851 → 507 MHz
+firmware throttle **did not trigger** during 15 s of continuous
+GEMV looping — clocks stayed at ~2520 MHz the whole time.
+`WprNative` wins unconditionally on observed hardware. The original
+`ClockRegime` / `select_variant` dispatch policy was removed as
+unused — a regime router can be added above `Fp8GemvVariant` later
+if a firmware revives the plateau.
 
 Original model (PR #28): at 507 MHz throttled, instruction issue
 rate caps memory bandwidth utilisation — *more* instructions per
@@ -206,12 +204,16 @@ Commits in the `rusty_sm121` branch (as of the current state):
    `build.sh` after every per-arch compile loop, writing
    `kernels/<sm_xxx>/manifest.json` with `{revision, arch, entries}`
    keyed by PTX stem. All new kernels auto-included.
-5. **`fp8_gemv` dispatch policy** — `rvllm-kernels::gb10_dispatch`
-   exposes `Fp8GemvVariant { WprLut, WprNative }` + pure
-   `select_variant(ClockRegime)` + two regime classifiers
-   (`regime_from_elapsed`, `regime_from_clock_mhz` with 1500 MHz
-   threshold calibrated to observed hardware). Entry-point symbols
-   test-pinned against `kernels/fp8_gemv.cu`.
+5. **`fp8_gemv` kernel variants** — `rvllm-kernels::gb10_dispatch`
+   exposes `Fp8GemvVariant { WprLut, WprNative, WprNativeF16In }`
+   as pure kernel-variant enum + `entry_point()` + `available_for()`
+   arch gate. Entry-point symbols test-pinned against
+   `kernels/fp8_gemv.cu`. (The earlier `ClockRegime` +
+   `select_variant` machinery was removed after the observed GB10
+   clock behaviour made regime-aware routing dead code — see the
+   "Power-profile paradox" note below; a regime router can be
+   re-added above this module if a future firmware revives the
+   plateau.)
 6. **CI compile-check** — new `gb10-check` job in
    `.github/workflows/ci.yml` runs `cargo check` + lib tests for
    `rvllm-core`, `rvllm-mem --features gb10`, and `rvllm-kernels`
@@ -251,6 +253,47 @@ Commits in the `rusty_sm121` branch (as of the current state):
      triggered (see "Power-profile paradox" section for historical
      PR #28 model).
 
+### Decode fast path (sm_121 FP8 GEMV f16-input)
+
+After the core bring-up landed, a second wave of changes replaces the
+4 decode projection GEMMs (QKV, O, gate_up, down) with an sm_121-
+specialised f16-input FP8 GEMV that keeps the per-channel block
+scale in the epilogue. On Gemma 4 31B fp8-block, measured end-to-end
+on GB10: **4.7 → 5.1 tok/s (+8.5%)** — and fixes a latent PPL
+regression where the `fp8_gemm_channelscale` cuBLASLt heuristic
+`LaunchFailed`s on Blackwell consumer and the fallback collapsed to
+a scalar weight scale.
+
+9. **Native CVT in FA2-FP8KV decode** — `kernels/flash_attention.cu`:
+   `fp8kv_decode_byte` branches on `__CUDA_ARCH__ >= 1000` and uses
+   `__nv_cvt_fp8_to_halfraw` (emits `cvt.rn.f16x2.e4m3x2`) on
+   Blackwell, branchless scalar elsewhere. Same source, per-arch
+   codegen — no Rust-side dispatch.
+10. **F16-input FP8 GEMV** — `kernels/fp8_gemv.cu`:
+    `fp8_gemv_blockwise_wpr_native_f16in_kernel` mirrors the existing
+    `wpr_native` kernel but consumes f16 activations and emits f16
+    output. Native `cvt.f32.f16` on every load; 8 halves per 2×u64
+    input read; `Fp8GemvF16InLaunch` in `rvllm-fused` is the
+    launcher. Enables skipping activation FP8-quant on the M=1
+    decode path — the kernel reads f16 straight from rmsnorm (QKV /
+    gate_up via `scratch.delta_f16`, O from `scratch.attn_out`, down
+    from GELU f16 scratch) and preserves the per-channel block
+    scale that the Sm121 cuBLASLt fallback drops.
+11. **F16-input fused norm+residual epilogue** —
+    `v3/kernels/fused_norm_add_residual_f16.cu` gains a
+    `_f16in_kernel` variant that reads f16 input + no channelscale
+    broadcast (we already applied it in the GEMV). Wired into the
+    O-proj and down-proj fast paths.
+12. **FA2 FP8-KV prefill for sm_121** —
+    `kernels/flash_attention.cu` adds
+    `flash_attention_2_prefill_fp8kv_kernel` (BC=32) and
+    `flash_attention_2_prefill_fp8kv_bc16_kernel` (BC=16 for
+    head_dim=512 smem budget). Multi-query causal FP8 prefill with
+    per-tensor descales, f16 output. `PagedPrefillFp8Launcher`'s
+    Fa2Ptx arm wires them — required after upstream ac72222 split
+    prompt prefill into its own phase. Probe TTFT on 8-tok prompt:
+    213-216 ms.
+
 ### Upstream fix bundled with this branch
 
 - `CudaContextHandle::init` uses `cuDevicePrimaryCtxRetain` +
@@ -263,12 +306,17 @@ Commits in the `rusty_sm121` branch (as of the current state):
 
 ## Remaining follow-ups (explicitly NOT on this branch)
 
-- Wire `gb10_dispatch::Fp8GemvVariant` selection into the runtime
-  launch path (no FP8 GEMV dispatcher exists on any arch today).
-- Switch `Bringup::load` to select `UnifiedArena` vs `HbmArena`
-  based on `CompileTarget`, gated by `feature = "gb10"` on the
-  runtime crate.
-- End-to-end Gemma-4 PPL on sm_121 once the launch path is in place.
+- ~~Wire `gb10_dispatch::Fp8GemvVariant` into the runtime launch
+  path~~: landed (decode fast path #9–11 above).
+- ~~Select `UnifiedArena` vs `HbmArena` in `Bringup::load` on
+  `CompileTarget`~~: landed (bring-up section #1–2 above).
+- End-to-end Gemma-4 PPL on sm_121 — probe run validates 32-token
+  decode numerically, a full PPL sweep is the next measurement
+  milestone.
+- Native sm_121 FP8 GEMM with column-scale epilogue — replace the
+  scalar-scale cuBLASLt fallback in `fp8_gemm_channelscale_or_fallback`
+  for the prefill / M>1 path (decode M=1 is already fixed by the
+  f16-input GEMV).
 - Switch `kernels/build.sh` to `-arch=sm_121f` (family-mode) when a
   future kernel needs FP8 tensor-core MMA or MXFP4 hardware paths.
   Not required for anything on this branch (see "Arch suffix").

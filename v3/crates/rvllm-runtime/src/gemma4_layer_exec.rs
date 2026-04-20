@@ -452,15 +452,17 @@ pub unsafe fn gemma4_forward_phase(
             weights.attn_norm_gamma,
             stream,
         )?;
-        launch_fp8_gemv_f16in(
+        gemma4_launcher::Fp8GemvF16InLaunch {
+            m: dims.num_tokens,
+            n: qkv_rows,
+            k: dims.hidden,
+        }
+        .launch(
             kernels.fp8_gemv_wpr_native_f16in.unwrap(),
             scratch.q_out,
             weights.qkv_fp8,
             weights.qkv_chscale,
             scratch.delta_f16,
-            dims.num_tokens as i32,
-            qkv_rows as i32,
-            dims.hidden as i32,
             stream,
         )?;
     } else if weights.qkv_chscale != 0 {
@@ -813,15 +815,17 @@ pub unsafe fn gemma4_forward_phase(
         // `fused_norm_add_residual_f16in`. We write the GEMV result
         // into `gemm_f32_tmp` (reused as f16 scratch: we only need
         // num_tokens*hidden*2 bytes, well under gemm_f32_tmp's capacity).
-        launch_fp8_gemv_f16in(
+        gemma4_launcher::Fp8GemvF16InLaunch {
+            m: dims.num_tokens,
+            n: dims.hidden,
+            k: q_dim,
+        }
+        .launch(
             kernels.fp8_gemv_wpr_native_f16in.unwrap(),
             scratch.gemm_f32_tmp,
             weights.o_fp8,
             weights.o_chscale,
             scratch.attn_out,
-            dims.num_tokens as i32,
-            dims.hidden as i32,
-            q_dim as i32,
             stream,
         )?;
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
@@ -999,15 +1003,17 @@ pub unsafe fn gemma4_forward_phase(
             weights.pre_ff_norm_gamma,
             stream,
         )?;
-        launch_fp8_gemv_f16in(
+        gemma4_launcher::Fp8GemvF16InLaunch {
+            m: dims.num_tokens,
+            n: 2 * dims.intermediate,
+            k: dims.hidden,
+        }
+        .launch(
             kernels.fp8_gemv_wpr_native_f16in.unwrap(),
             scratch.gate_up_out,
             weights.gate_up_fp8,
             weights.gate_up_chscale,
             scratch.delta_f16,
-            dims.num_tokens as i32,
-            (2 * dims.intermediate) as i32,
-            dims.hidden as i32,
             stream,
         )?;
     } else if weights.gate_up_chscale != 0 {
@@ -1082,15 +1088,17 @@ pub unsafe fn gemma4_forward_phase(
             let grid = (dims.num_tokens, 1, 1);
             rvllm_fused::launch_raw(kernels.fused_gelu_mul_f16, grid, block, 0, stream, &args)?;
         }
-        launch_fp8_gemv_f16in(
+        gemma4_launcher::Fp8GemvF16InLaunch {
+            m: dims.num_tokens,
+            n: dims.hidden,
+            k: dims.intermediate,
+        }
+        .launch(
             kernels.fp8_gemv_wpr_native_f16in.unwrap(),
             scratch.gemm_f32_tmp,
             weights.down_fp8,
             weights.down_chscale,
             scratch.gate_up_fp8,
-            dims.num_tokens as i32,
-            dims.hidden as i32,
-            dims.intermediate as i32,
             stream,
         )?;
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
@@ -1253,54 +1261,6 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
         // future variant should be an explicit audit.
         _ => unreachable!("unexpected CutlassBackend variant in channelscale fallback"),
     }
-}
-
-/// Launch `fp8_gemv_blockwise_wpr_native_f16in_kernel`.
-///
-/// Grid (ceil(N/8), M, 1), block (256, 1, 1), zero shared memory.
-/// Matches the launch config documented in `kernels/fp8_gemv.cu`.
-///
-/// Input is f16 activation (no activation scale needed — the kernel
-/// promotes f16→f32 on load via hardware `cvt.f32.f16`). Weight is
-/// block-scaled FP8. Output is f16.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn launch_fp8_gemv_f16in(
-    kernel: KernelFn,
-    output_f16: u64,
-    weight_fp8: u64,
-    b_chscale: u64,
-    input_f16: u64,
-    m: i32,
-    n: i32,
-    k: i32,
-    stream: u64,
-) -> Result<()> {
-    let mut output = output_f16;
-    let mut weight = weight_fp8;
-    let mut scale = b_chscale;
-    let mut input = input_f16;
-    let mut m_i = m;
-    let mut n_i = n;
-    let mut k_i = k;
-    // block-scale layout in `kernels/fp8_gemv.cu`: scale[N_blocks, K_blocks]
-    // with 128-wide blocks on the K axis. `num_col_blocks = ceil(K/128)`.
-    let mut num_col_blocks = (k + 127) / 128;
-    let args = [
-        (&mut output) as *mut u64 as *mut core::ffi::c_void,
-        (&mut weight) as *mut u64 as *mut core::ffi::c_void,
-        (&mut scale) as *mut u64 as *mut core::ffi::c_void,
-        (&mut input) as *mut u64 as *mut core::ffi::c_void,
-        (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
-        (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
-        (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
-        (&mut num_col_blocks) as *mut i32 as *mut core::ffi::c_void,
-    ];
-    // Grid: (ceil(N/8), M), 1). Block: 256 threads (8 warps, 1 warp per
-    // output row within a block).
-    let grid = (((n as u32 + 7) / 8), m as u32, 1u32);
-    let block = (256u32, 1u32, 1u32);
-    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
 }
 
 #[cfg(feature = "cuda")]
