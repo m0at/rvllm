@@ -724,19 +724,17 @@ impl CutlassBackend {
         Ok(CutlassBackend::So(CutlassLib::load(path, policy_variants)?))
     }
 
+    /// Without the `cuda` feature there is no runtime to dlopen
+    /// against, so every backend collapses to `Absent`. Callers
+    /// already have to route through the non-CUDA code paths; this
+    /// keeps the signature shape identical to the cuda build.
     #[cfg(not(feature = "cuda"))]
     pub fn load_for(
-        target: Option<rvllm_core::CompileTarget>,
-        path: PathBuf,
-        policy_variants: &[VariantId],
+        _target: Option<rvllm_core::CompileTarget>,
+        _path: PathBuf,
+        _policy_variants: &[VariantId],
     ) -> Result<Self> {
-        if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
-            if let Some(sm120_path) = resolve_sm120_so_path(&path) {
-                return Ok(CutlassBackend::SoSm120(CutlassSm120Lib::load(sm120_path)?));
-            }
-            return Ok(CutlassBackend::Absent);
-        }
-        Ok(CutlassBackend::So(CutlassLib::load(path, policy_variants)?))
+        Ok(CutlassBackend::Absent)
     }
 
     /// Path the `.so` was (or would be) loaded from — exposed for
