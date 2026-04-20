@@ -82,12 +82,12 @@ pub struct Gemma4FusedModules {
     pub fn_scale_cols_f16: KernelFn,
     pub scale_cols_f16_mod: LoadedModule,
 
-    // `fp8_gemv.ptx` — the GB10-focused unfused FP8 GEMV kernels. Loaded
-    // at bringup so the eventual FP8-GEMV dispatcher (see
-    // `rvllm_kernels::gb10_dispatch`) can call `select_variant` per
-    // launch without any per-step module load. Nothing in the current
-    // decode path touches these yet — this is the additive landing for
-    // the wiring that swaps in on a follow-up PR.
+    // `fp8_gemv.ptx` — GB10 warp-per-row FP8 GEMV kernels. Loaded at
+    // bringup so the decode fast path (`launch_fp8_gemv_f16in` in
+    // `gemma4_layer_exec.rs`) can call them without a per-step module
+    // load. `fn_fp8_gemv_wpr_native_f16in` is the only one the
+    // runtime path actually calls; `_lut` / `_native` are resolved
+    // for the `probe-gemma4-load` symbol-validity check.
     pub fp8_gemv_mod: LoadedModule,
     pub fn_fp8_gemv_wpr_lut: KernelFn,
     /// `None` when the live device is not Blackwell (sm_100+) — the
