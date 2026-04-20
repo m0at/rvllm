@@ -13,6 +13,8 @@
 #![deny(clippy::unwrap_used)]
 
 pub mod config;
+#[cfg(feature = "cuda")]
+pub mod cuda_worker;
 pub mod error;
 pub mod openai;
 pub mod router;

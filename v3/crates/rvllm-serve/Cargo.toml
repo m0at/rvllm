@@ -42,6 +42,7 @@ serde_json = { workspace = true }
 # Tokenizer + chat template
 tokenizers = { workspace = true }
 minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
 
 # Misc
 uuid = { workspace = true }

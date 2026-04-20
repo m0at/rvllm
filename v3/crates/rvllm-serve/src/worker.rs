@@ -48,6 +48,12 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Construct from an already-created `mpsc::Sender`. Used by the
+    /// worker-spawn helpers (mock + cuda).
+    pub(crate) fn new(submit: mpsc::Sender<GenerateRequest>) -> Self {
+        Self { submit }
+    }
+
     /// Try to enqueue a request. Returns [`ApiError::Busy`] if the
     /// worker's queue is full (bounded `mpsc::channel`).
     pub async fn submit(&self, req: GenerateRequest) -> Result<(), ApiError> {

@@ -1,6 +1,12 @@
 //! `rvllm-server` binary — thin entrypoint that wires CLI args into
 //! [`rvllm_serve::ServerConfig`], starts the worker, builds the axum
 //! router, and blocks on the HTTP listener.
+//!
+//! The worker backing the HTTP loop is chosen at compile time:
+//!   * default build (no features): mock worker (no CUDA), emits
+//!     canned tokens. Useful for HTTP/tokenizer/CI dev.
+//!   * `--features cuda` / `--features gb10`: real worker backed by
+//!     `Gemma4Bringup::run_generate`.
 
 // main.rs does need a handful of unwrap-on-startup paths (CLI parse,
 // listener bind). The library crate itself stays `deny(unwrap_used)`.
@@ -26,6 +32,29 @@ struct Cli {
     /// tokenizer.json, safetensors shards).
     #[arg(long, env = "RVLLM_MODEL_DIR")]
     model_dir: PathBuf,
+
+    /// Directory with per-arch kernel PTX + manifest.json. Required
+    /// under `--features cuda`; ignored with the default mock worker.
+    #[arg(long, env = "RVLLM_KERNELS_DIR")]
+    kernels_dir: Option<PathBuf>,
+
+    /// CUTLASS SM90 `.so`. Optional on sm_121 (never opened there).
+    #[arg(long, env = "RVLLM_CUTLASS_SO")]
+    cutlass_so: Option<PathBuf>,
+
+    /// FA3 SM90 `.so`. Optional on sm_121 (never opened there).
+    #[arg(long, env = "RVLLM_FA3_SO")]
+    fa3_so: Option<PathBuf>,
+
+    /// CUTLASS autotune policy JSON. Optional on sm_121 (a minimal
+    /// placeholder is generated in `--kernels-dir` when missing).
+    #[arg(long, env = "RVLLM_POLICY")]
+    policy_json: Option<PathBuf>,
+
+    /// Arena size in GiB for the CUDA worker. Gemma 4 31B fp8 needs
+    /// >= 35 GiB. Ignored with the mock worker.
+    #[arg(long, env = "RVLLM_ARENA_GB", default_value_t = 40)]
+    arena_gb: u64,
 
     /// Model name advertised on /v1/models. Defaults to the model_dir
     /// basename.
@@ -60,7 +89,7 @@ async fn main() -> anyhow_compat::Result<()> {
 
     let cli = Cli::parse();
 
-    let model_id = cli.model_id.unwrap_or_else(|| {
+    let model_id = cli.model_id.clone().unwrap_or_else(|| {
         cli.model_dir
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -70,7 +99,7 @@ async fn main() -> anyhow_compat::Result<()> {
     let config = ServerConfig {
         bind: cli.bind,
         model_dir: cli.model_dir.clone(),
-        model_id,
+        model_id: model_id.clone(),
         max_queue_depth: cli.max_queue_depth,
         max_new_tokens_cap: cli.max_new_tokens_cap,
         request_timeout: Duration::from_secs(cli.request_timeout_secs),
@@ -79,13 +108,10 @@ async fn main() -> anyhow_compat::Result<()> {
     config.validate().map_err(|e| anyhow_compat::err(format!("config: {e}")))?;
     let config = Arc::new(config);
 
-    // Tokenizer + worker.
     let tokenizer = rvllm_serve::tokenize::TokenizerHandle::load(&cli.model_dir)
         .map_err(|e| anyhow_compat::err(format!("tokenizer: {e:?}")))?;
 
-    // Phase 1 wires the mock worker. Phase 2+ will gate on feature
-    // `cuda` to spawn the real Gemma4Bringup-backed worker.
-    let (worker, _join) = rvllm_serve::worker::spawn_mock_worker(config.max_queue_depth);
+    let (worker, _join) = spawn_worker(&cli, config.max_queue_depth).await?;
 
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -100,7 +126,6 @@ async fn main() -> anyhow_compat::Result<()> {
         .await
         .map_err(|e| anyhow_compat::err(format!("bind {}: {e}", config.bind)))?;
 
-    // Graceful shutdown on Ctrl-C.
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -109,15 +134,70 @@ async fn main() -> anyhow_compat::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+async fn spawn_worker(
+    cli: &Cli,
+    queue_depth: usize,
+) -> anyhow_compat::Result<(
+    rvllm_serve::WorkerHandle,
+    std::thread::JoinHandle<()>,
+)> {
+    use rvllm_serve::cuda_worker;
+
+    let kernels_dir = cli
+        .kernels_dir
+        .clone()
+        .ok_or_else(|| anyhow_compat::err("--kernels-dir required under --features cuda"))?;
+    let paths = cuda_worker::resolve_paths(
+        cli.model_dir.clone(),
+        kernels_dir,
+        cli.cutlass_so.clone(),
+        cli.fa3_so.clone(),
+        cli.policy_json.clone(),
+    )
+    .map_err(|e| anyhow_compat::err(format!("paths: {e:?}")))?;
+
+    tracing::info!(
+        arena_gb = cli.arena_gb,
+        "starting cuda worker — Gemma4Bringup::load takes ~20 s for Gemma 4 31B",
+    );
+    let cfg = cuda_worker::CudaWorkerConfig {
+        paths,
+        arena_bytes: (cli.arena_gb as usize) * 1024 * 1024 * 1024,
+        queue_depth,
+    };
+    cuda_worker::spawn_cuda_worker(cfg)
+        .await
+        .map_err(|e| anyhow_compat::err(format!("cuda worker: {e:?}")))
+}
+
+#[cfg(not(feature = "cuda"))]
+async fn spawn_worker(
+    _cli: &Cli,
+    queue_depth: usize,
+) -> anyhow_compat::Result<(
+    rvllm_serve::WorkerHandle,
+    std::thread::JoinHandle<()>,
+)> {
+    tracing::warn!(
+        "built without --features cuda — using mock worker (canned tokens, no real inference)",
+    );
+    Ok(rvllm_serve::worker::spawn_mock_worker(queue_depth))
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.ok();
     };
     #[cfg(unix)]
     let term = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .ok()
-            .and_then(|mut s| futures::executor::block_on(async move { s.recv().await }));
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     };
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();

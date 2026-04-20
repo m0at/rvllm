@@ -13,7 +13,6 @@
 use std::sync::Arc;
 
 use axum::{
-    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
@@ -41,39 +40,17 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(crate::openai::models::list_models))
-        .route("/v1/chat/completions", post(chat_completions_stub))
-        .route("/v1/completions", post(completions_stub))
+        .route(
+            "/v1/chat/completions",
+            post(crate::openai::handlers::chat_completions),
+        )
+        .route(
+            "/v1/completions",
+            post(crate::openai::handlers::completions),
+        )
         .with_state(state)
 }
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
-}
-
-/// Phase-4 stub — replace with the real handler once the worker +
-/// tokenizer paths are wired end-to-end.
-async fn chat_completions_stub() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": {
-                "message": "POST /v1/chat/completions not yet implemented (phase 4)",
-                "type": "server_error",
-                "code": "not_implemented"
-            }
-        })),
-    )
-}
-
-async fn completions_stub() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": {
-                "message": "POST /v1/completions not yet implemented (phase 6)",
-                "type": "server_error",
-                "code": "not_implemented"
-            }
-        })),
-    )
 }

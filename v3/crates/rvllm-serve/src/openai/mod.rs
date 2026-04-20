@@ -9,5 +9,6 @@
 
 pub mod chat;
 pub mod completions;
+pub mod handlers;
 pub mod models;
 pub mod types;
