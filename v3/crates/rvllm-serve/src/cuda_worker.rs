@@ -176,10 +176,11 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
     };
 
     match result {
-        Ok(all_token_ids) => {
-            let generated = all_token_ids
-                .get(req.prompt_ids.len()..)
-                .unwrap_or(&[]);
+        Ok(generated_ids) => {
+            // `run_generate` returns ONLY the generated tokens (not
+            // prompt + generated). See gemma4_bring_up.rs:1634 —
+            // `output_ids` starts empty and only decode samples push.
+            let generated: &[u32] = &generated_ids;
 
             let mut emitted: u32 = 0;
             for (i, &id) in generated.iter().enumerate() {
