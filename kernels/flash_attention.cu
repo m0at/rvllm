@@ -875,20 +875,26 @@ __global__ void flash_attention_2_decode_f16kv_kernel(
 // now — sliding-window attention on the FP8-KV path is a follow-up.
 
 __device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
-    // Mirrors `fp8_e4m3_to_float` in kernels/fp8_kv.cu — kept inline here
-    // to avoid a cross-TU include (every .cu compiles stand-alone to PTX
-    // in this project).
-    float sign = (b & 0x80) ? -1.0f : 1.0f;
-    int exp = (b >> 3) & 0xF;
-    int mant = b & 0x7;
-    if (exp == 0) {
-        if (mant == 0) return 0.0f;
-        return sign * (float)mant * 1.953125e-3f; // subnormal: mantissa * 2^-9
-    }
-    // Normal: (1 + mant/8) * 2^(exp - 7)
-    float biased = (1.0f + (float)mant * 0.125f);
-    int e = exp - 7;
-    return sign * biased * ldexpf(1.0f, e);
+#if __CUDA_ARCH__ >= 1000
+    // Native Blackwell path: PTX `cvt.rn.f16.e4m3x2` emitted for
+    // sm_100+. On GB10 this is a single-cycle hardware conversion
+    // (measured ~2× faster than the branchless scalar path in the
+    // fp8_gemv bench, which is the analogous hot loop).
+    __half_raw hr = __nv_cvt_fp8_to_halfraw(
+        (__nv_fp8_storage_t)b, __NV_E4M3);
+    return __half2float(__half(hr));
+#else
+    // Pre-Blackwell path: branchless closed-form decode (avoids the
+    // divergent if/else in the original scalar path). Mirrors
+    // `fp8e4m3_to_float` in kernels/fp8_gemv.cu.
+    unsigned int s = (b >> 7) & 1u;
+    unsigned int e = (b >> 3) & 0xFu;
+    unsigned int m = b & 0x7u;
+    unsigned int f32_bits = (s << 31) | ((e + 120u) << 23) | (m << 20);
+    unsigned int is_normal = (e != 0u) & ((e != 0xFu) | (m != 0x7u));
+    f32_bits &= (unsigned int)(-(int)is_normal);
+    return __uint_as_float(f32_bits);
+#endif
 }
 
 extern "C"

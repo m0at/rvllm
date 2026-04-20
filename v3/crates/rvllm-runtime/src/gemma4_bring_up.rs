@@ -109,6 +109,11 @@ pub struct Gemma4FusedModules {
     /// PTX. `Fp8GemvVariant::available_for(target)` is the source of
     /// truth for this gate.
     pub fn_fp8_gemv_wpr_native: Option<KernelFn>,
+    /// F16-input variant of `fn_fp8_gemv_wpr_native`. Same arch gate
+    /// (sm_100+). Used by the Sm121 decode path to run projection
+    /// GEMMs (QKV / O / gate_up / down) directly off f16 activations,
+    /// skipping the FP8 activation-quant step that cuBLASLt requires.
+    pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
 }
 
 pub struct Gemma4Bringup {
@@ -2093,6 +2098,13 @@ fn load_gemma4_fused(
         ),
         _ => None,
     };
+    let fn_fp8_gemv_wpr_native_f16in = match target {
+        Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t) => Some(
+            fp8_gemv_mod
+                .get_function(rvllm_kernels::Fp8GemvVariant::WprNativeF16In.entry_point())?,
+        ),
+        _ => None,
+    };
 
     let fused_norm_add_residual_mod = loader.load_ptx("fused_norm_add_residual")?;
     let fn_fused_norm_add_residual =
@@ -2165,5 +2177,6 @@ fn load_gemma4_fused(
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_lut,
         fn_fp8_gemv_wpr_native,
+        fn_fp8_gemv_wpr_native_f16in,
     })
 }

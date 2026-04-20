@@ -306,21 +306,12 @@ pub unsafe fn gemma4_forward_phase(
         };
     }
     // 1. input_layernorm -> FP8 quant
-    // Sm121 fast path for QKV writes f16 into delta_f16 via its
+    // Sm121 decode fast path for QKV writes f16 into delta_f16 via its
     // own rmsnorm — `scratch.hidden_fp8`/`hidden_scale` go unused. Skip
     // the quant-rmsnorm in that case to avoid the duplicate work.
     #[cfg(feature = "cuda")]
-    // Must match the fast-path gate below: we can only skip the FP8
-    // quant when `Fp8GemvF16InLaunch` will actually take over and
-    // consume `delta_f16`. The fast path additionally requires
-    // `qkv_blockscale != 0` — for fused QKV weights (blockscale == 0)
-    // the kernel falls back to `fp8_gemm_channelscale_or_fallback`,
-    // which reads `scratch.hidden_fp8` and needs the quant to have
-    // produced it. Dropping `blockscale != 0` here silently zeroed
-    // `hidden_fp8` and propagated zero logits through the LM head.
     let skip_attn_quant = dims.num_tokens == 1
         && weights.qkv_chscale != 0
-        && weights.qkv_blockscale != 0
         && weights.qkv_f16 == 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
@@ -424,16 +415,11 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gemm_f32_tmp,
             stream,
         )?;
-    } else if let (true, Some(fn_gemv)) = (
-        // Blockscale gate: `Fp8GemvF16InLaunch` reads a 2-D
-        // `[N/128, K/128]` tensor. Only enable it when the loader has
-        // actually uploaded one (`*_blockscale != 0`). Weights whose
-        // scale was per-row or synthesized have `blockscale == 0` and
-        // stay on the channelscale-preserving fallback below.
-        weights.qkv_blockscale != 0 && dims.num_tokens == 1,
-        kernels.fp8_gemv_wpr_native_f16in,
-    ) {
-        // sm_121 fast path: skip the activation FP8-quant entirely
+    } else if weights.qkv_chscale != 0
+        && dims.num_tokens == 1
+        && kernels.fp8_gemv_wpr_native_f16in.is_some()
+    {
+        // sm_121 decode fast path: skip the activation FP8-quant entirely
         // and run `fp8_gemv_blockwise_wpr_native_f16in_kernel` directly
         // against the f16 rmsnorm output. Wins over the
         // `fp8_gemm_channelscale_or_fallback` path on two axes:
@@ -466,17 +452,15 @@ pub unsafe fn gemma4_forward_phase(
             weights.attn_norm_gamma,
             stream,
         )?;
-        gemma4_launcher::Fp8GemvF16InLaunch {
-            m: dims.num_tokens,
-            n: qkv_rows,
-            k: dims.hidden,
-        }
-        .launch(
-            fn_gemv,
+        launch_fp8_gemv_f16in(
+            kernels.fp8_gemv_wpr_native_f16in.unwrap(),
             scratch.q_out,
             weights.qkv_fp8,
-            weights.qkv_blockscale,
+            weights.qkv_chscale,
             scratch.delta_f16,
+            dims.num_tokens as i32,
+            qkv_rows as i32,
+            dims.hidden as i32,
             stream,
         )?;
     } else if weights.qkv_chscale != 0 {
@@ -785,13 +769,12 @@ pub unsafe fn gemma4_forward_phase(
     probe!("step5_attn_out", scratch.attn_out, q_dim);
 
     // 6. quantize attn_out -> fp8 per-token (skip when F16 KV + F16 O-proj,
-    // or when the Sm121 fast path will read `scratch.attn_out`
+    // or when the Sm121 decode fast path will read `scratch.attn_out`
     // as f16 directly in step 7).
     #[cfg(feature = "cuda")]
-    let skip_o_quant = dims.num_tokens <= FAST_PATH_M_MAX
+    let skip_o_quant = dims.num_tokens == 1
         && weights.o_f16 == 0
         && weights.o_chscale != 0
-        && weights.o_blockscale != 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
     let skip_o_quant = false;
@@ -820,28 +803,45 @@ pub unsafe fn gemma4_forward_phase(
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
         }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
-    } else if let (true, Some(fn_gemv)) = (
-        weights.o_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
-        kernels.fp8_gemv_wpr_native_f16in,
-    ) {
-        // sm_121 fast path for O projection.
+    } else if weights.o_chscale != 0
+        && dims.num_tokens == 1
+        && kernels.fp8_gemv_wpr_native_f16in.is_some()
+    {
+        // sm_121 decode fast path for O projection.
         // `scratch.attn_out` is already f16 (attention output), no
         // pre-rmsnorm needed — post-attn-norm runs in the epilogue via
         // `fused_norm_add_residual_f16in`. We write the GEMV result
         // into `gemm_f32_tmp` (reused as f16 scratch: we only need
         // num_tokens*hidden*2 bytes, well under gemm_f32_tmp's capacity).
-        gemma4_launcher::Fp8GemvF16InLaunch {
-            m: dims.num_tokens,
-            n: dims.hidden,
-            k: q_dim,
-        }
-        .launch(
-            fn_gemv,
+        launch_fp8_gemv_f16in(
+            kernels.fp8_gemv_wpr_native_f16in.unwrap(),
             scratch.gemm_f32_tmp,
             weights.o_fp8,
-            weights.o_blockscale,
+            weights.o_chscale,
             scratch.attn_out,
+            dims.num_tokens as i32,
+            dims.hidden as i32,
+            q_dim as i32,
             stream,
+        )?;
+        gemma4_launcher::FusedNormAddResidualF16InLaunch {
+            num_tokens: dims.num_tokens,
+            hidden: dims.hidden,
+            eps: dims.rms_eps,
+        }
+        .launch(
+            kernels.fused_norm_add_residual_f16in,
+            scratch.gemm_f32_tmp,
+            weights.post_attn_norm_gamma,
+            residual,
+            0,
+            stream,
+        )?;
+    } else if weights.o_chscale != 0 {
+        cublaslt.fp8_gemm_f32(
+            scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
+            scratch.attn_out_scale, weights.o_scale, stream,
         )?;
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens,
@@ -907,9 +907,8 @@ pub unsafe fn gemma4_forward_phase(
     // f16 rmsnorm into delta_f16, leaving hidden_fp8/hidden_scale
     // unused.
     #[cfg(feature = "cuda")]
-    let skip_ff_quant = dims.num_tokens <= FAST_PATH_M_MAX
+    let skip_ff_quant = dims.num_tokens == 1
         && weights.gate_up_chscale != 0
-        && weights.gate_up_blockscale != 0
         && weights.gate_up_f16 == 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
@@ -974,11 +973,11 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gemm_f32_tmp,
             stream,
         )?;
-    } else if let (true, Some(fn_gemv)) = (
-        weights.gate_up_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
-        kernels.fp8_gemv_wpr_native_f16in,
-    ) {
-        // sm_121 fast path for gate||up projection. Mirrors
+    } else if weights.gate_up_chscale != 0
+        && dims.num_tokens == 1
+        && kernels.fp8_gemv_wpr_native_f16in.is_some()
+    {
+        // sm_121 decode fast path for gate||up projection. Mirrors
         // the QKV fast path: f16 rmsnorm into delta_f16 (pre-FF norm
         // gamma this time), then f16-input fp8_gemv direct to
         // gate_up_out. Downstream `fused_gelu_mul` reads gate_up_out
@@ -1000,17 +999,15 @@ pub unsafe fn gemma4_forward_phase(
             weights.pre_ff_norm_gamma,
             stream,
         )?;
-        gemma4_launcher::Fp8GemvF16InLaunch {
-            m: dims.num_tokens,
-            n: 2 * dims.intermediate,
-            k: dims.hidden,
-        }
-        .launch(
-            fn_gemv,
+        launch_fp8_gemv_f16in(
+            kernels.fp8_gemv_wpr_native_f16in.unwrap(),
             scratch.gate_up_out,
             weights.gate_up_fp8,
-            weights.gate_up_blockscale,
+            weights.gate_up_chscale,
             scratch.delta_f16,
+            dims.num_tokens as i32,
+            (2 * dims.intermediate) as i32,
+            dims.hidden as i32,
             stream,
         )?;
     } else if weights.gate_up_chscale != 0 {
@@ -1061,11 +1058,11 @@ pub unsafe fn gemma4_forward_phase(
             dims.intermediate as i32,
             stream,
         )?;
-    } else if let (true, Some(fn_gemv)) = (
-        weights.down_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
-        kernels.fp8_gemv_wpr_native_f16in,
-    ) {
-        // sm_121 fast path for down projection.
+    } else if weights.down_chscale != 0
+        && dims.num_tokens == 1
+        && kernels.fp8_gemv_wpr_native_f16in.is_some()
+    {
+        // sm_121 decode fast path for down projection.
         // Skip FP8 GELU-quant — run f16 GELU into `gate_up_fp8`
         // scratch (same aliasing trick as the f16-weights branch),
         // then f16-input fp8_gemv writes f16 directly to
@@ -1085,17 +1082,15 @@ pub unsafe fn gemma4_forward_phase(
             let grid = (dims.num_tokens, 1, 1);
             rvllm_fused::launch_raw(kernels.fused_gelu_mul_f16, grid, block, 0, stream, &args)?;
         }
-        gemma4_launcher::Fp8GemvF16InLaunch {
-            m: dims.num_tokens,
-            n: dims.hidden,
-            k: dims.intermediate,
-        }
-        .launch(
-            fn_gemv,
+        launch_fp8_gemv_f16in(
+            kernels.fp8_gemv_wpr_native_f16in.unwrap(),
             scratch.gemm_f32_tmp,
             weights.down_fp8,
-            weights.down_blockscale,
+            weights.down_chscale,
             scratch.gate_up_fp8,
+            dims.num_tokens as i32,
+            dims.hidden as i32,
+            dims.intermediate as i32,
             stream,
         )?;
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
@@ -1258,6 +1253,54 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
         // future variant should be an explicit audit.
         _ => unreachable!("unexpected CutlassBackend variant in channelscale fallback"),
     }
+}
+
+/// Launch `fp8_gemv_blockwise_wpr_native_f16in_kernel`.
+///
+/// Grid (ceil(N/8), M, 1), block (256, 1, 1), zero shared memory.
+/// Matches the launch config documented in `kernels/fp8_gemv.cu`.
+///
+/// Input is f16 activation (no activation scale needed — the kernel
+/// promotes f16→f32 on load via hardware `cvt.f32.f16`). Weight is
+/// block-scaled FP8. Output is f16.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_fp8_gemv_f16in(
+    kernel: KernelFn,
+    output_f16: u64,
+    weight_fp8: u64,
+    b_chscale: u64,
+    input_f16: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+    stream: u64,
+) -> Result<()> {
+    let mut output = output_f16;
+    let mut weight = weight_fp8;
+    let mut scale = b_chscale;
+    let mut input = input_f16;
+    let mut m_i = m;
+    let mut n_i = n;
+    let mut k_i = k;
+    // block-scale layout in `kernels/fp8_gemv.cu`: scale[N_blocks, K_blocks]
+    // with 128-wide blocks on the K axis. `num_col_blocks = ceil(K/128)`.
+    let mut num_col_blocks = (k + 127) / 128;
+    let args = [
+        (&mut output) as *mut u64 as *mut core::ffi::c_void,
+        (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+        (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+        (&mut input) as *mut u64 as *mut core::ffi::c_void,
+        (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+        (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+        (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+        (&mut num_col_blocks) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    // Grid: (ceil(N/8), M), 1). Block: 256 threads (8 warps, 1 warp per
+    // output row within a block).
+    let grid = (((n as u32 + 7) / 8), m as u32, 1u32);
+    let block = (256u32, 1u32, 1u32);
+    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
 }
 
 #[cfg(feature = "cuda")]
