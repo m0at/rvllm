@@ -293,6 +293,13 @@ pub struct Fa2PtxKernels {
     /// Launcher picks between the two based on `params.head_dim`.
     #[cfg(feature = "cuda")]
     pub fn_decode_fp8kv_bc16: rvllm_kernels::KernelFn,
+    /// `flash_attention_2_prefill_fp8kv_kernel` — multi-query FP8 E4M3
+    /// prefill with causal mask. BC=32 variant; head_dim ≤ 256.
+    #[cfg(feature = "cuda")]
+    pub fn_prefill_fp8kv: rvllm_kernels::KernelFn,
+    /// BC=16 prefill variant for head_dim=512 (Gemma 4 global-attn).
+    #[cfg(feature = "cuda")]
+    pub fn_prefill_fp8kv_bc16: rvllm_kernels::KernelFn,
 }
 
 impl Fa2PtxKernels {
@@ -330,6 +337,10 @@ impl Fa2PtxKernels {
                 flash_attention_mod.get_function("flash_attention_2_decode_fp8kv_kernel")?;
             let fn_decode_fp8kv_bc16 = flash_attention_mod
                 .get_function("flash_attention_2_decode_fp8kv_bc16_kernel")?;
+            let fn_prefill_fp8kv =
+                flash_attention_mod.get_function("flash_attention_2_prefill_fp8kv_kernel")?;
+            let fn_prefill_fp8kv_bc16 = flash_attention_mod
+                .get_function("flash_attention_2_prefill_fp8kv_bc16_kernel")?;
             Ok(Self {
                 head_dim,
                 flash_attention_mod,
@@ -339,6 +350,8 @@ impl Fa2PtxKernels {
                 fn_prefill_f16kv,
                 fn_decode_fp8kv,
                 fn_decode_fp8kv_bc16,
+                fn_prefill_fp8kv,
+                fn_prefill_fp8kv_bc16,
             })
         }
         #[cfg(not(feature = "cuda"))]
