@@ -52,7 +52,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
 
 [lints.clippy]
 # Enforce the "no unwrap in request paths" invariant from the plan.
