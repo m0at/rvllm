@@ -292,8 +292,17 @@ pub unsafe fn gemma4_forward_phase(
     // own rmsnorm — `scratch.hidden_fp8`/`hidden_scale` go unused. Skip
     // the quant-rmsnorm in that case to avoid the duplicate work.
     #[cfg(feature = "cuda")]
+    // Must match the fast-path gate below: we can only skip the FP8
+    // quant when `Fp8GemvF16InLaunch` will actually take over and
+    // consume `delta_f16`. The fast path additionally requires
+    // `qkv_blockscale != 0` — for fused QKV weights (blockscale == 0)
+    // the kernel falls back to `fp8_gemm_channelscale_or_fallback`,
+    // which reads `scratch.hidden_fp8` and needs the quant to have
+    // produced it. Dropping `blockscale != 0` here silently zeroed
+    // `hidden_fp8` and propagated zero logits through the LM head.
     let skip_attn_quant = dims.num_tokens == 1
         && weights.qkv_chscale != 0
+        && weights.qkv_blockscale != 0
         && weights.qkv_f16 == 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
@@ -630,6 +639,7 @@ pub unsafe fn gemma4_forward_phase(
     let skip_o_quant = dims.num_tokens == 1
         && weights.o_f16 == 0
         && weights.o_chscale != 0
+        && weights.o_blockscale != 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
     let skip_o_quant = false;
@@ -726,6 +736,7 @@ pub unsafe fn gemma4_forward_phase(
     #[cfg(feature = "cuda")]
     let skip_ff_quant = dims.num_tokens == 1
         && weights.gate_up_chscale != 0
+        && weights.gate_up_blockscale != 0
         && weights.gate_up_f16 == 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
@@ -1187,71 +1198,6 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
                 stream,
             },
         )),
-    }
-}
-
-#[cfg(feature = "cuda")]
-unsafe fn launch_scale_cols_f16(
-    kernel: KernelFn,
-    data: u64,
-    scale: u64,
-    m: u32,
-    n: u32,
-    stream: u64,
-) -> Result<()> {
-    let mut data = data;
-    let mut scale = scale;
-    let mut m_i = m as i32;
-    let mut n_i = n as i32;
-    let args = [
-        (&mut data) as *mut u64 as *mut core::ffi::c_void,
-        (&mut scale) as *mut u64 as *mut core::ffi::c_void,
-        (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
-        (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
-    ];
-    let block = (256u32, 1, 1);
-    let grid = (((n + 255) / 256), m, 1);
-    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
-}
-
-#[cfg(feature = "cuda")]
-unsafe fn fp8_gemm_f32_with_channelscale_fallback(
-    cublaslt: &CublasLt,
-    scale_cols_kernel: KernelFn,
-    a_fp8: u64,
-    b_fp8: u64,
-    d_f32: u64,
-    m: i32,
-    n: i32,
-    k: i32,
-    a_scale: u64,
-    b_scale: u64,
-    b_channelscale: u64,
-    stream: u64,
-) -> Result<()> {
-    match cublaslt.fp8_gemm_f32_channelscale(
-        a_fp8,
-        b_fp8,
-        d_f32,
-        m,
-        n,
-        k,
-        a_scale,
-        b_channelscale,
-        stream,
-    ) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            cublaslt.fp8_gemm_f32(a_fp8, b_fp8, d_f32, m, n, k, a_scale, b_scale, stream)?;
-            launch_scale_cols_f32(
-                scale_cols_kernel,
-                d_f32,
-                b_channelscale,
-                m as u32,
-                n as u32,
-                stream,
-            )
-        }
     }
 }
 
