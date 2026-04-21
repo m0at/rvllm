@@ -17,9 +17,7 @@
 
 use rvllm_core::Result;
 use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan};
-use rvllm_fused::{
-    ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch, FusedSiluMulFp8QuantLaunch,
-};
+use rvllm_fused::{ArgmaxLaunch, FusedSiluMulFp8QuantLaunch};
 use rvllm_kernels::KernelFn;
 pub use rvllm_loader::{LayerAttnType, MlpActivation};
 
@@ -167,8 +165,8 @@ pub unsafe fn forward_phase(
     weights: &LayerWeights,
     scratch: &LayerScratch,
     meta: &MetadataPtrs,
-    plans: &LayerGemmPlans,
-    cutlass: &CutlassBackend,
+    _plans: &LayerGemmPlans,
+    _cutlass: &CutlassBackend,
     cublaslt: &CublasLt,
     fa3: &AttentionBackend,
     residual: u64,
@@ -186,7 +184,7 @@ pub unsafe fn forward_phase(
         });
     }
     let q_dim = dims.num_heads * dims.head_dim;
-    let kv_dim = dims.num_kv_heads * dims.head_dim;
+    let _kv_dim = dims.num_kv_heads * dims.head_dim;
 
     // 1. rmsnorm(residual) + fp8 quant. The residual add was already
     //    done by the prior layer's down-proj cuBLASLt epilogue (beta=1).

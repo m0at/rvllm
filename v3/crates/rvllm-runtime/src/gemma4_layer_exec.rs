@@ -295,26 +295,6 @@ pub unsafe fn gemma4_forward_phase(
             }
         };
     }
-    #[cfg(feature = "cuda")]
-    macro_rules! probe_amax {
-        ($label:expr, $ptr:expr, $n:expr) => {
-            if dbg_layer >= 0 {
-                cudarc::driver::sys::cuStreamSynchronize(stream as _);
-                let count = $n as usize;
-                let mut buf = vec![0u16; count];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut _, $ptr, count * 2);
-                let mut amax: f32 = 0.0;
-                for &x in &buf {
-                    let v = crate::bring_up::f16_to_f32(x).abs();
-                    if v > amax {
-                        amax = v;
-                    }
-                }
-                eprintln!("    [L{} {}] amax={:.4}", dbg_layer, $label, amax);
-            }
-        };
-    }
-
     // 1. input_layernorm -> FP8 quant
     // Sm121 fast path for QKV writes f16 into delta_f16 via its
     // own rmsnorm — `scratch.hidden_fp8`/`hidden_scale` go unused. Skip

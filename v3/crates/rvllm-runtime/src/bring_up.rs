@@ -477,7 +477,7 @@ impl Bringup {
             rvllm_core::DType::Fp8E4M3,
         )?);
         let vocab = arch.vocab_size as u32;
-        let plan_lm_head = override_nonres(Fp8GemmPlan::from_policy(
+        let _plan_lm_head = override_nonres(Fp8GemmPlan::from_policy(
             &self.policy,
             num_seqs,
             vocab,
@@ -812,7 +812,7 @@ impl Bringup {
             (None, None)
         };
 
-        let mut one_step = one_step;
+        let one_step = one_step;
         let no_graph = std::env::var("RVLLM_NO_GRAPH").ok().as_deref() == Some("1");
 
         let elapsed = if no_graph {

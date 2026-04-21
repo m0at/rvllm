@@ -504,7 +504,7 @@ impl Gemma4Bringup {
         let kv_dim_s = (arch.num_kv_heads_sliding * arch.head_dim_sliding) as u32;
         let qkv_rows_s = q_dim_s + 2 * kv_dim_s;
         use rvllm_cutlass::Fp8GemmPlan;
-        let gemm_plans = Gemma4GemmPlans {
+        let _gemm_plans = Gemma4GemmPlans {
             qkv: Fp8GemmPlan::from_policy(
                 &self.policy,
                 num_seqs,
@@ -546,7 +546,7 @@ impl Gemma4Bringup {
                 let nkvh = arch.num_kv_heads_for_layer(layer_idx) as u32;
                 let q_dim = (arch.num_attention_heads as u32) * hd;
                 let kv_dim = nkvh * hd;
-                let qkv_rows = q_dim + 2 * kv_dim;
+                let _qkv_rows = q_dim + 2 * kv_dim;
                 let layer_blocks = if lt == Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
 
                 let dims = Gemma4LayerDims {
@@ -773,7 +773,7 @@ impl Gemma4Bringup {
         fn_embed: rvllm_kernels::KernelFn,
         token_ids: &[u32],
     ) -> Result<crate::bring_up::PplResult> {
-        use crate::bring_up::{compute_nll_f16, dtoh_async_sync, f16_to_f32};
+        use crate::bring_up::{dtoh_async_sync, f16_to_f32};
         use crate::gemma4_layer_exec::*;
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
@@ -917,7 +917,7 @@ impl Gemma4Bringup {
         let kv_dim_s = (arch.num_kv_heads_sliding * arch.head_dim_sliding) as u32;
         let qkv_rows_s = q_dim_s + 2 * kv_dim_s;
         use rvllm_cutlass::Fp8GemmPlan;
-        let gemm_plans = Gemma4GemmPlans {
+        let _gemm_plans = Gemma4GemmPlans {
             qkv: Fp8GemmPlan::from_policy(
                 &self.policy,
                 num_seqs,
@@ -1668,17 +1668,17 @@ impl Gemma4Bringup {
             // after the gather, BEFORE any layers run.
             self.stream.fence()?;
             let mut r0 = vec![0u16; 4];
-            let mut rN = vec![0u16; 4];
+            let mut r_n_minus_1 = vec![0u16; 4];
             cudarc::driver::sys::cuMemcpyDtoH_v2(r0.as_mut_ptr() as *mut _, residual_ptr, 8);
             cudarc::driver::sys::cuMemcpyDtoH_v2(
-                rN.as_mut_ptr() as *mut _,
+                r_n_minus_1.as_mut_ptr() as *mut _,
                 residual_ptr + ((prompt_len - 1) as u64 * hidden as u64 * 2),
                 8,
             );
             eprintln!(
                 "[DIAG] post-gather row0[..4]={:?} rowN-1[..4]={:?}",
                 r0.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
-                rN.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
+                r_n_minus_1.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
             );
 
             let pos: Vec<i32> = (0..prompt_len as i32).collect();

@@ -123,99 +123,33 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         {
             let fa3 = match self.backend {
                 super::AttentionBackend::Fa3(fa3) => fa3,
-                super::AttentionBackend::Fa2Ptx(fa2) => {
-                    // sm_121 path: dispatch
-                    // `flash_attention_2_prefill_fp8kv{_bc16}_kernel`
-                    // directly. Same ABI story as the decode Fa2Ptx
-                    // arm: f32 math, FP8→f32 on-load dequant with
-                    // per-tensor descales, f16 output, opt-in dynamic
-                    // smem for the large BC×head_dim tile.
-                    use cudarc::driver::sys::*;
-                    const FA2_THREADS: i32 = 128;
-                    let hd = params.head_dim as i32;
-                    let (kernel_fn, fa2_bc) = if hd > 256 {
-                        (fa2.fn_prefill_fp8kv_bc16, 16)
-                    } else {
-                        (fa2.fn_prefill_fp8kv, 32)
-                    };
-                    let smem_bytes =
-                        2 * fa2_bc * hd * 4 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
-                    if smem_bytes as u32 >= 48 * 1024 {
-                        let _ = cuFuncSetAttribute(
-                            kernel_fn.raw() as CUfunction,
-                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            smem_bytes,
-                        );
-                    }
-
-                    let scale = params.scale;
-                    let num_heads = params.num_heads as i32;
-                    let num_kv_heads = params.num_kv_heads as i32;
-                    let head_dim = params.head_dim as i32;
-                    let block_size = params.block_size as i32;
-                    let max_blocks_per_seq = params.max_blocks_per_seq as i32;
-                    let window_size_left = params.window_size_left;
-
-                    let mut arg_out = o_f16;
-                    let mut arg_q = q_fp8;
-                    let mut arg_k = k_cache_fp8;
-                    let mut arg_v = v_cache_fp8;
-                    let mut arg_bt = block_tables;
-                    let mut arg_cl = context_lens;
-                    let mut arg_cu = cu_seqlens_q;
-                    let mut arg_qd = q_descale_ptr;
-                    let mut arg_kd = k_descale_ptr;
-                    let mut arg_vd = v_descale_ptr;
-                    let _ = (workspace, max_seqlen_q); // FA2 allocates in smem; qi-loop reads cu_seqlens_q
-
-                    let args: [*mut core::ffi::c_void; 17] = [
-                        &mut arg_out as *mut _ as *mut _,
-                        &mut arg_q as *mut _ as *mut _,
-                        &mut arg_k as *mut _ as *mut _,
-                        &mut arg_v as *mut _ as *mut _,
-                        &mut arg_bt as *mut _ as *mut _,
-                        &mut arg_cl as *mut _ as *mut _,
-                        &mut arg_cu as *mut _ as *mut _,
-                        &mut arg_qd as *mut _ as *mut _,
-                        &mut arg_kd as *mut _ as *mut _,
-                        &mut arg_vd as *mut _ as *mut _,
-                        &scale as *const _ as *mut _,
-                        &num_heads as *const _ as *mut _,
-                        &num_kv_heads as *const _ as *mut _,
-                        &head_dim as *const _ as *mut _,
-                        &block_size as *const _ as *mut _,
-                        &max_blocks_per_seq as *const _ as *mut _,
-                        &window_size_left as *const _ as *mut _,
-                    ];
-
-                    let rc = cuLaunchKernel(
-                        kernel_fn.raw() as CUfunction,
-                        params.num_seqs as u32,
-                        params.num_heads as u32,
-                        1,
-                        FA2_THREADS as u32,
-                        1,
-                        1,
-                        smem_bytes as u32,
-                        stream as CUstream,
-                        args.as_ptr() as *mut *mut core::ffi::c_void,
-                        core::ptr::null_mut(),
-                    );
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(RvllmError::Attention {
-                            err: AttentionError::KernelLaunchFailed {
-                                cuda: rvllm_core::CudaErrorKind::LaunchFailed,
-                            },
-                            ctx: AttnCtx {
-                                op: "paged_prefill_fp8 (Fa2Ptx)",
-                                stream,
-                                num_seqs: params.num_seqs,
-                                head_dim: params.head_dim,
-                            },
-                            bt: std::backtrace::Backtrace::capture(),
-                        });
-                    }
-                    return Ok(());
+                super::AttentionBackend::Fa2Ptx(_) => {
+                    // sm_121 no longer ships a dedicated FA2 prefill
+                    // kernel — Gemma 4's unified attention in
+                    // gemma4_layer_exec.rs replaces batch prefill with
+                    // a loop of single-query decode launches, which is
+                    // numerically identical to the per-token decode
+                    // path rvllm-ppl validates. Callers on sm_121
+                    // should route through `PagedDecodeFp8Launcher`
+                    // directly; keeping this arm would just tempt them
+                    // back into the less-accurate FA2 prefill.
+                    let _ = (o_f16, q_fp8, k_cache_fp8, v_cache_fp8,
+                        block_tables, context_lens, cu_seqlens_q,
+                        workspace, q_descale_ptr, k_descale_ptr,
+                        v_descale_ptr, max_seqlen_q, stream);
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            op: "paged_prefill_fp8 Fa2Ptx (use decode-per-qi loop)",
+                            backend: "Fa2Ptx",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_prefill_fp8 (Fa2Ptx)",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
                 }
             };
             let Some(f) = fa3.fn_paged_prefill_fp8 else {
