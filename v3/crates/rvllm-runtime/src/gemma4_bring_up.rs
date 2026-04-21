@@ -1712,17 +1712,17 @@ impl Gemma4Bringup {
             // after the gather, BEFORE any layers run.
             self.stream.fence()?;
             let mut r0 = vec![0u16; 4];
-            let mut rN = vec![0u16; 4];
+            let mut r_n_minus_1 = vec![0u16; 4];
             cudarc::driver::sys::cuMemcpyDtoH_v2(r0.as_mut_ptr() as *mut _, residual_ptr, 8);
             cudarc::driver::sys::cuMemcpyDtoH_v2(
-                rN.as_mut_ptr() as *mut _,
+                r_n_minus_1.as_mut_ptr() as *mut _,
                 residual_ptr + ((prompt_len - 1) as u64 * hidden as u64 * 2),
                 8,
             );
             eprintln!(
                 "[DIAG] post-gather row0[..4]={:?} rowN-1[..4]={:?}",
                 r0.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
-                rN.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
+                r_n_minus_1.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
             );
 
             let pos: Vec<i32> = (0..prompt_len as i32).collect();
