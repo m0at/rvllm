@@ -108,6 +108,12 @@ pub struct Gemma4LayerScratch {
     pub v_out: u64,
     pub q_normed: u64,
     pub k_normed: u64,
+    /// V after RmsNorm, compact `[num_tokens, num_kv_heads, head_dim]`.
+    /// Used by rope to read V before paged-cache write. Was previously
+    /// in-place on `v_out` (inside the interleaved QKV buffer), which
+    /// silently broke for `num_tokens > 1` because downstream kernels
+    /// index as compact.
+    pub v_normed: u64,
     pub q_fp8: u64,
     pub k_cache: u64,
     pub v_cache: u64,
@@ -506,13 +512,19 @@ pub unsafe fn gemma4_forward_phase(
         }
     }
 
-    // 2b+3. Fused QKV-norm: Q/K with learned gamma, V parameter-free
+    // 2b+3. Fused QKV-norm: Q/K with learned gamma, V parameter-free.
+    // Src pointers (q_out/k_out/v_out) index into the shared interleaved
+    // QKV GEMM output with row stride `qkv_rows`. Dsts are compact
+    // scratch buffers so the downstream rope kernel sees a uniform
+    // `[num_tokens, n_heads, head_dim]` layout across all three.
+    let qkv_rows = q_dim + 2 * dims.num_kv_heads * dims.head_dim;
     gemma4_launcher::FusedQkvRmsnormLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
         num_kv_heads: dims.num_kv_heads,
         head_dim: dims.head_dim,
         eps: dims.rms_eps,
+        src_row_stride: qkv_rows,
     }
     .launch(
         kernels.fused_qkv_rmsnorm,
@@ -521,6 +533,7 @@ pub unsafe fn gemma4_forward_phase(
         scratch.v_out,
         scratch.q_normed,
         scratch.k_normed,
+        scratch.v_normed,
         weights.q_norm_gamma,
         weights.k_norm_gamma,
         stream,
@@ -1211,7 +1224,7 @@ unsafe fn rope_f16kv(
 ) -> Result<()> {
     let mut q_in = scratch.q_normed;
     let mut k_in = scratch.k_normed;
-    let mut v_in = scratch.v_out;
+    let mut v_in = scratch.v_normed;
     let mut q_out = scratch.q_normed;
     let mut k_cache = scratch.k_cache;
     let mut v_cache = scratch.v_cache;
@@ -1266,7 +1279,7 @@ unsafe fn rope_fp8kv(
         kernels.fused_rope_partial_fp8kv,
         scratch.q_normed,
         scratch.k_normed,
-        scratch.v_out,
+        scratch.v_normed,
         scratch.q_fp8,
         scratch.k_cache,
         scratch.v_cache,

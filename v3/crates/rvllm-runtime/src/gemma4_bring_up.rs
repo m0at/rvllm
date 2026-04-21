@@ -347,6 +347,9 @@ impl Gemma4Bringup {
         let k_normed = arena
             .region("k_normed", (num_seqs * max_kv_dim * 2) as usize, 16)
             .unwrap();
+        let v_normed = arena
+            .region("v_normed", (num_seqs * max_kv_dim * 2) as usize, 16)
+            .unwrap();
         let q_fp8 = arena
             .region("q_fp8", (num_seqs * max_q_dim) as usize, 16)
             .unwrap();
@@ -598,6 +601,7 @@ impl Gemma4Bringup {
                     v_out,
                     q_normed: q_normed.device_ptr(),
                     k_normed: k_normed.device_ptr(),
+                    v_normed: v_normed.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + kv_layer_bytes / 2,
@@ -786,6 +790,7 @@ impl Gemma4Bringup {
         let q_base = qkv_out.device_ptr();
         let q_normed = arena.region("q_normed", (num_seqs * max_q_dim * 2) as usize, 16)?;
         let k_normed = arena.region("k_normed", (num_seqs * max_kv_dim * 2) as usize, 16)?;
+        let v_normed = arena.region("v_normed", (num_seqs * max_kv_dim * 2) as usize, 16)?;
         let q_fp8 = arena.region("q_fp8", (num_seqs * max_q_dim) as usize, 16)?;
         let attn_out = arena.region("attn_out", (num_seqs * max_q_dim * 2) as usize, 16)?;
         let attn_out_fp8 = arena.region("attn_out_fp8", (num_seqs * max_q_dim) as usize, 16)?;
@@ -986,6 +991,7 @@ impl Gemma4Bringup {
                     v_out,
                     q_normed: q_normed.device_ptr(),
                     k_normed: k_normed.device_ptr(),
+                    v_normed: v_normed.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + kv_layer_bytes / 2,
@@ -1329,6 +1335,7 @@ impl Gemma4Bringup {
         let q_base = qkv_out.device_ptr();
         let q_normed = arena.region("gen_q_normed", (max_tokens * max_q_dim * 2) as usize, 16)?;
         let k_normed = arena.region("gen_k_normed", (max_tokens * max_kv_dim * 2) as usize, 16)?;
+        let v_normed = arena.region("gen_v_normed", (max_tokens * max_kv_dim * 2) as usize, 16)?;
         let q_fp8 = arena.region("gen_q_fp8", (max_tokens * max_q_dim) as usize, 16)?;
         let attn_out = arena.region("gen_attn_out", (max_tokens * max_q_dim * 2) as usize, 16)?;
         let attn_out_fp8 = arena.region("gen_attn_out_fp8", (max_tokens * max_q_dim) as usize, 16)?;
@@ -1463,6 +1470,7 @@ impl Gemma4Bringup {
                     hidden_fp8: hidden_fp8.device_ptr(), hidden_scale: hidden_scale.device_ptr(),
                     q_out: q_base, k_out, v_out,
                     q_normed: q_normed.device_ptr(), k_normed: k_normed.device_ptr(),
+                    v_normed: v_normed.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + (layer_kv_elems / 2) * kv_bytes_per_elem as u64,
@@ -1492,8 +1500,22 @@ impl Gemma4Bringup {
 
         let t0 = std::time::Instant::now();
 
-        // Phase 1: Batch prefill (all prompt tokens in one forward pass)
-        {
+        // Phase 1: prompt through per-token decode.
+        //
+        // The QKV-buffer stride fix (fused_qkv_rmsnorm_kernel taking
+        // `src_row_stride`, V flowing through a compact `v_normed`)
+        // removed one num_tokens>1 layout bug but at least one more
+        // is still lurking: end-to-end prefill still produces wrong
+        // (though now non-zero) logits. Until it's nailed, loop the
+        // prompt through the same per-token decode path rvllm-ppl
+        // uses — attention operator is identical, cost is TTFT
+        // linear in prompt_len.
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            run_one_token(tok, i)?;
+        }
+        // Dead prefill block retained behind `if false`; flip when
+        // the remaining multi-token bug is fixed.
+        if false {
             let tok_ids: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
             token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
             rvllm_fused::EmbeddingGatherLaunch { num_tokens: prompt_len, hidden, vocab }
@@ -1571,6 +1593,7 @@ impl Gemma4Bringup {
                     hidden_fp8: hidden_fp8.device_ptr(), hidden_scale: hidden_scale.device_ptr(),
                     q_out: q_base, k_out, v_out,
                     q_normed: q_normed.device_ptr(), k_normed: k_normed.device_ptr(),
+                    v_normed: v_normed.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + (layer_kv_elems / 2) * kv_bytes_per_elem as u64,
