@@ -33,13 +33,13 @@ impl PinnedTokens {
     /// record the event, flip, and return a ticket the caller must
     /// collect later.
     pub fn launch_dtoh(&mut self, num_tokens: u32) -> DtoHTicket<'_> {
-        let buf_idx = self.pool.write_idx();
+        let _buf_idx = self.pool.write_idx();
         // Real impl: cuMemcpyDtoHAsync(write_buf, argmax_device, 4*N);
-        //            cuEventRecord(events[buf_idx]);
+        //            cuEventRecord(events[_buf_idx]);
         self.pool.flip();
         DtoHTicket {
             pool: self,
-            buf_idx,
+            _buf_idx,
             num_tokens,
             _marker: PhantomData,
         }
@@ -52,7 +52,11 @@ impl PinnedTokens {
 #[must_use = "DtoHTicket must be wait()-ed or dropped; silent drop leaks one pipeline slot"]
 pub struct DtoHTicket<'p> {
     pool: &'p mut PinnedTokens,
-    buf_idx: usize,
+    // Reserved for the future `cuEventSynchronize(events[self._buf_idx])`
+    // call in `wait()` once CUDA events are wired into PinnedTokens.
+    // Keep underscore-prefixed so it's not flagged as dead while the
+    // CUDA impl is still stubbed out.
+    _buf_idx: usize,
     num_tokens: u32,
     _marker: PhantomData<*const ()>, // !Send !Sync
 }
@@ -61,9 +65,9 @@ impl<'p> DtoHTicket<'p> {
     /// Block on the event and return the token-id slice. Consumes self
     /// so a second `wait` cannot compile.
     pub fn wait(self) -> &'p [TokenId] {
-        // Real impl: cuEventSynchronize(events[self.buf_idx]);
-        // The buf at `buf_idx` was the WRITE buffer before flip; after
-        // flip, `pool.read_idx() == buf_idx`.
+        // Real impl: cuEventSynchronize(events[self._buf_idx]);
+        // The buf at `_buf_idx` was the WRITE buffer before flip; after
+        // flip, `pool.read_idx() == _buf_idx`.
         let buf = self.pool.pool.read_buf();
         let slice: &[i32] = &buf.as_slice()[..self.num_tokens as usize];
         // Safety: TokenId is #[repr(transparent)] over u32; i32 and u32

@@ -99,30 +99,6 @@ pub fn load_gemma4_model(
         })
     };
 
-    // Gemma uses (1 + gamma) for RMSNorm weights. Pre-add 1.0 at load time
-    // so the kernel can use raw multiplication (same as Llama/Qwen path).
-    let upload_f16_gemma_norm = |name: &'static str, hf_name: &str| -> Result<F16Weight> {
-        let (si, e) = must_get(hf_name)?;
-        let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
-        let n = buf.len() / 2;
-        for i in 0..n {
-            let lo = buf[2 * i];
-            let hi = buf[2 * i + 1];
-            let bits = u16::from_le_bytes([lo, hi]);
-            let v = f16::from_bits(bits);
-            let adjusted = f16::from_f32(v.to_f32() + 1.0);
-            let out = adjusted.to_le_bytes();
-            buf[2 * i] = out[0];
-            buf[2 * i + 1] = out[1];
-        }
-        let region = arena.region(name, buf.len(), 16)?;
-        unsafe { region.copy_from_host(&buf)? };
-        Ok(F16Weight {
-            offset_bytes: region.device_ptr(),
-            shape: e.shape.clone(),
-        })
-    };
-
     let embed_name = format!("{prefix}.embed_tokens.weight");
     // Gemma models scale embeddings by sqrt(hidden_size) after lookup.
     // Pre-scale at load time so the embedding_gather kernel doesn't need modification.
@@ -255,7 +231,6 @@ pub fn load_gemma4_model(
     for l in 0..load_max_layers {
         let ln = |s: &str| format!("{prefix}.layers.{l}.{s}");
 
-        let is_global = arch.layer_types[l] == crate::gemma4_arch::Gemma4LayerType::GlobalAttention;
         let layer_hd = arch.head_dim_for_layer(l);
         let layer_nkvh = arch.num_kv_heads_for_layer(l);
         let layer_q_dim = arch.num_attention_heads * layer_hd;
