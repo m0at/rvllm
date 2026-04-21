@@ -903,11 +903,11 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
     const unsigned char* __restrict__ query,     // [num_seqs, num_heads, head_dim] fp8
     const unsigned char* __restrict__ key_cache, // [num_blocks, block_size, num_kv_heads, head_dim] fp8
     const unsigned char* __restrict__ value_cache,
+    const float* __restrict__ k_scale_cache,     // [num_blocks*block_size*num_kv_heads] per-slot f32
+    const float* __restrict__ v_scale_cache,     // [num_blocks*block_size*num_kv_heads] per-slot f32
     const int* __restrict__ block_tables,        // [num_seqs, max_blocks_per_seq]
     const int* __restrict__ context_lens,        // [num_seqs]
     const float* __restrict__ q_descale,         // single scalar
-    const float* __restrict__ k_descale,         // single scalar
-    const float* __restrict__ v_descale,         // single scalar
     float scale,
     int num_heads,
     int num_kv_heads,
@@ -927,8 +927,6 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
                                                          : (head_idx / (num_heads / num_kv_heads));
 
     const float q_scale = *q_descale;
-    const float k_scale = *k_descale;
-    const float v_scale = *v_descale;
 
     // Sliding-window left boundary. `window_size_left < 0` = full
     // context (global attention). Otherwise the decode query at
@@ -970,11 +968,12 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
         const int tile_start = tile * FA2_BC;
         const int tile_len = min(FA2_BC, context_len - tile_start);
 
-        // Load K tile: fp8 cache -> f32 shared mem (apply k_descale on load).
-        // Vectorized by 8: each thread pulls one u64 = 8 FP8 bytes.
-        // head_dim is always a multiple of 8 for the shapes we support
-        // (128 / 256 / 512), so the tile_len*head_dim/8 work divides
-        // cleanly across the 128 threads.
+        // Load K tile: fp8 cache -> f32 shared mem (apply per-slot K
+        // scale on load). Vectorized by 8: each thread pulls one
+        // u64 = 8 FP8 bytes. head_dim is always a multiple of 8 for
+        // the shapes we support (128/256/512), so the
+        // tile_len*head_dim/8 work divides cleanly across the 128
+        // threads.
         {
             const int vec_total = tile_len * (head_dim / 8);
             for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
@@ -984,9 +983,10 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
                 int page_idx = kv_pos / block_size;
                 int page_off = kv_pos % block_size;
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                int slot = phys_block * block_size + page_off;
+                float k_scale = __ldg(&k_scale_cache[slot * num_kv_heads + kv_head_idx]);
                 const unsigned char* k_row = key_cache
-                    + ((phys_block * block_size + page_off) * num_kv_heads
-                        + kv_head_idx) * head_dim;
+                    + (slot * num_kv_heads + kv_head_idx) * head_dim;
                 unsigned long long k8 = __ldg(
                     reinterpret_cast<const unsigned long long*>(k_row + d_base));
                 float* s = s_key + t * head_dim + d_base;
@@ -1058,8 +1058,7 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
         row_sum += s_reduce[0];
         __syncthreads();
 
-        // Load V tile: fp8 cache -> f32 shared mem (apply v_descale on load).
-        // Vectorized by 8 (see K load comment).
+        // Load V tile with per-slot V scale (see K load).
         {
             const int vec_total = tile_len * (head_dim / 8);
             for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
@@ -1069,9 +1068,10 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
                 int page_idx = kv_pos / block_size;
                 int page_off = kv_pos % block_size;
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                int slot = phys_block * block_size + page_off;
+                float v_scale = __ldg(&v_scale_cache[slot * num_kv_heads + kv_head_idx]);
                 const unsigned char* v_row = value_cache
-                    + ((phys_block * block_size + page_off) * num_kv_heads
-                        + kv_head_idx) * head_dim;
+                    + (slot * num_kv_heads + kv_head_idx) * head_dim;
                 unsigned long long v8 = __ldg(
                     reinterpret_cast<const unsigned long long*>(v_row + d_base));
                 float* s = s_val + t * head_dim + d_base;
@@ -1130,11 +1130,11 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
     const unsigned char* __restrict__ query,
     const unsigned char* __restrict__ key_cache,
     const unsigned char* __restrict__ value_cache,
+    const float* __restrict__ k_scale_cache,
+    const float* __restrict__ v_scale_cache,
     const int* __restrict__ block_tables,
     const int* __restrict__ context_lens,
     const float* __restrict__ q_descale,
-    const float* __restrict__ k_descale,
-    const float* __restrict__ v_descale,
     float scale,
     int num_heads,
     int num_kv_heads,
@@ -1154,8 +1154,6 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
                                                          : (head_idx / (num_heads / num_kv_heads));
 
     const float q_scale = *q_descale;
-    const float k_scale = *k_descale;
-    const float v_scale = *v_descale;
 
     // Sliding-window boundary — see BC=32 sibling for the full note.
     const int decode_q_abs_pos = context_len - 1;
@@ -1203,9 +1201,10 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
                 int page_idx = kv_pos / block_size;
                 int page_off = kv_pos % block_size;
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                int slot = phys_block * block_size + page_off;
+                float k_scale = __ldg(&k_scale_cache[slot * num_kv_heads + kv_head_idx]);
                 const unsigned char* k_row = key_cache
-                    + ((phys_block * block_size + page_off) * num_kv_heads
-                        + kv_head_idx) * head_dim;
+                    + (slot * num_kv_heads + kv_head_idx) * head_dim;
                 unsigned long long k8 = __ldg(
                     reinterpret_cast<const unsigned long long*>(k_row + d_base));
                 float* s = s_key + t * head_dim + d_base;
@@ -1265,7 +1264,7 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
         row_sum += s_reduce[0];
         __syncthreads();
 
-        // Vectorized-by-8 V load (see BC=32 kernel comment).
+        // Vectorized-by-8 V load with per-slot V scale.
         {
             const int vec_total = tile_len * (head_dim / 8);
             for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
@@ -1275,9 +1274,10 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
                 int page_idx = kv_pos / block_size;
                 int page_off = kv_pos % block_size;
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                int slot = phys_block * block_size + page_off;
+                float v_scale = __ldg(&v_scale_cache[slot * num_kv_heads + kv_head_idx]);
                 const unsigned char* v_row = value_cache
-                    + ((phys_block * block_size + page_off) * num_kv_heads
-                        + kv_head_idx) * head_dim;
+                    + (slot * num_kv_heads + kv_head_idx) * head_dim;
                 unsigned long long v8 = __ldg(
                     reinterpret_cast<const unsigned long long*>(v_row + d_base));
                 float* s = s_val + t * head_dim + d_base;

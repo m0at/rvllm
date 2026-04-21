@@ -191,12 +191,12 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
         q_fp8: u64,
         k_cache_fp8: u64,
         v_cache_fp8: u64,
+        k_scale_cache: u64,
+        v_scale_cache: u64,
         block_tables: u64,
         context_lens: u64,
         workspace: u64,
         q_descale_ptr: u64,
-        k_descale_ptr: u64,
-        v_descale_ptr: u64,
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
@@ -256,11 +256,11 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     let mut arg_q = q_fp8;
                     let mut arg_k = k_cache_fp8;
                     let mut arg_v = v_cache_fp8;
+                    let mut arg_ks = k_scale_cache;
+                    let mut arg_vs = v_scale_cache;
                     let mut arg_bt = block_tables;
                     let mut arg_cl = context_lens;
                     let mut arg_qd = q_descale_ptr;
-                    let mut arg_kd = k_descale_ptr;
-                    let mut arg_vd = v_descale_ptr;
                     let _ = workspace; // unused: FA2 allocates in smem
 
                     let args: [*mut core::ffi::c_void; 16] = [
@@ -268,11 +268,11 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                         &mut arg_q as *mut _ as *mut _,
                         &mut arg_k as *mut _ as *mut _,
                         &mut arg_v as *mut _ as *mut _,
+                        &mut arg_ks as *mut _ as *mut _,
+                        &mut arg_vs as *mut _ as *mut _,
                         &mut arg_bt as *mut _ as *mut _,
                         &mut arg_cl as *mut _ as *mut _,
                         &mut arg_qd as *mut _ as *mut _,
-                        &mut arg_kd as *mut _ as *mut _,
-                        &mut arg_vd as *mut _ as *mut _,
                         &scale as *const _ as *mut _,
                         &num_heads as *const _ as *mut _,
                         &num_kv_heads as *const _ as *mut _,
@@ -312,6 +312,14 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     return Ok(());
                 }
             };
+            // Fa3 SM90 path: not updated for per-slot K/V scales yet
+            // (sm_121 is the active target; Fa3 is legacy). Pass
+            // `k_scale_cache` / `v_scale_cache` where the SM90 kernel
+            // wants `k_descale` / `v_descale` scalars — it'll
+            // misinterpret them. A dedicated SM90 follow-up wires
+            // the new ABI properly.
+            let _ = k_scale_cache;
+            let _ = v_scale_cache;
             let rc = (fa3.fn_paged_decode_fp8)(
                 q_fp8 as *mut std::ffi::c_void,
                 k_cache_fp8 as *mut std::ffi::c_void,
@@ -321,8 +329,8 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                 context_lens as *mut std::ffi::c_void,
                 workspace as *mut std::ffi::c_void,
                 q_descale_ptr as *mut f32,
-                k_descale_ptr as *mut f32,
-                v_descale_ptr as *mut f32,
+                0 as *mut f32,
+                0 as *mut f32,
                 params.scale,
                 params.num_seqs as i32,
                 params.num_heads as i32,

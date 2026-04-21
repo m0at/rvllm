@@ -246,12 +246,16 @@ impl FusedRopePartialFp8KvLaunch {
         Ok(())
     }
 
-    /// Same as FusedRopeCacheFp8KvLaunch but with an extra `rotary_dim`
-    /// parameter. Elements beyond rotary_dim pass through without rotation.
+    /// Kernel sig: `(q, k, v, q_fp8, key_cache, value_cache,
+    ///   k_scale_cache, v_scale_cache, cos, sin, positions,
+    ///   slot_mapping, q_scale, num_tokens, num_heads, num_kv_heads,
+    ///   head_dim, rotary_dim)`.
     ///
-    /// Kernel sig: `(q, k, v, q_fp8, key_cache, value_cache, cos, sin,
-    ///   positions, slot_mapping, q_scale, kv_scale, num_tokens, num_heads,
-    ///   num_kv_heads, head_dim, rotary_dim)`
+    /// `k_scale_cache` and `v_scale_cache` are `[num_slots_total *
+    /// num_kv_heads]` f32 arrays. The kernel computes per-(slot,
+    /// head) amax and writes the matching scale into these buffers.
+    /// Downstream attention kernels read the per-slot scale instead
+    /// of the old per-tensor `kv_scale`.
     ///
     /// # Safety
     /// Caller owns all device pointers.
@@ -265,12 +269,13 @@ impl FusedRopePartialFp8KvLaunch {
         q_fp8_out: u64,
         k_cache_fp8: u64,
         v_cache_fp8: u64,
+        k_scale_cache: u64,
+        v_scale_cache: u64,
         cos: u64,
         sin: u64,
         positions: u64,
         slot_mapping: u64,
         q_scale_ptr: u64,
-        kv_scale_ptr: u64,
         stream: u64,
     ) -> Result<()> {
         self.validate()?;
@@ -280,12 +285,13 @@ impl FusedRopePartialFp8KvLaunch {
         let mut q_fp8_out = q_fp8_out;
         let mut k_cache_fp8 = k_cache_fp8;
         let mut v_cache_fp8 = v_cache_fp8;
+        let mut k_scale_cache = k_scale_cache;
+        let mut v_scale_cache = v_scale_cache;
         let mut cos = cos;
         let mut sin = sin;
         let mut positions = positions;
         let mut slot_mapping = slot_mapping;
         let mut q_scale_ptr = q_scale_ptr;
-        let mut kv_scale_ptr = kv_scale_ptr;
         let mut num_tokens = self.num_tokens as i32;
         let mut num_heads = self.num_heads as i32;
         let mut num_kv_heads = self.num_kv_heads as i32;
@@ -298,12 +304,13 @@ impl FusedRopePartialFp8KvLaunch {
             (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
             (&mut k_cache_fp8) as *mut u64 as *mut core::ffi::c_void,
             (&mut v_cache_fp8) as *mut u64 as *mut core::ffi::c_void,
+            (&mut k_scale_cache) as *mut u64 as *mut core::ffi::c_void,
+            (&mut v_scale_cache) as *mut u64 as *mut core::ffi::c_void,
             (&mut cos) as *mut u64 as *mut core::ffi::c_void,
             (&mut sin) as *mut u64 as *mut core::ffi::c_void,
             (&mut positions) as *mut u64 as *mut core::ffi::c_void,
             (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
             (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
-            (&mut kv_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
             (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
             (&mut num_heads) as *mut i32 as *mut core::ffi::c_void,
             (&mut num_kv_heads) as *mut i32 as *mut core::ffi::c_void,

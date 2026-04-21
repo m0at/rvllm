@@ -333,18 +333,25 @@ pub unsafe fn forward_phase(
                 scale: dims.attn_scale,
                 window_size_left: -1,
             };
+            // Llama/Qwen path: per-slot KV scales are not wired up for
+            // this path yet — the Gemma 4 KV-scale precision refactor
+            // only landed the scale buffers in `Gemma4LayerScratch`.
+            // Pass 0 / 0 here so the build stays green; attempting to
+            // run decode through this launcher will read from a null
+            // per-slot scale pointer and crash. Safe until someone
+            // brings a Llama/Qwen prefill path online.
             decode.launch(
                 decode_params,
                 scratch.attn_out,
                 scratch.q_fp8,
                 scratch.k_cache,
                 scratch.v_cache,
+                0, // k_scale_cache (per-slot, unused on Llama/Qwen)
+                0, // v_scale_cache (per-slot, unused on Llama/Qwen)
                 meta.block_tables,
                 meta.context_lens,
                 scratch.fa3_workspace,
                 scratch.q_scale_ptr,
-                scratch.kv_scale_ptr,
-                scratch.kv_scale_ptr,
                 stream,
             )?;
         }

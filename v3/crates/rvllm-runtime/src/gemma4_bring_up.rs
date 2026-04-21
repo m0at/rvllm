@@ -403,18 +403,27 @@ impl Gemma4Bringup {
 
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
         let mut kv_total_bytes: u64 = 0;
+        let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_scale_total_bytes: u64 = 0;
         for l in 0..arch.num_hidden_layers {
             kv_layer_offsets.push(kv_total_bytes);
+            kv_scale_layer_offsets.push(kv_scale_total_bytes);
             let layer_blocks = if arch.layer_types[l] == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
             let nkvh_l = arch.num_kv_heads_for_layer(l) as u32;
             let hd_l = arch.head_dim_for_layer(l) as u32;
             let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh_l as u64 * hd_l as u64;
             kv_total_bytes += layer_elems * kv_bytes_per_elem as u64;
+            let layer_scale_slots = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh_l as u64;
+            kv_scale_total_bytes += layer_scale_slots * 4;
         }
         let kv_cache = arena.region("kv_cache", kv_total_bytes as usize, 256).unwrap();
+        let kv_scale_cache = arena.region(
+            "kv_scale_cache", kv_scale_total_bytes as usize, 16).unwrap();
         #[cfg(feature = "cuda")]
         {
             cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
+            cudarc::driver::sys::cuMemsetD8_v2(
+                kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
         }
 
         let q_scale_region = arena.region("q_scale", 4, 4).unwrap();
@@ -568,6 +577,10 @@ impl Gemma4Bringup {
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
                 let kv_layer_bytes = layer_kv_elems * kv_bytes_per_elem as u64;
                 let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+                let layer_kv_scale_base =
+                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
+                let layer_kv_scale_slots_half =
+                    (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
 
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (
@@ -622,6 +635,8 @@ impl Gemma4Bringup {
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + kv_layer_bytes / 2,
+                    k_scale_cache: layer_kv_scale_base,
+                    v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
                     q_scale_ptr: q_scale_region.device_ptr(),
                     kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
@@ -836,20 +851,29 @@ impl Gemma4Bringup {
 
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
         let mut kv_total_bytes: u64 = 0;
+        let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_scale_total_bytes: u64 = 0;
         for l in 0..arch.num_hidden_layers {
             kv_layer_offsets.push(kv_total_bytes);
+            kv_scale_layer_offsets.push(kv_scale_total_bytes);
             let is_global = arch.layer_types[l] == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
             let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
             let nkvh = arch.num_kv_heads_for_layer(l) as u32;
             let hd = arch.head_dim_for_layer(l) as u32;
             let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
             kv_total_bytes += layer_elems * kv_bytes_per_elem as u64;
+            let layer_scale_slots = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
+            kv_scale_total_bytes += layer_scale_slots * 4;
         }
         eprintln!("[ppl] KV cache: {:.1} MB (sliding={} blocks, global={} blocks, {} bytes/elem)",
             kv_total_bytes as f64 / 1e6, sliding_blocks, num_blocks_total, kv_bytes_per_elem);
 
         let kv_cache = arena.region("kv_cache", kv_total_bytes as usize, 256)?;
         cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
+        let kv_scale_cache =
+            arena.region("kv_scale_cache", kv_scale_total_bytes as usize, 16)?;
+        cudarc::driver::sys::cuMemsetD8_v2(
+            kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
 
         let q_scale_region = arena.region("q_scale", 4, 4)?;
         let kv_scale_region = arena.region("kv_scale", 4, 4)?;
@@ -965,6 +989,10 @@ impl Gemma4Bringup {
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
                 let kv_layer_bytes = layer_kv_elems * kv_bytes_per_elem as u64;
                 let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+                let layer_kv_scale_base =
+                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
+                let layer_kv_scale_slots_half =
+                    (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (
                         self.model.rope_cos_sliding.offset_bytes,
@@ -1018,6 +1046,8 @@ impl Gemma4Bringup {
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + kv_layer_bytes / 2,
+                    k_scale_cache: layer_kv_scale_base,
+                    v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
                     q_scale_ptr: q_scale_region.device_ptr(),
                     kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
@@ -1377,17 +1407,30 @@ impl Gemma4Bringup {
         let kv_bytes_per_elem: u32 = if use_f16_kv { 2 } else { 1 };
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
         let mut kv_total_bytes: u64 = 0;
+        // Per-slot-per-head K/V scale cache offsets (f32 per entry).
+        // One entry per (slot, kv_head) — factor `head_dim` smaller
+        // than the FP8 KV cache region.
+        let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_scale_total_bytes: u64 = 0;
         for l in 0..arch.num_hidden_layers {
             kv_layer_offsets.push(kv_total_bytes);
+            kv_scale_layer_offsets.push(kv_scale_total_bytes);
             let is_global = arch.layer_types[l] == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
             let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
             let nkvh = arch.num_kv_heads_for_layer(l) as u32;
             let hd = arch.head_dim_for_layer(l) as u32;
             let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
             kv_total_bytes += layer_elems * kv_bytes_per_elem as u64;
+            // Scale storage: [2 (K+V)] × num_slots × num_kv_heads × f32.
+            let layer_scale_slots = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
+            kv_scale_total_bytes += layer_scale_slots * 4;
         }
         let kv_cache = arena.region("gen_kv", kv_total_bytes as usize, 256)?;
         cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
+        let kv_scale_cache =
+            arena.region("gen_kv_scale_cache", kv_scale_total_bytes as usize, 16)?;
+        cudarc::driver::sys::cuMemsetD8_v2(
+            kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
 
         let q_scale_region = arena.region("gen_q_scale", 4, 4)?;
         let kv_scale_region = arena.region("gen_kv_scale", 4, 4)?;
@@ -1456,6 +1499,10 @@ impl Gemma4Bringup {
                 let layer_blocks = if lt == Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
                 let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+                let layer_kv_scale_base =
+                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
+                let layer_kv_scale_slots_half =
+                    (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
 
                 let dims = crate::gemma4_layer_exec::Gemma4LayerDims {
                     num_tokens: 1, hidden,
@@ -1507,6 +1554,8 @@ impl Gemma4Bringup {
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + (layer_kv_elems / 2) * kv_bytes_per_elem as u64,
                     q_scale_ptr: q_scale_region.device_ptr(), kv_scale_ptr: kv_scale_region.device_ptr(),
+                    k_scale_cache: layer_kv_scale_base,
+                    v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
                     attn_out: attn_out.device_ptr(), attn_out_fp8: attn_out_fp8.device_ptr(),
                     attn_out_scale: attn_out_scale.device_ptr(), delta_f16: delta_f16.device_ptr(),
                     gate_up_out: gate_up_out.device_ptr(), gate_up_fp8: gate_up_fp8.device_ptr(),
@@ -1657,6 +1706,10 @@ impl Gemma4Bringup {
                 let layer_blocks = if lt == Gemma4LayerType::GlobalAttention { num_blocks_total } else { sliding_blocks };
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
                 let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+                let layer_kv_scale_base =
+                    kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
+                let layer_kv_scale_slots_half =
+                    (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
 
                 let dims = crate::gemma4_layer_exec::Gemma4LayerDims {
                     num_tokens: prompt_len, hidden,
@@ -1714,6 +1767,8 @@ impl Gemma4Bringup {
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + (layer_kv_elems / 2) * kv_bytes_per_elem as u64,
                     q_scale_ptr: q_scale_region.device_ptr(), kv_scale_ptr: kv_scale_region.device_ptr(),
+                    k_scale_cache: layer_kv_scale_base,
+                    v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
                     attn_out: attn_out.device_ptr(), attn_out_fp8: attn_out_fp8.device_ptr(),
                     attn_out_scale: attn_out_scale.device_ptr(), delta_f16: delta_f16.device_ptr(),
                     gate_up_out: gate_up_out.device_ptr(), gate_up_fp8: gate_up_fp8.device_ptr(),
