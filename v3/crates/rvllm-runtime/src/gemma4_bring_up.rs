@@ -46,6 +46,7 @@ pub struct Gemma4FusedModules {
     pub f32_to_bf16_mod: LoadedModule,
     pub f32_to_f16_sat_mod: LoadedModule,
     pub scale_cols_f32_mod: LoadedModule,
+    pub scale_rows_f32_ratio_mod: LoadedModule,
     pub compute_qkv_scales_mod: LoadedModule,
     pub fused_gelu_mul_f16_mod: LoadedModule,
     pub fused_rope_partial_f16kv_mod: LoadedModule,
@@ -67,6 +68,7 @@ pub struct Gemma4FusedModules {
     pub fn_f32_to_bf16: KernelFn,
     pub fn_f32_to_f16_sat: KernelFn,
     pub fn_scale_cols_f32: KernelFn,
+    pub fn_scale_rows_f32_ratio: KernelFn,
     pub fn_compute_qkv_scales: KernelFn,
     pub fn_fused_gelu_mul_f16: KernelFn,
     pub fn_fused_rope_partial_f16kv: KernelFn,
@@ -1843,6 +1845,7 @@ impl Gemma4Bringup {
             f32_to_bf16: self.fused.fn_f32_to_bf16,
             f32_to_f16_sat: self.fused.fn_f32_to_f16_sat,
             scale_cols_f32: self.fused.fn_scale_cols_f32,
+            scale_rows_f32_ratio: self.fused.fn_scale_rows_f32_ratio,
             compute_qkv_scales: self.fused.fn_compute_qkv_scales,
             fused_gelu_mul_f16: self.fused.fn_fused_gelu_mul_f16,
             fused_rope_partial_f16kv: self.fused.fn_fused_rope_partial_f16kv,
@@ -1901,6 +1904,9 @@ fn load_gemma4_fused(
 
     let scale_cols_f32_mod = loader.load_ptx("scale_cols_f32")?;
     let fn_scale_cols_f32 = scale_cols_f32_mod.get_function("scale_cols_f32_kernel")?;
+    let scale_rows_f32_ratio_mod = loader.load_ptx("scale_rows_f32_ratio")?;
+    let fn_scale_rows_f32_ratio =
+        scale_rows_f32_ratio_mod.get_function("scale_rows_f32_ratio_kernel")?;
 
     let compute_qkv_scales_mod = loader.load_ptx("compute_qkv_scales")?;
     let fn_compute_qkv_scales = compute_qkv_scales_mod.get_function("compute_qkv_scales_kernel")?;
@@ -1959,6 +1965,7 @@ fn load_gemma4_fused(
         f32_to_bf16_mod,
         f32_to_f16_sat_mod,
         scale_cols_f32_mod,
+        scale_rows_f32_ratio_mod,
         compute_qkv_scales_mod,
         fused_gelu_mul_f16_mod,
         fused_rope_partial_f16kv_mod,
@@ -1980,6 +1987,7 @@ fn load_gemma4_fused(
         fn_f32_to_bf16,
         fn_f32_to_f16_sat,
         fn_scale_cols_f32,
+        fn_scale_rows_f32_ratio,
         fn_compute_qkv_scales,
         fn_fused_gelu_mul_f16,
         fn_fused_rope_partial_f16kv,
