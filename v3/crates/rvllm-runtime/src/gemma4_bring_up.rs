@@ -1671,90 +1671,22 @@ impl Gemma4Bringup {
 
         let t0 = std::time::Instant::now();
 
-        // Phase 1: prompt through per-token decode (default, correct-by-design).
+        // Phase 1: prompt through per-token decode.
         //
-        // On sm_121 with FP8 block-scale weights (Gemma 4 fp8-block), the
-        // per-token path uses `fp8_gemv_blockwise_wpr_native_f16in_kernel`
-        // which preserves the per-channel weight block-scale. The batch
-        // (num_tokens>1) GEMM path goes through
-        // `fp8_gemm_channelscale_or_fallback`, which on Blackwell consumer
-        // collapses to a scalar weight scale because cuBLASLt's FP8
-        // channelscale heuristic `LaunchFailed`s at this arch. That is a
-        // genuine numerical difference, not a hidden bug — the two paths
-        // are not bit-identical by design at num_tokens<CUTLASS_M_MIN(=128).
-        //
-        // Path forward for genuine batch-prefill speedup:
-        //   * num_tokens >=128 : CUTLASS SM120 blockwise FP8 GEMM (landed;
-        //     opt-in via RVLLM_FP8_GEMM_CUTLASS_SM120 + M>=128 gate in
-        //     gemma4_layer_exec).  This preserves the per-channel scale
-        //     via SFA/SFB prep.
-        //   * num_tokens < 128 : per-token loop is optimal (fp8_gemv is
-        //     M=1-only; running it T times reads weights T times but each
-        //     call is already bandwidth-bound; cost parity with any batched
-        //     solution at small M).
-        //
-        // So we keep the per-token loop as the default for ALL prompt
-        // lengths today. RVLLM_BATCH_PREFILL=1 flips to the unified
-        // batch path (diagnostic: verifies CUTLASS >=128 correctness,
-        // or measures the collapsed-scalar quality floor at <128).
-        let skip_decode = std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
-        let use_batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
-        if !skip_decode && !use_batch_prefill {
-            for (i, &tok) in prompt_ids.iter().enumerate() {
-                run_one_token(tok, i)?;
-            }
+        // The QKV-buffer stride fix (fused_qkv_rmsnorm_kernel taking
+        // `src_row_stride`, V flowing through a compact `v_normed`)
+        // removed one num_tokens>1 layout bug but at least one more
+        // is still lurking: end-to-end prefill still produces wrong
+        // (though now non-zero) logits. Until it's nailed, loop the
+        // prompt through the same per-token decode path rvllm-ppl
+        // uses — attention operator is identical, cost is TTFT
+        // linear in prompt_len.
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            run_one_token(tok, i)?;
         }
-
-        // Optional prefill-vs-decode residual compare (RVLLM_DIAG_COMPARE=1).
-        // Captures the last-token residual produced by per-token decode
-        // (correct reference), resets KV, re-runs the prompt via batch
-        // prefill, captures the same row, and prints the diff. Combine
-        // with `RVLLM_MAX_LAYERS=N` to bisect where the two paths
-        // diverge. Only fires when prompt_len > 1 (decode==prefill
-        // trivially at prompt_len=1).
-        let diag_compare =
-            std::env::var_os("RVLLM_DIAG_COMPARE").is_some() && !skip_decode;
-        let mut decode_ref_last: Vec<u16> = Vec::new();
-        let mut decode_ref_first: Vec<u16> = Vec::new();
-        if diag_compare && prompt_len > 1 {
-            // Already captured: residual_ptr holds LAST token's residual
-            // after all prompt tokens were processed sequentially.
-            self.stream.fence()?;
-            decode_ref_last = vec![0u16; hidden as usize];
-            cudarc::driver::sys::cuMemcpyDtoH_v2(
-                decode_ref_last.as_mut_ptr() as *mut _,
-                residual_ptr,
-                (hidden * 2) as _,
-            );
-
-            // For FIRST token reference, re-run just token 0 through
-            // a fresh KV cache — the residual after that step is what
-            // prefill's row 0 should match (no prior context at
-            // position 0 in either path).
-            cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
-            self.stream.fence()?;
-            run_one_token(prompt_ids[0], 0)?;
-            self.stream.fence()?;
-            decode_ref_first = vec![0u16; hidden as usize];
-            cudarc::driver::sys::cuMemcpyDtoH_v2(
-                decode_ref_first.as_mut_ptr() as *mut _,
-                residual_ptr,
-                (hidden * 2) as _,
-            );
-
-            // Reset KV again before prefill re-runs the whole prompt.
-            cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
-            self.stream.fence()?;
-        }
-
-        // Dead prefill block retained behind `if false`; flip to the
-        // diag gate to re-run the prompt through batch prefill
-        // (correctness is still broken — this path is instrumentation,
-        // not production). `skip_decode` takes the prefill path
-        // standalone so the existing DBG probes fire on prefill's
-        // layer 0 / layer 1 for direct comparison against a normal
-        // decode-only run.
-        if (diag_compare && prompt_len > 1) || skip_decode || (use_batch_prefill && prompt_len > 1) {
+        // Dead prefill block retained behind `if false`; flip when
+        // the remaining multi-token bug is fixed.
+        if false {
             let tok_ids: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
             token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
             // Readback sanity-check: confirm the device buffer actually
