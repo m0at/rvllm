@@ -191,8 +191,14 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
         q_fp8: u64,
         k_cache_fp8: u64,
         v_cache_fp8: u64,
+        // `k_scale_cache` / `v_scale_cache`: per-slot f32 arrays
+        //   (Gemma 4). Pass `0` to fall back to the scalar
+        //   `k_descale_fallback_ptr` / `v_descale_fallback_ptr`
+        //   (Llama/Qwen path).
         k_scale_cache: u64,
         v_scale_cache: u64,
+        k_descale_fallback_ptr: u64,
+        v_descale_fallback_ptr: u64,
         block_tables: u64,
         context_lens: u64,
         workspace: u64,
@@ -258,18 +264,22 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     let mut arg_v = v_cache_fp8;
                     let mut arg_ks = k_scale_cache;
                     let mut arg_vs = v_scale_cache;
+                    let mut arg_kd = k_descale_fallback_ptr;
+                    let mut arg_vd = v_descale_fallback_ptr;
                     let mut arg_bt = block_tables;
                     let mut arg_cl = context_lens;
                     let mut arg_qd = q_descale_ptr;
                     let _ = workspace; // unused: FA2 allocates in smem
 
-                    let args: [*mut core::ffi::c_void; 16] = [
+                    let args: [*mut core::ffi::c_void; 18] = [
                         &mut arg_out as *mut _ as *mut _,
                         &mut arg_q as *mut _ as *mut _,
                         &mut arg_k as *mut _ as *mut _,
                         &mut arg_v as *mut _ as *mut _,
                         &mut arg_ks as *mut _ as *mut _,
                         &mut arg_vs as *mut _ as *mut _,
+                        &mut arg_kd as *mut _ as *mut _,
+                        &mut arg_vd as *mut _ as *mut _,
                         &mut arg_bt as *mut _ as *mut _,
                         &mut arg_cl as *mut _ as *mut _,
                         &mut arg_qd as *mut _ as *mut _,
