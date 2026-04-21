@@ -694,7 +694,7 @@ pub unsafe fn gemma4_forward_phase(
     // or when the Sm121 fast path will read `scratch.attn_out`
     // as f16 directly in step 7).
     #[cfg(feature = "cuda")]
-    let skip_o_quant = dims.num_tokens == 1
+    let skip_o_quant = dims.num_tokens <= FAST_PATH_M_MAX
         && weights.o_f16 == 0
         && weights.o_chscale != 0
         && weights.o_blockscale != 0
@@ -727,7 +727,7 @@ pub unsafe fn gemma4_forward_phase(
         }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
     } else if let (true, Some(fn_gemv)) = (
-        weights.o_blockscale != 0 && dims.num_tokens == 1,
+        weights.o_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
         // sm_121 fast path for O projection.
@@ -832,7 +832,7 @@ pub unsafe fn gemma4_forward_phase(
     // f16 rmsnorm into delta_f16, leaving hidden_fp8/hidden_scale
     // unused.
     #[cfg(feature = "cuda")]
-    let skip_ff_quant = dims.num_tokens == 1
+    let skip_ff_quant = dims.num_tokens <= FAST_PATH_M_MAX
         && weights.gate_up_chscale != 0
         && weights.gate_up_blockscale != 0
         && weights.gate_up_f16 == 0
@@ -900,7 +900,7 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if let (true, Some(fn_gemv)) = (
-        weights.gate_up_blockscale != 0 && dims.num_tokens == 1,
+        weights.gate_up_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
         // sm_121 fast path for gate||up projection. Mirrors
@@ -987,7 +987,7 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if let (true, Some(fn_gemv)) = (
-        weights.down_blockscale != 0 && dims.num_tokens == 1,
+        weights.down_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
         // sm_121 fast path for down projection.
