@@ -478,7 +478,7 @@ pub unsafe fn gemma4_forward_phase(
         )?;
     } else if weights.qkv_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
-            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32,
+            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
             scratch.q_out, scratch.hidden_fp8, weights.qkv_fp8,
             scratch.hidden_scale, weights.qkv_chscale, weights.qkv_scale,
             dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
@@ -940,7 +940,7 @@ pub unsafe fn gemma4_forward_phase(
         )?;
     } else if weights.gate_up_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
-            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32,
+            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
             scratch.gate_up_out, scratch.hidden_fp8, weights.gate_up_fp8,
             scratch.hidden_scale, weights.gate_up_chscale, weights.gate_up_scale,
             dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
@@ -1118,6 +1118,35 @@ unsafe fn launch_scale_cols_f32(
     rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
 }
 
+/// Post-GEMM per-row scale RATIO correction: `data[m, n] *=
+/// scale[m] / scale[0]` for an MxN f32 row-major buffer. Used to
+/// fix up cuBLASLt FP8 GEMM output when the B_SCALE was a per-token
+/// array but cuBLASLt ran in SCALAR mode (sm_121's only option).
+#[cfg(feature = "cuda")]
+unsafe fn launch_scale_rows_f32_ratio(
+    kernel: KernelFn,
+    data: u64,
+    scale: u64,
+    m: u32,
+    n: u32,
+    stream: u64,
+) -> Result<()> {
+    let total = m * n;
+    let mut data = data;
+    let mut scale = scale;
+    let mut m_i = m as i32;
+    let mut n_i = n as i32;
+    let args = [
+        (&mut data) as *mut u64 as *mut core::ffi::c_void,
+        (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+        (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+        (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let block = (256u32, 1, 1);
+    let grid = ((total + 255) / 256, 1, 1);
+    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
+}
+
 /// CUTLASS FP8 GEMM with row×col scale epilogue + sm_121 fallback.
 ///
 /// On SM80/89/90 this delegates straight to the CUTLASS `.so`
@@ -1140,6 +1169,7 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     cublaslt: &CublasLt,
     fn_f32_to_f16: KernelFn,
     fn_scale_cols_f32: KernelFn,
+    fn_scale_rows_f32_ratio: KernelFn,
     output_f16: u64,
     a_fp8: u64,
     b_fp8: u64,
@@ -1230,6 +1260,19 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
             a_scale, b_scale_scalar,
             stream,
         )?;
+        // cuBLASLt on sm_121 only supports SCALAR B_SCALE mode; the
+        // FP8 GEMM above applied `a_scale[0]` uniformly to every
+        // output row. For M>1 with per-token activation scales this
+        // under/over-scales rows 1..M-1 by `a_scale[m] / a_scale[0]`.
+        // Correct it with the ratio kernel. At M=1 the kernel is a
+        // no-op (row 0 stays put) so decode stays bit-identical.
+        if m > 1 {
+            launch_scale_rows_f32_ratio(
+                fn_scale_rows_f32_ratio,
+                scratch_f32, a_scale,
+                m as u32, n as u32, stream,
+            )?;
+        }
         if b_chscale != 0 {
             launch_scale_cols_f32(
                 fn_scale_cols_f32,
