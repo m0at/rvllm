@@ -286,21 +286,13 @@ impl Gemma4Bringup {
                     "policy.json",
                 )
             })?;
-        let policy: Policy = serde_json::from_slice(&policy_bytes).map_err(|e| {
-            rvllm_core::RvllmError::config(
-                rvllm_core::ConfigError::Inconsistent {
-                    reasons: vec![format!("policy.json parse: {e}")],
-                },
-                "policy.json",
-            )
-        })?;
-
-        let mut variants: std::collections::BTreeSet<_> =
-            policy.entries.values().map(|e| e.variant).collect();
-        for v in 0..16u32 {
-            variants.insert(rvllm_cutlass::VariantId(v));
-        }
-        let variants: Vec<_> = variants.into_iter().collect();
+            let mut variants: std::collections::BTreeSet<_> =
+                policy.entries.values().map(|e| e.variant).collect();
+            for v in 0..16u32 {
+                variants.insert(rvllm_cutlass::VariantId(v));
+            }
+            (policy, variants.into_iter().collect())
+        };
         // CUTLASS backend selection — see `bring_up::Bringup::load`
         // for the full rationale (sm_121 has no compatible `.so`).
         let cutlass =
