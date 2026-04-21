@@ -603,6 +603,7 @@ pub unsafe fn gemma4_forward_phase(
                     scratch.v_cache,
                     scratch.k_scale_cache,
                     scratch.v_scale_cache,
+                    scratch.q_scale_cache,
                     0, // k_descale_fallback (unused when per-slot populated)
                     0, // v_descale_fallback
                     meta.block_tables,
@@ -672,6 +673,7 @@ pub unsafe fn gemma4_forward_phase(
                     scratch.v_cache,
                     scratch.k_scale_cache,
                     scratch.v_scale_cache,
+                    scratch.q_scale_cache,
                     0, // k_descale_fallback (unused when per-slot populated)
                     0, // v_descale_fallback
                     meta.block_tables,

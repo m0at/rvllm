@@ -905,6 +905,7 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
     const unsigned char* __restrict__ value_cache,
     const float* __restrict__ k_scale_cache,     // per-slot f32, OR nullptr -> use k_descale_fallback
     const float* __restrict__ v_scale_cache,     // per-slot f32, OR nullptr -> use v_descale_fallback
+    const float* __restrict__ q_scale_cache,     // per-(seq,head) f32, OR nullptr -> use q_descale
     const float* __restrict__ k_descale_fallback,// scalar, used only if k_scale_cache==nullptr
     const float* __restrict__ v_descale_fallback,// scalar, used only if v_scale_cache==nullptr
     const int* __restrict__ block_tables,        // [num_seqs, max_blocks_per_seq]
@@ -928,7 +929,9 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
     const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx
                                                          : (head_idx / (num_heads / num_kv_heads));
 
-    const float q_scale = *q_descale;
+    const float q_scale = (q_scale_cache != nullptr)
+        ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
+        : *q_descale;
     // Per-slot KV scales (Gemma 4) or scalar fallback (Llama/Qwen).
     // Branch is on a per-launch parameter so the compiler can hoist
     // it out of the inner tile loop.
@@ -1145,6 +1148,7 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
     const unsigned char* __restrict__ value_cache,
     const float* __restrict__ k_scale_cache,
     const float* __restrict__ v_scale_cache,
+    const float* __restrict__ q_scale_cache,
     const float* __restrict__ k_descale_fallback,
     const float* __restrict__ v_descale_fallback,
     const int* __restrict__ block_tables,
@@ -1168,7 +1172,9 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
     const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx
                                                          : (head_idx / (num_heads / num_kv_heads));
 
-    const float q_scale = *q_descale;
+    const float q_scale = (q_scale_cache != nullptr)
+        ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
+        : *q_descale;
     const bool k_perslot = (k_scale_cache != nullptr);
     const bool v_perslot = (v_scale_cache != nullptr);
     const float k_scale_scalar = k_perslot ? 0.0f : __ldg(k_descale_fallback);

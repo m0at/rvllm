@@ -449,11 +449,19 @@ impl Gemma4Bringup {
         let kv_cache = arena.region("kv_cache", kv_total_bytes as usize, 256).unwrap();
         let kv_scale_cache = arena.region(
             "kv_scale_cache", kv_scale_total_bytes as usize, 16).unwrap();
+        // Per-(seq, head) Q scale scratch, written fresh by rope each
+        // forward and consumed by the same step's attention.
+        let q_scale_scratch_bytes =
+            (num_seqs as u64) * (arch.num_attention_heads as u64) * 4;
+        let q_scale_scratch = arena.region(
+            "q_scale_scratch", q_scale_scratch_bytes as usize, 16).unwrap();
         #[cfg(feature = "cuda")]
         {
             cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
             cudarc::driver::sys::cuMemsetD8_v2(
                 kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
+            cudarc::driver::sys::cuMemsetD8_v2(
+                q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
         }
 
         let q_scale_region = arena.region("q_scale", 4, 4).unwrap();
@@ -667,7 +675,7 @@ impl Gemma4Bringup {
                     v_cache: layer_kv_base + kv_layer_bytes / 2,
                     k_scale_cache: layer_kv_scale_base,
                     v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
-                    q_scale_cache: 0, // per-token Q scale: plumbing ready, scalar fallback for now
+                    q_scale_cache: q_scale_scratch.device_ptr(),
                     q_scale_ptr: q_scale_region.device_ptr(),
                     kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
@@ -912,6 +920,12 @@ impl Gemma4Bringup {
             arena.region("kv_scale_cache", kv_scale_total_bytes as usize, 16)?;
         cudarc::driver::sys::cuMemsetD8_v2(
             kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
+        let q_scale_scratch_bytes =
+            (num_seqs as u64) * (arch.num_attention_heads as u64) * 4;
+        let q_scale_scratch = arena.region(
+            "q_scale_scratch", q_scale_scratch_bytes as usize, 16)?;
+        cudarc::driver::sys::cuMemsetD8_v2(
+            q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
 
         let q_scale_region = arena.region("q_scale", 4, 4)?;
         let kv_scale_region = arena.region("kv_scale", 4, 4)?;
@@ -1086,7 +1100,7 @@ impl Gemma4Bringup {
                     v_cache: layer_kv_base + kv_layer_bytes / 2,
                     k_scale_cache: layer_kv_scale_base,
                     v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
-                    q_scale_cache: 0, // per-token Q scale: plumbing ready, scalar fallback for now
+                    q_scale_cache: q_scale_scratch.device_ptr(),
                     q_scale_ptr: q_scale_region.device_ptr(),
                     kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
@@ -1477,6 +1491,12 @@ impl Gemma4Bringup {
             arena.region("gen_kv_scale_cache", kv_scale_total_bytes as usize, 16)?;
         cudarc::driver::sys::cuMemsetD8_v2(
             kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
+        let q_scale_scratch_bytes =
+            (max_tokens as u64) * (arch.num_attention_heads as u64) * 4;
+        let q_scale_scratch = arena.region(
+            "gen_q_scale_scratch", q_scale_scratch_bytes as usize, 16)?;
+        cudarc::driver::sys::cuMemsetD8_v2(
+            q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
 
         let q_scale_region = arena.region("gen_q_scale", 4, 4)?;
         let kv_scale_region = arena.region("gen_kv_scale", 4, 4)?;
@@ -1602,7 +1622,7 @@ impl Gemma4Bringup {
                     q_scale_ptr: q_scale_region.device_ptr(), kv_scale_ptr: kv_scale_region.device_ptr(),
                     k_scale_cache: layer_kv_scale_base,
                     v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
-                    q_scale_cache: 0, // per-token Q scale: plumbing ready, scalar fallback for now
+                    q_scale_cache: q_scale_scratch.device_ptr(),
                     attn_out: attn_out.device_ptr(), attn_out_fp8: attn_out_fp8.device_ptr(),
                     attn_out_scale: attn_out_scale.device_ptr(), delta_f16: delta_f16.device_ptr(),
                     gate_up_out: gate_up_out.device_ptr(), gate_up_fp8: gate_up_fp8.device_ptr(),
@@ -1816,7 +1836,7 @@ impl Gemma4Bringup {
                     q_scale_ptr: q_scale_region.device_ptr(), kv_scale_ptr: kv_scale_region.device_ptr(),
                     k_scale_cache: layer_kv_scale_base,
                     v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
-                    q_scale_cache: 0, // per-token Q scale: plumbing ready, scalar fallback for now
+                    q_scale_cache: q_scale_scratch.device_ptr(),
                     attn_out: attn_out.device_ptr(), attn_out_fp8: attn_out_fp8.device_ptr(),
                     attn_out_scale: attn_out_scale.device_ptr(), delta_f16: delta_f16.device_ptr(),
                     gate_up_out: gate_up_out.device_ptr(), gate_up_fp8: gate_up_fp8.device_ptr(),
