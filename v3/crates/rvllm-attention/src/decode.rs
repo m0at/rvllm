@@ -197,6 +197,10 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
         //   (Llama/Qwen path).
         k_scale_cache: u64,
         v_scale_cache: u64,
+        // `q_scale_cache`: `[num_seqs * num_heads]` f32 array of
+        //   per-(seq, head) Q scales. Pass `0` to fall back to the
+        //   scalar `q_descale_ptr`.
+        q_scale_cache: u64,
         k_descale_fallback_ptr: u64,
         v_descale_fallback_ptr: u64,
         block_tables: u64,
@@ -264,6 +268,7 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     let mut arg_v = v_cache_fp8;
                     let mut arg_ks = k_scale_cache;
                     let mut arg_vs = v_scale_cache;
+                    let mut arg_qs = q_scale_cache;
                     let mut arg_kd = k_descale_fallback_ptr;
                     let mut arg_vd = v_descale_fallback_ptr;
                     let mut arg_bt = block_tables;
@@ -271,13 +276,14 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     let mut arg_qd = q_descale_ptr;
                     let _ = workspace; // unused: FA2 allocates in smem
 
-                    let args: [*mut core::ffi::c_void; 18] = [
+                    let args: [*mut core::ffi::c_void; 19] = [
                         &mut arg_out as *mut _ as *mut _,
                         &mut arg_q as *mut _ as *mut _,
                         &mut arg_k as *mut _ as *mut _,
                         &mut arg_v as *mut _ as *mut _,
                         &mut arg_ks as *mut _ as *mut _,
                         &mut arg_vs as *mut _ as *mut _,
+                        &mut arg_qs as *mut _ as *mut _,
                         &mut arg_kd as *mut _ as *mut _,
                         &mut arg_vd as *mut _ as *mut _,
                         &mut arg_bt as *mut _ as *mut _,
@@ -322,12 +328,15 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     return Ok(());
                 }
             };
-            // Fa3 SM90 path: not updated for per-slot K/V scales yet
-            // (sm_121 is the active target; Fa3 is legacy). Pass
-            // `k_scale_cache` / `v_scale_cache` where the SM90 kernel
-            // wants `k_descale` / `v_descale` scalars — it'll
-            // misinterpret them. A dedicated SM90 follow-up wires
-            // the new ABI properly.
+            // Fa3 SM90 path: takes scalar K/V descales (its ABI
+            // predates per-slot scales). Llama/Qwen callers pass
+            // their per-tensor scale via `k_descale_fallback_ptr` /
+            // `v_descale_fallback_ptr`; Gemma 4 sm_121 never reaches
+            // this arm (it goes through the Fa2Ptx branch above).
+            // If per-slot scales are populated AND an Fa3 caller
+            // somehow routes through here, that caller needs to
+            // materialize a representative scalar into the fallback
+            // pointer — the SM90 kernel can't consume per-slot.
             let _ = k_scale_cache;
             let _ = v_scale_cache;
             let rc = (fa3.fn_paged_decode_fp8)(
@@ -339,8 +348,8 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                 context_lens as *mut std::ffi::c_void,
                 workspace as *mut std::ffi::c_void,
                 q_descale_ptr as *mut f32,
-                0 as *mut f32,
-                0 as *mut f32,
+                k_descale_fallback_ptr as *mut f32,
+                v_descale_fallback_ptr as *mut f32,
                 params.scale,
                 params.num_seqs as i32,
                 params.num_heads as i32,
