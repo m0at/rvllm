@@ -584,6 +584,10 @@ impl Gemma4Bringup {
                     o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
                     gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
                     down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
+                    qkv_blockscale: layer.qkv.blockscale_ptr.unwrap_or(0),
+                    o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
+                    gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
+                    down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -968,6 +972,10 @@ impl Gemma4Bringup {
                     o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
                     gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
                     down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
+                    qkv_blockscale: layer.qkv.blockscale_ptr.unwrap_or(0),
+                    o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
+                    gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
+                    down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -1440,6 +1448,10 @@ impl Gemma4Bringup {
                     o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
                     gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
                     down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
+                    qkv_blockscale: layer.qkv.blockscale_ptr.unwrap_or(0),
+                    o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
+                    gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
+                    down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;
@@ -1544,6 +1556,10 @@ impl Gemma4Bringup {
                     o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
                     gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
                     down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
+                    qkv_blockscale: layer.qkv.blockscale_ptr.unwrap_or(0),
+                    o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
+                    gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
+                    down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
                 };
                 let k_out = q_base + (prompt_len as u64) * (q_dim as u64) * 2;
                 let v_out = k_out + (prompt_len as u64) * (kv_dim as u64) * 2;

@@ -31,7 +31,27 @@ pub struct Fp8Weight {
     /// Per-channel (per-row) f32 scale vector on device. When set,
     /// cuBLASLt uses OUTER_VEC_32F mode instead of scalar scaling.
     /// Length = shape[0] (number of output rows).
+    ///
+    /// This is a **compatibility projection** of the underlying scale
+    /// tensor: for weights whose source scale was 2-D blockwise
+    /// `[N_blocks, K_blocks]`, the loader collapses it to a per-row
+    /// vector by taking the first column-block's scale per row-block.
+    /// Works for any GEMM path that only consumes a per-row scale;
+    /// **does not** work for paths that read it as a 2-D blockscale
+    /// — those must consult `blockscale_ptr` instead.
     pub channelscale_ptr: Option<u64>,
+    /// Raw 2-D blockwise scale tensor `[N_blocks, K_blocks]` on device,
+    /// f32. `None` when the source weight did not ship a 2-D
+    /// blockscale (per-row vectors, synthesised fused weights, etc.).
+    /// When `Some`, callers whose kernel ABI expects a 2-D tensor
+    /// (e.g. `Fp8GemvBlockwiseF16InLaunch`) should consume this
+    /// directly rather than `channelscale_ptr`, which would read
+    /// the wrong shape.
+    pub blockscale_ptr: Option<u64>,
+    /// Shape of the 2-D blockscale tensor: `(N_blocks, K_blocks)`.
+    /// Both 0 when `blockscale_ptr` is `None`.
+    pub blockscale_n_blocks: u32,
+    pub blockscale_k_blocks: u32,
 }
 
 /// One transformer layer's weights. Borrows into the model's HBM
