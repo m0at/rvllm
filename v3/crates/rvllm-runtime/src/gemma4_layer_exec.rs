@@ -648,6 +648,16 @@ pub unsafe fn gemma4_forward_phase(
             let o_stride_bytes =
                 (dims.num_heads as u64) * (dims.head_dim as u64) * 2; // f16
             let q_fp8_stride_bytes = (dims.num_heads as u64) * (dims.head_dim as u64); // fp8
+            // Per-(token, head) Q scale cache stride. Rope writes at
+            // `q_scale_cache[token_idx * num_heads + head_idx]` (see
+            // fused_rope_partial_fp8kv.cu). Per-qi decode reads at
+            // `q_scale_cache[seq_idx * num_heads + head_idx]` with
+            // seq_idx=0 (num_seqs=1 per launch), so we must advance
+            // the pointer by `qi * num_heads * sizeof::<f32>()` just
+            // like the Q FP8 pointer — otherwise token qi gets token 0's
+            // scale and prefill logits diverge from the per-token
+            // decode reference.
+            let q_scale_stride_bytes = (dims.num_heads as u64) * 4;
 
             // Pre-populate cu_seqlens_q region with [1, 2, ..., num_tokens]
             // via a small host→device copy on THIS stream (async with
@@ -665,6 +675,11 @@ pub unsafe fn gemma4_forward_phase(
             );
 
             for qi in 0..dims.num_tokens {
+                let q_scale_cache_qi = if scratch.q_scale_cache != 0 {
+                    scratch.q_scale_cache + (qi as u64) * q_scale_stride_bytes
+                } else {
+                    0
+                };
                 decode.launch(
                     decode_params,
                     scratch.attn_out + (qi as u64) * o_stride_bytes,
@@ -673,7 +688,7 @@ pub unsafe fn gemma4_forward_phase(
                     scratch.v_cache,
                     scratch.k_scale_cache,
                     scratch.v_scale_cache,
-                    scratch.q_scale_cache,
+                    q_scale_cache_qi,
                     0, // k_descale_fallback (unused when per-slot populated)
                     0, // v_descale_fallback
                     meta.block_tables,
