@@ -310,8 +310,17 @@ pub unsafe fn gemma4_forward_phase(
     // own rmsnorm — `scratch.hidden_fp8`/`hidden_scale` go unused. Skip
     // the quant-rmsnorm in that case to avoid the duplicate work.
     #[cfg(feature = "cuda")]
+    // Must match the fast-path gate below: we can only skip the FP8
+    // quant when `Fp8GemvF16InLaunch` will actually take over and
+    // consume `delta_f16`. The fast path additionally requires
+    // `qkv_blockscale != 0` — for fused QKV weights (blockscale == 0)
+    // the kernel falls back to `fp8_gemm_channelscale_or_fallback`,
+    // which reads `scratch.hidden_fp8` and needs the quant to have
+    // produced it. Dropping `blockscale != 0` here silently zeroed
+    // `hidden_fp8` and propagated zero logits through the LM head.
     let skip_attn_quant = dims.num_tokens == 1
         && weights.qkv_chscale != 0
+        && weights.qkv_blockscale != 0
         && weights.qkv_f16 == 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
@@ -782,6 +791,7 @@ pub unsafe fn gemma4_forward_phase(
     let skip_o_quant = dims.num_tokens == 1
         && weights.o_f16 == 0
         && weights.o_chscale != 0
+        && weights.o_blockscale != 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
     let skip_o_quant = false;
@@ -918,6 +928,7 @@ pub unsafe fn gemma4_forward_phase(
     #[cfg(feature = "cuda")]
     let skip_ff_quant = dims.num_tokens == 1
         && weights.gate_up_chscale != 0
+        && weights.gate_up_blockscale != 0
         && weights.gate_up_f16 == 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
@@ -1313,258 +1324,6 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
             a_scale, b_scale_scalar,
             stream,
         )?;
-        if b_chscale != 0 {
-            launch_scale_cols_f32(
-                fn_scale_cols_f32,
-                scratch_f32, b_chscale,
-                m as u32, n as u32, stream,
-            )?;
-        }
-        // `Bf16ToF16SatLaunch` has the (dst, src, n) ABI we need;
-        // name refers to the historical caller, the launched kernel
-        // is `f32_to_f16_sat`.
-        gemma4_launcher::Bf16ToF16SatLaunch {
-            n: (m * n) as u32,
-        }
-        .launch(fn_f32_to_f16, output_f16, scratch_f32, stream)
-    };
-
-    match cutlass {
-        CutlassBackend::So(_) => cutlass.launch_fp8_gemm_channelscale(
-            output_f16,
-            a_fp8,
-            b_fp8,
-            a_scale,
-            b_chscale,
-            m,
-            n,
-            k,
-            cutlass_workspace,
-            cutlass_workspace_bytes,
-            stream,
-        ),
-        CutlassBackend::Absent => {
-            if b_chscale != 0 {
-                fallback_f32_scale_cast()
-            } else {
-                cublaslt.fp8_gemm(
-                    a_fp8, b_fp8, output_f16,
-                    m, n, k,
-                    a_scale, b_scale_scalar, stream,
-                )
-            }
-        }
-        // CUTLASS SM120 blockwise kernel — the .so is loaded and
-        // dispatchable, but its SFA ABI wants a [ceil(M/128), K/128] f32
-        // tensor, not the per-M a_scale vector we have here. That
-        // broadcast has to be staged by the caller (future: prefill
-        // scratch region + a K/128-wide broadcast kernel), so for now
-        // we route through the f32+scale_cols path which preserves
-        // channelscale correctly. The `RVLLM_FP8_GEMM_CUTLASS_SM120`
-        // opt-in at the top takes the SoSm120 fast path for M>=128;
-        // below that we land here.
-        CutlassBackend::SoSm120(_) => {
-            if b_chscale != 0 {
-                fallback_f32_scale_cast()
-            } else {
-                cublaslt.fp8_gemm(
-                    a_fp8, b_fp8, output_f16,
-                    m, n, k,
-                    a_scale, b_scale_scalar, stream,
-                )
-            }
-        }
-        // Exhaustiveness for #[non_exhaustive] CutlassBackend — a
-        // future variant lands here with a typed error rather than
-        // aborting the process, so adding a new backend can never
-        // silently panic in prod. The explicit arms above stay the
-        // source of truth; this is the default-deny for unknowns.
-        _ => Err(rvllm_core::RvllmError::cutlass(
-            rvllm_core::CutlassError::FeatureNotAvailable {
-                op: "fp8_gemm_channelscale (unknown CutlassBackend variant)",
-            },
-            rvllm_core::CutlassCtx {
-                kernel: "fp8_gemm_channelscale",
-                stream,
-            },
-        )),
-    }
-}
-
-#[cfg(feature = "cuda")]
-unsafe fn launch_scale_rows_f32_ratio(
-    kernel: KernelFn,
-    data: u64,
-    scale: u64,
-    m: u32,
-    n: u32,
-    stream: u64,
-) -> Result<()> {
-    let total = m * n;
-    let mut data = data;
-    let mut scale = scale;
-    let mut m_i = m as i32;
-    let mut n_i = n as i32;
-    let args = [
-        (&mut data) as *mut u64 as *mut core::ffi::c_void,
-        (&mut scale) as *mut u64 as *mut core::ffi::c_void,
-        (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
-        (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
-    ];
-    let block = (256u32, 1, 1);
-    let grid = ((total + 255) / 256, 1, 1);
-    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
-}
-
-/// CUTLASS FP8 GEMM with row×col scale epilogue + sm_121 fallback.
-///
-/// On SM80/89/90 this delegates straight to the CUTLASS `.so`
-/// wrapper (`cutlass_fp8_gemm_channelscale`), which applies the full
-/// per-token row scale × per-channel column scale epilogue.
-///
-/// On sm_121 (`CutlassBackend::Absent`) cuBLASLt's FP8
-/// `OUTER_VEC_32F` channelscale path doesn't produce a matmul
-/// heuristic for Blackwell consumer (`heuristic LaunchFailed`), so
-/// we fall back to the **scalar-scaled** FP8 matmul:
-/// `cublaslt.fp8_gemm(..., a_scale, b_scale_scalar)`. The
-/// per-channel b_chscale vector is intentionally dropped — this
-/// incurs a known PPL regression vs the CUTLASS path, documented
-/// as a follow-up. A proper channelscale kernel for sm_121 (native
-/// mma.sync + column-scale epilogue) is the next GB10 perf PR.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn fp8_gemm_channelscale_or_fallback(
-    cutlass: &CutlassBackend,
-    cublaslt: &CublasLt,
-    fn_f32_to_f16: KernelFn,
-    fn_scale_cols_f32: KernelFn,
-    fn_scale_rows_f32_ratio: KernelFn,
-    output_f16: u64,
-    a_fp8: u64,
-    b_fp8: u64,
-    a_scale: u64,
-    b_chscale: u64,
-    // Optional per-(N/128, K/128) blockscale, row-major, passed DIRECTLY
-    // to CUTLASS prep_sfb. `0` when weights were fused (e.g. QKV /
-    // gate_up where multi-part blockwise reconstruction is undefined);
-    // in that case the CUTLASS path is skipped and we fall through to
-    // the channelscale-preserving fallback. Not interchangeable with
-    // `b_chscale` — the latter is [rows] per-row scale, the former is
-    // [n_blocks, k_blocks] 2-D block scale.
-    b_blockscale: u64,
-    b_scale_scalar: u64,
-    m: i32,
-    n: i32,
-    k: i32,
-    scratch_f32: u64,
-    cutlass_workspace: u64,
-    cutlass_workspace_bytes: usize,
-    stream: u64,
-) -> Result<()> {
-    // Safety rail from PR review: `b_chscale != 0` means the real
-    // per-channel scale lives in the vector; `b_scale_scalar` is a
-    // sentinel 1.0 set by the loader. Any fallback arm that ignores
-    // `b_chscale` would multiply raw FP8 bytes by 1.0 and emit
-    // garbage. Every arm below must either
-    //   (a) consume `b_chscale` (the full row×col channelscale path),
-    //   (b) be guaranteed unreachable when `b_chscale != 0`, or
-    //   (c) fall through to the channelscale-preserving f32+scale_cols
-    //       path at the tail of this function.
-    // The cuBLASLt scalar `fp8_gemm(..., b_scale_scalar)` shortcut is
-    // reserved for the `b_chscale == 0` case (true scalar-scale
-    // weights).
-    debug_assert!(
-        b_chscale != 0 || b_scale_scalar != 0,
-        "fp8_gemm_channelscale_or_fallback called with both b_chscale \
-         and b_scale_scalar == 0 — no scale source",
-    );
-    // CUTLASS SM120 blockwise path — default ON when a `SoSm120`
-    // backend is loaded with all four prep symbols present (SFA bytes /
-    // SFB bytes / prep SFA / prep SFB). Older `libcutlass_sm120.so`
-    // builds without the prep helpers fall through to cuBLASLt.
-    // Measured on GB10 Gemma 4 31B decode: batch=128 461→555 tok/s
-    // (+20%), batch=256 665→909 tok/s (+37%). Opt-OUT via
-    // `RVLLM_FP8_GEMM_CUTLASS_SM120=0` for regression diagnosis.
-    //
-    // The CUTLASS cooperative blockwise kernel is built with a 128×128
-    // MMA tile and hard-asserts `M >= 128` (sm90_gemm_tma_warpspecialized_
-    // cooperative.hpp:371). Gate the dispatch so small-batch decode
-    // (M=num_seqs < 128) still gets routed through the cuBLASLt
-    // fallback below.
-    // CUTLASS blockwise path requires a proper 2-D b_blockscale. When
-    // the loader fused a weight (QKV / gate_up) it cannot reconstruct
-    // a consistent blockscale across parts (different shards ship
-    // different block alignments), so blockscale_ptr is `None` →
-    // b_blockscale == 0 here. In that case fall through to cuBLASLt
-    // channelscale fallback — feeding the per-row channelscale to
-    // CUTLASS's prep_sfb produces silently-wrong output (the kernel
-    // interprets it as [n_blocks, k_blocks] and reads completely
-    // unrelated row entries for the K/V output regions, which is
-    // exactly how aa01001pftrope0 manifested).
-    let cutlass_sm120_enabled = m >= 128
-        && b_blockscale != 0
-        && std::env::var("RVLLM_FP8_GEMM_CUTLASS_SM120").ok().as_deref() != Some("0");
-    if cutlass_sm120_enabled {
-        if let CutlassBackend::SoSm120(lib) = cutlass {
-            if lib.prep_sfa.is_some() && lib.prep_sfb.is_some() {
-                let sfa_bytes = lib.sfa_bytes(m, k);
-                let _sfb_bytes = lib.sfb_bytes(n, k);
-                // 16-byte-align the SFB offset inside scratch_f32.
-                let sfa_aligned = (sfa_bytes + 15) & !15;
-                let sfa_ptr = scratch_f32;
-                let sfb_ptr = scratch_f32 + sfa_aligned as u64;
-                lib.launch_prep_sfa(a_scale, sfa_ptr, m, k, stream)?;
-                lib.launch_prep_sfb(b_blockscale, sfb_ptr, n, k, stream)?;
-                return cutlass.launch_fp8_gemm_blockscale_sm120(
-                    output_f16,
-                    a_fp8,
-                    b_fp8,
-                    sfa_ptr,
-                    sfb_ptr,
-                    m,
-                    n,
-                    k,
-                    cutlass_workspace,
-                    cutlass_workspace_bytes,
-                    stream,
-                );
-            }
-        }
-    }
-    // Channelscale-preserving fallback for the sm_121 / SoSm120
-    // paths. cuBLASLt's scalar `fp8_gemm(..., b_scale_scalar)` is
-    // the shortcut when there's no per-channel scale to apply; when
-    // `b_chscale != 0` we can NOT use that shortcut (see the
-    // safety rail at the top of this fn — raw FP8 × 1.0 would
-    // land in the output). Instead route through:
-    //   1. FP8 GEMM into the f32 scratch region, no per-channel
-    //      scale yet → result has baked-in a_scale × 1.0.
-    //   2. scale_cols_f32 multiplies each column by `b_chscale[n]`.
-    //   3. cast f32 → f16 into the actual output buffer.
-    // Slower than a fused CUTLASS channelscale GEMM but correct.
-    // `scratch_f32` must be sized for `m * n * sizeof(f32)` — the
-    // caller guarantees this (same `gemm_f32_tmp` region the
-    // existing fp8_gemm_f32 path uses).
-    let fallback_f32_scale_cast = || -> Result<()> {
-        cublaslt.fp8_gemm_f32(
-            a_fp8, b_fp8, scratch_f32,
-            m, n, k,
-            a_scale, b_scale_scalar,
-            stream,
-        )?;
-        // cuBLASLt on sm_121 only supports SCALAR B_SCALE mode; the
-        // FP8 GEMM above applied `a_scale[0]` uniformly to every
-        // output row. For M>1 with per-token activation scales this
-        // under/over-scales rows 1..M-1 by `a_scale[m] / a_scale[0]`.
-        // Correct it with the ratio kernel. At M=1 the kernel is a
-        // no-op (row 0 stays put) so decode stays bit-identical.
-        if m > 1 {
-            launch_scale_rows_f32_ratio(
-                fn_scale_rows_f32_ratio,
-                scratch_f32, a_scale,
-                m as u32, n as u32, stream,
-            )?;
-        }
         if b_chscale != 0 {
             launch_scale_cols_f32(
                 fn_scale_cols_f32,
