@@ -914,7 +914,7 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
     int head_dim,
     int block_size,
     int max_blocks_per_seq,
-    int /*window_size_left*/                     // TODO: sliding window
+    int window_size_left
 ) {
     const int seq_idx  = blockIdx.x;
     const int head_idx = blockIdx.y;
@@ -929,6 +929,16 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
     const float q_scale = *q_descale;
     const float k_scale = *k_descale;
     const float v_scale = *v_descale;
+
+    // Sliding-window left boundary. `window_size_left < 0` = full
+    // context (global attention). Otherwise the decode query at
+    // absolute KV position `context_len - 1` can only attend back
+    // to `window_start = max(0, context_len - 1 - window_size_left)`.
+    // kv_pos < window_start → score = -FLT_MAX (masked).
+    const int decode_q_abs_pos = context_len - 1;
+    const int window_start = (window_size_left < 0)
+        ? 0
+        : max(0, decode_q_abs_pos - window_size_left);
 
     extern __shared__ float smem[];
     float* s_key    = smem;
@@ -988,7 +998,9 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
         }
         __syncthreads();
 
-        // Q * K^T per tile column.
+        // Q * K^T per tile column, with left-window mask applied
+        // before softmax. `window_size_left < 0` (global) → window_start
+        // is 0 → kv_pos >= 0 always, no-op mask.
         for (int t = 0; t < tile_len; t++) {
             float dot = 0.0f;
             for (int r = 0; r < dims_per_thread && r < 8; r++) {
@@ -998,11 +1010,18 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
                 }
             }
             dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
-            if (tid == 0) s_score[t] = dot;
+            if (tid == 0) {
+                int kv_pos = tile_start + t;
+                s_score[t] = (kv_pos < window_start) ? -FLT_MAX : dot;
+            }
             __syncthreads();
         }
 
-        // Online softmax update.
+        // Online softmax update. Masked columns carry -FLT_MAX so
+        // their exp is 0 and they contribute nothing to the row sum.
+        // The `s_score[t] > -FLT_MAX + 1.0f` guard on the exp pass
+        // keeps the sum numerically clean (otherwise exp(-FLT_MAX -
+        // row_max) can become NaN on some architectures).
         float tile_max = -FLT_MAX;
         if (tid == 0) {
             for (int t = 0; t < tile_len; t++) tile_max = fmaxf(tile_max, s_score[t]);
@@ -1024,7 +1043,12 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
         if (tid == 0) {
             float tsum = 0.0f;
             for (int t = 0; t < tile_len; t++) {
-                float v = expf(s_score[t] - row_max);
+                // Masked entries (window-left) carry -FLT_MAX; skip
+                // the exp to keep the sum exact and avoid the
+                // platform-specific NaN that expf(-FLT_MAX) can
+                // produce on some archs.
+                float v = (s_score[t] > -FLT_MAX + 1.0f)
+                            ? expf(s_score[t] - row_max) : 0.0f;
                 s_score[t] = v;
                 tsum += v;
             }
@@ -1117,7 +1141,7 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
     int head_dim,
     int block_size,
     int max_blocks_per_seq,
-    int /*window_size_left*/
+    int window_size_left
 ) {
     const int seq_idx  = blockIdx.x;
     const int head_idx = blockIdx.y;
@@ -1132,6 +1156,12 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
     const float q_scale = *q_descale;
     const float k_scale = *k_descale;
     const float v_scale = *v_descale;
+
+    // Sliding-window boundary — see BC=32 sibling for the full note.
+    const int decode_q_abs_pos = context_len - 1;
+    const int window_start = (window_size_left < 0)
+        ? 0
+        : max(0, decode_q_abs_pos - window_size_left);
 
     extern __shared__ float smem[];
     // BC=16 layout: [16 * head_dim K tile, 16 * head_dim V tile, 16 scores, smem reduce]
@@ -1196,7 +1226,10 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
                 }
             }
             dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
-            if (tid == 0) s_score[t] = dot;
+            if (tid == 0) {
+                int kv_pos = tile_start + t;
+                s_score[t] = (kv_pos < window_start) ? -FLT_MAX : dot;
+            }
             __syncthreads();
         }
 
@@ -1221,7 +1254,8 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
         if (tid == 0) {
             float tsum = 0.0f;
             for (int t = 0; t < tile_len; t++) {
-                float v = expf(s_score[t] - row_max);
+                float v = (s_score[t] > -FLT_MAX + 1.0f)
+                            ? expf(s_score[t] - row_max) : 0.0f;
                 s_score[t] = v;
                 tsum += v;
             }
@@ -1458,7 +1492,7 @@ __global__ void flash_attention_2_prefill_fp8kv_kernel(
     int head_dim,
     int block_size,
     int max_blocks_per_seq,
-    int /*window_size_left*/                     // sliding-window follow-up
+    int window_size_left
 ) {
     const int seq_idx  = blockIdx.x;
     const int head_idx = blockIdx.y;
@@ -1478,6 +1512,12 @@ __global__ void flash_attention_2_prefill_fp8kv_kernel(
     const float q_scale = *q_descale;
     const float k_scale = *k_descale;
     const float v_scale = *v_descale;
+
+    // Sliding-window left bound — see decode kernel. `window_size_left`
+    // is per-query in prefill; compute the floor inside the qi loop so
+    // each query row gets the right window anchored at its absolute
+    // KV position.
+    const bool has_window = window_size_left >= 0;
 
     extern __shared__ float smem[];
     float* s_key    = smem;
@@ -1537,10 +1577,14 @@ __global__ void flash_attention_2_prefill_fp8kv_kernel(
             }
             __syncthreads();
 
-            // Q * K^T + causal mask.
-            // Standard prefill causal: Q token at position (context_len - q_len + qi)
+            // Q * K^T + causal mask + optional left-window mask.
+            // Causal: Q token at position (context_len - q_len + qi)
             // in the KV sequence can attend to KV positions 0..=that_pos.
+            // Sliding window: additionally mask out `kv_pos <
+            // max(0, q_abs_kv_pos - window_size_left)`.
             const int q_abs_kv_pos = context_len - q_len + qi;
+            const int window_start = has_window
+                ? max(0, q_abs_kv_pos - window_size_left) : 0;
             for (int t = 0; t < tile_len; t++) {
                 float dot = 0.0f;
                 for (int r = 0; r < dims_per_thread && r < 8; r++) {
@@ -1552,7 +1596,8 @@ __global__ void flash_attention_2_prefill_fp8kv_kernel(
                 dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
                 if (tid == 0) {
                     int kv_pos = tile_start + t;
-                    s_score[t] = (kv_pos > q_abs_kv_pos) ? -FLT_MAX : dot;
+                    bool out_of_window = (kv_pos > q_abs_kv_pos) || (kv_pos < window_start);
+                    s_score[t] = out_of_window ? -FLT_MAX : dot;
                 }
                 __syncthreads();
             }
@@ -1659,7 +1704,7 @@ __global__ void flash_attention_2_prefill_fp8kv_bc16_kernel(
     int head_dim,
     int block_size,
     int max_blocks_per_seq,
-    int /*window_size_left*/
+    int window_size_left
 ) {
     const int seq_idx  = blockIdx.x;
     const int head_idx = blockIdx.y;
@@ -1679,6 +1724,8 @@ __global__ void flash_attention_2_prefill_fp8kv_bc16_kernel(
     const float q_scale = *q_descale;
     const float k_scale = *k_descale;
     const float v_scale = *v_descale;
+
+    const bool has_window = window_size_left >= 0;
 
     extern __shared__ float smem[];
     float* s_key    = smem;
@@ -1737,6 +1784,8 @@ __global__ void flash_attention_2_prefill_fp8kv_bc16_kernel(
             __syncthreads();
 
             const int q_abs_kv_pos = context_len - q_len + qi;
+            const int window_start = has_window
+                ? max(0, q_abs_kv_pos - window_size_left) : 0;
             for (int t = 0; t < tile_len; t++) {
                 float dot = 0.0f;
                 for (int r = 0; r < dims_per_thread && r < 8; r++) {
@@ -1748,7 +1797,8 @@ __global__ void flash_attention_2_prefill_fp8kv_bc16_kernel(
                 dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
                 if (tid == 0) {
                     int kv_pos = tile_start + t;
-                    s_score[t] = (kv_pos > q_abs_kv_pos) ? -FLT_MAX : dot;
+                    bool out_of_window = (kv_pos > q_abs_kv_pos) || (kv_pos < window_start);
+                    s_score[t] = out_of_window ? -FLT_MAX : dot;
                 }
                 __syncthreads();
             }
