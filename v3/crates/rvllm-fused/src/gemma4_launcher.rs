@@ -247,15 +247,14 @@ impl FusedRopePartialFp8KvLaunch {
     }
 
     /// Kernel sig: `(q, k, v, q_fp8, key_cache, value_cache,
-    ///   k_scale_cache, v_scale_cache, cos, sin, positions,
-    ///   slot_mapping, q_scale, num_tokens, num_heads, num_kv_heads,
-    ///   head_dim, rotary_dim)`.
+    ///   k_scale_cache, v_scale_cache, q_scale_cache, cos, sin,
+    ///   positions, slot_mapping, q_scale, num_tokens, num_heads,
+    ///   num_kv_heads, head_dim, rotary_dim)`.
     ///
-    /// `k_scale_cache` and `v_scale_cache` are `[num_slots_total *
-    /// num_kv_heads]` f32 arrays. The kernel computes per-(slot,
-    /// head) amax and writes the matching scale into these buffers.
-    /// Downstream attention kernels read the per-slot scale instead
-    /// of the old per-tensor `kv_scale`.
+    /// `q_scale_cache`: optional `[num_tokens * num_heads]` f32
+    /// scratch. When non-null the rope kernel computes per-(token,
+    /// head) Q amax and writes a dynamic scale; when null the kernel
+    /// falls back to the scalar `q_scale_ptr`.
     ///
     /// # Safety
     /// Caller owns all device pointers.
@@ -271,6 +270,7 @@ impl FusedRopePartialFp8KvLaunch {
         v_cache_fp8: u64,
         k_scale_cache: u64,
         v_scale_cache: u64,
+        q_scale_cache: u64,
         cos: u64,
         sin: u64,
         positions: u64,
@@ -287,6 +287,7 @@ impl FusedRopePartialFp8KvLaunch {
         let mut v_cache_fp8 = v_cache_fp8;
         let mut k_scale_cache = k_scale_cache;
         let mut v_scale_cache = v_scale_cache;
+        let mut q_scale_cache = q_scale_cache;
         let mut cos = cos;
         let mut sin = sin;
         let mut positions = positions;
@@ -306,6 +307,7 @@ impl FusedRopePartialFp8KvLaunch {
             (&mut v_cache_fp8) as *mut u64 as *mut core::ffi::c_void,
             (&mut k_scale_cache) as *mut u64 as *mut core::ffi::c_void,
             (&mut v_scale_cache) as *mut u64 as *mut core::ffi::c_void,
+            (&mut q_scale_cache) as *mut u64 as *mut core::ffi::c_void,
             (&mut cos) as *mut u64 as *mut core::ffi::c_void,
             (&mut sin) as *mut u64 as *mut core::ffi::c_void,
             (&mut positions) as *mut u64 as *mut core::ffi::c_void,

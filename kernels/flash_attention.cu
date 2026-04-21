@@ -903,8 +903,10 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
     const unsigned char* __restrict__ query,     // [num_seqs, num_heads, head_dim] fp8
     const unsigned char* __restrict__ key_cache, // [num_blocks, block_size, num_kv_heads, head_dim] fp8
     const unsigned char* __restrict__ value_cache,
-    const float* __restrict__ k_scale_cache,     // [num_blocks*block_size*num_kv_heads] per-slot f32
-    const float* __restrict__ v_scale_cache,     // [num_blocks*block_size*num_kv_heads] per-slot f32
+    const float* __restrict__ k_scale_cache,     // per-slot f32, OR nullptr -> use k_descale_fallback
+    const float* __restrict__ v_scale_cache,     // per-slot f32, OR nullptr -> use v_descale_fallback
+    const float* __restrict__ k_descale_fallback,// scalar, used only if k_scale_cache==nullptr
+    const float* __restrict__ v_descale_fallback,// scalar, used only if v_scale_cache==nullptr
     const int* __restrict__ block_tables,        // [num_seqs, max_blocks_per_seq]
     const int* __restrict__ context_lens,        // [num_seqs]
     const float* __restrict__ q_descale,         // single scalar
@@ -927,6 +929,13 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
                                                          : (head_idx / (num_heads / num_kv_heads));
 
     const float q_scale = *q_descale;
+    // Per-slot KV scales (Gemma 4) or scalar fallback (Llama/Qwen).
+    // Branch is on a per-launch parameter so the compiler can hoist
+    // it out of the inner tile loop.
+    const bool k_perslot = (k_scale_cache != nullptr);
+    const bool v_perslot = (v_scale_cache != nullptr);
+    const float k_scale_scalar = k_perslot ? 0.0f : __ldg(k_descale_fallback);
+    const float v_scale_scalar = v_perslot ? 0.0f : __ldg(v_descale_fallback);
 
     // Sliding-window left boundary. `window_size_left < 0` = full
     // context (global attention). Otherwise the decode query at
@@ -984,7 +993,9 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
                 int page_off = kv_pos % block_size;
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                 int slot = phys_block * block_size + page_off;
-                float k_scale = __ldg(&k_scale_cache[slot * num_kv_heads + kv_head_idx]);
+                float k_scale = k_perslot
+                    ? __ldg(&k_scale_cache[slot * num_kv_heads + kv_head_idx])
+                    : k_scale_scalar;
                 const unsigned char* k_row = key_cache
                     + (slot * num_kv_heads + kv_head_idx) * head_dim;
                 unsigned long long k8 = __ldg(
@@ -1069,7 +1080,9 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
                 int page_off = kv_pos % block_size;
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                 int slot = phys_block * block_size + page_off;
-                float v_scale = __ldg(&v_scale_cache[slot * num_kv_heads + kv_head_idx]);
+                float v_scale = v_perslot
+                    ? __ldg(&v_scale_cache[slot * num_kv_heads + kv_head_idx])
+                    : v_scale_scalar;
                 const unsigned char* v_row = value_cache
                     + (slot * num_kv_heads + kv_head_idx) * head_dim;
                 unsigned long long v8 = __ldg(
@@ -1132,6 +1145,8 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
     const unsigned char* __restrict__ value_cache,
     const float* __restrict__ k_scale_cache,
     const float* __restrict__ v_scale_cache,
+    const float* __restrict__ k_descale_fallback,
+    const float* __restrict__ v_descale_fallback,
     const int* __restrict__ block_tables,
     const int* __restrict__ context_lens,
     const float* __restrict__ q_descale,
@@ -1154,6 +1169,10 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
                                                          : (head_idx / (num_heads / num_kv_heads));
 
     const float q_scale = *q_descale;
+    const bool k_perslot = (k_scale_cache != nullptr);
+    const bool v_perslot = (v_scale_cache != nullptr);
+    const float k_scale_scalar = k_perslot ? 0.0f : __ldg(k_descale_fallback);
+    const float v_scale_scalar = v_perslot ? 0.0f : __ldg(v_descale_fallback);
 
     // Sliding-window boundary — see BC=32 sibling for the full note.
     const int decode_q_abs_pos = context_len - 1;
@@ -1202,7 +1221,9 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
                 int page_off = kv_pos % block_size;
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                 int slot = phys_block * block_size + page_off;
-                float k_scale = __ldg(&k_scale_cache[slot * num_kv_heads + kv_head_idx]);
+                float k_scale = k_perslot
+                    ? __ldg(&k_scale_cache[slot * num_kv_heads + kv_head_idx])
+                    : k_scale_scalar;
                 const unsigned char* k_row = key_cache
                     + (slot * num_kv_heads + kv_head_idx) * head_dim;
                 unsigned long long k8 = __ldg(
@@ -1275,7 +1296,9 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
                 int page_off = kv_pos % block_size;
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                 int slot = phys_block * block_size + page_off;
-                float v_scale = __ldg(&v_scale_cache[slot * num_kv_heads + kv_head_idx]);
+                float v_scale = v_perslot
+                    ? __ldg(&v_scale_cache[slot * num_kv_heads + kv_head_idx])
+                    : v_scale_scalar;
                 const unsigned char* v_row = value_cache
                     + (slot * num_kv_heads + kv_head_idx) * head_dim;
                 unsigned long long v8 = __ldg(
