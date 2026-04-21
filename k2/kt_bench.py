@@ -45,7 +45,7 @@ async def wait_ready(base_url: str, model: str, timeout_s: float) -> dict[str, A
         "stream": False,
     }
     deadline = time.monotonic() + timeout_s
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300, sock_read=300)) as session:
         while time.monotonic() < deadline:
             try:
                 async with session.post(
@@ -75,7 +75,8 @@ async def smoke_chat(base_url: str, model: str, prompt: str, max_tokens: int) ->
         async with session.post(f"{base_url}/v1/chat/completions", json=payload) as resp:
             body = await resp.json()
     elapsed = time.perf_counter() - start
-    choice = body["choices"][0]["message"]["content"]
+    message = body["choices"][0]["message"]
+    choice = message.get("content") or message.get("reasoning_content") or ""
     usage = body.get("usage", {})
     completion_tokens = usage.get("completion_tokens", 0)
     return {
@@ -223,48 +224,63 @@ async def throughput_bench(
     }
 
 
-async def ppl_probe(base_url: str, text: str) -> dict[str, Any]:
-    payload = {
-        "text": text,
-        "sampling_params": {
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "max_new_tokens": 1,
-        },
-        "return_logprob": True,
-        "logprob_start_len": 0,
-        "top_logprobs_num": 0,
-        "return_text_in_logprobs": False,
-        "stream": False,
-    }
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600)) as session:
-        async with session.post(f"{base_url}/generate", json=payload) as resp:
-            body = await resp.json()
-    meta = body.get("meta_info", {})
-    token_logprobs = meta.get("input_token_logprobs")
-    if not token_logprobs:
-        return {"ok": False, "body": body}
-
+async def ppl_probe(base_url: str, text: str, chunk_char_limit: int) -> dict[str, Any]:
+    chunks = [text[i : i + chunk_char_limit] for i in range(0, len(text), chunk_char_limit)] or [text]
     vals: list[float] = []
-    for item in token_logprobs:
-        if not item:
-            continue
-        lp = item[0]
-        if lp is None:
-            continue
-        vals.append(float(lp))
+    failed_chunk: dict[str, Any] | None = None
+    timeout = aiohttp.ClientTimeout(total=600)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for idx, chunk in enumerate(chunks):
+            payload = {
+                "text": chunk,
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "max_new_tokens": 1,
+                },
+                "return_logprob": True,
+                "logprob_start_len": 0,
+                "top_logprobs_num": 0,
+                "return_text_in_logprobs": False,
+                "stream": False,
+            }
+            try:
+                async with session.post(f"{base_url}/generate", json=payload) as resp:
+                    body = await resp.json()
+            except Exception as exc:  # noqa: BLE001
+                failed_chunk = {"chunk_index": idx, "error": repr(exc)}
+                break
+
+            meta = body.get("meta_info", {})
+            token_logprobs = meta.get("input_token_logprobs")
+            if not token_logprobs:
+                failed_chunk = {"chunk_index": idx, "body": body}
+                break
+
+            for item in token_logprobs:
+                if not item:
+                    continue
+                lp = item[0]
+                if lp is None:
+                    continue
+                vals.append(float(lp))
 
     if not vals:
-        return {"ok": False, "body": body}
+        return {"ok": False, "failed_chunk": failed_chunk}
 
     avg_nll = -sum(vals) / len(vals)
     ppl = math.exp(avg_nll)
-    return {
-        "ok": True,
+    result = {
+        "ok": failed_chunk is None,
         "tokens": len(vals),
         "avg_nll": avg_nll,
         "perplexity": ppl,
+        "chunks": len(chunks),
+        "chunk_char_limit": chunk_char_limit,
     }
+    if failed_chunk is not None:
+        result["failed_chunk"] = failed_chunk
+    return result
 
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
@@ -300,7 +316,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             }
         )
-    ppl = await ppl_probe(base_url, ppl_text)
+    ppl = await ppl_probe(base_url, ppl_text, args.ppl_chunk_char_limit)
 
     return {
         "base_url": base_url,
@@ -328,6 +344,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-completion-tokens", type=int, default=2048)
     p.add_argument("--ppl-text-file")
     p.add_argument("--ppl-char-limit", type=int, default=DEFAULT_PPL_CHAR_LIMIT)
+    p.add_argument("--ppl-chunk-char-limit", type=int, default=512)
     p.add_argument("--output", default="-")
     return p.parse_args()
 

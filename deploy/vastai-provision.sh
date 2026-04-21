@@ -11,15 +11,21 @@ set -euo pipefail
 DISK_GB=${DISK_GB:-100}
 GPU_TYPE=${GPU_TYPE:-"H100_SXM"}
 GPU_RAM_MIN=${GPU_RAM_MIN:-75}
+CPU_RAM_MIN=${CPU_RAM_MIN:-0}
 
 RVLLM_IMAGE="pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel"
 
 MODE="${1:---rvllm}"
 
+SEARCH_FILTER="gpu_name=$GPU_TYPE gpu_ram>=${GPU_RAM_MIN} num_gpus=1 inet_down>200 disk_space>=${DISK_GB}"
+if [[ "$CPU_RAM_MIN" != "0" ]]; then
+    SEARCH_FILTER="$SEARCH_FILTER cpu_ram>=${CPU_RAM_MIN}"
+fi
+
 if [[ "$MODE" == "--dry-run" ]]; then
-    echo "Searching for $GPU_TYPE instances (>=${GPU_RAM_MIN}GB VRAM)..."
+    echo "Searching for $GPU_TYPE instances (>=${GPU_RAM_MIN}GB VRAM, >=${DISK_GB}GB disk, >=${CPU_RAM_MIN}GB host RAM)..."
     vastai search offers \
-        "gpu_name=$GPU_TYPE gpu_ram>=${GPU_RAM_MIN} num_gpus=1 inet_down>200 disk_space>=${DISK_GB}" \
+        "$SEARCH_FILTER" \
         --order "dph_total" \
         --limit 5
     exit 0
@@ -30,7 +36,7 @@ echo "=== Provisioning rvllm instance ==="
 echo "Image: $RVLLM_IMAGE"
 
 vastai search offers \
-    "gpu_name=$GPU_TYPE gpu_ram>=${GPU_RAM_MIN} num_gpus=1 inet_down>200 disk_space>=${DISK_GB}" \
+    "$SEARCH_FILTER" \
     --order "dph_total" \
     --limit 5
 
