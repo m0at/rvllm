@@ -1387,7 +1387,13 @@ impl Gemma4Bringup {
         let positions = arena.region("gen_pos", (max_tokens * 4) as usize, 16)?;
         let slot_mapping = arena.region("gen_slot", (max_tokens * 4) as usize, 16)?;
         let context_lens = arena.region("gen_ctx", 4, 16)?;
-        let cu_seqlens_q = arena.region("gen_cu_seqlens", 8, 16)?;
+        // Sized for max_tokens i32 entries (not just the 2-entry prefix
+        // sum): the unified decode-per-qi attention loop reuses this
+        // region to stage a per-qi context-lens array `[1, 2, ..., N]`
+        // and indexes it by `qi * 4`. With only 8 bytes (old FA2
+        // prefill layout) writing beyond entry 1 corrupted adjacent
+        // arena regions and degenerated generation quality.
+        let cu_seqlens_q = arena.region("gen_cu_seqlens", (max_tokens * 4) as usize, 16)?;
         let block_tables = arena.region("gen_bt", (max_blocks_per_seq * 4) as usize, 16)?;
         {
             let bt: Vec<i32> = (0..max_blocks_per_seq as i32).collect();

@@ -33,10 +33,7 @@ use rvllm_fused::gemma4_launcher;
 use rvllm_fused::FusedRmsnormFp8QuantLaunch;
 use rvllm_kernels::KernelFn;
 
-use rvllm_attention::{
-    AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams,
-    PagedPrefillFp8Launcher, PagedPrefillParams,
-};
+use rvllm_attention::{AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams};
 
 use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
@@ -602,12 +599,27 @@ pub unsafe fn gemma4_forward_phase(
                 )?;
             }
         }
-        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q, num_seqs } => {
-            // Prefill always uses FP8 KV path (no F16 prefill kernel available)
+        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q: _, num_seqs: _ } => {
+            // Prefill always uses FP8 KV path (no F16 prefill kernel).
             rope_fp8kv(dims, kernels, scratch, meta, stream)?;
-            let prefill_params = PagedPrefillParams {
-                num_tokens: dims.num_tokens,
-                num_seqs,
+
+            // Unified attention: replace the dedicated FA2 multi-query
+            // prefill kernel with a loop of single-query decode kernel
+            // calls — one per prompt position qi. Per-qi context_lens
+            // value is NOT rewritten via HtoD each iteration (that
+            // races against the non-default stream); instead we reuse
+            // the `cu_seqlens_q` scratch region as a pre-populated
+            // device array `[1, 2, ..., num_tokens]` and let decode
+            // read ctx = (qi+1) by pointing into it at offset qi.
+            // By construction this is bit-identical to the per-token
+            // decode path rvllm-ppl validates.
+            //
+            // Cost: prompt_len extra kernel launches per layer. At
+            // prompt_len<=~64 this is dominated by the layer GEMMs.
+            // A proper multi-query FA2 kernel that reuses this math
+            // is a perf follow-up; correctness comes first.
+            let decode_params = PagedDecodeParams {
+                num_seqs: 1,
                 num_heads: dims.num_heads,
                 num_kv_heads: dims.num_kv_heads,
                 head_dim: dims.head_dim,
@@ -617,26 +629,44 @@ pub unsafe fn gemma4_forward_phase(
                 scale: dims.attn_scale,
                 window_size_left,
             };
-            // SM90 decode + SM89 prefill: the SM90 Varlen kernel exceeds H100's 232KB
-            // smem limit at hdim>=256. SM89 prefill works at all head dims.
-            // Prefill runs once per request; decode (SM90, CUDA graphed) is the hot path.
-            let prefill = PagedPrefillFp8Launcher::new(global_attention);
-            prefill.launch(
-                prefill_params,
-                scratch.attn_out,
-                scratch.q_fp8,
-                scratch.k_cache,
-                scratch.v_cache,
-                meta.block_tables,
-                meta.context_lens,
+            let decode = PagedDecodeFp8Launcher::new(attention);
+            let o_stride_bytes =
+                (dims.num_heads as u64) * (dims.head_dim as u64) * 2; // f16
+            let q_fp8_stride_bytes = (dims.num_heads as u64) * (dims.head_dim as u64); // fp8
+
+            // Pre-populate cu_seqlens_q region with [1, 2, ..., num_tokens]
+            // via a small host→device copy on THIS stream (async with
+            // pageable src; cudarc routes through the stream handle).
+            // We reuse cu_seqlens_q because it's already sized
+            // `(num_tokens + 1) * 4 bytes` and otherwise unused once
+            // the unified attention replaces the FA2 prefill kernel.
+            let ctx_host: Vec<i32> =
+                (1..=dims.num_tokens as i32).collect();
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                 cu_seqlens_q,
-                scratch.fa3_workspace,
-                scratch.q_scale_ptr,
-                scratch.kv_scale_ptr,
-                scratch.kv_scale_ptr,
-                max_seqlen_q,
-                stream,
-            )?;
+                ctx_host.as_ptr() as *const _,
+                (ctx_host.len() * 4) as _,
+                stream as _,
+            );
+
+            for qi in 0..dims.num_tokens {
+                decode.launch(
+                    decode_params,
+                    scratch.attn_out + (qi as u64) * o_stride_bytes,
+                    scratch.q_fp8 + (qi as u64) * q_fp8_stride_bytes,
+                    scratch.k_cache,
+                    scratch.v_cache,
+                    meta.block_tables,
+                    cu_seqlens_q + (qi as u64) * 4,
+                    scratch.fa3_workspace,
+                    scratch.q_scale_ptr,
+                    scratch.kv_scale_ptr,
+                    scratch.kv_scale_ptr,
+                    stream,
+                )?;
+            }
+            // Ensure ctx_host lives until the stream has consumed it.
+            std::hint::black_box(&ctx_host);
         }
     }
     #[cfg(not(feature = "cuda"))]
