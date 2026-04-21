@@ -436,7 +436,7 @@ pub unsafe fn gemma4_forward_phase(
         )?;
     } else if weights.qkv_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
-            cutlass, cublaslt, kernels.f32_to_f16_sat,
+            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32,
             scratch.q_out, scratch.hidden_fp8, weights.qkv_fp8,
             scratch.hidden_scale, weights.qkv_chscale, weights.qkv_scale,
             dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
@@ -813,7 +813,7 @@ pub unsafe fn gemma4_forward_phase(
         )?;
     } else if weights.gate_up_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
-            cutlass, cublaslt, kernels.f32_to_f16_sat,
+            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32,
             scratch.gate_up_out, scratch.hidden_fp8, weights.gate_up_fp8,
             scratch.hidden_scale, weights.gate_up_chscale, weights.gate_up_scale,
             dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
@@ -1003,6 +1003,7 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     cutlass: &CutlassBackend,
     cublaslt: &CublasLt,
     fn_f32_to_f16: KernelFn,
+    fn_scale_cols_f32: KernelFn,
     output_f16: u64,
     a_fp8: u64,
     b_fp8: u64,
@@ -1017,7 +1018,23 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     cutlass_workspace_bytes: usize,
     stream: u64,
 ) -> Result<()> {
-    let _ = fn_f32_to_f16; // only used by future f32+cast path
+    // Safety rail from PR review: `b_chscale != 0` means the real
+    // per-channel scale lives in the vector; `b_scale_scalar` is a
+    // sentinel 1.0 set by the loader. Any fallback arm that ignores
+    // `b_chscale` would multiply raw FP8 bytes by 1.0 and emit
+    // garbage. Every arm below must either
+    //   (a) consume `b_chscale` (the full row×col channelscale path),
+    //   (b) be guaranteed unreachable when `b_chscale != 0`, or
+    //   (c) fall through to the channelscale-preserving f32+scale_cols
+    //       path at the tail of this function.
+    // The cuBLASLt scalar `fp8_gemm(..., b_scale_scalar)` shortcut is
+    // reserved for the `b_chscale == 0` case (true scalar-scale
+    // weights).
+    debug_assert!(
+        b_chscale != 0 || b_scale_scalar != 0,
+        "fp8_gemm_channelscale_or_fallback called with both b_chscale \
+         and b_scale_scalar == 0 — no scale source",
+    );
     // CUTLASS SM120 blockwise path — opt-in via
     // `RVLLM_FP8_GEMM_CUTLASS_SM120=1`. Requires a `SoSm120` backend
     // with all four prep symbols present (SFA bytes/SFB bytes/prep
@@ -1056,7 +1073,43 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
             }
         }
     }
-    let _ = scratch_f32;
+    // Channelscale-preserving fallback for the sm_121 / SoSm120
+    // paths. cuBLASLt's scalar `fp8_gemm(..., b_scale_scalar)` is
+    // the shortcut when there's no per-channel scale to apply; when
+    // `b_chscale != 0` we can NOT use that shortcut (see the
+    // safety rail at the top of this fn — raw FP8 × 1.0 would
+    // land in the output). Instead route through:
+    //   1. FP8 GEMM into the f32 scratch region, no per-channel
+    //      scale yet → result has baked-in a_scale × 1.0.
+    //   2. scale_cols_f32 multiplies each column by `b_chscale[n]`.
+    //   3. cast f32 → f16 into the actual output buffer.
+    // Slower than a fused CUTLASS channelscale GEMM but correct.
+    // `scratch_f32` must be sized for `m * n * sizeof(f32)` — the
+    // caller guarantees this (same `gemm_f32_tmp` region the
+    // existing fp8_gemm_f32 path uses).
+    let fallback_f32_scale_cast = || -> Result<()> {
+        cublaslt.fp8_gemm_f32(
+            a_fp8, b_fp8, scratch_f32,
+            m, n, k,
+            a_scale, b_scale_scalar,
+            stream,
+        )?;
+        if b_chscale != 0 {
+            launch_scale_cols_f32(
+                fn_scale_cols_f32,
+                scratch_f32, b_chscale,
+                m as u32, n as u32, stream,
+            )?;
+        }
+        // `Bf16ToF16SatLaunch` has the (dst, src, n) ABI we need;
+        // name refers to the historical caller, the launched kernel
+        // is `f32_to_f16_sat`.
+        gemma4_launcher::Bf16ToF16SatLaunch {
+            n: (m * n) as u32,
+        }
+        .launch(fn_f32_to_f16, output_f16, scratch_f32, stream)
+    };
+
     match cutlass {
         CutlassBackend::So(_) => cutlass.launch_fp8_gemm_channelscale(
             output_f16,
@@ -1071,35 +1124,37 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
             cutlass_workspace_bytes,
             stream,
         ),
-        CutlassBackend::Absent => cublaslt.fp8_gemm(
-            a_fp8,
-            b_fp8,
-            output_f16,
-            m,
-            n,
-            k,
-            a_scale,
-            b_scale_scalar,
-            stream,
-        ),
+        CutlassBackend::Absent => {
+            if b_chscale != 0 {
+                fallback_f32_scale_cast()
+            } else {
+                cublaslt.fp8_gemm(
+                    a_fp8, b_fp8, output_f16,
+                    m, n, k,
+                    a_scale, b_scale_scalar, stream,
+                )
+            }
+        }
         // CUTLASS SM120 blockwise kernel — the .so is loaded and
         // dispatchable, but its SFA ABI wants a [ceil(M/128), K/128] f32
         // tensor, not the per-M a_scale vector we have here. That
         // broadcast has to be staged by the caller (future: prefill
         // scratch region + a K/128-wide broadcast kernel), so for now
-        // we route through cuBLASLt (same path as `Absent`). The hand-
-        // rolled sm_121 kernel remains the opt-in path above.
-        CutlassBackend::SoSm120(_) => cublaslt.fp8_gemm(
-            a_fp8,
-            b_fp8,
-            output_f16,
-            m,
-            n,
-            k,
-            a_scale,
-            b_scale_scalar,
-            stream,
-        ),
+        // we route through the f32+scale_cols path which preserves
+        // channelscale correctly. The `RVLLM_FP8_GEMM_CUTLASS_SM120`
+        // opt-in at the top takes the SoSm120 fast path for M>=128;
+        // below that we land here.
+        CutlassBackend::SoSm120(_) => {
+            if b_chscale != 0 {
+                fallback_f32_scale_cast()
+            } else {
+                cublaslt.fp8_gemm(
+                    a_fp8, b_fp8, output_f16,
+                    m, n, k,
+                    a_scale, b_scale_scalar, stream,
+                )
+            }
+        }
         // Exhaustiveness for #[non_exhaustive] CutlassBackend — a
         // future variant lands here with a typed error rather than
         // aborting the process, so adding a new backend can never
