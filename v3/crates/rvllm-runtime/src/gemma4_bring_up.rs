@@ -544,8 +544,11 @@ impl Gemma4Bringup {
                     f16_kv: f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0"),
                 };
 
-                let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
-                let v_out = k_out + (num_seqs as u64) * (kv_dim as u64) * 2;
+                // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
+                // point at row 0's K / V sub-slice. The rmsnorm kernel
+                // applies `src_row_stride` to reach later tokens.
+                let k_out = q_base + (q_dim as u64) * 2;
+                let v_out = k_out + (kv_dim as u64) * 2;
                 let is_global = lt == Gemma4LayerType::GlobalAttention;
                 let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
@@ -935,8 +938,11 @@ impl Gemma4Bringup {
                     f16_kv: f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0"),
                 };
 
-                let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
-                let v_out = k_out + (num_seqs as u64) * (kv_dim as u64) * 2;
+                // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
+                // point at row 0's K / V sub-slice. The rmsnorm kernel
+                // applies `src_row_stride` to reach later tokens.
+                let k_out = q_base + (q_dim as u64) * 2;
+                let v_out = k_out + (kv_dim as u64) * 2;
                 let is_global = lt == Gemma4LayerType::GlobalAttention;
                 let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
@@ -1510,17 +1516,95 @@ impl Gemma4Bringup {
         // prompt through the same per-token decode path rvllm-ppl
         // uses — attention operator is identical, cost is TTFT
         // linear in prompt_len.
-        for (i, &tok) in prompt_ids.iter().enumerate() {
-            run_one_token(tok, i)?;
+        let skip_decode = std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
+        let use_batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
+        if !skip_decode && !use_batch_prefill {
+            for (i, &tok) in prompt_ids.iter().enumerate() {
+                run_one_token(tok, i)?;
+            }
         }
-        // Dead prefill block retained behind `if false`; flip when
-        // the remaining multi-token bug is fixed.
-        if false {
+
+        // Optional prefill-vs-decode residual compare (RVLLM_DIAG_COMPARE=1).
+        // Captures the last-token residual produced by per-token decode
+        // (correct reference), resets KV, re-runs the prompt via batch
+        // prefill, captures the same row, and prints the diff. Combine
+        // with `RVLLM_MAX_LAYERS=N` to bisect where the two paths
+        // diverge. Only fires when prompt_len > 1 (decode==prefill
+        // trivially at prompt_len=1).
+        let diag_compare =
+            std::env::var_os("RVLLM_DIAG_COMPARE").is_some() && !skip_decode;
+        let mut decode_ref_last: Vec<u16> = Vec::new();
+        let mut decode_ref_first: Vec<u16> = Vec::new();
+        if diag_compare && prompt_len > 1 {
+            // Already captured: residual_ptr holds LAST token's residual
+            // after all prompt tokens were processed sequentially.
+            self.stream.fence()?;
+            decode_ref_last = vec![0u16; hidden as usize];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                decode_ref_last.as_mut_ptr() as *mut _,
+                residual_ptr,
+                (hidden * 2) as _,
+            );
+
+            // For FIRST token reference, re-run just token 0 through
+            // a fresh KV cache — the residual after that step is what
+            // prefill's row 0 should match (no prior context at
+            // position 0 in either path).
+            cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
+            self.stream.fence()?;
+            run_one_token(prompt_ids[0], 0)?;
+            self.stream.fence()?;
+            decode_ref_first = vec![0u16; hidden as usize];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                decode_ref_first.as_mut_ptr() as *mut _,
+                residual_ptr,
+                (hidden * 2) as _,
+            );
+
+            // Reset KV again before prefill re-runs the whole prompt.
+            cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
+            self.stream.fence()?;
+        }
+
+        // Dead prefill block retained behind `if false`; flip to the
+        // diag gate to re-run the prompt through batch prefill
+        // (correctness is still broken — this path is instrumentation,
+        // not production). `skip_decode` takes the prefill path
+        // standalone so the existing DBG probes fire on prefill's
+        // layer 0 / layer 1 for direct comparison against a normal
+        // decode-only run.
+        if (diag_compare && prompt_len > 1) || skip_decode || (use_batch_prefill && prompt_len > 1) {
             let tok_ids: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
             token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
+            // Readback sanity-check: confirm the device buffer actually
+            // holds the full prompt before the gather kernel runs.
+            self.stream.fence()?;
+            let mut readback = vec![0i32; prompt_len as usize];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                readback.as_mut_ptr() as *mut _,
+                token_ids_region.device_ptr(),
+                (prompt_len * 4) as _,
+            );
+            eprintln!("[DIAG] token_ids_region readback = {:?}", readback);
             rvllm_fused::EmbeddingGatherLaunch { num_tokens: prompt_len, hidden, vocab }
                 .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
                     token_ids_region.device_ptr(), stream)?;
+            // Also read back rows 0 and N-1 of residual IMMEDIATELY
+            // after the gather, BEFORE any layers run.
+            self.stream.fence()?;
+            let mut r0 = vec![0u16; 4];
+            let mut rN = vec![0u16; 4];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(r0.as_mut_ptr() as *mut _, residual_ptr, 8);
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                rN.as_mut_ptr() as *mut _,
+                residual_ptr + ((prompt_len - 1) as u64 * hidden as u64 * 2),
+                8,
+            );
+            eprintln!(
+                "[DIAG] post-gather row0[..4]={:?} rowN-1[..4]={:?}",
+                r0.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
+                rN.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
+            );
 
             let pos: Vec<i32> = (0..prompt_len as i32).collect();
             let slot: Vec<i32> = (0..prompt_len as i32).collect();
@@ -1583,8 +1667,14 @@ impl Gemma4Bringup {
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
                 };
-                let k_out = q_base + (prompt_len as u64) * (q_dim as u64) * 2;
-                let v_out = k_out + (prompt_len as u64) * (kv_dim as u64) * 2;
+                // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
+                // point at row 0's K / V sub-slice. The rmsnorm kernel
+                // applies `src_row_stride` to reach later tokens — the
+                // old `num_tokens * q_dim * 2` formula assumed a
+                // columnar "all Q then all K then all V" layout that
+                // the cuBLASLt QKV GEMM does NOT produce.
+                let k_out = q_base + (q_dim as u64) * 2;
+                let v_out = k_out + (kv_dim as u64) * 2;
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (self.model.rope_cos_sliding.offset_bytes, self.model.rope_sin_sliding.offset_bytes),
                     Gemma4LayerType::GlobalAttention => (self.model.rope_cos_global.offset_bytes, self.model.rope_sin_global.offset_bytes),
@@ -1619,12 +1709,65 @@ impl Gemma4Bringup {
                 )?;
             }
 
+            // Diag capture BEFORE the extract-last memcpy: row 0 is
+            // the first-token output (no prior context); row
+            // prompt_len-1 is the last-token output the LM head
+            // consumes. Without this ordering, the memcpy below
+            // would clobber row 0 with row N-1 and the row-0
+            // comparison would falsely report a bug.
+            self.stream.fence()?;
+            let mut prefill_first = vec![0u16; hidden as usize];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                prefill_first.as_mut_ptr() as *mut _,
+                residual_ptr,
+                (hidden * 2) as _,
+            );
+            let mut prefill_last = vec![0u16; hidden as usize];
+            let last_off_diag = (prompt_len - 1) as u64 * hidden as u64 * 2;
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                prefill_last.as_mut_ptr() as *mut _,
+                residual_ptr + last_off_diag,
+                (hidden * 2) as _,
+            );
+
             // Extract last token's residual for decode
             if prompt_len > 1 {
                 let last_offset = (prompt_len - 1) as u64 * hidden as u64 * 2;
                 cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                     residual_ptr, residual_ptr + last_offset, (hidden * 2) as usize, stream as _,
                 );
+            }
+
+            if !diag_compare {
+                if skip_decode { return Ok(Vec::new()); }
+                // use_batch_prefill: fall through to LM head.
+            } else {
+                let stats = |label: &str, reference: &[u16], probe: &[u16]| {
+                    let mut max_abs = 0f32;
+                    let mut sum_sq_diff = 0f64;
+                    let mut sum_sq_ref = 0f64;
+                    let mut first_diffs: Vec<(f32, f32)> = Vec::new();
+                    for i in 0..hidden as usize {
+                        let d = crate::bring_up::f16_to_f32(reference[i]);
+                        let p = crate::bring_up::f16_to_f32(probe[i]);
+                        let diff = (d - p).abs();
+                        if diff > max_abs { max_abs = diff; }
+                        sum_sq_diff += (diff as f64) * (diff as f64);
+                        sum_sq_ref += (d as f64) * (d as f64);
+                        if first_diffs.len() < 4 { first_diffs.push((d, p)); }
+                    }
+                    let rel_err = (sum_sq_diff / sum_sq_ref.max(1e-18)).sqrt();
+                    eprintln!(
+                        "[DIAG {label}] max_abs={max_abs:.4} rel_err={rel_err:.4e} \
+                         first4_ref_probe={first_diffs:?}",
+                    );
+                };
+                eprintln!(
+                    "[DIAG] max_layers={} prompt_len={} hidden={}",
+                    max_layers, prompt_len, hidden,
+                );
+                stats("row=0 (first token)", &decode_ref_first, &prefill_first);
+                stats("row=N-1 (last token)", &decode_ref_last, &prefill_last);
             }
         }
 
