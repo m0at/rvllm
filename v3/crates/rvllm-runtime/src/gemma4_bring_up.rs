@@ -1681,12 +1681,64 @@ impl Gemma4Bringup {
         // prompt through the same per-token decode path rvllm-ppl
         // uses — attention operator is identical, cost is TTFT
         // linear in prompt_len.
-        for (i, &tok) in prompt_ids.iter().enumerate() {
-            run_one_token(tok, i)?;
+        let skip_decode = std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
+        let use_batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
+        if !skip_decode && !use_batch_prefill {
+            for (i, &tok) in prompt_ids.iter().enumerate() {
+                run_one_token(tok, i)?;
+            }
         }
-        // Dead prefill block retained behind `if false`; flip when
-        // the remaining multi-token bug is fixed.
-        if false {
+
+        // Optional prefill-vs-decode residual compare (RVLLM_DIAG_COMPARE=1).
+        // Captures the last-token residual produced by per-token decode
+        // (correct reference), resets KV, re-runs the prompt via batch
+        // prefill, captures the same row, and prints the diff. Combine
+        // with `RVLLM_MAX_LAYERS=N` to bisect where the two paths
+        // diverge. Only fires when prompt_len > 1 (decode==prefill
+        // trivially at prompt_len=1).
+        let diag_compare =
+            std::env::var_os("RVLLM_DIAG_COMPARE").is_some() && !skip_decode;
+        let mut decode_ref_last: Vec<u16> = Vec::new();
+        let mut decode_ref_first: Vec<u16> = Vec::new();
+        if diag_compare && prompt_len > 1 {
+            // Already captured: residual_ptr holds LAST token's residual
+            // after all prompt tokens were processed sequentially.
+            self.stream.fence()?;
+            decode_ref_last = vec![0u16; hidden as usize];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                decode_ref_last.as_mut_ptr() as *mut _,
+                residual_ptr,
+                (hidden * 2) as _,
+            );
+
+            // For FIRST token reference, re-run just token 0 through
+            // a fresh KV cache — the residual after that step is what
+            // prefill's row 0 should match (no prior context at
+            // position 0 in either path).
+            cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
+            self.stream.fence()?;
+            run_one_token(prompt_ids[0], 0)?;
+            self.stream.fence()?;
+            decode_ref_first = vec![0u16; hidden as usize];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                decode_ref_first.as_mut_ptr() as *mut _,
+                residual_ptr,
+                (hidden * 2) as _,
+            );
+
+            // Reset KV again before prefill re-runs the whole prompt.
+            cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
+            self.stream.fence()?;
+        }
+
+        // Dead prefill block retained behind `if false`; flip to the
+        // diag gate to re-run the prompt through batch prefill
+        // (correctness is still broken — this path is instrumentation,
+        // not production). `skip_decode` takes the prefill path
+        // standalone so the existing DBG probes fire on prefill's
+        // layer 0 / layer 1 for direct comparison against a normal
+        // decode-only run.
+        if (diag_compare && prompt_len > 1) || skip_decode || (use_batch_prefill && prompt_len > 1) {
             let tok_ids: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
             token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
             // Readback sanity-check: confirm the device buffer actually
@@ -1706,17 +1758,17 @@ impl Gemma4Bringup {
             // after the gather, BEFORE any layers run.
             self.stream.fence()?;
             let mut r0 = vec![0u16; 4];
-            let mut r_n_minus_1 = vec![0u16; 4];
+            let mut rN = vec![0u16; 4];
             cudarc::driver::sys::cuMemcpyDtoH_v2(r0.as_mut_ptr() as *mut _, residual_ptr, 8);
             cudarc::driver::sys::cuMemcpyDtoH_v2(
-                r_n_minus_1.as_mut_ptr() as *mut _,
+                rN.as_mut_ptr() as *mut _,
                 residual_ptr + ((prompt_len - 1) as u64 * hidden as u64 * 2),
                 8,
             );
             eprintln!(
                 "[DIAG] post-gather row0[..4]={:?} rowN-1[..4]={:?}",
                 r0.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
-                r_n_minus_1.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
+                rN.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
             );
 
             let pos: Vec<i32> = (0..prompt_len as i32).collect();
