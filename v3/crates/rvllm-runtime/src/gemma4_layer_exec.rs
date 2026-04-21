@@ -33,10 +33,7 @@ use rvllm_fused::gemma4_launcher;
 use rvllm_fused::FusedRmsnormFp8QuantLaunch;
 use rvllm_kernels::KernelFn;
 
-use rvllm_attention::{
-    AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams,
-    PagedPrefillFp8Launcher, PagedPrefillParams,
-};
+use rvllm_attention::{AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams};
 
 use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
@@ -621,93 +618,21 @@ pub unsafe fn gemma4_forward_phase(
             // Prefill always uses FP8 KV path (no F16 prefill kernel).
             rope_fp8kv(dims, kernels, scratch, meta, stream)?;
 
-            // --- Unified multi-Q prefill fast path (sm_121) -----------
-            // `flash_attention_2_prefill_fp8kv_unified_kernel` handles
-            // all prompt tokens of one sequence in ONE kernel launch
-            // per layer. See v3/UNIFIED_PREFILL_SPEC.md. We route
-            // through it whenever:
-            //   * the attention backend is Fa2Ptx (sm_121),
-            //   * the PTX module + symbol loaded (`has_unified_prefill`),
-            //   * `RVLLM_UNIFIED_PREFILL` isn't explicitly set to "0".
-            // Otherwise we fall back to the decode-per-qi loop below —
-            // retained both as a bisect tool and as the reference path
-            // rvllm-ppl validates bit-for-bit.
-            let unified_enabled = std::env::var_os("RVLLM_UNIFIED_PREFILL")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-            let fa2_unified = if unified_enabled {
-                match attention {
-                    rvllm_attention::AttentionBackend::Fa2Ptx(k) if k.has_unified_prefill() => true,
-                    _ => false,
-                }
-            } else {
-                false
-            };
-            if fa2_unified && dims.num_tokens > 1 {
-                let prefill_params = rvllm_attention::PagedPrefillParams {
-                    num_tokens: dims.num_tokens,
-                    num_seqs: 1,
-                    num_heads: dims.num_heads,
-                    num_kv_heads: dims.num_kv_heads,
-                    head_dim: dims.head_dim,
-                    block_size: dims.block_size,
-                    max_blocks_per_seq: dims.max_blocks_per_seq,
-                    num_blocks_total: dims.num_blocks_total,
-                    scale: dims.attn_scale,
-                    window_size_left,
-                };
-                // Tile size picked so smem stays inside the sm_121
-                // 99 KB opt-in cap (see UNIFIED_PREFILL_SPEC §params).
-                let tile_size = if dims.head_dim <= 256 { 32u32 } else { 16u32 };
-                let num_queries_per_kv = dims.num_heads / dims.num_kv_heads;
-                let block_q = rvllm_attention::UNIFIED_PREFILL_BLOCK_M / num_queries_per_kv.max(1);
-                // Q·Kᵀ MMA is opt-in during bring-up (Phase F3).
-                // `RVLLM_UNIFIED_PREFILL_MMA=1` flips on the
-                // sm_121a `mma.sync.kind::f8f6f4` tensor-core path;
-                // unset / `0` keeps the scalar FMA reference.
-                let use_mma = std::env::var_os("RVLLM_UNIFIED_PREFILL_MMA")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-                let unified = rvllm_attention::UnifiedPrefillParams {
-                    num_queries_per_kv,
-                    tile_size,
-                    block_q,
-                    use_mma,
-                };
-                let prefill = rvllm_attention::PagedPrefillFp8Launcher::new(attention);
-                prefill.launch_fp8kv_unified_sm121(
-                    prefill_params,
-                    unified,
-                    scratch.attn_out,
-                    scratch.q_fp8,
-                    scratch.k_cache,
-                    scratch.v_cache,
-                    scratch.k_scale_cache,
-                    scratch.v_scale_cache,
-                    scratch.q_scale_cache,
-                    0, // k_descale_fallback (unused when per-slot populated)
-                    0, // v_descale_fallback
-                    meta.block_tables,
-                    cu_seqlens_q,
-                    meta.context_lens,
-                    scratch.q_scale_ptr,
-                    stream,
-                )?;
-            } else {
-            // --- Decode-per-qi fallback -------------------------------
-            // Replaces batch prefill with a loop of single-query decode
-            // kernel calls — one per prompt position qi. Per-qi
-            // context_lens value is NOT rewritten via HtoD each
-            // iteration (that races against the non-default stream);
-            // instead we reuse the `cu_seqlens_q` scratch region as a
-            // pre-populated device array `[1, 2, ..., num_tokens]`
-            // and let decode read ctx = (qi+1) by pointing into it at
-            // offset qi. By construction this is bit-identical to the
-            // per-token decode path rvllm-ppl validates.
+            // Unified attention: replace the dedicated FA2 multi-query
+            // prefill kernel with a loop of single-query decode kernel
+            // calls — one per prompt position qi. Per-qi context_lens
+            // value is NOT rewritten via HtoD each iteration (that
+            // races against the non-default stream); instead we reuse
+            // the `cu_seqlens_q` scratch region as a pre-populated
+            // device array `[1, 2, ..., num_tokens]` and let decode
+            // read ctx = (qi+1) by pointing into it at offset qi.
+            // By construction this is bit-identical to the per-token
+            // decode path rvllm-ppl validates.
             //
-            // Cost: prompt_len extra kernel launches per layer — the
-            // ≈30× TTFT gap against vLLM that motivated the unified
-            // kernel above.
+            // Cost: prompt_len extra kernel launches per layer. At
+            // prompt_len<=~64 this is dominated by the layer GEMMs.
+            // A proper multi-query FA2 kernel that reuses this math
+            // is a perf follow-up; correctness comes first.
             let decode_params = PagedDecodeParams {
                 num_seqs: 1,
                 num_heads: dims.num_heads,
@@ -723,16 +648,6 @@ pub unsafe fn gemma4_forward_phase(
             let o_stride_bytes =
                 (dims.num_heads as u64) * (dims.head_dim as u64) * 2; // f16
             let q_fp8_stride_bytes = (dims.num_heads as u64) * (dims.head_dim as u64); // fp8
-            // Per-(token, head) Q scale cache stride. Rope writes at
-            // `q_scale_cache[token_idx * num_heads + head_idx]` (see
-            // fused_rope_partial_fp8kv.cu). Per-qi decode reads at
-            // `q_scale_cache[seq_idx * num_heads + head_idx]` with
-            // seq_idx=0 (num_seqs=1 per launch), so we must advance
-            // the pointer by `qi * num_heads * sizeof::<f32>()` just
-            // like the Q FP8 pointer — otherwise token qi gets token 0's
-            // scale and prefill logits diverge from the per-token
-            // decode reference.
-            let q_scale_stride_bytes = (dims.num_heads as u64) * 4;
 
             // Pre-populate cu_seqlens_q region with [1, 2, ..., num_tokens]
             // via a small host→device copy on THIS stream (async with
@@ -750,32 +665,23 @@ pub unsafe fn gemma4_forward_phase(
             );
 
             for qi in 0..dims.num_tokens {
-                let q_scale_cache_qi = if scratch.q_scale_cache != 0 {
-                    scratch.q_scale_cache + (qi as u64) * q_scale_stride_bytes
-                } else {
-                    0
-                };
                 decode.launch(
                     decode_params,
                     scratch.attn_out + (qi as u64) * o_stride_bytes,
                     scratch.q_fp8 + (qi as u64) * q_fp8_stride_bytes,
                     scratch.k_cache,
                     scratch.v_cache,
-                    scratch.k_scale_cache,
-                    scratch.v_scale_cache,
-                    q_scale_cache_qi,
-                    0, // k_descale_fallback (unused when per-slot populated)
-                    0, // v_descale_fallback
                     meta.block_tables,
                     cu_seqlens_q + (qi as u64) * 4,
                     scratch.fa3_workspace,
                     scratch.q_scale_ptr,
+                    scratch.kv_scale_ptr,
+                    scratch.kv_scale_ptr,
                     stream,
                 )?;
             }
             // Ensure ctx_host lives until the stream has consumed it.
             std::hint::black_box(&ctx_host);
-            } // end of decode-per-qi fallback
         }
     }
     #[cfg(not(feature = "cuda"))]
