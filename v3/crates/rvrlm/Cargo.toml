@@ -1,0 +1,22 @@
+[package]
+name = "rvrlm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+cuda = ["dep:rvllm-core", "dep:rvllm-runtime", "dep:rvllm-kernels", "dep:tokenizers", "rvllm-runtime/cuda"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rhai = { version = "1.24", features = ["serde"] }
+rvllm-core = { workspace = true, optional = true }
+rvllm-runtime = { workspace = true, optional = true }
+rvllm-kernels = { workspace = true, optional = true }
+tokenizers = { version = "0.20", optional = true }

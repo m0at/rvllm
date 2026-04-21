@@ -16,6 +16,7 @@ members = [
     "crates/rvllm-bench",
     "crates/rvllm-deploy",
     "crates/rvllm-invariants",
+    "crates/rvrlm",
 ]
 
 [workspace.package]
@@ -38,6 +39,7 @@ rvllm-graph     = { path = "crates/rvllm-graph" }
 rvllm-loader    = { path = "crates/rvllm-loader" }
 rvllm-sampling  = { path = "crates/rvllm-sampling" }
 rvllm-runtime   = { path = "crates/rvllm-runtime" }
+rvrlm           = { path = "crates/rvrlm" }
 
 half = "2"
 serde = { version = "1", features = ["derive"] }

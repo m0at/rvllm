@@ -21,9 +21,13 @@ path = "src/bin/rvllm_eval.rs"
 name = "rvllm-ppl"
 path = "src/bin/rvllm_ppl.rs"
 
+[[bin]]
+name = "rvrlm-bench"
+path = "src/bin/rvrlm_bench.rs"
+
 [features]
 default = []
-cuda = ["rvllm-runtime/cuda", "rvllm-fused/cuda", "rvllm-mem/cuda", "dep:cudarc"]
+cuda = ["rvllm-runtime/cuda", "rvllm-fused/cuda", "rvllm-mem/cuda", "rvrlm/cuda", "dep:cudarc"]
 
 [dependencies]
 rvllm-core = { workspace = true }
@@ -32,6 +36,7 @@ rvllm-fused = { workspace = true }
 rvllm-mem = { workspace = true }
 rvllm-kernels = { workspace = true }
 rvllm-cutlass = { workspace = true }
+rvrlm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokenizers = "0.20"

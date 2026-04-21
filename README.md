@@ -237,6 +237,35 @@ Every kernel has a known purpose, a pinned variant, and a workspace contract. No
 
 No fallbacks. Missing kernel .so = engine refuses to start.
 
+## rvRLM (experimental)
+
+`rvRLM` is the in-repo recursive language model runtime under [`v3/crates/rvrlm`](/Users/andy/rvllm/v3/crates/rvrlm). It is inspired by and explicitly attributed to [alexzhang13/rlm](https://github.com/alexzhang13/rlm), but the implementation here is native to this repo and wired into the existing `rvllm` CUDA backend instead of shelling out to an external harness.
+
+Current `rvRLM` surface:
+
+- Native recursive loop in Rust: iterative prompt construction, code-block execution, execution history, and `FINAL_ANSWER` termination.
+- Persistent local execution environment: an in-process Rust-native Rhai runtime per session, with `context`, `history`, `llm_query`, `rlm_query`, and registered tool calls available inside executed code.
+- Recursive subcalls: `rlm_query(...)` now spins a fresh child `rvRLM` engine with depth limits instead of routing back through a stub.
+- Native PPL surface: `Rlm::perplexity`, `ServeService::perplexity`, and `rvrlm-bench` can call the backend's runtime perplexity path directly.
+
+Build and run on GPU:
+
+```bash
+cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvrlm -p rvllm-bench
+
+RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
+RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
+RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
+RVRLM_PROMPT="Write one short sentence about recursive language models." \
+RVRLM_PPL_PROMPT="The quick brown fox jumps over the lazy dog." \
+RVLLM_ITERS=10 RVLLM_WARMUP=2 \
+  ./v3/target/release/rvrlm-bench
+```
+
+`rvrlm-bench` emits throughput, ms/request, cold/hot TTFT, and, when `RVRLM_PPL_PROMPT` is set, native perplexity fields from the same service surface.
+
 ## v3 crate map
 
 ```
