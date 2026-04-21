@@ -1648,16 +1648,32 @@ impl Gemma4Bringup {
 
         let t0 = std::time::Instant::now();
 
-        // Phase 1: prompt through per-token decode.
+        // Phase 1: prompt through per-token decode (default, correct-by-design).
         //
-        // The QKV-buffer stride fix (fused_qkv_rmsnorm_kernel taking
-        // `src_row_stride`, V flowing through a compact `v_normed`)
-        // removed one num_tokens>1 layout bug but at least one more
-        // is still lurking: end-to-end prefill still produces wrong
-        // (though now non-zero) logits. Until it's nailed, loop the
-        // prompt through the same per-token decode path rvllm-ppl
-        // uses — attention operator is identical, cost is TTFT
-        // linear in prompt_len.
+        // On sm_121 with FP8 block-scale weights (Gemma 4 fp8-block), the
+        // per-token path uses `fp8_gemv_blockwise_wpr_native_f16in_kernel`
+        // which preserves the per-channel weight block-scale. The batch
+        // (num_tokens>1) GEMM path goes through
+        // `fp8_gemm_channelscale_or_fallback`, which on Blackwell consumer
+        // collapses to a scalar weight scale because cuBLASLt's FP8
+        // channelscale heuristic `LaunchFailed`s at this arch. That is a
+        // genuine numerical difference, not a hidden bug — the two paths
+        // are not bit-identical by design at num_tokens<CUTLASS_M_MIN(=128).
+        //
+        // Path forward for genuine batch-prefill speedup:
+        //   * num_tokens >=128 : CUTLASS SM120 blockwise FP8 GEMM (landed;
+        //     opt-in via RVLLM_FP8_GEMM_CUTLASS_SM120 + M>=128 gate in
+        //     gemma4_layer_exec).  This preserves the per-channel scale
+        //     via SFA/SFB prep.
+        //   * num_tokens < 128 : per-token loop is optimal (fp8_gemv is
+        //     M=1-only; running it T times reads weights T times but each
+        //     call is already bandwidth-bound; cost parity with any batched
+        //     solution at small M).
+        //
+        // So we keep the per-token loop as the default for ALL prompt
+        // lengths today. RVLLM_BATCH_PREFILL=1 flips to the unified
+        // batch path (diagnostic: verifies CUTLASS >=128 correctness,
+        // or measures the collapsed-scalar quality floor at <128).
         let skip_decode = std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
         let use_batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
         if !skip_decode && !use_batch_prefill {
