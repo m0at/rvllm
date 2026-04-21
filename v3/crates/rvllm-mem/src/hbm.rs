@@ -106,6 +106,10 @@ impl<'ctx> HbmArena<'ctx> {
     /// memory allocated via `cuMemAlloc_v2` or `cuMemAllocManaged`
     /// (both pair with `cuMemFree_v2`). Anything else will leak or
     /// double-free at teardown.
+    // Only consumed by `UnifiedArena` under `feature = "gb10"`; `--features
+    // cuda` alone would flag it dead. Keep the seam symmetric across
+    // feature combos by gating the definition.
+    #[cfg(feature = "gb10")]
     pub(crate) fn from_raw_parts(base: u64, bytes: usize) -> Self {
         Self {
             base,
