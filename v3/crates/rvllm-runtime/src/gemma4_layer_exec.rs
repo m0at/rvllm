@@ -124,13 +124,6 @@ pub struct Gemma4LayerScratch {
     pub k_scale_cache: u64,
     /// Companion to `k_scale_cache` for V.
     pub v_scale_cache: u64,
-    /// Per-(token, head) f32 Q scale scratch for this layer, shape
-    /// `[num_tokens * num_heads]`. Written by the rope kernel when
-    /// non-null; read by decode attention on load. Unlike the K/V
-    /// caches this is transient — Q is consumed by THIS step's
-    /// attention only, so the same region can be reused across
-    /// layers and across per-token-decode iterations.
-    pub q_scale_cache: u64,
     pub attn_out: u64,
     pub attn_out_fp8: u64,
     pub attn_out_scale: u64,
@@ -603,9 +596,6 @@ pub unsafe fn gemma4_forward_phase(
                     scratch.v_cache,
                     scratch.k_scale_cache,
                     scratch.v_scale_cache,
-                    scratch.q_scale_cache,
-                    0, // k_descale_fallback (unused when per-slot populated)
-                    0, // v_descale_fallback
                     meta.block_tables,
                     meta.context_lens,
                     scratch.fa3_workspace,
@@ -671,12 +661,12 @@ pub unsafe fn gemma4_forward_phase(
                     scratch.q_fp8 + (qi as u64) * q_fp8_stride_bytes,
                     scratch.k_cache,
                     scratch.v_cache,
+                    scratch.k_scale_cache,
+                    scratch.v_scale_cache,
                     meta.block_tables,
                     cu_seqlens_q + (qi as u64) * 4,
                     scratch.fa3_workspace,
                     scratch.q_scale_ptr,
-                    scratch.kv_scale_ptr,
-                    scratch.kv_scale_ptr,
                     stream,
                 )?;
             }
@@ -1422,7 +1412,6 @@ unsafe fn rope_fp8kv(
         scratch.v_cache,
         scratch.k_scale_cache,
         scratch.v_scale_cache,
-        scratch.q_scale_cache,
         meta.cos,
         meta.sin,
         meta.positions,

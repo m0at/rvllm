@@ -59,7 +59,6 @@ __global__ void fused_rope_partial_fp8kv_kernel(
     __nv_fp8_e4m3* __restrict__ value_cache,
     float* __restrict__ k_scale_cache,    // [num_slots * num_kv_heads] f32 (per-slot-per-head K scale)
     float* __restrict__ v_scale_cache,    // [num_slots * num_kv_heads] f32 (per-slot-per-head V scale)
-    float* __restrict__ q_scale_cache,    // [num_tokens * num_heads] f32 (per-token-per-head Q scale)
     const __half* __restrict__ cos_table,
     const __half* __restrict__ sin_table,
     const int* __restrict__ positions,
@@ -78,17 +77,15 @@ __global__ void fused_rope_partial_fp8kv_kernel(
     const int tid         = threadIdx.x;
     if (tid >= half_head) return;
 
+    const float q_scale_inv = 1.0f / (*q_scale_ptr);
     const int pos = positions[token_idx];
     const bool q_perblock = (q_scale_cache != nullptr);
 
     __shared__ float warp_max[32];
 
     // =============== Q head ===============
-    // Per-(token, head) Q scale when `q_scale_cache != nullptr`,
-    // otherwise the global per-tensor scalar from `q_scale_ptr`. Q is
-    // consumed by THIS step's attention and never written to the KV
-    // cache, so the scale storage lives in a short-lived scratch and
-    // is indexed by `(token_idx, head_idx)`.
+    // Per-tensor scale is fine: Q is consumed by THIS step's attention,
+    // never written to the KV cache.
     if (head_idx < num_heads) {
         int q_base = (token_idx * num_heads + head_idx) * head_dim;
 
@@ -101,8 +98,10 @@ __global__ void fused_rope_partial_fp8kv_kernel(
             q_lo_val = q_lo * cos_val - q_hi * sin_val;
             q_hi_val = q_lo * sin_val + q_hi * cos_val;
         } else {
-            q_lo_val = __half2float(q_in[q_base + tid]);
-            q_hi_val = __half2float(q_in[q_base + tid + half_head]);
+            float q_lo = __half2float(q_in[q_base + tid]);
+            float q_hi = __half2float(q_in[q_base + tid + half_head]);
+            q_fp8_out[q_base + tid]             = __nv_fp8_e4m3(q_lo * q_scale_inv);
+            q_fp8_out[q_base + tid + half_head] = __nv_fp8_e4m3(q_hi * q_scale_inv);
         }
 
         float q_scale;

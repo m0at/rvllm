@@ -334,23 +334,20 @@ pub unsafe fn forward_phase(
                 window_size_left: -1,
             };
             // Llama/Qwen path: per-slot KV scales are not wired up for
-            // Llama/Qwen: use the scalar per-tensor KV scale fallback
-            // in the attention kernel. The per-slot scale cache is a
-            // Gemma 4-specific addition (rope writes per-(slot, head)
-            // amax into it); Llama/Qwen's rope still uses the per-
-            // tensor `kv_scale_ptr` calibration, so we pass that as
-            // `k_descale_fallback_ptr` / `v_descale_fallback_ptr`.
+            // this path yet — the Gemma 4 KV-scale precision refactor
+            // only landed the scale buffers in `Gemma4LayerScratch`.
+            // Pass 0 / 0 here so the build stays green; attempting to
+            // run decode through this launcher will read from a null
+            // per-slot scale pointer and crash. Safe until someone
+            // brings a Llama/Qwen prefill path online.
             decode.launch(
                 decode_params,
                 scratch.attn_out,
                 scratch.q_fp8,
                 scratch.k_cache,
                 scratch.v_cache,
-                0, // k_scale_cache (per-slot; not populated on Llama/Qwen)
-                0, // v_scale_cache
-                0, // q_scale_cache (Llama/Qwen uses scalar)
-                scratch.kv_scale_ptr, // k_descale_fallback (scalar)
-                scratch.kv_scale_ptr, // v_descale_fallback (scalar)
+                0, // k_scale_cache (per-slot, unused on Llama/Qwen)
+                0, // v_scale_cache (per-slot, unused on Llama/Qwen)
                 meta.block_tables,
                 meta.context_lens,
                 scratch.fa3_workspace,
