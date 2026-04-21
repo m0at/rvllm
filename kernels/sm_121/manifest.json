@@ -1,16 +1,6 @@
 {
   "arch": "sm_121",
   "entries": {
-    "activation": {
-      "bytes": 4636,
-      "path": "activation.ptx",
-      "sha256": "4c9aa51f8748fe16885460bdc09a4433ba8d53819ade352001cabd834139680a"
-    },
-    "activation_f16": {
-      "bytes": 5299,
-      "path": "activation_f16.ptx",
-      "sha256": "8ac5b4a3b7ee732f8a64e4a741b467038ca9e941d244b5ce7b3bb1c3258a2d10"
-    },
     "add_bias_f16": {
       "bytes": 6480,
       "path": "add_bias_f16.ptx",
@@ -76,16 +66,6 @@
       "path": "fp8_gemv.ptx",
       "sha256": "a64d135e9d3efd9211c1c73ceb5bf383aa0681a1eca6bb51e707da90540cbc09"
     },
-    "fp8_kv": {
-      "bytes": 18314,
-      "path": "fp8_kv.ptx",
-      "sha256": "38bbd07f2bfe4090f8042c47868f0c4884882b84809e19dd3d21e4f3de74bcc2"
-    },
-    "fp8_rescale": {
-      "bytes": 4909,
-      "path": "fp8_rescale.ptx",
-      "sha256": "dfa95e068052f2f28fdf670660c081502925ee1ae6746813321210ab93e7d0a9"
-    },
     "fused_gelu_mul_f16": {
       "bytes": 8634,
       "path": "fused_gelu_mul_f16.ptx",
@@ -146,11 +126,6 @@
       "path": "logit_softcap.ptx",
       "sha256": "6042d0a7f9357024081cb27dae63207f1c9558a54592afc0fb57783e943cbed0"
     },
-    "paged_attention": {
-      "bytes": 42278,
-      "path": "paged_attention.ptx",
-      "sha256": "8d04a5dc9187171dc828d8670ef149b22b03ca617d8ea0a90710aa7d0f259e5d"
-    },
     "paged_attention_sm89": {
       "bytes": 121426,
       "path": "paged_attention_sm89.ptx",
@@ -202,5 +177,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "fd8c674fb3e1378955d1c5d9486c632874ac8a93"
+  "revision": "62bdb9b600e69336c6b4fe3942089bf60ec29c32"
 }
