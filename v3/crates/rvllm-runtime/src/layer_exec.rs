@@ -268,7 +268,7 @@ pub unsafe fn forward_phase(
     // Suppress unused warnings when cuda feature is off.
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (cublaslt, kernels.add_bias_f16, plans, qkv_n);
+        let _ = (cublaslt, kernels.add_bias_f16, _plans, qkv_n);
     }
 
     #[cfg(feature = "cuda")]
@@ -520,7 +520,7 @@ pub unsafe fn forward_phase(
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (cutlass, plans, stream, kv_dim);
+        let _ = (_cutlass, _plans, stream, _kv_dim);
     }
     Ok(())
 }
