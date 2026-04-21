@@ -272,8 +272,15 @@ pub struct Fa2PtxKernels {
     pub flash_attention_mod: rvllm_kernels::LoadedModule,
     #[cfg(feature = "cuda")]
     pub fn_decode: rvllm_kernels::KernelFn,
+    /// `flash_attention_2_decode_f16io_kernel` — f16 I/O decode against
+    /// an f16 paged KV cache. Matches the `PagedDecodeLauncher` ABI so
+    /// sm_121 can serve `RVLLM_F16_KV=1` without f32<->f16 scratch.
+    /// Head-dim is capped at 256 by the smem budget (BC=32 with
+    /// head_dim=512 overflows the 99 KB opt-in ceiling); head_dim > 256
+    /// returns `FeatureNotAvailable` — that arm is Gemma 4 global
+    /// attention which must use FP8 KV today.
     #[cfg(feature = "cuda")]
-    pub fn_decode_f16kv: rvllm_kernels::KernelFn,
+    pub fn_decode_f16io: rvllm_kernels::KernelFn,
     #[cfg(feature = "cuda")]
     pub fn_prefill: rvllm_kernels::KernelFn,
     #[cfg(feature = "cuda")]
@@ -318,8 +325,8 @@ impl Fa2PtxKernels {
         {
             let flash_attention_mod = loader.load_ptx("flash_attention")?;
             let fn_decode = flash_attention_mod.get_function("flash_attention_2_decode_kernel")?;
-            let fn_decode_f16kv =
-                flash_attention_mod.get_function("flash_attention_2_decode_f16kv_kernel")?;
+            let fn_decode_f16io =
+                flash_attention_mod.get_function("flash_attention_2_decode_f16io_kernel")?;
             let fn_prefill = flash_attention_mod.get_function("flash_attention_2_kernel")?;
             let fn_prefill_f16kv =
                 flash_attention_mod.get_function("flash_attention_2_f16kv_kernel")?;
@@ -331,7 +338,7 @@ impl Fa2PtxKernels {
                 head_dim,
                 flash_attention_mod,
                 fn_decode,
-                fn_decode_f16kv,
+                fn_decode_f16io,
                 fn_prefill,
                 fn_prefill_f16kv,
                 fn_decode_fp8kv,

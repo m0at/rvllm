@@ -26,6 +26,14 @@ fn env_path(k: &str) -> Result<PathBuf, String> {
         .map(PathBuf::from)
 }
 
+/// Optional env var: returns `/dev/null` when missing. For paths that
+/// the sm_121 backend never opens (SM90-only .so files + policy).
+fn env_path_or_placeholder(k: &str) -> PathBuf {
+    std::env::var(k)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/dev/null"))
+}
+
 fn is_gemma4_model_dir(model_dir: &std::path::Path) -> Result<bool, String> {
     Ok(matches!(
         ModelConfig::load_hf(model_dir)
@@ -86,9 +94,9 @@ fn run() -> Result<(), String> {
     let paths = EnginePaths {
         model_dir: model_dir.clone(),
         kernels_dir: env_path("RVLLM_KERNELS_DIR")?,
-        cutlass_so: env_path("RVLLM_CUTLASS_SO")?,
-        fa3_so: env_path("RVLLM_FA3_SO")?,
-        policy_json: env_path("RVLLM_POLICY")?,
+        cutlass_so: env_path_or_placeholder("RVLLM_CUTLASS_SO"),
+        fa3_so: env_path_or_placeholder("RVLLM_FA3_SO"),
+        policy_json: env_path_or_placeholder("RVLLM_POLICY"),
     };
     let arena_gb: usize = std::env::var("RVLLM_ARENA_GB")
         .ok()

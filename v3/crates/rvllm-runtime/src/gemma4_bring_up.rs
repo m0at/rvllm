@@ -257,27 +257,42 @@ impl Gemma4Bringup {
             }
         };
 
-        let policy_bytes =
-            std::fs::read(&paths.policy_json).map_err(|source| rvllm_core::RvllmError::Io {
-                err: rvllm_core::IoError::from(&source),
-                path: paths.policy_json.clone(),
-                source,
+        // Sm121 uses CutlassBackend::SoSm120 or Absent; neither consumes
+        // the SM90 variant table, so the policy.json can stay unread on
+        // that target. Saves a mandatory env var + avoids rejecting a
+        // missing-or-placeholder file on GB10 runs.
+        let skip_policy =
+            matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121));
+        let (policy, variants): (Policy, Vec<_>) = if skip_policy {
+            let empty = Policy {
+                revision: String::new(),
+                arch: "sm_121".into(),
+                variants: Vec::new(),
+                entries: Default::default(),
+            };
+            (empty, (0..16u32).map(rvllm_cutlass::VariantId).collect())
+        } else {
+            let policy_bytes = std::fs::read(&paths.policy_json)
+                .map_err(|source| rvllm_core::RvllmError::Io {
+                    err: rvllm_core::IoError::from(&source),
+                    path: paths.policy_json.clone(),
+                    source,
+                })?;
+            let policy: Policy = serde_json::from_slice(&policy_bytes).map_err(|e| {
+                rvllm_core::RvllmError::config(
+                    rvllm_core::ConfigError::Inconsistent {
+                        reasons: vec![format!("policy.json parse: {e}")],
+                    },
+                    "policy.json",
+                )
             })?;
-        let policy: Policy = serde_json::from_slice(&policy_bytes).map_err(|e| {
-            rvllm_core::RvllmError::config(
-                rvllm_core::ConfigError::Inconsistent {
-                    reasons: vec![format!("policy.json parse: {e}")],
-                },
-                "policy.json",
-            )
-        })?;
-
-        let mut variants: std::collections::BTreeSet<_> =
-            policy.entries.values().map(|e| e.variant).collect();
-        for v in 0..16u32 {
-            variants.insert(rvllm_cutlass::VariantId(v));
-        }
-        let variants: Vec<_> = variants.into_iter().collect();
+            let mut variants: std::collections::BTreeSet<_> =
+                policy.entries.values().map(|e| e.variant).collect();
+            for v in 0..16u32 {
+                variants.insert(rvllm_cutlass::VariantId(v));
+            }
+            (policy, variants.into_iter().collect())
+        };
         // CUTLASS backend selection — see `bring_up::Bringup::load`
         // for the full rationale (sm_121 has no compatible `.so`).
         let cutlass =

@@ -100,20 +100,101 @@ impl<'a> PagedDecodeLauncher<'a> {
         {
             let fa3 = match self.backend {
                 super::AttentionBackend::Fa3(fa3) => fa3,
-                super::AttentionBackend::Fa2Ptx(_) => {
-                    return Err(RvllmError::Attention {
-                        err: AttentionError::FeatureNotAvailable {
-                            backend: "Fa2Ptx",
-                            op: "paged_decode",
-                        },
-                        ctx: AttnCtx {
-                            op: "paged_decode",
-                            stream,
-                            num_seqs: params.num_seqs,
-                            head_dim: params.head_dim,
-                        },
-                        bt: std::backtrace::Backtrace::capture(),
-                    });
+                super::AttentionBackend::Fa2Ptx(fa2) => {
+                    // sm_121 F16 KV path: dispatch
+                    // `flash_attention_2_decode_f16io_kernel` (f16 I/O
+                    // against the paged f16 cache). head_dim=512 does
+                    // NOT fit the BC=32 smem budget on sm_121's 99 KB
+                    // opt-in cap — gate it off. Gemma 4 global layers
+                    // must use FP8 KV; F16 KV on sm_121 today is a
+                    // head_dim ≤ 256 path (Llama/Qwen or Gemma 4
+                    // sliding-only).
+                    if params.head_dim > 256 {
+                        return Err(RvllmError::Attention {
+                            err: AttentionError::FeatureNotAvailable {
+                                backend: "Fa2Ptx",
+                                op: "paged_decode (F16 KV, head_dim>256 — use FP8 KV)",
+                            },
+                            ctx: AttnCtx {
+                                op: "paged_decode",
+                                stream,
+                                num_seqs: params.num_seqs,
+                                head_dim: params.head_dim,
+                            },
+                            bt: std::backtrace::Backtrace::capture(),
+                        });
+                    }
+                    use cudarc::driver::sys::*;
+                    const FA2_THREADS: i32 = 128;
+                    const FA2_BC: i32 = 32;
+                    let hd = params.head_dim as i32;
+                    let smem_bytes = 2 * FA2_BC * hd * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+                    if smem_bytes as u32 >= 48 * 1024 {
+                        let _ = cuFuncSetAttribute(
+                            fa2.fn_decode_f16io.raw() as CUfunction,
+                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            smem_bytes,
+                        );
+                    }
+
+                    let scale = params.scale;
+                    let num_heads = params.num_heads as i32;
+                    let num_kv_heads = params.num_kv_heads as i32;
+                    let head_dim = params.head_dim as i32;
+                    let block_size = params.block_size as i32;
+                    let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+
+                    let mut arg_out = out_ptr;
+                    let mut arg_q = q_ptr;
+                    let mut arg_k = k_cache_ptr;
+                    let mut arg_v = v_cache_ptr;
+                    let mut arg_bt = block_tables_ptr;
+                    let mut arg_cl = context_lens_ptr;
+                    let _ = workspace_ptr; // unused: FA2 allocates smem dynamically
+
+                    let args: [*mut core::ffi::c_void; 12] = [
+                        &mut arg_out as *mut _ as *mut _,
+                        &mut arg_q as *mut _ as *mut _,
+                        &mut arg_k as *mut _ as *mut _,
+                        &mut arg_v as *mut _ as *mut _,
+                        &mut arg_bt as *mut _ as *mut _,
+                        &mut arg_cl as *mut _ as *mut _,
+                        &scale as *const _ as *mut _,
+                        &num_heads as *const _ as *mut _,
+                        &num_kv_heads as *const _ as *mut _,
+                        &head_dim as *const _ as *mut _,
+                        &block_size as *const _ as *mut _,
+                        &max_blocks_per_seq as *const _ as *mut _,
+                    ];
+
+                    let rc = cuLaunchKernel(
+                        fa2.fn_decode_f16io.raw() as CUfunction,
+                        params.num_seqs as u32,
+                        params.num_heads as u32,
+                        1,
+                        FA2_THREADS as u32,
+                        1,
+                        1,
+                        smem_bytes as u32,
+                        stream as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(RvllmError::Attention {
+                            err: AttentionError::KernelLaunchFailed {
+                                cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                            },
+                            ctx: AttnCtx {
+                                op: "paged_decode (Fa2Ptx F16 KV)",
+                                stream,
+                                num_seqs: params.num_seqs,
+                                head_dim: params.head_dim,
+                            },
+                            bt: std::backtrace::Backtrace::capture(),
+                        });
+                    }
+                    return Ok(());
                 }
             };
             let rc = (fa3.fn_paged_decode)(

@@ -2,15 +2,20 @@
 //! `iters` decode-step forwards on a fixed-batch bucket, and reports
 //! tokens/sec.
 //!
-//! Env vars (all required for cuda path):
-//!   RVLLM_MODEL_DIR   = HF snapshot dir with config.json + safetensors
-//!   RVLLM_KERNELS_DIR = dir with manifest.json + compiled PTX
-//!   RVLLM_CUTLASS_SO  = path to libcutlass_kernels.so
-//!   RVLLM_FA3_SO      = path to libfa3_kernels.so
-//!   RVLLM_POLICY      = path to policy.json
+//! Env vars:
+//!   RVLLM_MODEL_DIR   = HF snapshot dir with config.json + safetensors (required)
+//!   RVLLM_KERNELS_DIR = dir with manifest.json + compiled PTX         (required)
+//!   RVLLM_CUTLASS_SO  = path to libcutlass_kernels.so                 (SM90 only)
+//!   RVLLM_FA3_SO      = path to libfa3_kernels.so                     (SM90 only)
+//!   RVLLM_POLICY      = path to policy.json                           (SM90 only)
 //!   RVLLM_BATCH       = batch size (default 128)
 //!   RVLLM_ITERS       = decode-step iterations (default 100)
 //!   RVLLM_WARMUP      = warmup iterations (default 10)
+//!
+//! The three SM90 vars are ignored on sm_121 (CutlassBackend::Absent/
+//! SoSm120 + AttentionBackend::Fa2Ptx never open those files). When
+//! unset they default to `/dev/null`; dlopen of `/dev/null` fails
+//! cleanly on SM90 with a clear message.
 //!
 //! Prints one JSON line per run: {batch, iters, tok_per_sec, ms_per_step}.
 
@@ -25,6 +30,15 @@ fn env_path(k: &str) -> Result<PathBuf, String> {
     std::env::var(k)
         .map_err(|_| format!("missing env var: {k}"))
         .map(PathBuf::from)
+}
+
+/// Optional env var: returns `/dev/null` when missing. Used for paths
+/// that the sm_121 backend never opens. On SM90 an unset value will
+/// surface as a clean dlopen error for `/dev/null`.
+fn env_path_or_placeholder(k: &str) -> PathBuf {
+    std::env::var(k)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/dev/null"))
 }
 
 fn env_u32(k: &str, default: u32) -> u32 {
@@ -59,9 +73,9 @@ fn run() -> Result<(), String> {
     let paths = EnginePaths {
         model_dir: env_path("RVLLM_MODEL_DIR")?,
         kernels_dir: env_path("RVLLM_KERNELS_DIR")?,
-        cutlass_so: env_path("RVLLM_CUTLASS_SO")?,
-        fa3_so: env_path("RVLLM_FA3_SO")?,
-        policy_json: env_path("RVLLM_POLICY")?,
+        cutlass_so: env_path_or_placeholder("RVLLM_CUTLASS_SO"),
+        fa3_so: env_path_or_placeholder("RVLLM_FA3_SO"),
+        policy_json: env_path_or_placeholder("RVLLM_POLICY"),
     };
     let batch = env_u32("RVLLM_BATCH", 128);
     let iters = env_u32("RVLLM_ITERS", 100);
