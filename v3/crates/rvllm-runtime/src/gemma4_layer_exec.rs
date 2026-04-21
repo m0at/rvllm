@@ -416,7 +416,12 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if let (true, Some(fn_gemv)) = (
-        weights.qkv_chscale != 0 && dims.num_tokens == 1,
+        // Blockscale gate: `Fp8GemvF16InLaunch` reads a 2-D
+        // `[N/128, K/128]` tensor. Only enable it when the loader has
+        // actually uploaded one (`*_blockscale != 0`). Weights whose
+        // scale was per-row or synthesized have `blockscale == 0` and
+        // stay on the channelscale-preserving fallback below.
+        weights.qkv_blockscale != 0 && dims.num_tokens == 1,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
         // sm_121 fast path: skip the activation FP8-quant entirely
@@ -461,7 +466,7 @@ pub unsafe fn gemma4_forward_phase(
             fn_gemv,
             scratch.q_out,
             weights.qkv_fp8,
-            weights.qkv_chscale,
+            weights.qkv_blockscale,
             scratch.delta_f16,
             stream,
         )?;
@@ -806,7 +811,7 @@ pub unsafe fn gemma4_forward_phase(
         }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
     } else if let (true, Some(fn_gemv)) = (
-        weights.o_chscale != 0 && dims.num_tokens == 1,
+        weights.o_blockscale != 0 && dims.num_tokens == 1,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
         // sm_121 fast path for O projection.
@@ -824,7 +829,7 @@ pub unsafe fn gemma4_forward_phase(
             fn_gemv,
             scratch.gemm_f32_tmp,
             weights.o_fp8,
-            weights.o_chscale,
+            weights.o_blockscale,
             scratch.attn_out,
             stream,
         )?;
@@ -978,7 +983,7 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if let (true, Some(fn_gemv)) = (
-        weights.gate_up_chscale != 0 && dims.num_tokens == 1,
+        weights.gate_up_blockscale != 0 && dims.num_tokens == 1,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
         // sm_121 fast path for gate||up projection. Mirrors
@@ -1012,7 +1017,7 @@ pub unsafe fn gemma4_forward_phase(
             fn_gemv,
             scratch.gate_up_out,
             weights.gate_up_fp8,
-            weights.gate_up_chscale,
+            weights.gate_up_blockscale,
             scratch.delta_f16,
             stream,
         )?;
@@ -1065,7 +1070,7 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if let (true, Some(fn_gemv)) = (
-        weights.down_chscale != 0 && dims.num_tokens == 1,
+        weights.down_blockscale != 0 && dims.num_tokens == 1,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
         // sm_121 fast path for down projection.
@@ -1097,7 +1102,7 @@ pub unsafe fn gemma4_forward_phase(
             fn_gemv,
             scratch.gemm_f32_tmp,
             weights.down_fp8,
-            weights.down_chscale,
+            weights.down_blockscale,
             scratch.gate_up_fp8,
             stream,
         )?;
