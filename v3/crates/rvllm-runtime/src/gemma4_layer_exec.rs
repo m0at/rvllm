@@ -1170,18 +1170,22 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
         "fp8_gemm_channelscale_or_fallback called with both b_chscale \
          and b_scale_scalar == 0 — no scale source",
     );
-    // CUTLASS SM120 blockwise path — opt-in via
-    // `RVLLM_FP8_GEMM_CUTLASS_SM120=1`. Requires a `SoSm120` backend
-    // with all four prep symbols present (SFA bytes/SFB bytes/prep
-    // SFA/prep SFB); older `libcutlass_sm120.so` builds without the
-    // prep helpers fall through to cuBLASLt.
+    // CUTLASS SM120 blockwise path — default ON when a `SoSm120`
+    // backend is loaded with all four prep symbols present (SFA bytes /
+    // SFB bytes / prep SFA / prep SFB). Older `libcutlass_sm120.so`
+    // builds without the prep helpers fall through to cuBLASLt.
+    // Measured on GB10 Gemma 4 31B decode: batch=128 461→555 tok/s
+    // (+20%), batch=256 665→909 tok/s (+37%). Opt-OUT via
+    // `RVLLM_FP8_GEMM_CUTLASS_SM120=0` for regression diagnosis.
+    //
     // The CUTLASS cooperative blockwise kernel is built with a 128×128
     // MMA tile and hard-asserts `M >= 128` (sm90_gemm_tma_warpspecialized_
     // cooperative.hpp:371). Gate the dispatch so small-batch decode
     // (M=num_seqs < 128) still gets routed through the cuBLASLt
-    // fallback below. Prefill / large-batch decode (M >= 128) takes
-    // the CUTLASS path when opted in.
-    if m >= 128 && std::env::var_os("RVLLM_FP8_GEMM_CUTLASS_SM120").is_some() {
+    // fallback below.
+    let cutlass_sm120_enabled = m >= 128
+        && std::env::var("RVLLM_FP8_GEMM_CUTLASS_SM120").ok().as_deref() != Some("0");
+    if cutlass_sm120_enabled {
         if let CutlassBackend::SoSm120(lib) = cutlass {
             if lib.prep_sfa.is_some() && lib.prep_sfb.is_some() {
                 let sfa_bytes = lib.sfa_bytes(m, k);
