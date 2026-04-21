@@ -21,6 +21,17 @@ use crate::gemma4_layer_exec::Gemma4LayerKernels;
 
 pub use crate::bring_up::HbmArenaCheckpoint;
 
+/// Default per-tensor Q / KV scale for the FP8 E4M3 attention cache.
+/// The older 418/448 ≈ 0.933 defaults assume `amax ≈ 418` for the
+/// post-QK-norm / post-V-norm activations — an order of magnitude too
+/// large for Gemma 4. Empirical calibration sweep (chunk_len=128,
+/// English text) found `q=0.1, kv=0.08` minimizes PPL by 4× over the
+/// old defaults (PPL 10.2 → 2.3). Both overridable per-run via
+/// `RVLLM_Q_SCALE` / `RVLLM_KV_SCALE` env vars for further tuning or
+/// per-model calibration.
+const DEFAULT_Q_SCALE: f32 = 0.1;
+const DEFAULT_KV_SCALE: f32 = 0.08;
+
 pub struct Gemma4EnginePaths {
     pub model_dir: PathBuf,
     pub kernels_dir: PathBuf,
@@ -409,11 +420,12 @@ impl Gemma4Bringup {
         let q_scale_region = arena.region("q_scale", 4, 4).unwrap();
         let kv_scale_region = arena.region("kv_scale", 4, 4).unwrap();
         {
-            let scale: f32 = 418.0 / 448.0;
-            q_scale_region.copy_from_host(&scale.to_le_bytes()).unwrap();
-            kv_scale_region
-                .copy_from_host(&scale.to_le_bytes())
-                .unwrap();
+            let q_s: f32 = std::env::var("RVLLM_Q_SCALE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_Q_SCALE);
+            let kv_s: f32 = std::env::var("RVLLM_KV_SCALE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_KV_SCALE);
+            q_scale_region.copy_from_host(&q_s.to_le_bytes()).unwrap();
+            kv_scale_region.copy_from_host(&kv_s.to_le_bytes()).unwrap();
         }
 
         let fa3_ws = arena.region("fa3_ws", 16 * 1024 * 1024, 256).unwrap();
@@ -842,9 +854,12 @@ impl Gemma4Bringup {
         let q_scale_region = arena.region("q_scale", 4, 4)?;
         let kv_scale_region = arena.region("kv_scale", 4, 4)?;
         {
-            let scale: f32 = 418.0 / 448.0;
-            q_scale_region.copy_from_host(&scale.to_le_bytes())?;
-            kv_scale_region.copy_from_host(&scale.to_le_bytes())?;
+            let q_s: f32 = std::env::var("RVLLM_Q_SCALE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_Q_SCALE);
+            let kv_s: f32 = std::env::var("RVLLM_KV_SCALE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_KV_SCALE);
+            q_scale_region.copy_from_host(&q_s.to_le_bytes())?;
+            kv_scale_region.copy_from_host(&kv_s.to_le_bytes())?;
         }
 
         let fa3_ws = arena.region("fa3_ws", 16 * 1024 * 1024, 256)?;
@@ -1377,9 +1392,12 @@ impl Gemma4Bringup {
         let q_scale_region = arena.region("gen_q_scale", 4, 4)?;
         let kv_scale_region = arena.region("gen_kv_scale", 4, 4)?;
         {
-            let s: f32 = 418.0 / 448.0;
-            q_scale_region.copy_from_host(&s.to_le_bytes())?;
-            kv_scale_region.copy_from_host(&s.to_le_bytes())?;
+            let q_s: f32 = std::env::var("RVLLM_Q_SCALE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_Q_SCALE);
+            let kv_s: f32 = std::env::var("RVLLM_KV_SCALE")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_KV_SCALE);
+            q_scale_region.copy_from_host(&q_s.to_le_bytes())?;
+            kv_scale_region.copy_from_host(&kv_s.to_le_bytes())?;
         }
 
         let fa3_ws = arena.region("gen_fa3_ws", 128 * 1024 * 1024, 256)?;
