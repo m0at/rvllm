@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::openai::types::{FinishReason, Role, Usage};
+use crate::openai::types::{FinishReason, Role, ToolCall, Usage};
 use crate::sampling::SamplingParams;
 
 /// Request body. Tolerant of extra fields — the OpenAI SDK sometimes
@@ -133,7 +133,11 @@ pub struct ChatChoice {
 #[derive(Debug, Serialize)]
 pub struct ChatAssistantMessage {
     pub role: Role,
-    pub content: String,
+    /// OpenAI spec: `null` when the assistant emitted tool calls
+    /// instead of prose. Clients discriminate on presence.
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 // ─── Streaming (SSE) chunks ──────────────────────────────────────────
@@ -165,14 +169,19 @@ pub struct ChatDelta {
     pub role: Option<Role>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl ChatDelta {
     pub fn role(role: Role) -> Self {
-        Self { role: Some(role), content: None }
+        Self { role: Some(role), content: None, tool_calls: None }
     }
     pub fn content<S: Into<String>>(c: S) -> Self {
-        Self { role: None, content: Some(c.into()) }
+        Self { role: None, content: Some(c.into()), tool_calls: None }
+    }
+    pub fn tool_calls(calls: Vec<ToolCall>) -> Self {
+        Self { role: None, content: None, tool_calls: Some(calls) }
     }
     pub fn done() -> Self {
         Self::default()
@@ -230,5 +239,19 @@ mod tests {
         assert_eq!(j, r#"{"content":"hello"}"#);
         let done = serde_json::to_string(&ChatDelta::done()).expect("ok");
         assert_eq!(done, "{}");
+    }
+
+    #[test]
+    fn stream_delta_tool_calls_shape() {
+        use crate::openai::types::{new_tool_call_id, ToolCall, ToolCallFunction};
+        let d = ChatDelta::tool_calls(vec![ToolCall {
+            id: new_tool_call_id(),
+            kind: "function",
+            function: ToolCallFunction { name: "foo".into(), arguments: "{}".into() },
+        }]);
+        let j = serde_json::to_string(&d).expect("ok");
+        assert!(j.contains(r#""tool_calls""#));
+        assert!(j.contains(r#""function""#));
+        assert!(!j.contains(r#""content""#));
     }
 }

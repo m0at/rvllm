@@ -63,8 +63,10 @@ use crate::openai::completions::{
 };
 use crate::openai::models::ensure_model_matches;
 use crate::openai::types::{
-    new_chat_completion_id, new_completion_id, unix_now_secs, FinishReason, Role, Usage,
+    new_chat_completion_id, new_completion_id, new_tool_call_id, unix_now_secs, FinishReason,
+    Role, ToolCall, ToolCallFunction, Usage,
 };
+use crate::tool_parser::{parse_gemma4_tool_calls, strip_tool_markup};
 use crate::router::AppState;
 use crate::worker::{GenerateEvent, GenerateRequest};
 
@@ -206,6 +208,7 @@ async fn chat_collect(
     }
 
     let text = tokenizer.decode(&token_ids)?;
+    let (message, finish_reason) = shape_assistant_message(text, finish);
     Ok(ChatCompletionResponse {
         id: new_chat_completion_id(),
         object: "chat.completion",
@@ -213,11 +216,44 @@ async fn chat_collect(
         model: model_id.to_string(),
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatAssistantMessage { role: Role::Assistant, content: text },
-            finish_reason: finish,
+            message,
+            finish_reason,
         }],
         usage,
     })
+}
+
+/// Gemma 4 emits tool calls as plain text inside the reply (see
+/// `tool_parser`). If the decoded text contains any `<|tool_call>...`
+/// markup, hoist it into OpenAI's `tool_calls` shape and flip
+/// `finish_reason` to `ToolCalls`. Otherwise return the text verbatim.
+fn shape_assistant_message(
+    text: String,
+    model_finish: Option<FinishReason>,
+) -> (ChatAssistantMessage, Option<FinishReason>) {
+    let parsed = parse_gemma4_tool_calls(&text);
+    if parsed.is_empty() {
+        return (
+            ChatAssistantMessage { role: Role::Assistant, content: Some(text), tool_calls: None },
+            model_finish,
+        );
+    }
+    let calls = parsed
+        .into_iter()
+        .map(|p| ToolCall {
+            id: new_tool_call_id(),
+            kind: "function",
+            function: ToolCallFunction { name: p.name, arguments: p.arguments },
+        })
+        .collect();
+    // Preserve any prose the model emitted before the first call so
+    // clients that show reasoning alongside the call still get it.
+    let prefix = strip_tool_markup(&text);
+    let content = if prefix.is_empty() { None } else { Some(prefix) };
+    (
+        ChatAssistantMessage { role: Role::Assistant, content, tool_calls: Some(calls) },
+        Some(FinishReason::ToolCalls),
+    )
 }
 
 fn chat_stream_sse(
@@ -236,7 +272,10 @@ fn chat_stream_sse(
 
     // State transitions:
     //   Role       — emit the first `delta.role = assistant` chunk
-    //   Content    — forward incremental text deltas
+    //   Content    — forward incremental text deltas (with gated
+    //                buffering so we never leak a Gemma 4 `<|tool_call>`
+    //                tag into `delta.content`)
+    //   FlushToolCalls(calls) — emit the parsed tool_calls as one delta
     //   Finish(r)  — emit the terminal chunk with finish_reason
     //   Done       — emit "data: [DONE]\n\n"
     //   End        — stream over
@@ -245,7 +284,17 @@ fn chat_stream_sse(
         Content {
             rx: mpsc::Receiver<GenerateEvent>,
             decoder: crate::tokenize::StreamDecoder,
+            /// Full decoded text so far. Needed to parse tool calls at
+            /// `Done` time, and to check whether a pending tail could be
+            /// the start of `<|tool_call>`.
+            accum: String,
+            /// Bytes of `accum` already flushed as `content` deltas.
+            emitted: usize,
+            /// Flipped the moment we see the start tag — from then on
+            /// no more `content` deltas go out.
+            in_tool: bool,
         },
+        FlushToolCalls(Vec<ToolCall>),
         Finish(FinishReason),
         Done,
         End,
@@ -276,7 +325,13 @@ fn chat_stream_sse(
         cancelled,
         deadline,
     };
-    ctx.state = S::Content { rx: events_rx, decoder };
+    ctx.state = S::Content {
+        rx: events_rx,
+        decoder,
+        accum: String::new(),
+        emitted: 0,
+        in_tool: false,
+    };
     let _ = tokenizer; // keep for clone clarity
 
     let stream = stream::unfold(ctx, |mut ctx| async move {
@@ -301,14 +356,13 @@ fn chat_stream_sse(
                     let ev = sse_json(&chunk);
                     return Some((Ok(ev), ctx));
                 }
-                S::Content { mut rx, mut decoder } => {
+                S::Content { mut rx, mut decoder, mut accum, mut emitted, mut in_tool } => {
                     let deadline = ctx.deadline;
                     let ev = tokio::select! {
                         biased;
                         _ = tokio::time::sleep_until(deadline) => {
                             ctx.cancelled.store(true, Ordering::Relaxed);
                             tracing::warn!("sse request timeout — cancelling worker");
-                            // Emit a terminal Length chunk + [DONE].
                             ctx.state = S::Finish(FinishReason::Length);
                             continue;
                         }
@@ -318,40 +372,100 @@ fn chat_stream_sse(
                         Some(GenerateEvent::Token { id, .. }) => {
                             match decoder.step(id) {
                                 Ok(text) if text.is_empty() => {
-                                    // Partial codepoint held back — loop.
-                                    ctx.state = S::Content { rx, decoder };
+                                    ctx.state = S::Content { rx, decoder, accum, emitted, in_tool };
                                     continue;
                                 }
                                 Ok(text) => {
-                                    let chunk = ChatCompletionChunk {
-                                        id: ctx.id.clone(),
-                                        object: "chat.completion.chunk",
-                                        created: ctx.created,
-                                        model: ctx.model.clone(),
-                                        choices: vec![ChatChunkChoice {
-                                            index: 0,
-                                            delta: ChatDelta::content(text),
-                                            finish_reason: None,
-                                        }],
+                                    accum.push_str(&text);
+                                    if !in_tool
+                                        && (accum.contains("<|tool_call>")
+                                            || find_anchored_call(&accum, 0)
+                                                .map(|p| accum[p + 5..].contains('{'))
+                                                .unwrap_or(false))
+                                    {
+                                        in_tool = true;
+                                    }
+                                    // Decide how much of the accumulated
+                                    // text is safe to emit as `content`.
+                                    let safe_end = safe_content_emit_end(
+                                        &accum, emitted, in_tool,
+                                    );
+                                    if safe_end > emitted {
+                                        let chunk_text = accum[emitted..safe_end].to_string();
+                                        emitted = safe_end;
+                                        let chunk = ChatCompletionChunk {
+                                            id: ctx.id.clone(),
+                                            object: "chat.completion.chunk",
+                                            created: ctx.created,
+                                            model: ctx.model.clone(),
+                                            choices: vec![ChatChunkChoice {
+                                                index: 0,
+                                                delta: ChatDelta::content(chunk_text),
+                                                finish_reason: None,
+                                            }],
+                                        };
+                                        ctx.state = S::Content {
+                                            rx, decoder, accum, emitted, in_tool,
+                                        };
+                                        return Some((Ok(sse_json(&chunk)), ctx));
+                                    }
+                                    ctx.state = S::Content {
+                                        rx, decoder, accum, emitted, in_tool,
                                     };
-                                    ctx.state = S::Content { rx, decoder };
-                                    return Some((Ok(sse_json(&chunk)), ctx));
+                                    continue;
                                 }
                                 Err(_e) => {
-                                    // Decode failure — treat as Stop.
                                     ctx.state = S::Finish(FinishReason::Stop);
                                     continue;
                                 }
                             }
                         }
                         Some(GenerateEvent::Done { finish, .. }) => {
+                            // At Done, inspect the full buffer: if it
+                            // carries tool-call markup, emit one final
+                            // `tool_calls` delta and flip finish to
+                            // ToolCalls. Otherwise the buffer is just
+                            // prose — everything already flushed by the
+                            // safe-emit rule above (nothing buffered
+                            // outside the start-tag prefix window).
+                            let parsed = parse_gemma4_tool_calls(&accum);
+                            if !parsed.is_empty() {
+                                let calls = parsed
+                                    .into_iter()
+                                    .map(|p| ToolCall {
+                                        id: new_tool_call_id(),
+                                        kind: "function",
+                                        function: ToolCallFunction {
+                                            name: p.name,
+                                            arguments: p.arguments,
+                                        },
+                                    })
+                                    .collect();
+                                ctx.state = S::FlushToolCalls(calls);
+                                continue;
+                            }
+                            // No tool call — flush any residue that
+                            // was being held back for start-tag safety.
+                            if emitted < accum.len() {
+                                let tail = accum[emitted..].to_string();
+                                let chunk = ChatCompletionChunk {
+                                    id: ctx.id.clone(),
+                                    object: "chat.completion.chunk",
+                                    created: ctx.created,
+                                    model: ctx.model.clone(),
+                                    choices: vec![ChatChunkChoice {
+                                        index: 0,
+                                        delta: ChatDelta::content(tail),
+                                        finish_reason: None,
+                                    }],
+                                };
+                                ctx.state = S::Finish(finish);
+                                return Some((Ok(sse_json(&chunk)), ctx));
+                            }
                             ctx.state = S::Finish(finish);
                             continue;
                         }
                         Some(GenerateEvent::Error(_)) => {
-                            // Error in stream — best we can do over SSE is
-                            // emit a terminal finish chunk; OpenAI doesn't
-                            // define an error frame. Log + finish.
                             ctx.state = S::Finish(FinishReason::Stop);
                             continue;
                         }
@@ -360,6 +474,21 @@ fn chat_stream_sse(
                             continue;
                         }
                     }
+                }
+                S::FlushToolCalls(calls) => {
+                    let chunk = ChatCompletionChunk {
+                        id: ctx.id.clone(),
+                        object: "chat.completion.chunk",
+                        created: ctx.created,
+                        model: ctx.model.clone(),
+                        choices: vec![ChatChunkChoice {
+                            index: 0,
+                            delta: ChatDelta::tool_calls(calls),
+                            finish_reason: None,
+                        }],
+                    };
+                    ctx.state = S::Finish(FinishReason::ToolCalls);
+                    return Some((Ok(sse_json(&chunk)), ctx));
                 }
                 S::Finish(reason) => {
                     let chunk = ChatCompletionChunk {
@@ -386,6 +515,67 @@ fn chat_stream_sse(
     });
 
     { let boxed: SseStream = Box::pin(stream); Sse::new(boxed).keep_alive(axum::response::sse::KeepAlive::new().interval(keepalive)).into_response() }
+}
+
+/// How many bytes of `accum` can safely leave the server as SSE
+/// `delta.content`. Rules:
+///   * `in_tool == true` — hold everything; the FlushToolCalls stage
+///     will emit the parsed calls.
+///   * otherwise — emit up to the earliest byte that could start a
+///     Gemma 4 tool call:
+///       - tier-1: the `<|tool_call>` tag (the tokenizer may surface
+///         it when `skip_special_tokens=false` ever lands);
+///       - tier-2: a word-anchored `call:` sequence.
+///     Also hold back the final `max(tag.len()) - 1` bytes in case a
+///     marker is straddling chunks. Split on UTF-8 boundaries.
+fn safe_content_emit_end(accum: &str, emitted: usize, in_tool: bool) -> usize {
+    if in_tool {
+        return emitted;
+    }
+    // Earliest anchored tier-2 marker in the unemitted region.
+    let tier2 = find_anchored_call(accum, emitted);
+    // Earliest tier-1 wrapper start.
+    let tier1 = accum[emitted..].find("<|tool_call>").map(|r| emitted + r);
+    let earliest = match (tier1, tier2) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
+    let ceiling_by_tail = {
+        let keep_back = "<|tool_call>".len() - 1; // >= "call:".len()
+        accum.len().saturating_sub(keep_back)
+    };
+    let mut cand = match earliest {
+        Some(p) => p.min(ceiling_by_tail),
+        None => ceiling_by_tail,
+    };
+    if cand < emitted {
+        return emitted;
+    }
+    while cand > emitted && !accum.is_char_boundary(cand) {
+        cand -= 1;
+    }
+    cand
+}
+
+/// Return the byte offset of the earliest `call:` in `accum` at or after
+/// `from` that is anchored at start-of-string or directly after
+/// whitespace. Returns `None` if no anchored marker exists.
+fn find_anchored_call(accum: &str, from: usize) -> Option<usize> {
+    let bytes = accum.as_bytes();
+    let mut i = from;
+    while i + 5 <= bytes.len() {
+        if &bytes[i..i + 5] == b"call:" {
+            let anchored = i == 0 || (bytes[i - 1] as char).is_whitespace();
+            if anchored {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn sse_json<T: serde::Serialize>(value: &T) -> Event {

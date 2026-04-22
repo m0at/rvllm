@@ -20,6 +20,7 @@ pub mod openai;
 pub mod router;
 pub mod sampling;
 pub mod tokenize;
+pub mod tool_parser;
 pub mod worker;
 
 pub use config::ServerConfig;

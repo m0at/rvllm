@@ -25,6 +25,31 @@ pub enum FinishReason {
     Cancelled,
     /// Content filter (we don't run one yet, kept for forward-compat).
     ContentFilter,
+    /// Response contained one or more tool calls; see `tool_calls`.
+    ToolCalls,
+}
+
+/// OpenAI `tool_calls[i]` entry. Only `function`-kind calls are emitted.
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    /// JSON-encoded string per OpenAI spec (not a JSON object).
+    pub arguments: String,
+}
+
+/// Generate a short tool-call id (`call_<uuid-nodashes-prefix>`).
+pub fn new_tool_call_id() -> String {
+    let u = uuid::Uuid::new_v4();
+    let s = u.simple().to_string();
+    format!("call_{}", &s[..16])
 }
 
 /// Token usage counts. Returned on the final chunk / non-stream body.
