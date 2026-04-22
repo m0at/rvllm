@@ -43,7 +43,8 @@ NVCC_FLAGS="-std=c++17 -arch=${ARCH} --expt-relaxed-constexpr -O3 \
     --use_fast_math \
     -I${CUTLASS_DIR}/include \
     -I${CUTLASS_DIR}/tools/util/include \
-    --compiler-options -fPIC"
+    --compiler-options -fPIC \
+    ${EXTRA_NVCC_FLAGS:-}"
 
 echo "Building CUTLASS sm_120 shared library ($ARCH)..."
 

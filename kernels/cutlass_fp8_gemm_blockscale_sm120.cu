@@ -60,7 +60,19 @@ constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // 16
 constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // 16
 constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;  // 8
 
-using MmaTileShape_MNK = Shape<_128, _128, _128>;  // tile covers one 128×128 b-block-scale cell
+// Tile shape can be overridden at build time via -D{TILE_M,TILE_N,TILE_K}=N.
+// Must stay a multiple of 128 per dim to line up with the blockwise scale
+// granularity (sm120_trivial_blockwise_scale_config asserts this).
+#ifndef TILE_M
+#define TILE_M 128
+#endif
+#ifndef TILE_N
+#define TILE_N 128
+#endif
+#ifndef TILE_K
+#define TILE_K 128
+#endif
+using MmaTileShape_MNK = Shape<cute::Int<TILE_M>, cute::Int<TILE_N>, cute::Int<TILE_K>>;
 using ClusterShape_MNK = Shape<_1, _1, _1>;        // SM120 does not support cluster multicast
 
 using ScaleConfig = decltype(cutlass::detail::sm120_trivial_blockwise_scale_config(MmaTileShape_MNK{}));
