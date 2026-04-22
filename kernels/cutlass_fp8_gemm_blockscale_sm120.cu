@@ -75,7 +75,20 @@ constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;  // 8
 using MmaTileShape_MNK = Shape<cute::Int<TILE_M>, cute::Int<TILE_N>, cute::Int<TILE_K>>;
 using ClusterShape_MNK = Shape<_1, _1, _1>;        // SM120 does not support cluster multicast
 
-using ScaleConfig = decltype(cutlass::detail::sm120_trivial_blockwise_scale_config(MmaTileShape_MNK{}));
+// Explicit scale-vector granularity:
+//   SFVecSizeM = 1    → per-row activation scale (per-token)
+//   SFVecSizeN = 128  → per-128-channel weight scale (N-block)
+//   SFVecSizeK = 128  → per-128-channel K-block scale
+// The `sm120_trivial_blockwise_scale_config` helper hard-codes all three
+// to the MmaTileShape dims (128/128/128), which means **one SFA per
+// 128-row tile** — a tile-wise broadcast. That collapses to the
+// max-row-scale inside the tile, over-scaling every row whose
+// per-token activation scale is below the tile max. For Gemma 4 31B
+// prefill, activation scales vary ~6x across tokens (post-RMSNorm
+// amax is token-dependent), so tile-wise SFA produces ~6x output
+// bias on rows that weren't the scale-max row. aa01001pftrope0 root
+// cause.
+using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<1, 128, 128>;
 using LayoutSFA   = decltype(ScaleConfig::deduce_layoutSFA());
 using LayoutSFB   = decltype(ScaleConfig::deduce_layoutSFB());
 
@@ -189,9 +202,9 @@ int cutlass_fp8_gemm_blockscale_sm120(
 ///
 /// Bytes needed by each tensor at a given problem shape.
 size_t cutlass_fp8_gemm_blockscale_sm120_sfa_bytes(int m, int k) {
-    int mb = (m + 127) / 128;
+    // SFVecSizeM = 1 → one SFA entry per (row, k_block).
     int kb = (k + 127) / 128;
-    return (size_t)mb * (size_t)kb * sizeof(float);
+    return (size_t)m * (size_t)kb * sizeof(float);
 }
 
 size_t cutlass_fp8_gemm_blockscale_sm120_sfb_bytes(int n, int k) {
@@ -209,36 +222,20 @@ size_t cutlass_fp8_gemm_blockscale_sm120_sfb_bytes(int n, int k) {
 //
 // Grid: (k_blocks, m_blocks). Block: 128 threads (one per row in the
 // m_tile). 2-stage warp-shuffle reduction.
+// Per-row activation scale → SFA layout.
+// With SFVecSizeM=1, SFA has one entry per (row, k_block). CUTLASS
+// MN-major layout: sfa[row + k_block * m].
 __global__ void fill_sfa_from_a_scale_sm120(
     const float* __restrict__ a_scale,   // [M]
-    float*       __restrict__ sfa,       // [m_blocks * k_blocks], CUTLASS layout
+    float*       __restrict__ sfa,       // [m * k_blocks], CUTLASS MN-major
     int m,
-    int m_blocks,
-    int /*k_blocks*/
+    int /*m_blocks_unused*/,
+    int k_blocks
 ) {
+    int row     = blockIdx.y * blockDim.x + threadIdx.x;
     int k_block = blockIdx.x;
-    int m_tile  = blockIdx.y;
-    int tid     = threadIdx.x;
-    int row     = m_tile * 128 + tid;
-    float v = (row < m) ? a_scale[row] : 0.0f;
-    // Warp-level max reduction.
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset));
-    }
-    __shared__ float warp_max[4];
-    int warp_id = tid >> 5;
-    int lane    = tid & 31;
-    if (lane == 0) warp_max[warp_id] = v;
-    __syncthreads();
-    if (warp_id == 0) {
-        v = (lane < 4) ? warp_max[lane] : 0.0f;
-        for (int offset = 2; offset > 0; offset >>= 1) {
-            v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset));
-        }
-        if (lane == 0) {
-            sfa[m_tile + k_block * m_blocks] = v;
-        }
-    }
+    if (row >= m || k_block >= k_blocks) return;
+    sfa[row + k_block * m] = a_scale[row];
 }
 
 // SFB transpose kernel — read row-major b_chscale[n_tile, k_block] and
@@ -253,6 +250,8 @@ __global__ void fill_sfb_from_b_chscale_sm120(
     int idx   = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n_blocks * k_blocks;
     if (idx >= total) return;
+    // b_chscale is row-major [n_blocks, k_blocks]; SFB is CUTLASS
+    // MN-major [n_blocks, k_blocks] — transpose.
     int n_tile  = idx / k_blocks;
     int k_block = idx - n_tile * k_blocks;
     sfb[n_tile + k_block * n_blocks] = b_chscale[n_tile * k_blocks + k_block];
@@ -266,14 +265,16 @@ int cutlass_fp8_gemm_blockscale_sm120_prep_sfa(
     int m, int k,
     cudaStream_t stream
 ) {
-    int mb = (m + 127) / 128;
+    // Per-row SFA: grid = (k_blocks, m_tiles_of_128_threads).
     int kb = (k + 127) / 128;
-    dim3 grid(kb, mb);
-    dim3 block(128);
+    int threads = 128;
+    int m_tiles = (m + threads - 1) / threads;
+    dim3 grid(kb, m_tiles);
+    dim3 block(threads);
     fill_sfa_from_a_scale_sm120<<<grid, block, 0, stream>>>(
         reinterpret_cast<const float*>(a_scale),
         reinterpret_cast<float*>(sfa),
-        m, mb, kb
+        m, m_tiles, kb
     );
     return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }

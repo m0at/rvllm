@@ -480,7 +480,7 @@ pub unsafe fn gemma4_forward_phase(
         fp8_gemm_channelscale_or_fallback(
             cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
             scratch.q_out, scratch.hidden_fp8, weights.qkv_fp8,
-            scratch.hidden_scale, weights.qkv_chscale, weights.qkv_scale,
+            scratch.hidden_scale, weights.qkv_chscale, weights.qkv_blockscale, weights.qkv_scale,
             dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
             scratch.gemm_f32_tmp,
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
@@ -960,7 +960,7 @@ pub unsafe fn gemma4_forward_phase(
         fp8_gemm_channelscale_or_fallback(
             cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
             scratch.gate_up_out, scratch.hidden_fp8, weights.gate_up_fp8,
-            scratch.hidden_scale, weights.gate_up_chscale, weights.gate_up_scale,
+            scratch.hidden_scale, weights.gate_up_chscale, weights.gate_up_blockscale, weights.gate_up_scale,
             dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
             scratch.gemm_f32_tmp,
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
@@ -1193,6 +1193,14 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     b_fp8: u64,
     a_scale: u64,
     b_chscale: u64,
+    // Optional per-(N/128, K/128) blockscale, row-major, passed DIRECTLY
+    // to CUTLASS prep_sfb. `0` when weights were fused (e.g. QKV /
+    // gate_up where multi-part blockwise reconstruction is undefined);
+    // in that case the CUTLASS path is skipped and we fall through to
+    // the channelscale-preserving fallback. Not interchangeable with
+    // `b_chscale` — the latter is [rows] per-row scale, the former is
+    // [n_blocks, k_blocks] 2-D block scale.
+    b_blockscale: u64,
     b_scale_scalar: u64,
     m: i32,
     n: i32,
@@ -1232,7 +1240,18 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     // cooperative.hpp:371). Gate the dispatch so small-batch decode
     // (M=num_seqs < 128) still gets routed through the cuBLASLt
     // fallback below.
+    // CUTLASS blockwise path requires a proper 2-D b_blockscale. When
+    // the loader fused a weight (QKV / gate_up) it cannot reconstruct
+    // a consistent blockscale across parts (different shards ship
+    // different block alignments), so blockscale_ptr is `None` →
+    // b_blockscale == 0 here. In that case fall through to cuBLASLt
+    // channelscale fallback — feeding the per-row channelscale to
+    // CUTLASS's prep_sfb produces silently-wrong output (the kernel
+    // interprets it as [n_blocks, k_blocks] and reads completely
+    // unrelated row entries for the K/V output regions, which is
+    // exactly how aa01001pftrope0 manifested).
     let cutlass_sm120_enabled = m >= 128
+        && b_blockscale != 0
         && std::env::var("RVLLM_FP8_GEMM_CUTLASS_SM120").ok().as_deref() != Some("0");
     if cutlass_sm120_enabled {
         if let CutlassBackend::SoSm120(lib) = cutlass {
@@ -1244,7 +1263,7 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
                 let sfa_ptr = scratch_f32;
                 let sfb_ptr = scratch_f32 + sfa_aligned as u64;
                 lib.launch_prep_sfa(a_scale, sfa_ptr, m, k, stream)?;
-                lib.launch_prep_sfb(b_chscale, sfb_ptr, n, k, stream)?;
+                lib.launch_prep_sfb(b_blockscale, sfb_ptr, n, k, stream)?;
                 return cutlass.launch_fp8_gemm_blockscale_sm120(
                     output_f16,
                     a_fp8,

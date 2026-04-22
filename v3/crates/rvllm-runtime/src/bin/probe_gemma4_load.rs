@@ -235,9 +235,23 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("get embedding_gather_f16_kernel: {e}"))?;
         let fn_argmax = bringup.fused.fn_argmax;
 
-        // Tiny prompt (ids are placeholders — this is a throughput
-        // probe, not a correctness test; we discard the outputs).
-        let prompt_ids: Vec<u32> = vec![2, 108, 109, 110, 111, 112, 113, 114];
+        // Synthetic prompt. IDs are placeholders — this is a
+        // throughput / DIAG_COMPARE probe, not a correctness test; we
+        // discard the outputs. Length defaults to 8; override via
+        // RVLLM_PROMPT_LEN to exercise the CUTLASS M≥128 batch-prefill
+        // path when bisecting aa01001pftrope0 divergence.
+        let prompt_len: usize = std::env::var("RVLLM_PROMPT_LEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let mut prompt_ids: Vec<u32> = Vec::with_capacity(prompt_len);
+        prompt_ids.push(2); // BOS
+        for i in 1..prompt_len {
+            // Gemma 4 vocab has ~262k entries; pick a deterministic
+            // spread that touches a range of embedding rows rather
+            // than a single contiguous block.
+            prompt_ids.push((107 + (i as u32 * 37) % 100_000).max(107));
+        }
         let max_new: usize = std::env::var("RVLLM_MAX_NEW")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
         let eos_ids: Vec<u32> = vec![1, 107];
