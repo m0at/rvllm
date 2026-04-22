@@ -710,12 +710,22 @@ fn reject_v1_unsupported_chat(req: &ChatCompletionRequest) -> ApiResult<()> {
             "logit_bias_unsupported",
         ));
     }
+    // `tools` / `tool_choice` are accepted and IGNORED — we don't
+    // emit tool_calls today (no structured-output sampling path). The
+    // assistant will reply in plain text; clients like zeroclaw fall
+    // back gracefully when no tool_calls are returned. Rejecting with
+    // 400 forces every tool-using client to strip the schema before
+    // calling us, which no mainstream OpenAI SDK does. One WARN per
+    // process so an operator sees the coercion once.
     if req.tools.is_some() || req.tool_choice.is_some() {
-        return Err(ApiError::invalid_param(
-            "tools / tool_choice not yet supported",
-            "tools",
-            "tools_unsupported",
-        ));
+        static WARN_TOOLS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARN_TOOLS.get_or_init(|| {
+            tracing::warn!(
+                "tools / tool_choice in request — accepted and ignored; \
+                 v1 runtime emits plain-text only. This warning fires \
+                 once per process."
+            );
+        });
     }
     Ok(())
 }
