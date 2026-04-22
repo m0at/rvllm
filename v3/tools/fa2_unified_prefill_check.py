@@ -273,19 +273,14 @@ d_vfb = alloc(4); h2d(d_vfb, np.array([1.0], dtype=np.float32))
 d_qd  = alloc(4); h2d(d_qd, np.array([1.0], dtype=np.float32))
 
 FA2_THREADS = 128
-MMA_K = 32
 smem_bytes = (
-    BLOCK_M * head_dim * 1            # s_q_fp8 (Phase F3: FP8, not f32)
-    + BLOCK_M * 4                     # s_q_scale
+    BLOCK_M * head_dim * 4            # s_q
     + head_dim * tile_size * 1        # s_k_fp8
     + tile_size * head_dim * 1        # s_v_fp8
-    + MMA_K * head_dim * 1            # s_v_fp8_T (F4+F7: MMA_K-padded)
     + tile_size * 4                   # s_k_scale
     + tile_size * 4                   # s_v_scale
-    + BLOCK_M * MMA_K * 4             # s_s (F7: MMA_K, not tile_size)
+    + BLOCK_M * tile_size * 4         # s_s
     + BLOCK_M * 4 * 3                 # s_m + s_l + s_alpha
-    + BLOCK_M * MMA_K * 1             # s_p_fp8 (F4+F7)
-    + BLOCK_M * 4                     # s_p_scale (F4)
     + BLOCK_M * head_dim * 4          # s_acc
     + (FA2_THREADS // 32) * 4         # tail reduce
     + 128                             # safety margin
@@ -302,10 +297,6 @@ if smem_bytes >= 48 * 1024:
 total_num_q_blocks = prompt_len // block_q + 1
 window_size_left = -1 if sliding_window <= 0 else sliding_window
 num_seqs = 1
-# Phase F3: `use_mma=1` routes Q·Kᵀ through the sm_121a FP8 tensor
-# cores. Pass via CLI (e.g. `sm_121 256 256 1`) so the same harness
-# validates both paths against the same NumPy reference.
-use_mma = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 
 params = [
     np.array([int(d_out)], dtype=np.uint64),
@@ -332,7 +323,6 @@ params = [
     np.array([block_q],              dtype=np.int32),
     np.array([num_seqs],             dtype=np.int32),
     np.array([window_size_left],     dtype=np.int32),
-    np.array([use_mma],              dtype=np.int32),
 ]
 param_ptrs = np.array([p.ctypes.data for p in params], dtype=np.uint64)
 
