@@ -658,10 +658,18 @@ pub unsafe fn gemma4_forward_phase(
                 let tile_size = if dims.head_dim <= 256 { 32u32 } else { 16u32 };
                 let num_queries_per_kv = dims.num_heads / dims.num_kv_heads;
                 let block_q = rvllm_attention::UNIFIED_PREFILL_BLOCK_M / num_queries_per_kv.max(1);
+                // Q·Kᵀ MMA is opt-in during bring-up (Phase F3).
+                // `RVLLM_UNIFIED_PREFILL_MMA=1` flips on the
+                // sm_121a `mma.sync.kind::f8f6f4` tensor-core path;
+                // unset / `0` keeps the scalar FMA reference.
+                let use_mma = std::env::var_os("RVLLM_UNIFIED_PREFILL_MMA")
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
                 let unified = rvllm_attention::UnifiedPrefillParams {
                     num_queries_per_kv,
                     tile_size,
                     block_q,
+                    use_mma,
                 };
                 let prefill = rvllm_attention::PagedPrefillFp8Launcher::new(attention);
                 prefill.launch_fp8kv_unified_sm121(

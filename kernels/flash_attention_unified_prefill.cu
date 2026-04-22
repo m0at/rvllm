@@ -21,6 +21,8 @@
 #include <cuda_fp8.h>
 #include <cfloat>
 
+#include "fp8_mma_frag_pack.cuh"
+
 #define FA2_THREADS 128
 
 __device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
@@ -121,16 +123,26 @@ __device__ __forceinline__ int find_seq_idx_linear(
 // change.
 //
 // smem layout (dynamic):
-//     s_q_f32      [BLOCK_M * head_dim]      f32   (pre-scaled Q)
-//     s_k_fp8      [head_dim * TILE_SIZE]    u8
+//     s_q_fp8      [BLOCK_M * head_dim]      u8    (FP8 E4M3 bytes)
+//     s_q_scale    [BLOCK_M]                 f32   (per-row scale ×
+//                                                   softmax_scale; applied
+//                                                   post-dot)
+//     s_k_fp8      [head_dim * TILE_SIZE]    u8    (row-major [t][d])
 //     s_v_fp8      [TILE_SIZE * head_dim]    u8
 //     s_k_scale    [TILE_SIZE]               f32
 //     s_v_scale    [TILE_SIZE]               f32
 //     s_S          [BLOCK_M * TILE_SIZE]     f32
 //     s_M          [BLOCK_M]                 f32   (online-softmax max)
 //     s_L          [BLOCK_M]                 f32   (online-softmax denom)
+//     s_alpha      [BLOCK_M]                 f32
 //     s_acc        [BLOCK_M * head_dim]      f32
 //     s_reduce     [FA2_THREADS / 32]        f32   (block reductions)
+//
+// Storing Q as FP8 rather than pre-decoded f32 drops the Q tile from
+// BLOCK_M*head_dim*4 to BLOCK_M*head_dim bytes (12 KB savings at
+// head_dim=256) and, more importantly, lets the tensor-core path
+// (enabled by `use_mma=1`) pack the A fragment directly from smem
+// with no extra f32→FP8 round trip.
 // ----------------------------------------------------------------------------
 
 // BLOCK_M is a compile-time constant today: 16 covers every Gemma 4
@@ -166,7 +178,8 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
     int num_queries_per_kv,
     int block_q,          // = BLOCK_M / num_queries_per_kv
     int num_seqs,
-    int window_size_left  // -1 ⇒ no sliding window
+    int window_size_left, // -1 ⇒ no sliding window
+    int use_mma           // 0: scalar Q·Kᵀ, 1: tensor-core MMA path (Phase F3+)
 ) {
     // === Program setup ================================================
     const int q_block_global = blockIdx.x;
@@ -220,8 +233,11 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
     // varies per layer type (256 sliding vs 512 global). Host passes
     // a matching `dynamic_smem_bytes` via cuFuncSetAttribute.
     extern __shared__ unsigned char smem_raw[];
-    float*         s_q       = reinterpret_cast<float*>(smem_raw);
-    unsigned char* s_k_fp8   = reinterpret_cast<unsigned char*>(s_q + BLOCK_M * head_dim);
+    // Layout (aligned carefully so each region starts 4-byte or 16-byte
+    // aligned for the u32 / u128 loads used below).
+    unsigned char* s_q_fp8   = smem_raw;
+    float*         s_q_scale = reinterpret_cast<float*>(s_q_fp8 + BLOCK_M * head_dim);
+    unsigned char* s_k_fp8   = reinterpret_cast<unsigned char*>(s_q_scale + BLOCK_M);
     unsigned char* s_v_fp8   = s_k_fp8 + head_dim * tile_size;
     float*         s_k_scale = reinterpret_cast<float*>(s_v_fp8 + tile_size * head_dim);
     float*         s_v_scale = s_k_scale + tile_size;
@@ -235,25 +251,37 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
     const int lane_in_row = tid & 7;
 
     // === Load Q into smem =============================================
-    // Pre-scale by q_scale × softmax_scale so the inner dot product is
-    // a pure sum of products. Matches the decode kernel's approach.
+    // Store raw FP8 bytes + per-row (q_scale × softmax_scale). The
+    // scalar Q·Kᵀ path decodes on the fly; the MMA path consumes the
+    // bytes directly via `pack_a_frag_row_major_m16k32`. Scale is
+    // applied post-dot (fp32 accumulator × s_q_scale[m] × s_k_scale[t]).
     for (int idx = tid; idx < BLOCK_M * head_dim; idx += FA2_THREADS) {
         const int m = idx / head_dim;
         const int d = idx - m * head_dim;
         const int q_pos_in_seq = q_block_local * block_q + m / num_queries_per_kv;
         const int q_head = kv_head * num_queries_per_kv + (m % num_queries_per_kv);
         if (q_pos_in_seq >= query_len || q_head >= num_heads) {
-            s_q[idx] = 0.0f;
+            s_q_fp8[idx] = 0;
             continue;
         }
         const int tok = seq_q_start + q_pos_in_seq;
-        const float q_scale = (q_scale_cache != nullptr)
-            ? q_scale_cache[tok * num_heads + q_head]
-            : *q_descale;
-        const float qs = q_scale * scale;
-        const unsigned char qb =
-            query[(tok * num_heads + q_head) * head_dim + d];
-        s_q[idx] = fp8kv_decode_byte(qb) * qs;
+        s_q_fp8[idx] = query[(tok * num_heads + q_head) * head_dim + d];
+    }
+    // Per-row q_scale × softmax_scale. Only BLOCK_M entries — written
+    // by the first BLOCK_M threads.
+    if (tid < BLOCK_M) {
+        const int m = tid;
+        const int q_pos_in_seq = q_block_local * block_q + m / num_queries_per_kv;
+        const int q_head = kv_head * num_queries_per_kv + (m % num_queries_per_kv);
+        if (q_pos_in_seq < query_len && q_head < num_heads) {
+            const int tok = seq_q_start + q_pos_in_seq;
+            const float qs = (q_scale_cache != nullptr)
+                ? q_scale_cache[tok * num_heads + q_head]
+                : *q_descale;
+            s_q_scale[m] = qs * scale;
+        } else {
+            s_q_scale[m] = 0.0f;
+        }
     }
 
     // === Init online-softmax state ===================================
@@ -312,22 +340,22 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
         __syncthreads();
 
         // -- Compute S[BLOCK_M, tile_len] = (scale·Q) · K^T · k_scale --
-        // Thread layout: 128 threads round-robin over BLOCK_M×tile_len.
-        // BLOCK_M=16, tile_len∈{16,32} gives 1-4 cells per thread.
-        const int total_st = BLOCK_M * tile_len;
-        for (int idx = tid; idx < total_st; idx += FA2_THREADS) {
-            const int m = idx / tile_len;
-            const int t = idx - m * tile_len;
-            const float* qr = s_q + m * head_dim;
-            const unsigned char* kr = s_k_fp8 + t * head_dim;
-            float dot = 0.0f;
-            #pragma unroll 8
-            for (int d = 0; d < head_dim; d++) {
-                dot += qr[d] * fp8kv_decode_byte(kr[d]);
-            }
-            dot *= s_k_scale[t];
-
-            // Masks: causal + optional sliding window + valid query row.
+        //
+        // Two paths, selected at launch via `use_mma`:
+        //
+        //   * SCALAR (use_mma==0). 128 threads round-robin over
+        //     BLOCK_M × tile_len cells. Each thread does one dot
+        //     product of length head_dim with FP8→f32 dequant in the
+        //     inner loop. Correct but scalar-FMA bound.
+        //
+        //   * MMA    (use_mma==1). 4 warps × 1 n-tile each, each
+        //     warp loops `head_dim / 32` k-steps calling
+        //     `mma_m16n8k32_e4m3_e4m3_f32`. Accumulates 16×8 cells
+        //     per warp in registers, unpacks into s_s with per-row /
+        //     per-slot scale applied. Requires tile_len ∈ {8, 16,
+        //     24, 32} so `tile_len / 8` warps ≤ 4 — fine for Gemma 4
+        //     (tile_len=32 sliding, 16 global).
+        const auto mask_pack = [&](int m, int t, float dot) -> float {
             const int q_pos_in_seq = q_block_local * block_q + m / num_queries_per_kv;
             const int q_head = kv_head * num_queries_per_kv + (m % num_queries_per_kv);
             const int query_abs = prefix_len + q_pos_in_seq;
@@ -336,8 +364,87 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
             const bool causal = kv_pos <= query_abs;
             const bool sliding_ok =
                 (window_size_left <= 0) || ((query_abs - kv_pos) < window_size_left);
-            const bool valid = valid_row && causal && sliding_ok && (kv_pos < max_seq_prefix_len);
-            s_s[idx] = valid ? dot : -FLT_MAX;
+            const bool valid = valid_row && causal && sliding_ok
+                && (kv_pos < max_seq_prefix_len);
+            return valid ? dot : -FLT_MAX;
+        };
+
+        if (use_mma == 0) {
+            const int total_st = BLOCK_M * tile_len;
+            for (int idx = tid; idx < total_st; idx += FA2_THREADS) {
+                const int m = idx / tile_len;
+                const int t = idx - m * tile_len;
+                const unsigned char* qr = s_q_fp8 + m * head_dim;
+                const unsigned char* kr = s_k_fp8 + t * head_dim;
+                float dot = 0.0f;
+                #pragma unroll 8
+                for (int d = 0; d < head_dim; d++) {
+                    dot += fp8kv_decode_byte(qr[d]) * fp8kv_decode_byte(kr[d]);
+                }
+                dot *= s_q_scale[m] * s_k_scale[t];
+                s_s[idx] = mask_pack(m, t, dot);
+            }
+        } else {
+            // MMA path — one warp per n-tile of width 8.
+            //
+            // A fragment is the Q tile [16, k-step*32 .. k-step*32+32].
+            // B fragment is the K slice [w*8 .. w*8+7, k-step*32 ..
+            // k-step*32+32] — col-major [n][k] matches how we stored
+            // s_k_fp8 (`t` outer, `d` inner), which means the "col
+            // stride" for `pack_b_frag_col_major_n8k32` is head_dim.
+            const int warp_id = tid >> 5;            // 0..3
+            const int lane    = tid & 31;
+            const int n_tiles = (tile_len + 7) >> 3; // ceil(tile_len/8)
+            const int k_steps = head_dim >> 5;       // head_dim / 32
+
+            if (warp_id < n_tiles) {
+                const int n_base = warp_id * 8;
+                const unsigned char* q_row0 = s_q_fp8;                // row stride = head_dim
+                const unsigned char* k_base_ptr = s_k_fp8 + n_base * head_dim;
+                float d_frag[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                uint32_t a[4];
+                uint32_t b[2];
+                #pragma unroll 1
+                for (int ks = 0; ks < k_steps; ks++) {
+                    const int d_off = ks * 32;
+                    rvllm::pack_a_frag_row_major_m16k32(
+                        q_row0 + d_off, head_dim, a, lane);
+                    rvllm::pack_b_frag_col_major_n8k32(
+                        k_base_ptr + d_off, head_dim, b, lane);
+                    rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a, b, d_frag);
+                }
+
+                // Unpack d_frag into s_s, applying per-row / per-slot
+                // scales + masks. Per PTX spec for m16n8k32 output
+                // (same as `unpack_d_frag_to_smem_m16n8` but with scale
+                // and mask fused — cheaper than writing raw then
+                // rewriting).
+                const int r_lo = lane >> 2;
+                const int r_hi = r_lo + 8;
+                const int c    = (lane & 3) << 1;
+                const int t_lo = n_base + c;
+                const int t_hi = n_base + c + 1;
+                // Row r_lo
+                if (t_lo < tile_len) {
+                    float dot = d_frag[0] * s_q_scale[r_lo] * s_k_scale[t_lo];
+                    s_s[r_lo * tile_len + t_lo] = mask_pack(r_lo, t_lo, dot);
+                }
+                if (t_hi < tile_len) {
+                    float dot = d_frag[1] * s_q_scale[r_lo] * s_k_scale[t_hi];
+                    s_s[r_lo * tile_len + t_hi] = mask_pack(r_lo, t_hi, dot);
+                }
+                // Row r_hi
+                if (t_lo < tile_len) {
+                    float dot = d_frag[2] * s_q_scale[r_hi] * s_k_scale[t_lo];
+                    s_s[r_hi * tile_len + t_lo] = mask_pack(r_hi, t_lo, dot);
+                }
+                if (t_hi < tile_len) {
+                    float dot = d_frag[3] * s_q_scale[r_hi] * s_k_scale[t_hi];
+                    s_s[r_hi * tile_len + t_hi] = mask_pack(r_hi, t_hi, dot);
+                }
+            }
+            // Warps past n_tiles are idle for Q·Kᵀ — they rejoin at
+            // the __syncthreads below for the softmax phase.
         }
         __syncthreads();
 

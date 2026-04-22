@@ -274,7 +274,8 @@ d_qd  = alloc(4); h2d(d_qd, np.array([1.0], dtype=np.float32))
 
 FA2_THREADS = 128
 smem_bytes = (
-    BLOCK_M * head_dim * 4            # s_q
+    BLOCK_M * head_dim * 1            # s_q_fp8 (Phase F3: FP8, not f32)
+    + BLOCK_M * 4                     # s_q_scale
     + head_dim * tile_size * 1        # s_k_fp8
     + tile_size * head_dim * 1        # s_v_fp8
     + tile_size * 4                   # s_k_scale
@@ -297,6 +298,10 @@ if smem_bytes >= 48 * 1024:
 total_num_q_blocks = prompt_len // block_q + 1
 window_size_left = -1 if sliding_window <= 0 else sliding_window
 num_seqs = 1
+# Phase F3: `use_mma=1` routes Q·Kᵀ through the sm_121a FP8 tensor
+# cores. Pass via CLI (e.g. `sm_121 256 256 1`) so the same harness
+# validates both paths against the same NumPy reference.
+use_mma = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 
 params = [
     np.array([int(d_out)], dtype=np.uint64),
@@ -323,6 +328,7 @@ params = [
     np.array([block_q],              dtype=np.int32),
     np.array([num_seqs],             dtype=np.int32),
     np.array([window_size_left],     dtype=np.int32),
+    np.array([use_mma],              dtype=np.int32),
 ]
 param_ptrs = np.array([p.ctypes.data for p in params], dtype=np.uint64)
 
