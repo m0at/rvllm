@@ -83,7 +83,7 @@ compile_kernel() {
     # and `mma.kind::*f8*` live in the CUDA family-specific PTX
     # feature set. Plain `sm_121` rejects them at ptxas time even
     # though nvcc -ptx emits the instruction successfully.
-    if grep -q 'kind::f8f6f4\|mma.sync.*e4m3\|mma.sync.*e2m1' "$cu" 2>/dev/null; then
+    if grep -q 'kind::f8f6f4\|mma.sync.*e4m3\|mma.sync.*e2m1\|fp8_mma_frag_pack\|mma_m16n8k32' "$cu" 2>/dev/null; then
         case "$arch" in
             sm_120) arch="sm_120a" ;;
             sm_121) arch="sm_121a" ;;
