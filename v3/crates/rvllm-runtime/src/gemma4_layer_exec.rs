@@ -781,25 +781,6 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if weights.o_chscale != 0 {
-        cublaslt.fp8_gemm_f32(
-            scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
-            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
-            scratch.attn_out_scale, weights.o_scale, stream,
-        )?;
-        gemma4_launcher::FusedNormAddResidualF16InLaunch {
-            num_tokens: dims.num_tokens,
-            hidden: dims.hidden,
-            eps: dims.rms_eps,
-        }
-        .launch(
-            kernels.fused_norm_add_residual_f16in,
-            scratch.gemm_f32_tmp,
-            weights.post_attn_norm_gamma,
-            residual,
-            0,
-            stream,
-        )?;
-    } else if weights.o_chscale != 0 {
         // O-proj batch path (num_tokens > FAST_PATH_M_MAX).
         //
         // The old path was `cublaslt.fp8_gemm_f32` into f32 scratch
