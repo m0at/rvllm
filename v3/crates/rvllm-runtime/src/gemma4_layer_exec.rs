@@ -781,15 +781,36 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if weights.o_chscale != 0 {
-        cublaslt.fp8_gemm_f32(
-            scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
+        // O-proj batch path (num_tokens > FAST_PATH_M_MAX).
+        //
+        // The old path was `cublaslt.fp8_gemm_f32` into f32 scratch
+        // + `FusedNormAddResidualF16Launch` applying per-row o_chscale.
+        // That applies the CHANNELSCALE approximation (per-row only,
+        // collapsing K-block variation) whereas the per-token fast path
+        // applies the full 2-D blockscale via Fp8GemvF16InLaunch. On
+        // real Gemma 4 31B the scale tensor has meaningful K-block
+        // variation, so the approximation diverges from per-token —
+        // root cause of aa01001pftrope0 step-8 divergence.
+        //
+        // Route batch through `fp8_gemm_channelscale_or_fallback`
+        // which, after the b_blockscale gate fix, picks CUTLASS
+        // SM120 + full 2-D blockscale at M>=128, and the
+        // f32-scratch channelscale fallback otherwise (still lossy
+        // in the 16 < M < 128 range, tracked as a follow-up).
+        let o_out_f16 = scratch.gemm_f32_tmp; // reused as f16 staging, plenty big
+        fp8_gemm_channelscale_or_fallback(
+            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
+            o_out_f16, scratch.attn_out_fp8, weights.o_fp8,
+            scratch.attn_out_scale, weights.o_chscale, weights.o_blockscale, weights.o_scale,
             dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
-            scratch.attn_out_scale, weights.o_scale, stream,
+            scratch.gemm_f32_tmp + (dims.num_tokens * dims.hidden * 2) as u64,
+            scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+            stream,
         )?;
-        gemma4_launcher::FusedNormAddResidualF16Launch {
+        gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual_f16, scratch.gemm_f32_tmp,
-            weights.o_chscale, weights.post_attn_norm_gamma, residual, 0, stream)?;
+        }.launch(kernels.fused_norm_add_residual_f16in, o_out_f16,
+            weights.post_attn_norm_gamma, residual, 0, stream)?;
     } else {
         cublaslt.fp8_gemm_f32(
             scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
@@ -1028,15 +1049,24 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
         if weights.down_chscale != 0 {
-            cublaslt.fp8_gemm_f32(
-                scratch.mlp_out_fp8, weights.down_fp8, scratch.gemm_f32_tmp,
+            // Same reroute as O-proj: use fp8_gemm_channelscale_or_fallback
+            // so the M>=128 batch path picks CUTLASS + full 2-D blockscale
+            // (when available) instead of the cuBLASLt + channelscale
+            // approximation that collapses K-block variation.
+            let down_out_f16 = scratch.gemm_f32_tmp;
+            fp8_gemm_channelscale_or_fallback(
+                cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
+                down_out_f16, scratch.mlp_out_fp8, weights.down_fp8,
+                scratch.mlp_out_scale, weights.down_chscale, weights.down_blockscale, weights.down_scale,
                 dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
-                scratch.mlp_out_scale, weights.down_scale, stream,
+                scratch.gemm_f32_tmp + (dims.num_tokens * dims.hidden * 2) as u64,
+                scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+                stream,
             )?;
-            gemma4_launcher::FusedNormAddResidualF16Launch {
+            gemma4_launcher::FusedNormAddResidualF16InLaunch {
                 num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-            }.launch(kernels.fused_norm_add_residual_f16, scratch.gemm_f32_tmp,
-                weights.down_chscale, weights.post_ff_norm_gamma, residual,
+            }.launch(kernels.fused_norm_add_residual_f16in, down_out_f16,
+                weights.post_ff_norm_gamma, residual,
                 weights.layer_scalar_ptr, stream)?;
         } else {
             cublaslt.fp8_gemm_f32(
