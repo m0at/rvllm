@@ -25,6 +25,31 @@
 
 #define FA2_THREADS 128
 
+// Quantise an f32 to an FP8 E4M3 byte, saturating to ±448. Used by
+// the P·V MMA branch to re-quantise the f32 softmax output P so it
+// can enter the tensor core as an A operand.
+__device__ __forceinline__ unsigned char f32_to_e4m3_byte(float v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    __nv_fp8_storage_t s = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+    return static_cast<unsigned char>(s);
+#else
+    if (v == 0.0f) return 0;
+    unsigned sign = (v < 0.0f) ? 1u : 0u;
+    float a = fabsf(v);
+    if (a > 448.0f) a = 448.0f;
+    int e = 0;
+    while (a >= 2.0f) { a *= 0.5f; e++; }
+    while (a < 1.0f && e > -6) { a *= 2.0f; e--; }
+    int exp_bits = e + 7;
+    if (exp_bits < 0) return (unsigned char)(sign << 7);
+    if (exp_bits > 15) exp_bits = 15;
+    int mant = (int)(rintf((a - 1.0f) * 8.0f));
+    if (mant == 8) { mant = 0; exp_bits++; }
+    if (exp_bits > 15) { exp_bits = 15; mant = 7; }
+    return (unsigned char)((sign << 7) | ((exp_bits & 0xF) << 3) | (mant & 0x7));
+#endif
+}
+
 __device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
 #if __CUDA_ARCH__ >= 1000
     __half_raw hr = __nv_cvt_fp8_to_halfraw(
@@ -234,18 +259,25 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
     // a matching `dynamic_smem_bytes` via cuFuncSetAttribute.
     extern __shared__ unsigned char smem_raw[];
     // Layout (aligned carefully so each region starts 4-byte or 16-byte
-    // aligned for the u32 / u128 loads used below).
+    // aligned for the u32 / u128 loads used below). F4 additions:
+    //   s_v_fp8_T — V tile re-packed as [d][t] for the P·V MMA, which
+    //               needs B in (n, k)-layout with stride=tile_size.
+    //   s_p_fp8   — re-quantised P [BLOCK_M × tile_size] FP8 bytes.
+    //   s_p_scale — per-row scale picked during the P re-quant.
     unsigned char* s_q_fp8   = smem_raw;
     float*         s_q_scale = reinterpret_cast<float*>(s_q_fp8 + BLOCK_M * head_dim);
     unsigned char* s_k_fp8   = reinterpret_cast<unsigned char*>(s_q_scale + BLOCK_M);
     unsigned char* s_v_fp8   = s_k_fp8 + head_dim * tile_size;
-    float*         s_k_scale = reinterpret_cast<float*>(s_v_fp8 + tile_size * head_dim);
+    unsigned char* s_v_fp8_T = s_v_fp8 + tile_size * head_dim;
+    float*         s_k_scale = reinterpret_cast<float*>(s_v_fp8_T + tile_size * head_dim);
     float*         s_v_scale = s_k_scale + tile_size;
     float*         s_s       = s_v_scale + tile_size;
     float*         s_m       = s_s + BLOCK_M * tile_size;
     float*         s_l       = s_m + BLOCK_M;
     float*         s_alpha   = s_l + BLOCK_M;
-    float*         s_acc     = s_alpha + BLOCK_M;
+    unsigned char* s_p_fp8   = reinterpret_cast<unsigned char*>(s_alpha + BLOCK_M);
+    float*         s_p_scale = reinterpret_cast<float*>(s_p_fp8 + BLOCK_M * tile_size);
+    float*         s_acc     = s_p_scale + BLOCK_M;
 
     const int row        = tid / 8;
     const int lane_in_row = tid & 7;
@@ -529,20 +561,116 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
         }
         __syncthreads();
 
-        // -- acc += P · V, dequant V on the fly, apply per-slot scale --
-        // Each thread owns one (m, d) output cell; iterates across
-        // tile_len reductions over t. BLOCK_M*head_dim / FA2_THREADS
-        // gives 32 outputs/thread (head=256) or 64 (head=512).
-        for (int idx = tid; idx < BLOCK_M * head_dim; idx += FA2_THREADS) {
-            const int m = idx / head_dim;
-            const int d = idx - m * head_dim;
-            float sum = 0.0f;
-            for (int t = 0; t < tile_len; t++) {
-                const float p = s_s[m * tile_len + t];
-                const float v = fp8kv_decode_byte(s_v_fp8[t * head_dim + d]);
-                sum += p * v * s_v_scale[t];
+        // -- acc += P · V =================================================
+        //
+        // Two paths, selected at launch via `use_mma` + tile shape:
+        //
+        //   * SCALAR (always valid). Each thread owns one (m, d) output
+        //     cell, loops `tile_len` reductions over t. BLOCK_M*head_dim /
+        //     FA2_THREADS gives 32 outputs/thread (head=256) or 64 (512).
+        //   * MMA    (`use_mma==1 && tile_size==32`, i.e. sliding layers
+        //     only). Re-quantise P to FP8 per row (per-row dynamic max
+        //     × 1/FP8_MAX; v_scale[t] is folded into P first so the MMA
+        //     inputs carry it), transpose V into the [d][t] layout the
+        //     MMA B operand needs, then 4 warps × head_dim/32 n-tiles
+        //     per warp run one `mma.sync m16n8k32` each. Output is
+        //     scaled by s_p_scale[row] and added into s_acc. Global
+        //     layers (tile_size=16) fall through to scalar today — the
+        //     k=32 MMA would need V-padding + extra smem that the 10
+        //     global layers don't benefit enough from to justify.
+        const bool pv_use_mma = (use_mma != 0) && (tile_size == 32);
+
+        if (pv_use_mma) {
+            // (1) Transpose V [t][d] → s_v_fp8_T [d][t]. Each thread
+            // does scattered byte writes; sm_121 smem can keep up at
+            // this rate, and the MMA saving downstream dominates.
+            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
+                const int t = idx / head_dim;
+                const int d = idx - t * head_dim;
+                s_v_fp8_T[d * tile_size + t] = s_v_fp8[t * head_dim + d];
             }
-            s_acc[idx] += sum;
+            // Zero-pad V_T along t for the partial-tile case (the last
+            // tile in a prompt_len not divisible by 32). For the common
+            // full-tile case this loop is empty.
+            for (int idx = tid; idx < (tile_size - tile_len) * head_dim; idx += FA2_THREADS) {
+                const int t_off = idx / head_dim;
+                const int d     = idx - t_off * head_dim;
+                const int t     = tile_len + t_off;
+                s_v_fp8_T[d * tile_size + t] = 0;
+            }
+            __syncthreads();
+
+            // (2) Fold v_scale[t] into P, find per-row max, quantise to
+            // FP8. 16 rows × 8 lanes-per-row layout re-used from softmax.
+            const int pv_row = tid >> 3;
+            const int pv_lr  = tid & 7;
+            if (pv_row < BLOCK_M) {
+                float local_max = 0.0f;
+                for (int t = pv_lr; t < tile_len; t += 8) {
+                    const float p = s_s[pv_row * tile_size + t] * s_v_scale[t];
+                    s_s[pv_row * tile_size + t] = p;
+                    local_max = fmaxf(local_max, fabsf(p));
+                }
+                // Zero out padding in s_s too (mirrors V_T padding).
+                for (int t = tile_len + pv_lr; t < tile_size; t += 8) {
+                    s_s[pv_row * tile_size + t] = 0.0f;
+                }
+                const float row_max = row_reduce_max_8(local_max);
+                if (pv_lr == 0) {
+                    s_p_scale[pv_row] = (row_max > 1e-30f)
+                        ? (row_max * (1.0f / 448.0f)) : 1.0f;
+                }
+            }
+            __syncthreads();
+            if (pv_row < BLOCK_M) {
+                const float inv_scale = 1.0f / s_p_scale[pv_row];
+                for (int t = pv_lr; t < tile_size; t += 8) {
+                    s_p_fp8[pv_row * tile_size + t] =
+                        f32_to_e4m3_byte(s_s[pv_row * tile_size + t] * inv_scale);
+                }
+            }
+            __syncthreads();
+
+            // (3) MMA P·V_T. 4 warps × (head_dim/8)/4 n-tiles per warp.
+            //     Each MMA output is 16×8; scale by s_p_scale[row] and
+            //     ADD into s_acc.
+            const int warp_id = tid >> 5;
+            const int lane    = tid & 31;
+            const int n_tiles_total    = head_dim >> 3;
+            const int n_tiles_per_warp = n_tiles_total >> 2;
+            uint32_t a[4];
+            rvllm::pack_a_frag_row_major_m16k32(s_p_fp8, tile_size, a, lane);
+            #pragma unroll 1
+            for (int nt = 0; nt < n_tiles_per_warp; nt++) {
+                const int n_base = (warp_id * n_tiles_per_warp + nt) * 8;
+                uint32_t b[2];
+                float d_frag[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                rvllm::pack_b_frag_col_major_n8k32(
+                    s_v_fp8_T + n_base * tile_size, tile_size, b, lane);
+                rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a, b, d_frag);
+
+                const int r_lo = lane >> 2;
+                const int r_hi = r_lo + 8;
+                const int c    = (lane & 3) << 1;
+                const int d_lo = n_base + c;
+                const int d_hi = d_lo + 1;
+                s_acc[r_lo * head_dim + d_lo] += d_frag[0] * s_p_scale[r_lo];
+                s_acc[r_lo * head_dim + d_hi] += d_frag[1] * s_p_scale[r_lo];
+                s_acc[r_hi * head_dim + d_lo] += d_frag[2] * s_p_scale[r_hi];
+                s_acc[r_hi * head_dim + d_hi] += d_frag[3] * s_p_scale[r_hi];
+            }
+        } else {
+            for (int idx = tid; idx < BLOCK_M * head_dim; idx += FA2_THREADS) {
+                const int m = idx / head_dim;
+                const int d = idx - m * head_dim;
+                float sum = 0.0f;
+                for (int t = 0; t < tile_len; t++) {
+                    const float p = s_s[m * tile_len + t];
+                    const float v = fp8kv_decode_byte(s_v_fp8[t * head_dim + d]);
+                    sum += p * v * s_v_scale[t];
+                }
+                s_acc[idx] += sum;
+            }
         }
         __syncthreads();
     }

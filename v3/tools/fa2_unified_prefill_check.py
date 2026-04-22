@@ -278,10 +278,13 @@ smem_bytes = (
     + BLOCK_M * 4                     # s_q_scale
     + head_dim * tile_size * 1        # s_k_fp8
     + tile_size * head_dim * 1        # s_v_fp8
+    + tile_size * head_dim * 1        # s_v_fp8_T (F4)
     + tile_size * 4                   # s_k_scale
     + tile_size * 4                   # s_v_scale
     + BLOCK_M * tile_size * 4         # s_s
     + BLOCK_M * 4 * 3                 # s_m + s_l + s_alpha
+    + BLOCK_M * tile_size * 1         # s_p_fp8 (F4)
+    + BLOCK_M * 4                     # s_p_scale (F4)
     + BLOCK_M * head_dim * 4          # s_acc
     + (FA2_THREADS // 32) * 4         # tail reduce
     + 128                             # safety margin
