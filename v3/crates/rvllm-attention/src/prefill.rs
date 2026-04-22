@@ -198,17 +198,21 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
 
             // Smem budget — must match the kernel's layout. 128 B
             // cushion covers alignment slop without masking bugs.
-            // Phase F3: Q is stored as FP8 + per-row f32 scale
-            // instead of pre-decoded f32, which is both smaller and
-            // what the MMA path needs.
+            // Phase F3: Q is stored as FP8 + per-row f32 scale (was
+            // pre-decoded f32). Phase F4: adds V-transpose buffer
+            // + re-quantised-P region so the P·V MMA has the
+            // operand layouts the tensor core expects.
             let smem_bytes: u32 = BLOCK_M * hd        // s_q_fp8
                 + BLOCK_M * 4                          // s_q_scale
                 + hd * ts                              // s_k_fp8
                 + ts * hd                              // s_v_fp8
+                + ts * hd                              // s_v_fp8_T (F4)
                 + ts * 4                               // s_k_scale
                 + ts * 4                               // s_v_scale
                 + BLOCK_M * ts * 4                     // s_s
                 + BLOCK_M * 4 * 3                      // s_m + s_l + s_alpha
+                + BLOCK_M * ts                         // s_p_fp8 (F4)
+                + BLOCK_M * 4                          // s_p_scale (F4)
                 + BLOCK_M * hd * 4                     // s_acc
                 + (FA2_THREADS / 32) * 4               // reduce tail
                 + 128;
