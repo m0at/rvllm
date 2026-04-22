@@ -414,7 +414,14 @@ impl Gemma4Bringup {
             .unwrap();
 
         let kv_bytes_per_elem: u32 = 1; // bench path always FP8
-        let sliding_blocks = ((arch.sliding_window_size as u32 + block_size - 1) / block_size).min(num_blocks_total);
+        // aa01001pftrope0 cliff-fix: sliding layers need `slot_mapping[t] < sliding_blocks*block_size`
+        // at every t the rope writes; the old cap sliding_blocks = sliding_window/block_size = 32
+        // (= 1024 slots for Gemma 4) broke at prompt_len > sliding_window because slot_mapping
+        // is linear 0..prompt_len-1 and index 1024+ ran off the end of the sliding KV region.
+        // Proper fix is a per-sliding-layer ring buffer (slot = t mod sliding_window) but that
+        // needs rope + attention kernel cooperation. For now give sliding layers the full pool —
+        // ~10 GiB extra at num_blocks_total=1024, fits in the 50 GiB arena with Gemma 4 31B fp8.
+        let sliding_blocks = num_blocks_total;
 
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
         let mut kv_total_bytes: u64 = 0;
@@ -879,7 +886,14 @@ impl Gemma4Bringup {
 
         // Per-layer KV budget: sliding layers cap at sliding_window/block_size blocks,
         // global layers use full num_blocks_total. Saves ~5x KV memory for long context.
-        let sliding_blocks = ((arch.sliding_window_size as u32 + block_size - 1) / block_size).min(num_blocks_total);
+        // aa01001pftrope0 cliff-fix: sliding layers need `slot_mapping[t] < sliding_blocks*block_size`
+        // at every t the rope writes; the old cap sliding_blocks = sliding_window/block_size = 32
+        // (= 1024 slots for Gemma 4) broke at prompt_len > sliding_window because slot_mapping
+        // is linear 0..prompt_len-1 and index 1024+ ran off the end of the sliding KV region.
+        // Proper fix is a per-sliding-layer ring buffer (slot = t mod sliding_window) but that
+        // needs rope + attention kernel cooperation. For now give sliding layers the full pool —
+        // ~10 GiB extra at num_blocks_total=1024, fits in the 50 GiB arena with Gemma 4 31B fp8.
+        let sliding_blocks = num_blocks_total;
 
 
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
@@ -1449,7 +1463,14 @@ impl Gemma4Bringup {
         let gemm_f32_max_n = std::cmp::max(max_qkv_rows, 2 * inter);
         let gemm_f32_tmp = arena.region("gen_gemm_f32", (max_tokens * gemm_f32_max_n * 4) as usize, 16)?;
 
-        let sliding_blocks = ((arch.sliding_window_size as u32 + block_size - 1) / block_size).min(num_blocks_total);
+        // aa01001pftrope0 cliff-fix: sliding layers need `slot_mapping[t] < sliding_blocks*block_size`
+        // at every t the rope writes; the old cap sliding_blocks = sliding_window/block_size = 32
+        // (= 1024 slots for Gemma 4) broke at prompt_len > sliding_window because slot_mapping
+        // is linear 0..prompt_len-1 and index 1024+ ran off the end of the sliding KV region.
+        // Proper fix is a per-sliding-layer ring buffer (slot = t mod sliding_window) but that
+        // needs rope + attention kernel cooperation. For now give sliding layers the full pool —
+        // ~10 GiB extra at num_blocks_total=1024, fits in the 50 GiB arena with Gemma 4 31B fp8.
+        let sliding_blocks = num_blocks_total;
         let use_f16_kv = std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0");
         let kv_bytes_per_elem: u32 = if use_f16_kv { 2 } else { 1 };
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
