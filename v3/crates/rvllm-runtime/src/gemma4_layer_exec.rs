@@ -618,21 +618,85 @@ pub unsafe fn gemma4_forward_phase(
             // Prefill always uses FP8 KV path (no F16 prefill kernel).
             rope_fp8kv(dims, kernels, scratch, meta, stream)?;
 
-            // Unified attention: replace the dedicated FA2 multi-query
-            // prefill kernel with a loop of single-query decode kernel
-            // calls — one per prompt position qi. Per-qi context_lens
-            // value is NOT rewritten via HtoD each iteration (that
-            // races against the non-default stream); instead we reuse
-            // the `cu_seqlens_q` scratch region as a pre-populated
-            // device array `[1, 2, ..., num_tokens]` and let decode
-            // read ctx = (qi+1) by pointing into it at offset qi.
-            // By construction this is bit-identical to the per-token
-            // decode path rvllm-ppl validates.
+            // --- Unified multi-Q prefill fast path (sm_121) -----------
+            // `flash_attention_2_prefill_fp8kv_unified_kernel` handles
+            // all prompt tokens of one sequence in ONE kernel launch
+            // per layer. See v3/UNIFIED_PREFILL_SPEC.md. We route
+            // through it whenever:
+            //   * the attention backend is Fa2Ptx (sm_121),
+            //   * the PTX module + symbol loaded (`has_unified_prefill`),
+            //   * `RVLLM_UNIFIED_PREFILL` isn't explicitly set to "0".
+            // Otherwise we fall back to the decode-per-qi loop below —
+            // retained both as a bisect tool and as the reference path
+            // rvllm-ppl validates bit-for-bit.
+            let unified_enabled = std::env::var_os("RVLLM_UNIFIED_PREFILL")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let fa2_unified = if unified_enabled {
+                match attention {
+                    rvllm_attention::AttentionBackend::Fa2Ptx(k) if k.has_unified_prefill() => true,
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if fa2_unified && dims.num_tokens > 1 {
+                let prefill_params = rvllm_attention::PagedPrefillParams {
+                    num_tokens: dims.num_tokens,
+                    num_seqs: 1,
+                    num_heads: dims.num_heads,
+                    num_kv_heads: dims.num_kv_heads,
+                    head_dim: dims.head_dim,
+                    block_size: dims.block_size,
+                    max_blocks_per_seq: dims.max_blocks_per_seq,
+                    num_blocks_total: dims.num_blocks_total,
+                    scale: dims.attn_scale,
+                    window_size_left,
+                };
+                // Tile size picked so smem stays inside the sm_121
+                // 99 KB opt-in cap (see UNIFIED_PREFILL_SPEC §params).
+                let tile_size = if dims.head_dim <= 256 { 32u32 } else { 16u32 };
+                let num_queries_per_kv = dims.num_heads / dims.num_kv_heads;
+                let block_q = rvllm_attention::UNIFIED_PREFILL_BLOCK_M / num_queries_per_kv.max(1);
+                let unified = rvllm_attention::UnifiedPrefillParams {
+                    num_queries_per_kv,
+                    tile_size,
+                    block_q,
+                };
+                let prefill = rvllm_attention::PagedPrefillFp8Launcher::new(attention);
+                prefill.launch_fp8kv_unified_sm121(
+                    prefill_params,
+                    unified,
+                    scratch.attn_out,
+                    scratch.q_fp8,
+                    scratch.k_cache,
+                    scratch.v_cache,
+                    scratch.k_scale_cache,
+                    scratch.v_scale_cache,
+                    scratch.q_scale_cache,
+                    0, // k_descale_fallback (unused when per-slot populated)
+                    0, // v_descale_fallback
+                    meta.block_tables,
+                    cu_seqlens_q,
+                    meta.context_lens,
+                    scratch.q_scale_ptr,
+                    stream,
+                )?;
+            } else {
+            // --- Decode-per-qi fallback -------------------------------
+            // Replaces batch prefill with a loop of single-query decode
+            // kernel calls — one per prompt position qi. Per-qi
+            // context_lens value is NOT rewritten via HtoD each
+            // iteration (that races against the non-default stream);
+            // instead we reuse the `cu_seqlens_q` scratch region as a
+            // pre-populated device array `[1, 2, ..., num_tokens]`
+            // and let decode read ctx = (qi+1) by pointing into it at
+            // offset qi. By construction this is bit-identical to the
+            // per-token decode path rvllm-ppl validates.
             //
-            // Cost: prompt_len extra kernel launches per layer. At
-            // prompt_len<=~64 this is dominated by the layer GEMMs.
-            // A proper multi-query FA2 kernel that reuses this math
-            // is a perf follow-up; correctness comes first.
+            // Cost: prompt_len extra kernel launches per layer — the
+            // ≈30× TTFT gap against vLLM that motivated the unified
+            // kernel above.
             let decode_params = PagedDecodeParams {
                 num_seqs: 1,
                 num_heads: dims.num_heads,
@@ -700,6 +764,7 @@ pub unsafe fn gemma4_forward_phase(
             }
             // Ensure ctx_host lives until the stream has consumed it.
             std::hint::black_box(&ctx_host);
+            } // end of decode-per-qi fallback
         }
     }
     #[cfg(not(feature = "cuda"))]
