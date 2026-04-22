@@ -111,35 +111,16 @@ __device__ __forceinline__ void unpack_d_frag_to_smem_m16n8(
     row_hi[c + 1] = d[3];
 }
 
-// Explicitly zero all four D-fragment registers via PTX `mov.f32`.
-// Callers that want a "fresh" (non-accumulating) MMA output must run
-// this BEFORE the MMA — a naked `float d[4] = {0}` compiles to a
-// single `mov.f32 %0, 0` that only initialises the first slot and
-// leaves d[1..3] carrying stale values from an earlier compiler-
-// hoisted reg lifetime. That was the F4 P·V breakage in Phase F6.
-__device__ __forceinline__ void zero_mma_d_frag(float d[4]) {
-    asm volatile(
-        "mov.f32 %0, 0f00000000;\n\t"
-        "mov.f32 %1, 0f00000000;\n\t"
-        "mov.f32 %2, 0f00000000;\n\t"
-        "mov.f32 %3, 0f00000000;"
-        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-    );
-}
-
-// Thin wrapper around the PTX. `d` is in-out accumulator — value at
-// entry is the `C` operand, value at exit is `D`. Using `"+f"`
-// (read-write) instead of separate `"=f"` output and `"f"` input is
-// load-bearing: with separate constraints, when d is initialised to
-// `{0, 0, 0, 0}` the compiler deduplicates all four C-side registers
-// to a single register (observed as `{%f409, %f409, %f409, %f409}`
-// in PTX). The tensor core then reads garbage for three of the four
-// C positions and returns NaN / inf — the F4 P·V breakage that
-// Phase F6 tracked down.
+// Thin wrapper around the PTX. Kept here so the full prefill kernel
+// doesn't have to repeat the asm incantation at every call site.
+// `c` is the accumulator input — pass previous `d` for running
+// accumulation (FA2 online-softmax pattern), or zero-init for a
+// fresh output tile.
 __device__ __forceinline__ void mma_m16n8k32_e4m3_e4m3_f32(
     float           d[4],
     const uint32_t  a[4],
-    const uint32_t  b[2])
+    const uint32_t  b[2],
+    const float     c[4])
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     asm volatile(
@@ -147,13 +128,14 @@ __device__ __forceinline__ void mma_m16n8k32_e4m3_e4m3_f32(
         "{%0, %1, %2, %3}, "
         "{%4, %5, %6, %7}, "
         "{%8, %9}, "
-        "{%0, %1, %2, %3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        "{%10, %11, %12, %13};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b[0]), "r"(b[1])
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3])
     );
 #else
-    (void)a; (void)b;
+    (void)a; (void)b; (void)c;
     d[0] = d[1] = d[2] = d[3] = 0.0f;
 #endif
 }
