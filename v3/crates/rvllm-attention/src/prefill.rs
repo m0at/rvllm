@@ -103,6 +103,11 @@ pub struct UnifiedPrefillParams {
     pub num_queries_per_kv: u32,
     pub tile_size: u32,
     pub block_q: u32,
+    /// Route Q·Kᵀ through the sm_121a FP8 tensor-core MMA when `true`.
+    /// Scalar FMA otherwise (the correctness-validated baseline). The
+    /// engine selects this per-launch from `RVLLM_UNIFIED_PREFILL_MMA`
+    /// so A/B bisects stay trivial.
+    pub use_mma: bool,
 }
 
 impl<'a> PagedPrefillFp8Launcher<'a> {
@@ -193,15 +198,19 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
 
             // Smem budget — must match the kernel's layout. 128 B
             // cushion covers alignment slop without masking bugs.
-            let smem_bytes: u32 = BLOCK_M * hd * 4        // s_q
-                + hd * ts                                  // s_k_fp8
-                + ts * hd                                  // s_v_fp8
-                + ts * 4                                   // s_k_scale
-                + ts * 4                                   // s_v_scale
-                + BLOCK_M * ts * 4                         // s_s
-                + BLOCK_M * 4 * 3                          // s_m + s_l + s_alpha
-                + BLOCK_M * hd * 4                         // s_acc
-                + (FA2_THREADS / 32) * 4                   // reduce tail
+            // Phase F3: Q is stored as FP8 + per-row f32 scale
+            // instead of pre-decoded f32, which is both smaller and
+            // what the MMA path needs.
+            let smem_bytes: u32 = BLOCK_M * hd        // s_q_fp8
+                + BLOCK_M * 4                          // s_q_scale
+                + hd * ts                              // s_k_fp8
+                + ts * hd                              // s_v_fp8
+                + ts * 4                               // s_k_scale
+                + ts * 4                               // s_v_scale
+                + BLOCK_M * ts * 4                     // s_s
+                + BLOCK_M * 4 * 3                      // s_m + s_l + s_alpha
+                + BLOCK_M * hd * 4                     // s_acc
+                + (FA2_THREADS / 32) * 4               // reduce tail
                 + 128;
 
             if smem_bytes >= 48 * 1024 {
@@ -224,6 +233,7 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
             let block_q = unified.block_q as i32;
             let num_seqs = params.num_seqs as i32;
             let window_size_left = params.window_size_left;
+            let use_mma: i32 = if unified.use_mma { 1 } else { 0 };
 
             let mut arg_out = o_f16;
             let mut arg_q = q_fp8;
@@ -239,7 +249,7 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
             let mut arg_cl = context_lens;
             let mut arg_qdf = q_descale_fallback;
 
-            let args: [*mut core::ffi::c_void; 24] = [
+            let args: [*mut core::ffi::c_void; 25] = [
                 &mut arg_out as *mut _ as *mut _,
                 &mut arg_q as *mut _ as *mut _,
                 &mut arg_k as *mut _ as *mut _,
@@ -264,6 +274,7 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
                 &block_q as *const _ as *mut _,
                 &num_seqs as *const _ as *mut _,
                 &window_size_left as *const _ as *mut _,
+                &use_mma as *const _ as *mut _,
             ];
 
             // Grid: (total_num_q_blocks, num_kv_heads). params.num_tokens
