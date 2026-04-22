@@ -2,13 +2,20 @@
 //!
 //! v1 of the runtime only supports **greedy** decoding
 //! (`run_generate` ends in `argmax`). We accept the full OpenAI
-//! sampling surface in the request schema but reject any non-default
-//! value with a 400 — honest about the limitation, so callers don't
-//! silently get greedy output when they asked for `temperature=1.0`.
+//! sampling surface in the request schema and **coerce** anything
+//! non-greedy to greedy, with a `tracing::warn!` line on the first
+//! occurrence of each distinct parameter so an operator sees it once
+//! without log spam. Rationale: clients like zeroclaw and most
+//! OpenAI SDKs default to `temperature=1.0` / `top_p=1.0`; rejecting
+//! those with a 400 forced every caller to hard-code
+//! `temperature=0`. Coercing silently surprises callers; coercing
+//! with one warn-per-process is the honest middle.
 //!
-//! When a sampling kernel lands, the rejection rules below relax.
+//! When a sampling kernel lands, this file becomes the place to route
+//! to stochastic decode.
 
 use crate::error::ApiError;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingParams {
@@ -25,32 +32,58 @@ impl Default for SamplingParams {
     }
 }
 
+/// Once-per-process warn latches for each non-greedy parameter.
+static WARN_TEMPERATURE: OnceLock<()> = OnceLock::new();
+static WARN_TOP_P:       OnceLock<()> = OnceLock::new();
+static WARN_TOP_K:       OnceLock<()> = OnceLock::new();
+
 impl SamplingParams {
-    /// Accept only parameter combinations the runtime can honour today.
-    /// v1 = greedy only. Returns `ApiError::InvalidRequest` otherwise.
+    /// Coerce to greedy for the worker. Returns `GreedyParams` — the
+    /// type-level proof that stochastic params never reach the
+    /// runtime. Any non-default param triggers a one-shot WARN log.
+    /// Negative values (temperature < 0, top_p < 0) are still a hard
+    /// 400 because they're nonsensical, not just unsupported.
     pub fn ensure_supported(self) -> Result<GreedyParams, ApiError> {
-        // Temperature 0.0 is "greedy" by OpenAI convention; treat
-        // anything not exactly 0.0 as "wants sampling".
-        if self.temperature != 0.0 {
+        if self.temperature < 0.0 {
             return Err(ApiError::invalid_param(
-                "temperature must be 0 — sampling kernel not yet wired",
+                "temperature must be non-negative",
                 "temperature",
-                "sampling_unsupported",
+                "invalid_value",
             ));
+        }
+        if self.top_p < 0.0 || self.top_p > 1.0 {
+            return Err(ApiError::invalid_param(
+                "top_p must be in [0, 1]",
+                "top_p",
+                "invalid_value",
+            ));
+        }
+        if self.temperature != 0.0 {
+            WARN_TEMPERATURE.get_or_init(|| {
+                tracing::warn!(
+                    temperature = self.temperature,
+                    "coercing temperature to 0.0 (greedy) — sampling kernel \
+                     not wired yet; this warning fires once per process"
+                );
+            });
         }
         if self.top_p != 1.0 {
-            return Err(ApiError::invalid_param(
-                "top_p must be 1.0 — sampling kernel not yet wired",
-                "top_p",
-                "sampling_unsupported",
-            ));
+            WARN_TOP_P.get_or_init(|| {
+                tracing::warn!(
+                    top_p = self.top_p,
+                    "coercing top_p to 1.0 (greedy) — sampling kernel not \
+                     wired yet; this warning fires once per process"
+                );
+            });
         }
         if self.top_k.is_some() {
-            return Err(ApiError::invalid_param(
-                "top_k unsupported — sampling kernel not yet wired",
-                "top_k",
-                "sampling_unsupported",
-            ));
+            WARN_TOP_K.get_or_init(|| {
+                tracing::warn!(
+                    top_k = self.top_k,
+                    "ignoring top_k — sampling kernel not wired yet; this \
+                     warning fires once per process"
+                );
+            });
         }
         // `seed` is harmless with greedy decoding (deterministic anyway);
         // accept and ignore.
@@ -70,8 +103,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_params_reject_because_temp_is_one() {
-        assert!(SamplingParams::default().ensure_supported().is_err());
+    fn openai_defaults_coerce_to_greedy() {
+        // temperature=1.0 / top_p=1.0 is the OpenAI SDK default — must
+        // not error, must coerce silently (one WARN log, fired once
+        // per process).
+        assert!(SamplingParams::default().ensure_supported().is_ok());
     }
 
     #[test]
@@ -86,8 +122,20 @@ mod tests {
     }
 
     #[test]
-    fn non_default_top_p_rejected() {
+    fn non_default_top_p_accepted_and_coerced() {
         let p = SamplingParams { temperature: 0.0, top_p: 0.9, ..Default::default() };
+        assert!(p.ensure_supported().is_ok());
+    }
+
+    #[test]
+    fn negative_temperature_rejected() {
+        let p = SamplingParams { temperature: -0.1, ..Default::default() };
+        assert!(p.ensure_supported().is_err());
+    }
+
+    #[test]
+    fn out_of_range_top_p_rejected() {
+        let p = SamplingParams { temperature: 0.0, top_p: 1.5, ..Default::default() };
         assert!(p.ensure_supported().is_err());
     }
 }

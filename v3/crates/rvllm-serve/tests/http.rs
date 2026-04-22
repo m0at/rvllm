@@ -161,18 +161,28 @@ async fn chat_empty_messages_returns_400() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chat_non_greedy_sampling_returns_400() {
+async fn chat_non_greedy_sampling_coerces_silently() {
+    // v1 runtime is greedy-only, but OpenAI-default sampling params
+    // (temperature=1.0 / top_p=1.0) must not 400. They coerce to
+    // greedy with a one-shot WARN log. Negative / out-of-range
+    // values still 400; those are covered by sampling.rs unit tests.
     let (state, _join) = need_model!();
     let model = state.config.model_id.clone();
     let router = build_router(state);
     let body = format!(
         r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"temperature":0.7}}"#,
     );
-    let (status, _h, body) = send(router, Method::POST, "/v1/chat/completions", body).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(v["error"]["code"], "sampling_unsupported");
-    assert_eq!(v["error"]["param"], "temperature");
+    let (status, _h, _body) = send(router, Method::POST, "/v1/chat/completions", body).await;
+    // Not 400. The worker may fail for a different reason in the
+    // test harness (no real model) but the sampling check itself
+    // must pass — i.e. the status must NOT be 400 with
+    // sampling_unsupported. We assert status != 400 to cover both
+    // the happy path and test-harness errors that surface as 500.
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "temperature=0.7 should coerce to greedy, not 400"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
