@@ -312,27 +312,21 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     // blows past the 48 KB static-smem ceiling, so we
                     // opt in to dynamic smem via `cuFuncSetAttribute`
                     // once per process.
+                    // sm_121 FP8-KV decode is BC=16 only. head_dim=512
+                    // never fit BC=32 within the 99 KB opt-in smem cap,
+                    // and head_dim=256 measurably favours BC=16 too
+                    // (+2.5%/+5.5% at batch=128/256 — halving the tile
+                    // lets 2+ blocks live per SM and hides per-tile
+                    // __syncthreads latency). The BC=32 kernel was
+                    // removed from flash_attention.cu in the cleanup
+                    // that followed the ncu profile.
                     use cudarc::driver::sys::*;
                     const FA2_THREADS: i32 = 128;
+                    const FA2_BC: i32 = 16;
                     let hd = params.head_dim as i32;
-                    // head_dim=512 (Gemma 4 global-attn) doesn't fit
-                    // BC=32 within sm_121's ~99 KB opt-in smem cap
-                    // (128 KB needed). Dispatch to the BC=16 kernel
-                    // for those shapes.
-                    // BC=16 beats BC=32 on every measured batch on sm_121.
-                    // At head_dim=256, BC=32 needs ~64 KB smem/block →
-                    // one block per SM; BC=16 halves the tile to ~32 KB,
-                    // lets the SM launch 2+ concurrent blocks and hide
-                    // the per-tile __syncthreads latency. Measured gain:
-                    // batch=128 555→571 tok/s (+2.9%), batch=256 909→957
-                    // tok/s (+5.3%). head_dim=512 (Gemma 4 global-attn)
-                    // can only use BC=16 anyway (BC=32 blows the 99 KB
-                    // opt-in smem cap). So route everything through the
-                    // BC=16 kernel on sm_121.
-                    let (kernel_fn, fa2_bc) = (fa2.fn_decode_fp8kv_bc16, 16);
-                    let _ = hd;
+                    let kernel_fn = fa2.fn_decode_fp8kv;
                     let smem_bytes =
-                        2 * fa2_bc * hd * 4 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
+                        2 * FA2_BC * hd * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
                     if smem_bytes as u32 >= 48 * 1024 {
                         let _ = cuFuncSetAttribute(
                             kernel_fn.raw() as CUfunction,

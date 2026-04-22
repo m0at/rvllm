@@ -899,249 +899,6 @@ __device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
 
 extern "C"
 __global__ void flash_attention_2_decode_fp8kv_kernel(
-    __half* __restrict__ output,                 // [num_seqs, num_heads, head_dim] f16
-    const unsigned char* __restrict__ query,     // [num_seqs, num_heads, head_dim] fp8
-    const unsigned char* __restrict__ key_cache, // [num_blocks, block_size, num_kv_heads, head_dim] fp8
-    const unsigned char* __restrict__ value_cache,
-    const float* __restrict__ k_scale_cache,     // per-slot f32, OR nullptr -> use k_descale_fallback
-    const float* __restrict__ v_scale_cache,     // per-slot f32, OR nullptr -> use v_descale_fallback
-    const float* __restrict__ q_scale_cache,     // per-(seq,head) f32, OR nullptr -> use q_descale
-    const float* __restrict__ k_descale_fallback,// scalar, used only if k_scale_cache==nullptr
-    const float* __restrict__ v_descale_fallback,// scalar, used only if v_scale_cache==nullptr
-    const int* __restrict__ block_tables,        // [num_seqs, max_blocks_per_seq]
-    const int* __restrict__ context_lens,        // [num_seqs]
-    const float* __restrict__ q_descale,         // single scalar
-    float scale,
-    int num_heads,
-    int num_kv_heads,
-    int head_dim,
-    int block_size,
-    int max_blocks_per_seq,
-    int window_size_left
-) {
-    const int seq_idx  = blockIdx.x;
-    const int head_idx = blockIdx.y;
-    const int tid      = threadIdx.x;
-
-    const int context_len = context_lens[seq_idx];
-    if (context_len == 0) return;
-
-    const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx
-                                                         : (head_idx / (num_heads / num_kv_heads));
-
-    const float q_scale = (q_scale_cache != nullptr)
-        ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
-        : *q_descale;
-    // Per-slot KV scales (Gemma 4) or scalar fallback (Llama/Qwen).
-    // Branch is on a per-launch parameter so the compiler can hoist
-    // it out of the inner tile loop.
-    const bool k_perslot = (k_scale_cache != nullptr);
-    const bool v_perslot = (v_scale_cache != nullptr);
-    const float k_scale_scalar = k_perslot ? 0.0f : __ldg(k_descale_fallback);
-    const float v_scale_scalar = v_perslot ? 0.0f : __ldg(v_descale_fallback);
-
-    // Sliding-window left boundary. `window_size_left < 0` = full
-    // context (global attention). Otherwise the decode query at
-    // absolute KV position `context_len - 1` can only attend back
-    // to `window_start = max(0, context_len - 1 - window_size_left)`.
-    // kv_pos < window_start → score = -FLT_MAX (masked).
-    const int decode_q_abs_pos = context_len - 1;
-    const int window_start = (window_size_left < 0)
-        ? 0
-        : max(0, decode_q_abs_pos - window_size_left);
-
-    extern __shared__ float smem[];
-    float* s_key    = smem;
-    float* s_val    = smem + FA2_BC * head_dim;
-    float* s_score  = smem + 2 * FA2_BC * head_dim;
-    float* s_reduce = smem + 2 * FA2_BC * head_dim + FA2_BC;
-
-    const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
-    const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
-
-    // Load Q row with descale + attention scale folded in.
-    float q_reg[8];
-    for (int r = 0; r < dims_per_thread && r < 8; r++) {
-        int d = tid + r * FA2_THREADS;
-        if (d < head_dim) {
-            unsigned char qb = query[(seq_idx * num_heads + head_idx) * head_dim + d];
-            q_reg[r] = fp8kv_decode_byte(qb) * q_scale * scale;
-        } else {
-            q_reg[r] = 0.0f;
-        }
-    }
-
-    float row_max = -FLT_MAX;
-    float row_sum = 0.0f;
-    float acc[8];
-    for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] = 0.0f;
-
-    for (int tile = 0; tile < num_kv_tiles; tile++) {
-        const int tile_start = tile * FA2_BC;
-        const int tile_len = min(FA2_BC, context_len - tile_start);
-
-        // Load K tile: fp8 cache -> f32 shared mem (apply per-slot K
-        // scale on load). Vectorized by 8: each thread pulls one
-        // u64 = 8 FP8 bytes. head_dim is always a multiple of 8 for
-        // the shapes we support (128/256/512), so the
-        // tile_len*head_dim/8 work divides cleanly across the 128
-        // threads.
-        {
-            const int vec_total = tile_len * (head_dim / 8);
-            for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
-                int t = vi / (head_dim / 8);
-                int d_base = (vi % (head_dim / 8)) * 8;
-                int kv_pos = tile_start + t;
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                int slot = phys_block * block_size + page_off;
-                float k_scale = k_perslot
-                    ? __ldg(&k_scale_cache[slot * num_kv_heads + kv_head_idx])
-                    : k_scale_scalar;
-                const unsigned char* k_row = key_cache
-                    + (slot * num_kv_heads + kv_head_idx) * head_dim;
-                unsigned long long k8 = __ldg(
-                    reinterpret_cast<const unsigned long long*>(k_row + d_base));
-                float* s = s_key + t * head_dim + d_base;
-                #pragma unroll
-                for (int b = 0; b < 8; b++) {
-                    s[b] = fp8kv_decode_byte((unsigned char)(k8 >> (b * 8))) * k_scale;
-                }
-            }
-        }
-        __syncthreads();
-
-        // Q * K^T per tile column, with left-window mask applied
-        // before softmax. `window_size_left < 0` (global) → window_start
-        // is 0 → kv_pos >= 0 always, no-op mask.
-        for (int t = 0; t < tile_len; t++) {
-            float dot = 0.0f;
-            for (int r = 0; r < dims_per_thread && r < 8; r++) {
-                int d = tid + r * FA2_THREADS;
-                if (d < head_dim) {
-                    dot += q_reg[r] * s_key[t * head_dim + d];
-                }
-            }
-            dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
-            if (tid == 0) {
-                int kv_pos = tile_start + t;
-                s_score[t] = (kv_pos < window_start) ? -FLT_MAX : dot;
-            }
-            __syncthreads();
-        }
-
-        // Online softmax update. Masked columns carry -FLT_MAX so
-        // their exp is 0 and they contribute nothing to the row sum.
-        // The `s_score[t] > -FLT_MAX + 1.0f` guard on the exp pass
-        // keeps the sum numerically clean (otherwise exp(-FLT_MAX -
-        // row_max) can become NaN on some architectures).
-        float tile_max = -FLT_MAX;
-        if (tid == 0) {
-            for (int t = 0; t < tile_len; t++) tile_max = fmaxf(tile_max, s_score[t]);
-            s_reduce[0] = tile_max;
-        }
-        __syncthreads();
-        tile_max = s_reduce[0];
-        __syncthreads();
-
-        float prev_max = row_max;
-        float new_max = fmaxf(row_max, tile_max);
-        if (new_max > prev_max && prev_max > -FLT_MAX) {
-            float correction = expf(prev_max - new_max);
-            for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] *= correction;
-            row_sum *= correction;
-        }
-        row_max = new_max;
-
-        if (tid == 0) {
-            float tsum = 0.0f;
-            for (int t = 0; t < tile_len; t++) {
-                // Masked entries (window-left) carry -FLT_MAX; skip
-                // the exp to keep the sum exact and avoid the
-                // platform-specific NaN that expf(-FLT_MAX) can
-                // produce on some archs.
-                float v = (s_score[t] > -FLT_MAX + 1.0f)
-                            ? expf(s_score[t] - row_max) : 0.0f;
-                s_score[t] = v;
-                tsum += v;
-            }
-            s_reduce[0] = tsum;
-        }
-        __syncthreads();
-        row_sum += s_reduce[0];
-        __syncthreads();
-
-        // Load V tile with per-slot V scale (see K load).
-        {
-            const int vec_total = tile_len * (head_dim / 8);
-            for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
-                int t = vi / (head_dim / 8);
-                int d_base = (vi % (head_dim / 8)) * 8;
-                int kv_pos = tile_start + t;
-                int page_idx = kv_pos / block_size;
-                int page_off = kv_pos % block_size;
-                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                int slot = phys_block * block_size + page_off;
-                float v_scale = v_perslot
-                    ? __ldg(&v_scale_cache[slot * num_kv_heads + kv_head_idx])
-                    : v_scale_scalar;
-                const unsigned char* v_row = value_cache
-                    + (slot * num_kv_heads + kv_head_idx) * head_dim;
-                unsigned long long v8 = __ldg(
-                    reinterpret_cast<const unsigned long long*>(v_row + d_base));
-                float* s = s_val + t * head_dim + d_base;
-                #pragma unroll
-                for (int b = 0; b < 8; b++) {
-                    s[b] = fp8kv_decode_byte((unsigned char)(v8 >> (b * 8))) * v_scale;
-                }
-            }
-        }
-        __syncthreads();
-
-        // Accumulate P * V.
-        for (int r = 0; r < dims_per_thread && r < 8; r++) {
-            int d = tid + r * FA2_THREADS;
-            if (d < head_dim) {
-                float val_acc = 0.0f;
-                for (int t = 0; t < tile_len; t++) {
-                    val_acc += s_score[t] * s_val[t * head_dim + d];
-                }
-                acc[r] += val_acc;
-            }
-        }
-        __syncthreads();
-    }
-
-    // Normalize + cast f32 -> f16 output.
-    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
-    for (int r = 0; r < dims_per_thread && r < 8; r++) {
-        int d = tid + r * FA2_THREADS;
-        if (d < head_dim) {
-            output[(seq_idx * num_heads + head_idx) * head_dim + d] =
-                __float2half(acc[r] * inv_sum);
-        }
-    }
-}
-
-// ============================================================================
-// FP8 E4M3 paged-decode variant — BC=16 for head_dim=512 (smem-budget fit)
-// ============================================================================
-//
-// Same kernel as above but with `FA2_BC = 16` instead of the
-// arch-default 32. Needed on sm_121 for Gemma 4 *global-attention*
-// layers (head_dim=512): BC=32 gives a 128 KB smem request, beyond the
-// 99 KB `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`
-// ceiling on Blackwell consumer silicon. BC=16 drops the tile to
-// 64 KB which fits.
-//
-// Dispatcher selects between the two at launch time based on
-// `params.head_dim`. Duplicated rather than templated because all the
-// smem offsets use the BC macro directly and the kernel is already
-// long — one copy-paste-and-rename is the lower-entropy fix.
-
-extern "C"
-__global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
     __half* __restrict__ output,
     const unsigned char* __restrict__ query,
     const unsigned char* __restrict__ key_cache,
@@ -1180,7 +937,10 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
     const float k_scale_scalar = k_perslot ? 0.0f : __ldg(k_descale_fallback);
     const float v_scale_scalar = v_perslot ? 0.0f : __ldg(v_descale_fallback);
 
-    // Sliding-window boundary — see BC=32 sibling for the full note.
+    // Sliding-window boundary: when `window_size_left` is set (sliding
+    // attention layers on Gemma 4), only the last `window_size_left`
+    // KV positions are allowed to attend. Compute the earliest allowed
+    // absolute position once; per-tile logic masks anything before it.
     const int decode_q_abs_pos = context_len - 1;
     const int window_start = (window_size_left < 0)
         ? 0
@@ -1216,7 +976,10 @@ __global__ void flash_attention_2_decode_fp8kv_bc16_kernel(
         const int tile_start = tile * 16;
         const int tile_len = min(16, context_len - tile_start);
 
-        // Vectorized-by-8 K load (see BC=32 kernel comment).
+        // Vectorized-by-8 K load: each thread pulls an aligned u64 (8
+        // FP8 bytes), then decode-and-scatter into smem. Cuts the load
+        // instruction count 8× vs scalar at the cost of one extra
+        // unpack; under full BW pressure the win is measurable.
         {
             const int vec_total = tile_len * (head_dim / 8);
             for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
