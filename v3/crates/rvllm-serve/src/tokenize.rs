@@ -184,7 +184,11 @@ impl TokenizerHandle {
 
     /// Render the chat template around `messages` and return prompt
     /// token IDs (BOS already included via the template).
-    pub fn render_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>, ApiError> {
+    pub fn render_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<Vec<u32>, ApiError> {
         let mut env = Environment::new();
         // HF chat templates use Python-style `dict.get(key)` /
         // `.items()` which jinja2 supports natively but minijinja
@@ -217,8 +221,12 @@ impl TokenizerHandle {
                 messages => serde_msgs,
                 bos_token => self.inner.bos_token_str.as_deref().unwrap_or(""),
                 add_generation_prompt => true,
-                // v1 omits tool-calling; template guards on `tools` being truthy.
-                tools => Option::<()>::None,
+                // Threaded through so Gemma 4's chat template emits its native
+                // `<|tool_call>call:NAME{...}<tool_call|>` tool-calling block.
+                // The existing `tool_parser` extracts that back on response.
+                // Without this the model improvises Python-style `brain(...)`
+                // calls as plain text — zeroclaw saw exactly that on prefill.
+                tools => tools,
                 enable_thinking => false,
             })
             .map_err(|e| ApiError::Tokenize(format!("chat template render: {e}")))?;
@@ -383,7 +391,7 @@ mod tests {
             content: "Say hi.".into(),
             name: None,
         }];
-        let ids = t.render_chat(&msgs).expect("render");
+        let ids = t.render_chat(&msgs, None).expect("render");
         assert!(!ids.is_empty(), "empty prompt — template render produced nothing");
         // Should start with BOS — Gemma 4 bos id is 2.
         eprintln!("first 5 ids: {:?}", &ids[..ids.len().min(5)]);

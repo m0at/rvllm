@@ -104,7 +104,7 @@ pub async fn chat_completions(
     let stop_text = req.stop.as_ref().map(|s| extract_stop(s)).unwrap_or_default();
     validate_stops(&stop_text)?;
 
-    let prompt_ids = state.tokenizer.render_chat(&req.messages)?;
+    let prompt_ids = state.tokenizer.render_chat(&req.messages, req.tools.as_ref())?;
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
 
     // Channel + cancellation. Buffer 64 tokens before worker blocks —
@@ -900,22 +900,25 @@ fn reject_v1_unsupported_chat(req: &ChatCompletionRequest) -> ApiResult<()> {
             "logit_bias_unsupported",
         ));
     }
-    // `tools` / `tool_choice` are accepted and IGNORED — we don't
-    // emit tool_calls today (no structured-output sampling path). The
-    // assistant will reply in plain text; clients like zeroclaw fall
-    // back gracefully when no tool_calls are returned. Rejecting with
-    // 400 forces every tool-using client to strip the schema before
-    // calling us, which no mainstream OpenAI SDK does. One WARN per
-    // process so an operator sees the coercion once.
-    if req.tools.is_some() || req.tool_choice.is_some() {
-        static WARN_TOOLS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        WARN_TOOLS.get_or_init(|| {
-            tracing::warn!(
-                "tools / tool_choice in request — accepted and ignored; \
-                 v1 runtime emits plain-text only. This warning fires \
-                 once per process."
-            );
-        });
+    // `tools` is threaded into the Gemma 4 chat template so the model
+    // emits native `<|tool_call>call:NAME{...}<tool_call|>` blocks,
+    // which `tool_parser` extracts back into OpenAI `tool_calls`.
+    // `tool_choice` beyond "auto" / None isn't honoured — warn once if
+    // a client forces a specific tool, but don't fail the request.
+    if let Some(choice) = &req.tool_choice {
+        let is_auto = choice
+            .as_str()
+            .map(|s| s == "auto" || s == "none" || s == "required")
+            .unwrap_or(false);
+        if !is_auto {
+            static WARN_TC: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARN_TC.get_or_init(|| {
+                tracing::warn!(
+                    "tool_choice with specific function not enforced by \
+                     v1 runtime — treated as `auto`. Fires once per process."
+                );
+            });
+        }
     }
     Ok(())
 }
