@@ -207,9 +207,29 @@ impl TokenizerHandle {
         // (content, tool_calls, tool_call_id, name). Missing keys are
         // skipped so `message.get('tool_calls')` returns falsy exactly
         // like the HF reference path.
+        // Pre-parse `tool_calls[i].function.arguments` from its OpenAI
+        // string form into a JSON object where possible. Gemma 4's
+        // chat template has two branches:
+        //   * `arguments is mapping` → iterates the dict, renders
+        //     `{key:value,key:value}` without extra braces.
+        //   * `arguments is string` → inlines the string verbatim
+        //     between the `NAME{` prefix and the `}` suffix.
+        // With OpenAI-spec strings like `{"city":"Bern"}` the string
+        // branch would emit `NAME{{"city":"Bern"}}` — double braces,
+        // off-distribution for the model. It then ignores the tool
+        // result on replay and reissues the same call every turn,
+        // which zeroclaw's circuit breaker rightly aborts after 5
+        // identical invocations. Converting the string to a mapping
+        // routes through the first branch, producing the training
+        // shape `NAME{city:"Bern"}`.
+        let normalized_tool_calls: Vec<Option<serde_json::Value>> = messages
+            .iter()
+            .map(|m| m.tool_calls.as_ref().map(normalize_tool_calls))
+            .collect();
         let serde_msgs: Vec<TemplateMsg> = messages
             .iter()
-            .map(|m| TemplateMsg {
+            .zip(normalized_tool_calls.iter())
+            .map(|(m, tc)| TemplateMsg {
                 role: match m.role {
                     Role::System => "system",
                     Role::User => "user",
@@ -217,7 +237,7 @@ impl TokenizerHandle {
                     Role::Tool => "tool",
                 },
                 content: m.content.as_deref().unwrap_or(""),
-                tool_calls: m.tool_calls.as_ref(),
+                tool_calls: tc.as_ref(),
                 tool_call_id: m.tool_call_id.as_deref(),
                 name: m.name.as_deref(),
             })
@@ -275,6 +295,30 @@ impl TokenizerHandle {
     pub fn eos_token_ids(&self) -> &[u32] {
         &self.inner.eos_token_ids
     }
+}
+
+/// Walk each call's `function.arguments` and, when it's a JSON-object
+/// literal in string form, replace it with the parsed mapping. Non-JSON
+/// or non-object strings are left untouched (the template's string
+/// branch is still the right choice for those — the model's own
+/// training set occasionally emits bare `{key:value}` rather than full
+/// JSON). Clones only the touched path; the rest of the value is reused.
+fn normalize_tool_calls(calls: &serde_json::Value) -> serde_json::Value {
+    let mut cloned = calls.clone();
+    if let Some(arr) = cloned.as_array_mut() {
+        for call in arr.iter_mut() {
+            let Some(function) = call.get_mut("function") else { continue };
+            let Some(args) = function.get_mut("arguments") else { continue };
+            if let Some(s) = args.as_str() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                    if parsed.is_object() {
+                        *args = parsed;
+                    }
+                }
+            }
+        }
+    }
+    cloned
 }
 
 /// Shape handed to the jinja template per message. All tool-specific
