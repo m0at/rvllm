@@ -472,6 +472,123 @@ mod tests {
         eprintln!("first 5 ids: {:?}", &ids[..ids.len().min(5)]);
     }
 
+    /// `normalize_tool_calls` routes the Gemma 4 chat template's
+    /// `function['arguments'] is mapping` branch, which emits training-
+    /// shape `NAME{k:"v"}`. If we left the OpenAI-canonical string
+    /// through, the string branch would wrap `{"city":"Bern"}` in the
+    /// template's extra `{…}` and produce `NAME{{"city":"Bern"}}` —
+    /// which is what sent the model into the weather-loop in prod.
+    #[test]
+    fn normalize_tool_calls_converts_arguments_string_to_object() {
+        let calls = serde_json::json!([{
+            "id": "c1",
+            "type": "function",
+            "function": { "name": "weather", "arguments": "{\"city\":\"Bern\"}" }
+        }]);
+        let normalized = normalize_tool_calls(&calls);
+        let args = &normalized[0]["function"]["arguments"];
+        assert!(args.is_object(), "expected mapping, got {args}");
+        assert_eq!(args["city"], "Bern");
+    }
+
+    /// Non-JSON / non-object argument strings must be left untouched —
+    /// the template's string branch is the right choice for them.
+    #[test]
+    fn normalize_tool_calls_leaves_non_object_arguments_alone() {
+        let calls = serde_json::json!([{
+            "id": "c1",
+            "type": "function",
+            "function": { "name": "ping", "arguments": "not-json" }
+        }]);
+        let normalized = normalize_tool_calls(&calls);
+        assert_eq!(normalized[0]["function"]["arguments"], "not-json");
+    }
+
+    /// Already-a-mapping arguments stay as is (zeroclaw's native-provider
+    /// path sends them this way).
+    #[test]
+    fn normalize_tool_calls_preserves_mapping_arguments() {
+        let calls = serde_json::json!([{
+            "id": "c1",
+            "type": "function",
+            "function": { "name": "w", "arguments": {"k": "v"} }
+        }]);
+        let normalized = normalize_tool_calls(&calls);
+        assert_eq!(normalized[0]["function"]["arguments"], serde_json::json!({"k":"v"}));
+    }
+
+    /// Multi-call: each call's arguments is normalised independently.
+    #[test]
+    fn normalize_tool_calls_handles_multiple_entries() {
+        let calls = serde_json::json!([
+            { "id": "a", "type": "function", "function": { "name": "a", "arguments": "{\"x\":1}" } },
+            { "id": "b", "type": "function", "function": { "name": "b", "arguments": "{\"y\":2}" } }
+        ]);
+        let normalized = normalize_tool_calls(&calls);
+        assert_eq!(normalized[0]["function"]["arguments"]["x"], 1);
+        assert_eq!(normalized[1]["function"]["arguments"]["y"], 2);
+    }
+
+    /// End-to-end template render against the live Gemma 4 tokenizer for
+    /// a three-turn tool trajectory. The rendered prompt must:
+    ///   * carry the training-shape `call:weather{city:"Bern"}`, **not**
+    ///     the double-braced `{{"city":"Bern"}}` variant.
+    ///   * carry the tool result as a `<|tool_response>response:weather`
+    ///     block.
+    /// This is the prompt the model sees on turn 2; if either is wrong
+    /// the model ignores the tool result and re-emits the call.
+    #[test]
+    fn render_multi_turn_tool_trajectory_uses_training_shape() {
+        let Some(dir) = std::env::var_os("RVLLM_TEST_MODEL_DIR") else {
+            eprintln!("skip: RVLLM_TEST_MODEL_DIR not set");
+            return;
+        };
+        let t = TokenizerHandle::load(std::path::Path::new(&dir)).expect("load");
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }
+            }
+        }]);
+        let msgs = vec![
+            ChatMessage {
+                role: Role::User, content: Some("wetter in bern?".into()),
+                name: None, tool_calls: None, tool_call_id: None,
+            },
+            ChatMessage {
+                role: Role::Assistant, content: None, name: None, tool_call_id: None,
+                tool_calls: Some(serde_json::json!([{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "weather", "arguments": "{\"city\":\"Bern\"}" }
+                }])),
+            },
+            ChatMessage {
+                role: Role::Tool, content: Some("{\"temp_c\":14,\"desc\":\"bewölkt\"}".into()),
+                name: None, tool_calls: None, tool_call_id: Some("c1".into()),
+            },
+        ];
+        let ids = t.render_chat(&msgs, Some(&tools)).expect("render");
+        let back = t.decode_raw(&ids).expect("decode_raw");
+        assert!(
+            back.contains("call:weather{city:"),
+            "expected training-shape tool call, got prompt:\n{back}",
+        );
+        assert!(
+            !back.contains("call:weather{{"),
+            "double-brace regression — would make the model loop:\n{back}",
+        );
+        assert!(
+            back.contains("response:weather"),
+            "tool response block must be rendered so the model reads the result:\n{back}",
+        );
+    }
+
     #[test]
     fn stream_decoder_incrementally_emits() {
         let Some(dir) = std::env::var_os("RVLLM_TEST_MODEL_DIR") else {

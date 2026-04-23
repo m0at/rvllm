@@ -2107,30 +2107,6 @@ impl Gemma4Bringup {
             let next_id = host_tok[0] as u32;
             output_ids.push(next_id);
             if eos_ids.contains(&next_id) { break; }
-
-            // Greedy-decoding safety net. Today's sampling path is pure
-            // argmax (no temperature / no penalty), so once Gemma lands in
-            // a local attractor it can emit an identical N-gram forever.
-            // On 15k-token ZeroClaw prompts this was burning ~14 min of
-            // GPU before hitting max_new. Check once enough history exists:
-            // if the last 16 tokens exactly repeat the preceding 16, stop.
-            // Window size 16 is long enough that natural repetition (e.g.
-            // a bulleted list with shared prefix) rarely matches, but short
-            // enough to catch tight `A B A B`-style loops within a dozen
-            // tokens of entering them.
-            const REP_WIN: usize = 16;
-            let n = output_ids.len();
-            if n >= 2 * REP_WIN {
-                let tail = &output_ids[n - REP_WIN..];
-                let prev = &output_ids[n - 2 * REP_WIN..n - REP_WIN];
-                if tail == prev {
-                    eprintln!(
-                        "[generate] early-stop: detected {}-token repetition loop at step {}",
-                        REP_WIN, decode_step
-                    );
-                    break;
-                }
-            }
         }
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;

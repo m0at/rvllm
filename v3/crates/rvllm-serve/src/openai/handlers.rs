@@ -972,13 +972,7 @@ fn reject_v1_unsupported_completions(req: &CompletionRequest) -> ApiResult<()> {
 }
 
 fn resolve_max_new(requested: Option<u32>, cap: u32) -> ApiResult<u32> {
-    // Default chosen to bound the worst case when greedy decoding lands
-    // in a repetition attractor (the runtime coerces temperature to 0
-    // today — no sampling kernel yet, so any local loop runs to max).
-    // At ~1.2 tok/s on Gemma 4 31B FP8, 256 caps a runaway at ~3.5 min
-    // instead of ~14 min. Clients that genuinely want longer replies
-    // still pass `max_tokens` explicitly.
-    let m = requested.unwrap_or(cap.min(256));
+    let m = requested.unwrap_or(cap.min(1024));
     if m == 0 {
         return Err(ApiError::invalid_param(
             "max_tokens must be > 0",
@@ -1040,4 +1034,159 @@ fn validate_stops(stops: &[String]) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod shape_assistant_message_tests {
+    //! Coverage for `shape_assistant_message`, which turns the raw
+    //! token-stream text (decoded WITH special tokens preserved) into the
+    //! OpenAI `ChatAssistantMessage` + `finish_reason` pair.
+    //!
+    //! Inputs in every test below are **verbatim raw-decoded shapes** we
+    //! saw Gemma 4 produce against this server — the comments name the
+    //! failure mode that test locks down. Keep them realistic; adding a
+    //! cleaned-up synthetic string here would mask the bugs these tests
+    //! exist to prevent.
+    use super::*;
+    use crate::openai::types::{FinishReason, Role};
+    use serde_json::Value;
+    fn parse_args(msg: &ChatAssistantMessage) -> Value {
+        let tc = msg.tool_calls.as_ref().expect("tool_calls present");
+        serde_json::from_str(&tc[0].function.arguments).expect("arguments is valid JSON")
+    }
+    /// Happy path: model emits a single `<|tool_call>call:NAME{k:"v"}<tool_call|>`
+    /// block with no surrounding prose. OpenAI response should carry one
+    /// tool_call, no content, `finish_reason=tool_calls`.
+    #[test]
+    fn single_bare_tool_call_becomes_structured() {
+        let raw = "<|tool_call>call:weather{city:<|\"|>Bern<|\"|>}<tool_call|>";
+        let (msg, finish) = shape_assistant_message(raw.into(), None);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        assert!(matches!(msg.role, Role::Assistant));
+        assert!(msg.content.is_none(), "content should be empty, got {:?}", msg.content);
+        let tc = msg.tool_calls.as_ref().unwrap();
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0].function.name, "weather");
+        assert_eq!(parse_args(&msg), serde_json::json!({"city": "Bern"}));
+    }
+    /// Gemma 4 routinely wraps its pre-answer in `<|channel>thought\n…<channel|>`.
+    /// None of the reasoning prose (incl. hallucinated numbers) must leak into
+    /// `content`. This is the bug that reached Telegram as literal
+    /// `thought\n<thought\nDas Wetter ist bewölkt, 11°C` before we stripped it.
+    #[test]
+    fn thought_channel_does_not_leak_into_content() {
+        let raw = "<|channel>thought\nMaybe rainy, ~11°C.<channel|>\
+                   <|tool_call>call:weather{city:<|\"|>Bern<|\"|>}<tool_call|>";
+        let (msg, finish) = shape_assistant_message(raw.into(), None);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        assert!(msg.content.is_none(), "thought block must not reach content, got {:?}", msg.content);
+        assert_eq!(msg.tool_calls.as_ref().unwrap()[0].function.name, "weather");
+    }
+    /// The `<|tool_response>thought\n…<channel|>` block is another shape the
+    /// model puts its internal draft in. Must be dropped wholesale.
+    #[test]
+    fn tool_response_channel_does_not_leak_into_content() {
+        let raw = "<|tool_response>thought\ndraft answer goes here<channel|>\
+                   <|tool_call>call:weather{city:<|\"|>Bern<|\"|>}<tool_call|>";
+        let (msg, _) = shape_assistant_message(raw.into(), None);
+        assert!(msg.content.is_none(), "got {:?}", msg.content);
+    }
+    /// The literal `<thought …<channel|>` fragment is what Gemma emits when
+    /// it hallucinates a channel opener without the leading pipe. It's NOT a
+    /// special token and survives skip-specials decoding — the parser still
+    /// has to strip it.
+    #[test]
+    fn hallucinated_thought_fragment_is_stripped() {
+        let raw = "<thought\nmaybe 14°C<channel|>\
+                   <|tool_call>call:weather{city:<|\"|>Bern<|\"|>}<tool_call|>";
+        let (msg, _) = shape_assistant_message(raw.into(), None);
+        assert!(msg.content.is_none(), "got {:?}", msg.content);
+    }
+    /// After the tool round-trip the model usually replies in plain German
+    /// prose terminated by `<turn|>`. Content must preserve the answer
+    /// verbatim (including ö) and drop the trailing turn marker. This is
+    /// the check that confirms the thought-strip does NOT over-reach.
+    #[test]
+    fn final_answer_after_tool_round_trip_keeps_umlauts() {
+        let raw = "<|channel>thought\n<channel|>\
+                   Das Wetter in Bern ist heute bewölkt mit einer Temperatur von 14°C.\
+                   <turn|>";
+        let (msg, finish) = shape_assistant_message(raw.into(), Some(FinishReason::Stop));
+        assert_eq!(finish, Some(FinishReason::Stop));
+        assert!(msg.tool_calls.is_none());
+        assert_eq!(
+            msg.content.as_deref(),
+            Some("Das Wetter in Bern ist heute bewölkt mit einer Temperatur von 14°C."),
+        );
+    }
+    /// Plain-text reply with zero markup — baseline sanity. Model's finish
+    /// reason passes through unchanged; content is the text verbatim.
+    #[test]
+    fn plain_text_reply_is_pass_through() {
+        let raw = "Paris ist die Hauptstadt von Frankreich.";
+        let (msg, finish) = shape_assistant_message(raw.into(), Some(FinishReason::Stop));
+        assert_eq!(finish, Some(FinishReason::Stop));
+        assert_eq!(msg.content.as_deref(), Some(raw));
+        assert!(msg.tool_calls.is_none());
+    }
+    /// The tokenizer sometimes strips `<|tool_call>` / `<tool_call|>` markers
+    /// (depends on vocab config) — the parser must still find the call in
+    /// the bare `call:NAME{...}` residue. This is tier-2 of the parser;
+    /// guarding it at the shape layer is cheap insurance.
+    #[test]
+    fn bare_call_tier2_still_produces_structured_call() {
+        let raw = "call:weather{city:<|\"|>Bern<|\"|>}";
+        let (msg, finish) = shape_assistant_message(raw.into(), None);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+        let tc = msg.tool_calls.as_ref().unwrap();
+        assert_eq!(tc[0].function.name, "weather");
+        assert_eq!(parse_args(&msg), serde_json::json!({"city": "Bern"}));
+    }
+    /// Model emits two sequential calls (rare but real — batch enumeration).
+    /// Both must survive.
+    #[test]
+    fn multiple_tool_calls_survive() {
+        let raw = "<|tool_call>call:a{x:<|\"|>1<|\"|>}<tool_call|>\
+                   <|tool_call>call:b{y:<|\"|>2<|\"|>}<tool_call|>";
+        let (msg, _) = shape_assistant_message(raw.into(), None);
+        let tc = msg.tool_calls.as_ref().unwrap();
+        assert_eq!(tc.len(), 2);
+        assert_eq!(tc[0].function.name, "a");
+        assert_eq!(tc[1].function.name, "b");
+    }
+    /// Empty generation (model produced zero usable tokens) — should NOT
+    /// crash and NOT invent a tool call.
+    #[test]
+    fn empty_generation_does_not_invent_tool_calls() {
+        let (msg, finish) = shape_assistant_message(String::new(), Some(FinishReason::Stop));
+        assert_eq!(finish, Some(FinishReason::Stop));
+        assert!(msg.tool_calls.is_none());
+        assert!(msg.content.is_none());
+    }
+    /// The stray-marker sweep must NOT eat `<turn|>` tokens that are
+    /// *inside* user content (e.g. when the user asked about "A<turn|>B"
+    /// — unlikely but possible). Conservative check: alphanumeric body only.
+    #[test]
+    fn stray_sweep_leaves_non_token_brackets_intact() {
+        let raw = "Winkel < 90° hier.";
+        let (msg, _) = shape_assistant_message(raw.into(), Some(FinishReason::Stop));
+        assert_eq!(msg.content.as_deref(), Some("Winkel < 90° hier."));
+    }
+    /// Regression for the very first bug that kicked off this whole
+    /// stack: zeroclaw saw `brain(action="web_fetch", name="...")` emitted
+    /// as plain text. That shape is *not* a Gemma-4 tool call — it's the
+    /// Python-kwargs-style a model improvises when it gets no
+    /// native-format hint. Shape layer should NOT claim a tool call here;
+    /// returning it as content keeps the downstream text-parser (zeroclaw's
+    /// perl/func-call regex set) free to try. Catching this wrong would
+    /// produce a tool_call with name `brain` and empty args, which is the
+    /// exact failure that broke production.
+    #[test]
+    fn python_kwargs_style_is_not_misparsed_as_native_call() {
+        let raw = "brain(action=\"web_fetch\", name=\"https://example.com\")";
+        let (msg, finish) = shape_assistant_message(raw.into(), Some(FinishReason::Stop));
+        assert!(msg.tool_calls.is_none(), "must not be misparsed, got {:?}", msg.tool_calls);
+        assert_eq!(msg.content.as_deref(), Some(raw));
+        assert_eq!(finish, Some(FinishReason::Stop));
+    }
 }
