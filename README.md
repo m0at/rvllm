@@ -247,11 +247,12 @@ Current `rvRLM` surface:
 - Persistent local execution environment: an in-process Rust-native Rhai runtime per session, with `context`, `history`, `llm_query`, `rlm_query`, and registered tool calls available inside executed code.
 - Recursive subcalls: `rlm_query(...)` now spins a fresh child `rvRLM` engine with depth limits instead of routing back through a stub.
 - Native PPL surface: `Rlm::perplexity`, `ServeService::perplexity`, and `rvrlm-bench` can call the backend's runtime perplexity path directly.
+- Native GUI harness: [`v3/crates/rvrlm-egui`](/Users/andy/rvllm/v3/crates/rvrlm-egui) reuses the repo's Rust `egui` client pattern for an `rvRLM`-specific desktop app, with direct `ServeService` calls, recursive-run metrics, and a PPL action instead of the older OpenAI-compatible HTTP race path.
 
 Build and run on GPU:
 
 ```bash
-cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvrlm -p rvllm-bench
+cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvrlm -p rvllm-bench -p rvrlm-egui
 
 RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it \
 RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
@@ -265,6 +266,17 @@ RVLLM_ITERS=10 RVLLM_WARMUP=2 \
 ```
 
 `rvrlm-bench` emits throughput, ms/request, cold/hot TTFT, and, when `RVRLM_PPL_PROMPT` is set, native perplexity fields from the same service surface.
+
+Native desktop harness:
+
+```bash
+RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
+RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
+RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
+  cargo run --release --features cuda --manifest-path v3/Cargo.toml -p rvrlm-egui
+```
 
 ## v3 crate map
 
