@@ -79,11 +79,12 @@ compile_kernel() {
         ;;
     esac
     # FP8 / NVFP4 tensor-core MMA kernels need the arch-specific
-    # feature set (`sm_121a` / `sm_120a`) because `.kind::f8f6f4`
-    # and `mma.kind::*f8*` live in the CUDA family-specific PTX
-    # feature set. Plain `sm_121` rejects them at ptxas time even
-    # though nvcc -ptx emits the instruction successfully.
-    if grep -q 'kind::f8f6f4\|mma.sync.*e4m3\|mma.sync.*e2m1\|fp8_mma_frag_pack\|mma_m16n8k32' "$cu" 2>/dev/null; then
+    # feature set (`sm_121a` / `sm_120a`) because `.kind::f8f6f4`,
+    # `mma.kind::*f8*`, and the NVFP4 hardware dequant instructions
+    # (`cvt.rn.*.e2m1x2`) live in the CUDA family-specific PTX feature
+    # set. Plain `sm_121` rejects them at ptxas time even though nvcc
+    # -ptx emits the instruction successfully.
+    if grep -q 'kind::f8f6f4\|mma.sync.*e4m3\|mma.sync.*e2m1\|fp8_mma_frag_pack\|mma_m16n8k32\|cvt.rn.f16x2.e2m1x2\|cvt.rn.bf16x2.e2m1x2\|cvt.rn.e2m1x2' "$cu" 2>/dev/null; then
         case "$arch" in
             sm_120) arch="sm_120a" ;;
             sm_121) arch="sm_121a" ;;

@@ -61,6 +61,11 @@
       "path": "flash_attention_3_v3.ptx",
       "sha256": "84eeb1e52112fda81b9190569b483dff6f0618bda68015d7ead1f6958ebb20e6"
     },
+    "flash_attention_nvfp4kv": {
+      "bytes": 328441,
+      "path": "flash_attention_nvfp4kv.ptx",
+      "sha256": "f6354338070e20a5f52426ec09370509d13daf155323f9abf3dddfee0909ba93"
+    },
     "flash_attention_unified_prefill": {
       "bytes": 72311,
       "path": "flash_attention_unified_prefill.ptx",
@@ -131,6 +136,11 @@
       "path": "fused_rope_partial_fp8kv.ptx",
       "sha256": "8f9200f4742875d0e75b4e1480cab280e6a1a09cc7a82c968c1b0680457f903c"
     },
+    "fused_rope_partial_nvfp4kv": {
+      "bytes": 11200,
+      "path": "fused_rope_partial_nvfp4kv.ptx",
+      "sha256": "74de874fa0a220b012744b78648ce12d03282c303fd845f4e2ce0e99735ae96d"
+    },
     "fused_silu_fp8_quant": {
       "bytes": 21129,
       "path": "fused_silu_fp8_quant.ptx",
@@ -145,6 +155,16 @@
       "bytes": 1985,
       "path": "logit_softcap.ptx",
       "sha256": "6042d0a7f9357024081cb27dae63207f1c9558a54592afc0fb57783e943cbed0"
+    },
+    "nvfp4_mma_probe": {
+      "bytes": 1546,
+      "path": "nvfp4_mma_probe.ptx",
+      "sha256": "cb5b14ba886119be0fafbc289736e0bbe7171d2b453c36ec29261ca49ebdceb4"
+    },
+    "nvfp4_roundtrip_probe": {
+      "bytes": 33236,
+      "path": "nvfp4_roundtrip_probe.ptx",
+      "sha256": "68d7a0ede25853932ac03cf9f5b6577081a730f0fadae25dff5ba17ecab285c8"
     },
     "paged_attention_sm89": {
       "bytes": 121426,
@@ -197,5 +217,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "af8e3c6"
+  "revision": "5627fc9"
 }
