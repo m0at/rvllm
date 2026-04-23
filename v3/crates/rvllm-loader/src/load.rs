@@ -608,8 +608,12 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
     }
     let s: u8 = if v.to_bits() >> 31 != 0 { 0x80 } else { 0 };
     let a = v.abs();
+    // Canonicalise signed zero: both +0.0 and -0.0 encode to 0x00. FP8
+    // E4M3FN technically has a -0 (0x80) but the quantiser treats zero
+    // as sign-less — downstream attention / GEMM paths hit a dequant
+    // "zero + tiny scale → subnormal f16" edge if -0 leaks through.
     if a == 0.0 {
-        return s;
+        return 0;
     }
     if a > FP8_E4M3_MAX {
         return s | 0x7e;
