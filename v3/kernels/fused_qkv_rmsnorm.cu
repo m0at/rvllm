@@ -7,6 +7,20 @@
 //   num_heads <= blockIdx.y < num_heads + num_kv_heads   -> K head (gamma)
 //   blockIdx.y >= num_heads + num_kv_heads               -> V head (no gamma)
 // Block: (min(head_dim, 1024), 1, 1)
+//
+// Source layout (`src_row_stride`):
+//
+// The upstream QKV GEMM writes a single row-major
+// `[num_tokens, q_dim + 2*kv_dim]` buffer — token i's Q / K / V are
+// interleaved within row i. Callers pass q_in / k_in / v_in pointing
+// at the start of each component in row 0. To reach token `t`'s
+// component base we must stride by the full row (`qkv_rows`), not
+// by the per-component span (`n_heads_this * head_dim`).
+//
+// Q and K write to separate compact `[num_tokens, n_heads, head_dim]`
+// scratch buffers (q_out, v_out is the V-only compact analogue). That
+// way the downstream rope kernel's compact indexing is consistent
+// across all three components.
 
 #include <cuda_fp16.h>
 
@@ -14,16 +28,18 @@ extern "C"
 __global__ void fused_qkv_rmsnorm_kernel(
     const __half* __restrict__ q_in,
     const __half* __restrict__ k_in,
-    __half* __restrict__ v_inout,
+    const __half* __restrict__ v_in,
     __half* __restrict__ q_out,
     __half* __restrict__ k_out,
+    __half* __restrict__ v_out,
     const __half* __restrict__ q_gamma,
     const __half* __restrict__ k_gamma,
     int num_tokens,
     int num_heads,
     int num_kv_heads,
     int head_dim,
-    float eps
+    float eps,
+    int src_row_stride
 ) {
     const int token = blockIdx.x;
     const int head_global = blockIdx.y;
@@ -58,17 +74,20 @@ __global__ void fused_qkv_rmsnorm_kernel(
         // V head (parameter-free)
         head_local = head_global - num_heads - num_kv_heads;
         n_heads_this = num_kv_heads;
-        src = v_inout;
-        dst = v_inout;
+        src = v_in;
+        dst = v_out;
         gamma = nullptr;
         use_gamma = false;
     }
 
-    const int offset = (token * n_heads_this + head_local) * head_dim;
+    // Src strides by the full QKV row (interleaved GEMM output).
+    const int src_offset = token * src_row_stride + head_local * head_dim;
+    // Dst strides by the per-component span (compact scratch).
+    const int dst_offset = (token * n_heads_this + head_local) * head_dim;
 
     float sum_sq = 0.0f;
     for (int i = tid; i < head_dim; i += blockDim.x) {
-        float v = __half2float(src[offset + i]);
+        float v = __half2float(src[src_offset + i]);
         sum_sq += v * v;
     }
 
@@ -92,8 +111,8 @@ __global__ void fused_qkv_rmsnorm_kernel(
     float rms_inv = smem[0];
 
     for (int i = tid; i < head_dim; i += blockDim.x) {
-        float v = __half2float(src[offset + i]) * rms_inv;
+        float v = __half2float(src[src_offset + i]) * rms_inv;
         if (use_gamma) v *= __half2float(gamma[i]);
-        dst[offset + i] = __float2half(v);
+        dst[dst_offset + i] = __float2half(v);
     }
 }

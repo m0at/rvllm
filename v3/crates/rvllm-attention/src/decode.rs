@@ -62,15 +62,17 @@ impl PagedDecodeParams {
     }
 }
 
-/// Launcher. Construction from `&Fa3Kernels` guarantees the .so is
-/// loaded and head_dim is supported by the backend.
+/// Launcher. Constructed from `&AttentionBackend`. The `Fa3` variant
+/// goes through the SM90 `.so` dispatch; the `Fa2Ptx` variant returns
+/// `AttentionError::FeatureNotAvailable` until the sm_121 FA2 launch
+/// path is wired up (next GB10 follow-up PR).
 pub struct PagedDecodeLauncher<'a> {
-    fa3: &'a super::Fa3Kernels,
+    backend: &'a super::AttentionBackend,
 }
 
 impl<'a> PagedDecodeLauncher<'a> {
-    pub fn new(fa3: &'a super::Fa3Kernels) -> Self {
-        Self { fa3 }
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { backend }
     }
 
     /// Validate params + issue the launch.
@@ -96,7 +98,106 @@ impl<'a> PagedDecodeLauncher<'a> {
         params.validate()?;
         #[cfg(feature = "cuda")]
         {
-            let rc = (self.fa3.fn_paged_decode)(
+            let fa3 = match self.backend {
+                super::AttentionBackend::Fa3(fa3) => fa3,
+                super::AttentionBackend::Fa2Ptx(fa2) => {
+                    // sm_121 F16 KV path: dispatch
+                    // `flash_attention_2_decode_f16io_kernel` (f16 I/O
+                    // against the paged f16 cache). head_dim=512 does
+                    // NOT fit the BC=32 smem budget on sm_121's 99 KB
+                    // opt-in cap — gate it off. Gemma 4 global layers
+                    // must use FP8 KV; F16 KV on sm_121 today is a
+                    // head_dim ≤ 256 path (Llama/Qwen or Gemma 4
+                    // sliding-only).
+                    if params.head_dim > 256 {
+                        return Err(RvllmError::Attention {
+                            err: AttentionError::FeatureNotAvailable {
+                                backend: "Fa2Ptx",
+                                op: "paged_decode (F16 KV, head_dim>256 — use FP8 KV)",
+                            },
+                            ctx: AttnCtx {
+                                op: "paged_decode",
+                                stream,
+                                num_seqs: params.num_seqs,
+                                head_dim: params.head_dim,
+                            },
+                            bt: std::backtrace::Backtrace::capture(),
+                        });
+                    }
+                    use cudarc::driver::sys::*;
+                    const FA2_THREADS: i32 = 128;
+                    const FA2_BC: i32 = 32;
+                    let hd = params.head_dim as i32;
+                    let smem_bytes = 2 * FA2_BC * hd * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+                    if smem_bytes as u32 >= 48 * 1024 {
+                        let _ = cuFuncSetAttribute(
+                            fa2.fn_decode_f16io.raw() as CUfunction,
+                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            smem_bytes,
+                        );
+                    }
+
+                    let scale = params.scale;
+                    let num_heads = params.num_heads as i32;
+                    let num_kv_heads = params.num_kv_heads as i32;
+                    let head_dim = params.head_dim as i32;
+                    let block_size = params.block_size as i32;
+                    let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+
+                    let mut arg_out = out_ptr;
+                    let mut arg_q = q_ptr;
+                    let mut arg_k = k_cache_ptr;
+                    let mut arg_v = v_cache_ptr;
+                    let mut arg_bt = block_tables_ptr;
+                    let mut arg_cl = context_lens_ptr;
+                    let _ = workspace_ptr; // unused: FA2 allocates smem dynamically
+
+                    let args: [*mut core::ffi::c_void; 12] = [
+                        &mut arg_out as *mut _ as *mut _,
+                        &mut arg_q as *mut _ as *mut _,
+                        &mut arg_k as *mut _ as *mut _,
+                        &mut arg_v as *mut _ as *mut _,
+                        &mut arg_bt as *mut _ as *mut _,
+                        &mut arg_cl as *mut _ as *mut _,
+                        &scale as *const _ as *mut _,
+                        &num_heads as *const _ as *mut _,
+                        &num_kv_heads as *const _ as *mut _,
+                        &head_dim as *const _ as *mut _,
+                        &block_size as *const _ as *mut _,
+                        &max_blocks_per_seq as *const _ as *mut _,
+                    ];
+
+                    let rc = cuLaunchKernel(
+                        fa2.fn_decode_f16io.raw() as CUfunction,
+                        params.num_seqs as u32,
+                        params.num_heads as u32,
+                        1,
+                        FA2_THREADS as u32,
+                        1,
+                        1,
+                        smem_bytes as u32,
+                        stream as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(RvllmError::Attention {
+                            err: AttentionError::KernelLaunchFailed {
+                                cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                            },
+                            ctx: AttnCtx {
+                                op: "paged_decode (Fa2Ptx F16 KV)",
+                                stream,
+                                num_seqs: params.num_seqs,
+                                head_dim: params.head_dim,
+                            },
+                            bt: std::backtrace::Backtrace::capture(),
+                        });
+                    }
+                    return Ok(());
+                }
+            };
+            let rc = (fa3.fn_paged_decode)(
                 q_ptr as *mut std::ffi::c_void,
                 k_cache_ptr as *mut std::ffi::c_void,
                 v_cache_ptr as *mut std::ffi::c_void,
@@ -149,13 +250,15 @@ impl<'a> PagedDecodeLauncher<'a> {
 
 /// FP8 E4M3 paged-decode launcher. Same param validation as the FP16
 /// path; dispatches the FP8 entry point and threads per-tensor scales.
+/// `Fa2Ptx` backend returns `FeatureNotAvailable` — the FA2 kernels
+/// today only accept f16/f32 KV cache, not fp8.
 pub struct PagedDecodeFp8Launcher<'a> {
-    fa3: &'a super::Fa3Kernels,
+    backend: &'a super::AttentionBackend,
 }
 
 impl<'a> PagedDecodeFp8Launcher<'a> {
-    pub fn new(fa3: &'a super::Fa3Kernels) -> Self {
-        Self { fa3 }
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { backend }
     }
 
     /// # Safety
@@ -169,18 +272,156 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
         q_fp8: u64,
         k_cache_fp8: u64,
         v_cache_fp8: u64,
+        // `k_scale_cache` / `v_scale_cache`: per-slot f32 arrays
+        //   (Gemma 4). Pass `0` to fall back to the scalar
+        //   `k_descale_fallback_ptr` / `v_descale_fallback_ptr`
+        //   (Llama/Qwen path).
+        k_scale_cache: u64,
+        v_scale_cache: u64,
+        // `q_scale_cache`: `[num_seqs * num_heads]` f32 array of
+        //   per-(seq, head) Q scales. Pass `0` to fall back to the
+        //   scalar `q_descale_ptr`.
+        q_scale_cache: u64,
+        k_descale_fallback_ptr: u64,
+        v_descale_fallback_ptr: u64,
         block_tables: u64,
         context_lens: u64,
         workspace: u64,
         q_descale_ptr: u64,
-        k_descale_ptr: u64,
-        v_descale_ptr: u64,
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
         #[cfg(feature = "cuda")]
         {
-            let rc = (self.fa3.fn_paged_decode_fp8)(
+            let fa3 = match self.backend {
+                super::AttentionBackend::Fa3(fa3) => fa3,
+                super::AttentionBackend::Fa2Ptx(fa2) => {
+                    // sm_121 path: dispatch the PTX-built
+                    // `flash_attention_2_decode_fp8kv_kernel`. Internal
+                    // math f32, on-load dequant from FP8 E4M3 with
+                    // per-tensor descales, f16 output to match the
+                    // FA3 ABI (`o_f16`).
+                    //
+                    // Launch config:
+                    //   Grid  (num_seqs, num_heads, 1)
+                    //   Block (FA2_THREADS=128, 1, 1)
+                    //   Smem  = 2 * FA2_BC * head_dim * 4 + FA2_BC * 4
+                    //           + (FA2_THREADS / 32) * 4
+                    // FA2_BC is 32 for sm_100+ (arch-conditional in
+                    // flash_attention.cu). head_dim=256 with BC=32
+                    // blows past the 48 KB static-smem ceiling, so we
+                    // opt in to dynamic smem via `cuFuncSetAttribute`
+                    // once per process.
+                    // sm_121 FP8-KV decode is BC=16 only. head_dim=512
+                    // never fit BC=32 within the 99 KB opt-in smem cap,
+                    // and head_dim=256 measurably favours BC=16 too
+                    // (+2.5%/+5.5% at batch=128/256 — halving the tile
+                    // lets 2+ blocks live per SM and hides per-tile
+                    // __syncthreads latency). The BC=32 kernel was
+                    // removed from flash_attention.cu in the cleanup
+                    // that followed the ncu profile.
+                    use cudarc::driver::sys::*;
+                    const FA2_THREADS: i32 = 128;
+                    const FA2_BC: i32 = 16;
+                    let hd = params.head_dim as i32;
+                    let kernel_fn = fa2.fn_decode_fp8kv;
+                    let smem_bytes =
+                        2 * FA2_BC * hd * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+                    if smem_bytes as u32 >= 48 * 1024 {
+                        let _ = cuFuncSetAttribute(
+                            kernel_fn.raw() as CUfunction,
+                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            smem_bytes,
+                        );
+                    }
+
+                    // Scalar args must outlive cuLaunchKernel.
+                    let scale = params.scale;
+                    let num_heads = params.num_heads as i32;
+                    let num_kv_heads = params.num_kv_heads as i32;
+                    let head_dim = params.head_dim as i32;
+                    let block_size = params.block_size as i32;
+                    let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+                    let window_size_left = params.window_size_left;
+
+                    let mut arg_out = o_f16;
+                    let mut arg_q = q_fp8;
+                    let mut arg_k = k_cache_fp8;
+                    let mut arg_v = v_cache_fp8;
+                    let mut arg_ks = k_scale_cache;
+                    let mut arg_vs = v_scale_cache;
+                    let mut arg_qs = q_scale_cache;
+                    let mut arg_kd = k_descale_fallback_ptr;
+                    let mut arg_vd = v_descale_fallback_ptr;
+                    let mut arg_bt = block_tables;
+                    let mut arg_cl = context_lens;
+                    let mut arg_qd = q_descale_ptr;
+                    let _ = workspace; // unused: FA2 allocates in smem
+
+                    let args: [*mut core::ffi::c_void; 19] = [
+                        &mut arg_out as *mut _ as *mut _,
+                        &mut arg_q as *mut _ as *mut _,
+                        &mut arg_k as *mut _ as *mut _,
+                        &mut arg_v as *mut _ as *mut _,
+                        &mut arg_ks as *mut _ as *mut _,
+                        &mut arg_vs as *mut _ as *mut _,
+                        &mut arg_qs as *mut _ as *mut _,
+                        &mut arg_kd as *mut _ as *mut _,
+                        &mut arg_vd as *mut _ as *mut _,
+                        &mut arg_bt as *mut _ as *mut _,
+                        &mut arg_cl as *mut _ as *mut _,
+                        &mut arg_qd as *mut _ as *mut _,
+                        &scale as *const _ as *mut _,
+                        &num_heads as *const _ as *mut _,
+                        &num_kv_heads as *const _ as *mut _,
+                        &head_dim as *const _ as *mut _,
+                        &block_size as *const _ as *mut _,
+                        &max_blocks_per_seq as *const _ as *mut _,
+                        &window_size_left as *const _ as *mut _,
+                    ];
+
+                    let rc = cuLaunchKernel(
+                        kernel_fn.raw() as CUfunction,
+                        params.num_seqs as u32,
+                        params.num_heads as u32,
+                        1,
+                        FA2_THREADS as u32,
+                        1,
+                        1,
+                        smem_bytes as u32,
+                        stream as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(RvllmError::Attention {
+                            err: AttentionError::KernelLaunchFailed {
+                                cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                            },
+                            ctx: AttnCtx {
+                                op: "paged_decode_fp8 (Fa2Ptx)",
+                                stream,
+                                num_seqs: params.num_seqs,
+                                head_dim: params.head_dim,
+                            },
+                            bt: std::backtrace::Backtrace::capture(),
+                        });
+                    }
+                    return Ok(());
+                }
+            };
+            // Fa3 SM90 path: takes scalar K/V descales (its ABI
+            // predates per-slot scales). Llama/Qwen callers pass
+            // their per-tensor scale via `k_descale_fallback_ptr` /
+            // `v_descale_fallback_ptr`; Gemma 4 sm_121 never reaches
+            // this arm (it goes through the Fa2Ptx branch above).
+            // If per-slot scales are populated AND an Fa3 caller
+            // somehow routes through here, that caller needs to
+            // materialize a representative scalar into the fallback
+            // pointer — the SM90 kernel can't consume per-slot.
+            let _ = k_scale_cache;
+            let _ = v_scale_cache;
+            let rc = (fa3.fn_paged_decode_fp8)(
                 q_fp8 as *mut std::ffi::c_void,
                 k_cache_fp8 as *mut std::ffi::c_void,
                 v_cache_fp8 as *mut std::ffi::c_void,
@@ -189,8 +430,8 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                 context_lens as *mut std::ffi::c_void,
                 workspace as *mut std::ffi::c_void,
                 q_descale_ptr as *mut f32,
-                k_descale_ptr as *mut f32,
-                v_descale_ptr as *mut f32,
+                k_descale_fallback_ptr as *mut f32,
+                v_descale_fallback_ptr as *mut f32,
                 params.scale,
                 params.num_seqs as i32,
                 params.num_heads as i32,
@@ -221,7 +462,8 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
         {
             let _ = (
                 o_f16, q_fp8, k_cache_fp8, v_cache_fp8, block_tables, context_lens,
-                workspace, q_descale_ptr, k_descale_ptr, v_descale_ptr, stream,
+                workspace, q_descale_ptr, k_descale_fallback_ptr, v_descale_fallback_ptr,
+                k_scale_cache, v_scale_cache, q_scale_cache, stream,
             );
         }
         Ok(())
@@ -242,6 +484,7 @@ mod tests {
             max_blocks_per_seq: 33,
             num_blocks_total: 1024,
             scale: 1.0 / (128f32).sqrt(),
+            window_size_left: -1,
         }
     }
 

@@ -16,6 +16,11 @@ authors.workspace = true
 [features]
 default = []
 cuda = ["dep:cudarc"]
+# GB10 / sm_121 target: adds `UnifiedArena` on top of `HbmArena`.
+# Pair with `--features cuda` on GB10 hardware; `gb10` alone gives the
+# bookkeeping type with a host-stub backing so downstream crates can
+# reference the type unconditionally in their `cfg` trees.
+gb10 = []
 
 [dependencies]
 rvllm-core = { workspace = true }

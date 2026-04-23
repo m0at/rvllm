@@ -8,9 +8,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rvllm_attention::Fa3Kernels;
+use rvllm_attention::{AttentionBackend, Fa3Kernels};
+#[cfg(feature = "cuda")]
+use rvllm_core::CompileTarget;
 use rvllm_core::{ConfigError, Result, RvllmError};
-use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan, Policy};
+use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan, Policy};
 use rvllm_kernels::{manifest::KernelManifest, KernelFn, KernelLoader, LoadedModule};
 use rvllm_loader::{load_model, LoadedModel, ModelArch};
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
@@ -34,8 +36,8 @@ pub struct EnginePaths {
 /// is last.
 pub struct Bringup {
     pub fused_modules: FusedModules,
-    pub fa3: Fa3Kernels,
-    pub cutlass: CutlassLib,
+    pub fa3: AttentionBackend,
+    pub cutlass: CutlassBackend,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,
@@ -80,13 +82,40 @@ impl Bringup {
         // 1. CUDA context + stream.
         let ctx = Arc::new(CudaContextHandle::init(0)?);
 
-        // SAFETY: arena lifetime 'static via leak — engine owns it for program lifetime.
-        let arena = HbmArena::new(&ctx, arena_bytes)?;
-        // The 'static lifetime gymnastics: HbmArena<'ctx> borrows from ctx.
-        // The Arc keeps ctx alive. We transmute the lifetime to 'static
-        // because Bringup owns both. This is sound as long as `ctx`
-        // outlives `arena` — which it does (they live in the same
-        // struct and ctx is the last dropped).
+        // Pick arena backing per device compute capability. On GB10
+        // (sm_121) — which has no dedicated HBM — route through
+        // `UnifiedArena::new` (`cuMemAllocManaged(ATTACH_GLOBAL)` +
+        // `cuMemAdvise(SET_PREFERRED_LOCATION, device)`), then unwrap
+        // back to `HbmArena` so the storage type on `Bringup` stays
+        // uniform. Everywhere else we keep the original
+        // `cuMemAlloc_v2` fast path (`HbmArena::new`). Both call
+        // `cuMemFree_v2` on Drop, which correctly releases either
+        // allocation.
+        //
+        // Gated on `feature = "gb10"` so pre-Blackwell / non-GB10
+        // builds don't pay for managed-memory overhead they don't
+        // need.
+        let arena = {
+            #[cfg(feature = "gb10")]
+            {
+                let target = rvllm_core::CompileTarget::from_compute_capability(
+                    ctx.compute_capability().0,
+                    ctx.compute_capability().1,
+                );
+                if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+                    rvllm_mem::UnifiedArena::new(&ctx, arena_bytes)?.into_inner()
+                } else {
+                    HbmArena::new(&ctx, arena_bytes)?
+                }
+            }
+            #[cfg(not(feature = "gb10"))]
+            {
+                HbmArena::new(&ctx, arena_bytes)?
+            }
+        };
+        // SAFETY: arena lifetime 'static via transmute — engine owns it for program lifetime.
+        // HbmArena<'ctx> borrows from ctx; the Arc keeps ctx alive. This is sound
+        // as long as `ctx` outlives `arena` — which it does (same struct, ctx dropped last).
         let arena: HbmArena<'static> = unsafe { std::mem::transmute(arena) };
 
         let stream = Stream::new(&ctx)?;
@@ -96,13 +125,23 @@ impl Bringup {
         let model = load_model(&paths.model_dir, &arena, &arch)?;
 
         // 3. Kernel manifest -> loader -> modules.
-        let manifest_path = paths.kernels_dir.join("manifest.json");
+        //    Resolve the per-arch kernel subdirectory from the device's
+        //    compute capability. A device we don't build PTX for is a
+        //    hard error — no silent fallback to a generic arch.
+        let kernels_dir = resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
+        let manifest_path = kernels_dir.join("manifest.json");
         let manifest = KernelManifest::load_and_verify(&manifest_path)?;
         let kernels = Arc::new(KernelLoader::new(manifest));
         let fused_modules = load_fused(&kernels)?;
 
-        // 4. FA3 .so.
-        let fa3 = Fa3Kernels::load(paths.fa3_so.clone(), arch.head_dim as u32)?;
+        // 4. Attention backend.
+        //    Non-Gemma4 architectures currently always use the FA3 .so.
+        //    The Gemma4 bring-up branches on CompileTarget; if you add a
+        //    non-Gemma4 sm_121 model, wire the same branch here.
+        let fa3 = AttentionBackend::Fa3(Fa3Kernels::load(
+            paths.fa3_so.clone(),
+            arch.head_dim as u32,
+        )?);
 
         // 5. Policy + CUTLASS .so (resolve every variant referenced in
         //    the policy).
@@ -132,7 +171,25 @@ impl Bringup {
             variants.insert(rvllm_cutlass::VariantId(v));
         }
         let variants: Vec<_> = variants.into_iter().collect();
-        let cutlass = CutlassLib::load(paths.cutlass_so.clone(), &variants)?;
+        // CUTLASS backend selection — sm_121 has no compatible `.so`
+        // (CUTLASS SM90 collectives rely on WGMMA + TMA multicast,
+        // both Hopper-only). On sm_121 we route through
+        // `CutlassBackend::Absent`; FP8 GEMM launches return
+        // `CutlassError::FeatureNotAvailable` until a sm_121-native
+        // GEMM path lands (next GB10 follow-up).
+        let cutlass_target = {
+            #[cfg(feature = "cuda")]
+            {
+                let (maj, min) = ctx.compute_capability();
+                rvllm_core::CompileTarget::from_compute_capability(maj, min)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                None
+            }
+        };
+        let cutlass =
+            CutlassBackend::load_for(cutlass_target, paths.cutlass_so.clone(), &variants)?;
 
         // cuBLASLt workspace: 32 MiB is recommended for Hopper FP8.
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
@@ -420,7 +477,7 @@ impl Bringup {
             rvllm_core::DType::Fp8E4M3,
         )?);
         let vocab = arch.vocab_size as u32;
-        let plan_lm_head = override_nonres(Fp8GemmPlan::from_policy(
+        let _plan_lm_head = override_nonres(Fp8GemmPlan::from_policy(
             &self.policy,
             num_seqs,
             vocab,
@@ -755,7 +812,7 @@ impl Bringup {
             (None, None)
         };
 
-        let mut one_step = one_step;
+        let one_step = one_step;
         let no_graph = std::env::var("RVLLM_NO_GRAPH").ok().as_deref() == Some("1");
 
         let elapsed = if no_graph {
@@ -1491,4 +1548,61 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
         fn_argmax,
         fn_add_bias_f16,
     })
+}
+
+/// Resolve `<kernels_root>/<sm_xxx>/` for the CUDA device backing `ctx`.
+///
+/// Queries the device's compute capability, maps it to a `CompileTarget`,
+/// and returns the matching per-arch subdirectory. Rejects devices whose
+/// compute capability is not in our PTX build matrix and rejects missing
+/// subdirectories (no silent fallback to the legacy top-level layout).
+///
+/// Under `not(feature = "cuda")` this falls back to `kernels_root` as-is
+/// so host-stub builds still compile.
+pub fn resolve_kernels_dir(
+    ctx: &CudaContextHandle,
+    kernels_root: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    // Under `not(feature = "cuda")` we have no device to query, so
+    // fall through to the root directory unchanged (host-stub builds
+    // run invariant-level tests only — they never load kernels).
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ctx;
+        return Ok(kernels_root.to_path_buf());
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        let (major, minor) = ctx.compute_capability();
+        let target = CompileTarget::from_compute_capability(major, minor).ok_or_else(|| {
+            RvllmError::config(
+                ConfigError::InvalidField {
+                    name: "compute_capability",
+                    reason: format!(
+                        "unsupported CUDA compute capability {major}.{minor} \
+                         (no PTX build in kernels/). Add a `CompileTarget` \
+                         variant and rebuild kernels for this arch."
+                    ),
+                },
+                "compute_capability",
+            )
+        })?;
+        let sub = kernels_root.join(target.as_sm_str());
+        if !sub.is_dir() {
+            return Err(RvllmError::config(
+                ConfigError::InvalidField {
+                    name: "kernels_dir",
+                    reason: format!(
+                        "kernel subdirectory {} for compute capability {major}.{minor} \
+                         does not exist; run `kernels/build.sh {}`",
+                        sub.display(),
+                        target.as_sm_str(),
+                    ),
+                },
+                "kernels_dir",
+            ));
+        }
+        Ok(sub)
+    }
 }

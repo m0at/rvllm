@@ -11,6 +11,7 @@ target/
 .env
 .instance_id
 results_*.json
+v3/tools/bench_out/
 REVISION
 __pycache__/
 *.pyc

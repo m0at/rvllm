@@ -16,15 +16,13 @@
 //! 12 launches per layer.
 
 use rvllm_core::Result;
-use rvllm_cutlass::{CublasLt, CutlassLib, Fp8GemmPlan};
-use rvllm_fused::{
-    ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch, FusedSiluMulFp8QuantLaunch,
-};
+use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan};
+use rvllm_fused::{ArgmaxLaunch, FusedSiluMulFp8QuantLaunch};
 use rvllm_kernels::KernelFn;
 pub use rvllm_loader::{LayerAttnType, MlpActivation};
 
 use rvllm_attention::{
-    Fa3Kernels, PagedDecodeFp8Launcher, PagedDecodeParams, PagedPrefillFp8Launcher,
+    AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams, PagedPrefillFp8Launcher,
     PagedPrefillParams,
 };
 
@@ -136,9 +134,9 @@ pub unsafe fn forward(
     scratch: &LayerScratch,
     meta: &MetadataPtrs,
     plans: &LayerGemmPlans,
-    cutlass: &CutlassLib,
+    cutlass: &CutlassBackend,
     cublaslt: &CublasLt,
-    fa3: &Fa3Kernels,
+    fa3: &AttentionBackend,
     residual: u64,
     stream: u64,
     attn_type: LayerAttnType,
@@ -167,10 +165,10 @@ pub unsafe fn forward_phase(
     weights: &LayerWeights,
     scratch: &LayerScratch,
     meta: &MetadataPtrs,
-    plans: &LayerGemmPlans,
-    cutlass: &CutlassLib,
+    _plans: &LayerGemmPlans,
+    _cutlass: &CutlassBackend,
     cublaslt: &CublasLt,
-    fa3: &Fa3Kernels,
+    fa3: &AttentionBackend,
     residual: u64,
     stream: u64,
     phase: LayerPhase,
@@ -186,7 +184,7 @@ pub unsafe fn forward_phase(
         });
     }
     let q_dim = dims.num_heads * dims.head_dim;
-    let kv_dim = dims.num_kv_heads * dims.head_dim;
+    let _kv_dim = dims.num_kv_heads * dims.head_dim;
 
     // 1. rmsnorm(residual) + fp8 quant. The residual add was already
     //    done by the prior layer's down-proj cuBLASLt epilogue (beta=1).
@@ -270,7 +268,7 @@ pub unsafe fn forward_phase(
     // Suppress unused warnings when cuda feature is off.
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (cublaslt, kernels.add_bias_f16, plans, qkv_n);
+        let _ = (cublaslt, kernels.add_bias_f16, _plans, qkv_n);
     }
 
     #[cfg(feature = "cuda")]
@@ -333,18 +331,28 @@ pub unsafe fn forward_phase(
                 scale: dims.attn_scale,
                 window_size_left: -1,
             };
+            // Llama/Qwen path: per-slot KV scales are not wired up for
+            // Llama/Qwen: use the scalar per-tensor KV scale fallback
+            // in the attention kernel. The per-slot scale cache is a
+            // Gemma 4-specific addition (rope writes per-(slot, head)
+            // amax into it); Llama/Qwen's rope still uses the per-
+            // tensor `kv_scale_ptr` calibration, so we pass that as
+            // `k_descale_fallback_ptr` / `v_descale_fallback_ptr`.
             decode.launch(
                 decode_params,
                 scratch.attn_out,
                 scratch.q_fp8,
                 scratch.k_cache,
                 scratch.v_cache,
+                0, // k_scale_cache (per-slot; not populated on Llama/Qwen)
+                0, // v_scale_cache
+                0, // q_scale_cache (Llama/Qwen uses scalar)
+                scratch.kv_scale_ptr, // k_descale_fallback (scalar)
+                scratch.kv_scale_ptr, // v_descale_fallback (scalar)
                 meta.block_tables,
                 meta.context_lens,
                 scratch.fa3_workspace,
                 scratch.q_scale_ptr,
-                scratch.kv_scale_ptr,
-                scratch.kv_scale_ptr,
                 stream,
             )?;
         }
@@ -512,7 +520,7 @@ pub unsafe fn forward_phase(
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (cutlass, plans, stream, kv_dim);
+        let _ = (_cutlass, _plans, stream, _kv_dim);
     }
     Ok(())
 }

@@ -24,6 +24,7 @@
 
 #include <float.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 // ============================================================================
 // Configuration constants
@@ -32,7 +33,21 @@
 // Tile sizes for K/V streaming. Br = rows of Q per tile, Bc = cols of K per tile.
 // For decode (single query token), Br=1 is optimal.
 // For prefill, Br=64 or 128 is typical.
-#define FA2_BC 64          // K/V tile width (number of KV positions per tile)
+//
+// Bc default is 64 (SM80 / SM89 / SM90). Blackwell consumer targets (sm_100,
+// sm_121) have tighter static-smem budgets per block; head_dim=256 with Bc=64
+// overflows the 48 KB default limit on sm_121 (PR#28 bring-up). Halve Bc to
+// 32 on those arches so the per-block smem footprint stays within limits
+// without changing the SM90 production path. An explicit `-DFA2_BC=<n>` on
+// the nvcc command line still wins — the build system can override per-arch
+// if future tuning wants a different value.
+#ifndef FA2_BC
+#  if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+#    define FA2_BC 32      // sm_100 / sm_121 / sm_122 — smem-budget safe
+#  else
+#    define FA2_BC 64      // sm_80 / sm_89 / sm_90 — unchanged baseline
+#  endif
+#endif
 #define FA2_THREADS 128    // Threads per block
 
 // ============================================================================
@@ -845,6 +860,250 @@ __global__ void flash_attention_2_decode_f16kv_kernel(
     }
 }
 
+// ============================================================================
+// FP8 E4M3 paged-decode variant — matches the PagedDecodeFp8Launcher ABI
+// ============================================================================
+//
+// Drop-in replacement for `fa3_sm90_paged_decode_fp8` on targets where
+// FA3 doesn't apply (sm_121). Q, K, V are all FP8 E4M3 with per-tensor
+// scalar descales; output is f16 to match the FA3 .so ABI.
+//
+// Internal math stays in f32 for numerical stability. On-load dequant
+// per byte:
+//     val_f32 = fp8_e4m3_to_float(byte) * *descale
+// `window_size_left` is accepted but treated as `-1` (full context) for
+// now — sliding-window attention on the FP8-KV path is a follow-up.
+
+__device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
+#if __CUDA_ARCH__ >= 1000
+    // Native Blackwell path: PTX `cvt.rn.f16.e4m3x2` emitted for
+    // sm_100+. On GB10 this is a single-cycle hardware conversion
+    // (measured ~2× faster than the branchless scalar path in the
+    // fp8_gemv bench, which is the analogous hot loop).
+    __half_raw hr = __nv_cvt_fp8_to_halfraw(
+        (__nv_fp8_storage_t)b, __NV_E4M3);
+    return __half2float(__half(hr));
+#else
+    // Pre-Blackwell path: branchless closed-form decode (avoids the
+    // divergent if/else in the original scalar path). Mirrors
+    // `fp8e4m3_to_float` in kernels/fp8_gemv.cu.
+    unsigned int s = (b >> 7) & 1u;
+    unsigned int e = (b >> 3) & 0xFu;
+    unsigned int m = b & 0x7u;
+    unsigned int f32_bits = (s << 31) | ((e + 120u) << 23) | (m << 20);
+    unsigned int is_normal = (e != 0u) & ((e != 0xFu) | (m != 0x7u));
+    f32_bits &= (unsigned int)(-(int)is_normal);
+    return __uint_as_float(f32_bits);
+#endif
+}
+
+extern "C"
+__global__ void flash_attention_2_decode_fp8kv_kernel(
+    __half* __restrict__ output,
+    const unsigned char* __restrict__ query,
+    const unsigned char* __restrict__ key_cache,
+    const unsigned char* __restrict__ value_cache,
+    const float* __restrict__ k_scale_cache,
+    const float* __restrict__ v_scale_cache,
+    const float* __restrict__ q_scale_cache,
+    const float* __restrict__ k_descale_fallback,
+    const float* __restrict__ v_descale_fallback,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ context_lens,
+    const float* __restrict__ q_descale,
+    float scale,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq,
+    int window_size_left
+) {
+    const int seq_idx  = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid      = threadIdx.x;
+
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+
+    const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx
+                                                         : (head_idx / (num_heads / num_kv_heads));
+
+    const float q_scale = (q_scale_cache != nullptr)
+        ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
+        : *q_descale;
+    const bool k_perslot = (k_scale_cache != nullptr);
+    const bool v_perslot = (v_scale_cache != nullptr);
+    const float k_scale_scalar = k_perslot ? 0.0f : __ldg(k_descale_fallback);
+    const float v_scale_scalar = v_perslot ? 0.0f : __ldg(v_descale_fallback);
+
+    // Sliding-window boundary: when `window_size_left` is set (sliding
+    // attention layers on Gemma 4), only the last `window_size_left`
+    // KV positions are allowed to attend. Compute the earliest allowed
+    // absolute position once; per-tile logic masks anything before it.
+    const int decode_q_abs_pos = context_len - 1;
+    const int window_start = (window_size_left < 0)
+        ? 0
+        : max(0, decode_q_abs_pos - window_size_left);
+
+    extern __shared__ float smem[];
+    // BC=16 layout: [16 * head_dim K tile, 16 * head_dim V tile, 16 scores, smem reduce]
+    float* s_key    = smem;
+    float* s_val    = smem + 16 * head_dim;
+    float* s_score  = smem + 2 * 16 * head_dim;
+    float* s_reduce = smem + 2 * 16 * head_dim + 16;
+
+    const int num_kv_tiles = (context_len + 16 - 1) / 16;
+    const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
+
+    float q_reg[8];
+    for (int r = 0; r < dims_per_thread && r < 8; r++) {
+        int d = tid + r * FA2_THREADS;
+        if (d < head_dim) {
+            unsigned char qb = query[(seq_idx * num_heads + head_idx) * head_dim + d];
+            q_reg[r] = fp8kv_decode_byte(qb) * q_scale * scale;
+        } else {
+            q_reg[r] = 0.0f;
+        }
+    }
+
+    float row_max = -FLT_MAX;
+    float row_sum = 0.0f;
+    float acc[8];
+    for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] = 0.0f;
+
+    for (int tile = 0; tile < num_kv_tiles; tile++) {
+        const int tile_start = tile * 16;
+        const int tile_len = min(16, context_len - tile_start);
+
+        // Vectorized-by-8 K load: each thread pulls an aligned u64 (8
+        // FP8 bytes), then decode-and-scatter into smem. Cuts the load
+        // instruction count 8× vs scalar at the cost of one extra
+        // unpack; under full BW pressure the win is measurable.
+        {
+            const int vec_total = tile_len * (head_dim / 8);
+            for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                int t = vi / (head_dim / 8);
+                int d_base = (vi % (head_dim / 8)) * 8;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                int slot = phys_block * block_size + page_off;
+                float k_scale = k_perslot
+                    ? __ldg(&k_scale_cache[slot * num_kv_heads + kv_head_idx])
+                    : k_scale_scalar;
+                const unsigned char* k_row = key_cache
+                    + (slot * num_kv_heads + kv_head_idx) * head_dim;
+                unsigned long long k8 = __ldg(
+                    reinterpret_cast<const unsigned long long*>(k_row + d_base));
+                float* s = s_key + t * head_dim + d_base;
+                #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    s[b] = fp8kv_decode_byte((unsigned char)(k8 >> (b * 8))) * k_scale;
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int t = 0; t < tile_len; t++) {
+            float dot = 0.0f;
+            for (int r = 0; r < dims_per_thread && r < 8; r++) {
+                int d = tid + r * FA2_THREADS;
+                if (d < head_dim) {
+                    dot += q_reg[r] * s_key[t * head_dim + d];
+                }
+            }
+            dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
+            if (tid == 0) {
+                int kv_pos = tile_start + t;
+                s_score[t] = (kv_pos < window_start) ? -FLT_MAX : dot;
+            }
+            __syncthreads();
+        }
+
+        float tile_max = -FLT_MAX;
+        if (tid == 0) {
+            for (int t = 0; t < tile_len; t++) tile_max = fmaxf(tile_max, s_score[t]);
+            s_reduce[0] = tile_max;
+        }
+        __syncthreads();
+        tile_max = s_reduce[0];
+        __syncthreads();
+
+        float prev_max = row_max;
+        float new_max = fmaxf(row_max, tile_max);
+        if (new_max > prev_max && prev_max > -FLT_MAX) {
+            float correction = expf(prev_max - new_max);
+            for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] *= correction;
+            row_sum *= correction;
+        }
+        row_max = new_max;
+
+        if (tid == 0) {
+            float tsum = 0.0f;
+            for (int t = 0; t < tile_len; t++) {
+                float v = (s_score[t] > -FLT_MAX + 1.0f)
+                            ? expf(s_score[t] - row_max) : 0.0f;
+                s_score[t] = v;
+                tsum += v;
+            }
+            s_reduce[0] = tsum;
+        }
+        __syncthreads();
+        row_sum += s_reduce[0];
+        __syncthreads();
+
+        // Vectorized-by-8 V load with per-slot V scale.
+        {
+            const int vec_total = tile_len * (head_dim / 8);
+            for (int vi = tid; vi < vec_total; vi += FA2_THREADS) {
+                int t = vi / (head_dim / 8);
+                int d_base = (vi % (head_dim / 8)) * 8;
+                int kv_pos = tile_start + t;
+                int page_idx = kv_pos / block_size;
+                int page_off = kv_pos % block_size;
+                int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                int slot = phys_block * block_size + page_off;
+                float v_scale = v_perslot
+                    ? __ldg(&v_scale_cache[slot * num_kv_heads + kv_head_idx])
+                    : v_scale_scalar;
+                const unsigned char* v_row = value_cache
+                    + (slot * num_kv_heads + kv_head_idx) * head_dim;
+                unsigned long long v8 = __ldg(
+                    reinterpret_cast<const unsigned long long*>(v_row + d_base));
+                float* s = s_val + t * head_dim + d_base;
+                #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    s[b] = fp8kv_decode_byte((unsigned char)(v8 >> (b * 8))) * v_scale;
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int r = 0; r < dims_per_thread && r < 8; r++) {
+            int d = tid + r * FA2_THREADS;
+            if (d < head_dim) {
+                float val_acc = 0.0f;
+                for (int t = 0; t < tile_len; t++) {
+                    val_acc += s_score[t] * s_val[t * head_dim + d];
+                }
+                acc[r] += val_acc;
+            }
+        }
+        __syncthreads();
+    }
+
+    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+    for (int r = 0; r < dims_per_thread && r < 8; r++) {
+        int d = tid + r * FA2_THREADS;
+        if (d < head_dim) {
+            output[(seq_idx * num_heads + head_idx) * head_dim + d] =
+                __float2half(acc[r] * inv_sum);
+        }
+    }
+}
+
 // Fully f16 I/O variant: f16 query, f16 KV cache, f16 output.
 // All internal math remains f32 for numerical stability.
 // This eliminates the f32<->f16 casts around the attention kernel.
@@ -985,3 +1244,4 @@ __global__ void flash_attention_2_decode_f16io_kernel(
         }
     }
 }
+

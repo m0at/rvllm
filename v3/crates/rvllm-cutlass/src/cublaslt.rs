@@ -369,6 +369,7 @@ impl CublasLt {
             )?;
         }
 
+
         // Layouts: col-major view of our row-major buffers, TN.
         let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();

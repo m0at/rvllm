@@ -697,6 +697,9 @@ fn upload_fp8(
         clamp_ppm: q.clamp_ppm,
         dtype: DType::Fp8E4M3,
         channelscale_ptr: None,
+        blockscale_ptr: None,
+        blockscale_n_blocks: 0,
+        blockscale_k_blocks: 0,
     })
 }
 
@@ -731,6 +734,9 @@ fn upload_fp8_direct(
         clamp_ppm: 0.0,
         dtype: DType::Fp8E4M3,
         channelscale_ptr: None,
+        blockscale_ptr: None,
+        blockscale_n_blocks: 0,
+        blockscale_k_blocks: 0,
     })
 }
 
@@ -782,6 +788,9 @@ fn upload_fp8_fused_direct(
         clamp_ppm: 0.0,
         dtype: DType::Fp8E4M3,
         channelscale_ptr: None,
+        blockscale_ptr: None,
+        blockscale_n_blocks: 0,
+        blockscale_k_blocks: 0,
     })
 }
 
@@ -797,86 +806,6 @@ pub(crate) fn fp8_e4m3_to_f32(b: u8) -> f32 {
         f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
     };
     if s != 0 { -val } else { val }
-}
-
-fn concat_qkv(
-    q: &(usize, TensorEntry),
-    k: &(usize, TensorEntry),
-    v: &(usize, TensorEntry),
-    shards: &[ShardMap],
-    model_dir: &Path,
-) -> Result<Vec<u8>> {
-    let qb = tensor_to_f16_bytes(
-        &q.1,
-        &shards[q.0].bytes()[q.1.file_offset as usize..(q.1.file_offset + q.1.nbytes) as usize],
-        model_dir,
-    )?;
-    let kb = tensor_to_f16_bytes(
-        &k.1,
-        &shards[k.0].bytes()[k.1.file_offset as usize..(k.1.file_offset + k.1.nbytes) as usize],
-        model_dir,
-    )?;
-    let vb = tensor_to_f16_bytes(
-        &v.1,
-        &shards[v.0].bytes()[v.1.file_offset as usize..(v.1.file_offset + v.1.nbytes) as usize],
-        model_dir,
-    )?;
-    let mut out = Vec::with_capacity(qb.len() + kb.len() + vb.len());
-    out.extend_from_slice(&qb);
-    out.extend_from_slice(&kb);
-    out.extend_from_slice(&vb);
-    Ok(out)
-}
-
-fn concat_qkv_bias(
-    q: &(usize, TensorEntry),
-    k: &(usize, TensorEntry),
-    v: &(usize, TensorEntry),
-    shards: &[ShardMap],
-    model_dir: &Path,
-) -> Result<Vec<u8>> {
-    let qb = tensor_to_f16_bytes(
-        &q.1,
-        &shards[q.0].bytes()[q.1.file_offset as usize..(q.1.file_offset + q.1.nbytes) as usize],
-        model_dir,
-    )?;
-    let kb = tensor_to_f16_bytes(
-        &k.1,
-        &shards[k.0].bytes()[k.1.file_offset as usize..(k.1.file_offset + k.1.nbytes) as usize],
-        model_dir,
-    )?;
-    let vb = tensor_to_f16_bytes(
-        &v.1,
-        &shards[v.0].bytes()[v.1.file_offset as usize..(v.1.file_offset + v.1.nbytes) as usize],
-        model_dir,
-    )?;
-    let mut out = Vec::with_capacity(qb.len() + kb.len() + vb.len());
-    out.extend_from_slice(&qb);
-    out.extend_from_slice(&kb);
-    out.extend_from_slice(&vb);
-    Ok(out)
-}
-
-fn concat_gate_up(
-    g: &(usize, TensorEntry),
-    u: &(usize, TensorEntry),
-    shards: &[ShardMap],
-    model_dir: &Path,
-) -> Result<Vec<u8>> {
-    let gb = tensor_to_f16_bytes(
-        &g.1,
-        &shards[g.0].bytes()[g.1.file_offset as usize..(g.1.file_offset + g.1.nbytes) as usize],
-        model_dir,
-    )?;
-    let ub = tensor_to_f16_bytes(
-        &u.1,
-        &shards[u.0].bytes()[u.1.file_offset as usize..(u.1.file_offset + u.1.nbytes) as usize],
-        model_dir,
-    )?;
-    let mut out = Vec::with_capacity(gb.len() + ub.len());
-    out.extend_from_slice(&gb);
-    out.extend_from_slice(&ub);
-    Ok(out)
 }
 
 /// Precompute RoPE cos/sin tables as f16 bytes. The v3 fused_rope_cache

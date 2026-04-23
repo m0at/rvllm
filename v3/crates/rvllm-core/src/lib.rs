@@ -8,6 +8,7 @@
 // are explicitly documented as invariant-violating. Everywhere else,
 // errors flow through `Result<T, RvllmError>`.
 
+pub mod arch;
 pub mod config;
 pub mod dtype;
 pub mod env;
@@ -15,6 +16,7 @@ pub mod error;
 pub mod ids;
 pub mod shape;
 
+pub use arch::CompileTarget;
 pub use config::{
     GraphMode, LogLevel, ModelArch, ModelConfig, PreemptionMode, RuntimeConfig,
     RuntimeConfigBuilder,

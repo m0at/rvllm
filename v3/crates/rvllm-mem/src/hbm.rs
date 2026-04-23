@@ -84,8 +84,53 @@ impl<'ctx> HbmArena<'ctx> {
         Ok(Self::new_host_stub(bytes))
     }
 
+    /// Wrap a pre-allocated device pointer + byte count as an arena.
+    ///
+    /// Ownership semantics:
+    ///   * The arena takes *exclusive* ownership of `base`. The caller
+    ///     must not retain a copy of the pointer, free it elsewhere,
+    ///     or pass the same `base` to a second `from_raw_parts` call.
+    ///   * On `Drop` (under `feature = "cuda"`) the arena calls
+    ///     `cuMemFree_v2(base)`. This is the one CUDA deallocator that
+    ///     correctly releases both dedicated-HBM allocations
+    ///     (`cuMemAlloc_v2`) and managed-memory allocations
+    ///     (`cuMemAllocManaged`), so the same seam works for both
+    ///     arena flavours without a per-flavour teardown path.
+    ///
+    /// This is the private seam the `UnifiedArena` (managed-memory)
+    /// constructor plugs into so the bump-allocator bookkeeping is
+    /// shared across arena flavours.
+    ///
+    /// # Safety
+    /// `base` must point to at least `bytes` of valid device-addressable
+    /// memory allocated via `cuMemAlloc_v2` or `cuMemAllocManaged`
+    /// (both pair with `cuMemFree_v2`). Anything else will leak or
+    /// double-free at teardown.
+    // Only consumed by `UnifiedArena` under `feature = "gb10"`; `--features
+    // cuda` alone would flag it dead. Keep the seam symmetric across
+    // feature combos by gating the definition.
+    #[cfg(feature = "gb10")]
+    pub(crate) fn from_raw_parts(base: u64, bytes: usize) -> Self {
+        Self {
+            base,
+            capacity: bytes,
+            used: AtomicUsize::new(0),
+            owns_cuda: true,
+            _ctx: PhantomData,
+        }
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Device base pointer of the arena slab. All `Region`s live in
+    /// `[base_ptr, base_ptr + capacity)`. Stable for the lifetime of
+    /// the arena. Exposed for whole-arena operations like
+    /// `cuMemPrefetchAsync` — per-region callers should use
+    /// `Region::device_ptr()` instead.
+    pub fn base_ptr(&self) -> u64 {
+        self.base
     }
 
     pub fn used(&self) -> usize {

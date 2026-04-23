@@ -25,6 +25,7 @@ cd "$DIR"
 # sm_90  = H100, H200
 # sm_100 = B100, B200
 # sm_120 = RTX 5090, RTX 6000 Blackwell
+# sm_121 = GB10 (Project DIGITS / DGX Spark — Grace+Blackwell consumer)
 # sm_122 = RTX 5080, RTX 5070
 ALL_ARCHS="sm_70 sm_75 sm_80 sm_86 sm_89 sm_90"
 
@@ -36,9 +37,9 @@ if [ "$NVCC_MAJOR" -ge 13 ] || ([ "$NVCC_MAJOR" -eq 12 ] && [ "$NVCC_MINOR" -ge 
     ALL_ARCHS="$ALL_ARCHS sm_100"
 fi
 
-# Check nvcc version for sm_120/sm_122 support (CUDA 13.0+)
+# Check nvcc version for sm_120/sm_121/sm_122 support (CUDA 13.0+)
 if [ "$NVCC_MAJOR" -ge 13 ]; then
-    ALL_ARCHS="$ALL_ARCHS sm_120 sm_122"
+    ALL_ARCHS="$ALL_ARCHS sm_120 sm_121 sm_122"
 fi
 
 # Use specific arch if provided
@@ -77,8 +78,40 @@ compile_kernel() {
         extra_flags="$CUTLASS_FLAGS -std=c++17"
         ;;
     esac
+    # FP8 / NVFP4 tensor-core MMA kernels need the arch-specific
+    # feature set (`sm_121a` / `sm_120a`) because `.kind::f8f6f4`
+    # and `mma.kind::*f8*` live in the CUDA family-specific PTX
+    # feature set. Plain `sm_121` rejects them at ptxas time even
+    # though nvcc -ptx emits the instruction successfully.
+    if grep -q 'kind::f8f6f4\|mma.sync.*e4m3\|mma.sync.*e2m1\|fp8_mma_frag_pack\|mma_m16n8k32' "$cu" 2>/dev/null; then
+        case "$arch" in
+            sm_120) arch="sm_120a" ;;
+            sm_121) arch="sm_121a" ;;
+            sm_122) arch="sm_122a" ;;
+        esac
+    fi
     $NVCC -ptx -arch="$arch" -O3 $extra_flags -o "$ptx" "$cu" 2>/dev/null
 }
+
+# Revision pinned into the generated manifest.json. Precedence:
+#   1. $REVISION env var (tarball / CI shallow-clone builds where
+#      git isn't available or history is detached)
+#   2. git short HEAD
+#   3. literal "dev" (local hack build)
+REVISION="${REVISION:-$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo "dev")}"
+
+# Secondary kernel tree: `v3/kernels/`. Upstream shipped a second
+# source tree with Gemma-4-specific fused kernels (RoPE partial, norm
+# + add-residual, qk-rmsnorm, etc.) separately from this top-level
+# tree. Runtime loaders reference both sets under the same manifest,
+# so the per-arch OUTDIR must contain PTX for both. We co-locate the
+# output in OUTDIR (no name collisions verified at branch authoring
+# time; a collision would overwrite silently — audit if one appears).
+#
+# `$DIR/../v3/kernels` is optional — if the upstream tree ever moves
+# or the v3 prefix changes, this falls through without breaking the
+# top-level build.
+V3_KERNELS_DIR="$DIR/../v3/kernels"
 
 for arch in $ARCHS; do
     echo "=== Compiling for $arch ==="
@@ -94,9 +127,29 @@ for arch in $ARCHS; do
             echo "  WARNING: $base.cu failed for $arch (may need newer CUDA toolkit)"
         }
     done
+
+    if [ -d "$V3_KERNELS_DIR" ]; then
+        for cu in "$V3_KERNELS_DIR"/*.cu; do
+            [ -f "$cu" ] || continue
+            base=$(basename "$cu" .cu)
+            ptx="$OUTDIR/${base}.ptx"
+            echo "  (v3) $base.cu -> $arch/$base.ptx"
+            compile_kernel "$cu" "$arch" "$ptx" || {
+                echo "  WARNING: v3/$base.cu failed for $arch (may need newer CUDA toolkit)"
+            }
+        done
+    fi
+
+    "$DIR/gen_manifest.sh" "$OUTDIR" "$REVISION" || {
+        echo "  WARNING: manifest generation failed for $arch"
+    }
 done
 
 # Also compile a default set (sm_80) in the root for backward compat
+# with old bench scripts that look at `kernels/*.ptx`. Only run when
+# the caller didn't specifically ask for a single arch — otherwise
+# the explicit arch wins and we don't leave stale top-level artifacts.
+if [ -z "$1" ] && [ -z "$CUDA_ARCH" ]; then
 echo ""
 echo "=== Default PTX (sm_80) ==="
 for cu in "$DIR"/*.cu; do
@@ -106,6 +159,7 @@ for cu in "$DIR"/*.cu; do
     echo "  $base.cu -> $base.ptx"
     compile_kernel "$cu" "sm_80" "$ptx" || true
 done
+fi   # end: default sm_80 loop (skipped when specific arch requested)
 
 echo ""
 echo "Done. PTX files in: $DIR/<arch>/*.ptx"

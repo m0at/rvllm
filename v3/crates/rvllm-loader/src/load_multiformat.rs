@@ -678,6 +678,9 @@ fn upload_fp8(
         clamp_ppm: q.clamp_ppm,
         dtype: DType::Fp8E4M3,
         channelscale_ptr: None,
+        blockscale_ptr: None,
+        blockscale_n_blocks: 0,
+        blockscale_k_blocks: 0,
     })
 }
 
@@ -712,6 +715,9 @@ fn upload_fp8_direct(
         clamp_ppm: 0.0,
         dtype: DType::Fp8E4M3,
         channelscale_ptr: None,
+        blockscale_ptr: None,
+        blockscale_n_blocks: 0,
+        blockscale_k_blocks: 0,
     })
 }
 
@@ -763,6 +769,9 @@ fn upload_fp8_fused_direct(
         clamp_ppm: 0.0,
         dtype: DType::Fp8E4M3,
         channelscale_ptr: None,
+        blockscale_ptr: None,
+        blockscale_n_blocks: 0,
+        blockscale_k_blocks: 0,
     })
 }
 

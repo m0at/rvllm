@@ -25,6 +25,8 @@ pub mod kv_layout;
 pub mod pinned;
 pub mod stream;
 pub mod tensor;
+#[cfg(feature = "gb10")]
+pub mod unified;
 
 pub use capture::{record, BoundHandle, CaptureScope, HasDevicePtr};
 pub use context::CudaContextHandle;
@@ -36,3 +38,5 @@ pub use kv_layout::KvLayout;
 pub use pinned::{PinnedBuf, PinnedPool};
 pub use stream::Stream;
 pub use tensor::Tensor;
+#[cfg(feature = "gb10")]
+pub use unified::UnifiedArena;

@@ -12,22 +12,13 @@ use crate::manifest::VerifiedManifest;
 
 pub struct KernelLoader {
     manifest: VerifiedManifest,
-    // When `cuda` is on, this is the dlopen handle pool keyed by
-    // logical-name → loaded module. Keeping a BTreeMap so dump order
-    // is deterministic for CI logs.
-    #[cfg(feature = "cuda")]
-    modules: std::cell::RefCell<std::collections::BTreeMap<String, ()>>,
 }
 
 impl KernelLoader {
     /// Build a loader from a verified manifest. The manifest must
     /// already have passed `KernelManifest::load_and_verify`.
     pub fn new(manifest: VerifiedManifest) -> Self {
-        Self {
-            manifest,
-            #[cfg(feature = "cuda")]
-            modules: Default::default(),
-        }
+        Self { manifest }
     }
 
     pub fn manifest(&self) -> &VerifiedManifest {

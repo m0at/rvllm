@@ -1,0 +1,148 @@
+ncu_sm121_decode — Nsight-Compute profile, 2026-04-22
+=======================================================
+
+Target      : NVIDIA GB10 (compute cap 12.1), driver 595.58.03, CUDA 13.2
+Model       : Gemma 4 31B-it fp8-block
+Workload    : rvllm-bench batch=128 iters=3 warmup=1 RVLLM_F16_KV=0
+              CUTLASS SM120 default-on, FP8 E4M3 KV
+Observed    : 555 tok/s / 231 ms/step  (matches baseline)
+Profile     : ncu SpeedOfLight + LaunchStats + Occupancy + MemoryWorkloadAnalysis
+              launch-count=1500, snapshot = ~1.5 full layers worth of kernels
+              (profile was interrupted; snapshot sufficient for per-kernel stats).
+Ncu version : 2025.3.1.0
+
+
+Per-kernel summary (averages across sampled invocations)
+--------------------------------------------------------
+
+KERNEL                                     avg_us    SM%   MEM%   L1%   L2%
+cutlass_sm120_blockwise_gemm                960.6   18.9   20.2  10.8  20.2
+cublaslt_nvjet_gemm                         505.9   23.8   20.8  13.6  20.8
+flash_attention_2_decode_fp8kv_kernel       288.3    6.2    3.7   3.9   1.1
+fused_gelu_mul_fp8_quant_kernel              63.2   13.1   25.2  15.0  25.2
+fused_qkv_rmsnorm_kernel                     43.1   40.5   38.2  42.9  13.7
+fused_rope_partial_fp8kv_kernel              33.0   31.6   31.3  38.2  18.8
+fused_norm_add_residual_f16_kernel           31.9   11.5   11.5  14.2  13.3
+fused_rmsnorm_fp8_quant_kernel               22.7   21.3   18.0  25.8   9.0
+quantize_fp8_per_token_kernel                18.6   14.7   14.7  20.3  16.8
+fill_sfb_from_b_chscale_sm120                 6.4    0.7    9.0  10.7   9.0
+fill_sfa_from_a_scale_sm120                   5.5    0.5    0.5   3.4   0.5
+
+
+Full-step extrapolation (batch=128, 60 layers, 4 GEMMs/layer)
+-------------------------------------------------------------
+
+  240 × cutlass_sm120_blockwise_gemm × 960 μs     ≈ 230 ms  (~98% of step)
+   60 × flash_attention_2_decode_fp8kv × 288 μs   ≈  17 ms  (~7%)
+  120 × fused_norm_add_residual_f16    × 32 μs    ≈   4 ms  (~2%)
+   60 × fused_qkv_rmsnorm              × 43 μs    ≈   3 ms  (~1%)
+   60 × fused_rope_partial_fp8kv       × 33 μs    ≈   2 ms  (~1%)
+  other small fused                                 ≈   5 ms
+                                       -----------------------
+  sum extrapolation                               ≈ 261 ms
+  observed wall-clock                             = 231 ms
+  overlap (stream-level concurrency)              ≈  30 ms
+
+Sum extrapolates above wall-clock because ncu profiling serializes
+every kernel; live execution benefits from graph-replay + some SM/DRAM
+overlap between adjacent kernels. Ratios still hold.
+
+
+Findings
+--------
+
+1. **Decode is GEMM-bound, not attention-bound at batch=128.**
+   CUTLASS SM120 blockwise FP8 GEMM accounts for ~98% of step time by
+   extrapolation. Current memory 22222222aa010001 "attention/LM-head-
+   bound" framing was derived from the pre-CUTLASS baseline; with
+   CUTLASS default-on (commit fd8c674) the GEMM path is now fast
+   enough to make attention the small tail, not the dominant cost.
+
+2. **CUTLASS SM120 is memory-bound.** SM throughput 19% with L2
+   throughput 20%. On a compute-bound kernel we'd see SM% → 80-95.
+   This matches the earlier measurement: 101.8 TFLOPS at M=128 on
+   Gemma 4 QKV shape is ~20% of GB10's FP8 TC peak. DRAM% reads 0
+   because blockwise FP8 weights fit largely in L2 at this N/K; the
+   L2 roundtrip at 20% is the throttle. This is why CUTLASS tile-
+   autotune (task aa01001fcutlasat) is a real lever — a better
+   MmaTileShape/ClusterShape that reuses weight columns across more
+   output rows could push L2 utilization higher.
+
+3. **FA2 FP8-KV decode kernel is smem-stalled.** SM% = 6.2%,
+   L2% = 1.1%, L1% = 3.9%. Very low on every axis. The kernel tile
+   is head_dim × BC × 4 bytes per K and per V = 64 KB for head_dim=256
+   / BC=32, already at the 99 KB opt-in ceiling. Occupancy suffers
+   because a single block hogs most of the per-SM smem budget
+   (likely 1 block per SM). This is the right place to look for
+   attention speedup when batch>=128 — options:
+     a) Split-K over KV context to boost SM-count utilization
+        (context_lens up to 4096 on Gemma 4, plenty to split).
+     b) Smaller BC tile with register-resident K/V to free smem and
+        allow 2+ blocks per SM.
+     c) Native e2m1 MMA + 4-bit NVFP4 KV (task aa01001nvf4mma0)
+        halves the smem tile — likely bumps occupancy.
+   None of these are required at batch=128 because the kernel is
+   only ~7% of step time; they become leverage when GEMM optimizes
+   further or at higher batches.
+
+4. **cuBLASLt (nvjet) still runs 6 times per step.** These are the
+   non-blockscale GEMM ops: embedding gather, LM-head f16 × f16,
+   and any GEMM falling outside the SM120 blockwise path (e.g.
+   small-M or absent channelscale). nvjet at 506 μs × 6 ≈ 3 ms —
+   not a bottleneck, noted for awareness.
+
+5. **Scale-factor prep kernels (fill_sfa/sfb) are free.**
+   ~6 μs each, <1% SM, called 240 times per step = ~2 ms total.
+   SFA max-reduce-broadcast + SFB transpose (from loader's row-
+   major b_chscale to CUTLASS MN-major SFB) add negligible overhead.
+
+6. **No kernel serialization visible in the profile.** Graph-replay
+   keeps the launch queue full; ncu observed per-kernel durations
+   match sequential-launch expectation. The ~30 ms gap between
+   extrapolated sum and wall-clock = overlap within a single CUDA
+   stream (DRAM prefetch of weights for kernel N+1 during compute
+   of kernel N), not a scheduling pathology.
+
+
+Follow-up priorities (post this profile)
+----------------------------------------
+
+  HIGH:  CUTLASS SM120 tile-shape autotune (aa01001fcutlasat).
+         Every % of CUTLASS improvement = ~0.98% of step time.
+
+  MED:   FA2 FP8-KV decode smem-tuning — split-K or smaller BC.
+         Pays off when CUTLASS gets faster or at batch≥256.
+
+  LOW:   Investigate why some layer GEMMs fall to cuBLASLt nvjet
+         when CUTLASS is loaded — if channelscale gating is too
+         strict, forcing all 4 per-layer GEMMs through CUTLASS
+         could close the remaining 2 ms nvjet tail.
+
+
+Reproduction
+------------
+
+  cat > /tmp/ncu_bench.sh <<'SH'
+  #!/bin/bash
+  export RVLLM_MODEL_DIR=/path/to/gemma-4-31b-it-fp8-block
+  export RVLLM_KERNELS_DIR=/path/to/rvllm/kernels
+  export RVLLM_CUTLASS_SM120_SO=$RVLLM_KERNELS_DIR/sm_121/libcutlass_sm120.so
+  export RVLLM_ARENA_GB=40 RVLLM_F16_KV=0
+  export RVLLM_BATCH=128 RVLLM_ITERS=3 RVLLM_WARMUP=1
+  exec /path/to/rvllm/v3/target/release/rvllm-bench
+  SH
+  chmod +x /tmp/ncu_bench.sh
+  sudo /usr/local/cuda/bin/ncu \
+    --launch-count 1500 \
+    --section SpeedOfLight --section LaunchStats \
+    --section Occupancy --section MemoryWorkloadAnalysis \
+    -o /tmp/ncu_decode /tmp/ncu_bench.sh
+
+  # Analyze:
+  sudo /usr/local/cuda/bin/ncu --import /tmp/ncu_decode.ncu-rep \
+    --csv --page details > /tmp/ncu_details.csv
+
+Note: ncu profiling on GB10 requires root (RmProfilingAdminOnly=1 in
+/proc/driver/nvidia/params). Per-kernel profiling slowdown is heavy
+(the 1500-launch run didn't finish in 20 min); snapshot after ~60
+kernels is already representative of the per-kernel cost structure.

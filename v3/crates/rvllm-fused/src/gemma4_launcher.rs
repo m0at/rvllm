@@ -157,6 +157,11 @@ pub struct FusedQkvRmsnormLaunch {
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub eps: f32,
+    /// Row stride of the upstream QKV GEMM output (in f16 elements).
+    /// Callers pass `q_dim + 2*kv_dim` so token-stride reads span the
+    /// full interleaved row; the old code's implicit component-stride
+    /// only worked at `num_tokens == 1`.
+    pub src_row_stride: u32,
 }
 
 impl FusedQkvRmsnormLaunch {
@@ -166,18 +171,20 @@ impl FusedQkvRmsnormLaunch {
         kernel: KernelFn,
         q_in: u64,
         k_in: u64,
-        v_inout: u64,
+        v_in: u64,
         q_out: u64,
         k_out: u64,
+        v_out: u64,
         q_gamma: u64,
         k_gamma: u64,
         stream: u64,
     ) -> Result<()> {
         let mut q_in = q_in;
         let mut k_in = k_in;
-        let mut v_inout = v_inout;
+        let mut v_in = v_in;
         let mut q_out = q_out;
         let mut k_out = k_out;
+        let mut v_out = v_out;
         let mut q_gamma = q_gamma;
         let mut k_gamma = k_gamma;
         let mut num_tokens = self.num_tokens as i32;
@@ -185,12 +192,14 @@ impl FusedQkvRmsnormLaunch {
         let mut num_kv_heads = self.num_kv_heads as i32;
         let mut head_dim = self.head_dim as i32;
         let mut eps = self.eps;
+        let mut src_row_stride = self.src_row_stride as i32;
         let args = [
             (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
             (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
-            (&mut v_inout) as *mut u64 as *mut core::ffi::c_void,
+            (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
             (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
             (&mut k_out) as *mut u64 as *mut core::ffi::c_void,
+            (&mut v_out) as *mut u64 as *mut core::ffi::c_void,
             (&mut q_gamma) as *mut u64 as *mut core::ffi::c_void,
             (&mut k_gamma) as *mut u64 as *mut core::ffi::c_void,
             (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
@@ -198,6 +207,7 @@ impl FusedQkvRmsnormLaunch {
             (&mut num_kv_heads) as *mut i32 as *mut core::ffi::c_void,
             (&mut head_dim) as *mut i32 as *mut core::ffi::c_void,
             (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+            (&mut src_row_stride) as *mut i32 as *mut core::ffi::c_void,
         ];
         let total_heads = self.num_heads + 2 * self.num_kv_heads;
         let grid = (self.num_tokens, total_heads, 1);
@@ -236,12 +246,15 @@ impl FusedRopePartialFp8KvLaunch {
         Ok(())
     }
 
-    /// Same as FusedRopeCacheFp8KvLaunch but with an extra `rotary_dim`
-    /// parameter. Elements beyond rotary_dim pass through without rotation.
+    /// Kernel sig: `(q, k, v, q_fp8, key_cache, value_cache,
+    ///   k_scale_cache, v_scale_cache, q_scale_cache, cos, sin,
+    ///   positions, slot_mapping, q_scale, num_tokens, num_heads,
+    ///   num_kv_heads, head_dim, rotary_dim)`.
     ///
-    /// Kernel sig: `(q, k, v, q_fp8, key_cache, value_cache, cos, sin,
-    ///   positions, slot_mapping, q_scale, kv_scale, num_tokens, num_heads,
-    ///   num_kv_heads, head_dim, rotary_dim)`
+    /// `q_scale_cache`: optional `[num_tokens * num_heads]` f32
+    /// scratch. When non-null the rope kernel computes per-(token,
+    /// head) Q amax and writes a dynamic scale; when null the kernel
+    /// falls back to the scalar `q_scale_ptr`.
     ///
     /// # Safety
     /// Caller owns all device pointers.
@@ -255,12 +268,14 @@ impl FusedRopePartialFp8KvLaunch {
         q_fp8_out: u64,
         k_cache_fp8: u64,
         v_cache_fp8: u64,
+        k_scale_cache: u64,
+        v_scale_cache: u64,
+        q_scale_cache: u64,
         cos: u64,
         sin: u64,
         positions: u64,
         slot_mapping: u64,
         q_scale_ptr: u64,
-        kv_scale_ptr: u64,
         stream: u64,
     ) -> Result<()> {
         self.validate()?;
@@ -270,12 +285,14 @@ impl FusedRopePartialFp8KvLaunch {
         let mut q_fp8_out = q_fp8_out;
         let mut k_cache_fp8 = k_cache_fp8;
         let mut v_cache_fp8 = v_cache_fp8;
+        let mut k_scale_cache = k_scale_cache;
+        let mut v_scale_cache = v_scale_cache;
+        let mut q_scale_cache = q_scale_cache;
         let mut cos = cos;
         let mut sin = sin;
         let mut positions = positions;
         let mut slot_mapping = slot_mapping;
         let mut q_scale_ptr = q_scale_ptr;
-        let mut kv_scale_ptr = kv_scale_ptr;
         let mut num_tokens = self.num_tokens as i32;
         let mut num_heads = self.num_heads as i32;
         let mut num_kv_heads = self.num_kv_heads as i32;
@@ -288,12 +305,14 @@ impl FusedRopePartialFp8KvLaunch {
             (&mut q_fp8_out) as *mut u64 as *mut core::ffi::c_void,
             (&mut k_cache_fp8) as *mut u64 as *mut core::ffi::c_void,
             (&mut v_cache_fp8) as *mut u64 as *mut core::ffi::c_void,
+            (&mut k_scale_cache) as *mut u64 as *mut core::ffi::c_void,
+            (&mut v_scale_cache) as *mut u64 as *mut core::ffi::c_void,
+            (&mut q_scale_cache) as *mut u64 as *mut core::ffi::c_void,
             (&mut cos) as *mut u64 as *mut core::ffi::c_void,
             (&mut sin) as *mut u64 as *mut core::ffi::c_void,
             (&mut positions) as *mut u64 as *mut core::ffi::c_void,
             (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
             (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
-            (&mut kv_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
             (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
             (&mut num_heads) as *mut i32 as *mut core::ffi::c_void,
             (&mut num_kv_heads) as *mut i32 as *mut core::ffi::c_void,
@@ -555,6 +574,107 @@ impl FusedNormAddResidualF16Launch {
         let args = [
             (&mut gemm_out_f16) as *mut u64 as *mut core::ffi::c_void,
             (&mut channelscale) as *mut u64 as *mut core::ffi::c_void,
+            (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
+            (&mut residual) as *mut u64 as *mut core::ffi::c_void,
+            (&mut layer_scalar) as *mut u64 as *mut core::ffi::c_void,
+            (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
+            (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+        ];
+        let block = (self.hidden.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        let smem = self.hidden * 4;
+        launch_raw(kernel, grid, block, smem, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fused_norm_add_residual_f16in: f16-input variant for the Sm121 decode
+// fast path. Reads f16 gemm output directly, no channelscale broadcast
+// (the preceding `fp8_gemv_wpr_native_f16in` already baked the per-
+// channel scale into its output).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// fp8_gemv_blockwise_wpr_native_f16in — f16-activation FP8 GEMV for the
+// Sm121 decode fast path. Block-scaled weights (128×128 F32 scale
+// blocks) + native `cvt.rn.f16x2.e4m3x2` PTX + native `cvt.f32.f16`
+// for activations. Weight scale is applied in-kernel; no activation
+// scale (kernel promotes f16→f32 on load).
+// ---------------------------------------------------------------------------
+
+pub struct Fp8GemvF16InLaunch {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+}
+
+impl Fp8GemvF16InLaunch {
+    /// # Safety
+    /// All device pointers must be valid for the kernel's duration.
+    /// `weight_fp8` is `[N, K]` FP8 E4M3; `b_chscale` is
+    /// `[ceil(N/128), ceil(K/128)]` f32 block-scale; `input_f16` is
+    /// `[M, K]` f16; `output_f16` is `[M, N]` f16.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        output_f16: u64,
+        weight_fp8: u64,
+        b_chscale: u64,
+        input_f16: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut output = output_f16;
+        let mut weight = weight_fp8;
+        let mut scale = b_chscale;
+        let mut input = input_f16;
+        let mut m_i = self.m as i32;
+        let mut n_i = self.n as i32;
+        let mut k_i = self.k as i32;
+        // block-scale layout in `kernels/fp8_gemv.cu`:
+        // scale[N_blocks, K_blocks] with 128-wide blocks on the K
+        // axis. `num_col_blocks = ceil(K/128)`.
+        let mut num_col_blocks = ((self.k + 127) / 128) as i32;
+        let args = [
+            (&mut output) as *mut u64 as *mut core::ffi::c_void,
+            (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+            (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+            (&mut input) as *mut u64 as *mut core::ffi::c_void,
+            (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut num_col_blocks) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        // Grid (ceil(N/8), M, 1) — 8 warps × 1 warp-per-row; block 256.
+        let grid = ((self.n + 7) / 8, self.m, 1u32);
+        let block = (256u32, 1u32, 1u32);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
+pub struct FusedNormAddResidualF16InLaunch {
+    pub num_tokens: u32,
+    pub hidden: u32,
+    pub eps: f32,
+}
+
+impl FusedNormAddResidualF16InLaunch {
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        gemm_out_f16: u64,
+        gamma: u64,
+        residual: u64,
+        layer_scalar: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut gemm_out_f16 = gemm_out_f16;
+        let mut gamma = gamma;
+        let mut residual = residual;
+        let mut layer_scalar = layer_scalar;
+        let mut hidden = self.hidden as i32;
+        let mut eps = self.eps;
+        let args = [
+            (&mut gemm_out_f16) as *mut u64 as *mut core::ffi::c_void,
             (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
             (&mut residual) as *mut u64 as *mut core::ffi::c_void,
             (&mut layer_scalar) as *mut u64 as *mut core::ffi::c_void,

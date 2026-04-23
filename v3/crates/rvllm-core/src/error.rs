@@ -146,6 +146,14 @@ pub enum CutlassError {
         variant: u32,
         cuda: CudaErrorKind,
     },
+    /// The selected `CutlassBackend` does not implement this launch
+    /// path. Used on sm_121 (`Absent` variant) — Blackwell consumer
+    /// has no SM90 CUTLASS `.so` to dlopen, so actual FP8 GEMM launches
+    /// fall to cuBLASLt or a future sm_121-native path (next GB10
+    /// follow-up). Bring-up itself succeeds; only launches into the
+    /// absent backend fail, and fail closed with this typed error
+    /// instead of a silent miscomputation.
+    FeatureNotAvailable { op: &'static str },
 }
 
 #[derive(Debug)]
@@ -155,6 +163,11 @@ pub enum AttentionError {
     GqaRatioInvalid { num_heads: u32, num_kv_heads: u32 },
     ContextExceedsBucket { context: u32, max: u32 },
     KernelLaunchFailed { cuda: CudaErrorKind },
+    /// The selected `AttentionBackend` does not implement this launch
+    /// path. Used on sm_121 (Fa2Ptx variant) when callers reach for
+    /// FP8-KV paged-decode / paged-prefill — those translate from
+    /// FA3's parameter set and will land in a follow-up PR.
+    FeatureNotAvailable { backend: &'static str, op: &'static str },
 }
 
 #[derive(Debug)]

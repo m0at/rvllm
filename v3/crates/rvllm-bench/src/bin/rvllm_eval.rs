@@ -24,6 +24,14 @@ fn env_path(k: &str) -> Result<PathBuf, String> {
         .map(PathBuf::from)
 }
 
+/// Optional env var: returns `/dev/null` when missing. For paths that
+/// the sm_121 backend never opens (SM90-only .so files + policy).
+fn env_path_or_placeholder(k: &str) -> PathBuf {
+    std::env::var(k)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/dev/null"))
+}
+
 fn is_gemma4_model_dir(model_dir: &std::path::Path) -> Result<bool, String> {
     Ok(matches!(
         ModelConfig::load_hf(model_dir)
@@ -81,9 +89,9 @@ fn run() -> Result<(), String> {
     let paths = EnginePaths {
         model_dir: model_dir.clone(),
         kernels_dir: env_path("RVLLM_KERNELS_DIR")?,
-        cutlass_so: env_path("RVLLM_CUTLASS_SO")?,
-        fa3_so: env_path("RVLLM_FA3_SO")?,
-        policy_json: env_path("RVLLM_POLICY")?,
+        cutlass_so: env_path_or_placeholder("RVLLM_CUTLASS_SO"),
+        fa3_so: env_path_or_placeholder("RVLLM_FA3_SO"),
+        policy_json: env_path_or_placeholder("RVLLM_POLICY"),
     };
     let arena_bytes: usize = if let Some(gb) = std::env::var("RVLLM_ARENA_GB").ok().and_then(|s| s.parse::<usize>().ok()) {
         gb * 1024 * 1024 * 1024
@@ -93,15 +101,19 @@ fn run() -> Result<(), String> {
             let free = {
                 let mut free: usize = 0;
                 let mut total: usize = 0;
+                // Borrow a context just long enough to probe free memory.
+                // `CudaContextHandle::init` uses primary-context retain
+                // (works on CUDA 11/12/13 — see rvllm-mem/src/context.rs
+                // module docs); the legacy `cuCtxCreate_v2` this code
+                // used to call directly is unwrapped by cudarc only for
+                // CUDA ≤ 12.09, so on CUDA 13 hosts the old path
+                // failed to resolve.
+                let _probe_ctx = rvllm_mem::context::CudaContextHandle::init(0)
+                    .map_err(|e| format!("probe ctx: {e}"))?;
                 unsafe {
-                    cudarc::driver::sys::cuInit(0);
-                    let mut dev: cudarc::driver::sys::CUdevice = 0;
-                    cudarc::driver::sys::cuDeviceGet(&mut dev, 0);
-                    let mut ctx: cudarc::driver::sys::CUcontext = std::ptr::null_mut();
-                    cudarc::driver::sys::cuCtxCreate_v2(&mut ctx, 0, dev);
                     cudarc::driver::sys::cuMemGetInfo_v2(&mut free as *mut _, &mut total as *mut _);
-                    cudarc::driver::sys::cuCtxDestroy_v2(ctx);
                 }
+                drop(_probe_ctx);
                 free
             };
             let reserve = 512 * 1024 * 1024; // 512MB headroom
