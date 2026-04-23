@@ -100,14 +100,31 @@ impl StopField {
 }
 
 /// A single chat message in the request.
+///
+/// OpenAI's Chat Completions spec allows four shapes here:
+///   * user / system: `content` is required (string or parts array).
+///   * assistant with prose: `content` is a string.
+///   * assistant with tool calls: `content` is `null` and `tool_calls`
+///     carries the call payload (id + function + arguments).
+///   * tool result: `content` carries the result, `tool_call_id` links
+///     back to the assistant's call id.
+///
+/// We keep every field optional at the Rust level and let the chat
+/// template enforce shape — Gemma 4's template already handles the
+/// full matrix. The previous struct required `content: String` and
+/// 422'd the moment zeroclaw replayed an assistant-with-tool-calls
+/// message on a follow-up turn.
 #[derive(Debug, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
-    /// `content` is usually a string, but multimodal messages send
-    /// an array of parts. v1 accepts strings only.
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 // ─── Response bodies ─────────────────────────────────────────────────

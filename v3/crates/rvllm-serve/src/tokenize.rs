@@ -201,8 +201,12 @@ impl TokenizerHandle {
             .get_template("chat")
             .map_err(|e| ApiError::Internal(format!("get template: {e}")))?;
 
-        // minijinja consumes serde-serializable values. Project our
-        // typed `ChatMessage`s to the HF-shaped `{role, content}` map.
+        // minijinja consumes serde-serializable values. Project each
+        // typed `ChatMessage` to an HF-shaped dict that carries every
+        // optional field the Gemma 4 template actually reads
+        // (content, tool_calls, tool_call_id, name). Missing keys are
+        // skipped so `message.get('tool_calls')` returns falsy exactly
+        // like the HF reference path.
         let serde_msgs: Vec<TemplateMsg> = messages
             .iter()
             .map(|m| TemplateMsg {
@@ -212,7 +216,10 @@ impl TokenizerHandle {
                     Role::Assistant => "assistant",
                     Role::Tool => "tool",
                 },
-                content: &m.content,
+                content: m.content.as_deref().unwrap_or(""),
+                tool_calls: m.tool_calls.as_ref(),
+                tool_call_id: m.tool_call_id.as_deref(),
+                name: m.name.as_deref(),
             })
             .collect();
 
@@ -270,11 +277,20 @@ impl TokenizerHandle {
     }
 }
 
-/// Shape handed to the jinja template per message.
+/// Shape handed to the jinja template per message. All tool-specific
+/// fields are `skip_serializing_if = "Option::is_none"` so the jinja
+/// `message.get('tool_calls')` / `message.get('tool_call_id')` probes
+/// return falsy when absent, matching HF's reference rendering.
 #[derive(Serialize)]
 struct TemplateMsg<'a> {
     role: &'a str,
     content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
 }
 
 fn extract_token_str(cfg: &serde_json::Value, key: &str) -> Option<String> {
