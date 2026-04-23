@@ -1715,7 +1715,13 @@ unsafe fn rope_nvfp4kv(
     })?;
     let mut q_in = scratch.q_normed;
     let mut k_in = scratch.k_normed;
-    let mut v_in = scratch.v_out;
+    // Gemma 4 applies a parameter-free v-norm BEFORE writing V to the
+    // KV cache — the FP8 rope reads `scratch.v_normed` for the same
+    // reason. Reading pre-norm `v_out` here put raw QKV-GEMM output
+    // into the NVFP4 V cache with a different magnitude distribution
+    // than the attention kernel expected; that's where the
+    // end-to-end PPL blow-up came from (71 FP8 → 6.4M NVFP4).
+    let mut v_in = scratch.v_normed;
     let mut q_out = scratch.q_fp8;
     let mut k_packed = scratch.k_cache;
     let mut v_packed = scratch.v_cache;
