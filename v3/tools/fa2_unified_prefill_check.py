@@ -273,17 +273,18 @@ d_vfb = alloc(4); h2d(d_vfb, np.array([1.0], dtype=np.float32))
 d_qd  = alloc(4); h2d(d_qd, np.array([1.0], dtype=np.float32))
 
 FA2_THREADS = 128
+MMA_K = 32
 smem_bytes = (
     BLOCK_M * head_dim * 1            # s_q_fp8 (Phase F3: FP8, not f32)
     + BLOCK_M * 4                     # s_q_scale
     + head_dim * tile_size * 1        # s_k_fp8
     + tile_size * head_dim * 1        # s_v_fp8
-    + tile_size * head_dim * 1        # s_v_fp8_T (F4)
+    + MMA_K * head_dim * 1            # s_v_fp8_T (F4+F7: MMA_K-padded)
     + tile_size * 4                   # s_k_scale
     + tile_size * 4                   # s_v_scale
-    + BLOCK_M * tile_size * 4         # s_s
+    + BLOCK_M * MMA_K * 4             # s_s (F7: MMA_K, not tile_size)
     + BLOCK_M * 4 * 3                 # s_m + s_l + s_alpha
-    + BLOCK_M * tile_size * 1         # s_p_fp8 (F4)
+    + BLOCK_M * MMA_K * 1             # s_p_fp8 (F4+F7)
     + BLOCK_M * 4                     # s_p_scale (F4)
     + BLOCK_M * head_dim * 4          # s_acc
     + (FA2_THREADS // 32) * 4         # tail reduce
