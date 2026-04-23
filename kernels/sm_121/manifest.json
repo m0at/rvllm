@@ -136,6 +136,11 @@
       "path": "fused_silu_fp8_quant.ptx",
       "sha256": "2595692666794dff86f5666ec520d1ff6e8bf2b4f1f2c5cd56c492e46e91749e"
     },
+    "ldmatrix_probe": {
+      "bytes": 2727,
+      "path": "ldmatrix_probe.ptx",
+      "sha256": "cd2ac37a4ec5b691346fdfd6b0fdefc1b98a4c25c6cb84d7556b2392406496a7"
+    },
     "logit_softcap": {
       "bytes": 1985,
       "path": "logit_softcap.ptx",
@@ -192,5 +197,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "35477c7"
+  "revision": "cd12a58"
 }
