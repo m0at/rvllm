@@ -141,14 +141,13 @@ d_cl = alloc(context_lens.nbytes); h2d(d_cl, context_lens)
 d_one = alloc(4); h2d(d_one, np.array([1.0], dtype=np.float32))
 
 FA2_THREADS = 128
-MMA_K = 32  # F7: MMA inner dim, shared by sliding and global
 smem_bytes = (BLOCK_M * head_dim * 1 + BLOCK_M * 4
     + head_dim * tile_size * 1 + tile_size * head_dim * 1
-    + MMA_K * head_dim * 1            # s_v_fp8_T padded to MMA_K
+    + tile_size * head_dim * 1
     + tile_size * 4 + tile_size * 4
-    + BLOCK_M * MMA_K * 4             # s_s padded to MMA_K
+    + BLOCK_M * tile_size * 4
     + BLOCK_M * 4 * 3
-    + BLOCK_M * MMA_K * 1 + BLOCK_M * 4  # s_p_fp8 padded to MMA_K
+    + BLOCK_M * tile_size * 1 + BLOCK_M * 4
     + BLOCK_M * head_dim * 4
     + (FA2_THREADS // 32) * 4
     + 128)
