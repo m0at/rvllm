@@ -33,6 +33,20 @@ const START: &str = "<|tool_call>";
 const END_A: &str = "<tool_call|>";
 const END_B: &str = "<turn|>";
 const ESCAPE: &str = "<|\"|>";
+const CHANNEL_OPEN: &str = "<|channel>";
+const CHANNEL_CLOSE: &str = "<channel|>";
+// Gemma 4 wraps its pre-answer reasoning in multiple block shapes:
+//   <|channel>thought\n...<channel|>
+//   <|tool_response>thought\n...<channel|>
+//   <thought\n...<channel|>     (model hallucination without the leading `|`)
+// They all close with `<channel|>` and must be dropped from user content
+// wholesale — the inner prose is the model's "what do I think the answer is"
+// draft, which should never be shown to the user.
+const THOUGHT_BLOCK_OPENERS: &[&str] = &[
+    "<|channel>",
+    "<|tool_response>",
+    "<thought",
+];
 
 /// Extract all Gemma 4 tool calls from decoded text.
 ///
@@ -231,6 +245,37 @@ pub fn strip_tool_markup(text: &str) -> String {
         // slice safe when non-ASCII prose (e.g. German umlauts) sits in the
         // middle of the stream.
         if text.is_char_boundary(i) {
+            // Drop entire thought / tool_response / hallucinated-thought blocks —
+            // each closes with `<channel|>` and carries Gemma's internal
+            // reasoning, never user-facing prose.
+            let mut matched_thought = false;
+            for opener in THOUGHT_BLOCK_OPENERS {
+                if text[i..].starts_with(opener) {
+                    // Prefer `<channel|>` as the closer; if Gemma terminated the
+                    // block with `<turn|>` (end-of-turn) or just let it trail
+                    // off, match that too rather than eating the rest of the
+                    // reply. No closer found → only strip the opener itself so
+                    // real content after it survives.
+                    let rest = &text[i + opener.len()..];
+                    let close = match (rest.find(CHANNEL_CLOSE), rest.find("<turn|>")) {
+                        (Some(a), Some(b)) if a <= b => Some((a, CHANNEL_CLOSE.len())),
+                        (Some(_), Some(b)) => Some((b, "<turn|>".len())),
+                        (Some(a), None) => Some((a, CHANNEL_CLOSE.len())),
+                        (None, Some(b)) => Some((b, "<turn|>".len())),
+                        (None, None) => None,
+                    };
+                    let skip = match close {
+                        Some((rel, close_len)) => opener.len() + rel + close_len,
+                        None => opener.len(),
+                    };
+                    i += skip;
+                    matched_thought = true;
+                    break;
+                }
+            }
+            if matched_thought {
+                continue;
+            }
             if text[i..].starts_with(START) {
                 let rest = &text[i + START.len()..];
                 let skip = match (rest.find(END_A), rest.find(END_B)) {
@@ -274,7 +319,55 @@ pub fn strip_tool_markup(text: &str) -> String {
             i += 1;
         }
     }
-    out.trim().to_string()
+    // Final sweep: Gemma 4's raw output sprinkles other single-token control
+    // markers (`<|tool_response>`, `<turn|>`, `<|turn>`, literal `<thought`
+    // fragments the model hallucinates) that the named passes above don't
+    // enumerate. They all share a common shape (`<|…>` or `<…|>`), so a
+    // conservative token sweep is enough — and any false positive would
+    // have to be Gemma control-token-looking text in the middle of a
+    // legitimate reply, which is vanishingly rare.
+    strip_stray_control_markers(&out).trim().to_string()
+}
+
+fn strip_stray_control_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        if text.is_char_boundary(i) {
+            // `<|…>` — opening-style control marker.
+            if text[i..].starts_with("<|") {
+                if let Some(rel) = text[i + 2..].find('>') {
+                    i += 2 + rel + 1;
+                    continue;
+                }
+            }
+            // `<…|>` — closing-style control marker.
+            if let Some(ch) = text[i..].chars().next() {
+                if ch == '<' {
+                    if let Some(rel) = text[i + 1..].find("|>") {
+                        let inside = &text[i + 1..i + 1 + rel];
+                        // Guard against eating a legitimate `<` in prose: only
+                        // strip when the body is a bare token name (letters /
+                        // digits / underscore), matching Gemma's control shape.
+                        if !inside.is_empty()
+                            && inside.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            i += 1 + rel + 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ch) = text[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -339,6 +432,55 @@ mod tests {
         // "recall:foo{..}" must not match tier-2.
         let calls = parse_gemma4_tool_calls("the recall:foo{x:1} is fine");
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn strip_sweeps_stray_control_markers() {
+        // `<|tool_response>…<turn|>` is a reasoning block — its body (here
+        // "ok") is the model's pre-answer draft and must stay hidden.
+        // Trailing stray `<|turn>` is a control marker the sweep removes.
+        let s = "<|tool_response>ok<turn|> Das ist in Ordnung.<|turn> ";
+        let stripped = strip_tool_markup(s);
+        assert_eq!(stripped, "Das ist in Ordnung.");
+    }
+
+    #[test]
+    fn strip_drops_hallucinated_thought_fragment() {
+        // Regression for the live failure: Gemma replied with the leaked
+        // pattern `<|tool_response>thought\n<channel|><thought\n<channel|>
+        // Das Wetter ...`. Every bracketed marker should vanish; only the
+        // real answer survives.
+        let s = "<|tool_response>thought\n<channel|>\
+                 <thought\n<channel|>\
+                 Das Wetter in Bern ist heute bewölkt.<turn|>";
+        let stripped = strip_tool_markup(s);
+        assert_eq!(stripped, "Das Wetter in Bern ist heute bewölkt.");
+    }
+
+    #[test]
+    fn strip_keeps_math_inequality() {
+        // Regression guard — the stray-sweep must not chew up `<something|>`
+        // shapes that aren't Gemma tokens. A sentence like "5<3|>" is weird
+        // but the body "3" is numeric → alphanumeric → would strip. That's
+        // accepted; the same body with punctuation (`"3, 4"`) must NOT.
+        let s = "a<3, 4|>b";
+        let stripped = strip_tool_markup(s);
+        assert_eq!(stripped, "a<3, 4|>b");
+    }
+
+    #[test]
+    fn strip_drops_thought_channel() {
+        // Gemma 4 writes its internal reasoning inside `<|channel>thought...<channel|>`.
+        // Without explicit stripping the tokenizer's skip-specials pass drops
+        // the markers but leaves the reasoning prose in user-visible content.
+        let s = "<|channel>thought\nDas wird wohl 14°C sein.<channel|>\
+                 <|tool_call>call:weather{city:\"Bern\"}<tool_call|>";
+        let stripped = strip_tool_markup(s);
+        assert_eq!(stripped, "", "thought + tool_call markup should leave empty content, got {stripped:?}");
+        let calls = parse_gemma4_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "weather");
+        assert_eq!(calls[0].arguments, r#"{"city":"Bern"}"#);
     }
 
     #[test]

@@ -278,6 +278,19 @@ impl TokenizerHandle {
             .map_err(|e| ApiError::Tokenize(format!("{e}")))
     }
 
+    /// Decode while preserving special tokens (`<|tool_call>`,
+    /// `<|channel>`, …). The `tool_parser` needs these markers to
+    /// reliably extract calls + strip thought channels from content;
+    /// with `skip_special_tokens=true` they vanish and the raw prose
+    /// inside a `<|channel>thought` block leaks straight into the
+    /// user-visible reply.
+    pub fn decode_raw(&self, ids: &[u32]) -> Result<String, ApiError> {
+        self.inner
+            .tokenizer
+            .decode(ids, /*skip_special_tokens*/ false)
+            .map_err(|e| ApiError::Tokenize(format!("{e}")))
+    }
+
     /// Build a new streaming decoder. Each call to
     /// [`StreamDecoder::step`] returns the UTF-8 text emitted by the
     /// next token; incomplete codepoints are buffered until a
@@ -448,8 +461,10 @@ mod tests {
         let t = TokenizerHandle::load(std::path::Path::new(&dir)).expect("load");
         let msgs = vec![ChatMessage {
             role: Role::User,
-            content: "Say hi.".into(),
+            content: Some("Say hi.".into()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let ids = t.render_chat(&msgs, None).expect("render");
         assert!(!ids.is_empty(), "empty prompt — template render produced nothing");

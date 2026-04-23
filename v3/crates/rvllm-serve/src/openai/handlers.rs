@@ -207,7 +207,11 @@ async fn chat_collect(
         }
     }
 
-    let text = tokenizer.decode(&token_ids)?;
+    // Decode with special tokens preserved so the tool_parser + thought-
+    // strip can match `<|tool_call>...<tool_call|>` and
+    // `<|channel>thought\n...<channel|>` markers verbatim.
+    // `shape_assistant_message` produces the user-visible content view.
+    let text = tokenizer.decode_raw(&token_ids)?;
     let (message, finish_reason) = shape_assistant_message(text, finish);
     Ok(ChatCompletionResponse {
         id: new_chat_completion_id(),
