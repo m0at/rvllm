@@ -45,12 +45,12 @@ __global__ void fp8_mma_smem_probe_kernel(
     // Pack per-lane fragments straight out of smem.
     uint32_t a_frag[4];
     uint32_t b_frag[2];
-    float    d_frag[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float    d_frag[4]; rvllm::zero_mma_d_frag(d_frag);
     rvllm::pack_a_frag_row_major_m16k32(s_a, /*stride=*/K, a_frag, lane);
     rvllm::pack_b_frag_col_major_n8k32 (s_b, /*stride=*/K, b_frag, lane);
 
     // One MMA, accumulate into d_frag.
-    rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a_frag, b_frag, d_frag);
+    rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a_frag, b_frag);
 
     // Unpack D back into a row-major [M][N] tile in smem, then dump.
     rvllm::unpack_d_frag_to_smem_m16n8(

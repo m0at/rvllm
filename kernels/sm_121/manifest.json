@@ -62,9 +62,9 @@
       "sha256": "84eeb1e52112fda81b9190569b483dff6f0618bda68015d7ead1f6958ebb20e6"
     },
     "flash_attention_unified_prefill": {
-      "bytes": 69577,
+      "bytes": 75304,
       "path": "flash_attention_unified_prefill.ptx",
-      "sha256": "0564ec35f290184b98c3403064d80e566d87666e0aa0a5a74c04a187f5efd417"
+      "sha256": "cf9fe5b98fae4daf6728e583dd661f6cf718ad18726ee5e883cb3ac3f1c425a2"
     },
     "fp8_e4m3_mma_probe": {
       "bytes": 1570,
@@ -77,9 +77,9 @@
       "sha256": "a64d135e9d3efd9211c1c73ceb5bf383aa0681a1eca6bb51e707da90540cbc09"
     },
     "fp8_mma_smem_probe": {
-      "bytes": 2848,
+      "bytes": 2967,
       "path": "fp8_mma_smem_probe.ptx",
-      "sha256": "2502bc2740181563bf9fb3c3ae6c3deb30fb737a3fdb27a72fa4ab4526ebe68b"
+      "sha256": "b517be2396c41a447ee49804c7b129ef861fc2907db7c2ef492c5e0a2351e055"
     },
     "fused_gelu_mul_f16": {
       "bytes": 8634,
@@ -192,5 +192,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "8cfb3e58ba5a6d419de82bf97a2fb4fbcb366a98"
+  "revision": "7f67f4c"
 }

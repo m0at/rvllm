@@ -433,7 +433,7 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
                 const int n_base = warp_id * 8;
                 const unsigned char* q_row0 = s_q_fp8;                // row stride = head_dim
                 const unsigned char* k_base_ptr = s_k_fp8 + n_base * head_dim;
-                float d_frag[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                float d_frag[4]; rvllm::zero_mma_d_frag(d_frag);
                 uint32_t a[4];
                 uint32_t b[2];
                 #pragma unroll 1
@@ -443,7 +443,7 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
                         q_row0 + d_off, head_dim, a, lane);
                     rvllm::pack_b_frag_col_major_n8k32(
                         k_base_ptr + d_off, head_dim, b, lane);
-                    rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a, b, d_frag);
+                    rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a, b);
                 }
 
                 // Unpack d_frag into s_s, applying per-row / per-slot
@@ -516,7 +516,6 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
             }
         }
         __syncthreads();
-
         // -- Rescale running acc by alpha ------------------------------
         // Only needed if any row had a prior non-empty max; cheap
         // enough to always apply.
@@ -581,52 +580,66 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
         const bool pv_use_mma = (use_mma != 0) && (tile_size == 32);
 
         if (pv_use_mma) {
-            // (1) Transpose V [t][d] → s_v_fp8_T [d][t]. Each thread
-            // does scattered byte writes; sm_121 smem can keep up at
-            // this rate, and the MMA saving downstream dominates.
-            for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
-                const int t = idx / head_dim;
-                const int d = idx - t * head_dim;
-                s_v_fp8_T[d * tile_size + t] = s_v_fp8[t * head_dim + d];
-            }
-            // Zero-pad V_T along t for the partial-tile case (the last
-            // tile in a prompt_len not divisible by 32). For the common
-            // full-tile case this loop is empty.
-            for (int idx = tid; idx < (tile_size - tile_len) * head_dim; idx += FA2_THREADS) {
-                const int t_off = idx / head_dim;
-                const int d     = idx - t_off * head_dim;
-                const int t     = tile_len + t_off;
-                s_v_fp8_T[d * tile_size + t] = 0;
+            // (1) Transpose V [t][d] → s_v_fp8_T [d][t]. We pack 4
+            // consecutive t-values (for one d) into a single u32 so
+            // the smem writes are 4-byte word-aligned rather than
+            // byte-level. Byte writes to the same 4-byte word from
+            // sibling lanes of a warp have race-like behaviour on
+            // sm_121 — compute-sanitizer's racecheck misses it, but
+            // empirically s_s gets corrupted (F6 debug). u32 writes
+            // sidestep the hazard entirely; the minor overhead of
+            // packing 4 byte loads into one register is fine.
+            //
+            // tile_size is guaranteed multiple of 4 (is 32 for the
+            // only shape that enters this branch — sliding layers).
+            const int t_groups = tile_size / 4;
+            for (int idx = tid; idx < t_groups * head_dim; idx += FA2_THREADS) {
+                const int tg = idx / head_dim;       // 0..7 for tile_size=32
+                const int d  = idx - tg * head_dim;
+                const int t_base = tg * 4;
+                uint32_t packed = 0;
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const int t = t_base + k;
+                    unsigned char b = (t < tile_len)
+                        ? s_v_fp8[t * head_dim + d]
+                        : 0;
+                    packed |= (uint32_t)b << (k * 8);
+                }
+                *reinterpret_cast<uint32_t*>(s_v_fp8_T + d * tile_size + t_base) = packed;
             }
             __syncthreads();
-
             // (2) Fold v_scale[t] into P, find per-row max, quantise to
             // FP8. 16 rows × 8 lanes-per-row layout re-used from softmax.
             const int pv_row = tid >> 3;
             const int pv_lr  = tid & 7;
             if (pv_row < BLOCK_M) {
                 float local_max = 0.0f;
+                // Softmax wrote s_s with stride `tile_len` (not tile_size).
+                // For partial tiles tile_len < tile_size; `pv_row * tile_len`
+                // is the correct address. Positions t ∈ [tile_len, tile_size)
+                // have no softmax data — they feed 0 into the MMA via
+                // s_p_fp8 padding below, without reading back from s_s.
                 for (int t = pv_lr; t < tile_len; t += 8) {
-                    const float p = s_s[pv_row * tile_size + t] * s_v_scale[t];
-                    s_s[pv_row * tile_size + t] = p;
+                    const float p = s_s[pv_row * tile_len + t] * s_v_scale[t];
+                    s_s[pv_row * tile_len + t] = p;
                     local_max = fmaxf(local_max, fabsf(p));
                 }
-                // Zero out padding in s_s too (mirrors V_T padding).
-                for (int t = tile_len + pv_lr; t < tile_size; t += 8) {
-                    s_s[pv_row * tile_size + t] = 0.0f;
-                }
                 const float row_max = row_reduce_max_8(local_max);
-                if (pv_lr == 0) {
-                    s_p_scale[pv_row] = (row_max > 1e-30f)
+                if (pv_lr == 0) {                    s_p_scale[pv_row] = (row_max > 1e-30f)
                         ? (row_max * (1.0f / 448.0f)) : 1.0f;
                 }
             }
             __syncthreads();
             if (pv_row < BLOCK_M) {
                 const float inv_scale = 1.0f / s_p_scale[pv_row];
+                // Real P values cover t ∈ [0, tile_len). Out-of-range
+                // positions feed 0 into the MMA.
                 for (int t = pv_lr; t < tile_size; t += 8) {
-                    s_p_fp8[pv_row * tile_size + t] =
-                        f32_to_e4m3_byte(s_s[pv_row * tile_size + t] * inv_scale);
+                    const float p_scaled = (t < tile_len)
+                        ? s_s[pv_row * tile_len + t] * inv_scale
+                        : 0.0f;
+                    s_p_fp8[pv_row * tile_size + t] = f32_to_e4m3_byte(p_scaled);
                 }
             }
             __syncthreads();
@@ -644,17 +657,16 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
             for (int nt = 0; nt < n_tiles_per_warp; nt++) {
                 const int n_base = (warp_id * n_tiles_per_warp + nt) * 8;
                 uint32_t b[2];
-                float d_frag[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                float d_frag[4]; rvllm::zero_mma_d_frag(d_frag);
                 rvllm::pack_b_frag_col_major_n8k32(
                     s_v_fp8_T + n_base * tile_size, tile_size, b, lane);
-                rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a, b, d_frag);
+                rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a, b);
 
                 const int r_lo = lane >> 2;
                 const int r_hi = r_lo + 8;
                 const int c    = (lane & 3) << 1;
                 const int d_lo = n_base + c;
-                const int d_hi = d_lo + 1;
-                s_acc[r_lo * head_dim + d_lo] += d_frag[0] * s_p_scale[r_lo];
+                const int d_hi = d_lo + 1;                s_acc[r_lo * head_dim + d_lo] += d_frag[0] * s_p_scale[r_lo];
                 s_acc[r_lo * head_dim + d_hi] += d_frag[1] * s_p_scale[r_lo];
                 s_acc[r_hi * head_dim + d_lo] += d_frag[2] * s_p_scale[r_hi];
                 s_acc[r_hi * head_dim + d_hi] += d_frag[3] * s_p_scale[r_hi];
