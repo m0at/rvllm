@@ -350,14 +350,23 @@ pub unsafe fn gemma4_forward_phase(
 ) -> Result<()> {
     // Route O / gate_up / down through the f16-in GEMV fast path when
     // `num_tokens <= FAST_PATH_M_MAX`. That kernel is a per-row GEMV
-    // (grid.y = M, each block reloads the weight tile), so throughput
-    // plateaus quickly as M grows: on Gemma 4 31B at batch=128 it's
-    // ~35× slower than the cuBLASLt FP8-channelscale fallback. The
-    // fallback is numerically correct now (per-row `scale_rows_f32_ratio`
-    // correction landed in the prior commit), so for large M the
-    // fallback is the right choice on both precision and perf. 16 is
-    // generous for typical prefill prompts and avoids slowing bench.
-    const FAST_PATH_M_MAX: u32 = 16;
+    // (grid.y = M, each block reloads the weight tile) and preserves
+    // the full 2-D `[N/128, K/128]` weight blockscale.
+    //
+    // The other option — `fp8_gemm_channelscale_or_fallback` — routes
+    // M>=128 through CUTLASS SM120 (full blockscale preserved) and
+    // smaller M through a cuBLASLt-scalar + `scale_cols_f32` path
+    // that applies only the 1-D per-row `b_chscale` approximation.
+    // For Gemma 4 fp8-block weights, the K-axis blockscale has
+    // meaningful variation, so the 1-D approximation measurably
+    // degrades output (RVLLM_DIAG_COMPARE against the per-token
+    // decode reference: 38% row-0 / 93% row-(N-1) rel_err at
+    // prompt_len=18 on fp8-block weights over 60 layers).
+    //
+    // Cap at 127 so the bad zone (16 < M < 128, blockscale-present)
+    // takes the GEMV fast path instead of the lossy fallback.
+    // CUTLASS SM120 continues to cover M>=128.
+    const FAST_PATH_M_MAX: u32 = 127;
     let q_dim = dims.num_heads * dims.head_dim;
     let _kv_dim = dims.num_kv_heads * dims.head_dim;
     let qkv_rows = (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim;
