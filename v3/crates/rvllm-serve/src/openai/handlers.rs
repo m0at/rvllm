@@ -972,7 +972,13 @@ fn reject_v1_unsupported_completions(req: &CompletionRequest) -> ApiResult<()> {
 }
 
 fn resolve_max_new(requested: Option<u32>, cap: u32) -> ApiResult<u32> {
-    let m = requested.unwrap_or(cap.min(1024));
+    // Default chosen to bound the worst case when greedy decoding lands
+    // in a repetition attractor (the runtime coerces temperature to 0
+    // today — no sampling kernel yet, so any local loop runs to max).
+    // At ~1.2 tok/s on Gemma 4 31B FP8, 256 caps a runaway at ~3.5 min
+    // instead of ~14 min. Clients that genuinely want longer replies
+    // still pass `max_tokens` explicitly.
+    let m = requested.unwrap_or(cap.min(256));
     if m == 0 {
         return Err(ApiError::invalid_param(
             "max_tokens must be > 0",
