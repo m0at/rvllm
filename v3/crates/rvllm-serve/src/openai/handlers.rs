@@ -237,8 +237,13 @@ fn shape_assistant_message(
 ) -> (ChatAssistantMessage, Option<FinishReason>) {
     let parsed = parse_gemma4_tool_calls(&text);
     if parsed.is_empty() {
+        // No tool call — but the raw decode still contains reasoning /
+        // control markup (`<|channel>thought\n…<channel|>`, stray
+        // `<turn|>`, etc.) that must be stripped from user content.
+        let cleaned = strip_tool_markup(&text);
+        let content = if cleaned.is_empty() { None } else { Some(cleaned) };
         return (
-            ChatAssistantMessage { role: Role::Assistant, content: Some(text), tool_calls: None },
+            ChatAssistantMessage { role: Role::Assistant, content, tool_calls: None },
             model_finish,
         );
     }
