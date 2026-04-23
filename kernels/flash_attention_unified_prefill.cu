@@ -147,19 +147,29 @@ __device__ __forceinline__ int find_seq_idx_linear(
 // loop is in place so adding continuous batching later is a Rust-side
 // change.
 //
-// smem layout (dynamic):
+// smem layout (dynamic, MMA_K = 32 fixed by the tensor-core inner dim):
 //     s_q_fp8      [BLOCK_M * head_dim]      u8    (FP8 E4M3 bytes)
 //     s_q_scale    [BLOCK_M]                 f32   (per-row scale ×
 //                                                   softmax_scale; applied
 //                                                   post-dot)
 //     s_k_fp8      [head_dim * TILE_SIZE]    u8    (row-major [t][d])
 //     s_v_fp8      [TILE_SIZE * head_dim]    u8
+//     s_v_fp8_T    [MMA_K * head_dim]        u8    (P·V MMA B operand,
+//                                                   zero-padded along k
+//                                                   when tile_size < 32)
 //     s_k_scale    [TILE_SIZE]               f32
 //     s_v_scale    [TILE_SIZE]               f32
-//     s_S          [BLOCK_M * TILE_SIZE]     f32
+//     s_S          [BLOCK_M * MMA_K]         f32   (softmax writes with
+//                                                   stride tile_len, but
+//                                                   allocation is MMA_K
+//                                                   so the P·V quant can
+//                                                   feed zeros for k ≥
+//                                                   tile_len)
 //     s_M          [BLOCK_M]                 f32   (online-softmax max)
 //     s_L          [BLOCK_M]                 f32   (online-softmax denom)
 //     s_alpha      [BLOCK_M]                 f32
+//     s_p_fp8      [BLOCK_M * MMA_K]         u8    (re-quantised P)
+//     s_p_scale    [BLOCK_M]                 f32
 //     s_acc        [BLOCK_M * head_dim]      f32
 //     s_reduce     [FA2_THREADS / 32]        f32   (block reductions)
 //
@@ -257,26 +267,30 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
     // Runtime sizes — we can't use fixed constexpr because head_dim
     // varies per layer type (256 sliding vs 512 global). Host passes
     // a matching `dynamic_smem_bytes` via cuFuncSetAttribute.
+    //
+    // MMA_K = 32 is the tensor-core's fixed inner reduction for the
+    // m16n8k32 FP8 MMA. For sliding (tile_size=32) this equals
+    // tile_size; for global (tile_size=16) the MMA operand buffers
+    // are zero-padded along the k axis. s_v_fp8_T, s_p_fp8, and s_s
+    // (the P·V MMA operands + softmax scratch that feeds quantisation)
+    // size themselves off MMA_K rather than tile_size so the same
+    // kernel handles both layer types. s_v_fp8 / s_k_fp8 stay at
+    // tile_size (the real K/V data count).
+    constexpr int MMA_K = 32;
     extern __shared__ unsigned char smem_raw[];
-    // Layout (aligned carefully so each region starts 4-byte or 16-byte
-    // aligned for the u32 / u128 loads used below). F4 additions:
-    //   s_v_fp8_T — V tile re-packed as [d][t] for the P·V MMA, which
-    //               needs B in (n, k)-layout with stride=tile_size.
-    //   s_p_fp8   — re-quantised P [BLOCK_M × tile_size] FP8 bytes.
-    //   s_p_scale — per-row scale picked during the P re-quant.
     unsigned char* s_q_fp8   = smem_raw;
     float*         s_q_scale = reinterpret_cast<float*>(s_q_fp8 + BLOCK_M * head_dim);
     unsigned char* s_k_fp8   = reinterpret_cast<unsigned char*>(s_q_scale + BLOCK_M);
     unsigned char* s_v_fp8   = s_k_fp8 + head_dim * tile_size;
     unsigned char* s_v_fp8_T = s_v_fp8 + tile_size * head_dim;
-    float*         s_k_scale = reinterpret_cast<float*>(s_v_fp8_T + tile_size * head_dim);
+    float*         s_k_scale = reinterpret_cast<float*>(s_v_fp8_T + MMA_K * head_dim);
     float*         s_v_scale = s_k_scale + tile_size;
     float*         s_s       = s_v_scale + tile_size;
-    float*         s_m       = s_s + BLOCK_M * tile_size;
+    float*         s_m       = s_s + BLOCK_M * MMA_K;
     float*         s_l       = s_m + BLOCK_M;
     float*         s_alpha   = s_l + BLOCK_M;
     unsigned char* s_p_fp8   = reinterpret_cast<unsigned char*>(s_alpha + BLOCK_M);
-    float*         s_p_scale = reinterpret_cast<float*>(s_p_fp8 + BLOCK_M * tile_size);
+    float*         s_p_scale = reinterpret_cast<float*>(s_p_fp8 + BLOCK_M * MMA_K);
     float*         s_acc     = s_p_scale + BLOCK_M;
 
     const int row        = tid / 8;
@@ -577,24 +591,23 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
         //     layers (tile_size=16) fall through to scalar today — the
         //     k=32 MMA would need V-padding + extra smem that the 10
         //     global layers don't benefit enough from to justify.
-        const bool pv_use_mma = (use_mma != 0) && (tile_size == 32);
+        const bool pv_use_mma = (use_mma != 0);
 
         if (pv_use_mma) {
-            // (1) Transpose V [t][d] → s_v_fp8_T [d][t]. We pack 4
-            // consecutive t-values (for one d) into a single u32 so
-            // the smem writes are 4-byte word-aligned rather than
-            // byte-level. Byte writes to the same 4-byte word from
-            // sibling lanes of a warp have race-like behaviour on
-            // sm_121 — compute-sanitizer's racecheck misses it, but
-            // empirically s_s gets corrupted (F6 debug). u32 writes
-            // sidestep the hazard entirely; the minor overhead of
-            // packing 4 byte loads into one register is fine.
+            // (1) Transpose V [t][d] → s_v_fp8_T [d][k] with k stride
+            // = MMA_K (=32). For sliding layers tile_size=32=MMA_K.
+            // For global layers (tile_size=16), positions k ∈
+            // [tile_len, MMA_K) are zero-padded so they contribute
+            // 0 to the MMA reduction. Phase F7.
             //
-            // tile_size is guaranteed multiple of 4 (is 32 for the
-            // only shape that enters this branch — sliding layers).
-            const int t_groups = tile_size / 4;
-            for (int idx = tid; idx < t_groups * head_dim; idx += FA2_THREADS) {
-                const int tg = idx / head_dim;       // 0..7 for tile_size=32
+            // u32 writes (4 consecutive k values packed) sidestep a
+            // sm_121 smem hazard where sibling lanes byte-writing
+            // the same 4-byte word produce silently-corrupted
+            // neighbouring regions (F6 tracked that down; bug 4 in
+            // the F6 writeup).
+            constexpr int MMA_K_GROUPS = MMA_K / 4;
+            for (int idx = tid; idx < MMA_K_GROUPS * head_dim; idx += FA2_THREADS) {
+                const int tg = idx / head_dim;     // 0..7
                 const int d  = idx - tg * head_dim;
                 const int t_base = tg * 4;
                 uint32_t packed = 0;
@@ -606,7 +619,7 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
                         : 0;
                     packed |= (uint32_t)b << (k * 8);
                 }
-                *reinterpret_cast<uint32_t*>(s_v_fp8_T + d * tile_size + t_base) = packed;
+                *reinterpret_cast<uint32_t*>(s_v_fp8_T + d * MMA_K + t_base) = packed;
             }
             __syncthreads();
             // (2) Fold v_scale[t] into P, find per-row max, quantise to
@@ -633,13 +646,15 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
             __syncthreads();
             if (pv_row < BLOCK_M) {
                 const float inv_scale = 1.0f / s_p_scale[pv_row];
-                // Real P values cover t ∈ [0, tile_len). Out-of-range
-                // positions feed 0 into the MMA.
-                for (int t = pv_lr; t < tile_size; t += 8) {
+                // Real P values cover t ∈ [0, tile_len). We fill
+                // s_p_fp8 up to MMA_K=32 slots per row; positions
+                // t ≥ tile_len feed zero into the MMA (valid for
+                // global-layer tiles with tile_len ≤ 16 < MMA_K).
+                for (int t = pv_lr; t < MMA_K; t += 8) {
                     const float p_scaled = (t < tile_len)
                         ? s_s[pv_row * tile_len + t] * inv_scale
                         : 0.0f;
-                    s_p_fp8[pv_row * tile_size + t] = f32_to_e4m3_byte(p_scaled);
+                    s_p_fp8[pv_row * MMA_K + t] = f32_to_e4m3_byte(p_scaled);
                 }
             }
             __syncthreads();
@@ -652,14 +667,14 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
             const int n_tiles_total    = head_dim >> 3;
             const int n_tiles_per_warp = n_tiles_total >> 2;
             uint32_t a[4];
-            rvllm::pack_a_frag_row_major_m16k32(s_p_fp8, tile_size, a, lane);
+            rvllm::pack_a_frag_row_major_m16k32(s_p_fp8, MMA_K, a, lane);
             #pragma unroll 1
             for (int nt = 0; nt < n_tiles_per_warp; nt++) {
                 const int n_base = (warp_id * n_tiles_per_warp + nt) * 8;
                 uint32_t b[2];
                 float d_frag[4]; rvllm::zero_mma_d_frag(d_frag);
                 rvllm::pack_b_frag_col_major_n8k32(
-                    s_v_fp8_T + n_base * tile_size, tile_size, b, lane);
+                    s_v_fp8_T + n_base * MMA_K, MMA_K, b, lane);
                 rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a, b);
 
                 const int r_lo = lane >> 2;

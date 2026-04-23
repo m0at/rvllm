@@ -202,16 +202,24 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
             // pre-decoded f32). Phase F4: adds V-transpose buffer
             // + re-quantised-P region so the P·V MMA has the
             // operand layouts the tensor core expects.
+            // Phase F7: s_v_fp8_T, s_s, s_p_fp8 are sized off MMA_K
+            // (=32) rather than tile_size so the same kernel handles
+            // sliding (tile_size=32) and global (tile_size=16) layers.
+            // For sliding tile_size == MMA_K so no change; for global
+            // these three regions grow by (MMA_K - tile_size)/ts
+            // ratio. Full budget stays inside the 99 KB cap even at
+            // head_dim=512 (~77 KB total, empirically).
+            const MMA_K: u32 = 32;
             let smem_bytes: u32 = BLOCK_M * hd        // s_q_fp8
                 + BLOCK_M * 4                          // s_q_scale
                 + hd * ts                              // s_k_fp8
                 + ts * hd                              // s_v_fp8
-                + ts * hd                              // s_v_fp8_T (F4)
+                + MMA_K * hd                           // s_v_fp8_T (F4+F7)
                 + ts * 4                               // s_k_scale
                 + ts * 4                               // s_v_scale
-                + BLOCK_M * ts * 4                     // s_s
+                + BLOCK_M * MMA_K * 4                  // s_s (F7: MMA_K, not ts)
                 + BLOCK_M * 4 * 3                      // s_m + s_l + s_alpha
-                + BLOCK_M * ts                         // s_p_fp8 (F4)
+                + BLOCK_M * MMA_K                      // s_p_fp8 (F4+F7)
                 + BLOCK_M * 4                          // s_p_scale (F4)
                 + BLOCK_M * hd * 4                     // s_acc
                 + (FA2_THREADS / 32) * 4               // reduce tail
