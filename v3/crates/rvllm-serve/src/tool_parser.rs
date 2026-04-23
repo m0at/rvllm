@@ -100,11 +100,21 @@ fn parse_tier1(text: &str) -> Vec<ParsedToolCall> {
 /// Tier-2: bare `call:NAME{ARGS}` at start-of-string or after
 /// whitespace. Matches what remains when a `skip_special_tokens=true`
 /// decoder strips `<|tool_call>` / `<tool_call|>`.
+///
+/// UTF-8 note: the markers (`call:`, `{`, `}`) are ASCII, so marker
+/// matching is byte-oriented — but `i` must land on a char boundary
+/// before we can slice `&text[..]`. Output from Gemma 4 routinely
+/// contains non-ASCII (German prose, emoji) that would otherwise
+/// panic `str::is_char_boundary`.
 fn parse_tier2_bare(text: &str) -> Vec<ParsedToolCall> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
     while i + 5 <= bytes.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
         // Require start-of-string or whitespace immediately before `call:`.
         let anchored = i == 0 || (bytes[i - 1] as char).is_whitespace();
         if !anchored || &bytes[i..i + 5] != b"call:" {
@@ -216,39 +226,53 @@ pub fn strip_tool_markup(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if text[i..].starts_with(START) {
-            let rest = &text[i + START.len()..];
-            let skip = match (rest.find(END_A), rest.find(END_B)) {
-                (Some(a), Some(b)) if a <= b => START.len() + a + END_A.len(),
-                (Some(_a), Some(b)) => START.len() + b + END_B.len(),
-                (Some(a), None) => START.len() + a + END_A.len(),
-                (None, Some(b)) => START.len() + b + END_B.len(),
-                (None, None) => bytes.len() - i,
-            };
-            i += skip;
-            continue;
-        }
-        // Tier-2 bare `call:NAME{...}` — strip when anchored.
-        let anchored = i == 0
-            || out.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
-        if anchored && text[i..].starts_with("call:") {
-            let after = i + "call:".len();
-            let mut j = after;
-            while j < bytes.len() && {
-                let c = bytes[j] as char;
-                c.is_ascii_alphanumeric() || c == '_'
-            } {
-                j += 1;
+        // Markers are ASCII and therefore always start at a char boundary;
+        // checking `is_char_boundary` first makes the subsequent `text[i..]`
+        // slice safe when non-ASCII prose (e.g. German umlauts) sits in the
+        // middle of the stream.
+        if text.is_char_boundary(i) {
+            if text[i..].starts_with(START) {
+                let rest = &text[i + START.len()..];
+                let skip = match (rest.find(END_A), rest.find(END_B)) {
+                    (Some(a), Some(b)) if a <= b => START.len() + a + END_A.len(),
+                    (Some(_a), Some(b)) => START.len() + b + END_B.len(),
+                    (Some(a), None) => START.len() + a + END_A.len(),
+                    (None, Some(b)) => START.len() + b + END_B.len(),
+                    (None, None) => bytes.len() - i,
+                };
+                i += skip;
+                continue;
             }
-            if j > after && j < bytes.len() && bytes[j] == b'{' {
-                if let Some(end_rel) = text[j + 1..].find('}') {
-                    i = j + 1 + end_rel + 1;
-                    continue;
+            // Tier-2 bare `call:NAME{...}` — strip when anchored.
+            let anchored = i == 0
+                || out.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+            if anchored && text[i..].starts_with("call:") {
+                let after = i + "call:".len();
+                let mut j = after;
+                while j < bytes.len() && {
+                    let c = bytes[j] as char;
+                    c.is_ascii_alphanumeric() || c == '_'
+                } {
+                    j += 1;
+                }
+                if j > after && j < bytes.len() && bytes[j] == b'{' {
+                    if let Some(end_rel) = text[j + 1..].find('}') {
+                        i = j + 1 + end_rel + 1;
+                        continue;
+                    }
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Copy one whole UTF-8 scalar. If `i` is mid-codepoint (can happen
+        // after a `skip` jump landed mid-sequence on malformed input), step
+        // one byte to resynchronise — the lost byte will be replaced by the
+        // next `chars()` decode.
+        if let Some(ch) = text[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
     }
     out.trim().to_string()
 }
@@ -315,6 +339,27 @@ mod tests {
         // "recall:foo{..}" must not match tier-2.
         let calls = parse_gemma4_tool_calls("the recall:foo{x:1} is fine");
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn strip_handles_utf8_prose() {
+        // Regression: the parser used to panic with
+        // `byte index is not a char boundary; it is inside 'ü'` when
+        // Gemma 4 emitted a call followed by German prose.
+        let s = "call:weather{city:Bern} Es regnet in Zürich und München.";
+        let stripped = strip_tool_markup(s);
+        assert!(stripped.contains("Zürich"));
+        assert!(!stripped.contains("call:"));
+    }
+
+    #[test]
+    fn parse_tier2_handles_utf8_prose() {
+        // Same regression for the tier-2 matcher — must walk past
+        // non-ASCII bytes without panicking.
+        let s = "Die Antwort: ü call:ping{x:1}";
+        let calls = parse_gemma4_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "ping");
     }
 
     #[test]
