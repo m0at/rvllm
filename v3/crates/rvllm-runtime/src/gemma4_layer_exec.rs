@@ -740,9 +740,15 @@ pub unsafe fn gemma4_forward_phase(
             }
         }
         Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q, num_seqs: _ } => {
-            // NVFP4 prefill is a single-call dedicated launcher — no
-            // unified/decode-per-qi path. Handled upfront; FP8/F16 fall
-            // through to F-series' unified-or-fallback structure below.
+            // NVFP4 prefill: dedicated RoPE + attention launcher. Must
+            // fall through to the shared post-attention block below
+            // (O proj + post-attn norm + residual add + MLP + post-FF
+            // norm + residual add), same as the FP8 path does after
+            // its unified/decode-per-qi attention. A previous revision
+            // `return Ok(())`'d here, which turned every NVFP4-prefill
+            // layer into a no-op on the residual — end-to-end output
+            // was the raw embedding, manifesting as word-salad tokens
+            // at the LM head regardless of prompt length.
             if dims.kv_dtype == KvDtype::Nvfp4 {
                 rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
                 let prefill_params = rvllm_attention::PagedPrefillParams {
@@ -773,8 +779,7 @@ pub unsafe fn gemma4_forward_phase(
                     max_seqlen_q,
                     stream,
                 )?;
-                return Ok(());
-            }
+            } else {
             // FP8 / F16 prefill: share the FP8 write path (no F16 prefill
             // kernel on sm_121). F-series unified-or-fallback structure:
             // Prefill always uses FP8 KV path (no F16 prefill kernel).
@@ -935,6 +940,7 @@ pub unsafe fn gemma4_forward_phase(
             // Ensure ctx_host lives until the stream has consumed it.
             std::hint::black_box(&ctx_host);
             } // end of decode-per-qi fallback
+            } // end of FP8/F16 prefill (else of NVFP4 branch)
         }
     }
     #[cfg(not(feature = "cuda"))]
