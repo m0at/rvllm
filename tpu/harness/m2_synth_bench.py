@@ -1,21 +1,20 @@
 """MiniMax-M2.7-NVFP4 synthetic-weight throughput benchmark on TPU v6e-8.
 
-Skips the 190K-tensor real model load. Allocates RANDOM NVFP4-packed weights
-at the real architecture shapes, builds the same mesh + sharding, runs the
-forward pass in a timed loop, reports ms/step and tok/s.
+Uses jax.lax.scan over layers (NOT Python unroll) so XLA streams one layer's
+weights through HBM at a time. Peak argument memory stays bounded by one
+layer's sharded weight ~= 340 MB per chip instead of 21+ GB for 62 unrolled
+layers.
 
-NVFP4 packing matches modelopt format used by the real checkpoint:
-  - weight: packed uint8, shape (rows, cols/2), two FP4 values per byte
-  - weight_scale: uint8 (FP8 E4M3 bits), shape (rows, cols/16), one scale per 16 weights
-  - weight_scale_2: FP32 scalar, per-tensor global scale
-Memory footprint per chip ~= 130 GB / 8 = ~16 GB (fits in 32 GB v6e HBM).
+Architecture (MiniMax-M2.7-NVFP4):
+- 62 layers, hidden=3072, 48 Q / 8 KV heads, head_dim=128, rotary_dim=64
+- 256 experts top-8, MOE_INTER=1536, sigmoid+bias routing
+- NVFP4 experts: packed uint8 + FP8 E4M3 scales + FP32 global scale
+- bf16 attention + router + embed
 
-Attention backbone + router + embed stay bf16 (matches real checkpoint where
-only MoE experts are NVFP4 quantized).
+Expert weights sharded 8-way across `('expert',)` mesh axis.
 
 Usage:
-    python3 m2_synth_bench.py [--batch 1,8,32,128] [--ctx 2048] \
-                              [--iters 20] [--warmup 5] [--nl 62]
+    python3 m2_synth_bench.py --batch 1 --ctx 2048 --iters 10 --warmup 3 --nl 62
 """
 
 import argparse
@@ -29,12 +28,10 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-# Use the real shard_map MoE from m2_moe.py. This path has proper all-to-all
-# dispatch across the 'expert' axis — not the naive gather-based reference.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from m2_moe import moe_block_nvfp4
 
-# --- Arch constants (MiniMax-M2.7-NVFP4) ---
+# --- Arch constants ---
 H = 3072
 NH = 48
 NKV = 8
@@ -51,53 +48,6 @@ GROUP_SIZE = 16
 
 DTYPE = jnp.bfloat16
 
-
-# --- FP4 E2M1 decode LUT (16 entries) ---
-FP4_VALUES = np.array(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-    dtype=np.float32)
-FP4_LUT = jnp.asarray(FP4_VALUES, dtype=DTYPE)
-
-
-def fp8_e4m3_decode(bits_u8: jax.Array) -> jax.Array:
-    """FP8 E4M3 -> f32 via IEEE-754 f32 bit layout (Agent 15 fast path)."""
-    b = bits_u8.astype(jnp.uint32)
-    sign = (b >> 7) & jnp.uint32(1)
-    exp = (b >> 3) & jnp.uint32(0xF)
-    mant = b & jnp.uint32(0x7)
-    sign_bit = sign << jnp.uint32(31)
-    u_norm = sign_bit | ((exp + jnp.uint32(120)) << jnp.uint32(23)) | (mant << jnp.uint32(20))
-    val_norm = jax.lax.bitcast_convert_type(u_norm, jnp.float32)
-    sub = mant.astype(jnp.float32) * jnp.float32((1.0 / 8.0) * (2.0 ** -6))
-    sign_f = jnp.where(sign == jnp.uint32(1), jnp.float32(-1.0), jnp.float32(1.0))
-    val = jnp.where(exp == jnp.uint32(0), sign_f * sub, val_norm)
-    return val
-
-
-def nvfp4_dequant_bf16(packed: jax.Array, scales_u8: jax.Array, global_scale_f32: float,
-                     rows: int, cols: int) -> jax.Array:
-    """Dequant NVFP4 weight: packed (rows, cols/2) u8 + scales (rows, cols/16) u8 -> bf16 (rows, cols)."""
-    lo = (packed & 0x0F).astype(jnp.uint32)
-    hi = ((packed >> 4) & 0x0F).astype(jnp.uint32)
-    # Interleave lo (even cols) and hi (odd cols) -> (rows, cols)
-    fp4_idx = jnp.stack([lo, hi], axis=-1).reshape(rows, cols)
-    vals = FP4_LUT[fp4_idx]  # bf16
-    # Decode block scales (F8 E4M3) and broadcast 16x along col axis
-    block_scale_f32 = fp8_e4m3_decode(scales_u8)  # (rows, cols/16) f32
-    block_scale_bf16 = (block_scale_f32 * global_scale_f32).astype(DTYPE)
-    scale_expanded = jnp.repeat(block_scale_bf16, GROUP_SIZE, axis=1)  # (rows, cols) bf16
-    return (vals * scale_expanded).astype(DTYPE)
-
-
-def nvfp4_matmul(x_bf16: jax.Array, w_packed: jax.Array, w_scales: jax.Array,
-                 w_global_scale: float, out_features: int, in_features: int) -> jax.Array:
-    """Fused: dequant W on the fly, then x @ W^T. XLA should fuse."""
-    w_bf16 = nvfp4_dequant_bf16(w_packed, w_scales, w_global_scale, out_features, in_features)
-    return x_bf16 @ w_bf16.T
-
-
-# --- Arch ops ---
 
 def make_mesh_v6e8():
     devs = jax.devices()
@@ -134,13 +84,13 @@ def rope_partial(x, cos, sin):
     return jnp.concatenate([rotated, xp], axis=-1)
 
 
-def attn_layer(x, w, ln, k_cache, v_cache, pos, cos, sin):
+def attn_layer(x, wq, wk, wv, wo, qn, kn, ln, k_cache, v_cache, pos, cos, sin):
     h = rms_norm(x, ln)
-    q = (h @ w['q'].T).reshape(-1, NH, HEAD_DIM)
-    k = (h @ w['k'].T).reshape(-1, NKV, HEAD_DIM)
-    v = (h @ w['v'].T).reshape(-1, NKV, HEAD_DIM)
-    q = head_rms(q, w['qn'])
-    k = head_rms(k, w['kn'])
+    q = (h @ wq.T).reshape(-1, NH, HEAD_DIM)
+    k = (h @ wk.T).reshape(-1, NKV, HEAD_DIM)
+    v = (h @ wv.T).reshape(-1, NKV, HEAD_DIM)
+    q = head_rms(q, qn)
+    k = head_rms(k, kn)
     q = rope_partial(q, cos[pos], sin[pos])
     k = rope_partial(k, cos[pos], sin[pos])
     k_cache = jax.lax.dynamic_update_slice(k_cache, k[:, None], (0, pos, 0, 0))
@@ -154,27 +104,47 @@ def attn_layer(x, w, ln, k_cache, v_cache, pos, cos, sin):
     p = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(q.dtype)
     ctx = jnp.einsum('bhgk,bkhd->bhgd', p, v_cache.astype(q.dtype))
     ctx = ctx.reshape(B_, NH * HEAD_DIM)
-    out = ctx @ w['o'].T
+    out = ctx @ wo.T
     return out, k_cache, v_cache
 
 
-def layer_step(x, lw, k_cache, v_cache, pos, cos, sin, mesh):
-    att_out, k_cache, v_cache = attn_layer(x, lw['attn'], lw['ln1'],
-                                           k_cache, v_cache, pos, cos, sin)
-    x = x + att_out
-    h = rms_norm(x, lw['ln2'])
-    # Real perf path: shard_map dispatch along 'expert' axis (all-to-all).
-    moe_out = moe_block_nvfp4(h, lw['rg'], lw['rb'], lw['w1'], lw['w2'], lw['w3'], mesh)
-    return x + moe_out, k_cache, v_cache
+# --- Scan over layers. One layer's weights slice out of the stacked pytree
+# per scan step, so XLA streams them through HBM instead of holding all 62. ---
 
+def forward_step(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_head, mesh):
+    """stacked: pytree with leading axis = NL for every leaf."""
 
-def forward_step(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head, mesh):
-    NL = len(all_w)
-    for i in range(NL):
-        lw = all_w[i]
-        x, k_i, v_i = layer_step(x, lw, k_cache[i], v_cache[i], pos, cos, sin, mesh)
-        k_cache = k_cache.at[i].set(k_i)
-        v_cache = v_cache.at[i].set(v_i)
+    def layer_body(carry, layer_w):
+        x, k_cache, v_cache, i = carry
+        # Slice the per-layer k_cache/v_cache (axis 0 is NL)
+        k_i = jax.lax.dynamic_index_in_dim(k_cache, i, axis=0, keepdims=False)
+        v_i = jax.lax.dynamic_index_in_dim(v_cache, i, axis=0, keepdims=False)
+
+        att_out, k_i_new, v_i_new = attn_layer(
+            x,
+            layer_w['attn_q'], layer_w['attn_k'], layer_w['attn_v'], layer_w['attn_o'],
+            layer_w['attn_qn'], layer_w['attn_kn'], layer_w['ln1'],
+            k_i, v_i, pos, cos, sin)
+        x = x + att_out
+        h = rms_norm(x, layer_w['ln2'])
+
+        moe_out = moe_block_nvfp4(
+            h,
+            layer_w['rg'], layer_w['rb'],
+            (layer_w['w1_p'], layer_w['w1_s'], layer_w['w1_s2']),
+            (layer_w['w2_p'], layer_w['w2_s'], layer_w['w2_s2']),
+            (layer_w['w3_p'], layer_w['w3_s'], layer_w['w3_s2']),
+            mesh,
+        )
+        x = x + moe_out
+
+        k_cache = jax.lax.dynamic_update_index_in_dim(k_cache, k_i_new, i, axis=0)
+        v_cache = jax.lax.dynamic_update_index_in_dim(v_cache, v_i_new, i, axis=0)
+        return (x, k_cache, v_cache, i + 1), None
+
+    (x, k_cache, v_cache, _), _ = jax.lax.scan(
+        layer_body, (x, k_cache, v_cache, jnp.int32(0)), stacked)
+
     h = rms_norm(x, final_norm)
     logits = h @ lm_head.T
     tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
@@ -182,62 +152,58 @@ def forward_step(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head,
 
 
 def random_weights(B, max_ctx, mesh, nl):
-    """Random NVFP4-packed weights. Experts sharded along 'expert' axis.
-    Memory ~= 130 GB / 8 chips = ~16 GB/chip for NL=62."""
-    expert_spec = NamedSharding(mesh, P('expert', None, None))
+    """Stack random NVFP4-packed weights across NL layers for lax.scan consumption.
+    Expert-axis sharded per weight. Peak per-chip weight memory = ~340 MB (one layer)."""
+
+    # Per-expert-weight sharding: leading axis is NL (replicated), then
+    # 'expert' (sharded), then the rest replicated.
+    expert_spec = NamedSharding(mesh, P(None, 'expert', None, None))
+    scale2_spec = NamedSharding(mesh, P(None, 'expert'))
     rep_spec = NamedSharding(mesh, P())
     rng = np.random.default_rng(42)
 
-    def rand_bf16(shape, spec):
+    def rand_bf16_stack(shape, spec):
         arr = (rng.standard_normal(size=shape) * 0.02).astype(np.float32)
         return jax.device_put(jnp.asarray(arr, dtype=DTYPE), spec)
 
-    def rand_nvfp4(E, rows, cols, spec):
-        """Random NVFP4 weight for E experts. Returns (packed, scales, scale2).
-        scale2 is shape (E,) — per-expert global scale, placed on 'expert' axis so
-        m2_moe.py's shard_map can see it aligned with the expert dim.
-        """
-        packed = rng.integers(0, 256, size=(E, rows, cols // 2), dtype=np.uint8)
-        scales = rng.integers(0, 256, size=(E, rows, cols // GROUP_SIZE), dtype=np.uint8)
-        scale2 = (rng.standard_normal(size=(E,)) * 0.01 + 0.01).astype(np.float32)
-        packed_d = jax.device_put(jnp.asarray(packed), spec)
-        scales_d = jax.device_put(jnp.asarray(scales), spec)
-        # scale2 is (E,) — shard along expert axis
-        scale2_spec = NamedSharding(spec.mesh, P('expert')) if 'expert' in spec.mesh.axis_names else rep_spec
-        scale2_d = jax.device_put(jnp.asarray(scale2), scale2_spec)
-        return (packed_d, scales_d, scale2_d)
+    def rand_u8_stack(shape, spec):
+        arr = rng.integers(0, 256, size=shape, dtype=np.uint8)
+        return jax.device_put(jnp.asarray(arr), spec)
 
-    # Backbone (bf16, replicated)
-    embed = rand_bf16((VOCAB, H), rep_spec)
-    final_norm = rand_bf16((H,), rep_spec)
-    lm_head = rand_bf16((VOCAB, H), rep_spec)
+    def rand_f32_stack(shape, spec):
+        arr = (rng.standard_normal(size=shape) * 0.01 + 0.01).astype(np.float32)
+        return jax.device_put(jnp.asarray(arr), spec)
 
-    # Per-layer
-    all_w = []
-    for i in range(nl):
-        lw = {
-            'ln1': rand_bf16((H,), rep_spec),
-            'ln2': rand_bf16((H,), rep_spec),
-            'attn': {
-                'q': rand_bf16((NH * HEAD_DIM, H), rep_spec),
-                'k': rand_bf16((NKV * HEAD_DIM, H), rep_spec),
-                'v': rand_bf16((NKV * HEAD_DIM, H), rep_spec),
-                'o': rand_bf16((H, NH * HEAD_DIM), rep_spec),
-                'qn': rand_bf16((HEAD_DIM,), rep_spec),
-                'kn': rand_bf16((HEAD_DIM,), rep_spec),
-            },
-            'rg': rand_bf16((NUM_EXPERTS, H), rep_spec),
-            'rb': rand_bf16((NUM_EXPERTS,), rep_spec),
-            # NVFP4 expert weights, sharded along expert axis
-            'w1': rand_nvfp4(NUM_EXPERTS, MOE_INTER, H, expert_spec),
-            'w3': rand_nvfp4(NUM_EXPERTS, MOE_INTER, H, expert_spec),
-            'w2': rand_nvfp4(NUM_EXPERTS, H, MOE_INTER, expert_spec),
-        }
-        all_w.append(lw)
-        print(f"  layer {i+1}/{nl}", file=sys.stderr, end='\r')
-    print(file=sys.stderr)
+    # Backbone (bf16, replicated across all chips)
+    embed = rand_bf16_stack((VOCAB, H), rep_spec)
+    final_norm = rand_bf16_stack((H,), rep_spec)
+    lm_head = rand_bf16_stack((VOCAB, H), rep_spec)
 
-    # KV cache (bf16, replicated — small at B=1,ctx=2048)
+    # Per-layer stacked weights. Shape leading axis = nl.
+    print(f"  stacking {nl} layers of weights...", file=sys.stderr)
+    stacked = {
+        'ln1':      rand_bf16_stack((nl, H), rep_spec),
+        'ln2':      rand_bf16_stack((nl, H), rep_spec),
+        'attn_q':   rand_bf16_stack((nl, NH * HEAD_DIM, H), rep_spec),
+        'attn_k':   rand_bf16_stack((nl, NKV * HEAD_DIM, H), rep_spec),
+        'attn_v':   rand_bf16_stack((nl, NKV * HEAD_DIM, H), rep_spec),
+        'attn_o':   rand_bf16_stack((nl, H, NH * HEAD_DIM), rep_spec),
+        'attn_qn':  rand_bf16_stack((nl, HEAD_DIM,), rep_spec),
+        'attn_kn':  rand_bf16_stack((nl, HEAD_DIM,), rep_spec),
+        'rg':       rand_bf16_stack((nl, NUM_EXPERTS, H), rep_spec),
+        'rb':       rand_bf16_stack((nl, NUM_EXPERTS,), rep_spec),
+        'w1_p':     rand_u8_stack((nl, NUM_EXPERTS, MOE_INTER, H // 2), expert_spec),
+        'w1_s':     rand_u8_stack((nl, NUM_EXPERTS, MOE_INTER, H // GROUP_SIZE), expert_spec),
+        'w1_s2':    rand_f32_stack((nl, NUM_EXPERTS), scale2_spec),
+        'w3_p':     rand_u8_stack((nl, NUM_EXPERTS, MOE_INTER, H // 2), expert_spec),
+        'w3_s':     rand_u8_stack((nl, NUM_EXPERTS, MOE_INTER, H // GROUP_SIZE), expert_spec),
+        'w3_s2':    rand_f32_stack((nl, NUM_EXPERTS), scale2_spec),
+        'w2_p':     rand_u8_stack((nl, NUM_EXPERTS, H, MOE_INTER // 2), expert_spec),
+        'w2_s':     rand_u8_stack((nl, NUM_EXPERTS, H, MOE_INTER // GROUP_SIZE), expert_spec),
+        'w2_s2':    rand_f32_stack((nl, NUM_EXPERTS), scale2_spec),
+    }
+
+    # KV caches (bf16, replicated; small at B=1 ctx=2048)
     k_cache = jax.device_put(
         jnp.zeros((nl, B, max_ctx, NKV, HEAD_DIM), dtype=DTYPE), rep_spec)
     v_cache = jax.device_put(
@@ -247,16 +213,16 @@ def random_weights(B, max_ctx, mesh, nl):
     cos = jax.device_put(jnp.array(cos), rep_spec)
     sin = jax.device_put(jnp.array(sin), rep_spec)
 
-    return embed, final_norm, lm_head, all_w, k_cache, v_cache, cos, sin
+    return embed, final_norm, lm_head, stacked, k_cache, v_cache, cos, sin
 
 
 def bench_batch(mesh, B, max_ctx, iters, warmup, nl):
-    embed, final_norm, lm_head, all_w, k_cache, v_cache, cos, sin = random_weights(
+    embed, final_norm, lm_head, stacked, k_cache, v_cache, cos, sin = random_weights(
         B, max_ctx, mesh, nl)
 
-    # mesh is static, passed as closed-over. Wrap forward_step to avoid passing mesh as traced arg.
-    def _forward(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head):
-        return forward_step(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head, mesh)
+    def _forward(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_head):
+        return forward_step(x, stacked, k_cache, v_cache, pos, cos, sin,
+                          final_norm, lm_head, mesh)
     forward_jit = jax.jit(_forward)
 
     tok = jnp.zeros((B,), dtype=jnp.int32)
@@ -264,7 +230,7 @@ def bench_batch(mesh, B, max_ctx, iters, warmup, nl):
 
     print(f"  warmup ({warmup} iters)...", file=sys.stderr)
     for it in range(warmup):
-        tok, k_cache, v_cache = forward_jit(x, all_w, k_cache, v_cache,
+        tok, k_cache, v_cache = forward_jit(x, stacked, k_cache, v_cache,
                                             jnp.int32(it), cos, sin,
                                             final_norm, lm_head)
         x = embed[tok]
@@ -274,7 +240,7 @@ def bench_batch(mesh, B, max_ctx, iters, warmup, nl):
     times = []
     for it in range(iters):
         t0 = time.perf_counter()
-        tok, k_cache, v_cache = forward_jit(x, all_w, k_cache, v_cache,
+        tok, k_cache, v_cache = forward_jit(x, stacked, k_cache, v_cache,
                                             jnp.int32(warmup + it), cos, sin,
                                             final_norm, lm_head)
         jax.block_until_ready(tok)
@@ -282,8 +248,7 @@ def bench_batch(mesh, B, max_ctx, iters, warmup, nl):
         x = embed[tok]
     times = np.array(times)
     return {
-        'batch': B, 'ctx': max_ctx, 'nl': nl,
-        'iters': iters,
+        'batch': B, 'ctx': max_ctx, 'nl': nl, 'iters': iters,
         'ms_min': float(times.min()),
         'ms_mean': float(times.mean()),
         'ms_max': float(times.max()),
@@ -294,19 +259,18 @@ def bench_batch(mesh, B, max_ctx, iters, warmup, nl):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--batch', default='1,8,32', help='comma-separated batch sizes')
+    p.add_argument('--batch', default='1', help='comma-separated batch sizes')
     p.add_argument('--ctx', type=int, default=2048)
-    p.add_argument('--iters', type=int, default=20)
-    p.add_argument('--warmup', type=int, default=5)
-    p.add_argument('--nl', type=int, default=NL_FULL,
-                   help='number of layers to bench (default 62=full)')
+    p.add_argument('--iters', type=int, default=10)
+    p.add_argument('--warmup', type=int, default=3)
+    p.add_argument('--nl', type=int, default=NL_FULL)
     p.add_argument('--out', default=None)
     args = p.parse_args()
 
     batches = [int(b) for b in args.batch.split(',')]
     mesh = make_mesh_v6e8()
     print(f"mesh: {mesh}", file=sys.stderr)
-    print(f"layers: {args.nl} / {NL_FULL}", file=sys.stderr)
+    print(f"layers: {args.nl} / {NL_FULL} (scan-based)", file=sys.stderr)
 
     results = []
     for B in batches:
@@ -317,20 +281,13 @@ def main():
             print(f"  FAILED: {type(e).__name__}: {e}", file=sys.stderr)
             results.append({'batch': B, 'error': f'{type(e).__name__}: {e}'})
             continue
-        per_layer_ms = r['ms_mean'] / args.nl
-        full_model_ms = per_layer_ms * NL_FULL
-        full_tok_s = 1000.0 * B / full_model_ms
-        print(f"  B={B:4d} NL={args.nl} ms/step={r['ms_mean']:.2f} (min={r['ms_min']:.2f})  tok/s@NL={args.nl}={r['tok_per_s']:.1f}")
-        print(f"         per-layer={per_layer_ms:.3f}ms  extrapolated full 62L: ms/step={full_model_ms:.2f}  tok/s={full_tok_s:.1f}")
-        r['per_layer_ms'] = per_layer_ms
-        r['extrap_full_ms'] = full_model_ms
-        r['extrap_full_tok_per_s'] = full_tok_s
+        print(f"  B={B:4d} NL={args.nl} ms/step={r['ms_mean']:.2f} (min={r['ms_min']:.2f})  tok/s={r['tok_per_s']:.1f}")
         results.append(r)
 
-    out_path = args.out or f"/tmp/m2_synth_bench_{int(time.time())}.json"
+    out_path = args.out or f"/tmp/m2_synth_bench_scan_{int(time.time())}.json"
     with open(out_path, 'w') as f:
         json.dump({
-            'arch': 'MiniMax-M2.7-NVFP4 synth',
+            'arch': 'MiniMax-M2.7-NVFP4 synth (scan)',
             'slice': 'v6e-8',
             'n_layers_full': NL_FULL, 'n_layers_run': args.nl,
             'n_experts': NUM_EXPERTS, 'top_k': TOP_K, 'moe_inter': MOE_INTER,
