@@ -205,19 +205,34 @@ echo ">> (5c) unpack tarball into ${RUN_DIR} and write REVISION"
 UNPACK_CMD="${SSH_BASE} --command=\"set -euo pipefail; cd '${RUN_DIR}' && tar xzf '${REMOTE_TAR}' --strip-components=1 && echo '${SHA}' > '${RUN_DIR}/REVISION' && ls -la '${RUN_DIR}' | head\""
 run "$UNPACK_CMD"
 
-echo ">> (6) install deps on remote (jax[tpu], safetensors, tokenizers, ml_dtypes, zig)"
-INSTALL_SCRIPT=$(cat <<'EOS'
+echo ">> (6) install deps on remote (try HF-cached env first, fall back to pip install)"
+INSTALL_SCRIPT=$(cat <<EOS
 set -euo pipefail
-echo "host cores: $(nproc)"
+echo "host cores: \$(nproc)"
 python3 --version
-pip3 install --quiet --upgrade pip
-pip3 install --quiet --upgrade \
-  "jax[tpu]" \
-  safetensors \
-  huggingface_hub \
-  tokenizers \
-  ml_dtypes \
-  numpy
+
+# Try to pull cached python env + JAX compile cache from HF.
+export SHA=${SHA}
+export ACCEL=${ACCELERATOR}
+export REPO=and-y/rvllm-m2-build
+export PATH="\$HOME/.local/bin:\$PATH"
+
+if [[ "\${SKIP_HF_CACHE:-0}" != "1" ]]; then
+  bash '${RUN_DIR}/tpu/harness/pull_cache_from_hf.sh' || echo "HF cache pull failed (non-fatal)"
+fi
+
+# If py-env wasn't hit (or explicitly skipped), pip install fresh.
+if ! python3 -c "import jax" 2>/dev/null; then
+  echo "installing jax[tpu] + deps fresh (no cache hit)"
+  pip3 install --quiet --upgrade pip
+  pip3 install --quiet --upgrade \\
+    "jax[tpu]" \\
+    safetensors \\
+    huggingface_hub \\
+    tokenizers \\
+    ml_dtypes \\
+    numpy
+fi
 python3 -c "import jax; print('jax', jax.__version__, 'backend', jax.default_backend(), 'devs', len(jax.devices()))"
 
 # Zig toolchain (pinned; matches agent 5's expectations).
@@ -286,7 +301,11 @@ echo ">> (9) smoke run: m2_tpu_infer --max-tokens 16"
 SMOKE_SCRIPT=$(cat <<EOS
 set -euo pipefail
 export PATH="\$HOME/.local/bin:\$PATH"
-# RVLLM_ZIG_LIB intentionally unset — path A uses pure-JAX dequant and HF tokenizers.
+# Turn on JAX on-disk compile cache so this run populates ~/.jax_cache for HF upload.
+export JAX_COMPILATION_CACHE_DIR="\$HOME/.jax_cache"
+export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
+mkdir -p "\$HOME/.jax_cache"
 cd '${RUN_DIR}'
 cat REVISION
 python3 tpu/harness/m2_tpu_infer.py \
@@ -298,6 +317,24 @@ EOS
 SMOKE_SCRIPT="${SMOKE_SCRIPT//\$/\\\$}"
 SMOKE_CMD="${SSH_BASE} --command=\"${SMOKE_SCRIPT//\"/\\\"}\""
 run "$SMOKE_CMD"
+
+# Optional: push the populated cache + env to HF so next fresh VM boots fast.
+if [[ "${PUSH_CACHE:-0}" == "1" && "${DRY_RUN}" -eq 0 ]]; then
+  echo ">> (10) push JAX compile cache + py-env to HF"
+  PUSH_SCRIPT=$(cat <<EOS2
+set -euo pipefail
+export PATH="\\\$HOME/.local/bin:\\\$PATH"
+${HF_TOKEN_EXPORT}
+export SHA=${SHA}
+export ACCEL=${ACCELERATOR}
+export JAX_CACHE_DIR="\\\$HOME/.jax_cache"
+bash '${RUN_DIR}/tpu/harness/push_cache_to_hf.sh'
+EOS2
+)
+  PUSH_SCRIPT="${PUSH_SCRIPT//\$/\\\$}"
+  PUSH_CMD="${SSH_BASE} --command=\"${PUSH_SCRIPT//\"/\\\"}\""
+  run "$PUSH_CMD"
+fi
 
 echo ">> done. Run dir on ${TPU_NAME}: ${RUN_DIR}"
 echo ">> to teardown: gcloud compute tpus tpu-vm delete ${TPU_NAME} --zone=${ZONE} --project=${PROJECT}"
