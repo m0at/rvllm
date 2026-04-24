@@ -62,6 +62,10 @@ fn_decode_bc32 = CHECK(drv.cuModuleGetFunction(
     decode_mod, b"flash_attention_2_decode_nvfp4kv_kernel"), "get decode bc32")
 fn_decode_bc16 = CHECK(drv.cuModuleGetFunction(
     decode_mod, b"flash_attention_2_decode_nvfp4kv_bc16_kernel"), "get decode bc16")
+fn_decode_gqa_bc32 = CHECK(drv.cuModuleGetFunction(
+    decode_mod, b"flash_attention_2_decode_nvfp4kv_gqa_kernel"), "get decode gqa bc32")
+fn_decode_gqa_bc16 = CHECK(drv.cuModuleGetFunction(
+    decode_mod, b"flash_attention_2_decode_nvfp4kv_gqa_bc16_kernel"), "get decode gqa bc16")
 
 # Opt the decode kernels into the sm_121 99 KB dynamic-smem ceiling
 # on-demand (matches the Rust launcher's cuFuncSetAttribute call).
@@ -126,7 +130,7 @@ def fp8_e4m3_quantise(x: np.ndarray) -> np.ndarray:
 
 def run_one(
     num_seqs, num_heads, num_kv_heads, head_dim, rotary_dim,
-    context_len, block_size, seed, window_size_left=-1
+    context_len, block_size, seed, window_size_left=-1, gqa=False
 ):
     rng = np.random.default_rng(seed)
     assert context_len % block_size == 0 or context_len < block_size, \
@@ -299,8 +303,15 @@ def run_one(
     attn_scale = np.array([1.0 / np.sqrt(head_dim)], dtype=np.float32)
     use_bc16 = head_dim > 256
     fa2_bc = 16 if use_bc16 else 32
-    smem_bytes = 4 * (2 * fa2_bc * head_dim + fa2_bc + 128 // 32)
-    fn_decode = fn_decode_bc16 if use_bc16 else fn_decode_bc32
+    # GQA kernel needs larger s_score region (MAX_GQA_DECODE=4 × FA2_BC).
+    if gqa:
+        MAX_GQA = 4
+        # s_key + s_val (f16) + s_score (MAX_GQA × BC, f32) + s_reduce
+        smem_bytes = 2 * (2 * fa2_bc * head_dim) + 4 * (MAX_GQA * fa2_bc) + 4 * (128 // 32)
+        fn_decode = fn_decode_gqa_bc16 if use_bc16 else fn_decode_gqa_bc32
+    else:
+        smem_bytes = 4 * (2 * fa2_bc * head_dim + fa2_bc + 128 // 32)
+        fn_decode = fn_decode_bc16 if use_bc16 else fn_decode_bc32
     if smem_bytes >= 48 * 1024:
         CHECK(drv.cuFuncSetAttribute(fn_decode, SMEM_OPT_IN, smem_bytes),
               "opt-in smem")
@@ -324,8 +335,9 @@ def run_one(
         np.array([window_size_left],  dtype=np.int32),
     ]
     pp = np.array([p.ctypes.data for p in params], dtype=np.uint64)
+    grid_y = num_kv_heads if gqa else num_heads
     CHECK(drv.cuLaunchKernel(fn_decode,
-                             num_seqs, num_heads, 1,
+                             num_seqs, grid_y, 1,
                              128, 1, 1,
                              smem_bytes, 0, pp.ctypes.data, 0), "decode launch")
     CHECK(drv.cuCtxSynchronize(), "decode sync")
@@ -401,6 +413,8 @@ def run_one(
     ok = bad == 0
     status = "OK  " if ok else "FAIL"
     wtag = f" ws={window_size_left}" if window_size_left >= 0 else ""
+    if gqa:
+        wtag += " GQA"
     print(
         f"  {status}  S={num_seqs:>2} H={num_heads:>2} KVH={num_kv_heads:>2} "
         f"hd={head_dim:>3} rd={rotary_dim:>3} ctx={context_len:>3} bs={block_size:>2} "
@@ -441,6 +455,28 @@ all_pass = all([
     run_one(num_seqs=1, num_heads=4, num_kv_heads=2,
             head_dim=256, rotary_dim=128,
             context_len=128, block_size=16, seed=103, window_size_left=40),
+    # GQA-grouped decode kernel — one block per (seq, kv_head), all
+    # num_queries_per_kv Q-heads computed in parallel sharing the KV
+    # load. GQA ratio = num_heads / num_kv_heads = 2 mirrors Gemma 4.
+    run_one(num_seqs=1, num_heads=4, num_kv_heads=2,
+            head_dim=128, rotary_dim=128,
+            context_len=64, block_size=16, seed=201, gqa=True),
+    run_one(num_seqs=2, num_heads=8, num_kv_heads=2,
+            head_dim=256, rotary_dim=128,
+            context_len=64, block_size=16, seed=202, gqa=True),
+    # GQA at head_dim=512 (BC=16 path).
+    run_one(num_seqs=1, num_heads=4, num_kv_heads=2,
+            head_dim=512, rotary_dim=128,
+            context_len=64, block_size=16, seed=203, gqa=True),
+    # GQA + sliding window together.
+    run_one(num_seqs=1, num_heads=4, num_kv_heads=2,
+            head_dim=256, rotary_dim=128,
+            context_len=256, block_size=16, seed=204,
+            window_size_left=63, gqa=True),
+    # GQA ratio 4 (edge case — MAX_GQA_DECODE = 4).
+    run_one(num_seqs=1, num_heads=8, num_kv_heads=2,
+            head_dim=128, rotary_dim=128,
+            context_len=64, block_size=16, seed=205, gqa=True),
 ])
 print()
 print("all shapes pass" if all_pass

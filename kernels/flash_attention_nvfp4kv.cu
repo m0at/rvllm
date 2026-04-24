@@ -523,6 +523,435 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
 }
 #endif  // FA2_BC == 32 originally
 
+// Reset FA2_BC back to 32 so the GQA decode kernels below emit with
+// the correct BC. The `#if FA2_BC == 32` block above sets FA2_BC to
+// 16 and never restores it before its `#endif`.
+#if FA2_BC == 16
+#  undef FA2_BC
+#  define FA2_BC 32
+#endif
+
+// ---------------------------------------------------------------------
+// GQA-GROUPED DECODE — one block per (seq, kv_head), holds ALL
+// num_queries_per_kv Q-heads that share this kv_head.
+//
+// Motivation: at decode, Gemma 4's GQA ratio = num_heads / num_kv_heads
+// = 2. The per-head decode kernel above launches `num_heads` blocks
+// per seq, every pair of which loads the SAME NVFP4 K/V bytes +
+// scales and pays the same dequant cost. At 15k context the KV load
+// + dequant dominate each decode step, so the duplicate load is 2×
+// wasted bandwidth.
+//
+// This kernel loads K + V exactly ONCE per tile per (seq, kv_head)
+// and computes Q·Kᵀ / P·V for `num_queries_per_kv` queries in
+// parallel (each holds its own softmax state in registers). Output
+// is written to the same `[seq, head, d]` slots as before so the
+// downstream LM head / O-proj / residual pipeline is unchanged.
+//
+// Matches xqa's architecture (flashinfer/csrc/xqa/mha.cu — see
+// `nbValidRows = headGrpSize * beamWidth`): one block per kv-head
+// group, rows across the group are independent online-softmax
+// queries over a shared KV cache load.
+//
+// Limits:
+//   * `MAX_GQA = 4` cap on per-block query count. Gemma 4 uses 2.
+//     Higher GQA models would extend the `[MAX_GQA][8]` reg arrays.
+//   * Head count must be an exact multiple of kv_head count (true
+//     for all Gemma 4 layers; true for GQA models in general).
+//
+// Grid: (num_seqs, num_kv_heads). Block: FA2_THREADS. Smem:
+//   s_key[FA2_BC * head_dim]            f16  (shared KV read)
+//   s_val[FA2_BC * head_dim]            f16
+//   s_score[MAX_GQA * FA2_BC]           f32  (per-query scores)
+//   s_reduce[FA2_THREADS / 32]          f32  (block reduce scratch)
+// ---------------------------------------------------------------------
+
+#define MAX_GQA_DECODE 4
+
+extern "C"
+__global__ void flash_attention_2_decode_nvfp4kv_gqa_kernel(
+    __half*              __restrict__ output,
+    const unsigned char* __restrict__ query,
+    const uint8_t*       __restrict__ key_cache_packed,
+    const uint8_t*       __restrict__ value_cache_packed,
+    const __nv_fp8_e4m3* __restrict__ key_cache_scale,
+    const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    const int*           __restrict__ block_tables,
+    const int*           __restrict__ context_lens,
+    const float*         __restrict__ q_descale,
+    float scale,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq,
+    int window_size_left
+) {
+    const int seq_idx  = blockIdx.x;
+    const int kv_head  = blockIdx.y;
+    const int tid      = threadIdx.x;
+
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+
+    const int GQA = num_heads / num_kv_heads;
+    // Runtime guard — the compile-time cap on register arrays.
+    if (GQA <= 0 || GQA > MAX_GQA_DECODE) return;
+
+    const float q_scale = *q_descale;
+    const int decode_q_abs_pos = context_len - 1;
+    const int window_start = (window_size_left < 0)
+        ? 0
+        : max(0, decode_q_abs_pos - window_size_left);
+    const int tile_start_idx = window_start / FA2_BC;
+
+    extern __shared__ unsigned char smem_u8[];
+    __half* s_key = reinterpret_cast<__half*>(smem_u8);
+    __half* s_val = s_key + FA2_BC * head_dim;
+    float*  s_score  = reinterpret_cast<float*>(s_val + FA2_BC * head_dim);
+    float*  s_reduce = s_score + MAX_GQA_DECODE * FA2_BC;
+
+    const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
+    const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
+    const int half_D = head_dim >> 1;
+    const int scales_per_D = head_dim >> 4;
+
+    // Per-query state in thread registers. `q_reg` is scale-folded.
+    float q_reg[MAX_GQA_DECODE][8];
+    float row_max[MAX_GQA_DECODE];
+    float row_sum[MAX_GQA_DECODE];
+    float acc[MAX_GQA_DECODE][8];
+    #pragma unroll
+    for (int q = 0; q < MAX_GQA_DECODE; ++q) {
+        row_max[q] = -FLT_MAX;
+        row_sum[q] = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            q_reg[q][r] = 0.0f;
+            acc[q][r] = 0.0f;
+        }
+    }
+    for (int q = 0; q < GQA; ++q) {
+        const int head_idx = kv_head * GQA + q;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            int d = tid + r * FA2_THREADS;
+            if (r < dims_per_thread && d < head_dim) {
+                unsigned char qb = query[(seq_idx * num_heads + head_idx) * head_dim + d];
+                q_reg[q][r] = fp8kv_decode_byte(qb) * q_scale * scale;
+            }
+        }
+    }
+
+    for (int tile = tile_start_idx; tile < num_kv_tiles; ++tile) {
+        const int tile_start = tile * FA2_BC;
+        const int tile_len   = min(FA2_BC, context_len - tile_start);
+
+        // Shared K tile load (ONE dequant per kv_head — vs 2× in per-head kernel).
+        for (int t = 0; t < tile_len; ++t) {
+            int kv_pos   = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_blk = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            const uint8_t*       k_packed = key_cache_packed
+                + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * half_D;
+            const __nv_fp8_e4m3* k_scale  = key_cache_scale
+                + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * scales_per_D;
+            dequant_nvfp4_row_to_smem(k_packed, k_scale,
+                                      s_key + t * head_dim, tid, head_dim);
+        }
+        __syncthreads();
+
+        // Per-query Q·Kᵀ. s_score indexed by [q * FA2_BC + t].
+        for (int q = 0; q < GQA; ++q) {
+            for (int t = 0; t < tile_len; ++t) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    int d = tid + r * FA2_THREADS;
+                    if (r < dims_per_thread && d < head_dim) {
+                        dot += q_reg[q][r] * __half2float(s_key[t * head_dim + d]);
+                    }
+                }
+                dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
+                if (tid == 0) {
+                    int kv_pos = tile_start + t;
+                    s_score[q * FA2_BC + t] = (kv_pos < window_start) ? -FLT_MAX : dot;
+                }
+                __syncthreads();
+            }
+        }
+
+        // Per-query online softmax update.
+        for (int q = 0; q < GQA; ++q) {
+            float tile_max = -FLT_MAX;
+            if (tid == 0) {
+                for (int t = 0; t < tile_len; ++t)
+                    tile_max = fmaxf(tile_max, s_score[q * FA2_BC + t]);
+                s_reduce[0] = tile_max;
+            }
+            __syncthreads();
+            tile_max = s_reduce[0];
+            __syncthreads();
+
+            float prev_max = row_max[q];
+            float new_max  = fmaxf(prev_max, tile_max);
+            if (new_max > prev_max && prev_max > -FLT_MAX) {
+                float correction = expf(prev_max - new_max);
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) acc[q][r] *= correction;
+                row_sum[q] *= correction;
+            }
+            row_max[q] = new_max;
+
+            if (tid == 0) {
+                float tsum = 0.0f;
+                for (int t = 0; t < tile_len; ++t) {
+                    float v = (s_score[q * FA2_BC + t] > -FLT_MAX + 1.0f)
+                        ? expf(s_score[q * FA2_BC + t] - row_max[q]) : 0.0f;
+                    s_score[q * FA2_BC + t] = v;
+                    tsum += v;
+                }
+                s_reduce[0] = tsum;
+            }
+            __syncthreads();
+            row_sum[q] += s_reduce[0];
+            __syncthreads();
+        }
+
+        // Shared V tile load.
+        for (int t = 0; t < tile_len; ++t) {
+            int kv_pos   = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_blk = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            const uint8_t*       v_packed = value_cache_packed
+                + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * half_D;
+            const __nv_fp8_e4m3* v_scale  = value_cache_scale
+                + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * scales_per_D;
+            dequant_nvfp4_row_to_smem(v_packed, v_scale,
+                                      s_val + t * head_dim, tid, head_dim);
+        }
+        __syncthreads();
+
+        // Per-query P·V accumulate.
+        for (int q = 0; q < GQA; ++q) {
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                int d = tid + r * FA2_THREADS;
+                if (r < dims_per_thread && d < head_dim) {
+                    float val_acc = 0.0f;
+                    for (int t = 0; t < tile_len; ++t) {
+                        val_acc += s_score[q * FA2_BC + t]
+                                 * __half2float(s_val[t * head_dim + d]);
+                    }
+                    acc[q][r] += val_acc;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Per-query output write.
+    for (int q = 0; q < GQA; ++q) {
+        const int head_idx = kv_head * GQA + q;
+        float inv_sum = (row_sum[q] > 0.0f) ? (1.0f / row_sum[q]) : 0.0f;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            int d = tid + r * FA2_THREADS;
+            if (r < dims_per_thread && d < head_dim) {
+                output[(seq_idx * num_heads + head_idx) * head_dim + d] =
+                    __float2half(acc[q][r] * inv_sum);
+            }
+        }
+    }
+}
+
+#if FA2_BC == 32
+// BC=16 variant for head_dim=512 global layers, same body as above.
+#  undef FA2_BC
+#  define FA2_BC 16
+
+extern "C"
+__global__ void flash_attention_2_decode_nvfp4kv_gqa_bc16_kernel(
+    __half*              __restrict__ output,
+    const unsigned char* __restrict__ query,
+    const uint8_t*       __restrict__ key_cache_packed,
+    const uint8_t*       __restrict__ value_cache_packed,
+    const __nv_fp8_e4m3* __restrict__ key_cache_scale,
+    const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    const int*           __restrict__ block_tables,
+    const int*           __restrict__ context_lens,
+    const float*         __restrict__ q_descale,
+    float scale,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq,
+    int window_size_left
+) {
+    // Body identical to the BC=32 GQA kernel; the macro drives only
+    // the tile size + smem layout.
+    const int seq_idx  = blockIdx.x;
+    const int kv_head  = blockIdx.y;
+    const int tid      = threadIdx.x;
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+    const int GQA = num_heads / num_kv_heads;
+    if (GQA <= 0 || GQA > MAX_GQA_DECODE) return;
+    const float q_scale = *q_descale;
+    const int decode_q_abs_pos = context_len - 1;
+    const int window_start = (window_size_left < 0)
+        ? 0 : max(0, decode_q_abs_pos - window_size_left);
+    const int tile_start_idx = window_start / FA2_BC;
+
+    extern __shared__ unsigned char smem_u8[];
+    __half* s_key = reinterpret_cast<__half*>(smem_u8);
+    __half* s_val = s_key + FA2_BC * head_dim;
+    float*  s_score  = reinterpret_cast<float*>(s_val + FA2_BC * head_dim);
+    float*  s_reduce = s_score + MAX_GQA_DECODE * FA2_BC;
+
+    const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
+    const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
+    const int half_D = head_dim >> 1;
+    const int scales_per_D = head_dim >> 4;
+
+    float q_reg[MAX_GQA_DECODE][8];
+    float row_max[MAX_GQA_DECODE];
+    float row_sum[MAX_GQA_DECODE];
+    float acc[MAX_GQA_DECODE][8];
+    #pragma unroll
+    for (int q = 0; q < MAX_GQA_DECODE; ++q) {
+        row_max[q] = -FLT_MAX; row_sum[q] = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) { q_reg[q][r] = 0.0f; acc[q][r] = 0.0f; }
+    }
+    for (int q = 0; q < GQA; ++q) {
+        const int head_idx = kv_head * GQA + q;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            int d = tid + r * FA2_THREADS;
+            if (r < dims_per_thread && d < head_dim) {
+                unsigned char qb = query[(seq_idx * num_heads + head_idx) * head_dim + d];
+                q_reg[q][r] = fp8kv_decode_byte(qb) * q_scale * scale;
+            }
+        }
+    }
+
+    for (int tile = tile_start_idx; tile < num_kv_tiles; ++tile) {
+        const int tile_start = tile * FA2_BC;
+        const int tile_len   = min(FA2_BC, context_len - tile_start);
+
+        for (int t = 0; t < tile_len; ++t) {
+            int kv_pos   = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_blk = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            dequant_nvfp4_row_to_smem(
+                key_cache_packed + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * half_D,
+                key_cache_scale  + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * scales_per_D,
+                s_key + t * head_dim, tid, head_dim);
+        }
+        __syncthreads();
+
+        for (int q = 0; q < GQA; ++q) {
+            for (int t = 0; t < tile_len; ++t) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    int d = tid + r * FA2_THREADS;
+                    if (r < dims_per_thread && d < head_dim)
+                        dot += q_reg[q][r] * __half2float(s_key[t * head_dim + d]);
+                }
+                dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
+                if (tid == 0) {
+                    int kv_pos = tile_start + t;
+                    s_score[q * FA2_BC + t] = (kv_pos < window_start) ? -FLT_MAX : dot;
+                }
+                __syncthreads();
+            }
+        }
+
+        for (int q = 0; q < GQA; ++q) {
+            float tile_max = -FLT_MAX;
+            if (tid == 0) {
+                for (int t = 0; t < tile_len; ++t)
+                    tile_max = fmaxf(tile_max, s_score[q * FA2_BC + t]);
+                s_reduce[0] = tile_max;
+            }
+            __syncthreads();
+            tile_max = s_reduce[0];
+            __syncthreads();
+            float prev_max = row_max[q];
+            float new_max  = fmaxf(prev_max, tile_max);
+            if (new_max > prev_max && prev_max > -FLT_MAX) {
+                float correction = expf(prev_max - new_max);
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) acc[q][r] *= correction;
+                row_sum[q] *= correction;
+            }
+            row_max[q] = new_max;
+            if (tid == 0) {
+                float tsum = 0.0f;
+                for (int t = 0; t < tile_len; ++t) {
+                    float v = (s_score[q * FA2_BC + t] > -FLT_MAX + 1.0f)
+                        ? expf(s_score[q * FA2_BC + t] - row_max[q]) : 0.0f;
+                    s_score[q * FA2_BC + t] = v;
+                    tsum += v;
+                }
+                s_reduce[0] = tsum;
+            }
+            __syncthreads();
+            row_sum[q] += s_reduce[0];
+            __syncthreads();
+        }
+
+        for (int t = 0; t < tile_len; ++t) {
+            int kv_pos   = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_blk = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            dequant_nvfp4_row_to_smem(
+                value_cache_packed + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * half_D,
+                value_cache_scale  + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * scales_per_D,
+                s_val + t * head_dim, tid, head_dim);
+        }
+        __syncthreads();
+
+        for (int q = 0; q < GQA; ++q) {
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                int d = tid + r * FA2_THREADS;
+                if (r < dims_per_thread && d < head_dim) {
+                    float val_acc = 0.0f;
+                    for (int t = 0; t < tile_len; ++t)
+                        val_acc += s_score[q * FA2_BC + t] * __half2float(s_val[t * head_dim + d]);
+                    acc[q][r] += val_acc;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int q = 0; q < GQA; ++q) {
+        const int head_idx = kv_head * GQA + q;
+        float inv_sum = (row_sum[q] > 0.0f) ? (1.0f / row_sum[q]) : 0.0f;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            int d = tid + r * FA2_THREADS;
+            if (r < dims_per_thread && d < head_dim) {
+                output[(seq_idx * num_heads + head_idx) * head_dim + d] =
+                    __float2half(acc[q][r] * inv_sum);
+            }
+        }
+    }
+}
+
+#  undef FA2_BC
+#  define FA2_BC 32
+#endif
+
 // ---------------------------------------------------------------------
 // FP8-Q / NVFP4-KV paged-prefill — multi-query self-attention with
 // causal mask. Sibling of `flash_attention_2_prefill_fp8kv_kernel` in
