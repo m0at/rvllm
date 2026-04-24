@@ -270,6 +270,13 @@ all_pass = all([
     run_one(num_tokens=8,  num_heads=16, num_kv_heads=4, head_dim=256, rotary_dim=128, seed=7),
     run_one(num_tokens=16, num_heads=32, num_kv_heads=4, head_dim=256, rotary_dim=128, seed=42),
     run_one(num_tokens=8,  num_heads=8,  num_kv_heads=4, head_dim=512, rotary_dim=128, seed=101),
+    # Long-prompt regression for batch prefill (RVLLM_BATCH_PREFILL=1):
+    # rvllm-server produced garbage with NVFP4 KV + batch prefill at
+    # prompt_len >= 62. If this fails, the rope kernel itself has a
+    # num_tokens > 16 regression worth isolating; if it passes, the bug
+    # lives in the Rust wiring or layer-exec metadata.
+    run_one(num_tokens=128, num_heads=4,  num_kv_heads=2, head_dim=256, rotary_dim=128, seed=211),
+    run_one(num_tokens=300, num_heads=4,  num_kv_heads=2, head_dim=256, rotary_dim=128, seed=212),
 ])
 print()
 print("all shapes pass" if all_pass

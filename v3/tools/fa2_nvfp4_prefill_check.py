@@ -335,6 +335,17 @@ all_pass = all([
     run_one(num_seqs=2, num_heads=8, num_kv_heads=2,
             head_dim=512, rotary_dim=128,
             q_lens=[16, 32], block_size=16, seed=42),  # exercises BC=16
+    # Long-prompt regression — exercises q_len > FA2_BC (=32) and
+    # num_kv_tiles >= 2 inside the qi loop. Before this case the
+    # harness passed while the integrated runtime (rvllm-server +
+    # RVLLM_BATCH_PREFILL=1) produced garbage at prompt_len >= 62;
+    # if this fails the bug is in the kernel, not the Rust wiring.
+    run_one(num_seqs=1, num_heads=4, num_kv_heads=2,
+            head_dim=256, rotary_dim=128,
+            q_lens=[128], block_size=16, seed=211),
+    run_one(num_seqs=1, num_heads=4, num_kv_heads=2,
+            head_dim=256, rotary_dim=128,
+            q_lens=[300], block_size=16, seed=212),
 ])
 print()
 print("all shapes pass" if all_pass
