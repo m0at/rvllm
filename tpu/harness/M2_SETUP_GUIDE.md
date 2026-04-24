@@ -15,7 +15,7 @@ OpenAI-compatible API server.
 - **Current throughput** (as of this commit):
   - Load: ~80s (parallel ThreadPool over 61 safetensors shards)
   - **B=1**: 726 ms/step = **1.4 tok/s**
-  - **B=8**: 871 ms/step = **9.2 tok/s** (6.7× amortization)
+  - **B=8**: 745 ms/step = **10.7 tok/s** (replicate-token MoE)
   - B≥16 currently OOMs on KV cache (see "Known limits" below)
 
 ---
@@ -128,6 +128,7 @@ export JAX_COMPILATION_CACHE_DIR="$HOME/.jax_cache"
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
 export M2_MOE=shardmap
+# default: RVLLM_M2_MOE_IMPL=auto, which uses replicate-token MoE for B=8
 
 cd /tmp
 python3 -u m2_full_bench.py \
@@ -194,13 +195,33 @@ Flag reference:
 | `--skip-gen` | Skip generation |
 | `--single-batch N` | Run one batch size only (for subprocess-per-batch memory hygiene) |
 
-### MoE dispatch variants (env var `M2_MOE`)
+### MoE dispatch variants
+
+`M2_MOE=shardmap` selects the main NVFP4 MoE implementation. Inside that path,
+`RVLLM_M2_MOE_IMPL=auto` is the default:
+
+- B=8 uses exact replicate-token MoE: tokens/routing stay replicated, each chip
+  computes its 32 local experts, and outputs combine with `psum`.
+- Other batch sizes use the original padded all-to-all path unless overridden.
+
+Set `RVLLM_M2_MOE_IMPL=all_to_all` to force the old path, or
+`RVLLM_M2_MOE_IMPL=replicate_tokens` to force the new path.
+
+Measured B=8:
+
+| Impl | B=8 perf | Notes |
+|---|---:|---|
+| `auto` / `replicate_tokens` | **10.7 tok/s** | exact, PPL 5.14 on 750-token probe |
+| `all_to_all` | 10.0 tok/s | previous baseline |
+| `RVLLM_NVFP4_BACKEND=pallas` | 7.2 tok/s | exact but slower two-stage Pallas matmul |
+
+### Legacy `M2_MOE` variants
 
 Set before running:
 
 | Value | Impl | B=1 perf | B=8+ perf |
 |---|---|---|---|
-| `shardmap` (default) | sort + all_to_all dispatch | **1.4 tok/s** | **9.2 tok/s** |
+| `shardmap` (default) | expert-sharded MoE (`RVLLM_M2_MOE_IMPL=auto`) | **1.4 tok/s** | **10.7 tok/s** |
 | `dense` | compute all 32 local experts per shard | compile hangs | n/a |
 | `gather` | dynamic-gather top-K + vmap | 0.02 tok/s (vmap doesn't fuse) | n/a |
 
@@ -430,12 +451,13 @@ Set `RVLLM_API` to the forwarded port from Section 6.
 
 ## 9. What next (performance)
 
-Current bottleneck: MoE dispatch via `shard_map` + `all_to_all` at small B is
-dominated by kernel launch overhead per expert. Known paths that would move
-the needle:
+Current bottleneck: small-batch MoE still launches many per-expert NVFP4
+matmuls. B=8 avoids padded all-to-all now, but B=1 still needs a better kernel.
+Known paths that would move the needle:
 
-1. **Pallas NVFP4 matmul kernel** (`tpu/harness/nvfp4_matmul_pallas.py` sketch
-   exists). Fuses dequant + MXU into a single TPU kernel — est 2-5× at B=1.
+1. **True fused Pallas NVFP4 matmul kernel**. The current two-stage Pallas
+   backend is correct but slower; high-level Pallas currently crashes Mosaic
+   when a uint8-derived RHS feeds TPU matmul.
 2. **int8 KV cache** — unblocks B ≥ 16 (currently OOMs on replicated KV).
 3. **Prefill batching** — 20-token prompt currently costs 14s TTFT because
    prefill runs serial B=1. Packing the prompt into one (1, 20) forward pass
@@ -464,7 +486,7 @@ tpu/harness/
 ├── m2_moe_dense.py            # dense-B1 variant (compile hangs)
 ├── m2_moe_gather.py           # gather-top-K variant (regresses)
 ├── nvfp4_jax_ops.py           # pure-JAX NVFP4 matmul
-├── nvfp4_matmul_pallas.py     # Pallas kernel sketch (untested)
+├── nvfp4_matmul_pallas.py     # opt-in two-stage Pallas matmul backend
 ├── nvfp4_loader.py            # safetensors NVFP4 reader
 ├── m2_checkpoint_schema/      # ground-truth tensor names + real_schema.md
 │   ├── REAL_SCHEMA.md

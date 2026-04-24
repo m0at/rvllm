@@ -130,10 +130,12 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 |---|---|
 | Model load (136 GB via parallel ThreadPool) | 79 s |
 | B=1 | 726 ms/step, 1.4 tok/s |
-| **B=8** | **802 ms/step, 10.0 tok/s** |
+| **B=8** | **745 ms/step, 10.7 tok/s** (`RVLLM_M2_MOE_IMPL=auto`, replicate-token MoE) |
+| B=8, previous all-to-all MoE | 802 ms/step, 10.0 tok/s |
 | B=8, opt-in Pallas bf16 matmul (`RVLLM_NVFP4_BACKEND=pallas`, `BN=512`) | 1105 ms/step, 7.2 tok/s |
 | B=16+ | OOM (KV cache replicated) |
 | PPL probe (318 scored tokens) | **5.63** |
+| PPL probe with replicate-token MoE (750 scored tokens) | **5.14** |
 | Gen sample (32 tok) | `"Explain angular momentum. The angular momentum of a particle about a point \\(O\\) is defined as \\(\\vec{L}=\\vec{r} \\times \\vec{p}\\) where \\(\\vec{r"` |
 
 ### What this demonstrates
@@ -141,15 +143,16 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 - v6e-8 provisioning (spot), 130 GB HF download in 1m45s (authed)
 - NVFP4 safetensors loader (modelopt 4-tensor format: packed + weight_scale + weight_scale_2 + input_scale)
 - Correct bf16 checkpoint loading: safetensors bf16 payloads are bitcast from raw `uint16`, not numerically cast
-- Expert-parallel sharding: 256 experts across 8 chips (32/chip) via `shard_map` + `jax.lax.all_to_all` on `('expert',)` mesh axis
+- Expert-parallel sharding: 256 experts across 8 chips (32/chip) via `shard_map`; B=8 uses replicate-token + `psum`, while the legacy path uses `jax.lax.all_to_all`
 - `lax.scan` over 62 layers so XLA streams one layer's weights at a time (fits in 32 GB HBM/chip)
 - Sigmoid+bias top-8 router with aux-loss-free scoring (`scoring_func: sigmoid`, `use_routing_bias: true`)
 - Partial RoPE (rotary_dim=64 of head_dim=128), QK-norm per layer, GQA softmax
 - Per-batch JAX compile cache persisted to HuggingFace (`and-y/rvllm-m2-build`) so next boot skips install + JIT
+- B=8 now uses exact replicate-token MoE by default: tokens stay replicated across expert shards, each shard computes its 32 local experts, and outputs combine with `psum`. This avoids the padded all-to-all bucket path.
 
 ### Known issues blocking production
 
-1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. The opt-in two-stage Pallas path in `nvfp4_matmul_pallas.py` is correct but slower at B=8; a true fused uint8-decode + MXU kernel currently trips a Mosaic TPU layout assert.
+1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. The B=8 path avoids padded token all-to-all now; B=1 still needs a better small-batch kernel.
 2. **KV cache replication blocks B≥16**. Fix in `m2_full_bench.make_batched_empty_cache` (spec batch-axis-shard). int8 KV quant (Gemma4 reference) would also help.
 3. **Full validation still needed**. The short corrected probe is coherent (`tpu/out/m2/m2_fix_probe.json`), but the next run should score a longer Wikitext slice and capture a 256+ token sample.
 
@@ -157,7 +160,7 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 
 See [`tpu/harness/M2_PERF_ADVISOR_SPEC.md`](tpu/harness/M2_PERF_ADVISOR_SPEC.md) for the full analysis.
 
-1. True fused Pallas NVFP4→MXU matmul kernel — still required for a speed win; the current two-stage Pallas matmul is slower than XLA dot
+1. True fused Pallas NVFP4→MXU matmul kernel — high-level Pallas currently crashes Mosaic when a uint8-derived RHS feeds TPU matmul; the current two-stage Pallas matmul is slower than XLA dot
 2. int8 KV cache → unblock B≥16
 3. Batched prefill → 16× TTFT (20-token prompt currently 14s)
 4. Async collective flags (`LIBTPU_INIT_ARGS`) — ~5% at larger B

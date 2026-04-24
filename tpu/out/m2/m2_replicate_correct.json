@@ -1,0 +1,42 @@
+{
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "load_seconds": 78.44418573379517,
+  "sweep": [
+    {
+      "batch": 8,
+      "ctx": 2048,
+      "iters": 1,
+      "ms_min": 3056.0208819952095,
+      "ms_mean": 3056.0208819952095,
+      "ms_max": 3056.0208819952095,
+      "ms_p50": 3056.0208819952095,
+      "tok_per_s": 2.617783159510669
+    }
+  ],
+  "ppl": {
+    "n_tokens_scored": 750,
+    "avg_nll": 1.6365511976372848,
+    "ppl": 5.137420974632005
+  },
+  "generation": {
+    "batch": 1,
+    "prompt_len": 4,
+    "gen_tokens": 64,
+    "prefill_ms": 21091.173175998847,
+    "decode_ms": 45309.34071299998,
+    "ms_per_step": 1037.5080295156067,
+    "ms_per_tok": 1037.5080295156067,
+    "tok_per_s": 0.9638479621857784,
+    "texts": [
+      "Explain angular momentum. The angular momentum of a particle about a point \\(O\\) is defined as \\(\\vec{r} \\times \\vec{p}\\) where \\(\\\\vec{r}\\) is the particle's position vector relative to \\(O\\) and \\(\\vec{p}\\) is its linear momentum. The angular momentum of a system of particles is the sum of the"
+    ],
+    "text": "Explain angular momentum. The angular momentum of a particle about a point \\(O\\) is defined as \\(\\vec{r} \\times \\vec{p}\\) where \\(\\\\vec{r}\\) is the particle's position vector relative to \\(O\\) and \\(\\vec{p}\\) is its linear momentum. The angular momentum of a system of particles is the sum of the",
+    "prompts": [
+      "Explain angular momentum."
+    ],
+    "prompt": "Explain angular momentum."
+  }
+}

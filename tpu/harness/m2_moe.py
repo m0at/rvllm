@@ -13,6 +13,8 @@ Differences vs. Gemma 4 MoE:
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
@@ -317,6 +319,20 @@ def _moe_shard_map_nvfp4(
     Three separate projections w1 (gate), w3 (up), w2 (down), each with a
     per-tensor FP32 global scale stacked as (NUM_EXPERTS,).
     """
+    impl = os.environ.get('RVLLM_M2_MOE_IMPL', 'auto').strip().lower()
+    if impl == 'auto':
+        impl = 'replicate_tokens' if x.shape[0] == 8 else 'all_to_all'
+    if impl in ('replicate', 'replicated', 'replicate_tokens'):
+        return _moe_replicate_tokens_nvfp4(
+            x, router_w, router_bias,
+            w1_packed, w1_scale, w1_scale2,
+            w2_packed, w2_scale, w2_scale2,
+            w3_packed, w3_scale, w3_scale2,
+            mesh,
+        )
+    if impl not in ('', 'all_to_all', 'shardmap'):
+        raise ValueError(f"unknown RVLLM_M2_MOE_IMPL={impl!r}")
+
     n_shards = mesh.shape['expert']
     assert NUM_EXPERTS % n_shards == 0, 'experts must divide evenly across shards'
     experts_per_shard = NUM_EXPERTS // n_shards
@@ -453,6 +469,86 @@ def _moe_shard_map_nvfp4(
         out = jnp.zeros_like(x_l)
         out = out.at[flat_tok].add(contrib)
         return out
+
+    return shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_rep=False,
+    )(x, topk_w, topk_idx,
+      w1_packed, w1_scale, w1_scale2,
+      w2_packed, w2_scale, w2_scale2,
+      w3_packed, w3_scale, w3_scale2)
+
+
+def _moe_replicate_tokens_nvfp4(
+    x, router_w, router_bias,
+    w1_packed, w1_scale, w1_scale2,
+    w2_packed, w2_scale, w2_scale2,
+    w3_packed, w3_scale, w3_scale2,
+    mesh,
+):
+    """Exact expert-sharded MoE without token all_to_all.
+
+    For small decode batches, replicate tokens and routing metadata to every
+    expert shard, compute only that shard's 32 local experts, then psum the
+    weighted partial outputs. This avoids padded all_to_all buckets.
+    """
+    n_shards = mesh.shape['expert']
+    assert NUM_EXPERTS % n_shards == 0, 'experts must divide evenly across shards'
+    experts_per_shard = NUM_EXPERTS // n_shards
+
+    topk_w, topk_idx = router_sigmoid_topk(x, router_w, router_bias)
+
+    in_specs = (
+        P(),
+        P(),
+        P(),
+        P('expert', None, None),
+        P('expert', None, None),
+        P('expert'),
+        P('expert', None, None),
+        P('expert', None, None),
+        P('expert'),
+        P('expert', None, None),
+        P('expert', None, None),
+        P('expert'),
+    )
+    out_specs = P()
+
+    def _local(x_l, w_l, idx_l,
+               w1p_l, w1s_l, w1g_l,
+               w2p_l, w2s_l, w2g_l,
+               w3p_l, w3s_l, w3g_l):
+        shard_id = jax.lax.axis_index('expert')
+        shard_base = shard_id * experts_per_shard
+        H_dim = x_l.shape[-1]
+        inter_dim = w1p_l.shape[1]
+        local_out = jnp.zeros_like(x_l)
+
+        for e in range(experts_per_shard):
+            global_e = shard_base + e
+            selected = idx_l == global_e
+            coeff = jnp.sum(
+                jnp.where(selected, w_l, jnp.zeros_like(w_l)),
+                axis=-1,
+            )
+            active = coeff != jnp.asarray(0, coeff.dtype)
+            x_e = x_l * active[:, None].astype(x_l.dtype)
+            gate = nvfp4_matmul(
+                x_e, w1p_l[e], w1s_l[e], w1g_l[e], inter_dim, H_dim
+            )
+            up = nvfp4_matmul(
+                x_e, w3p_l[e], w3s_l[e], w3g_l[e], inter_dim, H_dim
+            )
+            h = jax.nn.silu(gate) * up
+            d = nvfp4_matmul(
+                h, w2p_l[e], w2s_l[e], w2g_l[e], H_dim, inter_dim
+            )
+            local_out = local_out + d * coeff[:, None].astype(d.dtype)
+
+        return jax.lax.psum(local_out, 'expert')
 
     return shard_map(
         _local,
