@@ -153,26 +153,45 @@ def forward_step(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_hea
 
 def random_weights(B, max_ctx, mesh, nl):
     """Stack random NVFP4-packed weights across NL layers for lax.scan consumption.
-    Expert-axis sharded per weight. Peak per-chip weight memory = ~340 MB (one layer)."""
+    Expert-axis sharded per weight. Uses make_array_from_callback so each chip only
+    materializes its LOCAL shard (not the full tensor), avoiding the one-chip
+    staging OOM that device_put(np.ndarray, sharding) causes on big tensors."""
 
-    # Per-expert-weight sharding: leading axis is NL (replicated), then
-    # 'expert' (sharded), then the rest replicated.
     expert_spec = NamedSharding(mesh, P(None, 'expert', None, None))
     scale2_spec = NamedSharding(mesh, P(None, 'expert'))
     rep_spec = NamedSharding(mesh, P())
-    rng = np.random.default_rng(42)
+
+    def _make(shape, sharding, fill_fn):
+        """fill_fn(local_shape) -> np.ndarray of that shape."""
+        def cb(idx):
+            local_shape = tuple(
+                (s.stop - s.start) if isinstance(s, slice) else 1
+                for s in idx
+            )
+            return fill_fn(local_shape)
+        return jax.make_array_from_callback(shape, sharding, cb)
 
     def rand_bf16_stack(shape, spec):
-        arr = (rng.standard_normal(size=shape) * 0.02).astype(np.float32)
-        return jax.device_put(jnp.asarray(arr, dtype=DTYPE), spec)
+        def fill(local):
+            return (np.random.default_rng().standard_normal(size=local) * 0.02).astype(
+                np.float32).astype('bfloat16') if False else \
+                (np.random.default_rng().standard_normal(size=local) * 0.02).astype(np.float32).view(np.uint32)
+        # Actually just build bf16 via ml_dtypes
+        import ml_dtypes
+        def fill_bf(local):
+            v = (np.random.default_rng().standard_normal(size=local) * 0.02).astype(np.float32)
+            return v.astype(ml_dtypes.bfloat16)
+        return _make(shape, spec, fill_bf)
 
     def rand_u8_stack(shape, spec):
-        arr = rng.integers(0, 256, size=shape, dtype=np.uint8)
-        return jax.device_put(jnp.asarray(arr), spec)
+        def fill(local):
+            return np.random.default_rng().integers(0, 256, size=local, dtype=np.uint8)
+        return _make(shape, spec, fill)
 
     def rand_f32_stack(shape, spec):
-        arr = (rng.standard_normal(size=shape) * 0.01 + 0.01).astype(np.float32)
-        return jax.device_put(jnp.asarray(arr), spec)
+        def fill(local):
+            return (np.random.default_rng().standard_normal(size=local) * 0.01 + 0.01).astype(np.float32)
+        return _make(shape, spec, fill)
 
     # Backbone (bf16, replicated across all chips)
     embed = rand_bf16_stack((VOCAB, H), rep_spec)
