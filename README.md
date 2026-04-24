@@ -94,7 +94,8 @@ python3 tpu/harness/gemma4_tpu_infer.py \
 python3 tpu/harness/gemma4_tpu_infer.py \
   --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 131072
 
-# API server (OpenAI-compatible)
+# API server (OpenAI-compatible) -- imports model symbols from gemma4_tpu_infer.py,
+# so --model-dir must be a directory its auto-detect can parse (standard HF layout).
 python3 tpu/harness/api_server.py --model-dir ~/models/gemma-4-31B-it --port 8080
 
 # Perplexity
@@ -117,6 +118,74 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, one co
 | Hardware ceiling | ~300 tok/s (3.8x) |
 
 Requires 50K+ training examples for production tau. Current: 2K examples, loss 7.1, pipeline validated end-to-end. See [`tpu/harness/EAGLE3_SPEC.md`](tpu/harness/EAGLE3_SPEC.md).
+
+
+## MiniMax-M2.7-NVFP4 on TPU v6e-8 (experimental)
+
+Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukealonso/MiniMax-M2.7-NVFP4`) on a single v6e-8 slice. 16-agent swarm built the wiring in one day; a second 16-agent perf swarm analyzed the bottlenecks. **The execution pipeline works end-to-end** (model load, forward pass, batched MoE dispatch across 8 chips, compiled JIT graph) but **numerical output is currently incorrect** — PPL equals vocab_size, indicating a bug in the NVFP4 dequant or weight layout.
+
+### Measured (v6e-8, spot, europe-west4-a, `M2_MOE=shardmap`)
+
+| Metric | Value |
+|---|---|
+| Model load (136 GB via parallel ThreadPool) | 79 s |
+| B=1 | 726 ms/step, 1.4 tok/s |
+| **B=8** | **802 ms/step, 10.0 tok/s** |
+| B=16+ | OOM (KV cache replicated) |
+| PPL (wikitext-2 valid) | **200,064 ≈ vocab_size** (uniform output) |
+| Gen sample (256 tok) | `"Explain angular momentum."` + 256× null byte |
+
+### What this demonstrates
+
+- ✅ v6e-8 provisioning (spot), 130 GB HF download in 1m45s (authed)
+- ✅ NVFP4 safetensors loader (modelopt 4-tensor format: packed + weight_scale + weight_scale_2 + input_scale)
+- ✅ Expert-parallel sharding: 256 experts across 8 chips (32/chip) via `shard_map` + `jax.lax.all_to_all` on `('expert',)` mesh axis
+- ✅ `lax.scan` over 62 layers so XLA streams one layer's weights at a time (fits in 32 GB HBM/chip)
+- ✅ Sigmoid+bias top-8 router with aux-loss-free scoring (`scoring_func: sigmoid`, `use_routing_bias: true`)
+- ✅ Partial RoPE (rotary_dim=64 of head_dim=128), QK-norm per layer, GQA softmax
+- ✅ Per-batch JAX compile cache persisted to HuggingFace (`and-y/rvllm-m2-build`) — next boot skips install + JIT
+- ❌ Numerics produce constant token-0 output (bug in dequant / layout, not in scheduling)
+
+### Known issues blocking production
+
+1. **NVFP4 dequant correctness** (top priority). The 2-level scale format (FP8 E4M3 per-16-element block scale × FP32 per-tensor global scale) is implemented in `nvfp4_jax_ops.py` but hasn't been validated against an HF reference forward. Likely culprits: FP4 E2M1 LUT ordering, block-scale expand direction, or missing input_scale for activations.
+2. **MoE dispatch overhead dominates at B=1** — 726 ms/step is ~900× off HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. Pallas NVFP4 matmul kernel sketched in `nvfp4_matmul_pallas.py`, untested.
+3. **KV cache replication** blocks B≥16. Fix in `m2_full_bench.make_batched_empty_cache` (spec batch-axis-shard). int8 KV quant (Gemma4 reference) would also help.
+
+### Build list (ranked, from 16-agent perf advisor spec)
+
+See [`tpu/harness/M2_PERF_ADVISOR_SPEC.md`](tpu/harness/M2_PERF_ADVISOR_SPEC.md) for the full analysis.
+
+1. Pallas fused NVFP4→MXU matmul kernel — 2-5× at B=1 (est)
+2. int8 KV cache → unblock B≥16
+3. Batched prefill → 16× TTFT (20-token prompt currently 14s)
+4. Async collective flags (`LIBTPU_INIT_ARGS`) — ~5% at larger B
+5. EAGLE-3 speculative decode (scaffold exists, needs draft-head training)
+
+### Reproduce
+
+One-shot deploy (requires v6e-8 quota in `europe-west4-a`):
+
+```bash
+SPOT=1 ZONE=europe-west4-a HF_TOKEN=$(cat ~/.cache/huggingface/token) \
+  bash tpu/harness/deploy_m2_tpu.sh
+```
+
+On the VM:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+export JAX_COMPILATION_CACHE_DIR="$HOME/.jax_cache"
+export M2_MOE=shardmap
+python3 -u /tmp/m2_full_bench.py \
+  --model-dir /dev/shm/m2-nvfp4 \
+  --batches 8 --ctx 2048 --iters 10 --warmup 3 \
+  --prompt "Explain angular momentum." --gen-tokens 256 \
+  --ppl-text /tmp/wiki.txt \
+  --out /tmp/m2_final.json
+```
+
+Full walkthrough in [`tpu/harness/M2_SETUP_GUIDE.md`](tpu/harness/M2_SETUP_GUIDE.md).
 
 
 ## GPU: 31B Gemma 4 on H100
@@ -208,7 +277,21 @@ bash kernels/build_fa3.sh           # libfa3_kernels.so
 
 # Build
 cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvllm-bench
+```
 
+The three build scripts populate `kernels/sm_90/` with the PTX blobs, `libcutlass_kernels.so`, `libfa3_kernels.so`, and `policy.json`. That directory is intentionally empty in the repo -- it is build output. The `RVLLM_*` env paths below resolve against it.
+
+**Required env vars** (every rvLLM GPU binary takes the same set):
+
+| Variable | What it points at |
+|---|---|
+| `RVLLM_MODEL_DIR` | HuggingFace-layout model directory (config.json, safetensors, tokenizer.json) |
+| `RVLLM_KERNELS_DIR` | directory holding the built PTX blobs |
+| `RVLLM_CUTLASS_SO` | path to `libcutlass_kernels.so` |
+| `RVLLM_FA3_SO` | path to `libfa3_kernels.so` |
+| `RVLLM_POLICY` | `policy.json` emitted by the autotune pass |
+
+```bash
 # Run
 RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it \
 RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
@@ -218,6 +301,14 @@ RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
 RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
   ./v3/target/release/rvllm-bench
 ```
+
+`RVLLM_BATCH`, `RVLLM_ITERS`, and `RVLLM_WARMUP` are bench-only knobs; the five variables in the table above are the minimum set for any rvLLM GPU binary.
+
+### Native HTTP server (experimental)
+
+The native OpenAI-compatible server lives in [`v3/crates/rvllm-serve`](/Users/andy/rvllm/v3/crates/rvllm-serve) and produces a `rvllm-server` binary. It reuses `step_launch` / `step_collect` from the runtime and the same `RVLLM_*` env set above -- no Python in the serving path.
+
+It is currently a Phase-D scaffold (`main.rs` exits with "not yet implemented"). The in-repo, production-grade OpenAI-compatible endpoint today is the TPU path: [`tpu/harness/api_server.py`](/Users/andy/rvllm/tpu/harness/api_server.py). A GPU HTTP server is an open contribution track -- see `CONTRIBUTING.md`.
 
 ### Kernels
 
@@ -237,47 +328,6 @@ Every kernel has a known purpose, a pinned variant, and a workspace contract. No
 
 No fallbacks. Missing kernel .so = engine refuses to start.
 
-## rvRLM (experimental)
-
-`rvRLM` is the in-repo recursive language model runtime under [`v3/crates/rvrlm`](/Users/andy/rvllm/v3/crates/rvrlm). It is inspired by and explicitly attributed to [alexzhang13/rlm](https://github.com/alexzhang13/rlm), but the implementation here is native to this repo and wired into the existing `rvllm` CUDA backend instead of shelling out to an external harness.
-
-Current `rvRLM` surface:
-
-- Native recursive loop in Rust: iterative prompt construction, code-block execution, execution history, and `FINAL_ANSWER` termination.
-- Persistent local execution environment: an in-process Rust-native Rhai runtime per session, with `context`, `history`, `llm_query`, `rlm_query`, and registered tool calls available inside executed code.
-- Recursive subcalls: `rlm_query(...)` now spins a fresh child `rvRLM` engine with depth limits instead of routing back through a stub.
-- Native PPL surface: `Rlm::perplexity`, `ServeService::perplexity`, and `rvrlm-bench` can call the backend's runtime perplexity path directly.
-- Native GUI harness: [`v3/crates/rvrlm-egui`](/Users/andy/rvllm/v3/crates/rvrlm-egui) reuses the repo's Rust `egui` client pattern for an `rvRLM`-specific desktop app, with direct `ServeService` calls, recursive-run metrics, and a PPL action instead of the older OpenAI-compatible HTTP race path.
-
-Build and run on GPU:
-
-```bash
-cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvrlm -p rvllm-bench -p rvrlm-egui
-
-RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it \
-RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
-RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
-RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
-RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
-RVRLM_PROMPT="Write one short sentence about recursive language models." \
-RVRLM_PPL_PROMPT="The quick brown fox jumps over the lazy dog." \
-RVLLM_ITERS=10 RVLLM_WARMUP=2 \
-  ./v3/target/release/rvrlm-bench
-```
-
-`rvrlm-bench` emits throughput, ms/request, cold/hot TTFT, and, when `RVRLM_PPL_PROMPT` is set, native perplexity fields from the same service surface.
-
-Native desktop harness:
-
-```bash
-RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it \
-RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
-RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
-RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
-RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
-  cargo run --release --features cuda --manifest-path v3/Cargo.toml -p rvrlm-egui
-```
-
 ## v3 crate map
 
 ```
@@ -293,7 +343,9 @@ v3/crates/
   rvllm-sampling     argmax tail, pinned DtoH
   rvllm-graph        captured-graph pool keyed on MetaLayoutHash
   rvllm-runtime      Engine, scheduler, layer_exec, bring_up
+  rvllm-serve        HTTP / OpenAI-compatible serve loop (bin: rvllm-server) -- Phase D scaffold
   rvllm-bench        RVLLM_* env-driven bench binary
+  rvllm-deploy       SHA-pinned tarball + manifest.json verification (bin: rvllm-deploy) -- Phase D scaffold
   rvllm-invariants   DAG-dep test, no-megakernel gate
 ```
 
