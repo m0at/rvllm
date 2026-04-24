@@ -1,17 +1,21 @@
 """MiniMax-M2.7-NVFP4 synthetic-weight throughput benchmark on TPU v6e-8.
 
-Skips the 190K-tensor real model load. Allocates RANDOM BF16 weights at the
-real architecture shapes, builds the same mesh + sharding, runs
-`forward_step_m2` in a timed loop, reports ms/step and tok/s at B=1,8,32,128.
+Skips the 190K-tensor real model load. Allocates RANDOM NVFP4-packed weights
+at the real architecture shapes, builds the same mesh + sharding, runs the
+forward pass in a timed loop, reports ms/step and tok/s.
 
-This measures hardware throughput ceiling for the MiniMax-M2 architecture
-(GQA attention + 256-expert MoE top-8, 62 layers). Model quality (PPL, token
-identity) is a separate concern that requires the real checkpoint — see
-`m2_tpu_infer.py` for that path.
+NVFP4 packing matches modelopt format used by the real checkpoint:
+  - weight: packed uint8, shape (rows, cols/2), two FP4 values per byte
+  - weight_scale: uint8 (FP8 E4M3 bits), shape (rows, cols/16), one scale per 16 weights
+  - weight_scale_2: FP32 scalar, per-tensor global scale
+Memory footprint per chip ~= 130 GB / 8 = ~16 GB (fits in 32 GB v6e HBM).
+
+Attention backbone + router + embed stay bf16 (matches real checkpoint where
+only MoE experts are NVFP4 quantized).
 
 Usage:
     python3 m2_synth_bench.py [--batch 1,8,32,128] [--ctx 2048] \
-                              [--iters 30] [--warmup 5]
+                              [--iters 20] [--warmup 5] [--nl 62]
 """
 
 import argparse
@@ -35,26 +39,69 @@ ROPE_THETA = 5_000_000.0
 MOE_INTER = 1536
 NUM_EXPERTS = 256
 TOP_K = 8
-NL = 62
+NL_FULL = 62
 VOCAB = 200064
 RMS_EPS = 1e-6
+GROUP_SIZE = 16
 
 DTYPE = jnp.bfloat16
 
+
+# --- FP4 E2M1 decode LUT (16 entries) ---
+FP4_VALUES = np.array(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=np.float32)
+FP4_LUT = jnp.asarray(FP4_VALUES, dtype=DTYPE)
+
+
+def fp8_e4m3_decode(bits_u8: jax.Array) -> jax.Array:
+    """uint8 bits -> f32 using IEEE-like E4M3 (sign 1, exp 4 bias 7, mant 3)."""
+    b = bits_u8.astype(jnp.uint32)
+    sign = (b >> 7) & 1
+    exp = (b >> 3) & 0xF
+    mant = b & 0x7
+    # Normal: 2^(exp-7) * (1 + mant/8); subnormal (exp==0): (mant/8) * 2^-6
+    sign_f = jnp.where(sign == 1, -1.0, 1.0).astype(jnp.float32)
+    norm = jnp.power(2.0, exp.astype(jnp.float32) - 7.0) * (1.0 + mant.astype(jnp.float32) / 8.0)
+    sub = (mant.astype(jnp.float32) / 8.0) * jnp.power(2.0, -6.0)
+    val = jnp.where(exp == 0, sub, norm)
+    return sign_f * val
+
+
+def nvfp4_dequant_bf16(packed: jax.Array, scales_u8: jax.Array, global_scale_f32: float,
+                     rows: int, cols: int) -> jax.Array:
+    """Dequant NVFP4 weight: packed (rows, cols/2) u8 + scales (rows, cols/16) u8 -> bf16 (rows, cols)."""
+    lo = (packed & 0x0F).astype(jnp.uint32)
+    hi = ((packed >> 4) & 0x0F).astype(jnp.uint32)
+    # Interleave lo (even cols) and hi (odd cols) -> (rows, cols)
+    fp4_idx = jnp.stack([lo, hi], axis=-1).reshape(rows, cols)
+    vals = FP4_LUT[fp4_idx]  # bf16
+    # Decode block scales (F8 E4M3) and broadcast 16x along col axis
+    block_scale_f32 = fp8_e4m3_decode(scales_u8)  # (rows, cols/16) f32
+    block_scale_bf16 = (block_scale_f32 * global_scale_f32).astype(DTYPE)
+    scale_expanded = jnp.repeat(block_scale_bf16, GROUP_SIZE, axis=1)  # (rows, cols) bf16
+    return (vals * scale_expanded).astype(DTYPE)
+
+
+def nvfp4_matmul(x_bf16: jax.Array, w_packed: jax.Array, w_scales: jax.Array,
+                 w_global_scale: float, out_features: int, in_features: int) -> jax.Array:
+    """Fused: dequant W on the fly, then x @ W^T. XLA should fuse."""
+    w_bf16 = nvfp4_dequant_bf16(w_packed, w_scales, w_global_scale, out_features, in_features)
+    return x_bf16 @ w_bf16.T
+
+
+# --- Arch ops ---
 
 def make_mesh_v6e8():
     devs = jax.devices()
     n = len(devs)
     print(f"  devices={n} kind={devs[0].device_kind if n else '?'}", file=sys.stderr)
-    if n >= 8:
-        mesh_devs = np.array(devs[:8]).reshape((8,))
-        return Mesh(mesh_devs, ('expert',))
-    mesh_devs = np.array(devs[:n]).reshape((n,))
+    mesh_devs = np.array(devs[:min(n, 8)]).reshape((min(n, 8),))
     return Mesh(mesh_devs, ('expert',))
 
 
 def precompute_rope(theta, rotary_dim, max_ctx):
-    half = rotary_dim // 2
     freqs = 1.0 / (theta ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
     angles = np.outer(np.arange(max_ctx, dtype=np.float32), freqs)
     return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
@@ -82,7 +129,6 @@ def rope_partial(x, cos, sin):
 
 
 def attn_layer(x, w, ln, k_cache, v_cache, pos, cos, sin):
-    # x: (B, H), returns (x_out, k_new, v_new)
     h = rms_norm(x, ln)
     q = (h @ w['q'].T).reshape(-1, NH, HEAD_DIM)
     k = (h @ w['k'].T).reshape(-1, NKV, HEAD_DIM)
@@ -91,10 +137,8 @@ def attn_layer(x, w, ln, k_cache, v_cache, pos, cos, sin):
     k = head_rms(k, w['kn'])
     q = rope_partial(q, cos[pos], sin[pos])
     k = rope_partial(k, cos[pos], sin[pos])
-    # Cache write
     k_cache = jax.lax.dynamic_update_slice(k_cache, k[:, None], (0, pos, 0, 0))
     v_cache = jax.lax.dynamic_update_slice(v_cache, v[:, None], (0, pos, 0, 0))
-    # GQA attention
     B_ = q.shape[0]
     q_g = q.reshape(B_, NKV, NH // NKV, HEAD_DIM)
     scale = 1.0 / jnp.sqrt(float(HEAD_DIM))
@@ -108,42 +152,72 @@ def attn_layer(x, w, ln, k_cache, v_cache, pos, cos, sin):
     return out, k_cache, v_cache
 
 
-def moe_layer(x, router_w, router_bias, w1_stack, w2_stack, w3_stack):
-    # x: (B, H), router_w: (E, H), biases (E,), experts (E, MOE_INTER, H) etc.
+def moe_layer(x, router_w, router_bias, w1, w2, w3):
+    """Gather-based reference MoE. Uses nvfp4_matmul for each of TOP_K experts.
+    For a bench, this path measures the correct FLOPs/memory even if not
+    shard_map optimal.
+
+    w1, w2, w3 are tuples: (packed, scales, global_scale).
+      w1/w3 packed shape: (NUM_EXPERTS, MOE_INTER, H/2)
+      w2   packed shape: (NUM_EXPERTS, H, MOE_INTER/2)
+    """
     B_ = x.shape[0]
-    logits = jax.nn.sigmoid((x.astype(jnp.float32) @ router_w.T.astype(jnp.float32)))  # (B, E)
+    logits = jax.nn.sigmoid(x.astype(jnp.float32) @ router_w.T.astype(jnp.float32))
     biased = logits + router_bias.astype(jnp.float32)
     _, topk_idx = jax.lax.top_k(biased, TOP_K)  # (B, K)
-    # gather unbiased scores
-    gathered = jnp.take_along_axis(logits, topk_idx, axis=1)  # (B, K)
-    weights = (gathered / (gathered.sum(axis=-1, keepdims=True) + 1e-9)).astype(x.dtype)  # (B, K)
-    # For each token, for each of TOP_K, gather expert weights and compute
-    # Reference (gather) path — slow but correct. Shard_map path is in m2_moe.py.
-    w1_sel = w1_stack[topk_idx]  # (B, K, MOE_INTER, H)
-    w3_sel = w3_stack[topk_idx]
-    w2_sel = w2_stack[topk_idx]  # (B, K, H, MOE_INTER)
-    gate = jnp.einsum('bki,bkmi->bkm', x, w1_sel)
-    up = jnp.einsum('bki,bkmi->bkm', x, w3_sel)
-    h = jax.nn.silu(gate) * up  # (B, K, MOE_INTER)
-    out_per_k = jnp.einsum('bkm,bkhm->bkh', h, w2_sel)  # (B, K, H)
-    return jnp.einsum('bk,bkh->bh', weights, out_per_k)
+    gathered = jnp.take_along_axis(logits, topk_idx, axis=1)
+    weights = (gathered / (gathered.sum(axis=-1, keepdims=True) + 1e-9)).astype(x.dtype)
+
+    # Dequant selected experts. topk_idx has shape (B, K).
+    # w1_packed: (E, M, H/2). gather -> (B, K, M, H/2).
+    def gather_packed(t, idx):
+        return jnp.take(t, idx, axis=0)  # (B, K, ...)
+
+    w1p, w1s, w1g = w1
+    w2p, w2s, w2g = w2
+    w3p, w3s, w3g = w3
+
+    # For each (b, k), dequant one expert and apply gemm. Reshape to batch.
+    # Flatten (B, K) -> BK
+    BK = B_ * TOP_K
+    idx_flat = topk_idx.reshape(BK)
+    x_flat = jnp.repeat(x, TOP_K, axis=0)  # (BK, H)
+
+    # Gather per-expert packed & scales
+    w1p_bk = jnp.take(w1p, idx_flat, axis=0)  # (BK, M, H/2)
+    w1s_bk = jnp.take(w1s, idx_flat, axis=0)  # (BK, M, H/16)
+    w3p_bk = jnp.take(w3p, idx_flat, axis=0)
+    w3s_bk = jnp.take(w3s, idx_flat, axis=0)
+    w2p_bk = jnp.take(w2p, idx_flat, axis=0)  # (BK, H, M/2)
+    w2s_bk = jnp.take(w2s, idx_flat, axis=0)  # (BK, H, M/16)
+
+    # Dequant + matmul per-row. Use vmap.
+    def one_expert(xi, p1, s1, p3, s3, p2, s2):
+        gate = nvfp4_matmul(xi[None], p1, s1, w1g, MOE_INTER, H)[0]
+        up   = nvfp4_matmul(xi[None], p3, s3, w3g, MOE_INTER, H)[0]
+        h = jax.nn.silu(gate) * up
+        out = nvfp4_matmul(h[None], p2, s2, w2g, H, MOE_INTER)[0]
+        return out
+
+    out_bk = jax.vmap(one_expert)(x_flat, w1p_bk, w1s_bk, w3p_bk, w3s_bk, w2p_bk, w2s_bk)
+    out_bk = out_bk.reshape(B_, TOP_K, H)
+    return jnp.einsum('bk,bkh->bh', weights, out_bk)
 
 
-def layer_step(x, layer_w, k_cache, v_cache, pos, cos, sin, post_ln):
-    att_out, k_cache, v_cache = attn_layer(x, layer_w['attn'], layer_w['ln1'],
+def layer_step(x, lw, k_cache, v_cache, pos, cos, sin):
+    att_out, k_cache, v_cache = attn_layer(x, lw['attn'], lw['ln1'],
                                            k_cache, v_cache, pos, cos, sin)
     x = x + att_out
-    h = rms_norm(x, post_ln)
-    moe_out = moe_layer(h, layer_w['rg'], layer_w['rb'],
-                        layer_w['w1'], layer_w['w2'], layer_w['w3'])
+    h = rms_norm(x, lw['ln2'])
+    moe_out = moe_layer(h, lw['rg'], lw['rb'], lw['w1'], lw['w2'], lw['w3'])
     return x + moe_out, k_cache, v_cache
 
 
 def forward_step(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head):
-    # x: (B, H), k_cache/v_cache: (NL, B, max_ctx, NKV, HEAD_DIM)
+    NL = len(all_w)
     for i in range(NL):
         lw = all_w[i]
-        x, k_i, v_i = layer_step(x, lw, k_cache[i], v_cache[i], pos, cos, sin, lw['ln2'])
+        x, k_i, v_i = layer_step(x, lw, k_cache[i], v_cache[i], pos, cos, sin)
         k_cache = k_cache.at[i].set(k_i)
         v_cache = v_cache.at[i].set(v_i)
     h = rms_norm(x, final_norm)
@@ -152,53 +226,62 @@ def forward_step(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head)
     return tok, k_cache, v_cache
 
 
-def random_weights(key, B, max_ctx, mesh):
-    """Allocate random bf16 weights at real shapes. Experts sharded across 'expert' axis."""
+def random_weights(B, max_ctx, mesh, nl):
+    """Random NVFP4-packed weights. Experts sharded along 'expert' axis.
+    Memory ~= 130 GB / 8 chips = ~16 GB/chip for NL=62."""
     expert_spec = NamedSharding(mesh, P('expert', None, None))
     rep_spec = NamedSharding(mesh, P())
-    kv_spec = NamedSharding(mesh, P())
+    rng = np.random.default_rng(42)
 
-    def rand(shape, spec):
-        return jax.device_put(
-            jax.random.normal(key, shape, dtype=DTYPE) * 0.02, spec)
+    def rand_bf16(shape, spec):
+        arr = (rng.standard_normal(size=shape) * 0.02).astype(np.float32)
+        return jax.device_put(jnp.asarray(arr, dtype=DTYPE), spec)
 
-    # Backbone
-    embed = rand((VOCAB, H), rep_spec)
-    final_norm = rand((H,), rep_spec)
-    lm_head = rand((VOCAB, H), rep_spec)
+    def rand_nvfp4(E, rows, cols, spec):
+        """Random NVFP4 weight for E experts. Returns (packed, scales, global_scale)."""
+        packed = rng.integers(0, 256, size=(E, rows, cols // 2), dtype=np.uint8)
+        scales = rng.integers(0, 256, size=(E, rows, cols // GROUP_SIZE), dtype=np.uint8)
+        gscale = 0.01  # one global float32, small
+        packed_d = jax.device_put(jnp.asarray(packed), spec)
+        scales_d = jax.device_put(jnp.asarray(scales), spec)
+        return (packed_d, scales_d, float(gscale))
+
+    # Backbone (bf16, replicated)
+    embed = rand_bf16((VOCAB, H), rep_spec)
+    final_norm = rand_bf16((H,), rep_spec)
+    lm_head = rand_bf16((VOCAB, H), rep_spec)
 
     # Per-layer
     all_w = []
-    for i in range(NL):
-        key, sub = jax.random.split(key)
+    for i in range(nl):
         lw = {
-            'ln1': rand((H,), rep_spec),
-            'ln2': rand((H,), rep_spec),
+            'ln1': rand_bf16((H,), rep_spec),
+            'ln2': rand_bf16((H,), rep_spec),
             'attn': {
-                'q': rand((NH * HEAD_DIM, H), rep_spec),
-                'k': rand((NKV * HEAD_DIM, H), rep_spec),
-                'v': rand((NKV * HEAD_DIM, H), rep_spec),
-                'o': rand((H, NH * HEAD_DIM), rep_spec),
-                'qn': rand((HEAD_DIM,), rep_spec),
-                'kn': rand((HEAD_DIM,), rep_spec),
+                'q': rand_bf16((NH * HEAD_DIM, H), rep_spec),
+                'k': rand_bf16((NKV * HEAD_DIM, H), rep_spec),
+                'v': rand_bf16((NKV * HEAD_DIM, H), rep_spec),
+                'o': rand_bf16((H, NH * HEAD_DIM), rep_spec),
+                'qn': rand_bf16((HEAD_DIM,), rep_spec),
+                'kn': rand_bf16((HEAD_DIM,), rep_spec),
             },
-            'rg': rand((NUM_EXPERTS, H), rep_spec),
-            'rb': rand((NUM_EXPERTS,), rep_spec),
-            'w1': rand((NUM_EXPERTS, MOE_INTER, H), expert_spec),
-            'w2': rand((NUM_EXPERTS, H, MOE_INTER), expert_spec),
-            'w3': rand((NUM_EXPERTS, MOE_INTER, H), expert_spec),
+            'rg': rand_bf16((NUM_EXPERTS, H), rep_spec),
+            'rb': rand_bf16((NUM_EXPERTS,), rep_spec),
+            # NVFP4 expert weights, sharded along expert axis
+            'w1': rand_nvfp4(NUM_EXPERTS, MOE_INTER, H, expert_spec),
+            'w3': rand_nvfp4(NUM_EXPERTS, MOE_INTER, H, expert_spec),
+            'w2': rand_nvfp4(NUM_EXPERTS, H, MOE_INTER, expert_spec),
         }
         all_w.append(lw)
-        print(f"  layer {i+1}/{NL}", file=sys.stderr, end='\r')
+        print(f"  layer {i+1}/{nl}", file=sys.stderr, end='\r')
     print(file=sys.stderr)
 
-    # KV cache
+    # KV cache (bf16, replicated — small at B=1,ctx=2048)
     k_cache = jax.device_put(
-        jnp.zeros((NL, B, max_ctx, NKV, HEAD_DIM), dtype=DTYPE), kv_spec)
+        jnp.zeros((nl, B, max_ctx, NKV, HEAD_DIM), dtype=DTYPE), rep_spec)
     v_cache = jax.device_put(
-        jnp.zeros((NL, B, max_ctx, NKV, HEAD_DIM), dtype=DTYPE), kv_spec)
+        jnp.zeros((nl, B, max_ctx, NKV, HEAD_DIM), dtype=DTYPE), rep_spec)
 
-    # RoPE tables
     cos, sin = precompute_rope(ROPE_THETA, ROTARY_DIM, max_ctx)
     cos = jax.device_put(jnp.array(cos), rep_spec)
     sin = jax.device_put(jnp.array(sin), rep_spec)
@@ -206,18 +289,15 @@ def random_weights(key, B, max_ctx, mesh):
     return embed, final_norm, lm_head, all_w, k_cache, v_cache, cos, sin
 
 
-def bench_batch(mesh, B, max_ctx, iters, warmup):
-    key = jax.random.PRNGKey(0)
+def bench_batch(mesh, B, max_ctx, iters, warmup, nl):
     embed, final_norm, lm_head, all_w, k_cache, v_cache, cos, sin = random_weights(
-        key, B, max_ctx, mesh)
+        B, max_ctx, mesh, nl)
 
     forward_jit = jax.jit(forward_step)
 
-    # Dummy input token at pos=0
     tok = jnp.zeros((B,), dtype=jnp.int32)
     x = embed[tok]
 
-    # Warmup
     print(f"  warmup ({warmup} iters)...", file=sys.stderr)
     for it in range(warmup):
         tok, k_cache, v_cache = forward_jit(x, all_w, k_cache, v_cache,
@@ -226,7 +306,6 @@ def bench_batch(mesh, B, max_ctx, iters, warmup):
         x = embed[tok]
     jax.block_until_ready(tok)
 
-    # Timed
     print(f"  measure ({iters} iters)...", file=sys.stderr)
     times = []
     for it in range(iters):
@@ -239,8 +318,7 @@ def bench_batch(mesh, B, max_ctx, iters, warmup):
         x = embed[tok]
     times = np.array(times)
     return {
-        'batch': B,
-        'ctx': max_ctx,
+        'batch': B, 'ctx': max_ctx, 'nl': nl,
         'iters': iters,
         'ms_min': float(times.min()),
         'ms_mean': float(times.mean()),
@@ -252,35 +330,46 @@ def bench_batch(mesh, B, max_ctx, iters, warmup):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--batch', default='1,8,32,128',
-                   help='comma-separated batch sizes')
+    p.add_argument('--batch', default='1,8,32', help='comma-separated batch sizes')
     p.add_argument('--ctx', type=int, default=2048)
     p.add_argument('--iters', type=int, default=20)
     p.add_argument('--warmup', type=int, default=5)
+    p.add_argument('--nl', type=int, default=NL_FULL,
+                   help='number of layers to bench (default 62=full)')
     p.add_argument('--out', default=None)
     args = p.parse_args()
 
     batches = [int(b) for b in args.batch.split(',')]
     mesh = make_mesh_v6e8()
     print(f"mesh: {mesh}", file=sys.stderr)
+    print(f"layers: {args.nl} / {NL_FULL}", file=sys.stderr)
 
     results = []
     for B in batches:
-        print(f"\n=== batch B={B} ctx={args.ctx} ===", file=sys.stderr)
-        r = bench_batch(mesh, B, args.ctx, args.iters, args.warmup)
-        print(f"  B={B:4d} ms/step={r['ms_mean']:.2f} (min={r['ms_min']:.2f})  tok/s={r['tok_per_s']:.1f}")
+        print(f"\n=== batch B={B} ctx={args.ctx} NL={args.nl} ===", file=sys.stderr)
+        try:
+            r = bench_batch(mesh, B, args.ctx, args.iters, args.warmup, args.nl)
+        except Exception as e:
+            print(f"  FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+            results.append({'batch': B, 'error': f'{type(e).__name__}: {e}'})
+            continue
+        per_layer_ms = r['ms_mean'] / args.nl
+        full_model_ms = per_layer_ms * NL_FULL
+        full_tok_s = 1000.0 * B / full_model_ms
+        print(f"  B={B:4d} NL={args.nl} ms/step={r['ms_mean']:.2f} (min={r['ms_min']:.2f})  tok/s@NL={args.nl}={r['tok_per_s']:.1f}")
+        print(f"         per-layer={per_layer_ms:.3f}ms  extrapolated full 62L: ms/step={full_model_ms:.2f}  tok/s={full_tok_s:.1f}")
+        r['per_layer_ms'] = per_layer_ms
+        r['extrap_full_ms'] = full_model_ms
+        r['extrap_full_tok_per_s'] = full_tok_s
         results.append(r)
 
     out_path = args.out or f"/tmp/m2_synth_bench_{int(time.time())}.json"
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, 'w') as f:
         json.dump({
-            'arch': 'MiniMax-M2.7 synth-weights',
+            'arch': 'MiniMax-M2.7-NVFP4 synth',
             'slice': 'v6e-8',
-            'n_layers': NL,
-            'n_experts': NUM_EXPERTS,
-            'top_k': TOP_K,
-            'moe_inter': MOE_INTER,
+            'n_layers_full': NL_FULL, 'n_layers_run': args.nl,
+            'n_experts': NUM_EXPERTS, 'top_k': TOP_K, 'moe_inter': MOE_INTER,
             'results': results,
         }, f, indent=2)
     print(f"\nwrote {out_path}")
