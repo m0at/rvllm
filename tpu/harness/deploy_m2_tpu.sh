@@ -148,10 +148,15 @@ if [[ "${SPOT:-0}" == "1" ]]; then
   SPOT_FLAG=" --spot"
   echo "   (spot/preemptible requested — may be reclaimed by Google at any time)"
 fi
+DATA_DISK_FLAG=""
+if [[ -n "${DATA_DISK:-}" ]]; then
+  DATA_DISK_FLAG=" --data-disk source=projects/${PROJECT}/zones/${ZONE}/disks/${DATA_DISK},mode=read-write"
+  echo "   attaching data disk: ${DATA_DISK}"
+fi
 CREATE_CMD="gcloud compute tpus tpu-vm create '${TPU_NAME}' \
   --zone='${ZONE}' --project='${PROJECT}' \
   --accelerator-type='${ACCELERATOR}' \
-  --version='${VERSION}'${SPOT_FLAG}"
+  --version='${VERSION}'${SPOT_FLAG}${DATA_DISK_FLAG}"
 if [[ "$DRY_RUN" -eq 0 ]]; then
   if gcloud compute tpus tpu-vm describe "$TPU_NAME" --zone="$ZONE" --project="$PROJECT" >/dev/null 2>&1; then
     echo "   TPU VM ${TPU_NAME} already exists; skipping create."
@@ -174,8 +179,34 @@ fi
 SSH_BASE="gcloud compute tpus tpu-vm ssh '${TPU_NAME}' --zone='${ZONE}' --project='${PROJECT}'"
 SCP_BASE="gcloud compute tpus tpu-vm scp --zone='${ZONE}' --project='${PROJECT}'"
 
-echo ">> (4) create run dir ${RUN_DIR} on remote"
-MKDIR_CMD="${SSH_BASE} --command=\"sudo mkdir -p '${RUN_DIR}' && sudo chown -R \\\$USER:\\\$USER /workspace && rm -rf '${RUN_DIR}'/* && mkdir -p '${RUN_DIR}'\""
+echo ">> (4) mount data disk (if attached) + create run dir ${RUN_DIR} on remote"
+MOUNT_SCRIPT=$(cat <<EOS
+set -euo pipefail
+# If an unformatted data disk is attached, format and mount it at /workspace.
+for dev in /dev/sdb /dev/nvme0n1 /dev/nvme1n1 /dev/disk/by-id/google-persistent-disk-1; do
+  if [[ -b "\$dev" ]]; then
+    if ! sudo blkid "\$dev" >/dev/null 2>&1; then
+      echo "formatting \$dev as ext4"
+      sudo mkfs.ext4 -F "\$dev"
+    fi
+    if ! mountpoint -q /workspace; then
+      sudo mkdir -p /workspace
+      sudo mount "\$dev" /workspace
+      sudo chown -R "\$(id -u):\$(id -g)" /workspace
+      echo "mounted \$dev at /workspace"
+    fi
+    break
+  fi
+done
+sudo mkdir -p '${RUN_DIR}'
+sudo chown -R "\$(id -u):\$(id -g)" /workspace
+rm -rf '${RUN_DIR}'/* 2>/dev/null || true
+mkdir -p '${RUN_DIR}'
+df -h /workspace
+EOS
+)
+MOUNT_SCRIPT="${MOUNT_SCRIPT//\$/\\\$}"
+MKDIR_CMD="${SSH_BASE} --command=\"${MOUNT_SCRIPT//\"/\\\"}\""
 run "$MKDIR_CMD"
 
 echo ">> (5a) build local tarball from git HEAD"
