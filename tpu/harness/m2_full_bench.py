@@ -241,6 +241,10 @@ def main():
     p.add_argument('--out', default=None)
     args = p.parse_args()
 
+    # Line-buffered stdout so progress shows up in log immediately.
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     mesh = make_mesh_v6e8()
     print(f"mesh: {mesh}", file=sys.stderr)
 
@@ -264,18 +268,27 @@ def main():
         'generation': None,
     }
 
-    # 1. Batch sweep
+    # 1. Batch sweep. Each batch clears its compile cache to free HBM.
     if not args.skip_sweep:
-        print("\n### Batch sweep ###", file=sys.stderr)
+        print("\n### Batch sweep ###", file=sys.stderr, flush=True)
         sweep_results = []
         for B in [int(b) for b in args.batches.split(',')]:
             try:
                 r = bench_batch(mesh, model_state, B, args.ctx, args.iters, args.warmup)
-                print(f"  B={B:4d} ms/step={r['ms_mean']:.2f} tok/s={r['tok_per_s']:.1f}")
+                line = f"  B={B:4d} ms/step={r['ms_mean']:.2f} tok/s={r['tok_per_s']:.1f}"
+                print(line, flush=True)
+                sys.stderr.write(line + '\n'); sys.stderr.flush()
                 sweep_results.append(r)
             except Exception as e:
-                print(f"  B={B} FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+                print(f"  B={B} FAILED: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
                 sweep_results.append({'batch': B, 'error': str(e)})
+            # Free XLA-side HBM holdings so the next batch compile has room.
+            try:
+                jax.clear_caches()
+            except Exception:
+                pass
+            import gc
+            gc.collect()
         out['sweep'] = sweep_results
 
     # 2. Perplexity
