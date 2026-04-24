@@ -143,6 +143,39 @@ python3 -u m2_full_bench.py \
   --out /tmp/m2_final.json
 ```
 
+For throughput experiments, prefer the subprocess sweep wrapper. It runs each
+batch in a fresh process, then runs a correctness gate that compares baseline
+PPL/generation against the optimized env before writing `final.json`:
+
+```bash
+export M2_MOE=shardmap
+export OPT_LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true \
+  --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true \
+  --xla_tpu_enable_async_collective_fusion_multiple_steps=true \
+  --xla_tpu_overlap_compute_collective_tc=true"
+
+MODEL_DIR=/dev/shm/m2-nvfp4 \
+BATCHES="1 8" \
+OUT_DIR=/tmp/m2_sweep \
+LOG_DIR=/tmp/m2_sweep_logs \
+bash ~/runs/$SHA/tpu/harness/run_sweep_subproc.sh
+```
+
+Gate outputs:
+
+| File | Contents |
+|---|---|
+| `/tmp/m2_sweep/baseline_ppl_gen.json` | Baseline `M2_MOE=shardmap`, empty `LIBTPU_INIT_ARGS` |
+| `/tmp/m2_sweep/optimized_ppl_gen.json` | Current optimized env |
+| `/tmp/m2_sweep/correctness_gate.json` | PPL delta, generation-prefix match, pass/fail |
+| `/tmp/m2_sweep/final.json` | Batch sweep plus optimized PPL/gen and gate result |
+
+Default gate thresholds are conservative: PPL may not regress by more than
+`max(0.10 absolute, 3% relative)`, the generated text must share the first 80
+characters with baseline, and control-character floods fail the run. Override
+with `PPL_ABS_TOL`, `PPL_REL_TOL`, `MIN_PREFIX_CHARS`, or set
+`RUN_CORRECTNESS_GATE=0` only for exploratory timing.
+
 Flag reference:
 
 | Flag | Effect |

@@ -177,13 +177,13 @@ On the VM:
 export PATH="$HOME/.local/bin:$PATH"
 export JAX_COMPILATION_CACHE_DIR="$HOME/.jax_cache"
 export M2_MOE=shardmap
-python3 -u /tmp/m2_full_bench.py \
-  --model-dir /dev/shm/m2-nvfp4 \
-  --batches 8 --ctx 2048 --iters 10 --warmup 3 \
-  --prompt "Explain angular momentum." --gen-tokens 256 \
-  --ppl-text /tmp/wiki.txt \
-  --out /tmp/m2_final.json
+bash ~/runs/$SHA/tpu/harness/run_sweep_subproc.sh
 ```
+
+`run_sweep_subproc.sh` runs each batch in a fresh process and then gates any
+optimized TPU env against a `M2_MOE=shardmap` baseline: PPL must stay within
+`max(0.10 absolute, 3% relative)`, generation must keep the same prefix, and
+control-character floods fail the run. Results land in `/tmp/m2_sweep/final.json`.
 
 Full walkthrough in [`tpu/harness/M2_SETUP_GUIDE.md`](tpu/harness/M2_SETUP_GUIDE.md).
 

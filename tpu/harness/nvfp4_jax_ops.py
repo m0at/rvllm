@@ -17,6 +17,8 @@ Exports:
 Per modelopt NVFP4 two-level scaling: decoded = fp4_lut * fp8_block_scale * global_scale.
 The `global_scale` / `w_scale_2` is a per-tensor FP32 scalar.
 """
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -27,6 +29,23 @@ _FP4_LUT = jnp.array(
      -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=jnp.bfloat16,
 )
+
+
+def _env_k_block(default):
+    raw = os.environ.get("RVLLM_NVFP4_K_BLOCK", "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"RVLLM_NVFP4_K_BLOCK must be an integer multiple of 16, got {raw!r}"
+        ) from exc
+    if value <= 0 or value % 16 != 0:
+        raise ValueError(
+            f"RVLLM_NVFP4_K_BLOCK must be a positive multiple of 16, got {value}"
+        )
+    return value
 
 
 def _fp8_e4m3_to_f32(bits):
@@ -84,7 +103,7 @@ def nvfp4_to_bf16_jax(packed, scales, global_scale, out_shape):
 
 
 def nvfp4_matmul(x_bf16, w_packed, w_scales, w_scale_2, out_features, in_features,
-                 k_block=512):
+                 k_block=None):
     """Fused: dequant W on the fly in K-blocks, then x @ W^T.
 
     Tiles along the reduction (K / in_features) axis via lax.scan so the full
@@ -98,6 +117,9 @@ def nvfp4_matmul(x_bf16, w_packed, w_scales, w_scale_2, out_features, in_feature
     w_scale_2: f32 scalar (modelopt per-tensor global scale)
     Returns:   (..., out_features) bf16
     """
+    if k_block is None:
+        k_block = _env_k_block(512)
+
     # If in_features is too small to tile, fall back to single-shot dequant.
     if in_features <= k_block or (in_features % k_block) != 0 or (k_block % 16) != 0:
         w_bf16 = nvfp4_to_bf16_jax(

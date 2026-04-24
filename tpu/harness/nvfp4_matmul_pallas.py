@@ -24,6 +24,8 @@ SRAM budget per tile pair:
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -35,6 +37,19 @@ NVFP4_LUT = jnp.array(
      -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=jnp.bfloat16,
 )
+
+
+def _env_int(name, default, multiple):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value <= 0 or value % multiple != 0:
+        raise ValueError(f"{name} must be a positive multiple of {multiple}, got {value}")
+    return value
 
 
 def _fp8_e4m3_to_bf16_vec(bits_u8):
@@ -93,7 +108,7 @@ def _kernel_body(x_ref, wq_ref, ws_ref, gs_ref, acc_ref, *, BK, GS):
 
 def nvfp4_matmul_pallas(x_bf16, w_packed, w_scales, w_scale_2,
                        out_features, in_features,
-                       BM=128, BN=256, BK=512, GS=16):
+                       BM=None, BN=None, BK=None, GS=16):
     """Pallas fused NVFP4 -> MXU matmul.
 
     x_bf16:    (..., in_features) bf16
@@ -107,6 +122,10 @@ def nvfp4_matmul_pallas(x_bf16, w_packed, w_scales, w_scale_2,
         N -> BN (parallel)
         K -> BK (reduction, serial accum into f32 acc)
     """
+    BM = _env_int("RVLLM_NVFP4_PALLAS_BM", 128, 1) if BM is None else BM
+    BN = _env_int("RVLLM_NVFP4_PALLAS_BN", 256, 16) if BN is None else BN
+    BK = _env_int("RVLLM_NVFP4_PALLAS_BK", 512, GS) if BK is None else BK
+
     # Reshape inputs to 2D for the kernel; preserve leading batch dims via reshape.
     leading = x_bf16.shape[:-1]
     M = 1
