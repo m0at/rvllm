@@ -61,17 +61,18 @@ FP4_LUT = jnp.asarray(FP4_VALUES, dtype=DTYPE)
 
 
 def fp8_e4m3_decode(bits_u8: jax.Array) -> jax.Array:
-    """uint8 bits -> f32 using IEEE-like E4M3 (sign 1, exp 4 bias 7, mant 3)."""
+    """FP8 E4M3 -> f32 via IEEE-754 f32 bit layout (Agent 15 fast path)."""
     b = bits_u8.astype(jnp.uint32)
-    sign = (b >> 7) & 1
-    exp = (b >> 3) & 0xF
-    mant = b & 0x7
-    # Normal: 2^(exp-7) * (1 + mant/8); subnormal (exp==0): (mant/8) * 2^-6
-    sign_f = jnp.where(sign == 1, -1.0, 1.0).astype(jnp.float32)
-    norm = jnp.power(2.0, exp.astype(jnp.float32) - 7.0) * (1.0 + mant.astype(jnp.float32) / 8.0)
-    sub = (mant.astype(jnp.float32) / 8.0) * jnp.power(2.0, -6.0)
-    val = jnp.where(exp == 0, sub, norm)
-    return sign_f * val
+    sign = (b >> 7) & jnp.uint32(1)
+    exp = (b >> 3) & jnp.uint32(0xF)
+    mant = b & jnp.uint32(0x7)
+    sign_bit = sign << jnp.uint32(31)
+    u_norm = sign_bit | ((exp + jnp.uint32(120)) << jnp.uint32(23)) | (mant << jnp.uint32(20))
+    val_norm = jax.lax.bitcast_convert_type(u_norm, jnp.float32)
+    sub = mant.astype(jnp.float32) * jnp.float32((1.0 / 8.0) * (2.0 ** -6))
+    sign_f = jnp.where(sign == jnp.uint32(1), jnp.float32(-1.0), jnp.float32(1.0))
+    val = jnp.where(exp == jnp.uint32(0), sign_f * sub, val_norm)
+    return val
 
 
 def nvfp4_dequant_bf16(packed: jax.Array, scales_u8: jax.Array, global_scale_f32: float,

@@ -350,7 +350,10 @@ def _moe_shard_map_nvfp4(
         local_expert = flat_idx % experts_per_shard
         token_id = jnp.repeat(jnp.arange(B), TOP_K)
 
-        capacity = (B * TOP_K + n_shards - 1) // n_shards * 2
+        # Fix (Agent 11): worst case is all TOP_K landing on the same shard.
+        # Previous formula `ceil(B*TOP_K / n_shards) * 2` silently dropped
+        # contributions for concentrated routing. Use tight bound.
+        capacity = min(B * TOP_K, B * experts_per_shard)
 
         order = jnp.argsort(dest_shard, stable=True)
         sorted_dest = dest_shard[order]
@@ -402,10 +405,19 @@ def _moe_shard_map_nvfp4(
             send_tok_id, 'expert', split_axis=0, concat_axis=0, tiled=True
         )
 
-        local_out = jnp.zeros_like(recv_tokens)
+        # Fix (Agent 1): flatten leading (n_shards, capacity) dims so
+        # downstream `[:, None]` broadcasts align with (N, H) correctly.
+        N = n_shards * capacity
+        recv_tokens_f = recv_tokens.reshape(N, H_dim)
+        recv_local_f = recv_local.reshape(N)
+        recv_valid_f = recv_valid.reshape(N)
+        recv_w_f = recv_w.reshape(N)
+        recv_tok_id_f = recv_tok_id.reshape(N)
+
+        local_out = jnp.zeros_like(recv_tokens_f)
         for e in range(experts_per_shard):
-            mask = (recv_local == e) & recv_valid
-            x_e = recv_tokens * mask[:, None].astype(recv_tokens.dtype)
+            mask = (recv_local_f == e) & recv_valid_f
+            x_e = recv_tokens_f * mask[:, None].astype(recv_tokens_f.dtype)
             gate = nvfp4_matmul(
                 x_e, w1p_l[e], w1s_l[e], w1g_l[e], inter_dim, H_dim
             )  # (N, MOE_INTER)
@@ -418,7 +430,7 @@ def _moe_shard_map_nvfp4(
             )  # (N, H)
             local_out = local_out + d * mask[:, None].astype(d.dtype)
 
-        local_out = local_out * recv_w[:, None].astype(local_out.dtype)
+        local_out = local_out * recv_w_f[:, None].astype(local_out.dtype)
 
         send_back = local_out.reshape(n_shards, capacity, H_dim)
         recv_back = jax.lax.all_to_all(

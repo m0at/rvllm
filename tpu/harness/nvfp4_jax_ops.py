@@ -30,35 +30,25 @@ _FP4_LUT = jnp.array(
 
 
 def _fp8_e4m3_to_f32(bits):
-    """FP8 E4M3 (1 sign, 4 exp bias=7, 3 mantissa) uint8 bits -> f32.
+    """FP8 E4M3 -> f32 via direct IEEE-754 f32 bit layout (Agent 15).
 
-    Pure bit manipulation. Special: 0x00/0x80 = +/-0, 0x7F/0xFF = NaN.
-    Denormals handled via explicit exp==0 branch.
+    Rebias E4M3 exp (bias 7) to f32 exp (bias 127) by adding 120, and shift
+    3-bit mantissa into f32 mantissa bits 20..22. Avoids `jnp.power`/`jnp.exp2`
+    which XLA can't lower to a cheap integer shift.
     """
-    bits = bits.astype(jnp.uint32)
-    sign = (bits >> 7) & jnp.uint32(1)
-    exp = (bits >> 3) & jnp.uint32(0xF)
-    mant = bits & jnp.uint32(0x7)
-
-    sign_f = jnp.where(sign == 1, jnp.float32(-1.0), jnp.float32(1.0))
-
-    # Normal: value = 2^(exp-7) * (1 + mant/8)
-    mant_norm = jnp.float32(1.0) + mant.astype(jnp.float32) * jnp.float32(1.0 / 8.0)
-    # Cast exp to int32 for signed subtraction before exponentiating.
-    exp_unb = exp.astype(jnp.int32) - jnp.int32(7)
-    pow_norm = jnp.exp2(exp_unb.astype(jnp.float32))
-    val_norm = mant_norm * pow_norm
-
-    # Subnormal (exp==0): value = 2^-6 * (mant/8)
-    val_sub = mant.astype(jnp.float32) * jnp.float32(1.0 / 8.0) * jnp.float32(2.0 ** -6)
-
-    # NaN: 0x7F / 0xFF (exp==0xF and mant==0x7)
+    b = bits.astype(jnp.uint32)
+    sign = (b >> 7) & jnp.uint32(1)
+    exp = (b >> 3) & jnp.uint32(0xF)
+    mant = b & jnp.uint32(0x7)
+    sign_bit = sign << jnp.uint32(31)
+    u_norm = sign_bit | ((exp + jnp.uint32(120)) << jnp.uint32(23)) | (mant << jnp.uint32(20))
+    val_norm = jax.lax.bitcast_convert_type(u_norm, jnp.float32)
+    # Subnormal (exp==0): (mant/8) * 2^-6
+    sub = mant.astype(jnp.float32) * jnp.float32((1.0 / 8.0) * (2.0 ** -6))
+    sign_f = jnp.where(sign == jnp.uint32(1), jnp.float32(-1.0), jnp.float32(1.0))
+    val = jnp.where(exp == jnp.uint32(0), sign_f * sub, val_norm)
     is_nan = (exp == jnp.uint32(0xF)) & (mant == jnp.uint32(0x7))
-
-    val = jnp.where(exp == jnp.uint32(0), val_sub, val_norm)
-    val = sign_f * val
-    val = jnp.where(is_nan, jnp.float32("nan"), val)
-    return val
+    return jnp.where(is_nan, jnp.float32("nan"), val)
 
 
 def nvfp4_to_bf16_jax(packed, scales, global_scale, out_shape):
@@ -93,8 +83,14 @@ def nvfp4_to_bf16_jax(packed, scales, global_scale, out_shape):
     return fp4_bf16 * scale_expanded
 
 
-def nvfp4_matmul(x_bf16, w_packed, w_scales, w_scale_2, out_features, in_features):
-    """Fused: dequant W on the fly, then x @ W^T.
+def nvfp4_matmul(x_bf16, w_packed, w_scales, w_scale_2, out_features, in_features,
+                 k_block=512):
+    """Fused: dequant W on the fly in K-blocks, then x @ W^T.
+
+    Tiles along the reduction (K / in_features) axis via lax.scan so the full
+    (out_features, in_features) bf16 intermediate never materializes. XLA only
+    holds one K_BLOCK-sized tile live per step — peak ~3 MB for out=3072 K=512
+    vs ~18 MB for the whole weight. Fix (Agent 9) for the 36.84G HBM compile OOM.
 
     x_bf16:    (..., in_features) bf16
     w_packed:  (out_features, in_features/2) uint8
@@ -102,15 +98,45 @@ def nvfp4_matmul(x_bf16, w_packed, w_scales, w_scale_2, out_features, in_feature
     w_scale_2: f32 scalar (modelopt per-tensor global scale)
     Returns:   (..., out_features) bf16
     """
-    w_bf16 = nvfp4_to_bf16_jax(
-        w_packed, w_scales, w_scale_2, (out_features, in_features))
-    # x @ W.T: contract last axis of x with last axis of W.
-    out = jax.lax.dot_general(
-        x_bf16, w_bf16,
-        dimension_numbers=(((x_bf16.ndim - 1,), (1,)), ((), ())),
-        preferred_element_type=jnp.bfloat16,
-    )
-    return out
+    # If in_features is too small to tile, fall back to single-shot dequant.
+    if in_features <= k_block or (in_features % k_block) != 0 or (k_block % 16) != 0:
+        w_bf16 = nvfp4_to_bf16_jax(
+            w_packed, w_scales, w_scale_2, (out_features, in_features))
+        out = jax.lax.dot_general(
+            x_bf16, w_bf16,
+            dimension_numbers=(((x_bf16.ndim - 1,), (1,)), ((), ())),
+            preferred_element_type=jnp.bfloat16,
+        )
+        return out
+
+    n_blk = in_features // k_block
+    # Reshape inputs/weights for per-block scan.
+    # x_bf16: (..., in_features) -> (..., n_blk, k_block) -> scan over axis -2
+    leading = x_bf16.shape[:-1]
+    xb = x_bf16.reshape(*leading, n_blk, k_block)                     # (..., n_blk, k_block)
+    xb = jnp.moveaxis(xb, -2, 0)                                      # (n_blk, ..., k_block)
+    wp = w_packed.reshape(out_features, n_blk, k_block // 2)          # (out, n_blk, kb/2)
+    wp = jnp.moveaxis(wp, 1, 0)                                       # (n_blk, out, kb/2)
+    ws = w_scales.reshape(out_features, n_blk, k_block // 16)         # (out, n_blk, kb/16)
+    ws = jnp.moveaxis(ws, 1, 0)                                       # (n_blk, out, kb/16)
+
+    gs = jnp.asarray(w_scale_2, dtype=jnp.float32)
+
+    def step(acc, tup):
+        xk, wpk, wsk = tup
+        # Dequant just this K-block.
+        w_tile = nvfp4_to_bf16_jax(wpk, wsk, gs, (out_features, k_block))   # (out, kb) bf16
+        # Contract last axis of xk with last axis of w_tile, accumulate in f32.
+        part = jax.lax.dot_general(
+            xk, w_tile,
+            dimension_numbers=(((xk.ndim - 1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        return acc + part, None
+
+    acc0 = jnp.zeros((*leading, out_features), dtype=jnp.float32)
+    acc, _ = jax.lax.scan(step, acc0, (xb, wp, ws))
+    return acc.astype(jnp.bfloat16)
 
 
 if __name__ == "__main__":
