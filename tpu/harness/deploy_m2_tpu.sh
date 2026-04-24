@@ -250,9 +250,10 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
 fi
 HF_SCRIPT=$(cat <<EOS
 set -euo pipefail
+export PATH="\$HOME/.local/bin:\$PATH"
 ${HF_TOKEN_EXPORT}
 mkdir -p /workspace/models
-pip3 install --quiet --upgrade 'huggingface_hub[cli]'
+pip3 install --quiet --upgrade huggingface_hub
 # Prefer new hf CLI (huggingface_hub 1.5+), fall back to legacy name.
 if command -v hf >/dev/null 2>&1; then
   hf download '${MODEL_REPO}' --local-dir /workspace/models/m2-nvfp4 --max-workers 32
@@ -269,6 +270,7 @@ run "$HF_CMD"
 echo ">> (9) smoke run: m2_tpu_infer --max-tokens 16"
 SMOKE_SCRIPT=$(cat <<EOS
 set -euo pipefail
+export PATH="\$HOME/.local/bin:\$PATH"
 # RVLLM_ZIG_LIB intentionally unset — path A uses pure-JAX dequant and HF tokenizers.
 cd '${RUN_DIR}'
 cat REVISION
