@@ -320,6 +320,22 @@ class ModeloptSafetensorsReader:
         if name not in self._name_to_shard:
             raise KeyError("tensor not found in any shard: %s" % name)
         path = self._name_to_shard[name]
+        # Read tensor info from header so we can bypass safetensors' dtype
+        # translation for exotic dtypes like F8_E4M3 that numpy can't represent.
+        info = self._tensor_info(name)
+        dtype_str = info['dtype'].upper()
+        shape = tuple(info['shape'])
+        data_offsets = info['data_offsets']
+        # Always prefer direct bytes-read for non-native dtypes. This avoids
+        # numpy AttributeError on float8_e4m3fn / float8_e5m2.
+        if dtype_str in ('F8_E4M3', 'F8_E5M2', 'F8_E8M0', 'F4', 'U4', 'I4'):
+            with open(path, 'rb') as f:
+                header_len = struct.unpack('<Q', f.read(8))[0]
+                f.seek(8 + header_len + data_offsets[0])
+                nbytes = data_offsets[1] - data_offsets[0]
+                raw = f.read(nbytes)
+            arr = np.frombuffer(raw, dtype=np.uint8)
+            return arr.reshape(shape) if shape else arr
         h = self._open_shard(path)
         if HAVE_SAFETENSORS:
             return h.get_tensor(name)
