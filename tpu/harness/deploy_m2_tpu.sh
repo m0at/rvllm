@@ -221,8 +221,13 @@ INSTALL_SCRIPT="${INSTALL_SCRIPT//\$/\\\$}"
 INSTALL_CMD="${SSH_BASE} --command=\"${INSTALL_SCRIPT//\"/\\\"}\""
 run "$INSTALL_CMD"
 
-echo ">> (7) build zig project in ${RUN_DIR}/zig"
-BUILD_ZIG_SCRIPT=$(cat <<EOS
+echo ">> (7) build zig project in ${RUN_DIR}/zig (SKIPPED: path A does not need Zig)"
+# Path A (default) uses pure JAX for NVFP4 dequant and falls back to HF tokenizers
+# for BPE. Zig is only needed for Path B (int8 upcast at load) and Zig BPE. The
+# current agent code has Zig 0.13 vs 0.15 API divergence; ship smoke without
+# librvllm_zig.so and revisit later.
+if [[ "${BUILD_ZIG:-0}" == "1" ]]; then
+  BUILD_ZIG_SCRIPT=$(cat <<EOS
 set -euo pipefail
 export PATH="\$HOME/zig-x86_64-linux-0.15.1:\$PATH"
 cd '${RUN_DIR}/zig'
@@ -231,9 +236,12 @@ zig build test
 ls -la zig-out || true
 EOS
 )
-BUILD_ZIG_SCRIPT="${BUILD_ZIG_SCRIPT//\$/\\\$}"
-BUILD_ZIG_CMD="${SSH_BASE} --command=\"${BUILD_ZIG_SCRIPT//\"/\\\"}\""
-run "$BUILD_ZIG_CMD"
+  BUILD_ZIG_SCRIPT="${BUILD_ZIG_SCRIPT//\$/\\\$}"
+  BUILD_ZIG_CMD="${SSH_BASE} --command=\"${BUILD_ZIG_SCRIPT//\"/\\\"}\""
+  run "$BUILD_ZIG_CMD"
+else
+  echo "   skipped; set BUILD_ZIG=1 to enable"
+fi
 
 echo ">> (8) download model ${MODEL_REPO} to /workspace/models/m2-nvfp4"
 HF_TOKEN_EXPORT=""
@@ -261,8 +269,7 @@ run "$HF_CMD"
 echo ">> (9) smoke run: m2_tpu_infer --max-tokens 16"
 SMOKE_SCRIPT=$(cat <<EOS
 set -euo pipefail
-export PATH="\$HOME/zig-x86_64-linux-0.15.1:\$PATH"
-export RVLLM_ZIG_LIB='${RUN_DIR}/zig/zig-out/lib/librvllm_zig.so'
+# RVLLM_ZIG_LIB intentionally unset — path A uses pure-JAX dequant and HF tokenizers.
 cd '${RUN_DIR}'
 cat REVISION
 python3 tpu/harness/m2_tpu_infer.py \
