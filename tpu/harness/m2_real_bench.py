@@ -259,12 +259,42 @@ def load_model_stacked(model_dir, mesh, max_ctx, B, n_workers=16):
 
         return packed_all, scale_all, scale2_all
 
+    # Slice-and-place per device so each chip only sees its shard. Required:
+    # the full (NL, E=256, rows, cols) packed tensor is ~37 GB and would OOM
+    # if staged on one chip before sharding.
+    devs = list(mesh.devices.flatten())
+    n_shards = len(devs)
+
+    def put_expert_sharded(np_arr):
+        """np_arr shape (NL, E, ...); shard axis 1 across devices."""
+        E = np_arr.shape[1]
+        eps = E // n_shards  # experts per shard
+        slabs = []
+        for i, dev in enumerate(devs):
+            local = np_arr[:, i * eps:(i + 1) * eps]  # view
+            slabs.append(jax.device_put(jnp.asarray(local), dev))
+        return jax.make_array_from_single_device_arrays(
+            np_arr.shape, expert_spec, slabs)
+
+    def put_scale2_sharded(np_arr):
+        """np_arr shape (NL, E); shard axis 1 across devices."""
+        E = np_arr.shape[1]
+        eps = E // n_shards
+        slabs = [
+            jax.device_put(jnp.asarray(np_arr[:, i * eps:(i + 1) * eps]), dev)
+            for i, dev in enumerate(devs)
+        ]
+        return jax.make_array_from_single_device_arrays(
+            np_arr.shape, scale2_spec, slabs)
+
     for pn, key_prefix in [('w1', 'w1'), ('w2', 'w2'), ('w3', 'w3')]:
         print(f">> stacking experts {pn}", file=sys.stderr)
         p_arr, s_arr, s2_arr = stack_experts(pn)
-        stacked[f'{key_prefix}_p'] = jax.device_put(jnp.asarray(p_arr), expert_spec)
-        stacked[f'{key_prefix}_s'] = jax.device_put(jnp.asarray(s_arr), expert_spec)
-        stacked[f'{key_prefix}_s2'] = jax.device_put(jnp.asarray(s2_arr), scale2_spec)
+        stacked[f'{key_prefix}_p'] = put_expert_sharded(p_arr)
+        stacked[f'{key_prefix}_s'] = put_expert_sharded(s_arr)
+        stacked[f'{key_prefix}_s2'] = put_scale2_sharded(s2_arr)
+        # Release host memory for this projection before building the next.
+        del p_arr, s_arr, s2_arr
 
     # KV caches
     k_cache = jax.device_put(jnp.zeros((nl, B, max_ctx, NKV, HEAD_DIM), dtype=DTYPE), rep_spec)
