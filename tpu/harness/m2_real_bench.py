@@ -177,9 +177,19 @@ def load_model_stacked(model_dir, mesh, max_ctx, B, n_workers=16):
     final_norm = jax.device_put(jnp.asarray(to_bf16(raw['model.norm.weight']), dtype=DTYPE), rep_spec)
     lm_head = jax.device_put(jnp.asarray(to_bf16(raw['lm_head.weight']), dtype=DTYPE), rep_spec)
 
-    # Per-layer stacked
+    # Per-layer stacked — parallelized via ThreadPool.
+    import os as _os
+    _cpu = max(1, (_os.cpu_count() or 1))
+
     def stack_by_layer(name_fmt):
-        return np.stack([to_bf16(raw[name_fmt.format(i=i)]) for i in range(nl)], axis=0)
+        first = to_bf16(raw[name_fmt.format(i=0)])
+        out = np.empty((nl,) + first.shape, dtype=first.dtype)
+        out[0] = first
+        def fill(i):
+            out[i] = to_bf16(raw[name_fmt.format(i=i)])
+        with ThreadPoolExecutor(max_workers=min(_cpu, nl)) as ex:
+            list(ex.map(fill, range(1, nl)))
+        return out
 
     # Attn shapes: Q (NH*HEAD_DIM, H), K (NKV*HEAD_DIM, H), V (NKV*HEAD_DIM, H), O (H, NH*HEAD_DIM)
     stacked = {
@@ -216,25 +226,38 @@ def load_model_stacked(model_dir, mesh, max_ctx, B, n_workers=16):
     }
 
     # Per-expert NVFP4: for each projection, stack (NL, E, rows, cols/2) packed + (NL, E, rows, cols/16) scale.
+    # Parallelized over layers using ThreadPoolExecutor — numpy releases GIL during memcpy.
     def stack_experts(proj_name):
         """proj_name in {'w1', 'w2', 'w3'}. Returns (packed_stack, scale_stack, scale2_stack)."""
-        packed_all, scale_all, scale2_all = [], [], []
-        for i in range(nl):
+        # Probe shape from layer 0 expert 0.
+        t0 = raw[f'model.layers.0.block_sparse_moe.experts.0.{proj_name}.weight']
+        p_shape = t0.packed.shape
+        s_shape = t0.scales.shape
+        p_dtype = t0.packed.dtype
+        s_dtype = t0.scales.dtype
+
+        # Pre-allocate full output buffers (NL, NUM_EXPERTS, ...) so each worker
+        # memcpys directly into its slice without extra copies.
+        packed_all = np.empty((nl, NUM_EXPERTS) + p_shape, dtype=p_dtype)
+        scale_all = np.empty((nl, NUM_EXPERTS) + s_shape, dtype=s_dtype)
+        scale2_all = np.empty((nl, NUM_EXPERTS), dtype=np.float32)
+
+        def fill_layer(i):
             p = f'model.layers.{i}.block_sparse_moe.experts'
-            packed_L, scale_L, scale2_L = [], [], []
             for e in range(NUM_EXPERTS):
                 t = raw[f'{p}.{e}.{proj_name}.weight']
-                packed_L.append(t.packed)
-                scale_L.append(t.scales)
-                scale2_L.append(np.asarray(t.global_scale, dtype=np.float32))
-            packed_all.append(np.stack(packed_L, axis=0))  # (E, rows, cols/2)
-            scale_all.append(np.stack(scale_L, axis=0))
-            scale2_all.append(np.stack(scale2_L, axis=0))   # (E,)
-        return (
-            np.stack(packed_all, axis=0),   # (NL, E, rows, cols/2)
-            np.stack(scale_all, axis=0),
-            np.stack(scale2_all, axis=0),   # (NL, E)
-        )
+                packed_all[i, e] = t.packed
+                scale_all[i, e] = t.scales
+                scale2_all[i, e] = float(t.global_scale)
+
+        # Fan out across all available CPUs — numpy releases GIL inside
+        # ndarray element assignment, so threads give true parallelism here.
+        import os as _os
+        n_workers = max(1, (_os.cpu_count() or 1))
+        with ThreadPoolExecutor(max_workers=min(n_workers, nl)) as ex:
+            list(ex.map(fill_layer, range(nl)))
+
+        return packed_all, scale_all, scale2_all
 
     for pn, key_prefix in [('w1', 'w1'), ('w2', 'w2'), ('w3', 'w3')]:
         print(f">> stacking experts {pn}", file=sys.stderr)
