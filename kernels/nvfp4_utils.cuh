@@ -219,4 +219,77 @@ __device__ __forceinline__ void unpack16_nvfp4_to_fp32_fast(
 #endif
 }
 
+/// f16-output variant of `unpack16_nvfp4_to_fp32_fast`. Produces the
+/// 16 scaled values directly as f16 in shared memory — avoids the
+/// f16 → f32 expansion the _fp32 variant does at the end, so smem
+/// traffic halves and the output is ready for f16 MMA operands.
+///
+/// Scale multiplication stays in f32 for precision, then casts back
+/// to f16 per element. On Blackwell the `hmul2` + `cvt` path is cheap
+/// enough that keeping scale as f32 is the right tradeoff.
+///
+/// Used by the Fa2 NVFP4 decode / prefill kernels after the f16-MMA
+/// port (task aa01001nvf4f16mma). Output `out_block16` is a f16
+/// array with 16 contiguous elements.
+__device__ __forceinline__ void unpack16_nvfp4_to_f16_fast(
+    uint64_t packed_u64,
+    float    scale_f32,
+    __half*  __restrict__ out_block16
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    uint32_t lo32 = static_cast<uint32_t>(packed_u64 & 0xFFFFFFFFull);
+    uint32_t hi32 = static_cast<uint32_t>(packed_u64 >> 32);
+
+    uint32_t h01, h23, h45, h67;   // low 8 elems as 4 × f16x2
+    uint32_t h89, hAB, hCD, hEF;
+
+    asm volatile(
+        "{\n"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n"
+        "mov.b32 {byte0, byte1, byte2, byte3}, %4;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
+        "cvt.rn.f16x2.e2m1x2 %1, byte1;\n"
+        "cvt.rn.f16x2.e2m1x2 %2, byte2;\n"
+        "cvt.rn.f16x2.e2m1x2 %3, byte3;\n"
+        "}"
+        : "=r"(h01), "=r"(h23), "=r"(h45), "=r"(h67)
+        : "r"(lo32)
+    );
+    asm volatile(
+        "{\n"
+        ".reg .b8 byte0, byte1, byte2, byte3;\n"
+        "mov.b32 {byte0, byte1, byte2, byte3}, %4;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
+        "cvt.rn.f16x2.e2m1x2 %1, byte1;\n"
+        "cvt.rn.f16x2.e2m1x2 %2, byte2;\n"
+        "cvt.rn.f16x2.e2m1x2 %3, byte3;\n"
+        "}"
+        : "=r"(h89), "=r"(hAB), "=r"(hCD), "=r"(hEF)
+        : "r"(hi32)
+    );
+
+    // Each f16x2 packs (val0, val1). Expand to f32, scale, cast to
+    // f16 pair, store as one u32.
+    auto emit = [&] (uint32_t h2, int i) {
+        float2 f = __half22float2(*reinterpret_cast<__half2 const*>(&h2));
+        __half2 out = __floats2half2_rn(f.x * scale_f32, f.y * scale_f32);
+        *reinterpret_cast<__half2*>(out_block16 + i) = out;
+    };
+    emit(h01,  0); emit(h23,  2); emit(h45,  4); emit(h67,  6);
+    emit(h89,  8); emit(hAB, 10); emit(hCD, 12); emit(hEF, 14);
+#else
+    // Scalar fallback for pre-Blackwell archs.
+    uint8_t bytes[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        bytes[i] = static_cast<uint8_t>(packed_u64 >> (8 * i));
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out_block16[2 * i    ] = __float2half(fp4_decode(bytes[i] & 0xFu)      * scale_f32);
+        out_block16[2 * i + 1] = __float2half(fp4_decode((bytes[i] >> 4) & 0xFu) * scale_f32);
+    }
+#endif
+}
+
 } // namespace rvllm_nvfp4

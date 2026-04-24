@@ -31,6 +31,11 @@
       "path": "embedding_gather_f16.ptx",
       "sha256": "3b3270fc87b3aa3a268f960bcdf1785ecd19f3847fbf854fd1ce6e513211f0ea"
     },
+    "f16_mma_probe": {
+      "bytes": 3103,
+      "path": "f16_mma_probe.ptx",
+      "sha256": "e15c2813f4bcd1e6afe24b6f554b0205f72797b7dac9aa8ea4173f719a39e488"
+    },
     "f32_to_bf16": {
       "bytes": 1178,
       "path": "f32_to_bf16.ptx",
@@ -62,9 +67,9 @@
       "sha256": "84eeb1e52112fda81b9190569b483dff6f0618bda68015d7ead1f6958ebb20e6"
     },
     "flash_attention_nvfp4kv": {
-      "bytes": 328441,
+      "bytes": 376712,
       "path": "flash_attention_nvfp4kv.ptx",
-      "sha256": "f6354338070e20a5f52426ec09370509d13daf155323f9abf3dddfee0909ba93"
+      "sha256": "90c0a3d88608f33df627ab1c05df465947a85a5d7f882dbed857c0a6d7857120"
     },
     "flash_attention_unified_prefill": {
       "bytes": 72311,
@@ -157,9 +162,9 @@
       "sha256": "6042d0a7f9357024081cb27dae63207f1c9558a54592afc0fb57783e943cbed0"
     },
     "nvfp4_mma_probe": {
-      "bytes": 1546,
+      "bytes": 4416,
       "path": "nvfp4_mma_probe.ptx",
-      "sha256": "cb5b14ba886119be0fafbc289736e0bbe7171d2b453c36ec29261ca49ebdceb4"
+      "sha256": "6c21c480925b34fd4de713ee8f1e98ba75080e1fea702d8167e720f1c5de5979"
     },
     "nvfp4_roundtrip_probe": {
       "bytes": 33236,
@@ -217,5 +222,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "c3b3839"
+  "revision": "938ab179df54d8a282d02aa3ec4fdcd4238ad31c"
 }

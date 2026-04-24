@@ -551,8 +551,12 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 bt: std::backtrace::Backtrace::capture(),
             })?;
 
+            // Phase 2a (aa01001nvf4f16mma): K/V dequant target is
+            // f16 smem (2 bytes/elem) instead of f32 (4 bytes/elem),
+            // halving the K/V tile footprint. s_score and s_reduce
+            // stay f32 for softmax precision.
             let smem_bytes =
-                2 * fa2_bc * hd * 4 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
+                2 * fa2_bc * hd * 2 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
             if smem_bytes as u32 >= 48 * 1024 {
                 let _ = cuFuncSetAttribute(
                     kernel_fn.raw() as CUfunction,

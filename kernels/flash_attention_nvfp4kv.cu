@@ -10,11 +10,19 @@
 // separate PTX module that the Rust side loads alongside
 // `flash_attention.ptx`.
 //
-// Smem layout (matches FP8 sibling, per tile of `FA2_BC` KV rows):
-//   s_key    [FA2_BC * head_dim]   f32   — K dequant scratch
-//   s_val    [FA2_BC * head_dim]   f32   — V dequant scratch
+// Smem layout (per tile of `FA2_BC` KV rows):
+//   s_key    [FA2_BC * head_dim]   f16   — K dequant scratch (Phase 2a)
+//   s_val    [FA2_BC * head_dim]   f16   — V dequant scratch (Phase 2a)
 //   s_score  [FA2_BC]              f32   — per-row Q·K^T scores
 //   s_reduce [FA2_THREADS / 32]    f32   — block-reduce scratch
+//
+// Phase 2a of task aa01001nvf4f16mma: K/V dequant target switched
+// from f32 to f16 to halve the smem footprint. Q·K^T and P·V inner
+// loops read `__half2float(s_key[i])` / `__half2float(s_val[i])`
+// per element — a single-cycle hw cvt. MMA integration (Phase 2b)
+// is scoped to the prefill kernel where m > 1 makes the MMA fragment
+// shape a real win; at decode m=1 the MMA forces 15/16 dummy rows
+// so scalar FMA over f16 smem stays competitive.
 //
 // Build: same flow as flash_attention.cu (kernels/build.sh picks up
 // `*.cu` automatically). On sm_121 use `-arch=sm_121a` as elsewhere
@@ -75,21 +83,21 @@ __device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
 }
 
 // Dequant one NVFP4-packed KV row of `head_dim` elements into the
-// shared-mem f32 buffer `s_dst` (row starts at `s_dst`, all head_dim
+// shared-mem f16 buffer `s_dst` (row starts at `s_dst`, all head_dim
 // entries). `packed_row` is the 4-bit byte stream, `scale_row` is the
 // head_dim/16 E4M3 microscales.
 //
 // Fast path: the first `head_dim/16` threads in the block each claim
 // one 16-element block (8 packed bytes → one u64 LDG → 4× native
-// `cvt.rn.f16x2.e2m1x2` → 8× f16→f32 + scale multiply → 16 smem
-// stores). ~6× faster than the original thread-per-element
+// `cvt.rn.f16x2.e2m1x2` → 8× scale multiply + cast to f16 → 8 smem
+// stores of f16x2). ~6× faster than the original thread-per-element
 // switch-decode. Remaining threads (>= head_dim/16) are idle for
 // this load — the Q·K^T dot-product downstream is thread-per-dim
 // so they pick work back up there.
 __device__ __forceinline__ void dequant_nvfp4_row_to_smem(
     const uint8_t*       __restrict__ packed_row,   // head_dim / 2 bytes
     const __nv_fp8_e4m3* __restrict__ scale_row,    // head_dim / 16 E4M3
-    float*               __restrict__ s_dst,        // head_dim floats
+    __half*              __restrict__ s_dst,        // head_dim halves
     int tid,
     int head_dim
 ) {
@@ -100,7 +108,7 @@ __device__ __forceinline__ void dequant_nvfp4_row_to_smem(
         const int d_base    = block_idx << 4;
         uint64_t packed8 = *reinterpret_cast<const uint64_t*>(packed_row + (d_base >> 1));
         float    scale   = float(scale_row[block_idx]);
-        rvllm_nvfp4::unpack16_nvfp4_to_fp32_fast(packed8, scale, s_dst + d_base);
+        rvllm_nvfp4::unpack16_nvfp4_to_f16_fast(packed8, scale, s_dst + d_base);
     }
 }
 
@@ -141,11 +149,15 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
 
     const float q_scale = *q_descale;
 
-    extern __shared__ float smem[];
-    float* s_key    = smem;
-    float* s_val    = smem + FA2_BC * head_dim;
-    float* s_score  = smem + 2 * FA2_BC * head_dim;
-    float* s_reduce = smem + 2 * FA2_BC * head_dim + FA2_BC;
+    // Smem layout: f16 K/V tiles + f32 score + f32 reduce scratch.
+    // Allocate the f16 region first (alignment-friendly for f16x2
+    // loads); stash pointer arithmetic on byte offsets so the f32
+    // tail lands 4-byte aligned regardless of FA2_BC.
+    extern __shared__ unsigned char smem_u8[];
+    __half* s_key = reinterpret_cast<__half*>(smem_u8);
+    __half* s_val = s_key + FA2_BC * head_dim;
+    float*  s_score  = reinterpret_cast<float*>(s_val + FA2_BC * head_dim);
+    float*  s_reduce = s_score + FA2_BC;
 
     const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
     const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
@@ -153,6 +165,8 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
     const int scales_per_D = head_dim >> 4;    // E4M3 scales per row
 
     // Load Q row (FP8) with descale + attention scale folded in.
+    // Q stays in f32 regs for the dot product — cheap (single cvt)
+    // and keeps the softmax accumulator in f32 precision.
     float q_reg[8];
     #pragma unroll
     for (int r = 0; r < 8; ++r) {
@@ -175,9 +189,10 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
         const int tile_start = tile * FA2_BC;
         const int tile_len   = min(FA2_BC, context_len - tile_start);
 
-        // --- Load + dequant K tile (NVFP4 → f32 smem). -------------
-        // One CTA thread per dim-chunk, `dims_per_thread` dims each.
-        // Row-major: `t` is the token inside the tile, `d` the dim.
+        // --- Load + dequant K tile (NVFP4 → f16 smem). -------------
+        // First `head_dim/16` threads do the dequant (one 16-element
+        // block each); the rest are idle here and pick work back up
+        // in the thread-per-dim Q·K^T below.
         for (int t = 0; t < tile_len; ++t) {
             int kv_pos    = tile_start + t;
             int page_idx  = kv_pos / block_size;
@@ -196,13 +211,17 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
         __syncthreads();
 
         // --- Q · K^T per column of the tile. -----------------------
+        // f16 smem read + cvt-to-f32 per element keeps the dot in
+        // f32 precision. The cvt is free in practice (single-cycle
+        // hw op on sm_120+).
         for (int t = 0; t < tile_len; ++t) {
             float dot = 0.0f;
             #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 int d = tid + r * FA2_THREADS;
                 if (r < dims_per_thread && d < head_dim) {
-                    dot += q_reg[r] * s_key[t * head_dim + d];
+                    dot += q_reg[r]
+                         * __half2float(s_key[t * head_dim + d]);
                 }
             }
             dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
@@ -244,7 +263,7 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
         row_sum += s_reduce[0];
         __syncthreads();
 
-        // --- Load + dequant V tile (NVFP4 → f32 smem). -------------
+        // --- Load + dequant V tile (NVFP4 → f16 smem). -------------
         for (int t = 0; t < tile_len; ++t) {
             int kv_pos   = tile_start + t;
             int page_idx = kv_pos / block_size;
@@ -269,7 +288,8 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
             if (r < dims_per_thread && d < head_dim) {
                 float val_acc = 0.0f;
                 for (int t = 0; t < tile_len; ++t) {
-                    val_acc += s_score[t] * s_val[t * head_dim + d];
+                    val_acc += s_score[t]
+                             * __half2float(s_val[t * head_dim + d]);
                 }
                 acc[r] += val_acc;
             }
@@ -342,11 +362,11 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
         : (head_idx / (num_heads / num_kv_heads));
     const float q_scale = *q_descale;
 
-    extern __shared__ float smem[];
-    float* s_key    = smem;
-    float* s_val    = smem + FA2_BC * head_dim;
-    float* s_score  = smem + 2 * FA2_BC * head_dim;
-    float* s_reduce = smem + 2 * FA2_BC * head_dim + FA2_BC;
+    extern __shared__ unsigned char smem_u8[];
+    __half* s_key = reinterpret_cast<__half*>(smem_u8);
+    __half* s_val = s_key + FA2_BC * head_dim;
+    float*  s_score  = reinterpret_cast<float*>(s_val + FA2_BC * head_dim);
+    float*  s_reduce = s_score + FA2_BC;
 
     const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
     const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
@@ -391,7 +411,8 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
             #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 int d = tid + r * FA2_THREADS;
-                if (r < dims_per_thread && d < head_dim) dot += q_reg[r] * s_key[t * head_dim + d];
+                if (r < dims_per_thread && d < head_dim)
+                    dot += q_reg[r] * __half2float(s_key[t * head_dim + d]);
             }
             dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
             if (tid == 0) s_score[t] = dot;
@@ -447,7 +468,8 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
             int d = tid + r * FA2_THREADS;
             if (r < dims_per_thread && d < head_dim) {
                 float val_acc = 0.0f;
-                for (int t = 0; t < tile_len; ++t) val_acc += s_score[t] * s_val[t * head_dim + d];
+                for (int t = 0; t < tile_len; ++t)
+                    val_acc += s_score[t] * __half2float(s_val[t * head_dim + d]);
                 acc[r] += val_acc;
             }
         }
@@ -527,11 +549,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_kernel(
 
     const float q_scale = *q_descale;
 
-    extern __shared__ float smem[];
-    float* s_key    = smem;
-    float* s_val    = smem + FA2_BC * head_dim;
-    float* s_score  = smem + 2 * FA2_BC * head_dim;
-    float* s_reduce = smem + 2 * FA2_BC * head_dim + FA2_BC;
+    extern __shared__ unsigned char smem_u8[];
+    __half* s_key = reinterpret_cast<__half*>(smem_u8);
+    __half* s_val = s_key + FA2_BC * head_dim;
+    float*  s_score  = reinterpret_cast<float*>(s_val + FA2_BC * head_dim);
+    float*  s_reduce = s_score + FA2_BC;
 
     const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
     const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
@@ -583,7 +605,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_kernel(
                 for (int r = 0; r < 8; ++r) {
                     int d = tid + r * FA2_THREADS;
                     if (r < dims_per_thread && d < head_dim) {
-                        dot += q_reg[r] * s_key[t * head_dim + d];
+                        dot += q_reg[r] * __half2float(s_key[t * head_dim + d]);
                     }
                 }
                 dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
@@ -647,7 +669,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_kernel(
                 if (r < dims_per_thread && d < head_dim) {
                     float val_acc = 0.0f;
                     for (int t = 0; t < tile_len; ++t)
-                        val_acc += s_score[t] * s_val[t * head_dim + d];
+                        val_acc += s_score[t] * __half2float(s_val[t * head_dim + d]);
                     acc[r] += val_acc;
                 }
             }
@@ -707,11 +729,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_kernel(
         : (head_idx / (num_heads / num_kv_heads));
     const float q_scale = *q_descale;
 
-    extern __shared__ float smem[];
-    float* s_key    = smem;
-    float* s_val    = smem + FA2_BC * head_dim;
-    float* s_score  = smem + 2 * FA2_BC * head_dim;
-    float* s_reduce = smem + 2 * FA2_BC * head_dim + FA2_BC;
+    extern __shared__ unsigned char smem_u8[];
+    __half* s_key = reinterpret_cast<__half*>(smem_u8);
+    __half* s_val = s_key + FA2_BC * head_dim;
+    float*  s_score  = reinterpret_cast<float*>(s_val + FA2_BC * head_dim);
+    float*  s_reduce = s_score + FA2_BC;
 
     const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
     const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
@@ -757,7 +779,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_kernel(
                 for (int r = 0; r < 8; ++r) {
                     int d = tid + r * FA2_THREADS;
                     if (r < dims_per_thread && d < head_dim)
-                        dot += q_reg[r] * s_key[t * head_dim + d];
+                        dot += q_reg[r] * __half2float(s_key[t * head_dim + d]);
                 }
                 dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
                 if (tid == 0) {
@@ -818,7 +840,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_kernel(
                 if (r < dims_per_thread && d < head_dim) {
                     float val_acc = 0.0f;
                     for (int t = 0; t < tile_len; ++t)
-                        val_acc += s_score[t] * s_val[t * head_dim + d];
+                        val_acc += s_score[t] * __half2float(s_val[t * head_dim + d]);
                     acc[r] += val_acc;
                 }
             }
