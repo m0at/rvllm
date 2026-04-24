@@ -86,6 +86,18 @@ pub async fn spawn_cuda_worker(
             // `HbmArena::region AllocFailed` after a handful of
             // calls (each `run_generate` allocates ~a dozen named
             // scratch regions sized for max_tokens + KV cache).
+            //
+            // Initialise the session-level prefix cache BEFORE the
+            // scratch checkpoint so the persistent KV region sits
+            // below the checkpoint and survives every
+            // `arena.restore(scratch_ck)` between requests. This is
+            // what makes the MVP vLLM-style prefix reuse work on
+            // zeroclaw's "identical 15k-token persona every request"
+            // pattern.
+            if let Err(e) = bringup.init_prefix_cache() {
+                let _ = ready_tx.send(Err(format!("init_prefix_cache: {e:?}")));
+                return;
+            }
             let scratch_ck = bringup.arena.checkpoint();
             tracing::info!(
                 compute_cap = ?bringup.ctx.compute_capability(),

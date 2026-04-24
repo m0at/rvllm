@@ -80,9 +80,17 @@ CASES = [
     ("nvfp4-batch-medium",     {"RVLLM_NVFP4_KV": "1", "RVLLM_BATCH_PREFILL": "1"},         256,   "paris"),
     ("nvfp4-batch-large",      {"RVLLM_NVFP4_KV": "1", "RVLLM_BATCH_PREFILL": "1"},        1024,   "paris"),
     ("nvfp4-batch-xlarge",     {"RVLLM_NVFP4_KV": "1", "RVLLM_BATCH_PREFILL": "1"},        2048,   "paris"),
+    # Long-context cases — post-Phase-2b (commit 8e8f517) the NVFP4
+    # unified kernel makes these tractable, but the n² tile walk
+    # still bites at 15k+. These cases are the regression net for
+    # BLOCK_M / tile-size perf work + chunked prefill follow-ups.
+    ("nvfp4-batch-5k",         {"RVLLM_NVFP4_KV": "1", "RVLLM_BATCH_PREFILL": "1"},        5120,   "paris"),
+    ("nvfp4-batch-10k",        {"RVLLM_NVFP4_KV": "1", "RVLLM_BATCH_PREFILL": "1"},       10240,   "paris"),
+    ("nvfp4-batch-15k",        {"RVLLM_NVFP4_KV": "1", "RVLLM_BATCH_PREFILL": "1"},       15360,   "paris"),
     # Reference: same sizes on FP8-batch (known-good after 04fec77).
     ("fp8-batch-medium",       {"RVLLM_BATCH_PREFILL": "1"},                                256,   "paris"),
     ("fp8-batch-large",        {"RVLLM_BATCH_PREFILL": "1"},                               1024,   "paris"),
+    ("fp8-batch-15k",          {"RVLLM_BATCH_PREFILL": "1"},                              15360,   "paris"),
 ]
 
 # --- helpers --------------------------------------------------------------

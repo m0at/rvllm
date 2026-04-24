@@ -113,6 +113,31 @@ pub struct Gemma4FusedModules {
     pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
 }
 
+/// Session-level prefix cache state. Populated on first `run_generate`
+/// call; each subsequent call inspects `last_tokens` for a common
+/// prefix with the incoming prompt and, on hit, skips prefill for
+/// the matched prefix (the KV entries from the previous request
+/// remain valid in the persistent KV region because `kv_cache_ptr`
+/// points above the worker's scratch checkpoint).
+///
+/// MVP of vLLM's block-level prefix caching — no hashing, no
+/// reference counting, just a single "last request's prompt" slot.
+/// Covers the common zeroclaw pattern (identical 15k-token persona
+/// on every request) at a cost of ~100 LOC of plumbing. Full
+/// multi-sequence prefix caching is future work.
+pub struct PrefixCacheState {
+    pub last_tokens: Vec<u32>,
+    pub kv_cache_ptr: u64,
+    pub kv_cache_bytes: u64,
+    pub kv_scale_ptr: u64,
+    pub kv_scale_bytes: u64,
+    pub kv_dtype: crate::gemma4_layer_exec::KvDtype,
+    pub kv_layer_offsets: Vec<u64>,
+    pub kv_scale_layer_offsets: Vec<u64>,
+    pub num_blocks_total: u32,
+    pub block_size: u32,
+}
+
 pub struct Gemma4Bringup {
     pub fused: Gemma4FusedModules,
     pub sliding_attention: AttentionBackend,
@@ -127,6 +152,10 @@ pub struct Gemma4Bringup {
     pub stream: Stream,
     pub arena: HbmArena<'static>,
     pub ctx: Arc<CudaContextHandle>,
+    /// Session-level prefix cache. Populated lazily on first
+    /// `run_generate` call; kept across subsequent calls so the
+    /// KV cache survives the worker's scratch-checkpoint restore.
+    pub prefix_cache: std::sync::Mutex<Option<PrefixCacheState>>,
 }
 
 impl Gemma4Bringup {
@@ -326,7 +355,96 @@ impl Gemma4Bringup {
             global_attention,
             policy,
             fused,
+            prefix_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Allocate the session-level prefix cache's KV cache region.
+    /// Must be called BEFORE the cuda worker takes its scratch
+    /// checkpoint — the region's device pointer is captured as a
+    /// raw u64 and the arena's bump pointer is advanced past it,
+    /// so subsequent `arena.restore(scratch_ck)` calls won't clobber
+    /// the persistent KV data.
+    ///
+    /// Safe to call multiple times; becomes a no-op after the first
+    /// successful init.
+    pub fn init_prefix_cache(&self) -> Result<()> {
+        let mut guard = self.prefix_cache.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
+        let arch = &self.arch;
+        let block_size: u32 = 32;
+        let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let sliding_blocks = num_blocks_total;
+        let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
+
+        let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_total_bytes: u64 = 0;
+        let mut kv_scale_total_bytes: u64 = 0;
+        for l in 0..arch.num_hidden_layers {
+            kv_layer_offsets.push(kv_total_bytes);
+            kv_scale_layer_offsets.push(kv_scale_total_bytes);
+            let is_global = arch.layer_types[l]
+                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+            let hd = arch.head_dim_for_layer(l) as u32;
+            let layer_elems =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+            kv_total_bytes += match kv_dtype {
+                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
+            };
+            let layer_scale_slots =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
+            kv_scale_total_bytes += match kv_dtype {
+                crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
+            };
+        }
+
+        let kv_region = self.arena.region("persistent_kv", kv_total_bytes as usize, 256)?;
+        let kv_cache_ptr = kv_region.device_ptr();
+        let kv_scale_bytes_alloc = kv_scale_total_bytes.max(16) as usize;
+        let kv_scale_region =
+            self.arena.region("persistent_kv_scale", kv_scale_bytes_alloc, 16)?;
+        let kv_scale_ptr = kv_scale_region.device_ptr();
+
+        // Leak the Region wrappers by forgetting them. The arena's
+        // bump pointer has already advanced past both regions, so
+        // their bytes stay reserved for the lifetime of `self.arena`.
+        // `arena.restore(scratch_ck)` run by the cuda worker only
+        // restores to a checkpoint taken AFTER this call, so these
+        // bytes are always above the worker's restore target.
+        std::mem::forget(kv_region);
+        std::mem::forget(kv_scale_region);
+
+        #[cfg(feature = "cuda")]
+        unsafe {
+            cudarc::driver::sys::cuMemsetD8_v2(kv_cache_ptr, 0, kv_total_bytes as usize);
+            cudarc::driver::sys::cuMemsetD8_v2(kv_scale_ptr, 0, kv_scale_bytes_alloc);
+        }
+
+        *guard = Some(PrefixCacheState {
+            last_tokens: Vec::new(),
+            kv_cache_ptr,
+            kv_cache_bytes: kv_total_bytes,
+            kv_scale_ptr,
+            kv_scale_bytes: kv_scale_total_bytes,
+            kv_dtype,
+            kv_layer_offsets,
+            kv_scale_layer_offsets,
+            num_blocks_total,
+            block_size,
+        });
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
@@ -1543,41 +1661,119 @@ impl Gemma4Bringup {
         let gemm_f32_max_n = std::cmp::max(max_qkv_rows, 2 * inter);
         let gemm_f32_tmp = arena.region("gen_gemm_f32", (max_tokens * gemm_f32_max_n * 4) as usize, 16)?;
 
-        // aa01001pftrope0 cliff-fix (F-series): sliding layers need the
-        // full block pool. See earlier copy of this comment for detail.
+        // Prefix cache: use the persistent KV region allocated by
+        // `init_prefix_cache`. If the cache wasn't pre-initialised
+        // (old callers, rvllm-bench / probe), fall back to per-call
+        // arena allocation — no cache hit available in that case.
         let sliding_blocks = num_blocks_total;
         let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
-        let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
-        let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
-        let mut kv_total_bytes: u64 = 0;
-        let mut kv_scale_total_bytes: u64 = 0;
-        for l in 0..arch.num_hidden_layers {
-            kv_layer_offsets.push(kv_total_bytes);
-            kv_scale_layer_offsets.push(kv_scale_total_bytes);
-            let is_global = arch.layer_types[l] == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
-            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
-            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
-            let hd = arch.head_dim_for_layer(l) as u32;
-            let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-            kv_total_bytes += match kv_dtype {
-                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
-                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
-                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
-            };
-            let layer_scale_slots =
-                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
-            kv_scale_total_bytes += match kv_dtype {
-                crate::gemma4_layer_exec::KvDtype::F16 => 0,
-                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
-                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
-            };
+        let (kv_cache_ptr, kv_scale_ptr, kv_layer_offsets, kv_scale_layer_offsets,
+             kv_total_bytes, kv_scale_total_bytes, common_prefix_len_raw) = {
+            let guard = self.prefix_cache.lock().unwrap();
+            match &*guard {
+                Some(pc) => {
+                    // Cache hit path: compute the longest common
+                    // prefix in raw token ids.
+                    let mut prefix = 0usize;
+                    while prefix < pc.last_tokens.len()
+                        && prefix < prompt_ids.len()
+                        && pc.last_tokens[prefix] == prompt_ids[prefix]
+                    {
+                        prefix += 1;
+                    }
+                    // Leave at least one token for the prefill to
+                    // process (otherwise there's nothing to decode
+                    // the last hidden state from).
+                    if prefix >= prompt_ids.len() {
+                        prefix = prompt_ids.len().saturating_sub(1);
+                    }
+                    (
+                        pc.kv_cache_ptr,
+                        pc.kv_scale_ptr,
+                        pc.kv_layer_offsets.clone(),
+                        pc.kv_scale_layer_offsets.clone(),
+                        pc.kv_cache_bytes,
+                        pc.kv_scale_bytes,
+                        prefix as u32,
+                    )
+                }
+                None => (0, 0, Vec::new(), Vec::new(), 0, 0, 0),
+            }
+        };
+
+        let use_prefix_cache = kv_cache_ptr != 0;
+        // Per-call fallback when cache wasn't initialised.
+        let _kv_cache_region;
+        let _kv_scale_region;
+        let (kv_cache_ptr, kv_scale_ptr,
+             kv_layer_offsets, kv_scale_layer_offsets,
+             kv_total_bytes, kv_scale_total_bytes) = if use_prefix_cache {
+            (kv_cache_ptr, kv_scale_ptr,
+             kv_layer_offsets, kv_scale_layer_offsets,
+             kv_total_bytes, kv_scale_total_bytes)
+        } else {
+            let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+            let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+            let mut kv_total_bytes: u64 = 0;
+            let mut kv_scale_total_bytes: u64 = 0;
+            for l in 0..arch.num_hidden_layers {
+                kv_layer_offsets.push(kv_total_bytes);
+                kv_scale_layer_offsets.push(kv_scale_total_bytes);
+                let is_global = arch.layer_types[l]
+                    == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+                let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+                let hd = arch.head_dim_for_layer(l) as u32;
+                let layer_elems =
+                    2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+                kv_total_bytes += match kv_dtype {
+                    crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
+                    crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
+                    crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
+                };
+                let layer_scale_slots =
+                    2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
+                kv_scale_total_bytes += match kv_dtype {
+                    crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                    crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
+                    crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
+                };
+            }
+            let kvr = arena.region("gen_kv", kv_total_bytes as usize, 256)?;
+            cudarc::driver::sys::cuMemsetD8_v2(kvr.device_ptr(), 0, kv_total_bytes as usize);
+            let kvs = arena.region(
+                "gen_kv_scale_cache", kv_scale_total_bytes.max(16) as usize, 16)?;
+            cudarc::driver::sys::cuMemsetD8_v2(
+                kvs.device_ptr(), 0, kv_scale_total_bytes as usize);
+            let kc_ptr = kvr.device_ptr();
+            let ks_ptr = kvs.device_ptr();
+            _kv_cache_region = kvr;
+            _kv_scale_region = kvs;
+            (kc_ptr, ks_ptr, kv_layer_offsets, kv_scale_layer_offsets,
+             kv_total_bytes, kv_scale_total_bytes)
+        };
+
+        // Clamp the prefix-match to the actual KV region size.
+        let common_prefix_len: u32 = if use_prefix_cache {
+            common_prefix_len_raw
+        } else {
+            0
+        };
+        if common_prefix_len > 0 {
+            eprintln!(
+                "[prefix-cache] hit: reusing {} of {} prompt tokens",
+                common_prefix_len, prompt_len
+            );
         }
-        let kv_cache = arena.region("gen_kv", kv_total_bytes as usize, 256)?;
-        cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
-        let kv_scale_cache =
-            arena.region("gen_kv_scale_cache", kv_scale_total_bytes.max(16) as usize, 16)?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
+        // Wrap the raw pointers so downstream `.device_ptr()` calls
+        // stay source-identical across the cache-hit and fallback
+        // paths. This is a 16-byte local, zero runtime cost.
+        struct KvHandle(u64);
+        impl KvHandle {
+            fn device_ptr(&self) -> u64 { self.0 }
+        }
+        let kv_cache = KvHandle(kv_cache_ptr);
+        let kv_scale_cache = KvHandle(kv_scale_ptr);
         let q_scale_scratch_bytes =
             (max_tokens as u64) * (arch.num_attention_heads as u64) * 4;
         let q_scale_scratch = arena.region(
@@ -1786,7 +1982,15 @@ impl Gemma4Bringup {
         let skip_decode = std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
         let use_batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
         if !skip_decode && !use_batch_prefill {
-            for (i, &tok) in prompt_ids.iter().enumerate() {
+            // Prefix-cache fast path: if common_prefix_len > 0, the
+            // persistent KV region already holds valid entries for
+            // slots [0..common_prefix_len). Skip those tokens; the
+            // per-token loop picks up at the first new token, attention
+            // reads the cached KV for context. Batch-prefill path
+            // below doesn't use this shortcut yet (unified kernel
+            // would need partial-query support wired through).
+            let start = common_prefix_len as usize;
+            for (i, &tok) in prompt_ids.iter().enumerate().skip(start) {
                 run_one_token(tok, i)?;
             }
         }
@@ -1841,30 +2045,43 @@ impl Gemma4Bringup {
         // layer 0 / layer 1 for direct comparison against a normal
         // decode-only run.
         if (diag_compare && prompt_len > 1) || skip_decode || (use_batch_prefill && prompt_len > 1) {
-            let tok_ids: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+            // Prefix-cache aware batch prefill. When `use_prefix_cache`
+            // reports a common prefix of length L, the unified kernel
+            // supports "partial query with cached KV history" natively
+            // via `context_lens = N, cu_seqlens_q = [0, N-L],
+            // positions = [L..N)`. This mirrors vLLM's prefix-caching
+            // dispatch — the cached slots [0..L) contribute to
+            // attention but aren't re-prefilled.
+            //
+            // Diag mode forces L=0 so the row-0/row-(N-1) rel_err
+            // comparison stays meaningful (decode ref path walks
+            // every token from slot 0).
+            let prefix_skip = if diag_compare { 0 } else { common_prefix_len };
+            let new_q = prompt_len - prefix_skip;
+            let tok_ids: Vec<i32> = prompt_ids[prefix_skip as usize..]
+                .iter().map(|&t| t as i32).collect();
             token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
-            // Readback sanity-check: confirm the device buffer actually
-            // holds the full prompt before the gather kernel runs.
             self.stream.fence()?;
-            let mut readback = vec![0i32; prompt_len as usize];
+            let mut readback = vec![0i32; new_q as usize];
             cudarc::driver::sys::cuMemcpyDtoH_v2(
                 readback.as_mut_ptr() as *mut _,
                 token_ids_region.device_ptr(),
-                (prompt_len * 4) as _,
+                (new_q * 4) as _,
             );
-            eprintln!("[DIAG] token_ids_region readback = {:?}", readback);
-            rvllm_fused::EmbeddingGatherLaunch { num_tokens: prompt_len, hidden, vocab }
+            eprintln!(
+                "[DIAG] batch-prefill prefix_skip={} new_q={} readback[..min(8)]={:?}",
+                prefix_skip, new_q, &readback[..readback.len().min(8)]
+            );
+            rvllm_fused::EmbeddingGatherLaunch { num_tokens: new_q, hidden, vocab }
                 .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
                     token_ids_region.device_ptr(), stream)?;
-            // Also read back rows 0 and N-1 of residual IMMEDIATELY
-            // after the gather, BEFORE any layers run.
             self.stream.fence()?;
             let mut r0 = vec![0u16; 4];
             let mut r_n_minus_1 = vec![0u16; 4];
             cudarc::driver::sys::cuMemcpyDtoH_v2(r0.as_mut_ptr() as *mut _, residual_ptr, 8);
             cudarc::driver::sys::cuMemcpyDtoH_v2(
                 r_n_minus_1.as_mut_ptr() as *mut _,
-                residual_ptr + ((prompt_len - 1) as u64 * hidden as u64 * 2),
+                residual_ptr + ((new_q - 1) as u64 * hidden as u64 * 2),
                 8,
             );
             eprintln!(
@@ -1873,10 +2090,15 @@ impl Gemma4Bringup {
                 r_n_minus_1.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
             );
 
-            let pos: Vec<i32> = (0..prompt_len as i32).collect();
-            let slot: Vec<i32> = (0..prompt_len as i32).collect();
+            // positions span the NEW suffix only; slot_mapping writes
+            // new K,V at slots [prefix_skip..prompt_len), leaving the
+            // cached slots [0..prefix_skip) untouched. The context
+            // length still reflects the full prompt so attention
+            // reads all slots.
+            let pos: Vec<i32> = (prefix_skip as i32..prompt_len as i32).collect();
+            let slot: Vec<i32> = (prefix_skip as i32..prompt_len as i32).collect();
             let ctx = [prompt_len as i32];
-            let cu_seq = [0i32, prompt_len as i32];
+            let cu_seq = [0i32, new_q as i32];
             positions.copy_from_host(bytemuck_cast_i32(&pos))?;
             slot_mapping.copy_from_host(bytemuck_cast_i32(&slot))?;
             context_lens.copy_from_host(bytemuck_cast_i32(&ctx))?;
@@ -1884,7 +2106,7 @@ impl Gemma4Bringup {
 
             let phase = crate::gemma4_layer_exec::Gemma4Phase::Prefill {
                 cu_seqlens_q: cu_seqlens_q.device_ptr(),
-                max_seqlen_q: prompt_len,
+                max_seqlen_q: new_q,
                 num_seqs: 1,
             };
 
@@ -1918,7 +2140,7 @@ impl Gemma4Bringup {
                 };
 
                 let dims = crate::gemma4_layer_exec::Gemma4LayerDims {
-                    num_tokens: prompt_len, hidden,
+                    num_tokens: new_q, hidden,
                     num_heads: arch.num_attention_heads as u32, num_kv_heads: nkvh, head_dim: hd,
                     rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
                     intermediate: inter, block_size,
@@ -2018,8 +2240,12 @@ impl Gemma4Bringup {
                 residual_ptr,
                 (hidden * 2) as _,
             );
+            // The residual buffer holds `new_q` rows after the layer
+            // loop (the prefix-cached slots are not re-prefilled).
+            // Row `new_q - 1` is the last prompt token regardless of
+            // how many tokens were cached.
             let mut prefill_last = vec![0u16; hidden as usize];
-            let last_off_diag = (prompt_len - 1) as u64 * hidden as u64 * 2;
+            let last_off_diag = (new_q - 1) as u64 * hidden as u64 * 2;
             cudarc::driver::sys::cuMemcpyDtoH_v2(
                 prefill_last.as_mut_ptr() as *mut _,
                 residual_ptr + last_off_diag,
@@ -2027,8 +2253,8 @@ impl Gemma4Bringup {
             );
 
             // Extract last token's residual for decode
-            if prompt_len > 1 {
-                let last_offset = (prompt_len - 1) as u64 * hidden as u64 * 2;
+            if new_q > 1 {
+                let last_offset = (new_q - 1) as u64 * hidden as u64 * 2;
                 cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                     residual_ptr, residual_ptr + last_offset, (hidden * 2) as usize, stream as _,
                 );
@@ -2113,6 +2339,23 @@ impl Gemma4Bringup {
         let decode_ms = total_ms - prefill_ms;
         eprintln!("[generate] {} tokens decoded in {:.1}ms ({:.1} tok/s)",
             output_ids.len(), decode_ms, output_ids.len() as f64 / (decode_ms / 1000.0));
+
+        // Update the prefix cache with this request's prompt so the
+        // next request can benefit from a cache hit. We cache ONLY
+        // the prompt tokens (not the generated output) — the
+        // generated tokens' KV entries are in slots [prompt_len..]
+        // and are indeed valid, but zeroclaw typically includes
+        // prior assistant responses in the NEXT prompt's history
+        // anyway, so persisting generated-token KV here adds
+        // complexity without extra benefit.
+        if use_prefix_cache {
+            if let Ok(mut guard) = self.prefix_cache.lock() {
+                if let Some(pc) = guard.as_mut() {
+                    pc.last_tokens.clear();
+                    pc.last_tokens.extend_from_slice(prompt_ids);
+                }
+            }
+        }
         Ok(output_ids)
     }
 
