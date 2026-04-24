@@ -309,11 +309,18 @@ class ModeloptSafetensorsReader:
         path = self._name_to_shard[name]
         h = self._open_shard(path)
         if HAVE_SAFETENSORS:
-            # safe_open has no public header access; fall back to re-reading header
-            with open(path, 'rb') as f:
-                header_len = struct.unpack('<Q', f.read(8))[0]
-                header = json.loads(f.read(header_len))
-            return header[name]
+            # Cache parsed headers per shard — without this we re-read and
+            # re-parse the entire multi-MB JSON header for every single
+            # tensor access (48K tensors × re-parse = catastrophic).
+            if not hasattr(self, '_shard_headers'):
+                self._shard_headers = {}
+            hdr = self._shard_headers.get(path)
+            if hdr is None:
+                with open(path, 'rb') as f:
+                    header_len = struct.unpack('<Q', f.read(8))[0]
+                    hdr = json.loads(f.read(header_len))
+                self._shard_headers[path] = hdr
+            return hdr[name]
         return h.get_info(name)
 
     def _read_raw(self, name):
