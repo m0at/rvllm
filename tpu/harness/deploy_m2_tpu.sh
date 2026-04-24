@@ -226,7 +226,7 @@ BUILD_ZIG_SCRIPT=$(cat <<EOS
 set -euo pipefail
 export PATH="\$HOME/zig-x86_64-linux-0.15.1:\$PATH"
 cd '${RUN_DIR}/zig'
-zig build -Doptimize=ReleaseFast
+zig build
 zig build test
 ls -la zig-out || true
 EOS
