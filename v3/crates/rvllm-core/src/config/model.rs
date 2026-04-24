@@ -14,6 +14,7 @@ pub enum ModelArch {
     Mistral,
     Gemma2,
     Gemma4,
+    MiniMaxM2,
 }
 
 impl ModelArch {
@@ -23,7 +24,9 @@ impl ModelArch {
             "LlamaForCausalLM" => Some(ModelArch::Llama),
             "MistralForCausalLM" => Some(ModelArch::Mistral),
             "Gemma2ForCausalLM" => Some(ModelArch::Gemma2),
+            "Gemma4ForCausalLM" => Some(ModelArch::Gemma4),
             "Gemma4ForConditionalGeneration" => Some(ModelArch::Gemma4),
+            "MiniMaxM2ForCausalLM" => Some(ModelArch::MiniMaxM2),
             _ => None,
         }
     }
@@ -79,7 +82,11 @@ impl ModelConfig {
         })?;
 
         // Gemma 3/4: text model fields nested under text_config.
-        let tc = if v["text_config"]["hidden_size"].is_u64() { &v["text_config"] } else { v };
+        let tc = if v["text_config"]["hidden_size"].is_u64() {
+            &v["text_config"]
+        } else {
+            v
+        };
 
         let hidden_size = hf::usize_field(tc, "hidden_size", file)?;
         let num_layers = hf::usize_field(tc, "num_hidden_layers", file)?;
@@ -98,7 +105,9 @@ impl ModelConfig {
             .or_else(|| hf::bool_field_opt(v, "tie_word_embeddings"))
             .unwrap_or(false);
         let torch_dtype = match hf::str_field(v, "torch_dtype", file)
-            .or_else(|_| hf::str_field(tc, "dtype", file))?.as_str() {
+            .or_else(|_| hf::str_field(tc, "dtype", file))?
+            .as_str()
+        {
             "float16" => DType::F16,
             "bfloat16" => DType::Bf16,
             other => {
@@ -122,7 +131,9 @@ impl ModelConfig {
             ));
         }
         // Gemma 4 has explicit head_dim (256) that doesn't equal hidden_size/num_heads.
-        let head_dim = tc["head_dim"].as_u64().map(|d| d as usize)
+        let head_dim = tc["head_dim"]
+            .as_u64()
+            .map(|d| d as usize)
             .unwrap_or_else(|| hidden_size / num_attention_heads);
         if tc["head_dim"].as_u64().is_none() && head_dim * num_attention_heads != hidden_size {
             return Err(RvllmError::config(
@@ -150,5 +161,50 @@ impl ModelConfig {
             tie_word_embeddings,
             torch_dtype,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelArch, ModelConfig};
+
+    fn gemma4_config(architecture: &str) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": [architecture],
+            "torch_dtype": "bfloat16",
+            "text_config": {
+                "hidden_size": 2560,
+                "num_hidden_layers": 34,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "intermediate_size": 10240,
+                "vocab_size": 262144,
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": true,
+                "rope_parameters": {
+                    "sliding_attention": {
+                        "rope_theta": 10000.0
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn parses_gemma4_conditional_generation_architecture() {
+        let config = gemma4_config("Gemma4ForConditionalGeneration");
+        let parsed = ModelConfig::from_hf_value(&config, std::path::Path::new("config.json"))
+            .expect("Gemma4 conditional generation config should parse");
+        assert_eq!(parsed.architecture, ModelArch::Gemma4);
+    }
+
+    #[test]
+    fn parses_gemma4_causal_lm_architecture() {
+        let config = gemma4_config("Gemma4ForCausalLM");
+        let parsed = ModelConfig::from_hf_value(&config, std::path::Path::new("config.json"))
+            .expect("Gemma4 causal LM config should parse");
+        assert_eq!(parsed.architecture, ModelArch::Gemma4);
     }
 }

@@ -6,9 +6,11 @@
 
 mod builder;
 mod hf;
+pub mod minimax_m2;
 mod model;
 mod runtime;
 
 pub use builder::RuntimeConfigBuilder;
+pub use minimax_m2::{MiniMaxM2Extras, NvFp4Config};
 pub use model::{ModelArch, ModelConfig};
 pub use runtime::{GraphMode, LogLevel, PreemptionMode, RuntimeConfig};
