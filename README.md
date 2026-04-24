@@ -131,6 +131,7 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 | Model load (136 GB via parallel ThreadPool) | 79 s |
 | B=1 | 726 ms/step, 1.4 tok/s |
 | **B=8** | **802 ms/step, 10.0 tok/s** |
+| B=8, opt-in Pallas bf16 matmul (`RVLLM_NVFP4_BACKEND=pallas`, `BN=512`) | 1105 ms/step, 7.2 tok/s |
 | B=16+ | OOM (KV cache replicated) |
 | PPL probe (318 scored tokens) | **5.63** |
 | Gen sample (32 tok) | `"Explain angular momentum. The angular momentum of a particle about a point \\(O\\) is defined as \\(\\vec{L}=\\vec{r} \\times \\vec{p}\\) where \\(\\vec{r"` |
@@ -148,7 +149,7 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 
 ### Known issues blocking production
 
-1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. Pallas NVFP4 matmul kernel sketched in `nvfp4_matmul_pallas.py`, untested.
+1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. The opt-in two-stage Pallas path in `nvfp4_matmul_pallas.py` is correct but slower at B=8; a true fused uint8-decode + MXU kernel currently trips a Mosaic TPU layout assert.
 2. **KV cache replication blocks B≥16**. Fix in `m2_full_bench.make_batched_empty_cache` (spec batch-axis-shard). int8 KV quant (Gemma4 reference) would also help.
 3. **Full validation still needed**. The short corrected probe is coherent (`tpu/out/m2/m2_fix_probe.json`), but the next run should score a longer Wikitext slice and capture a 256+ token sample.
 
@@ -156,7 +157,7 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 
 See [`tpu/harness/M2_PERF_ADVISOR_SPEC.md`](tpu/harness/M2_PERF_ADVISOR_SPEC.md) for the full analysis.
 
-1. Pallas fused NVFP4→MXU matmul kernel — 2-5× at B=1 (est)
+1. True fused Pallas NVFP4→MXU matmul kernel — still required for a speed win; the current two-stage Pallas matmul is slower than XLA dot
 2. int8 KV cache → unblock B≥16
 3. Batched prefill → 16× TTFT (20-token prompt currently 14s)
 4. Async collective flags (`LIBTPU_INIT_ARGS`) — ~5% at larger B

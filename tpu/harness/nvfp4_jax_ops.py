@@ -117,6 +117,14 @@ def nvfp4_matmul(x_bf16, w_packed, w_scales, w_scale_2, out_features, in_feature
     w_scale_2: f32 scalar (modelopt per-tensor global scale)
     Returns:   (..., out_features) bf16
     """
+    backend = os.environ.get("RVLLM_NVFP4_BACKEND", "jax").strip().lower()
+    if backend == "pallas":
+        from nvfp4_matmul_pallas import nvfp4_matmul_pallas
+        return nvfp4_matmul_pallas(
+            x_bf16, w_packed, w_scales, w_scale_2, out_features, in_features)
+    if backend not in ("", "jax"):
+        raise ValueError(f"unknown RVLLM_NVFP4_BACKEND={backend!r}")
+
     if k_block is None:
         k_block = _env_k_block(512)
 

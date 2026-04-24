@@ -1,0 +1,21 @@
+{
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "load_seconds": 83.24645662307739,
+  "sweep": [
+    {
+      "batch": 8,
+      "ctx": 2048,
+      "iters": 5,
+      "ms_min": 1104.3906369959586,
+      "ms_mean": 1104.5892523994553,
+      "ms_max": 1104.993665998336,
+      "ms_p50": 1104.541546999826,
+      "tok_per_s": 7.242511171118059
+    }
+  ],
+  "ppl": null,
+  "generation": null
+}
