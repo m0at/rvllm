@@ -18,9 +18,11 @@
 set -euo pipefail
 
 DRY_RUN=0
+SKIP_CREATE=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
+    --skip-create) SKIP_CREATE=1 ;;
     -h|--help)
       sed -n '2,20p' "$0"
       exit 0
@@ -211,6 +213,7 @@ export PATH="$ZIG_DIR:$PATH"
 zig version
 EOS
 )
+INSTALL_SCRIPT="${INSTALL_SCRIPT//\$/\\\$}"
 INSTALL_CMD="${SSH_BASE} --command=\"${INSTALL_SCRIPT//\"/\\\"}\""
 run "$INSTALL_CMD"
 
@@ -224,6 +227,7 @@ zig build test
 ls -la zig-out || true
 EOS
 )
+BUILD_ZIG_SCRIPT="${BUILD_ZIG_SCRIPT//\$/\\\$}"
 BUILD_ZIG_CMD="${SSH_BASE} --command=\"${BUILD_ZIG_SCRIPT//\"/\\\"}\""
 run "$BUILD_ZIG_CMD"
 
@@ -246,6 +250,7 @@ fi
 du -sh /workspace/models/m2-nvfp4
 EOS
 )
+HF_SCRIPT="${HF_SCRIPT//\$/\\\$}"
 HF_CMD="${SSH_BASE} --command=\"${HF_SCRIPT//\"/\\\"}\""
 run "$HF_CMD"
 
@@ -262,6 +267,7 @@ python3 tpu/harness/m2_tpu_infer.py \
   --prompt 'Hello'
 EOS
 )
+SMOKE_SCRIPT="${SMOKE_SCRIPT//\$/\\\$}"
 SMOKE_CMD="${SSH_BASE} --command=\"${SMOKE_SCRIPT//\"/\\\"}\""
 run "$SMOKE_CMD"
 
