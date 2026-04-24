@@ -213,7 +213,6 @@ if [[ ! -x "$ZIG_DIR/zig" ]]; then
   curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz" \
     | tar xJ -C "$HOME/"
 fi
-echo "export PATH=\"\$HOME/zig-x86_64-linux-${ZIG_VER}:\$PATH\"" > "$HOME/.rvllm_zig_env"
 export PATH="$ZIG_DIR:$PATH"
 zig version
 EOS
@@ -225,7 +224,7 @@ run "$INSTALL_CMD"
 echo ">> (7) build zig project in ${RUN_DIR}/zig"
 BUILD_ZIG_SCRIPT=$(cat <<EOS
 set -euo pipefail
-source "\$HOME/.rvllm_zig_env"
+export PATH="\$HOME/zig-x86_64-linux-0.15.1:\$PATH"
 cd '${RUN_DIR}/zig'
 zig build -Doptimize=ReleaseFast
 zig build test
@@ -262,7 +261,7 @@ run "$HF_CMD"
 echo ">> (9) smoke run: m2_tpu_infer --max-tokens 16"
 SMOKE_SCRIPT=$(cat <<EOS
 set -euo pipefail
-source "\$HOME/.rvllm_zig_env"
+export PATH="\$HOME/zig-x86_64-linux-0.15.1:\$PATH"
 export RVLLM_ZIG_LIB='${RUN_DIR}/zig/zig-out/lib/librvllm_zig.so'
 cd '${RUN_DIR}'
 cat REVISION
