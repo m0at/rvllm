@@ -29,6 +29,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+# Use the real shard_map MoE from m2_moe.py. This path has proper all-to-all
+# dispatch across the 'expert' axis — not the naive gather-based reference.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from m2_moe import moe_block_nvfp4
+
 # --- Arch constants (MiniMax-M2.7-NVFP4) ---
 H = 3072
 NH = 48
@@ -152,72 +157,21 @@ def attn_layer(x, w, ln, k_cache, v_cache, pos, cos, sin):
     return out, k_cache, v_cache
 
 
-def moe_layer(x, router_w, router_bias, w1, w2, w3):
-    """Gather-based reference MoE. Uses nvfp4_matmul for each of TOP_K experts.
-    For a bench, this path measures the correct FLOPs/memory even if not
-    shard_map optimal.
-
-    w1, w2, w3 are tuples: (packed, scales, global_scale).
-      w1/w3 packed shape: (NUM_EXPERTS, MOE_INTER, H/2)
-      w2   packed shape: (NUM_EXPERTS, H, MOE_INTER/2)
-    """
-    B_ = x.shape[0]
-    logits = jax.nn.sigmoid(x.astype(jnp.float32) @ router_w.T.astype(jnp.float32))
-    biased = logits + router_bias.astype(jnp.float32)
-    _, topk_idx = jax.lax.top_k(biased, TOP_K)  # (B, K)
-    gathered = jnp.take_along_axis(logits, topk_idx, axis=1)
-    weights = (gathered / (gathered.sum(axis=-1, keepdims=True) + 1e-9)).astype(x.dtype)
-
-    # Dequant selected experts. topk_idx has shape (B, K).
-    # w1_packed: (E, M, H/2). gather -> (B, K, M, H/2).
-    def gather_packed(t, idx):
-        return jnp.take(t, idx, axis=0)  # (B, K, ...)
-
-    w1p, w1s, w1g = w1
-    w2p, w2s, w2g = w2
-    w3p, w3s, w3g = w3
-
-    # For each (b, k), dequant one expert and apply gemm. Reshape to batch.
-    # Flatten (B, K) -> BK
-    BK = B_ * TOP_K
-    idx_flat = topk_idx.reshape(BK)
-    x_flat = jnp.repeat(x, TOP_K, axis=0)  # (BK, H)
-
-    # Gather per-expert packed & scales
-    w1p_bk = jnp.take(w1p, idx_flat, axis=0)  # (BK, M, H/2)
-    w1s_bk = jnp.take(w1s, idx_flat, axis=0)  # (BK, M, H/16)
-    w3p_bk = jnp.take(w3p, idx_flat, axis=0)
-    w3s_bk = jnp.take(w3s, idx_flat, axis=0)
-    w2p_bk = jnp.take(w2p, idx_flat, axis=0)  # (BK, H, M/2)
-    w2s_bk = jnp.take(w2s, idx_flat, axis=0)  # (BK, H, M/16)
-
-    # Dequant + matmul per-row. Use vmap.
-    def one_expert(xi, p1, s1, p3, s3, p2, s2):
-        gate = nvfp4_matmul(xi[None], p1, s1, w1g, MOE_INTER, H)[0]
-        up   = nvfp4_matmul(xi[None], p3, s3, w3g, MOE_INTER, H)[0]
-        h = jax.nn.silu(gate) * up
-        out = nvfp4_matmul(h[None], p2, s2, w2g, H, MOE_INTER)[0]
-        return out
-
-    out_bk = jax.vmap(one_expert)(x_flat, w1p_bk, w1s_bk, w3p_bk, w3s_bk, w2p_bk, w2s_bk)
-    out_bk = out_bk.reshape(B_, TOP_K, H)
-    return jnp.einsum('bk,bkh->bh', weights, out_bk)
-
-
-def layer_step(x, lw, k_cache, v_cache, pos, cos, sin):
+def layer_step(x, lw, k_cache, v_cache, pos, cos, sin, mesh):
     att_out, k_cache, v_cache = attn_layer(x, lw['attn'], lw['ln1'],
                                            k_cache, v_cache, pos, cos, sin)
     x = x + att_out
     h = rms_norm(x, lw['ln2'])
-    moe_out = moe_layer(h, lw['rg'], lw['rb'], lw['w1'], lw['w2'], lw['w3'])
+    # Real perf path: shard_map dispatch along 'expert' axis (all-to-all).
+    moe_out = moe_block_nvfp4(h, lw['rg'], lw['rb'], lw['w1'], lw['w2'], lw['w3'], mesh)
     return x + moe_out, k_cache, v_cache
 
 
-def forward_step(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head):
+def forward_step(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head, mesh):
     NL = len(all_w)
     for i in range(NL):
         lw = all_w[i]
-        x, k_i, v_i = layer_step(x, lw, k_cache[i], v_cache[i], pos, cos, sin)
+        x, k_i, v_i = layer_step(x, lw, k_cache[i], v_cache[i], pos, cos, sin, mesh)
         k_cache = k_cache.at[i].set(k_i)
         v_cache = v_cache.at[i].set(v_i)
     h = rms_norm(x, final_norm)
@@ -238,13 +192,19 @@ def random_weights(B, max_ctx, mesh, nl):
         return jax.device_put(jnp.asarray(arr, dtype=DTYPE), spec)
 
     def rand_nvfp4(E, rows, cols, spec):
-        """Random NVFP4 weight for E experts. Returns (packed, scales, global_scale)."""
+        """Random NVFP4 weight for E experts. Returns (packed, scales, scale2).
+        scale2 is shape (E,) — per-expert global scale, placed on 'expert' axis so
+        m2_moe.py's shard_map can see it aligned with the expert dim.
+        """
         packed = rng.integers(0, 256, size=(E, rows, cols // 2), dtype=np.uint8)
         scales = rng.integers(0, 256, size=(E, rows, cols // GROUP_SIZE), dtype=np.uint8)
-        gscale = 0.01  # one global float32, small
+        scale2 = (rng.standard_normal(size=(E,)) * 0.01 + 0.01).astype(np.float32)
         packed_d = jax.device_put(jnp.asarray(packed), spec)
         scales_d = jax.device_put(jnp.asarray(scales), spec)
-        return (packed_d, scales_d, float(gscale))
+        # scale2 is (E,) — shard along expert axis
+        scale2_spec = NamedSharding(spec.mesh, P('expert')) if 'expert' in spec.mesh.axis_names else rep_spec
+        scale2_d = jax.device_put(jnp.asarray(scale2), scale2_spec)
+        return (packed_d, scales_d, scale2_d)
 
     # Backbone (bf16, replicated)
     embed = rand_bf16((VOCAB, H), rep_spec)
@@ -293,7 +253,10 @@ def bench_batch(mesh, B, max_ctx, iters, warmup, nl):
     embed, final_norm, lm_head, all_w, k_cache, v_cache, cos, sin = random_weights(
         B, max_ctx, mesh, nl)
 
-    forward_jit = jax.jit(forward_step)
+    # mesh is static, passed as closed-over. Wrap forward_step to avoid passing mesh as traced arg.
+    def _forward(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head):
+        return forward_step(x, all_w, k_cache, v_cache, pos, cos, sin, final_norm, lm_head, mesh)
+    forward_jit = jax.jit(_forward)
 
     tok = jnp.zeros((B,), dtype=jnp.int32)
     x = embed[tok]
