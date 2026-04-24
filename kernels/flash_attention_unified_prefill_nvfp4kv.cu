@@ -214,6 +214,12 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
     }
 
     // === smem layout ==================================================
+    // NB: MMA_K = 16 for f16 m16n8k16 whereas the FP8 unified variant
+    // uses MMA_K = 32 (m16n8k32 e4m3). For tile_size > MMA_K, s_s must
+    // be sized to BLOCK_M * tile_size (softmax writes with stride
+    // tile_len up to tile_size), and the P·V path loops over
+    // ceil(tile_len / MMA_K) MMA steps inside each tile iteration.
+    const int s_s_stride = (tile_size > MMA_K) ? tile_size : MMA_K;
     extern __shared__ unsigned char smem_raw[];
     __half* s_q_f16    = reinterpret_cast<__half*>(smem_raw);
     float*  s_q_scale  = reinterpret_cast<float*>(s_q_f16 + BLOCK_M * head_dim);
@@ -221,7 +227,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
     __half* s_v_f16    = s_k_f16 + tile_size * head_dim;
     __half* s_v_f16_T  = s_v_f16 + tile_size * head_dim;
     float*  s_s        = reinterpret_cast<float*>(s_v_f16_T + MMA_K * head_dim);
-    float*  s_m        = s_s + BLOCK_M * MMA_K;
+    float*  s_m        = s_s + BLOCK_M * s_s_stride;
     float*  s_l        = s_m + BLOCK_M;
     float*  s_alpha    = s_l + BLOCK_M;
     __half* s_p_f16    = reinterpret_cast<__half*>(s_alpha + BLOCK_M);
@@ -415,23 +421,9 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
         }
         __syncthreads();
 
-        // -- Transpose V into s_v_f16_T [d][k] with k stride = MMA_K(=16). --
-        // Positions k ∈ [tile_len, MMA_K) are zero-padded so they
-        // contribute 0 to the MMA reduction.
-        for (int idx = tid; idx < MMA_K * head_dim; idx += FA2_THREADS) {
-            const int k_off = idx / head_dim;          // 0..MMA_K-1
-            const int d     = idx - k_off * head_dim;
-            __half v = (k_off < tile_len)
-                ? s_v_f16[k_off * head_dim + d]
-                : __float2half(0.0f);
-            s_v_f16_T[d * MMA_K + k_off] = v;
-        }
-        __syncthreads();
-
-        // -- Cast P (softmax output in s_s) to f16 in s_p_f16 with per-row scale. --
-        // P magnitudes can sit near 1 (post-softmax) so direct f16
-        // cast is typically in range. Still compute a per-row max
-        // for a safety rescale into s_p_scale.
+        // -- Per-row P safety scale (applied so f16 MMA operands stay
+        //    inside the f16 dynamic range). P ∈ [0, 1] post-softmax so
+        //    the clamp is usually a no-op.
         const int pv_row = tid >> 3;
         const int pv_lr  = tid & 7;
         if (pv_row < BLOCK_M) {
@@ -441,26 +433,52 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
             }
             const float row_max = row_reduce_max_8(local_max);
             if (pv_lr == 0) {
-                // f16 max magnitude ≈ 65504; scale down if P exceeds
-                // that, though in practice P ∈ [0, 1] post-softmax.
                 s_p_scale[pv_row] = (row_max > 1.0f) ? row_max : 1.0f;
             }
         }
         __syncthreads();
-        if (pv_row < BLOCK_M) {
-            const float inv_scale = 1.0f / s_p_scale[pv_row];
-            for (int t = pv_lr; t < MMA_K; t += 8) {
-                const float p = (t < tile_len)
-                    ? s_s[pv_row * tile_len + t] * inv_scale
-                    : 0.0f;
-                s_p_f16[pv_row * MMA_K + t] = __float2half(p);
-            }
-        }
-        __syncthreads();
 
-        // -- P·V MMA with fused alpha-rescale via C operand. --
-        // Each warp handles n_tiles_per_warp n-tiles of width 8.
-        {
+        // -- P·V loop over k sub-tiles of width MMA_K = 16. tile_size
+        //    = 16 runs once; tile_size = 32 (sliding layers) runs twice.
+        //    FIRST sub-tile folds the online-softmax alpha rescale into
+        //    the MMA C operand; subsequent ones accumulate without
+        //    re-scaling s_acc (alpha already baked in).
+        const int k_sub_count = (tile_size + MMA_K - 1) / MMA_K;
+        for (int ks_i = 0; ks_i < k_sub_count; ks_i++) {
+            const int k_base_t = ks_i * MMA_K;
+            if (k_base_t >= tile_len) break;
+
+            // (1) Transpose V[t=k_base_t..k_base_t+MMA_K) into
+            //     s_v_f16_T[d][0..MMA_K) with zero-pad past tile_len.
+            for (int idx = tid; idx < MMA_K * head_dim; idx += FA2_THREADS) {
+                const int k_off = idx / head_dim;
+                const int d     = idx - k_off * head_dim;
+                const int t_src = k_base_t + k_off;
+                __half v = (t_src < tile_len)
+                    ? s_v_f16[t_src * head_dim + d]
+                    : __float2half(0.0f);
+                s_v_f16_T[d * MMA_K + k_off] = v;
+            }
+            __syncthreads();
+
+            // (2) Pack P[m, t=k_base_t..k_base_t+MMA_K) into s_p_f16
+            //     [m, 0..MMA_K) with per-row inv scale, zero-pad past
+            //     tile_len.
+            if (pv_row < BLOCK_M) {
+                const float inv_scale = 1.0f / s_p_scale[pv_row];
+                for (int t = pv_lr; t < MMA_K; t += 8) {
+                    const int t_src = k_base_t + t;
+                    const float p = (t_src < tile_len)
+                        ? s_s[pv_row * tile_len + t_src] * inv_scale
+                        : 0.0f;
+                    s_p_f16[pv_row * MMA_K + t] = __float2half(p);
+                }
+            }
+            __syncthreads();
+
+            // (3) MMA. First ks_i applies alpha via C operand; later
+            //     ks_i iterations pass alpha = 1 so s_acc only gets
+            //     rescaled once per tile iteration.
             const int warp_id = tid >> 5;
             const int lane    = tid & 31;
             const int n_tiles_total    = head_dim >> 3;
@@ -472,8 +490,8 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
             const int r_lo = lane >> 2;
             const int r_hi = r_lo + 8;
             const int c    = (lane & 3) << 1;
-            const float alpha_lo = s_alpha[r_lo];
-            const float alpha_hi = s_alpha[r_hi];
+            const float alpha_lo = (ks_i == 0) ? s_alpha[r_lo] : 1.0f;
+            const float alpha_hi = (ks_i == 0) ? s_alpha[r_hi] : 1.0f;
 
             #pragma unroll 1
             for (int nt = 0; nt < n_tiles_per_warp; nt++) {
@@ -491,7 +509,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
                 float d_frag[4];
                 d_frag[0] = s_acc[r_lo * head_dim + d_lo] * alpha_lo * inv_ps_lo;
                 d_frag[1] = s_acc[r_lo * head_dim + d_hi] * alpha_lo * inv_ps_lo;
-                d_frag[2] = s_acc[r_hi * head_dim + d_lo] * alpha_hi * inv_ps_hi;
+                d_frag[2] = s_acc[r_hi * head_dim + d_lo] * alpha_hi * inv_ps_lo;
                 d_frag[3] = s_acc[r_hi * head_dim + d_hi] * alpha_hi * inv_ps_hi;
                 rvllm_f16mma::mma_m16n8k16_f16_f16_f32(d_frag, a, b);
                 s_acc[r_lo * head_dim + d_lo] = d_frag[0] * pscale_lo;
@@ -499,8 +517,8 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
                 s_acc[r_hi * head_dim + d_lo] = d_frag[2] * pscale_hi;
                 s_acc[r_hi * head_dim + d_hi] = d_frag[3] * pscale_hi;
             }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     // === Epilogue: acc / L → f16 output ==============================

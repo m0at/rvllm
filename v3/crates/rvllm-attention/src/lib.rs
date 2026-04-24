@@ -353,6 +353,19 @@ pub struct Fa2PtxKernels {
     /// BC=16 prefill variant for head_dim=512.
     #[cfg(feature = "cuda")]
     pub fn_prefill_nvfp4kv_bc16: Option<rvllm_kernels::KernelFn>,
+    /// `flash_attention_2_prefill_nvfp4kv_unified_kernel` — multi-query
+    /// NVFP4 prefill using `m16n8k16` f16 MMA (dequant NVFP4 → f16
+    /// smem via `cvt.rn.f16x2.e2m1x2`, then standard SM80-era f16 MMA
+    /// driven through `f16_mma_frag_pack.cuh`). Mirror of
+    /// `fn_prefill_fp8kv_unified`; targets the ~10× NVFP4-vs-FP8
+    /// batch-prefill gap (memory 22222222aa010020). Owner module is
+    /// `unified_prefill_nvfp4kv_mod` below. Optional — missing when
+    /// the kernel tree predates Phase 2b of aa01001nvf4f16mma.
+    #[cfg(feature = "cuda")]
+    pub fn_prefill_nvfp4kv_unified: Option<rvllm_kernels::KernelFn>,
+    /// Owner PTX module for `fn_prefill_nvfp4kv_unified`.
+    #[cfg(feature = "cuda")]
+    pub unified_prefill_nvfp4kv_mod: Option<rvllm_kernels::LoadedModule>,
     /// `fused_rope_partial_nvfp4kv_kernel` — RoPE + NVFP4 paged-KV
     /// cache write (layer-exec uses this in the decode/prefill hot
     /// path when `kv_dtype == Nvfp4`).
@@ -440,6 +453,22 @@ impl Fa2PtxKernels {
                     Err(_) => (None, None),
                 };
 
+            // Unified NVFP4 prefill — Phase 2b follow-up. Separate PTX
+            // so old kernel trees can still bring up (runtime gates
+            // dispatch on `is_some()`).
+            let (unified_prefill_nvfp4kv_mod, fn_prefill_nvfp4kv_unified) =
+                match loader.load_ptx("flash_attention_unified_prefill_nvfp4kv") {
+                    Ok(m) => {
+                        let f = m
+                            .get_function(
+                                "flash_attention_2_prefill_nvfp4kv_unified_kernel",
+                            )
+                            .ok();
+                        (Some(m), f)
+                    }
+                    Err(_) => (None, None),
+                };
+
             Ok(Self {
                 head_dim,
                 flash_attention_mod,
@@ -456,6 +485,8 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_bc16,
                 fn_prefill_nvfp4kv,
                 fn_prefill_nvfp4kv_bc16,
+                fn_prefill_nvfp4kv_unified,
+                unified_prefill_nvfp4kv_mod,
                 fn_rope_nvfp4kv,
             })
         }
@@ -475,6 +506,20 @@ impl Fa2PtxKernels {
         #[cfg(feature = "cuda")]
         {
             self.fn_prefill_fp8kv_unified.is_some()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
+    /// NVFP4 analogue: is the f16-MMA unified NVFP4 prefill kernel
+    /// loaded? Dispatched from `gemma4_layer_exec.rs` when
+    /// `kv_dtype == Nvfp4 && num_tokens > 1`.
+    pub fn has_unified_prefill_nvfp4(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.fn_prefill_nvfp4kv_unified.is_some()
         }
         #[cfg(not(feature = "cuda"))]
         {

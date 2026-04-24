@@ -764,21 +764,76 @@ pub unsafe fn gemma4_forward_phase(
                     window_size_left,
                 };
                 let prefill = rvllm_attention::PagedPrefillNvfp4Launcher::new(attention);
-                prefill.launch(
-                    prefill_params,
-                    scratch.attn_out,
-                    scratch.q_fp8,
-                    scratch.k_cache,
-                    scratch.v_cache,
-                    scratch.k_cache_scale,
-                    scratch.v_cache_scale,
-                    meta.block_tables,
-                    meta.context_lens,
-                    cu_seqlens_q,
-                    scratch.q_scale_ptr,
-                    max_seqlen_q,
-                    stream,
-                )?;
+
+                // Phase 2b of aa01001nvf4f16mma: route multi-query
+                // prefill through the f16-MMA unified kernel when it
+                // loaded into Fa2PtxKernels. Matches the FP8 unified
+                // dispatch gate above — opt-out via
+                // `RVLLM_UNIFIED_PREFILL=0` for bisect bisect/quality
+                // comparisons. Falls back to the per-qi dedicated
+                // kernel when the unified PTX is missing (old kernel
+                // trees) or disabled via env.
+                let unified_enabled_nvfp4 = std::env::var_os("RVLLM_UNIFIED_PREFILL")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+                let have_nvfp4_unified = match attention {
+                    rvllm_attention::AttentionBackend::Fa2Ptx(k)
+                        if k.has_unified_prefill_nvfp4() => true,
+                    _ => false,
+                };
+                if unified_enabled_nvfp4 && have_nvfp4_unified && dims.num_tokens > 1 {
+                    // Tile size matches the FP8 unified heuristic —
+                    // head_dim ≤ 256 gets tile_size=32 (sliding), else
+                    // 16 (global, smem-tight at head_dim=512).
+                    let tile_size = if dims.head_dim <= 256 { 32u32 } else { 16u32 };
+                    let num_queries_per_kv = dims.num_heads / dims.num_kv_heads;
+                    let block_q = rvllm_attention::UNIFIED_PREFILL_BLOCK_M
+                        / num_queries_per_kv.max(1);
+                    let unified = rvllm_attention::UnifiedPrefillParams {
+                        num_queries_per_kv,
+                        tile_size,
+                        block_q,
+                        use_mma: true,
+                    };
+                    // rope_nvfp4kv encodes Q with the per-tensor
+                    // scalar `scratch.q_scale_ptr`, NOT the per-(token,
+                    // head) cache the FP8 path uses. Pass 0 for
+                    // q_scale_cache so the unified kernel falls back
+                    // to `*q_descale` per row — consistent with how
+                    // rope_nvfp4kv wrote the Q bytes.
+                    prefill.launch_nvfp4kv_unified_sm121(
+                        prefill_params,
+                        unified,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_cache_scale,
+                        scratch.v_cache_scale,
+                        0, // q_scale_cache = nullptr → fall back to *q_descale
+                        meta.block_tables,
+                        cu_seqlens_q,
+                        meta.context_lens,
+                        scratch.q_scale_ptr,
+                        stream,
+                    )?;
+                } else {
+                    prefill.launch(
+                        prefill_params,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_cache_scale,
+                        scratch.v_cache_scale,
+                        meta.block_tables,
+                        meta.context_lens,
+                        cu_seqlens_q,
+                        scratch.q_scale_ptr,
+                        max_seqlen_q,
+                        stream,
+                    )?;
+                }
             } else {
             // FP8 / F16 prefill: share the FP8 write path (no F16 prefill
             // kernel on sm_121). F-series unified-or-fallback structure:
