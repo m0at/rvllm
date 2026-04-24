@@ -11,8 +11,11 @@ Layout (per modelopt producer):
   - Effective bf16 weight = fp4_decoded * fp8_scale_decoded (both as bf16).
 
 Exports:
-  nvfp4_to_bf16_jax(packed, scales, out_shape) -> bf16
-  nvfp4_matmul(x_bf16, w_packed, w_scales, out_features, in_features) -> bf16
+  nvfp4_to_bf16_jax(packed, scales, global_scale, out_shape) -> bf16
+  nvfp4_matmul(x_bf16, w_packed, w_scales, w_scale_2, out_features, in_features) -> bf16
+
+Per modelopt NVFP4 two-level scaling: decoded = fp4_lut * fp8_block_scale * global_scale.
+The `global_scale` / `w_scale_2` is a per-tensor FP32 scalar.
 """
 import jax
 import jax.numpy as jnp
@@ -58,17 +61,17 @@ def _fp8_e4m3_to_f32(bits):
     return val
 
 
-def nvfp4_to_bf16_jax(packed, scales, out_shape):
-    """Dequant packed NVFP4 (+ FP8 E4M3 scales) -> bf16 tensor of shape out_shape.
+def nvfp4_to_bf16_jax(packed, scales, global_scale, out_shape):
+    """Dequant packed NVFP4 (+ FP8 E4M3 scales + FP32 global scale) -> bf16.
 
-    packed: uint8, shape (rows, cols/2)
-    scales: uint8, shape (rows, cols/16)
-    out_shape: (rows, cols)
+    packed:       uint8, shape (rows, cols/2)
+    scales:       uint8, shape (rows, cols/16)
+    global_scale: f32 scalar (modelopt per-tensor weight_scale_2)
+    out_shape:    (rows, cols)
     """
     rows, cols = out_shape
     if cols % 16 != 0:
         raise ValueError(f"cols must be multiple of 16, got {cols}")
-    half = cols // 2
 
     packed = packed.astype(jnp.uint8)
     lo = jnp.bitwise_and(packed, jnp.uint8(0x0F))
@@ -80,23 +83,27 @@ def nvfp4_to_bf16_jax(packed, scales, out_shape):
 
     fp4_bf16 = jnp.take(_FP4_LUT, nibbles.astype(jnp.int32), axis=0)  # (rows, cols) bf16
 
-    # Decode scales: uint8 FP8 E4M3 -> f32 -> bf16, then broadcast over group of 16.
+    # Decode block scales: uint8 FP8 E4M3 -> f32. Fold per-tensor global_scale
+    # in FP32 then cast to bf16 before broadcasting across the 16-element block.
     scale_f32 = _fp8_e4m3_to_f32(scales)            # (rows, cols/16)
-    scale_bf16 = scale_f32.astype(jnp.bfloat16)
+    gs = jnp.asarray(global_scale, dtype=jnp.float32)
+    scale_bf16 = (scale_f32 * gs).astype(jnp.bfloat16)
     scale_expanded = jnp.repeat(scale_bf16, 16, axis=1)  # (rows, cols)
 
     return fp4_bf16 * scale_expanded
 
 
-def nvfp4_matmul(x_bf16, w_packed, w_scales, out_features, in_features):
+def nvfp4_matmul(x_bf16, w_packed, w_scales, w_scale_2, out_features, in_features):
     """Fused: dequant W on the fly, then x @ W^T.
 
-    x_bf16:   (..., in_features) bf16
-    w_packed: (out_features, in_features/2) uint8
-    w_scales: (out_features, in_features/16) uint8
-    Returns:  (..., out_features) bf16
+    x_bf16:    (..., in_features) bf16
+    w_packed:  (out_features, in_features/2) uint8
+    w_scales:  (out_features, in_features/16) uint8
+    w_scale_2: f32 scalar (modelopt per-tensor global scale)
+    Returns:   (..., out_features) bf16
     """
-    w_bf16 = nvfp4_to_bf16_jax(w_packed, w_scales, (out_features, in_features))
+    w_bf16 = nvfp4_to_bf16_jax(
+        w_packed, w_scales, w_scale_2, (out_features, in_features))
     # x @ W.T: contract last axis of x with last axis of W.
     out = jax.lax.dot_general(
         x_bf16, w_bf16,
@@ -126,8 +133,9 @@ if __name__ == "__main__":
     packed_j = jnp.asarray(packed)
     scales_j = jnp.asarray(scales)
 
-    jit_deq = jax.jit(nvfp4_to_bf16_jax, static_argnums=(2,))
-    w_bf16 = jit_deq(packed_j, scales_j, (rows, cols))
+    jit_deq = jax.jit(nvfp4_to_bf16_jax, static_argnums=(3,))
+    gs = jnp.float32(1.0)
+    w_bf16 = jit_deq(packed_j, scales_j, gs, (rows, cols))
     print("dequant shape:", w_bf16.shape, "dtype:", w_bf16.dtype)
 
     # Hand-computed reference for a single 16-element block of row 0.
@@ -173,7 +181,8 @@ if __name__ == "__main__":
     x = rng.standard_normal((2, in_features)).astype(np.float32)
     x_bf = jnp.asarray(x).astype(jnp.bfloat16)
 
-    jit_mm = jax.jit(nvfp4_matmul, static_argnums=(3, 4))
-    y = jit_mm(x_bf, jnp.asarray(wp), jnp.asarray(ws), out_features, in_features)
+    jit_mm = jax.jit(nvfp4_matmul, static_argnums=(4, 5))
+    y = jit_mm(x_bf, jnp.asarray(wp), jnp.asarray(ws), jnp.float32(1.0),
+              out_features, in_features)
     print("matmul shape:", y.shape, "dtype:", y.dtype)
     print("ok")

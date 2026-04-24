@@ -22,8 +22,9 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from m2_attention import precompute_rope_m2, attention_layer
-from m2_moe import moe_block, router_sigmoid_topk
-from m2_mtp import mtp_forward, mtp_load_weights
+from m2_moe import moe_block, moe_block_nvfp4, router_sigmoid_topk
+# m2_mtp is intentionally NOT imported: the real lukealonso/MiniMax-M2.7-NVFP4
+# checkpoint has no MTP tensors. Config's use_mtp=True is aspirational.
 from m2_mesh import make_mesh_v6e8, expert_shard_spec, replicate_spec
 from m2_kv_cache import make_kv_caches, M2_KV_LAYOUT
 from m2_chat import load_tokenizer_m2, apply_chat_template
@@ -70,8 +71,10 @@ def load_config_m2(model_dir):
     TOP_K = int(cfg['num_experts_per_tok'])
     MOE_INTER = int(cfg['intermediate_size'])
 
-    USE_MTP = bool(cfg.get('use_mtp', False))
-    NUM_MTP = int(cfg.get('num_mtp_modules', 0))
+    # The lukealonso/MiniMax-M2.7-NVFP4 checkpoint has no MTP tensors despite
+    # config `use_mtp=True`. Force-disable MTP at runtime until weights ship.
+    USE_MTP = False
+    NUM_MTP = 0
 
     print(
         f"M2 config: H={H} NH={NH} NKV={NKV} HEAD_DIM={HEAD_DIM} NL={NL} VOCAB={VOCAB}",
@@ -120,20 +123,43 @@ def load_model_m2(model_dir, mesh, max_ctx, path="A"):
         return _put_replicated(mesh, jnp.asarray(arr))
 
     def read_expert_weight(name):
-        """Per-expert packed NVFP4 weight. Returns packed or bf16 depending on PATH.
+        """Per-expert packed NVFP4 weight (modelopt 4-tensor layout).
 
-        Expected logical shape: (NUM_EXPERTS, out, in). Path A keeps packed layout
-        (uint8 w_packed + uint8 w_scale). Path B dequantizes to int8 per-row.
+        Returns an NvFp4Tensor for path A. Path B dequantizes to int8 per-row
+        at load time (not currently exercised).
         """
         if path == "A":
-            t = reader.read_nvfp4(name)
-            return t  # caller sends packed + scales through nvfp4_matmul
+            return reader.read_nvfp4(name)
         elif path == "B":
             t = reader.read_nvfp4(name)
             i8, rs = dequant_nvfp4_to_int8_cpu(t, n_threads=0)
             return {'int8': jnp.asarray(i8), 'row_scales': jnp.asarray(rs)}
         else:
             raise ValueError(f"unknown path {path!r}, expected 'A' or 'B'")
+
+    def stack_expert_nvfp4(base_fmt):
+        """Load NUM_EXPERTS NVFP4 tensors named base_fmt.format(e)
+        and return stacked (packed_arr, scale_arr, scale2_arr) jax arrays.
+
+        packed:  (NE, rows, cols/2) uint8
+        scale:   (NE, rows, cols/16) uint8
+        scale2:  (NE,) float32
+        """
+        packed_list = []
+        scale_list = []
+        scale2_list = []
+        for e in range(NUM_EXPERTS):
+            t = reader.read_nvfp4(base_fmt.format(e))
+            packed_list.append(t.packed)
+            scale_list.append(t.scales)
+            scale2_list.append(np.float32(t.global_scale))
+        packed = np.stack(packed_list, axis=0)
+        scale = np.stack(scale_list, axis=0)
+        scale2 = np.asarray(scale2_list, dtype=np.float32)
+        packed_j = _put_expert_sharded(mesh, jnp.asarray(packed))
+        scale_j = _put_expert_sharded(mesh, jnp.asarray(scale))
+        scale2_j = _put_expert_sharded(mesh, jnp.asarray(scale2))
+        return (packed_j, scale_j, scale2_j)
 
     # Embedding + final norm + lm_head are bf16 (in the ignore list).
     embed = read_bf16_replicated('model.embed_tokens.weight')
@@ -160,29 +186,34 @@ def load_model_m2(model_dir, mesh, max_ctx, path="A"):
         }
         attention_weights.append(attn)
 
-        # Router: bf16, in the ignore list. Per-expert bias for aux-loss-free routing.
+        # Router: bf16, in the ignore list. Per-expert bias for aux-loss-free
+        # routing lives at `block_sparse_moe.e_score_correction_bias` (no `.gate.`).
         router = {
             'router_w': read_bf16_replicated(
                 f'{prefix}.block_sparse_moe.gate.weight'),
             'router_bias': read_bf16_replicated(
-                f'{prefix}.block_sparse_moe.gate.e_score_correction_bias'),
+                f'{prefix}.block_sparse_moe.e_score_correction_bias'),
         }
         router_weights.append(router)
 
-        # Experts: NVFP4 packed (path A) or int8 (path B).
-        # Layout: per-expert fused gate||up and down.
+        # Experts: NVFP4 packed (path A). Three separate SwiGLU projections:
+        #   w1 = gate (MOE_INTER, H), w3 = up (MOE_INTER, H), w2 = down (H, MOE_INTER).
+        # Each stored as modelopt 4-tensor NVFP4 (weight/weight_scale/weight_scale_2/input_scale).
+        if path != "A":
+            raise NotImplementedError(
+                "expert stacking currently targets path A only")
         moe = {
-            'gate_up': read_expert_weight(
-                f'{prefix}.block_sparse_moe.experts.gate_up_proj'),
-            'down': read_expert_weight(
-                f'{prefix}.block_sparse_moe.experts.down_proj'),
+            'w1': stack_expert_nvfp4(
+                f'{prefix}.block_sparse_moe.experts.{{}}.w1'),
+            'w2': stack_expert_nvfp4(
+                f'{prefix}.block_sparse_moe.experts.{{}}.w2'),
+            'w3': stack_expert_nvfp4(
+                f'{prefix}.block_sparse_moe.experts.{{}}.w3'),
         }
         moe_weights.append(moe)
 
+    # MTP weights: real checkpoint has none. Leave as None unconditionally.
     mtp_weights = None
-    if USE_MTP and NUM_MTP > 0:
-        all_tensors = {name: reader for name in reader.list_tensors()}
-        mtp_weights = mtp_load_weights(all_tensors, 'model.mtp_modules.')
 
     return {
         'embed': embed,
@@ -226,12 +257,13 @@ def _decode_one_step(token_id, pos, ctx, model, caches, cos, sin, mesh):
         new_k_cache = new_k_cache.at[i].set(k_new)
         new_v_cache = new_v_cache.at[i].set(v_new)
 
-        x = moe_block(
+        x = moe_block_nvfp4(
             x,
             router_w['router_w'],
             router_w['router_bias'],
-            moe_w['gate_up'],
-            moe_w['down'],
+            moe_w['w1'],
+            moe_w['w2'],
+            moe_w['w3'],
             mesh,
         )
 

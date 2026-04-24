@@ -108,6 +108,8 @@ class NvFp4Tensor:
     packed: np.ndarray
     scales: np.ndarray
     group_size: int = 16
+    global_scale: float = 1.0
+    input_scale: float = 1.0
 
 
 # ---- in-house safetensors reader (fallback) --------------------------------
@@ -189,6 +191,8 @@ class ModeloptSafetensorsReader:
     WEIGHT_SUFFIX = '.weight'
     PACKED_SUFFIX = '.weight_packed'
     SCALE_SUFFIX = '.weight_scale'
+    SCALE2_SUFFIX = '.weight_scale_2'
+    INPUT_SCALE_SUFFIX = '.input_scale'
 
     def __init__(self, model_dir):
         self.model_dir = model_dir
@@ -270,25 +274,35 @@ class ModeloptSafetensorsReader:
 
     def is_nvfp4(self, name):
         """True when `name` is the logical (unquantized) tensor name whose
-        on-disk form is a `.weight_packed` + `.weight_scale` pair.
+        on-disk form is one of the supported NVFP4 layouts.
 
         Accepts either the bare base (e.g. `model.layers.0.mlp.gate_proj`) or
         the full `<base>.weight` name, consistent with modelopt layouts.
+
+        Supported layouts:
+          A (modelopt 4-tensor, real schema):
+              <base>.weight          uint8  (rows, cols/2) -- packed FP4 pairs
+              <base>.weight_scale    uint8  (rows, cols/16) -- FP8 E4M3 block scale
+              <base>.weight_scale_2  float32 scalar -- per-tensor global scale
+              <base>.input_scale     float32 scalar -- per-tensor activation scale
+          B (legacy pair):
+              <base>.weight_packed + <base>.weight_scale
         """
         base = name[:-len(self.WEIGHT_SUFFIX)] if name.endswith(self.WEIGHT_SUFFIX) else name
         if self._matches_ignore(base):
             return False
-        packed = base + self.PACKED_SUFFIX
         scale = base + self.SCALE_SUFFIX
-        if packed in self._name_to_shard and scale in self._name_to_shard:
-            return True
-        # alternate modelopt layout: <base>.weight + <base>.weight_scale (packed at .weight)
+        # Layout A: <base>.weight is uint8 packed + <base>.weight_scale present.
         alt_weight = base + self.WEIGHT_SUFFIX
         if alt_weight in self._name_to_shard and scale in self._name_to_shard:
             info = self._tensor_info(alt_weight)
             dtype_str = info['dtype'].upper()
             if dtype_str in ('U8', 'UINT8'):
                 return True
+        # Layout B (fallback): explicit weight_packed + weight_scale.
+        packed = base + self.PACKED_SUFFIX
+        if packed in self._name_to_shard and scale in self._name_to_shard:
+            return True
         return False
 
     def _tensor_info(self, name):
@@ -315,16 +329,25 @@ class ModeloptSafetensorsReader:
 
     def read_nvfp4(self, name):
         base = name[:-len(self.WEIGHT_SUFFIX)] if name.endswith(self.WEIGHT_SUFFIX) else name
-        packed_name = base + self.PACKED_SUFFIX
         scale_name = base + self.SCALE_SUFFIX
-        if packed_name not in self._name_to_shard:
-            alt = base + self.WEIGHT_SUFFIX
-            if alt in self._name_to_shard:
+        scale2_name = base + self.SCALE2_SUFFIX
+        input_scale_name = base + self.INPUT_SCALE_SUFFIX
+
+        # Prefer layout A (modelopt 4-tensor): <base>.weight as uint8 packed.
+        alt = base + self.WEIGHT_SUFFIX
+        packed_name = None
+        if alt in self._name_to_shard:
+            info = self._tensor_info(alt)
+            if info['dtype'].upper() in ('U8', 'UINT8'):
                 packed_name = alt
-            else:
-                raise KeyError(
-                    "NVFP4 packed tensor not found: %s or %s" % (
-                        base + self.PACKED_SUFFIX, alt))
+        if packed_name is None:
+            legacy = base + self.PACKED_SUFFIX
+            if legacy in self._name_to_shard:
+                packed_name = legacy
+        if packed_name is None:
+            raise KeyError(
+                "NVFP4 packed tensor not found: %s or %s"
+                % (base + self.WEIGHT_SUFFIX, base + self.PACKED_SUFFIX))
         if scale_name not in self._name_to_shard:
             raise KeyError("NVFP4 scale tensor not found: %s" % scale_name)
 
@@ -340,12 +363,35 @@ class ModeloptSafetensorsReader:
             raise ValueError(
                 "scale shape %s does not match rows=%d cols/group=%d for %s"
                 % (scales.shape, rows, cols // self.group_size, base))
+
+        global_scale = 1.0
+        if scale2_name in self._name_to_shard:
+            raw = self._read_raw(scale2_name)
+            arr = np.asarray(raw).astype(np.float32).reshape(-1)
+            if arr.size != 1:
+                raise ValueError(
+                    "weight_scale_2 expected scalar, got shape %s for %s"
+                    % (arr.shape, base))
+            global_scale = float(arr[0])
+
+        input_scale = 1.0
+        if input_scale_name in self._name_to_shard:
+            raw = self._read_raw(input_scale_name)
+            arr = np.asarray(raw).astype(np.float32).reshape(-1)
+            if arr.size != 1:
+                raise ValueError(
+                    "input_scale expected scalar, got shape %s for %s"
+                    % (arr.shape, base))
+            input_scale = float(arr[0])
+
         return NvFp4Tensor(
             name=base,
             shape=(rows, cols),
             packed=packed,
             scales=scales,
             group_size=self.group_size,
+            global_scale=global_scale,
+            input_scale=input_scale,
         )
 
     def read_bf16(self, name):
@@ -397,6 +443,9 @@ def dequant_nvfp4_to_int8_cpu(t, n_threads=0):
     if rc != 0:
         raise RuntimeError(
             "rvllm_nvfp4_to_int8 failed with rc=%d for tensor %s" % (rc, t.name))
+    # Fold per-tensor modelopt global scale into the per-row scales.
+    if t.global_scale != 1.0:
+        row_scales = (row_scales * np.float32(t.global_scale)).astype(np.float32)
     return out, row_scales
 
 
@@ -421,6 +470,13 @@ def dequant_nvfp4_to_bf16_cpu(t, n_threads=0):
     if rc != 0:
         raise RuntimeError(
             "rvllm_nvfp4_to_bf16 failed with rc=%d for tensor %s" % (rc, t.name))
+    if t.global_scale != 1.0:
+        if not HAVE_ML_DTYPES:
+            raise RuntimeError(
+                "ml_dtypes required to fold modelopt global_scale for %s" % t.name)
+        bf16_view = out_u16.view(ml_dtypes.bfloat16)
+        scaled_f32 = bf16_view.astype(np.float32) * np.float32(t.global_scale)
+        return scaled_f32.astype(ml_dtypes.bfloat16)
     if HAVE_ML_DTYPES:
         return out_u16.view(ml_dtypes.bfloat16)
     return out_u16

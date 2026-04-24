@@ -260,35 +260,44 @@ def moe_block(x_normed, router_w, router_bias, expert_gate_up, expert_down, mesh
 
 
 def _moe_gather_reference_nvfp4(
-    x, router_w, router_bias, gu_packed, gu_scales, dn_packed, dn_scales
+    x, router_w, router_bias,
+    w1_packed, w1_scale, w1_scale2,
+    w2_packed, w2_scale, w2_scale2,
+    w3_packed, w3_scale, w3_scale2,
 ):
-    """Gather-based reference for NVFP4-packed expert weights.
+    """Gather-based reference for NVFP4-packed expert weights (three projections).
 
-    gu_packed: (NUM_EXPERTS, 2*MOE_INTER, H/2) uint8
-    gu_scales: (NUM_EXPERTS, 2*MOE_INTER, H/16) uint8 (FP8 E4M3 scale bits)
-    dn_packed: (NUM_EXPERTS, H, MOE_INTER/2) uint8
-    dn_scales: (NUM_EXPERTS, H, MOE_INTER/16) uint8
+    Each of w1 (gate), w3 (up), w2 (down) has its own packed tensor + block
+    scales + FP32 per-tensor global scale, stacked along expert axis.
+
+    w1_packed: (NUM_EXPERTS, MOE_INTER, H/2) uint8
+    w1_scale:  (NUM_EXPERTS, MOE_INTER, H/16) uint8
+    w1_scale2: (NUM_EXPERTS,) float32
+    w3_packed: (NUM_EXPERTS, MOE_INTER, H/2) uint8
+    w3_scale:  (NUM_EXPERTS, MOE_INTER, H/16) uint8
+    w3_scale2: (NUM_EXPERTS,) float32
+    w2_packed: (NUM_EXPERTS, H, MOE_INTER/2) uint8
+    w2_scale:  (NUM_EXPERTS, H, MOE_INTER/16) uint8
+    w2_scale2: (NUM_EXPERTS,) float32
     """
     topk_w, topk_idx = router_sigmoid_topk(x, router_w, router_bias)  # (B, K)
     out = jnp.zeros_like(x)
     H_dim = x.shape[-1]
-    two_inter = gu_packed.shape[1]
-    inter = two_inter // 2
+    inter = w1_packed.shape[1]
     for k in range(topk_idx.shape[1]):
-        # Per-token expert — run one token at a time to honor per-token
-        # expert selection. Cheap: this is the reference path only.
         for b in range(x.shape[0]):
             e = topk_idx[b, k]
-            gu_p = gu_packed[e]          # (2*MOE_INTER, H/2)
-            gu_s = gu_scales[e]          # (2*MOE_INTER, H/16)
-            dn_p = dn_packed[e]          # (H, MOE_INTER/2)
-            dn_s = dn_scales[e]          # (H, MOE_INTER/16)
-            x_b = x[b:b+1]               # (1, H)
-            gate_up = nvfp4_matmul(x_b, gu_p, gu_s, two_inter, H_dim)  # (1, 2*MOE_INTER)
-            gate = gate_up[:, :inter]
-            up = gate_up[:, inter:]
-            h = jax.nn.silu(gate) * up    # (1, MOE_INTER)
-            y = nvfp4_matmul(h, dn_p, dn_s, H_dim, inter)  # (1, H)
+            x_b = x[b:b+1]                 # (1, H)
+            gate = nvfp4_matmul(
+                x_b, w1_packed[e], w1_scale[e], w1_scale2[e], inter, H_dim
+            )                              # (1, MOE_INTER)
+            up = nvfp4_matmul(
+                x_b, w3_packed[e], w3_scale[e], w3_scale2[e], inter, H_dim
+            )                              # (1, MOE_INTER)
+            h = jax.nn.silu(gate) * up     # (1, MOE_INTER)
+            y = nvfp4_matmul(
+                h, w2_packed[e], w2_scale[e], w2_scale2[e], H_dim, inter
+            )                              # (1, H)
             out = out.at[b].add(
                 (topk_w[b, k].astype(y.dtype) * y[0]).astype(out.dtype)
             )
@@ -296,11 +305,17 @@ def _moe_gather_reference_nvfp4(
 
 
 def _moe_shard_map_nvfp4(
-    x, router_w, router_bias, gu_packed, gu_scales, dn_packed, dn_scales, mesh
+    x, router_w, router_bias,
+    w1_packed, w1_scale, w1_scale2,
+    w2_packed, w2_scale, w2_scale2,
+    w3_packed, w3_scale, w3_scale2,
+    mesh,
 ):
     """shard_map MoE with on-the-fly NVFP4 dequant per expert.
 
     Expert weights are NVFP4-packed and sharded along the expert axis.
+    Three separate projections w1 (gate), w3 (up), w2 (down), each with a
+    per-tensor FP32 global scale stacked as (NUM_EXPERTS,).
     """
     n_shards = mesh.shape['expert']
     assert NUM_EXPERTS % n_shards == 0, 'experts must divide evenly across shards'
@@ -313,14 +328,22 @@ def _moe_shard_map_nvfp4(
         P(),                       # x replicated
         P(),                       # topk_w replicated
         P(),                       # topk_idx replicated
-        P('expert', None, None),   # gu_packed sharded on experts
-        P('expert', None, None),   # gu_scales sharded on experts
-        P('expert', None, None),   # dn_packed sharded on experts
-        P('expert', None, None),   # dn_scales sharded on experts
+        P('expert', None, None),   # w1_packed sharded on experts
+        P('expert', None, None),   # w1_scale sharded on experts
+        P('expert'),               # w1_scale2 sharded on experts
+        P('expert', None, None),   # w2_packed sharded on experts
+        P('expert', None, None),   # w2_scale sharded on experts
+        P('expert'),               # w2_scale2 sharded on experts
+        P('expert', None, None),   # w3_packed sharded on experts
+        P('expert', None, None),   # w3_scale sharded on experts
+        P('expert'),               # w3_scale2 sharded on experts
     )
     out_specs = P()
 
-    def _local(x_l, w_l, idx_l, gup_l, gus_l, dnp_l, dns_l):
+    def _local(x_l, w_l, idx_l,
+               w1p_l, w1s_l, w1g_l,
+               w2p_l, w2s_l, w2g_l,
+               w3p_l, w3s_l, w3g_l):
         flat_idx = idx_l.reshape(-1)
         flat_w = w_l.reshape(-1)
         dest_shard = flat_idx // experts_per_shard
@@ -340,8 +363,7 @@ def _moe_shard_map_nvfp4(
         within = pos < capacity
 
         H_dim = x_l.shape[-1]
-        two_inter = gup_l.shape[1]
-        inter_dim = two_inter // 2
+        inter_dim = w1p_l.shape[1]
 
         send_tokens = jnp.zeros((n_shards, capacity, H_dim), x_l.dtype)
         send_local = jnp.zeros((n_shards, capacity), jnp.int32)
@@ -384,14 +406,15 @@ def _moe_shard_map_nvfp4(
         for e in range(experts_per_shard):
             mask = (recv_local == e) & recv_valid
             x_e = recv_tokens * mask[:, None].astype(recv_tokens.dtype)
-            gate_up = nvfp4_matmul(
-                x_e, gup_l[e], gus_l[e], two_inter, H_dim
-            )  # (N, 2*MOE_INTER)
-            gate = gate_up[:, :inter_dim]
-            up = gate_up[:, inter_dim:]
+            gate = nvfp4_matmul(
+                x_e, w1p_l[e], w1s_l[e], w1g_l[e], inter_dim, H_dim
+            )  # (N, MOE_INTER)
+            up = nvfp4_matmul(
+                x_e, w3p_l[e], w3s_l[e], w3g_l[e], inter_dim, H_dim
+            )  # (N, MOE_INTER)
             h = jax.nn.silu(gate) * up
             d = nvfp4_matmul(
-                h, dnp_l[e], dns_l[e], H_dim, inter_dim
+                h, w2p_l[e], w2s_l[e], w2g_l[e], H_dim, inter_dim
             )  # (N, H)
             local_out = local_out + d * mask[:, None].astype(d.dtype)
 
@@ -425,33 +448,44 @@ def _moe_shard_map_nvfp4(
         in_specs=in_specs,
         out_specs=out_specs,
         check_rep=False,
-    )(x, topk_w, topk_idx, gu_packed, gu_scales, dn_packed, dn_scales)
+    )(x, topk_w, topk_idx,
+      w1_packed, w1_scale, w1_scale2,
+      w2_packed, w2_scale, w2_scale2,
+      w3_packed, w3_scale, w3_scale2)
 
 
 def moe_block_nvfp4(
     x_normed,
     router_w,
     router_bias,
-    gu_packed,
-    gu_scales,
-    dn_packed,
-    dn_scales,
+    w1,
+    w2,
+    w3,
     mesh,
 ):
-    """Path A MoE block with NVFP4-packed expert weights.
+    """Path A MoE block with NVFP4-packed expert weights (three projections).
 
-    Same top-8 sigmoid+bias routing as moe_block. Per-expert FFN uses
-    nvfp4_matmul for on-the-fly dequant fused into the GEMM. Returns (B, H).
+    Same top-8 sigmoid+bias routing as moe_block. Per-expert SwiGLU FFN:
+        gate = nvfp4_matmul(x, w1)
+        up   = nvfp4_matmul(x, w3)
+        h    = silu(gate) * up
+        out  = nvfp4_matmul(h, w2)
+
+    Each of w1, w2, w3 is a tuple of three arrays:
+        (packed, scale, scale2)
+    with shapes per expert, stacked along axis 0:
+        w1: packed (NE, MOE_INTER, H/2)  scale (NE, MOE_INTER, H/16)  scale2 (NE,)
+        w3: packed (NE, MOE_INTER, H/2)  scale (NE, MOE_INTER, H/16)  scale2 (NE,)
+        w2: packed (NE, H, MOE_INTER/2)  scale (NE, H, MOE_INTER/16)  scale2 (NE,)
 
     Shapes:
         x_normed: (B, H)
         router_w: (NUM_EXPERTS, H) bf16
         router_bias: (NUM_EXPERTS,) bf16
-        gu_packed: (NUM_EXPERTS, 2*MOE_INTER, H/2) uint8
-        gu_scales: (NUM_EXPERTS, 2*MOE_INTER, H/16) uint8
-        dn_packed: (NUM_EXPERTS, H, MOE_INTER/2) uint8
-        dn_scales: (NUM_EXPERTS, H, MOE_INTER/16) uint8
     """
+    w1_packed, w1_scale, w1_scale2 = w1
+    w2_packed, w2_scale, w2_scale2 = w2
+    w3_packed, w3_scale, w3_scale2 = w3
     has_expert_axis = (
         mesh is not None
         and hasattr(mesh, 'axis_names')
@@ -460,11 +494,16 @@ def moe_block_nvfp4(
     if has_expert_axis:
         return _moe_shard_map_nvfp4(
             x_normed, router_w, router_bias,
-            gu_packed, gu_scales, dn_packed, dn_scales, mesh,
+            w1_packed, w1_scale, w1_scale2,
+            w2_packed, w2_scale, w2_scale2,
+            w3_packed, w3_scale, w3_scale2,
+            mesh,
         )
     return _moe_gather_reference_nvfp4(
         x_normed, router_w, router_bias,
-        gu_packed, gu_scales, dn_packed, dn_scales,
+        w1_packed, w1_scale, w1_scale2,
+        w2_packed, w2_scale, w2_scale2,
+        w3_packed, w3_scale, w3_scale2,
     )
 
 
