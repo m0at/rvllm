@@ -131,27 +131,44 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 
 <header>
   <h1>rvLLM Benchmarks</h1>
-  <div class="sub">Gemma 4 inference on <strong>TPU v6e-4</strong> (JAX+XLA) and <strong>H100 GPU</strong> (Rust+CUDA). Three TPU models: <strong>E4B</strong> (4B dense), <strong>26B-A4B</strong> (MoE, 128 experts), <strong>31B</strong> (dense). All numbers measured on our hardware.</div>
+  <div class="sub">Gemma 4 inference on <strong>TPU v6e-4</strong> (JAX+XLA) and <strong>H100 GPU</strong> (Rust+CUDA). TPU: <strong>E4B</strong> (4B dense), <strong>26B-A4B</strong> (MoE), <strong>31B</strong> (dense). GPU: <strong>E4B FP8</strong> and <strong>31B FP8</strong>. All numbers measured on our hardware.</div>
   <div class="nav-buttons">
     <a href="index.html">Home</a>
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="paper/rvllm.pdf">Paper</a>
     <a href="arch.md">Architecture</a>
+    <a href="#b200-tpu-comparison">B200 vs TPU</a>
   </div>
 </header>
 
 <table style="margin:1.5rem 0 2rem">
-<thead><tr><th></th><th class="r">E4B (4B)</th><th class="r">26B-A4B (MoE)</th><th class="r">31B</th><th class="r">vLLM H100</th></tr></thead>
+<thead><tr><th></th><th class="r">E4B TPU</th><th class="r">E4B H100 rvLLM</th><th class="r">26B-A4B TPU</th><th class="r">31B TPU</th><th class="r">31B vLLM H100</th></tr></thead>
 <tbody>
-<tr><td><strong>PPL</strong></td><td class="r pos"><strong>5.87</strong></td><td class="r">90.21</td><td class="r">24.76</td><td class="r">-</td></tr>
-<tr><td><strong>B=1 tok/s</strong></td><td class="r pos"><strong>78.3</strong></td><td class="r">52.9</td><td class="r">44.2</td><td class="r">66.9</td></tr>
-<tr><td><strong>B=128 tok/s</strong></td><td class="r pos"><strong>6,298</strong></td><td class="r">4,915</td><td class="r">3,853</td><td class="r">3,848</td></tr>
-<tr><td><strong>Cached TTFT</strong></td><td class="r pos"><strong>25.9 ms</strong></td><td class="r">35.3 ms</td><td class="r">73.3 ms</td><td class="r">-</td></tr>
-<tr><td><strong>Peak tok/s</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">14,899</td><td class="r">9,600</td><td class="r">3,848</td></tr>
-<tr><td><strong>Peak tok/s/$</strong></td><td class="r pos"><strong>3,230</strong></td><td class="r">2,865</td><td class="r">1,846</td><td class="r">2,004</td></tr>
+<tr><td><strong>PPL</strong></td><td class="r pos"><strong>5.87</strong></td><td class="r">28.33*</td><td class="r">90.21</td><td class="r">24.76</td><td class="r">-</td></tr>
+<tr><td><strong>B=1 tok/s</strong></td><td class="r">78.3</td><td class="r pos"><strong>136.1</strong></td><td class="r">52.9</td><td class="r">44.2</td><td class="r">66.9</td></tr>
+<tr><td><strong>B=30 broadcast tok/s</strong></td><td class="r">-</td><td class="r pos"><strong>451.6</strong></td><td class="r">-</td><td class="r">-</td><td class="r">-</td></tr>
+<tr><td><strong>B=128 tok/s</strong></td><td class="r pos"><strong>6,298</strong></td><td class="r">-</td><td class="r">4,915</td><td class="r">3,853</td><td class="r">3,848</td></tr>
+<tr><td><strong>Cached TTFT / step</strong></td><td class="r pos"><strong>25.9 ms</strong></td><td class="r pos"><strong>7.3 ms/step</strong></td><td class="r">35.3 ms</td><td class="r">73.3 ms</td><td class="r">-</td></tr>
+<tr><td><strong>Best measured tok/s</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">451.6</td><td class="r">14,899</td><td class="r">9,600</td><td class="r">3,848</td></tr>
+<tr><td><strong>Best tok/s/$</strong></td><td class="r pos"><strong>3,230</strong></td><td class="r">235</td><td class="r">2,865</td><td class="r">1,846</td><td class="r">2,004</td></tr>
 </tbody>
 </table>
-<div class="footnote">TPU: v6e-4, $5.20/hr, int8 weights, bf16 KV, max-ctx 2048. vLLM: H100 SXM, $1.92/hr, FP8, max-ctx 2048. GPU rvLLM: H100 SXM, $1.92/hr, FP8+F16 KV. All measured.</div>
+<div class="footnote">TPU: v6e-4, $5.20/hr, int8 weights, bf16 KV, max-ctx 2048. GPU: H100 SXM, $1.92/hr, FP8+F16 KV. *E4B GPU PPL is the 4B FP8 gate spot check. E4B B=30 is same-prompt broadcast throughput, not heterogeneous batching.</div>
+
+<h3 id="b200-tpu-comparison">B200 vs TPU v6e equivalent</h3>
+<div class="note-box" style="border-left-color:#e06080">
+  <strong>Bench-derived result:</strong> for E4B small-model int8 decode, one B200 is about <strong>2.7x a v6e-8 slice</strong> at peak. For 31B high-batch decode, <strong>v6e-8 is roughly one B200</strong>. Raw BF16 FLOPs say v6e-8 is ~3.3x B200, but that is the wrong model for rvLLM decode.
+</div>
+
+<table>
+<thead><tr><th>Workload</th><th class="r">v6e-8 vs B200</th><th class="r">Full v6e-256 pod</th><th>Read</th></tr></thead>
+<tbody>
+<tr class="highlight"><td><strong>E4B / 4B int8 decode</strong></td><td class="r"><strong>0.37x</strong></td><td class="r">~12 B200s</td><td>B200 wins hard on small-model bandwidth-bound decode</td></tr>
+<tr><td>31B high-batch decode</td><td class="r">~0.9-1.0x</td><td class="r">~30 B200s</td><td>v6e-8 is roughly one B200</td></tr>
+<tr><td>Raw dense BF16 spec sheet</td><td class="r">~3.3x</td><td class="r">~104 B200s</td><td>Misleading for measured decode behavior</td></tr>
+</tbody>
+</table>
+<div class="footnote">E4B uses measured v6e-4 peak 16,794 tok/s replicated to v6e-8 and the B200 projection of 90,000 tok/s. 31B uses measured v6e-4 peak 9,600 tok/s replicated to v6e-8 and measured rvLLM H100 peak 8,786 tok/s scaled to B200. Details: <a href="b200-tpu-comparison.md">b200-tpu-comparison.md</a>.</div>
 
 <div class="filter-bar">
   <button class="filter-btn active" onclick="filterView('both')">Both</button>
@@ -163,40 +180,42 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 
 <div class="chart-box">
   <div class="chart-title"><strong>All configurations: throughput vs batch size</strong>
-    <div class="note">3 TPU models + 2 GPU baselines. TPU v6e-4 $5.20/hr, H100 SXM $1.92/hr. All at max-ctx 2048.</div>
+    <div class="note">3 TPU models + GPU baselines. TPU v6e-4 $5.20/hr, H100 SXM $1.92/hr. E4B GPU B=30 is same-prompt broadcast.</div>
   </div>
   <div id="chart-overview" style="height:400px"></div>
 </div>
 
 <h3>Full batch sweep -- all configurations</h3>
 <table>
-<thead><tr><th>Batch</th><th class="r">E4B TPU</th><th class="r">26B-A4B TPU</th><th class="r">31B TPU</th><th class="r">31B GPU (rvLLM)</th><th class="r">31B GPU (vLLM)</th></tr></thead>
+<thead><tr><th>Batch</th><th class="r">E4B TPU</th><th class="r">E4B GPU rvLLM</th><th class="r">26B-A4B TPU</th><th class="r">31B TPU</th><th class="r">31B GPU (rvLLM)</th><th class="r">31B GPU (vLLM)</th></tr></thead>
 <tbody>
-<tr><td>1</td><td class="r">78</td><td class="r">53</td><td class="r">44</td><td class="r">53</td><td class="r">69</td></tr>
-<tr><td>8</td><td class="r">542</td><td class="r">390</td><td class="r">318</td><td class="r">434</td><td class="r">515</td></tr>
-<tr><td>32</td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td class="r">1,743</td><td class="r">1,748</td></tr>
-<tr><td>64</td><td class="r">3,661</td><td class="r">2,662</td><td class="r">2,112</td><td class="r">3,265</td><td class="r">3,130</td></tr>
-<tr><td>128</td><td class="r pos">6,298</td><td class="r">4,915</td><td class="r">3,853</td><td class="r pos">5,802</td><td class="r">4,689</td></tr>
-<tr><td>256</td><td class="r pos">10,214</td><td class="r">8,192</td><td class="r">6,246</td><td class="r pos">7,808</td><td class="r">7,077</td></tr>
-<tr><td>512</td><td class="r pos">13,773</td><td class="r">12,390</td><td class="r">8,550</td><td class="r pos">8,786</td><td class="r">8,243</td></tr>
-<tr class="highlight"><td><strong>768</strong></td><td class="r pos"><strong>15,514</strong></td><td class="r"><strong>14,899</strong></td><td class="r"><strong>9,600</strong></td><td class="r">-</td><td class="r">-</td></tr>
-<tr class="highlight"><td><strong>1024</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td class="r">-</td></tr>
+<tr><td>1</td><td class="r">78</td><td class="r pos"><strong>136</strong></td><td class="r">53</td><td class="r">44</td><td class="r">53</td><td class="r">69</td></tr>
+<tr><td>8</td><td class="r">542</td><td class="r">-</td><td class="r">390</td><td class="r">318</td><td class="r">434</td><td class="r">515</td></tr>
+<tr class="highlight"><td><strong>30*</strong></td><td class="r">-</td><td class="r pos"><strong>452</strong></td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td class="r">-</td></tr>
+<tr><td>32</td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td class="r">1,743</td><td class="r">1,748</td></tr>
+<tr><td>64</td><td class="r">3,661</td><td class="r">-</td><td class="r">2,662</td><td class="r">2,112</td><td class="r">3,265</td><td class="r">3,130</td></tr>
+<tr><td>128</td><td class="r pos">6,298</td><td class="r">-</td><td class="r">4,915</td><td class="r">3,853</td><td class="r pos">5,802</td><td class="r">4,689</td></tr>
+<tr><td>256</td><td class="r pos">10,214</td><td class="r">-</td><td class="r">8,192</td><td class="r">6,246</td><td class="r pos">7,808</td><td class="r">7,077</td></tr>
+<tr><td>512</td><td class="r pos">13,773</td><td class="r">-</td><td class="r">12,390</td><td class="r">8,550</td><td class="r pos">8,786</td><td class="r">8,243</td></tr>
+<tr class="highlight"><td><strong>768</strong></td><td class="r pos"><strong>15,514</strong></td><td class="r">-</td><td class="r"><strong>14,899</strong></td><td class="r"><strong>9,600</strong></td><td class="r">-</td><td class="r">-</td></tr>
+<tr class="highlight"><td><strong>1024</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td class="r">-</td></tr>
 </tbody>
 </table>
-<div class="footnote">All tok/s are total throughput (batch x per-element rate). "-" = not tested or OOM at that batch size.</div>
+<div class="footnote">All tok/s are total throughput (batch x per-element rate). "*" = E4B GPU same-prompt broadcast. "-" = not tested or OOM at that batch size.</div>
 
 <h3>Summary across all configurations</h3>
 <table>
-<thead><tr><th>Config</th><th class="r">PPL</th><th class="r">B=1 tok/s</th><th class="r">Cached TTFT</th><th class="r">Peak tok/s</th><th class="r">$/hr</th><th class="r">Peak tok/s/$</th></tr></thead>
+<thead><tr><th>Config</th><th class="r">PPL</th><th class="r">B=1 tok/s</th><th class="r">Cached TTFT</th><th class="r">Best measured tok/s</th><th class="r">$/hr</th><th class="r">Best tok/s/$</th></tr></thead>
 <tbody>
 <tr class="highlight"><td><strong>E4B on TPU</strong></td><td class="r pos"><strong>5.87</strong></td><td class="r pos"><strong>78.3</strong></td><td class="r pos"><strong>25.9 ms</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">$5.20</td><td class="r pos"><strong>3,230</strong></td></tr>
+<tr><td>E4B rvLLM GPU (FP8)</td><td class="r">28.33*</td><td class="r pos"><strong>136.1</strong></td><td class="r">7.3 ms/step</td><td class="r">451.6*</td><td class="r">$1.92</td><td class="r">235</td></tr>
 <tr><td>26B-A4B on TPU</td><td class="r">90.21</td><td class="r">52.9</td><td class="r">35.3 ms</td><td class="r">14,899</td><td class="r">$5.20</td><td class="r">2,865</td></tr>
 <tr><td>31B on TPU</td><td class="r">24.76</td><td class="r">44.2</td><td class="r">73.3 ms</td><td class="r">9,600</td><td class="r">$5.20</td><td class="r">1,846</td></tr>
 <tr><td>31B rvLLM GPU</td><td class="r pos">14.75</td><td class="r">53</td><td class="r">63 ms</td><td class="r">8,786</td><td class="r">$1.92</td><td class="r">4,576</td></tr>
 <tr><td>31B vLLM GPU</td><td class="r">-</td><td class="r">69</td><td class="r">-</td><td class="r">3,848</td><td class="r">$1.92</td><td class="r">2,004</td></tr>
 </tbody>
 </table>
-<div class="footnote">PPL measured on 86-token passage. 26B-A4B PPL is high for both rvLLM (90.21) and HF reference (85.42) -- instruct MoE on raw prose. GPU rvLLM PPL 14.75 is best due to FP8-Dynamic per-channel scales + CUTLASS F32 epilogue preserving more precision than int8 or bf16.</div>
+<div class="footnote">TPU PPL measured on 86-token passage. E4B GPU PPL is the FP8 gate spot check. 26B-A4B PPL is high for both rvLLM (90.21) and HF reference (85.42) -- instruct MoE on raw prose. 31B GPU rvLLM PPL 14.75 is best due to FP8-Dynamic per-channel scales + CUTLASS F32 epilogue preserving more precision than int8 or bf16.</div>
 
 </div>
 
@@ -469,8 +488,32 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 </tbody>
 </table>
 
+<h3>E4B / 4B FP8 on H100 <span class="badge measured">Measured</span></h3>
+<div class="note-box" style="border-left-color:#84E6B7;margin-top:2rem">
+  <strong>4B now passes the H100 FP8 gate.</strong> Known-good mode uses the Gemma E4B FP8 checkpoint with F16 KV and the first 9 per-layer-input layers forced through F16. Pure all-layer FP8 remains blocked because it previously produced repetitive junk.
+</div>
+
+<table>
+<thead><tr><th>Metric</th><th class="r">Measured value</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>PPL spot check</td><td class="r">28.33</td><td>Quality gate passage, coherent output required</td></tr>
+<tr><td>B=1 decode bench</td><td class="r pos"><strong>136.1 tok/s</strong></td><td>7.35 ms/step, FP8 weights + F16 KV</td></tr>
+<tr><td>B=30 broadcast</td><td class="r pos"><strong>451.6 row tok/s</strong></td><td>48 visible tokens x 30 rows in 3.19s</td></tr>
+<tr><td>Quality prompt</td><td class="r pos"><strong>pass</strong></td><td><code>explain angular momentum</code> produced coherent explanatory text</td></tr>
+<tr><td>Heterogeneous B&gt;1 FP8</td><td class="r">not claimed</td><td>Current cuBLASLt path uses scalar activation scale; same-prompt broadcast is exact</td></tr>
+</tbody>
+</table>
+
+<div class="method-box">
+<strong>Known-good E4B H100 env:</strong><br>
+<code>RVLLM_MODEL_DIR=/root/models/gemma-4-E4B-it-FP8</code><br>
+<code>RVLLM_F16_LAYERS=9</code><br>
+<code>RVLLM_F16_KV=1</code><br>
+<code>RVLLM_DECODE_BATCH_TARGET=30</code>
+</div>
+
 <div class="note-box" style="border-left-color:#e8d26d;margin-top:2rem">
-  <strong style="color:#e8d26d">Coming soon: E4B (4B) + 26B-A4B on GPU.</strong> FP8-Dynamic checkpoints downloaded. Per-layer input injection and KV sharing (E4B) and MoE expert routing (26B-A4B) are actively being implemented in the Rust+CUDA engine. Check back shortly.
+  <strong style="color:#e8d26d">Still pending: 26B-A4B on GPU and vLLM E4B comparison.</strong> The 4B rvLLM path is validated; MoE routing and a direct vLLM 4B apples-to-apples run are separate work.
 </div>
 
 </div>
@@ -503,15 +546,20 @@ Hardware: H100 SXM 80 GB.<br>
 Model: 31B Gemma 4, FP8 E4M3 weights (per-channel scale), F16 KV cache.<br>
 Forward: ~13 kernel launches per layer (post-fusion), 60 layers + lm_head + argmax = ~1350 nodes in one <code>cuGraphLaunch</code>.<br>
 Kernels: cuBLASLt FP8 GEMMs (SM90), FlashAttention-3, custom fused ops.
+<br><br>
+<strong>GPU E4B / 4B FP8 gate:</strong><br>
+Hardware: H100 SXM 80 GB on vast.ai ($1.92/hr).<br>
+Model: Gemma 4 E4B FP8 checkpoint, F16 KV cache, first 9 PLI layers forced F16.<br>
+Gate: PPL spot 28.33, B=1 decode 136.1 tok/s, B=30 same-prompt broadcast 451.6 row tok/s. Heterogeneous B&gt;1 FP8 remains a separate row-scale path.
 </div>
 
 
 <hr class="divider">
 
-<h2>Small Model Parallelization <span class="sub">speculative, not yet benchmarked</span></h2>
+<h2>Small Model Parallelization <span class="sub">measured 4B anchor + projections</span></h2>
 
 <div class="note-box">
-<strong>This section is speculation.</strong> We have not extensively tested single-GPU parallelization for small models, nor factored all potential strategies. The numbers below are back-of-envelope estimates based on hardware specs and known bottlenecks. Treat them as directional, not measured.
+<strong>Updated with an H100 4B measurement.</strong> E4B now has a real FP8 gate result on H100: 136.1 tok/s at B=1 and 451.6 row tok/s for B=30 same-prompt broadcast. The H200/B200 curves below remain projections.
 </div>
 
 <p style="font-size:0.92rem;color:#d0d0d0;margin:1rem 0;line-height:1.7">
@@ -526,10 +574,21 @@ This means <strong>the accelerator with the most memory bandwidth wins</strong>,
 
 <div class="chart-box">
   <div class="chart-title"><strong>E4B throughput: measured (solid) vs projected (open)</strong>
-    <div class="note">Measured on TPU v6e-4. GPU projections from HBM bandwidth at 40-50% utilization. INT4 assumes 2.5 GB weights. Batch projections extrapolated from measured scaling curve.</div>
+    <div class="note">Measured on TPU v6e-4 and H100 FP8. H100 B=30 is same-prompt broadcast. H200/B200 curves are HBM-bandwidth projections.</div>
   </div>
   <div id="chart-projections" style="height:420px"></div>
 </div>
+
+<h3>Measured H100 E4B FP8 gate</h3>
+
+<table>
+<thead><tr><th>Mode</th><th class="r">Throughput</th><th class="r">Latency</th><th>Quality</th></tr></thead>
+<tbody>
+<tr><td>B=1 decode bench</td><td class="r pos"><strong>136.1 tok/s</strong></td><td class="r">7.35 ms/step</td><td>PPL spot 28.33</td></tr>
+<tr><td>B=30 same-prompt broadcast</td><td class="r pos"><strong>451.6 row tok/s</strong></td><td class="r">3.19s / 48 visible tokens</td><td>30/30 done, 0 failed</td></tr>
+</tbody>
+</table>
+<div class="footnote">This is not a full heterogeneous batch sweep. The current FP8 cuBLASLt activation-scale path is exact for same-prompt broadcast rows; different prompts in the same FP8 batch need a row-scale path.</div>
 
 <h3>Single-GPU estimates for 4B decode (B=1)</h3>
 
@@ -581,11 +640,11 @@ On an H100 80GB, recovering 3-6 GB of framework overhead means the difference be
 <h3>Projected single-GPU 4B performance</h3>
 
 <p style="font-size:0.92rem;color:#d0d0d0;margin:1rem 0;line-height:1.7">
-With no framework overhead eating into VRAM and bandwidth-optimal weight streaming, small models can exploit the full hardware budget. The real lever is batch scaling: at B=128, the same weight read serves 128 sequences, pushing arithmetic intensity to ~128 FLOPs/byte and saturating tensor cores. Our measured E4B numbers show 81x scaling from B=1 to B=128.
+With no framework overhead eating into VRAM and bandwidth-optimal weight streaming, small models can exploit the full hardware budget. The real lever is batch scaling: at B=128, the same weight read serves 128 sequences, pushing arithmetic intensity to ~128 FLOPs/byte and saturating tensor cores. Our measured TPU E4B numbers show 81x scaling from B=1 to B=128; the H100 FP8 gate currently proves B=1 and same-prompt B=30.
 </p>
 
 <div class="note-box">
-<strong>Bottom line:</strong> a native binary running a 4B model on a B200 at B=1 could plausibly hit 500-900 tok/s -- fast enough for real-time speech synthesis or interactive agents. At B=128, the same B200 could push 50,000+ tok/s. The no-Python VRAM savings make higher batch sizes and longer contexts achievable where Python stacks would OOM. We haven't extensively tested single-GPU parallelization and these are estimates from hardware specs and measured TPU scaling curves. If you're interested in pushing this direction, we'd welcome collaboration.
+<strong>Bottom line:</strong> native 4B on H100 is now real at 136 tok/s B=1 in the guarded FP8 path, with 452 row tok/s in B=30 broadcast. A B200 at B=1 could still plausibly reach 500-900 tok/s, but that remains a projection until measured. Next work is heterogeneous B&gt;1 row-scale FP8 and the direct vLLM E4B comparison.
 </div>
 
 <footer>
@@ -636,24 +695,29 @@ With no framework overhead eating into VRAM and bandwidth-optimal weight streami
     );
   }
 
-  // TPU batch scaling: E4B + 26B-A4B + 31B + vLLM
+  // TPU batch scaling plus measured H100 baselines.
   const tpuScalingData = [
-    { batch: '1',    e4b: 78,    moe: 53,    b31: 44,   vllm: 66.9 },
-    { batch: '8',    e4b: 542,   moe: 390,   b31: 318,  vllm: 511.7 },
-    { batch: '64',   e4b: 3661,  moe: 2662,  b31: 2112, vllm: 2794 },
-    { batch: '128',  e4b: 6298,  moe: 4915,  b31: 3853, vllm: 3848 },
-    { batch: '256',  e4b: 10214, moe: 8192,  b31: 6246, vllm: 3709 },
-    { batch: '512',  e4b: 13773, moe: 12390, b31: 8550, vllm: 3788 },
-    { batch: '768',  e4b: 15514, moe: 14899, b31: 9600, vllm: 3671 },
-    { batch: '1024', e4b: 16794, moe: null,  b31: null, vllm: null }
+    { batch: '1',    e4b: 78,    e4bgpu: 136.1, moe: 53,    b31: 44,   vllm: 66.9 },
+    { batch: '8',    e4b: 542,   e4bgpu: null,  moe: 390,   b31: 318,  vllm: 511.7 },
+    { batch: '30*',  e4b: null,  e4bgpu: 451.6, moe: null,  b31: null, vllm: null },
+    { batch: '64',   e4b: 3661,  e4bgpu: null,  moe: 2662,  b31: 2112, vllm: 2794 },
+    { batch: '128',  e4b: 6298,  e4bgpu: null,  moe: 4915,  b31: 3853, vllm: 3848 },
+    { batch: '256',  e4b: 10214, e4bgpu: null,  moe: 8192,  b31: 6246, vllm: 3709 },
+    { batch: '512',  e4b: 13773, e4bgpu: null,  moe: 12390, b31: 8550, vllm: 3788 },
+    { batch: '768',  e4b: 15514, e4bgpu: null,  moe: 14899, b31: 9600, vllm: 3671 },
+    { batch: '1024', e4b: 16794, e4bgpu: null,  moe: null,  b31: null, vllm: null }
   ];
 
-  // Projections scatter: measured E4B + projected GPU estimates
-  // Measured points (TPU v6e-4)
+  // Projections scatter: measured E4B plus projected GPU estimates.
+  // Measured points (TPU v6e-4).
   const measuredE4B = [
     { batch: 1, toks: 78 }, { batch: 8, toks: 542 }, { batch: 64, toks: 3661 },
     { batch: 128, toks: 6298 }, { batch: 256, toks: 10214 }, { batch: 512, toks: 13773 },
     { batch: 768, toks: 15514 }, { batch: 1024, toks: 16794 }
+  ];
+  // Measured points (H100 FP8). B=30 is same-prompt broadcast.
+  const measuredH100E4B = [
+    { batch: 1, toks: 136.1 }, { batch: 30, toks: 451.6 }
   ];
   // Projected: H100 int8 (BW=3.35 TB/s, ~40-50% util)
   const projH100 = [
@@ -703,6 +767,7 @@ With no framework overhead eating into VRAM and bandwidth-optimal weight streami
           labelFormatter: function(v){ return 'B=' + v; } }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8, fontSize: 11 } }),
         e(R.Scatter, { name: 'E4B TPU (measured)', data: measuredE4B, fill: '#84E6B7', line: { stroke: '#84E6B7', strokeWidth: 2 }, lineType: 'monotone' }),
+        e(R.Scatter, { name: 'E4B H100 FP8 (measured)', data: measuredH100E4B, fill: '#ff7a2f', line: { stroke: '#ff7a2f', strokeWidth: 2 }, lineType: 'monotone' }),
         e(R.Scatter, { name: 'H100 int8 (projected)', data: projH100, fill: 'none', stroke: '#e8a84c', strokeWidth: 2, shape: 'cross', line: { stroke: '#e8a84c', strokeWidth: 1, strokeDasharray: '6 3' }, lineType: 'monotone' }),
         e(R.Scatter, { name: 'H100 INT4 (projected)', data: projH100i4, fill: 'none', stroke: '#f0c878', strokeWidth: 2, shape: 'diamond', line: { stroke: '#f0c878', strokeWidth: 1, strokeDasharray: '6 3' }, lineType: 'monotone' }),
         e(R.Scatter, { name: 'H200 int8 (projected)', data: projH200, fill: 'none', stroke: '#5a8bd4', strokeWidth: 2, shape: 'triangle', line: { stroke: '#5a8bd4', strokeWidth: 1, strokeDasharray: '6 3' }, lineType: 'monotone' }),
@@ -720,6 +785,7 @@ With no framework overhead eating into VRAM and bandwidth-optimal weight streami
         e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v ? v.toLocaleString() + ' tok/s' : 'N/A' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
         e(R.Bar, { dataKey: 'e4b', name: 'E4B TPU (4B)', fill: '#84E6B7', radius: [4, 4, 0, 0] }),
+        e(R.Bar, { dataKey: 'e4bgpu', name: 'E4B H100 FP8', fill: '#ff7a2f', radius: [4, 4, 0, 0] }),
         e(R.Bar, { dataKey: 'moe', name: '26B-A4B TPU (MoE)', fill: '#b088e0', radius: [4, 4, 0, 0] }),
         e(R.Bar, { dataKey: 'b31', name: '31B TPU', fill: '#5a8bd4', radius: [4, 4, 0, 0] }),
         e(R.Bar, { dataKey: 'vllm', name: 'vLLM H100 (31B)', fill: '#e8a84c', radius: [4, 4, 0, 0] })
