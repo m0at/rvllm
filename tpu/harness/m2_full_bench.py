@@ -238,6 +238,8 @@ def main():
     p.add_argument('--skip-sweep', action='store_true')
     p.add_argument('--skip-gen', action='store_true')
     p.add_argument('--skip-ppl', action='store_true')
+    p.add_argument('--single-batch', type=int, default=None,
+                   help='Run sweep for ONE batch only then exit (for subprocess-per-batch memory hygiene).')
     p.add_argument('--out', default=None)
     args = p.parse_args()
 
@@ -268,27 +270,38 @@ def main():
         'generation': None,
     }
 
-    # 1. Batch sweep. Each batch clears its compile cache to free HBM.
-    if not args.skip_sweep:
-        print("\n### Batch sweep ###", file=sys.stderr, flush=True)
+    # 1. Batch sweep.
+    # In-process sweep is unreliable — XLA retains compiled HBM buffers past
+    # Python scope and `jax.clear_caches()` doesn't fully release them. For
+    # multi-batch, use `--single-batch N` and drive a subprocess per batch
+    # externally (see tpu/harness/run_sweep_subproc.sh).
+    if not args.skip_sweep and args.single_batch is not None:
+        print(f"\n### Single batch B={args.single_batch} ###",
+              file=sys.stderr, flush=True)
+        try:
+            r = bench_batch(mesh, model_state, args.single_batch, args.ctx,
+                          args.iters, args.warmup)
+            line = f"  B={args.single_batch:4d} ms/step={r['ms_mean']:.2f} tok/s={r['tok_per_s']:.1f}"
+            print(line, flush=True)
+            out['sweep'] = [r]
+        except Exception as e:
+            print(f"  B={args.single_batch} FAILED: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+            out['sweep'] = [{'batch': args.single_batch, 'error': str(e)}]
+    elif not args.skip_sweep:
+        print("\n### Batch sweep (in-process — may OOM past B=8) ###",
+              file=sys.stderr, flush=True)
         sweep_results = []
         for B in [int(b) for b in args.batches.split(',')]:
             try:
                 r = bench_batch(mesh, model_state, B, args.ctx, args.iters, args.warmup)
                 line = f"  B={B:4d} ms/step={r['ms_mean']:.2f} tok/s={r['tok_per_s']:.1f}"
                 print(line, flush=True)
-                sys.stderr.write(line + '\n'); sys.stderr.flush()
                 sweep_results.append(r)
             except Exception as e:
-                print(f"  B={B} FAILED: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                print(f"  B={B} FAILED: {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
                 sweep_results.append({'batch': B, 'error': str(e)})
-            # Free XLA-side HBM holdings so the next batch compile has room.
-            try:
-                jax.clear_caches()
-            except Exception:
-                pass
-            import gc
-            gc.collect()
         out['sweep'] = sweep_results
 
     # 2. Perplexity
