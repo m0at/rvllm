@@ -207,13 +207,13 @@ python3 -c "import jax; print('jax', jax.__version__, 'backend', jax.default_bac
 
 # Zig toolchain (pinned; matches agent 5's expectations).
 ZIG_VER=0.15.1
-ZIG_DIR="$HOME/zig-linux-x86_64-${ZIG_VER}"
+ZIG_DIR="$HOME/zig-x86_64-linux-${ZIG_VER}"
 if [[ ! -x "$ZIG_DIR/zig" ]]; then
   echo "installing zig ${ZIG_VER}"
-  curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-linux-x86_64-${ZIG_VER}.tar.xz" \
+  curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz" \
     | tar xJ -C "$HOME/"
 fi
-echo "export PATH=\"\$HOME/zig-linux-x86_64-${ZIG_VER}:\$PATH\"" > "$HOME/.rvllm_zig_env"
+echo "export PATH=\"\$HOME/zig-x86_64-linux-${ZIG_VER}:\$PATH\"" > "$HOME/.rvllm_zig_env"
 export PATH="$ZIG_DIR:$PATH"
 zig version
 EOS
