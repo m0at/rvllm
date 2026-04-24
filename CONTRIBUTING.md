@@ -1,255 +1,226 @@
 # Contributing to rvLLM
 
-We're building the Rust standard for LLM inference. Here's how to help.
+rvLLM is a Rust + CUDA inference engine on GPU and a pure-JAX inference engine on TPU. Both live in this repo. Contributions should land against the **v3 workspace** (`v3/crates/*`) on the GPU side and `tpu/harness/` on the TPU side.
 
-## Architecture
+This doc tells you where things are, how to build and test them, and what's open to work on right now.
 
-Every feature lives in its own crate. You can work on any crate independently -- all tests run with `mock-gpu` (no CUDA needed for development).
+## Repo layout
 
-```bash
-# Run all tests (no GPU required)
-cargo test --workspace
+```
+rvllm/
+  v3/                      GPU runtime (Rust + CUDA). All new GPU work lands here.
+    Cargo.toml             workspace root -- use --manifest-path v3/Cargo.toml
+    crates/
+      rvllm-core           typed errors, IDs, dtype, shape, config, env
+      rvllm-mem            HbmArena, Region, Stream, Event, PinnedBuf, CudaContextHandle
+      rvllm-kernels        SHA-pinned kernel manifest, PTX loader, kernel catalog
+      rvllm-fused          fused-kernel launchers + pure-Rust f32 references
+      rvllm-attention      FA3 SM90 paged decode/prefill (dlopen)
+      rvllm-cutlass        FP8 variant catalog + schedule/epilogue pairing + cuBLASLt wrapper
+      rvllm-metadata       frozen-layout metadata per bucket (single upload path)
+      rvllm-loader         safetensors mmap -> HBM + CPU-path FP8 quant + clamp gate
+      rvllm-sampling       argmax tail, pinned DtoH
+      rvllm-graph          captured-graph pool keyed on MetaLayoutHash
+      rvllm-runtime        Engine, scheduler, layer_exec, bring_up
+      rvllm-serve          OpenAI-compatible HTTP serve loop (Phase D scaffold)
+      rvllm-bench          RVLLM_* env-driven bench binary
+      rvllm-deploy         SHA-pinned tarball + manifest.json verification (Phase D scaffold)
+      rvllm-invariants     DAG-dep test, no-megakernel gate
+    specs/                 numbered specs referenced by each crate's Cargo.toml
+    GEMMA4_SPEC.md         31B Gemma 4 architecture and weight shapes
+    SPEC.md, IMPL_PLAN.md  v3 rewrite plan and agent specs
 
-# Check compilation
-cargo check --workspace
+  kernels/                 .cu sources + build scripts
+    build.sh               compiles .cu -> .ptx into kernels/sm_90/
+    build_cutlass_so.sh    builds libcutlass_kernels.so
+    build_fa3.sh           builds libfa3_kernels.so
+    sm_90/                 build output (populated by the three scripts above)
 
-# Run your crate's tests
-cargo test -p rvllm-model-runner
+  tpu/harness/             pure-JAX TPU path -- single-file model + server
+    gemma4_tpu_infer.py    model + forward pass (E4B / 26B-A4B / 31B auto-detect)
+    api_server.py          OpenAI-compatible HTTP server (imports from above)
+    eagle3_infer.py        EAGLE-3 speculative-decoding inference
+    eagle3_train.py        EAGLE-3 draft head training
+
+  docs/                    architecture, benchmarks, model-support notes
 ```
 
-## Open Feature Tracks
+The top-level `crates/`, `Makefile`, `bench_harness.py`, and other root-level files predate v3 and are kept only for backward compatibility. **Do not extend them -- extend `v3/crates/*` instead.**
 
-These are well-scoped features with clear specs. Each one is a meaningful contribution. Pick one, implement it, open a PR.
+## Setup
 
----
+```bash
+git clone https://github.com/m0at/rvllm.git
+cd rvllm
 
-### 1. LoRA Adapter Serving
+# Workspace compile check (no GPU required, works on macOS)
+cargo check --manifest-path v3/Cargo.toml --workspace
 
-**Crate:** `rvllm-model-runner`, `rvllm-model-loader`, `rvllm-api`
+# Run the CPU-safe tests (no CUDA)
+cargo test  --manifest-path v3/Cargo.toml --workspace
+```
+
+`install.sh` installs Rust + Python + tooling if you want a one-shot bootstrap. Read it before running it.
+
+## Building on a GPU box
+
+```bash
+# One-time: build kernel artifacts into kernels/sm_90/
+bash kernels/build.sh                # fused PTX
+bash kernels/build_cutlass_so.sh     # libcutlass_kernels.so
+bash kernels/build_fa3.sh            # libfa3_kernels.so
+
+# Build the bench binary
+cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvllm-bench
+
+# Build everything CUDA-enabled
+cargo build --release --features cuda --manifest-path v3/Cargo.toml --workspace
+```
+
+All rvLLM GPU binaries share the same required env set: `RVLLM_MODEL_DIR`, `RVLLM_KERNELS_DIR`, `RVLLM_CUTLASS_SO`, `RVLLM_FA3_SO`, `RVLLM_POLICY`. See `README.md` for the full run recipe.
+
+## Building on a TPU box
+
+```bash
+pip3 install 'jax[tpu]' huggingface_hub tokenizers \
+  -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
+That's it. No Rust toolchain, no custom kernels. Run the harness directly:
+
+```bash
+python3 tpu/harness/gemma4_tpu_infer.py --model-dir ~/models/gemma-4-E4B-it --max-tokens 200
+```
+
+## Open contribution tracks
+
+Each of these is a well-scoped, meaningful landing. Pick one, open a PR.
+
+### 1. Additional CUTLASS channelscale tile shapes (GPU)
+
+**Where:** `kernels/cutlass_fp8_gemm_channelscale.cu`, `v3/crates/rvllm-cutlass/`
+**Difficulty:** Medium
+**Impact:** High -- directly moves B=1..8 throughput
+
+The current CUTLASS channelscale kernel uses a single 128x128x128 tile. For low-batch decode (M <= 16) this leaves perf on the table. Add a 64x64x128 tile variant (same EVT epilogue: per-token ColBroadcast for activation scale, per-channel RowBroadcast for weight scale, F32 accumulate, F16 output), wire it into the FP8 variant catalog in `rvllm-cutlass`, and extend the autotune entry in `policy.json` so small M hits the new tile.
+
+Acceptance: measurable improvement at B=1, B=4, B=8 without regressing B=128+; invariants crate passes.
+
+### 2. GPU OpenAI-compatible HTTP server (`rvllm-serve`)
+
+**Where:** `v3/crates/rvllm-serve/`
+**Difficulty:** Medium-Hard
+**Impact:** Huge -- removes the only remaining Python in the GPU serving path
+
+`rvllm-serve` is a Phase-D scaffold today (`main.rs` exits with "not yet implemented"). The spec is `v3/specs/05-concurrency.md`. The serve loop should reuse `step_launch` / `step_collect` from `rvllm-runtime`, run a single-worker tokio task against a batch queue, and expose `/v1/completions` and `/v1/chat/completions` with streaming.
+
+Reference shape: `tpu/harness/api_server.py` has the request/response contract already working on the TPU side -- port the surface, not the implementation.
+
+### 3. `rvllm-deploy` tarball + manifest tool
+
+**Where:** `v3/crates/rvllm-deploy/`
+**Difficulty:** Medium
+**Impact:** Medium -- needed before the GPU stack can be shipped as a pinned artifact
+
+Also a Phase-D scaffold. The spec is `v3/specs/16-deploy.md`. Build: produce a SHA-pinned tarball containing the `rvllm-server` binary, the PTX blobs, `libcutlass_kernels.so`, `libfa3_kernels.so`, `policy.json`, and a `manifest.json` that records the SHA of every artifact plus the git SHA of the build. Verify: load the tarball, recompute SHAs, refuse to start on any mismatch.
+
+No runtime dependency on `rvllm-runtime` -- this crate is build/ship tooling only.
+
+### 4. FA3 prefill path (GPU)
+
+**Where:** `v3/crates/rvllm-attention/`, `kernels/flash_attention_3_prefill.cu`
 **Difficulty:** Hard
-**Impact:** Huge -- lets users serve 100+ fine-tuned models on one GPU
+**Impact:** High -- drops TTFT on long prompts
 
-**What to build:**
-- `crates/rvllm-model-runner/src/lora.rs` -- LoRA weight container: base_weight + low-rank A,B matrices per layer
-- Fused forward: `output = x @ (W + alpha * A @ B)` -- either materialize the merged weight or compute the delta on the fly
-- Hot-swap: load/unload LoRA adapters without restarting the server
-- API: `POST /v1/lora/load`, `POST /v1/lora/unload`, `model` field in request selects adapter
-- Store LoRA weights separately from base model, share base KV cache across adapters
+The current attention path is decode-focused. A first-class prefill variant (chunked over sequence, same SM90 wrapper style) would complete the path and let the scheduler batch prefill and decode cleanly.
 
-**Reference:** [Python vLLM LoRA](https://docs.vllm.ai/en/latest/models/lora.html), [LoRA paper](https://arxiv.org/abs/2106.09685)
+### 5. Additional fused-kernel variants
 
-**Key files to read:**
-- `crates/rvllm-model-runner/src/layers/linear.rs` -- where weight multiplication happens
-- `crates/rvllm-model-runner/src/gpu_runner.rs` -- forward pass orchestration
-- `crates/rvllm-model-loader/src/gpu_loader.rs` -- weight loading
-
----
-
-### 2. Beam Search and Best-of-N
-
-**Crate:** `rvllm-engine`, `rvllm-block-manager`, `rvllm-sequence`
+**Where:** `v3/crates/rvllm-fused/`, `v3/crates/rvllm-kernels/` (manifest), `kernels/*.cu`
 **Difficulty:** Medium
-**Impact:** Medium -- needed for summarization, translation, and quality-sensitive applications
+**Impact:** Medium -- each fusion removes graph nodes and one kernel launch per layer
 
-**What to build:**
-- `crates/rvllm-engine/src/beam_search.rs` -- maintain K beams per request
-- Each beam is a `Sequence` that shares prompt KV cache blocks via copy-on-write
-- At each step: expand each beam by top-K tokens, score, prune to K best
-- Best-of-N: run N independent samples, return highest cumulative logprob
-- Use `BlockManager::fork()` for CoW KV cache sharing between beams
+Candidates visible in `kernels/` today include persistent-kernel variants (`persistent_gemm.cu`, `persistent_layer_*.cu`) and `megakernel_decode.cu`. The discipline: every kernel gets a SHA-pinned entry in the manifest, a launcher in `rvllm-fused`, and a pure-Rust f32 reference test. No dispatch fallback chains.
 
-**The data structures already exist:**
-- `SequenceGroup` supports multiple `Sequence` objects (beam candidates)
-- `BlockManager` has `fork()` and reference counting on physical blocks
-- `SamplingParams` has `best_of` and `use_beam_search` fields
+### 6. EAGLE-3 training data expansion (TPU)
 
-**What's missing:** wiring these into the `GpuLLMEngine::step()` loop.
-
----
-
-### 3. Batch Processing API
-
-**Crate:** `rvllm-api`, `rvllm-engine`
+**Where:** `tpu/harness/eagle3_train.py`, `tpu/harness/EAGLE3_SPEC.md`
 **Difficulty:** Medium
-**Impact:** Medium -- needed for offline batch processing workloads
+**Impact:** High -- moves the speculative path from "pipeline validated" to "production tau"
 
-**What to build:**
-- `crates/rvllm-api/src/routes/batch.rs` -- OpenAI Batch API endpoints
-- `POST /v1/batches` -- accept JSONL file of requests, return batch ID
-- `GET /v1/batches/{id}` -- check status (pending, in_progress, completed, failed)
-- `GET /v1/batches/{id}/output` -- download results as JSONL
-- Background processing: feed requests through the engine, store results on disk
-- Support cancellation: `POST /v1/batches/{id}/cancel`
+README's measured numbers use a 2K-example draft head (loss 7.1). Production tau needs 50K+ examples. The pipeline is validated end-to-end; the work is data curation + a longer training run + checkpoint delivery.
 
-**Reference:** [OpenAI Batch API](https://platform.openai.com/docs/api-reference/batch)
+### 7. New TPU model coverage
 
----
-
-### 4. Embedding Model Support
-
-**Crate:** `rvllm-model-runner`, `rvllm-api`
+**Where:** `tpu/harness/gemma4_tpu_infer.py`
 **Difficulty:** Medium
-**Impact:** Medium -- embeddings are a major API use case
+**Impact:** Medium -- `~500 lines of JAX` currently covers three Gemma 4 variants; adding another family (Qwen, Llama, Mistral) exercises the dual-path architecture
 
-**What to build:**
-- `crates/rvllm-model-runner/src/architectures/embedding.rs` -- `EmbeddingModel` trait
-- Forward pass returns hidden states instead of logits
-- Pooling strategies: mean pooling, CLS token, last token
-- Normalization option (L2 normalize embeddings)
-- `crates/rvllm-api/src/routes/embeddings.rs` -- `POST /v1/embeddings` endpoint
-- Support sentence-transformers, E5, GTE, BGE model families
+Keep it pure JAX. No custom kernels, no torch, no vLLM.
 
-**Key difference from causal models:** no autoregressive generation, single forward pass per request. Much simpler execution path.
+## How to add a CUDA kernel
 
----
+1. **Write the .cu** under `kernels/`. Keep it self-contained (no headers outside the kernels dir). Use `extern "C"` for any symbol the Rust side dlopens.
 
-### 5. Vision-Language Models
+2. **Wire it into a build script.** Either extend `kernels/build.sh` (for PTX) or one of the `.so` build scripts (for SM90 CUTLASS / FA3 wrappers). Never bake per-arch flags into the kernel -- the build script decides `-arch=sm_90`.
 
-**Crate:** `rvllm-model-runner`, `rvllm-tokenizer`, `rvllm-api`
-**Difficulty:** Very Hard
-**Impact:** High -- VLMs are growing fast
+3. **Pin it in the manifest.** Add a SHA-pinned entry in `v3/crates/rvllm-kernels` so the runtime refuses to load a drifted artifact.
 
-**What to build:**
-- Image preprocessing: resize, normalize, patch extraction
-- Vision encoder (ViT): separate forward pass for image patches
-- Cross-attention or concatenated image+text tokens
-- Support LLaVA, Qwen-VL, InternVL architectures
-- API: accept image URLs or base64 in chat messages
-- `crates/rvllm-model-runner/src/vision/` -- vision encoder, image preprocessing
+4. **Write a launcher in `rvllm-fused` (or the relevant crate).** The launcher owns the workspace contract, the bucket/layout, and the stream. No `unwrap()` in library code -- return `Result<T, RvllmError>`.
 
-**This is the largest feature.** Consider starting with LLaVA (simplest architecture: ViT encoder + linear projection + Llama decoder).
+5. **Write a pure-Rust f32 reference test.** Every fused launcher in this repo has one. It must match the CUDA output within tolerance on a pinned input. This is non-negotiable: correctness is gated on the reference path.
 
----
+6. **Update `policy.json`** if the kernel has tile variants that need autotune selection.
 
-### 6. Pipeline Parallelism
+No fallback chains. Missing kernel = engine panic at bring-up, not a runtime surprise.
 
-**Crate:** `rvllm-executor`, `rvllm-worker`
-**Difficulty:** Hard
-**Impact:** Medium -- useful for very large models that don't fit with TP alone
+## How to add a fused kernel launcher in pure Rust
 
-**What to build:**
-- Split transformer layers across GPUs (layers 0-15 on GPU0, 16-31 on GPU1)
-- Point-to-point communication between pipeline stages (NCCL send/recv)
-- Microbatching to keep all GPUs busy
-- Combine with tensor parallelism for hybrid TP+PP
+Pattern lives in `v3/crates/rvllm-fused/`. Every launcher:
 
-**Prerequisites:** Agent 18 (Multi-GPU Tensor Parallelism) should be done first.
+- Takes a `CudaContextHandle` and a `Stream`.
+- Owns a workspace `Region` from the `HbmArena`.
+- Reads frozen metadata from `rvllm-metadata` (no per-step allocation).
+- Returns `Result<(), RvllmError>`.
+- Has a `tests/` entry with a pure-Rust f32 reference against pinned input.
 
----
+Read two existing launchers before writing a third.
 
-## How to Contribute
-
-### Setup
+## Testing
 
 ```bash
-git clone https://github.com/m0at/hermes-lite.git
-cd hermes-lite/vllm-rs
-cargo test --workspace  # verify everything passes
+# CPU-safe workspace tests (macOS, CI)
+cargo test --manifest-path v3/Cargo.toml --workspace
+
+# CUDA feature tests (H100 box)
+cargo test --manifest-path v3/Cargo.toml --workspace --features cuda
+
+# Invariants gate (DAG dependency, no-megakernel)
+cargo test --manifest-path v3/Cargo.toml -p rvllm-invariants
 ```
 
-### Adding a Model Architecture
+TPU-side: the harness is a single-file model; run it against a small `--max-tokens` and diff against the HuggingFace BF16 reference (PPL is the canonical signal -- README lists the reference numbers).
 
-The most common contribution. Here's the pattern:
+## Code style
 
-```bash
-# 1. Create your architecture file
-touch crates/rvllm-model-runner/src/architectures/my_model.rs
-```
+- `cargo fmt` before committing.
+- `cargo clippy --manifest-path v3/Cargo.toml --workspace` must be warning-free.
+- All public items need `///` doc comments.
+- Use `tracing::{info, debug, warn, error}` for logging, never `println!`.
+- Error handling: `Result<T, RvllmError>` end-to-end with structured context. **No `unwrap()` in libraries.** Binaries may `unwrap` at `main` boundaries only.
+- All CUDA code behind `#[cfg(feature = "cuda")]`.
+- No dispatch fallback chains. Missing variant = panic at bring-up, not silent degradation.
 
-```rust
-// crates/rvllm-model-runner/src/architectures/my_model.rs
-use crate::bridge::*;
+## Project principles
 
-pub struct MyModelForCausalLM {
-    config: ModelRunnerConfig,
-}
+These are enforced, not aspirational:
 
-impl Architecture for MyModelForCausalLM {
-    fn forward(&self, input: &ModelInput, cache: &CacheEngine) -> Result<GpuBuffer<f32>> {
-        // Your forward pass here
-        // See llama.rs for the reference implementation
-        todo!()
-    }
+1. **No fallbacks.** Missing autotune entry = panic. Missing `.so` = refuse start.
+2. **Graph-capture invariant.** Metadata buffer layout is frozen per `(bucket, max_blocks_per_seq)`. Captured graphs bind exact offsets.
+3. **CUTLASS schedule/epilogue pairing.** Mainloop and epilogue schedules must match -- enforced via `static_assert`.
+4. **No `unwrap()` in libraries.** `Result<T, RvllmError>` with structured context, end-to-end.
+5. **Real block-change detection.** The scheduler emits block-table updates; missing signals = stale KV reads caught at the type level.
 
-    fn name(&self) -> &str { "MyModelForCausalLM" }
-}
-```
+## License
 
-```rust
-// Register in crates/rvllm-model-runner/src/architectures/mod.rs
-pub fn create_model(architecture: &str, ...) -> Result<Box<dyn Architecture>> {
-    match architecture {
-        // ... existing models ...
-        "MyModelForCausalLM" => Ok(Box::new(MyModelForCausalLM::new(...))),
-        _ => Err(LLMError::ModelError(...)),
-    }
-}
-```
-
-### Adding a CUDA Kernel
-
-```bash
-# 1. Write the kernel
-cat > kernels/my_kernel.cu << 'EOF'
-extern "C" __global__ void my_kernel(float* output, const float* input, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        output[idx] = input[idx] * 2.0f;  // your operation
-    }
-}
-EOF
-
-# 2. Compile to PTX
-cd kernels && nvcc -ptx -arch=sm_80 -O3 -o my_kernel.ptx my_kernel.cu
-
-# 3. Load in Rust via KernelLoader (see crates/rvllm-gpu/src/kernel_loader.rs)
-```
-
-### Adding an API Endpoint
-
-```rust
-// crates/rvllm-api/src/routes/my_endpoint.rs
-use axum::{Json, extract::State};
-
-pub async fn my_handler(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<MyRequest>,
-) -> Result<Json<MyResponse>, ApiError> {
-    // Your handler
-}
-
-// Register in crates/rvllm-api/src/server.rs build_router()
-```
-
-### Testing
-
-```bash
-# Run all tests (mock-gpu, no CUDA needed)
-cargo test --workspace
-
-# Run specific crate
-cargo test -p rvllm-sampling
-
-# Run with CUDA (requires GPU)
-cargo test --workspace --features cuda
-
-# API compatibility tests
-VLLM_RS_URL=http://localhost:8000 python3 -m pytest tests/api_compat/ -v
-```
-
-### Code Style
-
-- `cargo fmt` before committing
-- `cargo clippy --workspace` should be warning-free
-- All public items need `///` doc comments
-- Use `tracing::{info, debug, warn, error}` for logging, never `println!`
-- Error handling: return `Result<T>` with `LLMError`, never `unwrap()` in library code
-- CUDA code behind `#[cfg(feature = "cuda")]`
-
-## Project Principles
-
-- **Correctness first** -- match Python vLLM output token-for-token before optimizing
-- **Test without hardware** -- every feature should be testable with `mock-gpu`
-- **Minimal dependencies** -- prefer standard library, avoid crate bloat
-- **Direct GPU access** -- no PyTorch, no Python, just cuBLAS and CUDA kernels
-- **One binary** -- everything ships as a single static executable
+Contributions are accepted under Apache-2.0, matching the repo.

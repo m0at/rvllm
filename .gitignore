@@ -31,3 +31,4 @@ build/
 *.synctex.gz
 zig/.zig-cache/
 .wrangler/
+.blackboxcli/

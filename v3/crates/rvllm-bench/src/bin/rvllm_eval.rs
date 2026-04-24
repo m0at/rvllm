@@ -27,6 +27,13 @@ fn env_path(k: &str) -> Result<PathBuf, String> {
         .map(PathBuf::from)
 }
 
+fn env_u32(k: &str, default: u32) -> u32 {
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 fn is_gemma4_model_dir(model_dir: &std::path::Path) -> Result<bool, String> {
     Ok(matches!(
         ModelConfig::load_hf(model_dir)
@@ -37,8 +44,7 @@ fn is_gemma4_model_dir(model_dir: &std::path::Path) -> Result<bool, String> {
 }
 
 fn gemma4_generation_prompt(model_dir: &std::path::Path, prompt: &str) -> String {
-    if prompt.contains("<|turn>") || std::env::var("RVLLM_RAW_PROMPT").map_or(false, |v| v == "1")
-    {
+    if prompt.contains("<|turn>") || std::env::var("RVLLM_RAW_PROMPT").map_or(false, |v| v == "1") {
         return prompt.to_string();
     }
     let prompt = prompt.trim();
@@ -101,10 +107,7 @@ fn run() -> Result<(), String> {
     let prompt_len = prompt_ids.len() as u32;
     eprintln!("prompt: {} tokens", prompt_len);
 
-    let max_new: u32 = std::env::var("RVLLM_MAX_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
+    let max_new = env_u32("RVLLM_MAX_TOKENS", 256);
 
     // -- bringup --
     let paths = EnginePaths {
@@ -193,26 +196,49 @@ fn run() -> Result<(), String> {
                 .ok()
                 .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
                 .unwrap_or_else(|| vec![1, 106, 50]);
+            let batch = env_u32("RVLLM_BATCH", 1).max(1);
 
             let t_gen = Instant::now();
             let output_ids = unsafe {
-                g4.run_generate(
-                    fn_embed,
-                    fn_argmax,
-                    &prompt_with_bos,
-                    max_new as usize,
-                    &eos_ids,
-                )
+                if batch == 1 {
+                    g4.run_generate(
+                        fn_embed,
+                        fn_argmax,
+                        &prompt_with_bos,
+                        max_new as usize,
+                        &eos_ids,
+                    )
+                } else {
+                    g4.run_generate_batched(
+                        fn_embed,
+                        fn_argmax,
+                        &prompt_with_bos,
+                        max_new as usize,
+                        &eos_ids,
+                        batch,
+                    )
+                }
             }
             .map_err(|e| format!("gemma4 generate: {e}"))?;
 
             let elapsed = t_gen.elapsed();
             let n = output_ids.len();
+            let row_tokens = n as u64 * u64::from(batch);
             eprintln!(
-                "generated {} tokens in {:.2}s ({:.1} tok/s)",
+                "generated {} tokens x B={} in {:.2}s ({:.1} row tok/s)",
                 n,
+                batch,
                 elapsed.as_secs_f64(),
-                n as f64 / elapsed.as_secs_f64()
+                row_tokens as f64 / elapsed.as_secs_f64()
+            );
+            eprintln!(
+                "rvllm_eval_json: {{\"batch\":{},\"prompt_tokens\":{},\"output_tokens\":{},\"row_output_tokens\":{},\"generate_s\":{:.6},\"row_tok_per_sec\":{:.3}}}",
+                batch,
+                prompt_with_bos.len(),
+                n,
+                row_tokens,
+                elapsed.as_secs_f64(),
+                row_tokens as f64 / elapsed.as_secs_f64()
             );
             if std::env::var("RVLLM_PRINT_TOKEN_IDS").map_or(false, |v| v == "1") {
                 eprintln!("output_ids: {:?}", output_ids);

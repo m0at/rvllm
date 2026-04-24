@@ -1,0 +1,75 @@
+Here is the rewritten prompt:
+
+---
+
+Act as a senior technical screenwriter and GPU architecture educator. Generate a complete, beat-by-beat production script for a 90-second explainer animation teaching how NVIDIA Hopper's memory hierarchy enables high-throughput matrix multiplication. The target audience is first-year CS undergraduates who understand loops and arrays but have never touched GPU programming. Technical fidelity must be conceptually exact — covering L2 cache residency, async pipeline staging via TMA, warp-group-level tensor core dispatch via WGMMA, and register-file bypass — but every concept must be communicated exclusively through a sustained "City Water System" visual metaphor with zero jargon on screen.
+
+**Visual Style Constraints:**
+- Crisp technical blueprint aesthetic: dark navy background, white and cyan line art only.
+- All geometry is isometric 2.5D — pipes, tanks, buildings rendered in clean isometric projection.
+- No gradients. Flat fills with hatching patterns for material differentiation.
+- Typography is monospaced, all-caps, tight tracking. Think engraved blueprint labels.
+- Transitions between scenes use a "blueprint redraw" wipe: lines animate in as if being drafted by an invisible pen.
+
+**The Core Metaphor — strict mappings, never break them:**
+- **Global Memory (HBM):** The city's main reservoir — enormous, distant, high-capacity, but water pressure (bandwidth) is finite.
+- **L2 Cache:** The district holding tank — smaller than the reservoir, physically closer to neighborhoods, water already filtered and pressurized.
+- **Shared Memory (SMEM):** The building's rooftop water tank — tiny, local, immediately accessible, refilled from the district tank.
+- **TMA (Tensor Memory Accelerator):** An automated pump-and-pipe system that pre-fills the rooftop tank on a timed schedule, independently of whether any taps are open.
+- **Registers:** The individual apartment plumbing — water already inside the walls, zero travel time from tap to fixture.
+- **WGMMA (register bypass):** A direct pipe manifold connecting the rooftop tank straight to the building's boiler. Bypasses apartment plumbing entirely. Boiler output goes directly to the city's output treatment plant.
+- **Thread Block:** A single residential building — self-contained, with its own rooftop tank and plumbing.
+- **Warp Group:** One floor of the building — 128 threads, four warps, acting in synchronized lockstep.
+- **Matrix Tile (A and B):** A delivery of raw water from the reservoir — one truckload fits precisely on one rooftop tank.
+- **Output Matrix (C):** The city's central output treatment plant, which receives processed water from every building simultaneously and fills its holding basins.
+- **SM (Streaming Multiprocessor):** The city block — contains multiple buildings, shares district-level infrastructure.
+
+**Required Scene Breakdown and Pacing — strictly 90 seconds:**
+
+**Scene 1: The Naive Baseline — Why Bandwidth Is the Enemy (0:00–0:22)**
+- Open on a wide isometric city view. The reservoir (HBM) sits on a distant hill. One small building sits in the foreground.
+- A pipe runs directly from the reservoir to a single tap inside one apartment. The pipe is visibly long and thin.
+- Water trickles out. The tap drips. A gauge labeled "THROUGHPUT" barely moves.
+- The building's boiler (compute unit) sits idle 80% of the time, waiting for water.
+- On-screen text: "Problem: Moving data from memory is slow. Compute starves."
+- A second pipe, fatter, branches off to show what "more bandwidth" looks like — but the reservoir pressure gauge redlines and the pipe bursts. On-screen text: "More bandwidth alone doesn't scale."
+
+**Scene 2: Tiling and the District Tank — Bringing Data Closer (0:22–0:44)**
+- Scene redraws. The district holding tank (L2) materializes between the reservoir and the building.
+- A tile-delivery animation: a truck (tile) drives from the reservoir, fills the district tank. From the district tank, a faster, fatter local pipe fills the rooftop tank (SMEM).
+- The boiler fires immediately once the rooftop tank has water. Throughput gauge climbs.
+- Dotted-line scissors appear and cut the reservoir data into equal-sized truck deliveries — explicitly showing tiling. Each tile is labeled with grid coordinates [i,j].
+- On-screen text: "Tiling: Partition the matrix. Bring one chunk at a time. Reuse it."
+- The robot building processes one tile-pair, result drains into the output plant. Repeat visually 3x, accelerating. On-screen text: "Multiply. Accumulate. Repeat."
+
+**Scene 3: The TMA Upgrade — Async Prefetch Pipeline (0:44–1:02)**
+- Hard cut with blueprint redraw wipe. Big "HOPPER UPGRADE 1" stamp animates on, then dissolves.
+- Before: building's maintenance worker (software thread) walks to the rooftop tank, manually opens the valve, waits for it to fill, walks back down.
+- After: an automated pump controller (TMA hardware unit) with a timer dial. The controller pre-fills the rooftop tank on a fixed schedule. The maintenance worker is now free.
+- Split-screen: left side shows the old way (worker blocked, boiler idle). Right side shows TMA (boiler fires continuously, worker does other work, tank refills in background).
+- A progress indicator shows the software thread's instruction stream — with TMA, the thread never stalls on a memory wait.
+- On-screen text: "TMA: Hardware manages data movement. Software never waits."
+- Crucially: show the pipeline overlap — while the boiler processes tile N, TMA is already filling the tank with tile N+1. Double-buffer visually with two alternating rooftop tanks.
+
+**Scene 4: The WGMMA Upgrade — Register Bypass and Tensor Cores (1:02–1:20)**
+- Blueprint redraw wipe. "HOPPER UPGRADE 2" stamp.
+- Before: water from rooftop tank flows down through apartment plumbing (registers), is collected floor-by-floor, then fed into the boiler. Many handoffs. Latency.
+- After: a thick direct manifold pipe appears, connecting the rooftop tank output straight into the boiler intake. The apartment plumbing is visibly bypassed — shown with a red X through the old path.
+- The boiler now accepts water directly from SMEM. Show the boiler operating at full capacity for the first time — pressure gauge maxes out, steam output doubles.
+- A warp-group floor lights up — all 128 units on one floor fire simultaneously. Synchronized.
+- On-screen text: "WGMMA: Tensor Cores consume directly from Shared Memory. No register bottleneck."
+- Briefly show the register file as now freed up for other work — the apartments are empty of water pipes but the residents are doing other tasks.
+
+**Scene 5: The Full Pipeline — Hopper at Scale (1:20–1:30)**
+- Zoom out to reveal not one building but an entire city block (one SM), then the full city (GPU).
+- Hundreds of buildings, all running the same synchronized pipeline. Every rooftop tank filling in staggered waves (pipeline depth visible). Every boiler firing. Every floor lighting up in warp-group synchrony.
+- The central output treatment plant (Matrix C) fills completely, basin by basin, in a rapid mosaic pattern.
+- Final on-screen text: "Hopper GPU: TMA + WGMMA = Continuous, latency-hidden, register-bypassed compute."
+- Freeze on completed city. Blueprint lines pulse once. Fade.
+
+**Output Requirements:**
+1. For each scene, provide the exact video-AI generation prompt (suitable for Sora, Kling, or Runway Gen-4), including camera angle, animation timing, and visual consistency anchors.
+2. Provide the full voiceover script timed to the second, written at a ninth-grade reading level, technically accurate.
+3. Provide all on-screen text overlays with their entry and exit timecodes.
+4. Provide a transition specification between every scene pair.
+5. Explicitly flag the two moments (Scene 3 and Scene 4) where the Hopper-specific hardware features are introduced with a "HARDWARE DELTA" callout block, distinguishing them from the baseline GEMM behavior in Scenes 1 and 2.

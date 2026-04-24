@@ -1,0 +1,149 @@
+{
+  "model_path": "/workspace/models/gemma4-31b-fp8",
+  "attn_implementation": "eager",
+  "torch_dtype": "bfloat16",
+  "variant": "hf_quant_fp32",
+  "splits": 4,
+  "patched_layer_count": 50,
+  "patched_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    6,
+    7,
+    8,
+    9,
+    10,
+    12,
+    13,
+    14,
+    15,
+    16,
+    18,
+    19,
+    20,
+    21,
+    22,
+    24,
+    25,
+    26,
+    27,
+    28,
+    30,
+    31,
+    32,
+    33,
+    34,
+    36,
+    37,
+    38,
+    39,
+    40,
+    42,
+    43,
+    44,
+    45,
+    46,
+    48,
+    49,
+    50,
+    51,
+    52,
+    54,
+    55,
+    56,
+    57,
+    58
+  ],
+  "module_parity": [
+    {
+      "layer": 0,
+      "max_abs_diff": 0.125,
+      "l2_rel_diff": 0.00024233841403468177
+    },
+    {
+      "layer": 1,
+      "max_abs_diff": 0.0625,
+      "l2_rel_diff": 0.0001728138157776302
+    },
+    {
+      "layer": 2,
+      "max_abs_diff": 0.0625,
+      "l2_rel_diff": 0.0002209076548799424
+    },
+    {
+      "layer": 3,
+      "max_abs_diff": 0.0625,
+      "l2_rel_diff": 0.0001725870204730225
+    },
+    {
+      "layer": 4,
+      "max_abs_diff": 0.0625,
+      "l2_rel_diff": 0.00018078225879648705
+    },
+    {
+      "layer": 6,
+      "max_abs_diff": 0.125,
+      "l2_rel_diff": 0.00014161208116433813
+    }
+  ],
+  "prompt_tokens": 23,
+  "baseline_loss": {
+    "tokens": 512,
+    "loss": 7.493625640869141,
+    "perplexity": 1796.5539574582
+  },
+  "patched_loss": {
+    "tokens": 512,
+    "loss": 7.614757537841797,
+    "perplexity": 2027.9030094285026
+  },
+  "ppl_ratio": 1.1287737843942187,
+  "logits": {
+    "max_abs_diff": 2.09375,
+    "max_rel_diff": 73.4130859375,
+    "l2_rel_diff": 0.0526462908846029,
+    "topk_match": false,
+    "baseline_topk_ids": [
+      799,
+      902,
+      240017,
+      759,
+      236772,
+      236770,
+      496,
+      108,
+      874,
+      715
+    ],
+    "patched_topk_ids": [
+      799,
+      902,
+      240017,
+      759,
+      236772,
+      496,
+      236770,
+      715,
+      874,
+      108
+    ]
+  },
+  "decode": {
+    "prompt_tokens": 23,
+    "max_new_tokens": 1,
+    "baseline_new_ids": [
+      799
+    ],
+    "patched_new_ids": [
+      799
+    ],
+    "exact_match": true,
+    "baseline_text": " In",
+    "patched_text": " In",
+    "baseline_ms": 387.7313320408575,
+    "patched_ms": 335.2839960134588
+  }
+}

@@ -1,0 +1,57 @@
+# Standalone Cargo project. Explicit empty [workspace] keeps us out of the
+# parent v3/ workspace, so this crate builds with zero edits to any file
+# outside its own folder.
+[workspace]
+
+[package]
+name = "rvllm-swarm-egui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+authors = ["m0at <47344131+m0at@users.noreply.github.com>"]
+description = "Native egui control surface for a 30-agent rvLLM swarm (1 master + 30 4B workers) on a single H100"
+
+[features]
+default = []
+cuda = [
+    "dep:rvllm-core",
+    "dep:rvllm-kernels",
+    "dep:rvllm-runtime",
+    "dep:tokenizers",
+    "rvllm-runtime/cuda",
+]
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+anyhow = "1"
+
+rvllm-core = { path = "../rvllm-core", optional = true }
+rvllm-kernels = { path = "../rvllm-kernels", optional = true }
+rvllm-runtime = { path = "../rvllm-runtime", optional = true }
+tokenizers = { version = "0.20", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "rvllm-swarm-egui"
+path = "src/main.rs"
+
+[[bin]]
+name = "swarm-cli"
+path = "src/bin/swarm_cli.rs"
+
+[[bin]]
+name = "swarmd"
+path = "src/bin/swarmd.rs"

@@ -1,0 +1,179 @@
+{
+  "model_path": "/workspace/models/gemma4-31b-fp8",
+  "attn_implementation": "eager",
+  "torch_dtype": "bfloat16",
+  "variant": "hf_quant_bf16",
+  "splits": 2,
+  "patched_layer_count": 50,
+  "patched_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    6,
+    7,
+    8,
+    9,
+    10,
+    12,
+    13,
+    14,
+    15,
+    16,
+    18,
+    19,
+    20,
+    21,
+    22,
+    24,
+    25,
+    26,
+    27,
+    28,
+    30,
+    31,
+    32,
+    33,
+    34,
+    36,
+    37,
+    38,
+    39,
+    40,
+    42,
+    43,
+    44,
+    45,
+    46,
+    48,
+    49,
+    50,
+    51,
+    52,
+    54,
+    55,
+    56,
+    57,
+    58
+  ],
+  "module_parity": [
+    {
+      "layer": 0,
+      "max_abs_diff": 0.5,
+      "l2_rel_diff": 0.002767075335972254
+    },
+    {
+      "layer": 1,
+      "max_abs_diff": 1.0,
+      "l2_rel_diff": 0.0028597295998392534
+    },
+    {
+      "layer": 2,
+      "max_abs_diff": 0.5,
+      "l2_rel_diff": 0.002669436343458255
+    },
+    {
+      "layer": 3,
+      "max_abs_diff": 1.0,
+      "l2_rel_diff": 0.0026007228464729757
+    },
+    {
+      "layer": 4,
+      "max_abs_diff": 0.125,
+      "l2_rel_diff": 0.0027675259276099
+    },
+    {
+      "layer": 6,
+      "max_abs_diff": 2.0,
+      "l2_rel_diff": 0.002474782327792258
+    }
+  ],
+  "prompt_tokens": 23,
+  "baseline_loss": {
+    "tokens": 512,
+    "loss": 7.493625640869141,
+    "perplexity": 1796.5539574582
+  },
+  "patched_loss": {
+    "tokens": 512,
+    "loss": 7.753595352172852,
+    "perplexity": 2329.9343080046124
+  },
+  "ppl_ratio": 1.2968908049391676,
+  "logits": {
+    "max_abs_diff": 2.0625,
+    "max_rel_diff": 127.56179809570312,
+    "l2_rel_diff": 0.06682173910330164,
+    "topk_match": false,
+    "baseline_topk_ids": [
+      799,
+      902,
+      240017,
+      759,
+      236772,
+      236770,
+      496,
+      108,
+      874,
+      715
+    ],
+    "patched_topk_ids": [
+      799,
+      902,
+      759,
+      240017,
+      236772,
+      236770,
+      496,
+      108,
+      715,
+      506
+    ]
+  },
+  "decode": {
+    "prompt_tokens": 23,
+    "max_new_tokens": 16,
+    "baseline_new_ids": [
+      799,
+      496,
+      12010,
+      9744,
+      236764,
+      506,
+      86396,
+      10035,
+      506,
+      115901,
+      1680,
+      38306,
+      236761,
+      799,
+      496,
+      12010
+    ],
+    "patched_new_ids": [
+      799,
+      496,
+      12010,
+      9744,
+      236764,
+      506,
+      86396,
+      10035,
+      506,
+      115901,
+      1680,
+      38306,
+      236761,
+      799,
+      496,
+      12010
+    ],
+    "exact_match": true,
+    "baseline_text": " In a quiet village, the baker lit the ovens before dawn. In a quiet",
+    "patched_text": " In a quiet village, the baker lit the ovens before dawn. In a quiet",
+    "baseline_ms": 5046.232914959546,
+    "patched_ms": 4999.538801028393
+  }
+}

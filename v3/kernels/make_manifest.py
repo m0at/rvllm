@@ -54,6 +54,7 @@ NAME_TO_SOURCE = {
     "slice_cols_f16": SCRIPT_DIR / "slice_cols_f16.cu",
     "vector_add_f16": SCRIPT_DIR / "vector_add_f16.cu",
     "bf16_to_f16_sat": SCRIPT_DIR / "bf16_to_f16_sat.cu",
+    "decode_metadata": SCRIPT_DIR / "decode_metadata.cu",
     "f32_to_bf16": SCRIPT_DIR / "f32_to_bf16.cu",
     "f32_to_f16_sat": SCRIPT_DIR / "f32_to_f16_sat.cu",
     "rmsnorm_inplace_bf16": SCRIPT_DIR / "rmsnorm_inplace_bf16.cu",
