@@ -227,7 +227,6 @@ impl CublasLt {
             2,
             None,
             false,
-            false,
         )
     }
 
@@ -560,7 +559,6 @@ impl CublasLt {
             d_out_type,
             b_channelscale,
             false,
-            false,
         )
     }
 
@@ -586,7 +584,6 @@ impl CublasLt {
         d_out_type: u8,
         b_channelscale: Option<u64>,
         a_scale_outer_vec: bool,
-        b_scale_outer_vec: bool,
     ) -> Result<()> {
         let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
         let rc = lt::cublasLtMatmulDescCreate(
@@ -637,15 +634,6 @@ impl CublasLt {
             b_scale
         };
         let cublas_b_scale = a_scale;
-        if m > 1 && !b_scale_outer_vec {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static WARNED_SCALAR_ACT_SCALE: AtomicBool = AtomicBool::new(false);
-            if !WARNED_SCALAR_ACT_SCALE.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "[cublaslt] warning: scalar activation scale used for M={m}; exact only for shared/broadcast rows. Heterogeneous rows need a row-scale FP8 path."
-                );
-            }
-        }
         set_attr(
             desc,
             lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
@@ -674,21 +662,6 @@ impl CublasLt {
                 std::mem::size_of_val(&scale_mode),
             )?;
         }
-        if b_scale_outer_vec {
-            let scale_mode: u32 = 3; // OUTER_VEC_32F on CUDA 12.9+.
-            let attr_b_scale_mode: u32 = 32; // CUBLASLT_MATMUL_DESC_B_SCALE_MODE.
-            set_attr(
-                desc,
-                unsafe {
-                    std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(
-                        attr_b_scale_mode,
-                    )
-                },
-                &scale_mode as *const _ as *const _,
-                std::mem::size_of_val(&scale_mode),
-            )?;
-        }
-
         // Layouts: col-major view of our row-major buffers, TN.
         let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
@@ -743,7 +716,7 @@ impl CublasLt {
                 (_, false, _, true) => 40 + d_out_type,
                 (_, false, _, false) => 10 + d_out_type,
             },
-            scale_mode: (a_scale_outer_vec as u8) | ((b_scale_outer_vec as u8) << 1),
+            scale_mode: a_scale_outer_vec as u8,
         };
         let cached_algo = self
             .algo_cache

@@ -49,6 +49,7 @@ pub struct Gemma4FusedModules {
     pub f32_to_bf16_mod: LoadedModule,
     pub f32_to_f16_sat_mod: LoadedModule,
     pub scale_cols_f32_mod: LoadedModule,
+    pub scale_rows_f32_mod: LoadedModule,
     pub compute_qkv_scales_mod: LoadedModule,
     pub fused_gelu_mul_f16_mod: LoadedModule,
     pub fused_gelu_mul_two_f16_mod: LoadedModule,
@@ -74,6 +75,7 @@ pub struct Gemma4FusedModules {
     pub fn_f32_to_bf16: KernelFn,
     pub fn_f32_to_f16_sat: KernelFn,
     pub fn_scale_cols_f32: KernelFn,
+    pub fn_scale_rows_f32: KernelFn,
     pub fn_compute_qkv_scales: KernelFn,
     pub fn_fused_gelu_mul_f16: KernelFn,
     pub fn_fused_gelu_mul_two_f16: KernelFn,
@@ -85,6 +87,8 @@ pub struct Gemma4FusedModules {
     pub fused_qkv_rmsnorm_mod: LoadedModule,
     pub fn_scale_cols_f16: KernelFn,
     pub scale_cols_f16_mod: LoadedModule,
+    pub fn_scale_rows_f16: KernelFn,
+    pub scale_rows_f16_mod: LoadedModule,
     pub fn_slice_cols_f16: KernelFn,
 }
 
@@ -220,6 +224,12 @@ impl Gemma4Bringup {
         let max_blocks_per_seq = (num_blocks_total / num_seqs).max(1);
         let use_f16_kv = f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0");
         let kv_bytes_per_elem: u32 = if use_f16_kv { 2 } else { 1 };
+        let hetero_bench = std::env::var("RVLLM_GEMMA4_HETERO_BENCH")
+            .ok()
+            .is_some_and(|v| v != "0");
+        if hetero_bench {
+            eprintln!("[bench] heterogeneous B={} row seed enabled", num_seqs);
+        }
 
         let arena = &self.arena;
         let hidden_fp8 = arena
@@ -336,7 +346,11 @@ impl Gemma4Bringup {
             None
         };
         if let Some(ref token_ids_region) = token_ids_region {
-            let tok_ids = vec![0i32; num_seqs as usize];
+            let tok_ids: Vec<i32> = if hetero_bench {
+                (0..num_seqs as i32).map(|i| i % 256).collect()
+            } else {
+                vec![0i32; num_seqs as usize]
+            };
             token_ids_region
                 .copy_from_host(bytemuck_cast_i32(&tok_ids))
                 .unwrap();
@@ -418,6 +432,16 @@ impl Gemma4Bringup {
             0,
             (num_seqs * hidden * 2) as usize,
         );
+        if hetero_bench && !arch.is_pli_enabled() {
+            let mut seed = vec![0u16; (num_seqs * hidden) as usize];
+            for row in 0..num_seqs as usize {
+                for col in 0..hidden as usize {
+                    let v = (((row % 7) as f32 + 1.0) * ((col % 17) as f32 - 8.0)) * 0.001;
+                    seed[row * hidden as usize + col] = f16::from_f32(v).to_bits();
+                }
+            }
+            residual.copy_from_host(bytemuck_cast_u16(&seed)).unwrap();
+        }
 
         let positions = arena
             .region("positions", (num_seqs * 4) as usize, 16)
@@ -746,6 +770,16 @@ impl Gemma4Bringup {
                     hidden as i32,
                     hidden_scale.device_ptr(),
                     self.model.lm_head_fp8.scale_ptr,
+                    stream,
+                )?;
+            }
+            if num_seqs > 1 {
+                launch_scale_rows_f16(
+                    kernels.scale_rows_f16,
+                    logits.device_ptr(),
+                    hidden_scale.device_ptr(),
+                    num_seqs,
+                    vocab,
                     stream,
                 )?;
             }
@@ -2399,6 +2433,7 @@ impl Gemma4Bringup {
             f32_to_bf16: self.fused.fn_f32_to_bf16,
             f32_to_f16_sat: self.fused.fn_f32_to_f16_sat,
             scale_cols_f32: self.fused.fn_scale_cols_f32,
+            scale_rows_f32: self.fused.fn_scale_rows_f32,
             compute_qkv_scales: self.fused.fn_compute_qkv_scales,
             fused_gelu_mul_f16: self.fused.fn_fused_gelu_mul_f16,
             fused_gelu_mul_two_f16: self.fused.fn_fused_gelu_mul_two_f16,
@@ -2407,6 +2442,7 @@ impl Gemma4Bringup {
             fused_norm_add_residual_f16: self.fused.fn_fused_norm_add_residual_f16,
             fused_qkv_rmsnorm: self.fused.fn_fused_qkv_rmsnorm,
             scale_cols_f16: self.fused.fn_scale_cols_f16,
+            scale_rows_f16: self.fused.fn_scale_rows_f16,
         }
     }
 }
@@ -2417,6 +2453,35 @@ fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
 
 fn bytemuck_cast_f32(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+}
+
+fn bytemuck_cast_u16(v: &[u16]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn launch_scale_rows_f16(
+    kernel: KernelFn,
+    data: u64,
+    scale: u64,
+    m: u32,
+    n: u32,
+    stream: u64,
+) -> Result<()> {
+    let total = m * n;
+    let mut data = data;
+    let mut scale = scale;
+    let mut m_i = m as i32;
+    let mut n_i = n as i32;
+    let args = [
+        (&mut data) as *mut u64 as *mut core::ffi::c_void,
+        (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+        (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+        (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let block = (256u32, 1, 1);
+    let grid = ((total + 255) / 256, 1, 1);
+    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
 }
 
 #[cfg(feature = "cuda")]
@@ -2622,6 +2687,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
 
     let scale_cols_f32_mod = loader.load_ptx("scale_cols_f32")?;
     let fn_scale_cols_f32 = scale_cols_f32_mod.get_function("scale_cols_f32_kernel")?;
+    let scale_rows_f32_mod = loader.load_ptx("scale_rows_f32")?;
+    let fn_scale_rows_f32 = scale_rows_f32_mod.get_function("scale_rows_f32_kernel")?;
 
     let compute_qkv_scales_mod = loader.load_ptx("compute_qkv_scales")?;
     let fn_compute_qkv_scales = compute_qkv_scales_mod.get_function("compute_qkv_scales_kernel")?;
@@ -2649,6 +2716,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
 
     let scale_cols_f16_mod = loader.load_ptx("scale_cols_f16")?;
     let fn_scale_cols_f16 = scale_cols_f16_mod.get_function("scale_cols_f16_kernel")?;
+    let scale_rows_f16_mod = loader.load_ptx("scale_rows_f16")?;
+    let fn_scale_rows_f16 = scale_rows_f16_mod.get_function("scale_rows_f16_kernel")?;
     let slice_cols_f16_mod = loader.load_ptx("slice_cols_f16")?;
     let fn_slice_cols_f16 = slice_cols_f16_mod.get_function("slice_cols_f16_kernel")?;
     let fn_embed_gather_f16 = embed_gather_f16_mod.get_function("embedding_gather_f16_kernel")?;
@@ -2672,6 +2741,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         f32_to_bf16_mod,
         f32_to_f16_sat_mod,
         scale_cols_f32_mod,
+        scale_rows_f32_mod,
         compute_qkv_scales_mod,
         fused_gelu_mul_f16_mod,
         fused_gelu_mul_two_f16_mod,
@@ -2697,6 +2767,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_f32_to_bf16,
         fn_f32_to_f16_sat,
         fn_scale_cols_f32,
+        fn_scale_rows_f32,
         fn_compute_qkv_scales,
         fn_fused_gelu_mul_f16,
         fn_fused_gelu_mul_two_f16,
@@ -2708,6 +2779,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fused_qkv_rmsnorm_mod,
         fn_scale_cols_f16,
         scale_cols_f16_mod,
+        fn_scale_rows_f16,
+        scale_rows_f16_mod,
         fn_slice_cols_f16,
     })
 }
