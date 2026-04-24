@@ -143,10 +143,15 @@ CREATE_CMD="gcloud compute tpus tpu-vm create '${TPU_NAME}' \
        --accelerator-type='${ACCELERATOR}' \
        --version='${VERSION}'"
 # Use simpler create (boot-disk size via --disk-size if supported; else rely on default and resize).
+SPOT_FLAG=""
+if [[ "${SPOT:-0}" == "1" ]]; then
+  SPOT_FLAG=" --spot"
+  echo "   (spot/preemptible requested — may be reclaimed by Google at any time)"
+fi
 CREATE_CMD="gcloud compute tpus tpu-vm create '${TPU_NAME}' \
   --zone='${ZONE}' --project='${PROJECT}' \
   --accelerator-type='${ACCELERATOR}' \
-  --version='${VERSION}'"
+  --version='${VERSION}'${SPOT_FLAG}"
 if [[ "$DRY_RUN" -eq 0 ]]; then
   if gcloud compute tpus tpu-vm describe "$TPU_NAME" --zone="$ZONE" --project="$PROJECT" >/dev/null 2>&1; then
     echo "   TPU VM ${TPU_NAME} already exists; skipping create."
