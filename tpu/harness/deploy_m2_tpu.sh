@@ -179,30 +179,14 @@ fi
 SSH_BASE="gcloud compute tpus tpu-vm ssh '${TPU_NAME}' --zone='${ZONE}' --project='${PROJECT}'"
 SCP_BASE="gcloud compute tpus tpu-vm scp --zone='${ZONE}' --project='${PROJECT}'"
 
-echo ">> (4) mount data disk (if attached) + create run dir ${RUN_DIR} on remote"
+echo ">> (4) create run dir ${RUN_DIR} on remote (model will live in /dev/shm)"
 MOUNT_SCRIPT=$(cat <<EOS
 set -euo pipefail
-# If an unformatted data disk is attached, format and mount it at /workspace.
-for dev in /dev/sdb /dev/nvme0n1 /dev/nvme1n1 /dev/disk/by-id/google-persistent-disk-1; do
-  if [[ -b "\$dev" ]]; then
-    if ! sudo blkid "\$dev" >/dev/null 2>&1; then
-      echo "formatting \$dev as ext4"
-      sudo mkfs.ext4 -F "\$dev"
-    fi
-    if ! mountpoint -q /workspace; then
-      sudo mkdir -p /workspace
-      sudo mount "\$dev" /workspace
-      sudo chown -R "\$(id -u):\$(id -g)" /workspace
-      echo "mounted \$dev at /workspace"
-    fi
-    break
-  fi
-done
 sudo mkdir -p '${RUN_DIR}'
 sudo chown -R "\$(id -u):\$(id -g)" /workspace
 rm -rf '${RUN_DIR}'/* 2>/dev/null || true
 mkdir -p '${RUN_DIR}'
-df -h /workspace
+df -h / /dev/shm
 EOS
 )
 MOUNT_SCRIPT="${MOUNT_SCRIPT//\$/\\\$}"
@@ -274,7 +258,7 @@ else
   echo "   skipped; set BUILD_ZIG=1 to enable"
 fi
 
-echo ">> (8) download model ${MODEL_REPO} to /workspace/models/m2-nvfp4"
+echo ">> (8) download model ${MODEL_REPO} to /dev/shm/m2-nvfp4"
 HF_TOKEN_EXPORT=""
 if [[ -n "${HF_TOKEN:-}" ]]; then
   HF_TOKEN_EXPORT="export HF_TOKEN='${HF_TOKEN}'; export HUGGING_FACE_HUB_TOKEN='${HF_TOKEN}';"
@@ -283,15 +267,15 @@ HF_SCRIPT=$(cat <<EOS
 set -euo pipefail
 export PATH="\$HOME/.local/bin:\$PATH"
 ${HF_TOKEN_EXPORT}
-mkdir -p /workspace/models
+mkdir -p /dev/shm
 pip3 install --quiet --upgrade huggingface_hub
 # Prefer new hf CLI (huggingface_hub 1.5+), fall back to legacy name.
 if command -v hf >/dev/null 2>&1; then
-  hf download '${MODEL_REPO}' --local-dir /workspace/models/m2-nvfp4 --max-workers 32
+  hf download '${MODEL_REPO}' --local-dir /dev/shm/m2-nvfp4 --max-workers 32
 else
-  huggingface-cli download '${MODEL_REPO}' --local-dir /workspace/models/m2-nvfp4 --max-workers 32
+  huggingface-cli download '${MODEL_REPO}' --local-dir /dev/shm/m2-nvfp4 --max-workers 32
 fi
-du -sh /workspace/models/m2-nvfp4
+du -sh /dev/shm/m2-nvfp4
 EOS
 )
 HF_SCRIPT="${HF_SCRIPT//\$/\\\$}"
@@ -306,7 +290,7 @@ export PATH="\$HOME/.local/bin:\$PATH"
 cd '${RUN_DIR}'
 cat REVISION
 python3 tpu/harness/m2_tpu_infer.py \
-  --model-dir /workspace/models/m2-nvfp4 \
+  --model-dir /dev/shm/m2-nvfp4 \
   --max-tokens 16 \
   --prompt 'Hello'
 EOS
