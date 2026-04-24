@@ -281,6 +281,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
 
     const int half_D       = head_dim >> 1;   // NVFP4 packed bytes per row
     const int scales_per_D = head_dim >> 4;   // E4M3 scales per row
+    const int blocks_per_row = scales_per_D;
 
     // === Tile loop ====================================================
     for (int j = tile_start; j < tile_end; j++) {
@@ -288,19 +289,33 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
         const int tile_len  = min(tile_size, max_seq_prefix_len - tile_base);
         if (tile_len <= 0) break;
 
-        // -- Load K tile (NVFP4 → f16 smem) --
-        for (int t = 0; t < tile_len; t++) {
-            const int kv_pos = tile_base + t;
-            const int page_idx = kv_pos / block_size;
-            const int page_off = kv_pos - page_idx * block_size;
-            const int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            const int slot = phys_block * block_size + page_off;
-            const uint8_t* k_packed = key_cache_packed
-                + (slot * num_kv_heads + kv_head) * half_D;
-            const __nv_fp8_e4m3* k_scale = key_cache_scale
-                + (slot * num_kv_heads + kv_head) * scales_per_D;
-            dequant_nvfp4_row_to_f16_smem(
-                k_packed, k_scale, s_k_f16 + t * head_dim, tid, head_dim);
+        // -- Load K tile (NVFP4 → f16 smem). Thread-per-(row, 16-block);
+        //    keeps all 128 threads busy during the dequant phase
+        //    instead of the `head_dim/16`-threads-per-row pattern the
+        //    legacy decode kernel uses. At head_dim=256 that's 16 of
+        //    128 threads → 128/128 after this change.
+        {
+            const int total_units = tile_len * blocks_per_row;
+            for (int u = tid; u < total_units; u += FA2_THREADS) {
+                const int t         = u / blocks_per_row;
+                const int block_idx = u - t * blocks_per_row;
+                const int kv_pos    = tile_base + t;
+                const int page_idx  = kv_pos / block_size;
+                const int page_off  = kv_pos - page_idx * block_size;
+                const int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                const int slot      = phys_block * block_size + page_off;
+                const uint8_t* k_packed = key_cache_packed
+                    + (slot * num_kv_heads + kv_head) * half_D;
+                const __nv_fp8_e4m3* k_scale = key_cache_scale
+                    + (slot * num_kv_heads + kv_head) * scales_per_D;
+                const int d_base = block_idx << 4;
+                uint64_t packed8 = *reinterpret_cast<const uint64_t*>(
+                    k_packed + (d_base >> 1));
+                float    scale   = float(k_scale[block_idx]);
+                rvllm_nvfp4::unpack16_nvfp4_to_f16_fast(
+                    packed8, scale,
+                    s_k_f16 + t * head_dim + d_base);
+            }
         }
         __syncthreads();
 
@@ -405,19 +420,30 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
         }
         __syncthreads();
 
-        // -- Load V tile (NVFP4 → f16 smem) --
-        for (int t = 0; t < tile_len; t++) {
-            const int kv_pos = tile_base + t;
-            const int page_idx = kv_pos / block_size;
-            const int page_off = kv_pos - page_idx * block_size;
-            const int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-            const int slot = phys_block * block_size + page_off;
-            const uint8_t* v_packed = value_cache_packed
-                + (slot * num_kv_heads + kv_head) * half_D;
-            const __nv_fp8_e4m3* v_scale = value_cache_scale
-                + (slot * num_kv_heads + kv_head) * scales_per_D;
-            dequant_nvfp4_row_to_f16_smem(
-                v_packed, v_scale, s_v_f16 + t * head_dim, tid, head_dim);
+        // -- Load V tile (NVFP4 → f16 smem). Same parallel pattern
+        //    as the K load above.
+        {
+            const int total_units = tile_len * blocks_per_row;
+            for (int u = tid; u < total_units; u += FA2_THREADS) {
+                const int t         = u / blocks_per_row;
+                const int block_idx = u - t * blocks_per_row;
+                const int kv_pos    = tile_base + t;
+                const int page_idx  = kv_pos / block_size;
+                const int page_off  = kv_pos - page_idx * block_size;
+                const int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+                const int slot      = phys_block * block_size + page_off;
+                const uint8_t* v_packed = value_cache_packed
+                    + (slot * num_kv_heads + kv_head) * half_D;
+                const __nv_fp8_e4m3* v_scale = value_cache_scale
+                    + (slot * num_kv_heads + kv_head) * scales_per_D;
+                const int d_base = block_idx << 4;
+                uint64_t packed8 = *reinterpret_cast<const uint64_t*>(
+                    v_packed + (d_base >> 1));
+                float    scale   = float(v_scale[block_idx]);
+                rvllm_nvfp4::unpack16_nvfp4_to_f16_fast(
+                    packed8, scale,
+                    s_v_f16 + t * head_dim + d_base);
+            }
         }
         __syncthreads();
 
