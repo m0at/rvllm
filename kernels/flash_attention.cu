@@ -940,11 +940,17 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
     // Sliding-window boundary: when `window_size_left` is set (sliding
     // attention layers on Gemma 4), only the last `window_size_left`
     // KV positions are allowed to attend. Compute the earliest allowed
-    // absolute position once; per-tile logic masks anything before it.
+    // absolute position once; the tile loop skips any tile whose
+    // `tile_start + FA2_BC <= window_start` (none of its positions
+    // contribute), and per-row masking handles the edge tile that
+    // straddles `window_start`. Tile-skip turns a 15k-context sliding
+    // layer from ~940 tile iterations to ~64 — matches the NVFP4
+    // decode kernel's Phase-2b sliding fix.
     const int decode_q_abs_pos = context_len - 1;
     const int window_start = (window_size_left < 0)
         ? 0
         : max(0, decode_q_abs_pos - window_size_left);
+    const int tile_start_idx = window_start / 16;
 
     extern __shared__ float smem[];
     // BC=16 layout: [16 * head_dim K tile, 16 * head_dim V tile, 16 scores, smem reduce]
@@ -972,7 +978,7 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
     float acc[8];
     for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] = 0.0f;
 
-    for (int tile = 0; tile < num_kv_tiles; tile++) {
+    for (int tile = tile_start_idx; tile < num_kv_tiles; tile++) {
         const int tile_start = tile * 16;
         const int tile_len = min(16, context_len - tile_start);
 
