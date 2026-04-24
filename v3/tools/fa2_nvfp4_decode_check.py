@@ -126,7 +126,7 @@ def fp8_e4m3_quantise(x: np.ndarray) -> np.ndarray:
 
 def run_one(
     num_seqs, num_heads, num_kv_heads, head_dim, rotary_dim,
-    context_len, block_size, seed
+    context_len, block_size, seed, window_size_left=-1
 ):
     rng = np.random.default_rng(seed)
     assert context_len % block_size == 0 or context_len < block_size, \
@@ -321,7 +321,7 @@ def run_one(
         np.array([head_dim],          dtype=np.int32),
         np.array([block_size],        dtype=np.int32),
         np.array([blocks_per_seq],    dtype=np.int32),
-        np.array([-1],                dtype=np.int32),   # window_size_left
+        np.array([window_size_left],  dtype=np.int32),
     ]
     pp = np.array([p.ctypes.data for p in params], dtype=np.uint64)
     CHECK(drv.cuLaunchKernel(fn_decode,
@@ -375,6 +375,11 @@ def run_one(
     gqa = num_heads // num_kv_heads
 
     out_ref = np.empty_like(q_ref)
+    # Sliding-window reference: mirror the kernel's `window_start`
+    # computation. `window_size_left < 0` disables the mask.
+    decode_q_abs = context_len - 1
+    ref_window_start = (0 if window_size_left < 0
+                         else max(0, decode_q_abs - window_size_left))
     for s in range(num_seqs):
         for h in range(num_heads):
             kvh = h // gqa
@@ -382,6 +387,8 @@ def run_one(
             k_hist_h = k_hist[:, s, kvh]                     # [T, D]
             v_hist_h = v_hist[:, s, kvh]                     # [T, D]
             scores = (k_hist_h @ q_row) * float(attn_scale[0])  # [T]
+            if ref_window_start > 0:
+                scores[:ref_window_start] = -np.inf
             scores -= scores.max()
             probs = np.exp(scores); probs /= probs.sum()
             out_ref[s, h] = (probs[:, None] * v_hist_h).sum(axis=0)
@@ -393,10 +400,11 @@ def run_one(
     bad = int((abs_err > tol).sum())
     ok = bad == 0
     status = "OK  " if ok else "FAIL"
+    wtag = f" ws={window_size_left}" if window_size_left >= 0 else ""
     print(
         f"  {status}  S={num_seqs:>2} H={num_heads:>2} KVH={num_kv_heads:>2} "
         f"hd={head_dim:>3} rd={rotary_dim:>3} ctx={context_len:>3} bs={block_size:>2} "
-        f"bc={fa2_bc:>2}   "
+        f"bc={fa2_bc:>2}{wtag}   "
         f"abs_err.max={abs_err.max():.3e} (≤{tol:.3e})  "
         f"mismatches={bad}/{out_got.size}"
     )
@@ -420,6 +428,19 @@ all_pass = all([
     run_one(num_seqs=2, num_heads=8, num_kv_heads=2,
             head_dim=512, rotary_dim=128,
             context_len=64, block_size=16, seed=42),  # exercises BC=16
+    # Sliding-window cases — decode kernel's tile-skip + mask path.
+    # Gemma 4 sliding layers use window_size_left = 1023, so at large
+    # context most tiles are below window_start and must be skipped.
+    run_one(num_seqs=1, num_heads=4, num_kv_heads=2,
+            head_dim=128, rotary_dim=128,
+            context_len=128, block_size=16, seed=101, window_size_left=31),
+    run_one(num_seqs=1, num_heads=4, num_kv_heads=2,
+            head_dim=256, rotary_dim=128,
+            context_len=256, block_size=16, seed=102, window_size_left=63),
+    # Edge tile: window_start straddles the middle of a BC-sized block.
+    run_one(num_seqs=1, num_heads=4, num_kv_heads=2,
+            head_dim=256, rotary_dim=128,
+            context_len=128, block_size=16, seed=103, window_size_left=40),
 ])
 print()
 print("all shapes pass" if all_pass

@@ -134,7 +134,7 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
     int head_dim,
     int block_size,
     int max_blocks_per_seq,
-    int /*window_size_left*/
+    int window_size_left
 ) {
     const int seq_idx  = blockIdx.x;
     const int head_idx = blockIdx.y;
@@ -148,6 +148,19 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
         : (head_idx / (num_heads / num_kv_heads));
 
     const float q_scale = *q_descale;
+
+    // Sliding-window bounds. On Gemma 4 the 50 sliding layers set
+    // `window_size_left = sliding_window - 1 = 1023`, so only the
+    // last 1024 KV positions are attended. `window_start` is the
+    // earliest absolute KV position allowed. `tile_start_idx` prunes
+    // tiles entirely when they're below `window_start` — the big
+    // decode win at long context (e.g. 15k → only ~64 tiles walked
+    // instead of ~470 on sliding layers).
+    const int decode_q_abs_pos = context_len - 1;
+    const int window_start = (window_size_left < 0)
+        ? 0
+        : max(0, decode_q_abs_pos - window_size_left);
+    const int tile_start_idx = window_start / FA2_BC;
 
     // Smem layout: f16 K/V tiles + f32 score + f32 reduce scratch.
     // Allocate the f16 region first (alignment-friendly for f16x2
@@ -185,7 +198,7 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
     #pragma unroll
     for (int r = 0; r < 8; ++r) acc[r] = 0.0f;
 
-    for (int tile = 0; tile < num_kv_tiles; ++tile) {
+    for (int tile = tile_start_idx; tile < num_kv_tiles; ++tile) {
         const int tile_start = tile * FA2_BC;
         const int tile_len   = min(FA2_BC, context_len - tile_start);
 
@@ -212,8 +225,11 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
 
         // --- Q · K^T per column of the tile. -----------------------
         // f16 smem read + cvt-to-f32 per element keeps the dot in
-        // f32 precision. The cvt is free in practice (single-cycle
-        // hw op on sm_120+).
+        // f32 precision. Sliding-window mask: entries with
+        // kv_pos < window_start get -FLT_MAX so softmax drops them.
+        // (The edge-tile case: if this tile straddles window_start,
+        // some rows are masked and some aren't. Inner tiles —
+        // whose `tile_start` >= window_start — pass everything.)
         for (int t = 0; t < tile_len; ++t) {
             float dot = 0.0f;
             #pragma unroll
@@ -225,7 +241,10 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
                 }
             }
             dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
-            if (tid == 0) s_score[t] = dot;
+            if (tid == 0) {
+                int kv_pos = tile_start + t;
+                s_score[t] = (kv_pos < window_start) ? -FLT_MAX : dot;
+            }
             __syncthreads();
         }
 
@@ -253,7 +272,10 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
         if (tid == 0) {
             float tsum = 0.0f;
             for (int t = 0; t < tile_len; ++t) {
-                float v = expf(s_score[t] - row_max);
+                // Skip masked entries on the exp path so partially-
+                // masked tiles don't produce NaN from exp(-FLT_MAX - X).
+                float v = (s_score[t] > -FLT_MAX + 1.0f)
+                    ? expf(s_score[t] - row_max) : 0.0f;
                 s_score[t] = v;
                 tsum += v;
             }
@@ -368,6 +390,13 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
     float*  s_score  = reinterpret_cast<float*>(s_val + FA2_BC * head_dim);
     float*  s_reduce = s_score + FA2_BC;
 
+    // Sliding-window bounds (see BC=32 sibling for detail).
+    const int decode_q_abs_pos = context_len - 1;
+    const int window_start = (window_size_left < 0)
+        ? 0
+        : max(0, decode_q_abs_pos - window_size_left);
+    const int tile_start_idx = window_start / FA2_BC;
+
     const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
     const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
     const int half_D = head_dim >> 1;
@@ -390,7 +419,7 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
     #pragma unroll
     for (int r = 0; r < 8; ++r) acc[r] = 0.0f;
 
-    for (int tile = 0; tile < num_kv_tiles; ++tile) {
+    for (int tile = tile_start_idx; tile < num_kv_tiles; ++tile) {
         const int tile_start = tile * FA2_BC;
         const int tile_len   = min(FA2_BC, context_len - tile_start);
 
@@ -415,7 +444,10 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
                     dot += q_reg[r] * __half2float(s_key[t * head_dim + d]);
             }
             dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
-            if (tid == 0) s_score[t] = dot;
+            if (tid == 0) {
+                int kv_pos = tile_start + t;
+                s_score[t] = (kv_pos < window_start) ? -FLT_MAX : dot;
+            }
             __syncthreads();
         }
 
@@ -441,7 +473,10 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
         if (tid == 0) {
             float tsum = 0.0f;
             for (int t = 0; t < tile_len; ++t) {
-                float v = expf(s_score[t] - row_max);
+                // Skip masked entries on the exp path so partially-
+                // masked tiles don't produce NaN from exp(-FLT_MAX - X).
+                float v = (s_score[t] > -FLT_MAX + 1.0f)
+                    ? expf(s_score[t] - row_max) : 0.0f;
                 s_score[t] = v;
                 tsum += v;
             }
@@ -485,7 +520,6 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
                 __float2half(acc[r] * inv_sum);
         }
     }
-    (void)window_size_left;
 }
 #endif  // FA2_BC == 32 originally
 
