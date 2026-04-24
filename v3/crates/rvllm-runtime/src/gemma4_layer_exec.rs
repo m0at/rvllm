@@ -95,10 +95,21 @@ impl KvDtype {
         matches!(self, KvDtype::F16)
     }
 
-    /// Resolve from the engine env flags. Precedence:
-    ///   1. `RVLLM_NVFP4_KV=1`   → Nvfp4
-    ///   2. `RVLLM_F16_KV=0`     → Fp8
-    ///   3. anything else or unset → F16 (engine default).
+    /// Resolve from the engine env flags. Precedence (post-Phase-2b
+    /// of task aa01001nvf4f16mma, commit 8e8f517 — NVFP4 + f16-MMA
+    /// unified prefill is 13× faster than the per-qi kernel and
+    /// beats FP8 unified prefill at 1082-tok prompts, so NVFP4 is
+    /// now the default KV dtype):
+    ///
+    ///   1. `RVLLM_NVFP4_KV=1`    → Nvfp4 (explicit opt-in).
+    ///   2. `RVLLM_F16_KV=1`      → F16.
+    ///   3. `RVLLM_FP8_KV=1`      → Fp8.
+    ///   4. `RVLLM_NVFP4_KV=0`    → F16 (explicit opt-out of the
+    ///                              NVFP4 default — matches the
+    ///                              pre-2b engine default for
+    ///                              legacy tests / probes).
+    ///   5. unset → Nvfp4.
+    ///
     /// `f16_only` short-circuits to F16 — used by the bench path
     /// when the caller explicitly asks for f16 regardless of env.
     #[must_use]
@@ -106,14 +117,19 @@ impl KvDtype {
         if f16_only {
             return KvDtype::F16;
         }
-        if std::env::var("RVLLM_NVFP4_KV").map(|v| v != "0").unwrap_or(false) {
+        if std::env::var("RVLLM_NVFP4_KV").map_or(false, |v| v != "0") {
             return KvDtype::Nvfp4;
         }
-        if std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0") {
-            KvDtype::F16
-        } else {
-            KvDtype::Fp8
+        if std::env::var("RVLLM_F16_KV").map_or(false, |v| v != "0") {
+            return KvDtype::F16;
         }
+        if std::env::var("RVLLM_FP8_KV").map_or(false, |v| v != "0") {
+            return KvDtype::Fp8;
+        }
+        if std::env::var("RVLLM_NVFP4_KV").map_or(false, |v| v == "0") {
+            return KvDtype::F16;
+        }
+        KvDtype::Nvfp4
     }
 }
 
