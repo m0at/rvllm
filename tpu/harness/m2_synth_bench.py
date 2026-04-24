@@ -69,8 +69,14 @@ def rms_norm(x, g):
 
 
 def head_rms(h, g):
+    """Per-head RMSNorm. h: (..., NH, HEAD_DIM). g may be (HEAD_DIM,) shared-per-head
+    or (NH*HEAD_DIM,) per-head — reshape to match h's trailing two dims."""
     h32 = h.astype(jnp.float32)
-    return (h * jax.lax.rsqrt(jnp.mean(h32 * h32, axis=-1, keepdims=True) + RMS_EPS).astype(h.dtype)) * g
+    normed = h * jax.lax.rsqrt(jnp.mean(h32 * h32, axis=-1, keepdims=True) + RMS_EPS).astype(h.dtype)
+    # If g is flat (NH*HEAD_DIM,), reshape to (NH, HEAD_DIM) so broadcast matches.
+    if g.ndim == 1 and g.shape[0] == h.shape[-2] * h.shape[-1]:
+        g = g.reshape(h.shape[-2], h.shape[-1])
+    return normed * g
 
 
 def rope_partial(x, cos, sin):
