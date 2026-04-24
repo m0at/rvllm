@@ -145,6 +145,14 @@ pub struct Gemma4LayerDims {
     pub block_size: u32,
     pub max_blocks_per_seq: u32,
     pub num_blocks_total: u32,
+    /// Current-step upper bound on KV context length across the active
+    /// batch, when the caller can compute it cheaply (e.g. decode step
+    /// knows `step + 1`). Used by the split-KV decode dispatch to skip
+    /// the split path when the current context is short enough that
+    /// the single-CTA kernel wins, without conflating it with the
+    /// bucket max that still sizes workspace. `None` falls back to
+    /// `max_blocks_per_seq * block_size` — correct but conservative.
+    pub current_max_context_len: Option<u32>,
     pub attn_scale: f32,
     pub rms_eps: f32,
     pub layer_type: Gemma4LayerType,
@@ -739,19 +747,92 @@ pub unsafe fn gemma4_forward_phase(
                     // NVFP4 path: dedicated RoPE + dedicated decode launcher.
                     rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
                     let decode = rvllm_attention::PagedDecodeNvfp4Launcher::new(attention);
-                    decode.launch(
-                        decode_params,
-                        scratch.attn_out,
-                        scratch.q_fp8,
-                        scratch.k_cache,
-                        scratch.v_cache,
-                        scratch.k_cache_scale,
-                        scratch.v_cache_scale,
-                        meta.block_tables,
-                        meta.context_lens,
-                        scratch.q_scale_ptr,
-                        stream,
-                    )?;
+
+                    // Split-KV decode (paged_attention_v2-style) —
+                    // default ON. Opt-out via `RVLLM_NVFP4_SPLIT_KV=0`
+                    // for A/B comparisons. Engages only when the split
+                    // kernels exist AND the context is long enough to
+                    // benefit (single-partition would waste phase-2
+                    // overhead).
+                    //
+                    // Measured +75% on 15k-ctx bs=1 decode vs the
+                    // single-CTA path (2.0 → 3.5 tok/s on GB10); was
+                    // the gating change that got zeroclaw's 14795-tok
+                    // prompt under the 600s gateway timeout.
+                    //
+                    // Partition size follows vLLM's default (512).
+                    // `max_num_parts` is sized for the engine's max
+                    // context window so the workspace layout is
+                    // stable across calls — running at a shorter ctx
+                    // just writes sentinels to the tail partitions.
+                    let split_env_on = std::env::var("RVLLM_NVFP4_SPLIT_KV")
+                        .map(|s| !matches!(s.as_str(),
+                            "0" | "false" | "FALSE" | "no" | "off" | ""))
+                        .unwrap_or(true);
+                    const PARTITION_SIZE: u32 = 512;
+                    // Bucket max ctx = max_blocks_per_seq * block_size.
+                    // Workspace is sized off this so the layout is
+                    // stable across iterations regardless of current
+                    // context growth.
+                    let bucket_ctx = (dims.max_blocks_per_seq as u32)
+                        * (dims.block_size as u32);
+                    let max_num_parts = bucket_ctx.div_ceil(PARTITION_SIZE).max(1);
+                    // Current-step max ctx — used only for the dispatch
+                    // gate, NOT for workspace sizing. Earlier revisions
+                    // used `bucket_ctx` here, which over-fired the split
+                    // path on short-context turns (each empty partition
+                    // still launches a CTA, just writing sentinels).
+                    // Fall back to bucket_ctx when caller didn't supply.
+                    let current_ctx = dims
+                        .current_max_context_len
+                        .unwrap_or(bucket_ctx);
+                    let current_num_parts =
+                        current_ctx.div_ceil(PARTITION_SIZE).max(1);
+                    // Skip split path if: env gate off, split kernels
+                    // missing, current ctx short enough that one CTA
+                    // per (seq, head) fits comfortably, or workspace
+                    // can't fit the scratch layout.
+                    let slots = (decode_params.num_seqs as u64)
+                        * (dims.num_heads as u64)
+                        * (max_num_parts as u64);
+                    let ws_need = slots * (dims.head_dim as u64) * 2
+                        + slots * 4 * 2;
+                    let use_split = split_env_on
+                        && decode.has_split_kernels()
+                        && current_num_parts > 1
+                        && ws_need <= 16 * 1024 * 1024; // fa3_ws is 16MiB
+                    if use_split {
+                        decode.launch_split(
+                            decode_params,
+                            scratch.attn_out,
+                            scratch.q_fp8,
+                            scratch.k_cache,
+                            scratch.v_cache,
+                            scratch.k_cache_scale,
+                            scratch.v_cache_scale,
+                            meta.block_tables,
+                            meta.context_lens,
+                            scratch.q_scale_ptr,
+                            scratch.fa3_workspace,
+                            PARTITION_SIZE,
+                            max_num_parts,
+                            stream,
+                        )?;
+                    } else {
+                        decode.launch(
+                            decode_params,
+                            scratch.attn_out,
+                            scratch.q_fp8,
+                            scratch.k_cache,
+                            scratch.v_cache,
+                            scratch.k_cache_scale,
+                            scratch.v_cache_scale,
+                            meta.block_tables,
+                            meta.context_lens,
+                            scratch.q_scale_ptr,
+                            stream,
+                        )?;
+                    }
                 }
             }
         }
@@ -1823,6 +1904,19 @@ unsafe fn rope_nvfp4kv(
     let mut nkvh = dims.num_kv_heads as i32;
     let mut hd = dims.head_dim as i32;
     let mut rd = dims.rotary_dim as i32;
+    // NVFP4 scale policy — read env lazily. Stable across a run once
+    // chosen. `amax6` (0) = OCP baseline (range-preserving, outlier-
+    // insensitive — produces garbage on Gemma 4 at 15k). `mse` (1) =
+    // blockwise MSE search over 4 outlier-aware candidates (see
+    // fused_rope_partial_nvfp4kv.cu for the candidate set).
+    let mut scale_policy: i32 = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "amax6" | "0" => Some(0),
+            "mse" | "1" => Some(1),
+            _ => None,
+        })
+        .unwrap_or(0);
     let args = [
         (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
         (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -1842,6 +1936,7 @@ unsafe fn rope_nvfp4kv(
         (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
         (&mut hd) as *mut i32 as *mut core::ffi::c_void,
         (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut scale_policy) as *mut i32 as *mut core::ffi::c_void,
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);

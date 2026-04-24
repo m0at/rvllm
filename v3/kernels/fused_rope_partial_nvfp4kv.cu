@@ -42,6 +42,79 @@ __device__ __forceinline__ float block16_peak_abs(float v) {
     return a;
 }
 
+// Reduce the absolute-value SUM across the 16-lane group.
+__device__ __forceinline__ float block16_sum_abs(float v) {
+    float a = fabsf(v);
+    #pragma unroll
+    for (int off = 8; off > 0; off >>= 1) {
+        a += __shfl_xor_sync(0xFFFFFFFFu, a, off);
+    }
+    return a;
+}
+
+// Reduce an arbitrary f32 SUM across the 16-lane group.
+__device__ __forceinline__ float block16_sum(float v) {
+    #pragma unroll
+    for (int off = 8; off > 0; off >>= 1) {
+        v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+    }
+    return v;
+}
+
+// Find second-largest abs value in the 16-lane group by masking out
+// the peak's lane(s) and reducing again. If multiple lanes hold the
+// peak (ties), the second reduce still returns the peak magnitude —
+// acceptable for our use since ties mean the distribution doesn't
+// have a single outlier.
+__device__ __forceinline__ float block16_second_largest_abs(
+    float v, float peak)
+{
+    float a = fabsf(v);
+    // Mask: if this lane IS the peak, contribute -1 so max ignores it.
+    float contrib = (a >= peak - 1e-9f) ? -1.0f : a;
+    #pragma unroll
+    for (int off = 8; off > 0; off >>= 1) {
+        contrib = fmaxf(contrib, __shfl_xor_sync(0xFFFFFFFFu, contrib, off));
+    }
+    // If all 16 lanes tied at peak, the mask knocks everything to -1 →
+    // fall back to peak.
+    return (contrib < 0.0f) ? peak : contrib;
+}
+
+// --- Scale-policy encoding (kernel arg `scale_policy`) ---
+//   0 = amax6   : peak / 6.0  (OCP-baseline, range-preserving — outlier-insensitive)
+//   1 = mse    : blockwise MSE search over 4 candidates:
+//                  { peak/6, peak/4, second_largest/6, second_largest/4 }
+//                e4m3-rounded, picks the scale minimizing sum-squared
+//                dequant error over the 16-element block.
+// Policies 0 and 1 produce DIFFERENT on-cache byte streams (different
+// scale bytes + different nibbles). Re-run through the full KV cache
+// fill when switching.
+#define RVLLM_NVFP4_POLICY_AMAX6 0
+#define RVLLM_NVFP4_POLICY_MSE   1
+
+// Given a candidate scale, compute this lane's squared error under
+// the nearest-e2m1 quantize → dequantize roundtrip.
+__device__ __forceinline__ float lane_quant_sse(float v, float scale) {
+    if (scale <= 0.0f) return v * v;
+    uint32_t nib = fp4_encode(v / scale);
+    // Decode (inverse of fp4_encode used in the rest of the kernel).
+    static constexpr float kTable[8] =
+        {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float mag = kTable[nib & 0x7u];
+    float sign = ((nib >> 3) & 0x1u) ? -1.0f : 1.0f;
+    float dq = sign * mag * scale;
+    float err = v - dq;
+    return err * err;
+}
+
+// Round raw-scale to E4M3 and back to f32, exactly mirroring what the
+// production path does (cvt.rn.satfinite).
+__device__ __forceinline__ float round_scale_e4m3(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    return float(__nv_fp8_e4m3(s));
+}
+
 extern "C"
 __global__ void fused_rope_partial_nvfp4kv_kernel(
     const __half* __restrict__ q_in,
@@ -61,7 +134,8 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
     int num_heads,
     int num_kv_heads,
     int head_dim,
-    int rotary_dim
+    int rotary_dim,
+    int scale_policy    // RVLLM_NVFP4_POLICY_* (see top of file)
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -123,9 +197,39 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
             float v = apply_rope ? rope_one(in, k_base)
                                  : __half2float(in[k_base + tid]);
 
-            // Per-16-block peak → E4M3 scale.
+            // Per-16-block scale selection. Default path is the
+            // range-preserving OCP baseline (peak/6). The MSE path
+            // searches over 4 outlier-aware candidates and picks the
+            // one that minimises sum-squared reconstruction error
+            // over the 16-element block.
             float peak = block16_peak_abs(v);
-            float scale_f32 = (peak > 0.0f) ? (peak * (1.0f / 6.0f)) : 0.0f;
+            float scale_f32;
+            if (scale_policy == RVLLM_NVFP4_POLICY_MSE && peak > 0.0f) {
+                float second = block16_second_largest_abs(v, peak);
+                // 4 candidates (E4M3-rounded before scoring, to match
+                // what the production path would actually store).
+                float c0 = round_scale_e4m3(peak * (1.0f / 6.0f));
+                float c1 = round_scale_e4m3(peak * (1.0f / 4.0f));
+                float c2 = round_scale_e4m3(second * (1.0f / 6.0f));
+                float c3 = round_scale_e4m3(second * (1.0f / 4.0f));
+                // Per-lane squared error at each candidate, then
+                // sum across the 16-lane group.
+                float e0 = block16_sum(lane_quant_sse(v, c0));
+                float e1 = block16_sum(lane_quant_sse(v, c1));
+                float e2 = block16_sum(lane_quant_sse(v, c2));
+                float e3 = block16_sum(lane_quant_sse(v, c3));
+                // Pick min across {c0..c3}. Prefer c0 (= current
+                // baseline) on ties to stay range-preserving when MSE
+                // is indifferent.
+                float best_e = e0;    float best_s = c0;
+                if (e1 < best_e) { best_e = e1; best_s = c1; }
+                if (e2 < best_e) { best_e = e2; best_s = c2; }
+                if (e3 < best_e) { best_e = e3; best_s = c3; }
+                scale_f32 = best_s;
+            } else {
+                // Baseline: peak / 6 (OCP NVFP4 default).
+                scale_f32 = (peak > 0.0f) ? (peak * (1.0f / 6.0f)) : 0.0f;
+            }
             __nv_fp8_e4m3 scale_e4m3 = __nv_fp8_e4m3(scale_f32);
             float scale = float(scale_e4m3);
             float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;

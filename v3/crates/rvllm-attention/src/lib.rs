@@ -300,6 +300,11 @@ pub struct Fa2PtxKernels {
     /// on BC=16 for all head_dims.
     #[cfg(feature = "cuda")]
     pub fn_decode_fp8kv: rvllm_kernels::KernelFn,
+    /// GQA-grouped FP8 decode — CTA per (seq, kv_head). Optional;
+    /// absent on older PTX trees. Dispatched when
+    /// `num_heads > num_kv_heads` and GQA ≤ MAX_GQA_DECODE (=4).
+    #[cfg(feature = "cuda")]
+    pub fn_decode_fp8kv_gqa: Option<rvllm_kernels::KernelFn>,
     /// `flash_attention_2_prefill_fp8kv_unified_kernel` — multi-query
     /// FP8-KV prefill. Port of vLLM's
     /// `kernel_unified_attention_2d`; see
@@ -346,6 +351,15 @@ pub struct Fa2PtxKernels {
     /// BC=16 decode variant for head_dim=512 (global-attn smem fit).
     #[cfg(feature = "cuda")]
     pub fn_decode_nvfp4kv_bc16: Option<rvllm_kernels::KernelFn>,
+    /// GQA-grouped decode variants — one CTA per (seq, kv_head)
+    /// handling all `num_heads / num_kv_heads` queries sharing that
+    /// KV slice. Halves K/V dequant + smem traffic at decode for
+    /// models with GQA > 1 (Gemma 4: ratio 2). Dispatched when
+    /// `num_heads > num_kv_heads` and GQA ≤ MAX_GQA_DECODE (=4).
+    #[cfg(feature = "cuda")]
+    pub fn_decode_nvfp4kv_gqa: Option<rvllm_kernels::KernelFn>,
+    #[cfg(feature = "cuda")]
+    pub fn_decode_nvfp4kv_gqa_bc16: Option<rvllm_kernels::KernelFn>,
     /// `flash_attention_2_prefill_nvfp4kv_kernel` — NVFP4 KV prefill,
     /// BC=32 variant.
     #[cfg(feature = "cuda")]
@@ -371,6 +385,29 @@ pub struct Fa2PtxKernels {
     /// path when `kv_dtype == Nvfp4`).
     #[cfg(feature = "cuda")]
     pub fn_rope_nvfp4kv: Option<rvllm_kernels::KernelFn>,
+
+    // ---- Split-KV decode path (paged_attention_v2-style) ----
+    //
+    // Partitions the KV sequence into `PARTITION_SIZE`-token tiles,
+    // launches one CTA per (seq, head, partition) in phase 1, then a
+    // reduce kernel combines partial outputs in phase 2. Unblocks
+    // SM-occupancy at long-context / bs=1 decode — at 15k ctx the
+    // per-head kernel only launches 32 CTAs on GB10's 108 SMs (see
+    // harness `fa2_nvfp4_split_decode_check.py` for protocol).
+    /// Owner PTX module — `flash_attention_split_decode_nvfp4kv.ptx`.
+    #[cfg(feature = "cuda")]
+    pub split_decode_nvfp4kv_mod: Option<rvllm_kernels::LoadedModule>,
+    /// `flash_attention_2_decode_nvfp4kv_split_kernel` (BC=32).
+    #[cfg(feature = "cuda")]
+    pub fn_decode_nvfp4kv_split: Option<rvllm_kernels::KernelFn>,
+    /// `flash_attention_2_decode_nvfp4kv_split_bc16_kernel`.
+    #[cfg(feature = "cuda")]
+    pub fn_decode_nvfp4kv_split_bc16: Option<rvllm_kernels::KernelFn>,
+    /// `paged_attention_reduce_f16_kernel` — combines partial outputs.
+    /// Head-dtype-agnostic (f16 in / out). Shared by FP8 split path
+    /// when that's added.
+    #[cfg(feature = "cuda")]
+    pub fn_paged_attn_reduce_f16: Option<rvllm_kernels::KernelFn>,
 }
 
 impl Fa2PtxKernels {
@@ -406,6 +443,9 @@ impl Fa2PtxKernels {
                 flash_attention_mod.get_function("flash_attention_2_f16kv_kernel")?;
             let fn_decode_fp8kv =
                 flash_attention_mod.get_function("flash_attention_2_decode_fp8kv_kernel")?;
+            let fn_decode_fp8kv_gqa = flash_attention_mod
+                .get_function("flash_attention_2_decode_fp8kv_gqa_kernel")
+                .ok();
 
             // Optional: the unified prefill PTX module is added in
             // Phase A of `UNIFIED_PREFILL_SPEC.md` and its body lands
@@ -434,15 +474,19 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_bc16,
                 fn_prefill_nvfp4kv,
                 fn_prefill_nvfp4kv_bc16,
+                fn_decode_nvfp4kv_gqa,
+                fn_decode_nvfp4kv_gqa_bc16,
             ) = match loader.load_ptx("flash_attention_nvfp4kv") {
                 Ok(m) => {
                     let d    = m.get_function("flash_attention_2_decode_nvfp4kv_kernel").ok();
                     let d16  = m.get_function("flash_attention_2_decode_nvfp4kv_bc16_kernel").ok();
                     let p    = m.get_function("flash_attention_2_prefill_nvfp4kv_kernel").ok();
                     let p16  = m.get_function("flash_attention_2_prefill_nvfp4kv_bc16_kernel").ok();
-                    (Some(m), d, d16, p, p16)
+                    let dg   = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_kernel").ok();
+                    let dg16 = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_bc16_kernel").ok();
+                    (Some(m), d, d16, p, p16, dg, dg16)
                 }
-                Err(_) => (None, None, None, None, None),
+                Err(_) => (None, None, None, None, None, None, None),
             };
             let (fused_rope_nvfp4kv_mod, fn_rope_nvfp4kv) =
                 match loader.load_ptx("fused_rope_partial_nvfp4kv") {
@@ -469,6 +513,26 @@ impl Fa2PtxKernels {
                     Err(_) => (None, None),
                 };
 
+            // Split-KV decode module — optional. Missing on PTX trees
+            // predating the paged_attention_v2-style split kernel.
+            let (
+                split_decode_nvfp4kv_mod,
+                fn_decode_nvfp4kv_split,
+                fn_decode_nvfp4kv_split_bc16,
+                fn_paged_attn_reduce_f16,
+            ) = match loader.load_ptx("flash_attention_split_decode_nvfp4kv") {
+                Ok(m) => {
+                    let s32 = m.get_function(
+                        "flash_attention_2_decode_nvfp4kv_split_kernel").ok();
+                    let s16 = m.get_function(
+                        "flash_attention_2_decode_nvfp4kv_split_bc16_kernel").ok();
+                    let r   = m.get_function(
+                        "paged_attention_reduce_f16_kernel").ok();
+                    (Some(m), s32, s16, r)
+                }
+                Err(_) => (None, None, None, None),
+            };
+
             Ok(Self {
                 head_dim,
                 flash_attention_mod,
@@ -477,17 +541,24 @@ impl Fa2PtxKernels {
                 fn_prefill,
                 fn_prefill_f16kv,
                 fn_decode_fp8kv,
+                fn_decode_fp8kv_gqa,
                 fn_prefill_fp8kv_unified,
                 unified_prefill_mod,
                 flash_attention_nvfp4kv_mod,
                 fused_rope_nvfp4kv_mod,
                 fn_decode_nvfp4kv,
                 fn_decode_nvfp4kv_bc16,
+                fn_decode_nvfp4kv_gqa,
+                fn_decode_nvfp4kv_gqa_bc16,
                 fn_prefill_nvfp4kv,
                 fn_prefill_nvfp4kv_bc16,
                 fn_prefill_nvfp4kv_unified,
                 unified_prefill_nvfp4kv_mod,
                 fn_rope_nvfp4kv,
+                split_decode_nvfp4kv_mod,
+                fn_decode_nvfp4kv_split,
+                fn_decode_nvfp4kv_split_bc16,
+                fn_paged_attn_reduce_f16,
             })
         }
         #[cfg(not(feature = "cuda"))]

@@ -751,6 +751,7 @@ impl Gemma4Bringup {
                     sliding_window: arch.sliding_window_size as u32,
                     f16_kv: kv_dtype.is_f16(),
                     kv_dtype,
+                    current_max_context_len: None,
                 };
 
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
@@ -1222,6 +1223,7 @@ impl Gemma4Bringup {
                     sliding_window: arch.sliding_window_size as u32,
                     f16_kv: kv_dtype.is_f16(),
                     kv_dtype,
+                    current_max_context_len: None,
                 };
 
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
@@ -1877,6 +1879,12 @@ impl Gemma4Bringup {
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
                     f16_kv: kv_dtype.is_f16(),
                     kv_dtype,
+                    // Decode step knows its own ctx CPU-side — `ctx = [step + 1]`
+                    // was computed at line ~1843. Pass it so the split-KV
+                    // dispatch gates on the current ctx length instead of
+                    // the bucket max (avoids dispatching split on short
+                    // early-generation turns where one-CTA decode wins).
+                    current_max_context_len: Some((step as u32) + 1),
                 };
                 let w = crate::gemma4_layer_exec::Gemma4LayerWeightPtrs {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
@@ -2186,6 +2194,7 @@ impl Gemma4Bringup {
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
                     f16_kv: false, // prefill uses FP8 KV (no F16 prefill kernel)
                     kv_dtype: prefill_kv_dtype,
+                    current_max_context_len: None,  // prefill path — not used by split-KV decode
                 };
                 let w = crate::gemma4_layer_exec::Gemma4LayerWeightPtrs {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
