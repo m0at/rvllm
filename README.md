@@ -122,7 +122,7 @@ Requires 50K+ training examples for production tau. Current: 2K examples, loss 7
 
 ## MiniMax-M2.7-NVFP4 on TPU v6e-8 (experimental)
 
-Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukealonso/MiniMax-M2.7-NVFP4`) on a single v6e-8 slice. 16-agent swarm built the wiring in one day; a second 16-agent perf swarm analyzed the bottlenecks. **The execution pipeline works end-to-end** (model load, forward pass, batched MoE dispatch across 8 chips, compiled JIT graph) but **numerical output is currently incorrect** — PPL equals vocab_size, indicating a bug in the NVFP4 dequant or weight layout.
+Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukealonso/MiniMax-M2.7-NVFP4`) on a single v6e-8 slice. 16-agent swarm built the wiring in one day; a second 16-agent perf swarm analyzed the bottlenecks. The execution pipeline works end-to-end: model load, forward pass, batched MoE dispatch across 8 chips, compiled JIT graph, PPL, and coherent generation.
 
 ### Measured (v6e-8, spot, europe-west4-a, `M2_MOE=shardmap`)
 
@@ -132,25 +132,25 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 | B=1 | 726 ms/step, 1.4 tok/s |
 | **B=8** | **802 ms/step, 10.0 tok/s** |
 | B=16+ | OOM (KV cache replicated) |
-| PPL (wikitext-2 valid) | **200,064 ≈ vocab_size** (uniform output) |
-| Gen sample (256 tok) | `"Explain angular momentum."` + 256× null byte |
+| PPL probe (318 scored tokens) | **5.63** |
+| Gen sample (32 tok) | `"Explain angular momentum. The angular momentum of a particle about a point \\(O\\) is defined as \\(\\vec{L}=\\vec{r} \\times \\vec{p}\\) where \\(\\vec{r"` |
 
 ### What this demonstrates
 
-- ✅ v6e-8 provisioning (spot), 130 GB HF download in 1m45s (authed)
-- ✅ NVFP4 safetensors loader (modelopt 4-tensor format: packed + weight_scale + weight_scale_2 + input_scale)
-- ✅ Expert-parallel sharding: 256 experts across 8 chips (32/chip) via `shard_map` + `jax.lax.all_to_all` on `('expert',)` mesh axis
-- ✅ `lax.scan` over 62 layers so XLA streams one layer's weights at a time (fits in 32 GB HBM/chip)
-- ✅ Sigmoid+bias top-8 router with aux-loss-free scoring (`scoring_func: sigmoid`, `use_routing_bias: true`)
-- ✅ Partial RoPE (rotary_dim=64 of head_dim=128), QK-norm per layer, GQA softmax
-- ✅ Per-batch JAX compile cache persisted to HuggingFace (`and-y/rvllm-m2-build`) — next boot skips install + JIT
-- ❌ Numerics produce constant token-0 output (bug in dequant / layout, not in scheduling)
+- v6e-8 provisioning (spot), 130 GB HF download in 1m45s (authed)
+- NVFP4 safetensors loader (modelopt 4-tensor format: packed + weight_scale + weight_scale_2 + input_scale)
+- Correct bf16 checkpoint loading: safetensors bf16 payloads are bitcast from raw `uint16`, not numerically cast
+- Expert-parallel sharding: 256 experts across 8 chips (32/chip) via `shard_map` + `jax.lax.all_to_all` on `('expert',)` mesh axis
+- `lax.scan` over 62 layers so XLA streams one layer's weights at a time (fits in 32 GB HBM/chip)
+- Sigmoid+bias top-8 router with aux-loss-free scoring (`scoring_func: sigmoid`, `use_routing_bias: true`)
+- Partial RoPE (rotary_dim=64 of head_dim=128), QK-norm per layer, GQA softmax
+- Per-batch JAX compile cache persisted to HuggingFace (`and-y/rvllm-m2-build`) so next boot skips install + JIT
 
 ### Known issues blocking production
 
-1. **NVFP4 dequant correctness** (top priority). The 2-level scale format (FP8 E4M3 per-16-element block scale × FP32 per-tensor global scale) is implemented in `nvfp4_jax_ops.py` but hasn't been validated against an HF reference forward. Likely culprits: FP4 E2M1 LUT ordering, block-scale expand direction, or missing input_scale for activations.
-2. **MoE dispatch overhead dominates at B=1** — 726 ms/step is ~900× off HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. Pallas NVFP4 matmul kernel sketched in `nvfp4_matmul_pallas.py`, untested.
-3. **KV cache replication** blocks B≥16. Fix in `m2_full_bench.make_batched_empty_cache` (spec batch-axis-shard). int8 KV quant (Gemma4 reference) would also help.
+1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. Pallas NVFP4 matmul kernel sketched in `nvfp4_matmul_pallas.py`, untested.
+2. **KV cache replication blocks B≥16**. Fix in `m2_full_bench.make_batched_empty_cache` (spec batch-axis-shard). int8 KV quant (Gemma4 reference) would also help.
+3. **Full validation still needed**. The short corrected probe is coherent (`tpu/out/m2/m2_fix_probe.json`), but the next run should score a longer Wikitext slice and capture a 256+ token sample.
 
 ### Build list (ranked, from 16-agent perf advisor spec)
 

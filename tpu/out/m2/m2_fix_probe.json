@@ -1,0 +1,21 @@
+{
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "load_seconds": 78.36671757698059,
+  "sweep": null,
+  "ppl": {
+    "n_tokens_scored": 318,
+    "avg_nll": 1.728547144672841,
+    "ppl": 5.632464804580831
+  },
+  "generation": {
+    "prompt_len": 4,
+    "gen_tokens": 32,
+    "ms_per_tok": 705.9817519061653,
+    "tok_per_s": 1.4164672065531148,
+    "text": "Explain angular momentum. The angular momentum of a particle about a point \\(O\\) is defined as \\(\\vec{L}=\\vec{r} \\times \\vec{p}\\) where \\(\\vec{r",
+    "prompt": "Explain angular momentum."
+  }
+}

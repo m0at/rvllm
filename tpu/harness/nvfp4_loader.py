@@ -418,16 +418,21 @@ class ModeloptSafetensorsReader:
         )
 
     def read_bf16(self, name):
-        """Return tensor as uint16 (bf16 bits) ndarray. Up-casts f16/f32 to bf16."""
+        """Return tensor as numeric bf16 ndarray. Up-casts f16/f32 to bf16."""
         raw = self._read_raw(name)
         info = self._tensor_info(name)
         dtype_str = info['dtype'].upper()
         if dtype_str in ('BF16', 'BFLOAT16'):
-            return np.ascontiguousarray(raw).view(np.uint16)
+            arr = np.ascontiguousarray(raw)
+            if HAVE_ML_DTYPES and arr.dtype == np.uint16:
+                return arr.view(ml_dtypes.bfloat16)
+            return arr.astype(ml_dtypes.bfloat16) if HAVE_ML_DTYPES else arr
         if dtype_str in ('F16', 'FLOAT16'):
-            return _f32_to_bf16_bits(np.asarray(raw, dtype=np.float32))
+            bits = _f32_to_bf16_bits(np.asarray(raw, dtype=np.float32))
+            return bits.view(ml_dtypes.bfloat16) if HAVE_ML_DTYPES else bits
         if dtype_str in ('F32', 'FLOAT32'):
-            return _f32_to_bf16_bits(np.asarray(raw, dtype=np.float32))
+            bits = _f32_to_bf16_bits(np.asarray(raw, dtype=np.float32))
+            return bits.view(ml_dtypes.bfloat16) if HAVE_ML_DTYPES else bits
         raise ValueError(
             "read_bf16 called on non-float tensor %s (dtype=%s)" % (name, dtype_str))
 
