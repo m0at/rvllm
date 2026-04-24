@@ -164,11 +164,15 @@ def random_weights(B, max_ctx, mesh, nl):
     def _make(shape, sharding, fill_fn):
         """fill_fn(local_shape) -> np.ndarray of that shape."""
         def cb(idx):
-            local_shape = tuple(
-                (s.stop - s.start) if isinstance(s, slice) else 1
-                for s in idx
-            )
-            return fill_fn(local_shape)
+            local_shape = []
+            for i, s in enumerate(idx):
+                if isinstance(s, slice):
+                    start = s.start if s.start is not None else 0
+                    stop = s.stop if s.stop is not None else shape[i]
+                    local_shape.append(stop - start)
+                else:
+                    local_shape.append(1)
+            return fill_fn(tuple(local_shape))
         return jax.make_array_from_callback(shape, sharding, cb)
 
     def rand_bf16_stack(shape, spec):
