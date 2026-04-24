@@ -156,7 +156,8 @@ def load_model_stacked(model_dir, mesh, max_ctx, B, n_workers=16):
                     f'{p}.block_sparse_moe.experts.{e}.{w}.weight')
 
     all_names = bb_names + layer_bf16_names + expert_nvfp4_names
-    print(f">> reading {len(all_names)} tensors across {len(reader.shards)} shards "
+    n_shards = len(reader._shards) if hasattr(reader, '_shards') else 1
+    print(f">> reading {len(all_names)} tensors across {n_shards} shards "
           f"with {n_workers} workers", file=sys.stderr)
 
     t0 = time.time()
