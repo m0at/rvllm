@@ -2045,72 +2045,109 @@ impl Gemma4Bringup {
         // layer 0 / layer 1 for direct comparison against a normal
         // decode-only run.
         if (diag_compare && prompt_len > 1) || skip_decode || (use_batch_prefill && prompt_len > 1) {
-            // Prefix-cache aware batch prefill. When `use_prefix_cache`
-            // reports a common prefix of length L, the unified kernel
-            // supports "partial query with cached KV history" natively
-            // via `context_lens = N, cu_seqlens_q = [0, N-L],
-            // positions = [L..N)`. This mirrors vLLM's prefix-caching
-            // dispatch — the cached slots [0..L) contribute to
-            // attention but aren't re-prefilled.
+            // Prefix-cache aware batch prefill, OPTIONALLY chunked.
             //
-            // Diag mode forces L=0 so the row-0/row-(N-1) rel_err
-            // comparison stays meaningful (decode ref path walks
-            // every token from slot 0).
+            // When `use_prefix_cache` reports a common prefix of length
+            // L, we skip prefill for slots [0..L). The remaining
+            // `prompt_len - L` new tokens get processed in chunks of
+            // `RVLLM_PREFILL_CHUNK_SIZE` (0 = single chunk / all new
+            // tokens at once, matching the pre-chunked path).
+            //
+            // Each chunk is a "partial query with full-prefix KV
+            // history" — the unified kernel handles this natively via
+            // `context_lens = chunk_end, cu_seqlens_q = [0, chunk_q],
+            // positions = [chunk_start..chunk_end)`. After the chunk
+            // runs, its KV is in the persistent cache for the next
+            // chunk's attention reads.
+            //
+            // Diag mode forces L=0 + single chunk so the row-0 /
+            // row-(N-1) rel_err comparison stays meaningful.
             let prefix_skip = if diag_compare { 0 } else { common_prefix_len };
-            let new_q = prompt_len - prefix_skip;
-            let tok_ids: Vec<i32> = prompt_ids[prefix_skip as usize..]
-                .iter().map(|&t| t as i32).collect();
-            token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
-            self.stream.fence()?;
-            let mut readback = vec![0i32; new_q as usize];
-            cudarc::driver::sys::cuMemcpyDtoH_v2(
-                readback.as_mut_ptr() as *mut _,
-                token_ids_region.device_ptr(),
-                (new_q * 4) as _,
-            );
-            eprintln!(
-                "[DIAG] batch-prefill prefix_skip={} new_q={} readback[..min(8)]={:?}",
-                prefix_skip, new_q, &readback[..readback.len().min(8)]
-            );
-            rvllm_fused::EmbeddingGatherLaunch { num_tokens: new_q, hidden, vocab }
-                .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
-                    token_ids_region.device_ptr(), stream)?;
-            self.stream.fence()?;
-            let mut r0 = vec![0u16; 4];
-            let mut r_n_minus_1 = vec![0u16; 4];
-            cudarc::driver::sys::cuMemcpyDtoH_v2(r0.as_mut_ptr() as *mut _, residual_ptr, 8);
-            cudarc::driver::sys::cuMemcpyDtoH_v2(
-                r_n_minus_1.as_mut_ptr() as *mut _,
-                residual_ptr + ((new_q - 1) as u64 * hidden as u64 * 2),
-                8,
-            );
-            eprintln!(
-                "[DIAG] post-gather row0[..4]={:?} rowN-1[..4]={:?}",
-                r0.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
-                r_n_minus_1.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
-            );
-
-            // positions span the NEW suffix only; slot_mapping writes
-            // new K,V at slots [prefix_skip..prompt_len), leaving the
-            // cached slots [0..prefix_skip) untouched. The context
-            // length still reflects the full prompt so attention
-            // reads all slots.
-            let pos: Vec<i32> = (prefix_skip as i32..prompt_len as i32).collect();
-            let slot: Vec<i32> = (prefix_skip as i32..prompt_len as i32).collect();
-            let ctx = [prompt_len as i32];
-            let cu_seq = [0i32, new_q as i32];
-            positions.copy_from_host(bytemuck_cast_i32(&pos))?;
-            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot))?;
-            context_lens.copy_from_host(bytemuck_cast_i32(&ctx))?;
-            cu_seqlens_q.copy_from_host(bytemuck_cast_i32(&cu_seq))?;
-
-            let phase = crate::gemma4_layer_exec::Gemma4Phase::Prefill {
-                cu_seqlens_q: cu_seqlens_q.device_ptr(),
-                max_seqlen_q: new_q,
-                num_seqs: 1,
+            let total_new_q = prompt_len - prefix_skip;
+            let chunk_env: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let chunk_size_max: u32 = if diag_compare || chunk_env == 0 {
+                total_new_q
+            } else {
+                chunk_env
             };
 
-            for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            if chunk_size_max < total_new_q {
+                eprintln!(
+                    "[prefill-chunk] total_new_q={} chunk_size_max={} num_chunks={}",
+                    total_new_q, chunk_size_max,
+                    (total_new_q + chunk_size_max - 1) / chunk_size_max
+                );
+            }
+
+            // Outer chunk loop. `new_q` at end-of-block holds the LAST
+            // chunk's Q length so the downstream last-token-residual
+            // extract picks the right row.
+            let mut chunk_start_abs: u32 = prefix_skip;
+            let mut new_q: u32 = 0;
+            let mut chunk_idx: u32 = 0;
+            while chunk_start_abs < prompt_len {
+                let chunk_end_abs = std::cmp::min(
+                    chunk_start_abs + chunk_size_max,
+                    prompt_len,
+                );
+                let chunk_q = chunk_end_abs - chunk_start_abs;
+                new_q = chunk_q;
+                let tok_ids: Vec<i32> = prompt_ids[
+                    chunk_start_abs as usize .. chunk_end_abs as usize
+                ].iter().map(|&t| t as i32).collect();
+                token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
+                if chunk_idx == 0 {
+                    self.stream.fence()?;
+                    let mut readback = vec![0i32; chunk_q as usize];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        readback.as_mut_ptr() as *mut _,
+                        token_ids_region.device_ptr(),
+                        (chunk_q * 4) as _,
+                    );
+                    eprintln!(
+                        "[DIAG] batch-prefill prefix_skip={} chunk0_q={} readback[..min(8)]={:?}",
+                        prefix_skip, chunk_q, &readback[..readback.len().min(8)]
+                    );
+                }
+                rvllm_fused::EmbeddingGatherLaunch { num_tokens: chunk_q, hidden, vocab }
+                    .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
+                        token_ids_region.device_ptr(), stream)?;
+                if chunk_idx == 0 {
+                    self.stream.fence()?;
+                    let mut r0 = vec![0u16; 4];
+                    let mut r_n_minus_1 = vec![0u16; 4];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(r0.as_mut_ptr() as *mut _, residual_ptr, 8);
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        r_n_minus_1.as_mut_ptr() as *mut _,
+                        residual_ptr + ((chunk_q - 1) as u64 * hidden as u64 * 2),
+                        8,
+                    );
+                    eprintln!(
+                        "[DIAG] post-gather row0[..4]={:?} rowN-1[..4]={:?}",
+                        r0.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
+                        r_n_minus_1.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
+                    );
+                }
+
+                // positions / slot_mapping for THIS chunk; cu_seq + ctx
+                // frame the partial query within the full sequence.
+                let pos: Vec<i32> = (chunk_start_abs as i32 .. chunk_end_abs as i32).collect();
+                let slot: Vec<i32> = (chunk_start_abs as i32 .. chunk_end_abs as i32).collect();
+                let ctx = [chunk_end_abs as i32];
+                let cu_seq = [0i32, chunk_q as i32];
+                positions.copy_from_host(bytemuck_cast_i32(&pos))?;
+                slot_mapping.copy_from_host(bytemuck_cast_i32(&slot))?;
+                context_lens.copy_from_host(bytemuck_cast_i32(&ctx))?;
+                cu_seqlens_q.copy_from_host(bytemuck_cast_i32(&cu_seq))?;
+
+                let phase = crate::gemma4_layer_exec::Gemma4Phase::Prefill {
+                    cu_seqlens_q: cu_seqlens_q.device_ptr(),
+                    max_seqlen_q: chunk_q,
+                    num_seqs: 1,
+                };
+
+                for (layer_idx, layer) in self.model.layers.iter().enumerate() {
                 if layer_idx >= max_layers { break; }
                 let lt = arch.layer_types[layer_idx];
                 let hd = arch.head_dim_for_layer(layer_idx) as u32;
@@ -2226,13 +2263,17 @@ impl Gemma4Bringup {
                     residual_ptr, stream, phase,
                 )?;
             }
+                chunk_start_abs = chunk_end_abs;
+                chunk_idx += 1;
+            } // end chunk loop
 
             // Diag capture BEFORE the extract-last memcpy: row 0 is
             // the first-token output (no prior context); row
-            // prompt_len-1 is the last-token output the LM head
-            // consumes. Without this ordering, the memcpy below
-            // would clobber row 0 with row N-1 and the row-0
-            // comparison would falsely report a bug.
+            // new_q-1 is the last-token output the LM head consumes.
+            // With chunking, row 0 = first row of the LAST chunk (a
+            // mid-prompt position), so the row-0 diag semantics only
+            // match the decode reference when diag_compare forces a
+            // single chunk.
             self.stream.fence()?;
             let mut prefill_first = vec![0u16; hidden as usize];
             cudarc::driver::sys::cuMemcpyDtoH_v2(
