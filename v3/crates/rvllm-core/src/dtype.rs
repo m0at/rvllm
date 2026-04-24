@@ -2,7 +2,9 @@
 //!
 //! No implicit conversions; every cast is an explicit kernel.
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum DType {
     F16,
     Bf16,

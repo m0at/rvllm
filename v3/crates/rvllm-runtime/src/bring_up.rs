@@ -60,6 +60,7 @@ pub struct HbmArenaCheckpoint {
 /// reused for three handles.
 pub struct FusedModules {
     pub rmsnorm_mod: LoadedModule,
+    pub rmsnorm_inplace_mod: LoadedModule,
     pub rope_mod: LoadedModule,
     pub silu_mod: LoadedModule,
     pub gelu_mod: Option<LoadedModule>,
@@ -71,6 +72,7 @@ pub struct FusedModules {
     pub fn_rope_cache_fp8kv: KernelFn,
     pub fn_silu_mul: KernelFn,
     pub fn_gelu_mul: Option<KernelFn>,
+    pub fn_rmsnorm_inplace: KernelFn,
     pub fn_argmax: KernelFn,
     pub fn_add_bias_f16: KernelFn,
 }
@@ -246,24 +248,9 @@ impl Bringup {
         let arena = &self.arena;
         let hidden_fp8 = arena.region("hidden_fp8", (max_tokens * hidden) as usize, 16)?;
         let hidden_scale = arena.region("hidden_scale", (max_tokens * 4) as usize, 16)?;
-        // Packed QKV output. cuBLASLt writes in col-major [N, M] which
-        // is physical layout "all Q heads over all M tokens, then all K
-        // heads, then all V heads". So k_base = q_base + (num_tokens *
-        // q_dim * 2 bytes) and v_base = k_base + (num_tokens * kv_dim *
-        // 2 bytes). num_tokens here is max_tokens (the allocation
-        // ceiling); the effective per-call offset depends on the phase
-        // and is computed by the caller.
-        let qkv_out_bytes = (max_tokens * qkv_rows * 2) as usize;
-        let qkv_out = arena.region("qkv_out", qkv_out_bytes, 16)?;
-        let q_base = qkv_out.device_ptr();
-        // For decode and prefill alike, the offsets depend on the
-        // GEMM's M dim (num_tokens). At decode num_tokens = num_seqs;
-        // at prefill num_tokens = num_seqs * prefill_len. We precompute
-        // both sets of offsets so the same scratch region serves both.
-        let k_base_decode = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
-        let v_base_decode = k_base_decode + (num_seqs as u64) * (kv_dim as u64) * 2;
-        let k_base_prefill = q_base + (max_tokens as u64) * (q_dim as u64) * 2;
-        let v_base_prefill = k_base_prefill + (max_tokens as u64) * (kv_dim as u64) * 2;
+        let q_out = arena.region("q_out", (max_tokens * q_dim * 2) as usize, 16)?;
+        let k_out = arena.region("k_out", (max_tokens * kv_dim * 2) as usize, 16)?;
+        let v_out = arena.region("v_out", (max_tokens * kv_dim * 2) as usize, 16)?;
         let attn_out = arena.region("attn_out", (max_tokens * q_dim * 2) as usize, 16)?;
         let attn_out_fp8 = arena.region("attn_out_fp8", (max_tokens * q_dim) as usize, 16)?;
         let attn_out_scale = arena.region("attn_out_scale", (max_tokens * 4) as usize, 16)?;
@@ -428,8 +415,8 @@ impl Bringup {
             rvllm_core::DType::Fp8E4M3,
         )?);
 
-        // LM head scratch: batch x vocab f16 logits + batch sampled tokens.
-        let logits = arena.region("logits", (num_seqs * vocab * 2) as usize, 16)?;
+        // LM head scratch: batch x vocab f32 logits + batch sampled tokens.
+        let logits = arena.region("logits", (num_seqs * vocab * 4) as usize, 16)?;
         let sampled_tokens = arena.region("sampled_tokens", (num_seqs * 4) as usize, 16)?;
 
         let dims = layer_exec::LayerDims {
@@ -466,11 +453,11 @@ impl Bringup {
         let residual_ptr = residual.device_ptr();
 
         let one_step = |phase: layer_exec::LayerPhase| -> Result<()> {
-            let (layer_num_tokens, k_base_phase, v_base_phase) = match phase {
-                layer_exec::LayerPhase::Decode => (num_seqs, k_base_decode, v_base_decode),
+            let layer_num_tokens = match phase {
+                layer_exec::LayerPhase::Decode => num_seqs,
                 layer_exec::LayerPhase::Prefill { max_seqlen_q, .. } => {
                     // total_q = num_seqs * max_seqlen_q (uniform prompt length)
-                    (num_seqs * max_seqlen_q, k_base_prefill, v_base_prefill)
+                    num_seqs * max_seqlen_q
                 }
             };
             let mut phase_dims = dims;
@@ -494,9 +481,9 @@ impl Bringup {
                 let scratch = layer_exec::LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(),
                     hidden_scale: hidden_scale.device_ptr(),
-                    q_out: q_base,
-                    k_out: k_base_phase,
-                    v_out: v_base_phase,
+                    q_out: q_out.device_ptr(),
+                    k_out: k_out.device_ptr(),
+                    v_out: v_out.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + (kv_per_layer / 2) as u64,
@@ -568,35 +555,25 @@ impl Bringup {
             // separate post-prefill step the caller handles.
             let is_prefill = matches!(phase, layer_exec::LayerPhase::Prefill { .. });
             if !skip_lm_head && !is_prefill {
-                // LM head tail: fused_rmsnorm_fp8_quant applies the
-                // model.norm weight AND produces FP8 hidden in one kernel.
-                // Same kernel count as the previous quantize-only step,
-                // but includes the final RMSnorm that Qwen2.5 requires —
-                // fixes a correctness bug where we previously fed raw
-                // residual to lm_head.
-                rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                     num_tokens: num_seqs,
                     hidden,
                     eps: arch.rms_norm_eps,
                 }
                 .launch(
-                    self.fused_modules.fn_rmsnorm,
-                    hidden_fp8.device_ptr(),
-                    hidden_scale.device_ptr(),
+                    self.fused_modules.fn_rmsnorm_inplace,
                     residual_ptr,
                     self.model.final_norm.offset_bytes,
                     stream,
                 )?;
                 #[cfg(feature = "cuda")]
-                self.cublaslt.fp8_gemm(
-                    hidden_fp8.device_ptr(),
-                    self.model.lm_head_fp8.offset_bytes,
+                self.cublaslt.f16_gemm_f32(
+                    residual_ptr,
+                    self.model.lm_head_f16.offset_bytes,
                     logits.device_ptr(),
                     num_seqs as i32,
                     vocab as i32,
                     hidden as i32,
-                    hidden_scale.device_ptr(),
-                    self.model.lm_head_fp8.scale_ptr,
                     stream,
                 )?;
                 rvllm_fused::ArgmaxLaunch {
@@ -797,8 +774,8 @@ impl Bringup {
         // Debug: dump logits values.
         if std::env::var("RVLLM_DUMP_LOGITS").ok().as_deref() == Some("1") {
             let logits_elems = (num_seqs * vocab) as usize;
-            let logits_bytes = logits_elems * 2;
-            let mut logits_host: Vec<u16> = vec![0u16; logits_elems];
+            let logits_bytes = logits_elems * 4;
+            let mut logits_host: Vec<f32> = vec![0.0; logits_elems];
             dtoh_async_sync(
                 logits.device_ptr(),
                 logits_host.as_mut_ptr() as *mut i32,
@@ -806,11 +783,8 @@ impl Bringup {
                 stream,
             )?;
             self.stream.fence()?;
-            let first5: Vec<f32> = logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
-            let nan_count = logits_host
-                .iter()
-                .filter(|&&b| f16_to_f32(b).is_nan())
-                .count();
+            let first5: Vec<f32> = logits_host[..5].to_vec();
+            let nan_count = logits_host.iter().filter(|&&v| v.is_nan()).count();
             eprintln!(
                 "[LOGITS] nan={}/{} first5={:?}",
                 nan_count, logits_elems, &first5
@@ -903,11 +877,9 @@ impl Bringup {
         let arena = &self.arena;
         let hidden_fp8 = arena.region("hidden_fp8", (max_tokens * hidden) as usize, 16)?;
         let hidden_scale = arena.region("hidden_scale", (max_tokens * 4) as usize, 16)?;
-        let qkv_out_bytes = (max_tokens * qkv_rows * 2) as usize;
-        let qkv_out = arena.region("qkv_out", qkv_out_bytes, 16)?;
-        let q_base = qkv_out.device_ptr();
-        let k_base_decode = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
-        let v_base_decode = k_base_decode + (num_seqs as u64) * (kv_dim as u64) * 2;
+        let q_out = arena.region("q_out", (max_tokens * q_dim * 2) as usize, 16)?;
+        let k_out = arena.region("k_out", (max_tokens * kv_dim * 2) as usize, 16)?;
+        let v_out = arena.region("v_out", (max_tokens * kv_dim * 2) as usize, 16)?;
         let attn_out = arena.region("attn_out", (max_tokens * q_dim * 2) as usize, 16)?;
         let attn_out_fp8 = arena.region("attn_out_fp8", (max_tokens * q_dim) as usize, 16)?;
         let attn_out_scale = arena.region("attn_out_scale", (max_tokens * 4) as usize, 16)?;
@@ -997,7 +969,7 @@ impl Bringup {
         )?;
         let vocab = arch.vocab_size as u32;
 
-        let logits = arena.region("logits", (num_seqs * vocab * 2) as usize, 16)?;
+        let logits = arena.region("logits", (num_seqs * vocab * 4) as usize, 16)?;
         // token_ids upload region
         let token_ids_region = arena.region("token_ids_ppl", (num_seqs * 4) as usize, 16)?;
 
@@ -1055,9 +1027,9 @@ impl Bringup {
                 let scratch = layer_exec::LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(),
                     hidden_scale: hidden_scale.device_ptr(),
-                    q_out: q_base,
-                    k_out: k_base_decode,
-                    v_out: v_base_decode,
+                    q_out: q_out.device_ptr(),
+                    k_out: k_out.device_ptr(),
+                    v_out: v_out.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + (kv_per_layer / 2) as u64,
@@ -1156,29 +1128,25 @@ impl Bringup {
             }
             step_counter.set(step_counter.get() + 1);
             // LM head (no argmax).
-            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: num_seqs,
                 hidden,
-                eps: 1e-6,
+                eps: arch.rms_norm_eps,
             }
             .launch(
-                self.fused_modules.fn_rmsnorm,
-                hidden_fp8.device_ptr(),
-                hidden_scale.device_ptr(),
+                self.fused_modules.fn_rmsnorm_inplace,
                 residual_ptr,
                 self.model.final_norm.offset_bytes,
                 stream,
             )?;
             #[cfg(feature = "cuda")]
-            self.cublaslt.fp8_gemm(
-                hidden_fp8.device_ptr(),
-                self.model.lm_head_fp8.offset_bytes,
+            self.cublaslt.f16_gemm_f32(
+                residual_ptr,
+                self.model.lm_head_f16.offset_bytes,
                 logits.device_ptr(),
                 num_seqs as i32,
                 vocab as i32,
                 hidden as i32,
-                hidden_scale.device_ptr(),
-                self.model.lm_head_fp8.scale_ptr,
                 stream,
             )?;
             Ok(())
@@ -1199,8 +1167,8 @@ impl Bringup {
 
         // Process token IDs starting at position 0.
         let logits_row_elems = vocab as usize;
-        let logits_row_bytes = logits_row_elems * 2;
-        let mut logits_host: Vec<u16> = vec![0u16; logits_row_elems];
+        let logits_row_bytes = logits_row_elems * 4;
+        let mut logits_host: Vec<f32> = vec![0.0; logits_row_elems];
 
         let mut total_nll: f64 = 0.0;
         let mut n_evaluated: usize = 0;
@@ -1273,19 +1241,18 @@ impl Bringup {
 
                 let target = token_ids[t + 1] as usize;
                 if t == 0 {
-                    let first5: Vec<f32> =
-                        logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
+                    let first5: Vec<f32> = logits_host[..5].to_vec();
                     let max_val = logits_host
                         .iter()
-                        .map(|&b| f16_to_f32(b))
+                        .copied()
                         .filter(|v| !v.is_nan())
                         .fold(f32::MIN, f32::max);
                     let min_val = logits_host
                         .iter()
-                        .map(|&b| f16_to_f32(b))
+                        .copied()
                         .filter(|v| !v.is_nan())
                         .fold(f32::MAX, f32::min);
-                    let target_logit = f16_to_f32(logits_host[token_ids[t + 1] as usize]);
+                    let target_logit = logits_host[token_ids[t + 1] as usize];
                     eprintln!(
                         "  [DBG] logits: first5={:?} min={:.1} max={:.1} target[{}]={:.1}",
                         first5,
@@ -1294,10 +1261,7 @@ impl Bringup {
                         token_ids[t + 1],
                         target_logit
                     );
-                    let nan_count = logits_host
-                        .iter()
-                        .filter(|&&b| f16_to_f32(b).is_nan())
-                        .count();
+                    let nan_count = logits_host.iter().filter(|&&v| v.is_nan()).count();
                     if nan_count > 0 {
                         eprintln!(
                             "  WARNING: {}/{} logits are NaN (first5={:?}). FP8 precision issue.",
@@ -1305,7 +1269,7 @@ impl Bringup {
                         );
                     }
                 }
-                let nll = compute_nll_f16(&logits_host, target);
+                let nll = compute_nll_f32(&logits_host, target);
                 total_nll += nll;
                 n_evaluated += 1;
 
@@ -1451,6 +1415,7 @@ pub fn f16_to_f32(bits: u16) -> f32 {
 
 fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let rmsnorm_mod = loader.load_ptx("fused_rmsnorm_fp8_quant")?;
+    let rmsnorm_inplace_mod = loader.load_ptx("rmsnorm_inplace_f16")?;
     let rope_mod = loader.load_ptx("fused_rope_cache_fp8kv")?;
     let silu_mod = loader.load_ptx("fused_silu_fp8_quant")?;
     let argmax_mod = loader.load_ptx("argmax")?;
@@ -1470,6 +1435,7 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let fn_rmsnorm = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_add_rmsnorm = rmsnorm_mod.get_function("fused_add_rmsnorm_fp8_quant_kernel")?;
     let fn_quantize = rmsnorm_mod.get_function("quantize_fp8_per_token_kernel")?;
+    let fn_rmsnorm_inplace = rmsnorm_inplace_mod.get_function("rmsnorm_inplace_f16_kernel")?;
     let fn_rope_cache_fp8kv = rope_mod.get_function("fused_rope_cache_fp8kv_kernel")?;
     let fn_silu_mul = silu_mod.get_function("fused_silu_mul_fp8_quant_kernel")?;
     let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
@@ -1477,6 +1443,7 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
 
     Ok(FusedModules {
         rmsnorm_mod,
+        rmsnorm_inplace_mod,
         rope_mod,
         silu_mod,
         gelu_mod,
@@ -1488,6 +1455,7 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
         fn_rope_cache_fp8kv,
         fn_silu_mul,
         fn_gelu_mul,
+        fn_rmsnorm_inplace,
         fn_argmax,
         fn_add_bias_f16,
     })

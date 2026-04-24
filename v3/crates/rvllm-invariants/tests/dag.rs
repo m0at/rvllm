@@ -14,19 +14,43 @@ fn allowed_deps() -> HashMap<&'static str, HashSet<&'static str>> {
     m.insert("rvllm-core", s(&[]));
     m.insert("rvllm-mem", s(&["rvllm-core"]));
     m.insert("rvllm-kernels", s(&["rvllm-core", "rvllm-mem"]));
-    m.insert("rvllm-cutlass", s(&["rvllm-core", "rvllm-mem", "rvllm-kernels"]));
-    m.insert("rvllm-attention", s(&["rvllm-core", "rvllm-mem", "rvllm-kernels"]));
-    m.insert("rvllm-fused", s(&["rvllm-core", "rvllm-mem", "rvllm-kernels"]));
+    m.insert(
+        "rvllm-cutlass",
+        s(&["rvllm-core", "rvllm-mem", "rvllm-kernels"]),
+    );
+    m.insert(
+        "rvllm-attention",
+        s(&["rvllm-core", "rvllm-mem", "rvllm-kernels"]),
+    );
+    m.insert(
+        "rvllm-fused",
+        s(&["rvllm-core", "rvllm-mem", "rvllm-kernels"]),
+    );
     m.insert("rvllm-metadata", s(&["rvllm-core", "rvllm-mem"]));
-    m.insert("rvllm-graph", s(&["rvllm-core", "rvllm-mem", "rvllm-metadata"]));
+    m.insert(
+        "rvllm-graph",
+        s(&["rvllm-core", "rvllm-mem", "rvllm-metadata"]),
+    );
     m.insert("rvllm-loader", s(&["rvllm-core", "rvllm-mem"]));
-    m.insert("rvllm-sampling", s(&["rvllm-core", "rvllm-mem", "rvllm-fused"]));
-    m.insert("rvllm-runtime", s(&[
-        "rvllm-core", "rvllm-mem",
-        "rvllm-kernels",
-        "rvllm-cutlass", "rvllm-attention", "rvllm-fused",
-        "rvllm-metadata", "rvllm-graph", "rvllm-loader", "rvllm-sampling",
-    ]));
+    m.insert(
+        "rvllm-sampling",
+        s(&["rvllm-core", "rvllm-mem", "rvllm-fused"]),
+    );
+    m.insert(
+        "rvllm-runtime",
+        s(&[
+            "rvllm-core",
+            "rvllm-mem",
+            "rvllm-kernels",
+            "rvllm-cutlass",
+            "rvllm-attention",
+            "rvllm-fused",
+            "rvllm-metadata",
+            "rvllm-graph",
+            "rvllm-loader",
+            "rvllm-sampling",
+        ]),
+    );
     m.insert("rvllm-serve", s(&["rvllm-core", "rvllm-runtime"]));
     m.insert("rvllm-bench", s(&["rvllm-core", "rvllm-runtime"]));
     m.insert("rvllm-deploy", s(&["rvllm-core"]));
@@ -50,10 +74,7 @@ fn parse_rvllm_deps(cargo_toml: &str) -> HashSet<String> {
     let mut in_deps = false;
     for line in cargo_toml.lines() {
         let t = line.trim();
-        if let Some(rest) = t
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-        {
+        if let Some(rest) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             // Tables: [dependencies] / [dev-dependencies] / [build-dependencies]
             // Subtables: [dependencies.NAME] / [dev-dependencies.NAME] / [build-dependencies.NAME]
             let (section, subkey) = match rest.split_once('.') {

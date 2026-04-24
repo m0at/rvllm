@@ -159,27 +159,62 @@ pub enum AttentionError {
 
 #[derive(Debug)]
 pub enum LoaderError {
-    MissingTensor { name: String },
-    ShapeMismatch { tensor: String, expected: Vec<usize>, got: Vec<usize> },
-    DtypeMismatch { tensor: String, expected: DType, got: DType },
-    Fp8MisScaled { tensor: String, clamp_ppm: f32 },
-    Corrupt { detail: String },
+    MissingTensor {
+        name: String,
+    },
+    ShapeMismatch {
+        tensor: String,
+        expected: Vec<usize>,
+        got: Vec<usize>,
+    },
+    DtypeMismatch {
+        tensor: String,
+        expected: DType,
+        got: DType,
+    },
+    Fp8MisScaled {
+        tensor: String,
+        clamp_ppm: f32,
+    },
+    Corrupt {
+        detail: String,
+    },
 }
 
 #[derive(Debug)]
 pub enum ConfigError {
-    MissingHfField { name: &'static str, file: PathBuf },
-    HfTypeMismatch { name: &'static str, expected: &'static str },
-    MissingField { name: &'static str },
-    InvalidField { name: &'static str, reason: String },
-    UnknownEnvVar { name: String },
-    Inconsistent { reasons: Vec<String> },
+    MissingHfField {
+        name: &'static str,
+        file: PathBuf,
+    },
+    HfTypeMismatch {
+        name: &'static str,
+        expected: &'static str,
+    },
+    MissingField {
+        name: &'static str,
+    },
+    InvalidField {
+        name: &'static str,
+        reason: String,
+    },
+    UnknownEnvVar {
+        name: String,
+    },
+    Inconsistent {
+        reasons: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
 pub enum SchedulerError {
-    KvExhausted { needed_blocks: u32, free_blocks: u32 },
-    BucketNotCaptured { num_seqs: u32 },
+    KvExhausted {
+        needed_blocks: u32,
+        free_blocks: u32,
+    },
+    BucketNotCaptured {
+        num_seqs: u32,
+    },
     QueueFull,
 }
 
@@ -298,11 +333,7 @@ impl std::fmt::Display for RvllmError {
                     ctx.kernel, ctx.stream, ctx.device
                 )?;
                 if let Some(l) = ctx.launch {
-                    write!(
-                        f,
-                        " grid={:?} block={:?} smem={}",
-                        l.grid, l.block, l.smem
-                    )?;
+                    write!(f, " grid={:?} block={:?} smem={}", l.grid, l.block, l.smem)?;
                 }
                 Ok(())
             }

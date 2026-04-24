@@ -84,19 +84,24 @@ impl ModelArch {
             path: p.clone(),
             source,
         })?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| RvllmError::Loader {
-            err: LoaderError::Corrupt {
-                detail: format!("config.json: {e}"),
-            },
-            ctx: LoaderCtx {
-                path: p.clone(),
-                tensor: None,
-            },
-            bt: std::backtrace::Backtrace::capture(),
-        })?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!("config.json: {e}"),
+                },
+                ctx: LoaderCtx {
+                    path: p.clone(),
+                    tensor: None,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })?;
         // Gemma 3/4: text model params nested under text_config.
         let has_text_config = v["text_config"]["hidden_size"].is_u64();
-        let tc = if has_text_config { &v["text_config"] } else { &v };
+        let tc = if has_text_config {
+            &v["text_config"]
+        } else {
+            &v
+        };
         let num_hidden_layers = tc["num_hidden_layers"].as_u64().unwrap_or(0) as usize;
         let hidden_size = tc["hidden_size"].as_u64().unwrap_or(0) as usize;
         let num_attention_heads = tc["num_attention_heads"].as_u64().unwrap_or(0) as usize;
@@ -114,22 +119,30 @@ impl ModelArch {
             tc["max_position_embeddings"].as_u64().unwrap_or(2048) as usize;
         let attention_bias = tc["attention_bias"].as_bool().unwrap_or(false);
         let rms_norm_eps = tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
-        let layer_types_val = tc["layer_types"].as_array()
+        let layer_types_val = tc["layer_types"]
+            .as_array()
             .or_else(|| v["layer_types"].as_array());
         let layer_types: Vec<LayerAttnType> = match layer_types_val {
-            Some(arr) => arr.iter().map(|t| {
-                match t.as_str().unwrap_or("full_attention") {
+            Some(arr) => arr
+                .iter()
+                .map(|t| match t.as_str().unwrap_or("full_attention") {
                     "sliding_attention" => LayerAttnType::SlidingAttention,
                     "linear_attention" => LayerAttnType::Linear,
                     _ => LayerAttnType::Full,
-                }
-            }).collect(),
+                })
+                .collect(),
             None => vec![LayerAttnType::Full; num_hidden_layers],
         };
         let head_dim = tc["head_dim"]
             .as_u64()
             .map(|d| d as usize)
-            .unwrap_or_else(|| if num_attention_heads == 0 { 0 } else { hidden_size / num_attention_heads });
+            .unwrap_or_else(|| {
+                if num_attention_heads == 0 {
+                    0
+                } else {
+                    hidden_size / num_attention_heads
+                }
+            });
         // Accept head_dim 128 (Llama/Qwen/Mistral) and 256 (Gemma 4).
         if head_dim != 128 && head_dim != 256 {
             return Err(RvllmError::Loader {
@@ -145,33 +158,47 @@ impl ModelArch {
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
-        let hidden_activation = tc["hidden_act"].as_str()
+        let hidden_activation = tc["hidden_act"]
+            .as_str()
             .or_else(|| tc["hidden_activation"].as_str())
             .map(|s| s.to_string());
         let global_head_dim = tc["global_head_dim"].as_u64().map(|d| d as usize);
-        let num_global_key_value_heads = tc["num_global_key_value_heads"].as_u64().map(|d| d as usize);
-        let global_rope_theta = tc.get("rope_parameters")
+        let num_global_key_value_heads = tc["num_global_key_value_heads"]
+            .as_u64()
+            .map(|d| d as usize);
+        let global_rope_theta = tc
+            .get("rope_parameters")
             .and_then(|rp| rp["full_attention"]["rope_theta"].as_f64())
             .or_else(|| tc["rope_theta_global"].as_f64())
             .map(|t| t as f32);
-        let partial_rotary_factor = tc.get("rope_parameters")
+        let partial_rotary_factor = tc
+            .get("rope_parameters")
             .and_then(|rp| rp["full_attention"]["partial_rotary_factor"].as_f64())
             .or_else(|| tc["partial_rotary_factor"].as_f64())
             .map(|f| f as f32);
-        let sliding_window = tc["sliding_window"].as_u64()
+        let sliding_window = tc["sliding_window"]
+            .as_u64()
             .or_else(|| tc["sliding_window_size"].as_u64())
             .map(|s| s as usize);
-        let final_logit_softcapping = tc["final_logit_softcapping"].as_f64()
+        let final_logit_softcapping = tc["final_logit_softcapping"]
+            .as_f64()
             .or_else(|| tc["logit_softcapping"].as_f64())
             .map(|s| s as f32);
-        let tie_word_embeddings = tc["tie_word_embeddings"].as_bool()
+        let tie_word_embeddings = tc["tie_word_embeddings"]
+            .as_bool()
             .or_else(|| v["tie_word_embeddings"].as_bool())
             .unwrap_or(false);
         let attention_k_eq_v = tc["attention_k_eq_v"].as_bool().unwrap_or(false);
 
         if global_head_dim.is_some() {
-            let n_sliding = layer_types.iter().filter(|t| **t == LayerAttnType::SlidingAttention).count();
-            let n_full = layer_types.iter().filter(|t| **t == LayerAttnType::Full).count();
+            let n_sliding = layer_types
+                .iter()
+                .filter(|t| **t == LayerAttnType::SlidingAttention)
+                .count();
+            let n_full = layer_types
+                .iter()
+                .filter(|t| **t == LayerAttnType::Full)
+                .count();
             eprintln!(
                 "[loader] Gemma 4: {num_hidden_layers} layers ({n_sliding} sliding + {n_full} full), \
                  head_dim={head_dim}/{}, kv_heads={num_key_value_heads}/{}, \
@@ -289,9 +316,7 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
         &s[start..start + e.nbytes as usize]
     };
 
-    let get_tensor = |name: &str| -> Option<(usize, TensorEntry)> {
-        tensors.get(name).cloned()
-    };
+    let get_tensor = |name: &str| -> Option<(usize, TensorEntry)> { tensors.get(name).cloned() };
 
     let must_get = |name: &str| -> Result<(usize, TensorEntry)> {
         get_tensor(name).ok_or_else(|| RvllmError::Loader {
@@ -328,12 +353,26 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
         let (si, e) = must_get(&embed_name)?;
         upload_fp8_from(arena, "lm_head", &(si, e), &shards, model_dir)?
     } else {
-        upload_fp8_from(arena, "lm_head", &must_get("lm_head.weight")?, &shards, model_dir)?
+        upload_fp8_from(
+            arena,
+            "lm_head",
+            &must_get("lm_head.weight")?,
+            &shards,
+            model_dir,
+        )?
     };
     eprintln!(
         "[loader] lm_head FP8 scale={:.6e} clamp_ppm={:.1}",
         lm_head_fp8.scale, lm_head_fp8.clamp_ppm,
     );
+    let lm_head_f16 = if tie_embeddings {
+        F16Weight {
+            offset_bytes: embedding.offset_bytes,
+            shape: embedding.shape.clone(),
+        }
+    } else {
+        upload_f16("lm_head_f16", "lm_head.weight")?
+    };
 
     // RoPE cos/sin table -- precompute at load time.
     let (cos_bytes, sin_bytes) = rope_cos_sin_bytes(arch);
@@ -360,9 +399,15 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
         if e.dtype != DType::Fp8E4M3 {
             return Err(RvllmError::Loader {
                 err: LoaderError::Corrupt {
-                    detail: format!("FP8-only loader requires F8_E4M3 weights, got {:?} for q_proj.weight", e.dtype),
+                    detail: format!(
+                        "FP8-only loader requires F8_E4M3 weights, got {:?} for q_proj.weight",
+                        e.dtype
+                    ),
                 },
-                ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: Some("q_proj.weight".into()) },
+                ctx: LoaderCtx {
+                    path: model_dir.to_path_buf(),
+                    tensor: Some("q_proj.weight".into()),
+                },
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
@@ -375,15 +420,16 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
 
         // Per-layer head geometry: global layers may have different dims
         // and attention_k_eq_v (no separate v_proj).
-        let is_global = arch.layer_types[l] == LayerAttnType::Full
-            && arch.global_head_dim.is_some();
+        let is_global =
+            arch.layer_types[l] == LayerAttnType::Full && arch.global_head_dim.is_some();
         let layer_head_dim = if is_global {
             arch.global_head_dim.unwrap_or(arch.head_dim)
         } else {
             arch.head_dim
         };
         let layer_kv_heads = if is_global {
-            arch.num_global_key_value_heads.unwrap_or(arch.num_key_value_heads)
+            arch.num_global_key_value_heads
+                .unwrap_or(arch.num_key_value_heads)
         } else {
             arch.num_key_value_heads
         };
@@ -419,7 +465,8 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
 
         let qkv_cols = arch.hidden_size;
         let qkv = upload_fp8_fused_direct(
-            arena, "qkv",
+            arena,
+            "qkv",
             &qkv_parts,
             &qkv_scales,
             &shards,
@@ -429,7 +476,8 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
         let qkv_bias: Option<F16Weight> = None;
 
         let o_proj = upload_fp8_direct(
-            arena, "o_proj",
+            arena,
+            "o_proj",
             &must_get(&ln("self_attn.o_proj.weight"))?,
             get_tensor(&ln("self_attn.o_proj.weight_scale")),
             &shards,
@@ -438,7 +486,8 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
         let gate_up_rows = 2 * arch.intermediate_size;
         let gate_up_cols = arch.hidden_size;
         let gate_up = upload_fp8_fused_direct(
-            arena, "gate_up",
+            arena,
+            "gate_up",
             &[
                 must_get(&ln("mlp.gate_proj.weight"))?,
                 must_get(&ln("mlp.up_proj.weight"))?,
@@ -452,7 +501,8 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
         )?;
 
         let down_proj = upload_fp8_direct(
-            arena, "down_proj",
+            arena,
+            "down_proj",
             &must_get(&ln("mlp.down_proj.weight"))?,
             get_tensor(&ln("mlp.down_proj.weight_scale")),
             &shards,
@@ -500,6 +550,7 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
     Ok(LoadedModel {
         embedding,
         lm_head_fp8,
+        lm_head_f16,
         final_norm,
         rope_cos,
         rope_sin,
@@ -516,11 +567,7 @@ fn arena_base(arena: &HbmArena) -> u64 {
     0
 }
 
-fn tensor_to_f16_bytes(
-    e: &TensorEntry,
-    raw: &[u8],
-    model_dir: &Path,
-) -> Result<Vec<u8>> {
+fn tensor_to_f16_bytes(e: &TensorEntry, raw: &[u8], model_dir: &Path) -> Result<Vec<u8>> {
     match e.dtype {
         DType::F16 => Ok(raw.to_vec()),
         DType::Bf16 => Ok(bf16_bytes_to_f16_bytes(raw)),
@@ -561,12 +608,20 @@ fn fp8e4m3_bytes_to_f16_bytes(raw: &[u8]) -> Vec<u8> {
         let e = (b >> 3) & 0xF;
         let m = b & 0x7;
         let val = if e == 0 {
-            if m == 0 { 0.0f32 } else { (m as f32) * (1.0 / 512.0) * if s != 0 { -1.0 } else { 1.0 } }
+            if m == 0 {
+                0.0f32
+            } else {
+                (m as f32) * (1.0 / 512.0) * if s != 0 { -1.0 } else { 1.0 }
+            }
         } else if e == 15 && m == 7 {
             f32::NAN
         } else {
             let v = f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20));
-            if s != 0 { -v } else { v }
+            if s != 0 {
+                -v
+            } else {
+                v
+            }
         };
         out.extend_from_slice(&f16::from_f32(val).to_le_bytes());
     }
@@ -623,8 +678,16 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
         let full = (mant32 | (1 << 23)) as u32;
         let rshift = (20 + shift) as u32;
         let mut m = full >> rshift;
-        let round_bit = if rshift > 0 { (full >> (rshift - 1)) & 1 } else { 0 };
-        let sticky = if rshift > 1 { (full & ((1 << (rshift - 1)) - 1) != 0) as u32 } else { 0 };
+        let round_bit = if rshift > 0 {
+            (full >> (rshift - 1)) & 1
+        } else {
+            0
+        };
+        let sticky = if rshift > 1 {
+            (full & ((1 << (rshift - 1)) - 1) != 0) as u32
+        } else {
+            0
+        };
         m += round_bit & (sticky | (m & 1));
         if m >= 8 {
             return s | 0x08;
@@ -790,13 +853,21 @@ pub(crate) fn fp8_e4m3_to_f32(b: u8) -> f32 {
     let e = (b >> 3) & 0xF;
     let m = b & 0x7;
     let val = if e == 0 {
-        if m == 0 { 0.0f32 } else { (m as f32) * (1.0 / 512.0) }
+        if m == 0 {
+            0.0f32
+        } else {
+            (m as f32) * (1.0 / 512.0)
+        }
     } else if e == 15 && m == 7 {
         return f32::NAN;
     } else {
         f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
     };
-    if s != 0 { -val } else { val }
+    if s != 0 {
+        -val
+    } else {
+        val
+    }
 }
 
 fn concat_qkv(

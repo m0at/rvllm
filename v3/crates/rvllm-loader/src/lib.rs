@@ -13,12 +13,14 @@ pub mod fp8_quant;
 pub mod gemma4_arch;
 pub mod gemma4_load;
 pub mod gemma4_weights;
+pub mod k2_cpu;
 pub mod load;
 pub mod load_multiformat;
 pub mod safetensors;
 pub mod weights;
 
 pub use fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, QuantResult, FP8_E4M3_MAX};
+pub use k2_cpu::{K2Arch, K2CpuExpertStore};
 pub use load::{load_model, LayerAttnType, MlpActivation, ModelArch};
 pub use safetensors::{ShardHeader, ShardIndex, TensorEntry};
 pub use weights::{F16Weight, Fp8Weight, LayerWeights, LoadedModel};

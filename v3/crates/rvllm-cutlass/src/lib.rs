@@ -23,7 +23,6 @@ pub mod w4a8;
 
 pub use cublaslt::CublasLt;
 pub use lib_so::CutlassLib;
-pub use w4a8::W4a8Lib;
 pub use plan::Fp8GemmPlan;
 pub use policy::{Policy, PolicyEntry, ShapeKey};
 pub use schedule::{Coop, Fp8Coop, Fp8WS, MatchedPair, Schedule, ScheduleTag, WS};
@@ -32,3 +31,4 @@ pub use variants::{
     FP8_GEMM_COOP_128_128_128, FP8_GEMM_COOP_128_256_128, FP8_GEMM_FP8COOP_128_128_128,
     FP8_GEMM_FP8WS_64_128_128, FP8_GEMM_RESIDUAL_COOP, FP8_GEMM_WS_64_128_128,
 };
+pub use w4a8::W4a8Lib;

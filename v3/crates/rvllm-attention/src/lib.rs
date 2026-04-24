@@ -20,17 +20,29 @@ use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 
 const SUPPORTED_HEAD_DIMS: &[u32] = &[128, 256, 512];
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AttentionBackendKind {
+    Sm90Fa3,
+    Sm89Ada,
+}
+
+impl AttentionBackendKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sm90Fa3 => "SM90 (Hopper FA3)",
+            Self::Sm89Ada => "SM89 (Ada fallback)",
+        }
+    }
+}
+
 /// Runtime-constructed wrapper around `libfa3_kernels.so`. The wrapper
 /// refuses to exist if the .so is missing or its manifest-verified
 /// exports don't include the entry points. Callers obtain launchers
 /// from the wrapper.
 /// Function pointer types for FA3 .so exports.
 #[cfg(feature = "cuda")]
-pub(crate) type WorkspaceSizeFn = unsafe extern "C" fn(
-    batch_size: i32,
-    num_heads: i32,
-    max_num_splits: i32,
-) -> i32;
+pub(crate) type WorkspaceSizeFn =
+    unsafe extern "C" fn(batch_size: i32, num_heads: i32, max_num_splits: i32) -> i32;
 
 #[cfg(feature = "cuda")]
 #[allow(clippy::type_complexity)]
@@ -116,6 +128,7 @@ pub(crate) type PagedPrefillFp8Fn = unsafe extern "C" fn(
 #[derive(Debug)]
 pub struct Fa3Kernels {
     pub so_path: std::path::PathBuf,
+    pub backend: AttentionBackendKind,
     #[cfg(feature = "cuda")]
     _lib: libloading::Library,
     #[cfg(feature = "cuda")]
@@ -178,38 +191,66 @@ impl Fa3Kernels {
                     bt: std::backtrace::Backtrace::capture(),
                 })?;
                 // Try SM90 (FA3 Hopper) symbols first, then SM89 (Ada).
-                let is_sm89 = _lib.get::<WorkspaceSizeFn>(b"fa3_sm90_workspace_size\0").is_err()
-                    && _lib.get::<WorkspaceSizeFn>(b"fa_sm89_workspace_size\0").is_ok();
-                if is_sm89 {
-                    eprintln!("[rvllm-attention] using SM89 (Ada) attention backend");
-                }
-                let (ws_name, dec_name, fp8_name, prefill_name): (&[u8], &[u8], &[u8], &[u8]) = if is_sm89 {
-                    (b"fa_sm89_workspace_size\0", b"fa_sm89_paged_decode\0",
-                     b"fa_sm89_paged_decode_fp8\0", b"fa_sm89_paged_prefill_fp8\0")
+                let backend = if _lib
+                    .get::<WorkspaceSizeFn>(b"fa3_sm90_workspace_size\0")
+                    .is_err()
+                    && _lib
+                        .get::<WorkspaceSizeFn>(b"fa_sm89_workspace_size\0")
+                        .is_ok()
+                {
+                    AttentionBackendKind::Sm89Ada
                 } else {
-                    (b"fa3_sm90_workspace_size\0", b"fa3_sm90_paged_decode\0",
-                     b"fa3_sm90_paged_decode_fp8\0", b"fa3_sm90_paged_prefill_fp8\0")
+                    AttentionBackendKind::Sm90Fa3
                 };
+                let (ws_name, dec_name, fp8_name, prefill_name): (&[u8], &[u8], &[u8], &[u8]) =
+                    if backend == AttentionBackendKind::Sm89Ada {
+                        (
+                            b"fa_sm89_workspace_size\0",
+                            b"fa_sm89_paged_decode\0",
+                            b"fa_sm89_paged_decode_fp8\0",
+                            b"fa_sm89_paged_prefill_fp8\0",
+                        )
+                    } else {
+                        (
+                            b"fa3_sm90_workspace_size\0",
+                            b"fa3_sm90_paged_decode\0",
+                            b"fa3_sm90_paged_decode_fp8\0",
+                            b"fa3_sm90_paged_prefill_fp8\0",
+                        )
+                    };
                 let sym_err = |name: &'static str| RvllmError::Attention {
                     err: AttentionError::Fa3SoMissing { path: path.clone() },
-                    ctx: AttnCtx { op: name, stream: 0, num_seqs: 0, head_dim },
+                    ctx: AttnCtx {
+                        op: name,
+                        stream: 0,
+                        num_seqs: 0,
+                        head_dim,
+                    },
                     bt: std::backtrace::Backtrace::capture(),
                 };
                 let ws_sym: libloading::Symbol<WorkspaceSizeFn> = _lib
-                    .get(ws_name).map_err(|_| sym_err("dlsym:workspace_size"))?;
+                    .get(ws_name)
+                    .map_err(|_| sym_err("dlsym:workspace_size"))?;
                 let dec_sym: libloading::Symbol<PagedDecodeFn> = _lib
-                    .get(dec_name).map_err(|_| sym_err("dlsym:paged_decode"))?;
+                    .get(dec_name)
+                    .map_err(|_| sym_err("dlsym:paged_decode"))?;
                 let dec_fp8_sym: libloading::Symbol<PagedDecodeFp8Fn> = _lib
-                    .get(fp8_name).map_err(|_| sym_err("dlsym:paged_decode_fp8"))?;
-                let fn_paged_prefill_fp8: Option<PagedPrefillFp8Fn> = _lib
-                    .get::<PagedPrefillFp8Fn>(prefill_name)
-                    .ok()
-                    .map(|s| *s);
+                    .get(fp8_name)
+                    .map_err(|_| sym_err("dlsym:paged_decode_fp8"))?;
+                let fn_paged_prefill_fp8: Option<PagedPrefillFp8Fn> =
+                    _lib.get::<PagedPrefillFp8Fn>(prefill_name).ok().map(|s| *s);
                 let fn_workspace_size = *ws_sym;
                 let fn_paged_decode = *dec_sym;
                 let fn_paged_decode_fp8 = *dec_fp8_sym;
+                eprintln!(
+                    "[rvllm-attention] loaded {} backend from {} (head_dim={})",
+                    backend.label(),
+                    path.display(),
+                    head_dim
+                );
                 return Ok(Self {
                     so_path: path,
+                    backend,
                     _lib,
                     fn_workspace_size,
                     fn_paged_decode,
@@ -219,7 +260,10 @@ impl Fa3Kernels {
             }
         }
         #[cfg(not(feature = "cuda"))]
-        Ok(Self { so_path: path })
+        Ok(Self {
+            so_path: path,
+            backend: AttentionBackendKind::Sm90Fa3,
+        })
     }
 
     /// Minimum workspace size in bytes for the given batch + heads.
@@ -234,6 +278,10 @@ impl Fa3Kernels {
             let _ = (batch_size, num_heads);
             0
         }
+    }
+
+    pub fn backend_kind(&self) -> AttentionBackendKind {
+        self.backend
     }
 }
 

@@ -10,11 +10,11 @@
 //!   the April 16 vectorized-quantize ILLEGAL_ADDRESS hunt).
 //! - No megakernels. Each fused kernel does one recognizable composite.
 
+pub mod gemma4_launcher;
+pub mod gemma4_reference;
 pub mod launch_raw;
 pub mod launcher;
 pub mod reference;
-pub mod gemma4_launcher;
-pub mod gemma4_reference;
 
 pub use launch_raw::launch_raw;
 pub use launcher::{

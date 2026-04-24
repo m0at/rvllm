@@ -430,12 +430,7 @@ impl VnormF16Launch {
     ///
     /// # Safety
     /// Caller owns pointers.
-    pub unsafe fn launch(
-        &self,
-        kernel: KernelFn,
-        v_inout: u64,
-        stream: u64,
-    ) -> Result<()> {
+    pub unsafe fn launch(&self, kernel: KernelFn, v_inout: u64, stream: u64) -> Result<()> {
         self.validate()?;
         let mut v = v_inout;
         let mut eps = self.eps;
@@ -461,13 +456,7 @@ pub struct VectorAddF16Launch {
 }
 
 impl VectorAddF16Launch {
-    pub unsafe fn launch(
-        &self,
-        kernel: KernelFn,
-        dst: u64,
-        src: u64,
-        stream: u64,
-    ) -> Result<()> {
+    pub unsafe fn launch(&self, kernel: KernelFn, dst: u64, src: u64, stream: u64) -> Result<()> {
         let mut dst = dst;
         let mut src = src;
         let mut n = self.n as i32;
@@ -577,13 +566,7 @@ pub struct Bf16ToF16SatLaunch {
 }
 
 impl Bf16ToF16SatLaunch {
-    pub unsafe fn launch(
-        &self,
-        kernel: KernelFn,
-        dst: u64,
-        src: u64,
-        stream: u64,
-    ) -> Result<()> {
+    pub unsafe fn launch(&self, kernel: KernelFn, dst: u64, src: u64, stream: u64) -> Result<()> {
         let mut dst = dst;
         let mut src = src;
         let mut n = self.n as i32;
@@ -624,12 +607,7 @@ impl LogitSoftcapLaunch {
     ///
     /// # Safety
     /// Caller owns pointers.
-    pub unsafe fn launch(
-        &self,
-        kernel: KernelFn,
-        logits: u64,
-        stream: u64,
-    ) -> Result<()> {
+    pub unsafe fn launch(&self, kernel: KernelFn, logits: u64, stream: u64) -> Result<()> {
         self.validate()?;
         let mut logits = logits;
         let mut vocab = self.vocab as i32;

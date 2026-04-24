@@ -51,6 +51,11 @@ pub struct Gemma4LayerWeights {
     pub q_norm: F16Weight,
     pub k_norm: F16Weight,
     pub layer_scalar: F16Weight,
+    pub pli_gate: Option<F16Weight>,
+    pub pli_projection: Option<F16Weight>,
+    pub post_pli_norm: Option<F16Weight>,
+    pub kv_shared: bool,
+    pub kv_source_layer: usize,
 }
 
 #[derive(Debug)]
@@ -66,4 +71,7 @@ pub struct Gemma4LoadedModel {
     pub rope_cos_global: F16Weight,
     pub rope_sin_global: F16Weight,
     pub layers: Vec<Gemma4LayerWeights>,
+    pub pli_embed: Option<F16Weight>,
+    pub pli_model_projection: Option<F16Weight>,
+    pub pli_projection_norm: Option<F16Weight>,
 }

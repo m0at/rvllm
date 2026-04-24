@@ -17,8 +17,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use rvllm_core::{ModelArch as HfModelArch, ModelConfig};
-use rvllm_runtime::{Bringup, EnginePaths};
+#[cfg(feature = "cuda")]
 use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
+use rvllm_runtime::{Bringup, EnginePaths};
 
 fn env_path(k: &str) -> Result<PathBuf, String> {
     std::env::var(k)
@@ -33,6 +34,33 @@ fn is_gemma4_model_dir(model_dir: &std::path::Path) -> Result<bool, String> {
             .architecture,
         HfModelArch::Gemma4
     ))
+}
+
+fn env_bool_any(keys: &[&str]) -> Result<Option<bool>, String> {
+    for key in keys {
+        if let Ok(raw) = std::env::var(key) {
+            let value = match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                other => return Err(format!("invalid boolean for {key}: {other}")),
+            };
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+fn env_u32_any(keys: &[&str]) -> Result<Option<u32>, String> {
+    for key in keys {
+        if let Ok(raw) = std::env::var(key) {
+            let value = raw
+                .trim()
+                .parse::<u32>()
+                .map_err(|e| format!("invalid integer for {key}: {e}"))?;
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 fn main() {
@@ -69,9 +97,15 @@ fn run() -> Result<(), String> {
     let encoding = tokenizer
         .encode(text.as_str(), false)
         .map_err(|e| format!("tokenize: {e}"))?;
-    let all_ids: Vec<u32> = std::iter::once(2u32) // BOS
-        .chain(encoding.get_ids().iter().copied())
-        .collect();
+    let add_bos = env_bool_any(&["RVLLM_ADD_BOS"])?.unwrap_or(true);
+    let bos_token_id = env_u32_any(&["RVLLM_BOS_TOKEN_ID"])?.unwrap_or(2);
+    let all_ids: Vec<u32> = if add_bos {
+        std::iter::once(bos_token_id)
+            .chain(encoding.get_ids().iter().copied())
+            .collect()
+    } else {
+        encoding.get_ids().to_vec()
+    };
     eprintln!("total tokens: {}", all_ids.len());
 
     let chunk_len: usize = std::env::var("RVLLM_PPL_CHUNK")
@@ -98,63 +132,82 @@ fn run() -> Result<(), String> {
     let t0 = Instant::now();
 
     if is_gemma4_model_dir(&model_dir)? {
-        let g4_paths = Gemma4EnginePaths {
-            model_dir: paths.model_dir,
-            kernels_dir: paths.kernels_dir.clone(),
-            cutlass_so: paths.cutlass_so,
-            fa3_so: paths.fa3_so,
-            policy_json: paths.policy_json,
-        };
-        let g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
-            .map_err(|e| format!("gemma4 bringup: {e}"))?;
-        eprintln!("bringup: {:.2}s", t0.elapsed().as_secs_f64());
-
-        let embed_mod = g4.kernels
-            .load_ptx("embedding_gather_f16")
-            .map_err(|e| format!("load embedding_gather_f16: {e}"))?;
-        let fn_embed = embed_mod
-            .get_function("embedding_gather_f16_kernel")
-            .map_err(|e| format!("get embedding_gather_f16_kernel: {e}"))?;
-
-        let mut chunks: Vec<&[u32]> = all_ids.chunks(chunk_len).collect();
-        if let Some(last) = chunks.last() {
-            if last.len() < chunk_len { chunks.pop(); }
+        #[cfg(not(feature = "cuda"))]
+        {
+            return Err("Gemma4 PPL requires rvllm-bench built with --features cuda".into());
         }
-        if max_chunks > 0 && chunks.len() > max_chunks {
-            chunks.truncate(max_chunks);
-        }
-        if chunks.is_empty() {
-            return Err(format!("not enough tokens ({}) for chunk_len={chunk_len}", all_ids.len()));
-        }
-        eprintln!("evaluating {} chunks of {} tokens", chunks.len(), chunk_len);
+        #[cfg(feature = "cuda")]
+        {
+            let g4_paths = Gemma4EnginePaths {
+                model_dir: paths.model_dir,
+                kernels_dir: paths.kernels_dir.clone(),
+                cutlass_so: paths.cutlass_so,
+                fa3_so: paths.fa3_so,
+                policy_json: paths.policy_json,
+            };
+            let g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
+                .map_err(|e| format!("gemma4 bringup: {e}"))?;
+            eprintln!("bringup: {:.2}s", t0.elapsed().as_secs_f64());
 
-        let mut total_nll: f64 = 0.0;
-        let mut total_tokens: usize = 0;
-        let t_eval = Instant::now();
+            let embed_mod = g4
+                .kernels
+                .load_ptx("embedding_gather_f16")
+                .map_err(|e| format!("load embedding_gather_f16: {e}"))?;
+            let fn_embed = embed_mod
+                .get_function("embedding_gather_f16_kernel")
+                .map_err(|e| format!("get embedding_gather_f16_kernel: {e}"))?;
 
-        for (ci, chunk) in chunks.iter().enumerate() {
-            let chunk_t0 = Instant::now();
-            let result = unsafe { g4.run_ppl(fn_embed, chunk) }
-                .map_err(|e| format!("run_ppl chunk {ci}: {e}"))?;
-            total_nll += result.total_nll;
-            total_tokens += result.n_evaluated;
-            let running_ppl = (total_nll / total_tokens as f64).exp();
-            let chunk_ppl = if result.n_evaluated > 0 {
-                (result.total_nll / result.n_evaluated as f64).exp()
-            } else { 0.0 };
-            eprintln!(
-                "chunk {}/{}: chunk_ppl={:.4} running_ppl={:.4} ({:.1} tok/s, {:.1}s)",
-                ci + 1, chunks.len(), chunk_ppl, running_ppl,
-                chunk.len() as f64 / chunk_t0.elapsed().as_secs_f64(),
-                chunk_t0.elapsed().as_secs_f64()
-            );
+            let mut chunks: Vec<&[u32]> = all_ids.chunks(chunk_len).collect();
+            if max_chunks > 0 && chunks.len() > max_chunks {
+                chunks.truncate(max_chunks);
+            }
+            if chunks.is_empty() {
+                return Err(format!(
+                    "not enough tokens ({}) for chunk_len={chunk_len}",
+                    all_ids.len()
+                ));
+            }
+            eprintln!("evaluating {} chunks of {} tokens", chunks.len(), chunk_len);
+            if chunks.len() > 1 {
+                eprintln!(
+                    "warning: chunked PPL resets Gemma4 KV/context for each chunk; \
+                     running_ppl is only comparable across identical chunk settings"
+                );
+            }
+
+            let mut total_nll: f64 = 0.0;
+            let mut total_tokens: usize = 0;
+            let t_eval = Instant::now();
+
+            for (ci, chunk) in chunks.iter().enumerate() {
+                let chunk_t0 = Instant::now();
+                let result = unsafe { g4.run_ppl(fn_embed, chunk) }
+                    .map_err(|e| format!("run_ppl chunk {ci}: {e}"))?;
+                total_nll += result.total_nll;
+                total_tokens += result.n_evaluated;
+                let running_ppl = (total_nll / total_tokens as f64).exp();
+                let chunk_ppl = if result.n_evaluated > 0 {
+                    (result.total_nll / result.n_evaluated as f64).exp()
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "chunk {}/{}: chunk_ppl={:.4} running_ppl={:.4} ({:.1} tok/s, {:.1}s)",
+                    ci + 1,
+                    chunks.len(),
+                    chunk_ppl,
+                    running_ppl,
+                    chunk.len() as f64 / chunk_t0.elapsed().as_secs_f64(),
+                    chunk_t0.elapsed().as_secs_f64()
+                );
+            }
+
+            let ppl = (total_nll / total_tokens as f64).exp();
+            let elapsed = t_eval.elapsed().as_secs_f64();
+            eprintln!("perplexity = {ppl:.4} ({total_tokens} tokens, {elapsed:.1}s)");
+            println!("{{\"perplexity\":{ppl:.4},\"tokens\":{total_tokens},\"chunk_len\":{chunk_len},\"elapsed_s\":{elapsed:.1}}}");
+            return Ok(());
         }
-
-        let ppl = (total_nll / total_tokens as f64).exp();
-        let elapsed = t_eval.elapsed().as_secs_f64();
-        eprintln!("perplexity = {ppl:.4} ({total_tokens} tokens, {elapsed:.1}s)");
-        println!("{{\"perplexity\":{ppl:.4},\"tokens\":{total_tokens},\"chunk_len\":{chunk_len},\"elapsed_s\":{elapsed:.1}}}");
-        return Ok(());
     }
 
     let br = Bringup::load(paths, arena_bytes).map_err(|e| format!("bringup: {e}"))?;
@@ -170,11 +223,6 @@ fn run() -> Result<(), String> {
 
     // Chunk the input.
     let mut chunks: Vec<&[u32]> = all_ids.chunks(chunk_len).collect();
-    if let Some(last) = chunks.last() {
-        if last.len() < chunk_len {
-            chunks.pop();
-        }
-    }
     if max_chunks > 0 && chunks.len() > max_chunks {
         chunks.truncate(max_chunks);
     }
@@ -188,8 +236,14 @@ fn run() -> Result<(), String> {
         "evaluating {} chunks of {} tokens ({} total)",
         chunks.len(),
         chunk_len,
-        chunks.len() * chunk_len
+        all_ids.len()
     );
+    if chunks.len() > 1 {
+        eprintln!(
+            "warning: chunked PPL resets KV/context for each chunk; \
+             running_ppl is only comparable across identical chunk settings"
+        );
+    }
 
     let mut total_nll: f64 = 0.0;
     let mut total_tokens: usize = 0;
@@ -221,9 +275,7 @@ fn run() -> Result<(), String> {
 
     let ppl = (total_nll / total_tokens as f64).exp();
     let elapsed = t_eval.elapsed().as_secs_f64();
-    eprintln!(
-        "perplexity = {ppl:.4} ({total_tokens} tokens, {elapsed:.1}s)"
-    );
+    eprintln!("perplexity = {ppl:.4} ({total_tokens} tokens, {elapsed:.1}s)");
     println!(
         "{{\"perplexity\":{ppl:.4},\"tokens\":{total_tokens},\"chunk_len\":{chunk_len},\"elapsed_s\":{elapsed:.1}}}"
     );

@@ -110,15 +110,14 @@ impl KernelManifest {
             hasher.update(&bytes);
             let got = hex::encode(hasher.finalize());
             if got != entry.sha256 {
-                mismatches.push(format!(
-                    "{name}: sha256 {got} != manifest {}",
-                    entry.sha256
-                ));
+                mismatches.push(format!("{name}: sha256 {got} != manifest {}", entry.sha256));
             }
         }
         if !mismatches.is_empty() {
             return Err(RvllmError::config(
-                ConfigError::Inconsistent { reasons: mismatches },
+                ConfigError::Inconsistent {
+                    reasons: mismatches,
+                },
                 "manifest.json",
             ));
         }

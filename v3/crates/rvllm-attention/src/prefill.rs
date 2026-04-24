@@ -177,9 +177,19 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = (
-                o_f16, q_fp8, k_cache_fp8, v_cache_fp8, block_tables, context_lens,
-                cu_seqlens_q, workspace, q_descale_ptr, k_descale_ptr, v_descale_ptr,
-                max_seqlen_q, stream,
+                o_f16,
+                q_fp8,
+                k_cache_fp8,
+                v_cache_fp8,
+                block_tables,
+                context_lens,
+                cu_seqlens_q,
+                workspace,
+                q_descale_ptr,
+                k_descale_ptr,
+                v_descale_ptr,
+                max_seqlen_q,
+                stream,
             );
         }
         Ok(())
@@ -202,6 +212,7 @@ mod tests {
             max_blocks_per_seq: 33,
             num_blocks_total: 1024,
             scale: 1.0,
+            window_size_left: -1,
         };
         assert!(p.validate().is_err());
     }
@@ -218,6 +229,7 @@ mod tests {
             max_blocks_per_seq: 33,
             num_blocks_total: 1024,
             scale: 1.0 / (256f32).sqrt(),
+            window_size_left: -1,
         };
         assert!(p.validate().is_ok());
     }

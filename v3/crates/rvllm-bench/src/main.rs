@@ -18,8 +18,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use rvllm_core::{ModelArch as HfModelArch, ModelConfig};
-use rvllm_runtime::{Bringup, EnginePaths};
+#[cfg(feature = "cuda")]
 use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
+use rvllm_runtime::{Bringup, EnginePaths};
 
 fn env_path(k: &str) -> Result<PathBuf, String> {
     std::env::var(k)
@@ -84,30 +85,37 @@ fn run() -> Result<(), String> {
     let is_gemma4 = is_gemma4_model_dir(&paths.model_dir)?;
 
     if is_gemma4 {
-        eprintln!("== Gemma 4 detected, using Gemma4Bringup ==");
-        let g4_paths = Gemma4EnginePaths {
-            model_dir: paths.model_dir,
-            kernels_dir: paths.kernels_dir,
-            cutlass_so: paths.cutlass_so,
-            fa3_so: paths.fa3_so,
-            policy_json: paths.policy_json,
-        };
-        let t0 = Instant::now();
-        let g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
-            .map_err(|e| format!("gemma4 bringup: {e}"))?;
-        eprintln!(
-            "bringup: {:.2}s | arch layers={} hidden={} heads={} sliding_kv={} global_kv={}",
-            t0.elapsed().as_secs_f64(),
-            g4.arch.num_hidden_layers,
-            g4.arch.hidden_size,
-            g4.arch.num_attention_heads,
-            g4.arch.num_kv_heads_sliding,
-            g4.arch.num_kv_heads_global,
-        );
-        eprintln!("arena used = {} MiB", g4.arena.used() / (1024 * 1024));
-        let result = unsafe { g4.run_bench(batch, iters, warmup) };
-        print_result(result);
-        return Ok(());
+        #[cfg(not(feature = "cuda"))]
+        {
+            return Err("Gemma4 bench requires rvllm-bench built with --features cuda".into());
+        }
+        #[cfg(feature = "cuda")]
+        {
+            eprintln!("== Gemma 4 detected, using Gemma4Bringup ==");
+            let g4_paths = Gemma4EnginePaths {
+                model_dir: paths.model_dir,
+                kernels_dir: paths.kernels_dir,
+                cutlass_so: paths.cutlass_so,
+                fa3_so: paths.fa3_so,
+                policy_json: paths.policy_json,
+            };
+            let t0 = Instant::now();
+            let g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
+                .map_err(|e| format!("gemma4 bringup: {e}"))?;
+            eprintln!(
+                "bringup: {:.2}s | arch layers={} hidden={} heads={} sliding_kv={} global_kv={}",
+                t0.elapsed().as_secs_f64(),
+                g4.arch.num_hidden_layers,
+                g4.arch.hidden_size,
+                g4.arch.num_attention_heads,
+                g4.arch.num_kv_heads_sliding,
+                g4.arch.num_kv_heads_global,
+            );
+            eprintln!("arena used = {} MiB", g4.arena.used() / (1024 * 1024));
+            let result = unsafe { g4.run_bench(batch, iters, warmup) };
+            print_result(result);
+            return Ok(());
+        }
     }
 
     let t0 = Instant::now();
@@ -126,8 +134,8 @@ fn run() -> Result<(), String> {
         return run_sweep(&br, batch, iters, warmup);
     }
 
-    let result = unsafe { br.run_bench(batch, iters, warmup) }
-        .map_err(|e| format!("run_bench: {e}"))?;
+    let result =
+        unsafe { br.run_bench(batch, iters, warmup) }.map_err(|e| format!("run_bench: {e}"))?;
     print_result(result);
     Ok(())
 }
@@ -178,7 +186,8 @@ fn run_sweep(br: &Bringup, batch: u32, iters: u32, warmup: u32) -> Result<(), St
     for &nr in nonres {
         for &r in residuals {
             let ck = br.arena.checkpoint();
-            let res = unsafe { br.run_bench_with_variants(batch, iters, warmup, Some(nr), Some(r)) };
+            let res =
+                unsafe { br.run_bench_with_variants(batch, iters, warmup, Some(nr), Some(r)) };
             unsafe { br.arena.restore(ck) };
             match res {
                 Ok(r_) => {
@@ -206,6 +215,11 @@ fn run_sweep(br: &Bringup, batch: u32, iters: u32, warmup: u32) -> Result<(), St
             }
         }
     }
-    eprintln!("BEST: nonres={} res={} ({:.3} ms/step)", best.1, best.2, best.0 as f64 / 1.0e6);
+    eprintln!(
+        "BEST: nonres={} res={} ({:.3} ms/step)",
+        best.1,
+        best.2,
+        best.0 as f64 / 1.0e6
+    );
     Ok(())
 }

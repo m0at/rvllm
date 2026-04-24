@@ -36,4 +36,5 @@ rvllm-loader = { workspace = true }
 rvllm-sampling = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+half = { workspace = true }
 cudarc = { version = "0.19", features = ["driver", "cuda-version-from-build-system"], optional = true }

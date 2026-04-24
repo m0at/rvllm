@@ -31,7 +31,7 @@ __global__ void fused_rope_partial_f16kv_kernel(
 
     const int pos = positions[token_idx];
 
-    // Q head: split-half RoPE, output as F16
+    // Q head: rotate only the first rotary_dim values, then pass through the tail.
     if (head_idx < num_heads) {
         int q_base = (token_idx * num_heads + head_idx) * head_dim;
 
@@ -39,16 +39,18 @@ __global__ void fused_rope_partial_f16kv_kernel(
             float cos_val = __half2float(cos_table[pos * half_rotary + tid]);
             float sin_val = __half2float(sin_table[pos * half_rotary + tid]);
             float q_lo = __half2float(q_in[q_base + tid]);
-            float q_hi = __half2float(q_in[q_base + tid + half_head]);
+            float q_hi = __half2float(q_in[q_base + tid + half_rotary]);
             q_out[q_base + tid]             = __float2half(q_lo * cos_val - q_hi * sin_val);
-            q_out[q_base + tid + half_head] = __float2half(q_lo * sin_val + q_hi * cos_val);
+            q_out[q_base + tid + half_rotary] = __float2half(q_lo * sin_val + q_hi * cos_val);
         } else {
-            q_out[q_base + tid]             = q_in[q_base + tid];
-            q_out[q_base + tid + half_head] = q_in[q_base + tid + half_head];
+            int tail_idx = rotary_dim + 2 * (tid - half_rotary);
+            q_out[q_base + tail_idx] = q_in[q_base + tail_idx];
+            q_out[q_base + tail_idx + 1] = q_in[q_base + tail_idx + 1];
         }
     }
 
-    // K head: split-half RoPE + F16 cache write. V: direct F16 cache write.
+    // K head: rotate only the first rotary_dim values, then pass through the tail.
+    // V head: direct F16 cache write.
     if (head_idx < num_kv_heads) {
         int k_base = (token_idx * num_kv_heads + head_idx) * head_dim;
         int slot = slot_mapping[token_idx];
@@ -60,12 +62,13 @@ __global__ void fused_rope_partial_f16kv_kernel(
                 float cos_val = __half2float(cos_table[pos * half_rotary + tid]);
                 float sin_val = __half2float(sin_table[pos * half_rotary + tid]);
                 float k_lo = __half2float(k_in[k_base + tid]);
-                float k_hi = __half2float(k_in[k_base + tid + half_head]);
+                float k_hi = __half2float(k_in[k_base + tid + half_rotary]);
                 key_cache[cache_offset + tid]             = __float2half(k_lo * cos_val - k_hi * sin_val);
-                key_cache[cache_offset + tid + half_head] = __float2half(k_lo * sin_val + k_hi * cos_val);
+                key_cache[cache_offset + tid + half_rotary] = __float2half(k_lo * sin_val + k_hi * cos_val);
             } else {
-                key_cache[cache_offset + tid]             = k_in[k_base + tid];
-                key_cache[cache_offset + tid + half_head] = k_in[k_base + tid + half_head];
+                int tail_idx = rotary_dim + 2 * (tid - half_rotary);
+                key_cache[cache_offset + tail_idx] = k_in[k_base + tail_idx];
+                key_cache[cache_offset + tail_idx + 1] = k_in[k_base + tail_idx + 1];
             }
 
             // V: no rotation, direct F16 copy

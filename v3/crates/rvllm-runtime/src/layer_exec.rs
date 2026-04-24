@@ -76,9 +76,9 @@ pub struct LayerWeights {
 pub struct LayerScratch {
     pub hidden_fp8: u64,
     pub hidden_scale: u64,
-    pub q_out: u64,        // f16, QKV GEMM output (Q half)
-    pub k_out: u64,        // f16, QKV GEMM output (K half)
-    pub v_out: u64,        // f16, QKV GEMM output (V half)
+    pub q_out: u64,        // f16, [num_tokens, q_dim]
+    pub k_out: u64,        // f16, [num_tokens, kv_dim]
+    pub v_out: u64,        // f16, [num_tokens, kv_dim]
     pub q_fp8: u64,        // fp8, post-rope Q consumed by FA3 (FP8 KV path)
     pub k_cache: u64,      // fp8 (1 byte/elem) paged K cache, this layer's base
     pub v_cache: u64,      // fp8 (1 byte/elem) paged V cache, this layer's base
@@ -235,42 +235,105 @@ pub unsafe fn forward_phase(
         }
     }
 
-    // 2. Fused Q||K||V projection + f16 bias via cuBLASLt (one launch
-    //    replaces cutlass_fp8_gemm + add_bias_f16). Output is packed
-    //    [num_tokens, q_dim + 2*kv_dim] f16. q_out/k_out/v_out are byte
-    //    offsets into the same buffer (set by bring_up).
-    let qkv_n = dims.num_heads * dims.head_dim + 2 * dims.num_kv_heads * dims.head_dim;
+    // 2..4. Q, K, V projections. The packed weight tensor is laid out
+    // row-wise as [Q rows][K rows][V rows], but a single [M, Q+K+V]
+    // output matrix is token-major, so splitting it with plain pointer
+    // offsets is only correct when M=1.
     #[cfg(feature = "cuda")]
-    if weights.qkv_bias != 0 {
-        cublaslt.fp8_gemm_bias(
-            scratch.hidden_fp8,
-            weights.qkv_fp8,
-            weights.qkv_bias,
-            scratch.q_out,
-            dims.num_tokens as i32,
-            qkv_n as i32,
-            dims.hidden as i32,
-            scratch.hidden_scale,
-            weights.qkv_scale,
-            stream,
-        )?;
-    } else {
-        cublaslt.fp8_gemm(
-            scratch.hidden_fp8,
-            weights.qkv_fp8,
-            scratch.q_out,
-            dims.num_tokens as i32,
-            qkv_n as i32,
-            dims.hidden as i32,
-            scratch.hidden_scale,
-            weights.qkv_scale,
-            stream,
-        )?;
+    {
+        let hidden_bytes = dims.hidden as u64;
+        let q_weight = weights.qkv_fp8;
+        let k_weight = weights.qkv_fp8 + (q_dim as u64) * hidden_bytes;
+        let v_weight = weights.qkv_fp8 + ((q_dim + kv_dim) as u64) * hidden_bytes;
+        let q_bias = weights.qkv_bias;
+        let k_bias = if weights.qkv_bias != 0 {
+            weights.qkv_bias + (q_dim as u64) * 2
+        } else {
+            0
+        };
+        let v_bias = if weights.qkv_bias != 0 {
+            weights.qkv_bias + ((q_dim + kv_dim) as u64) * 2
+        } else {
+            0
+        };
+
+        if q_bias != 0 {
+            cublaslt.fp8_gemm_bias(
+                scratch.hidden_fp8,
+                q_weight,
+                q_bias,
+                scratch.q_out,
+                dims.num_tokens as i32,
+                q_dim as i32,
+                dims.hidden as i32,
+                scratch.hidden_scale,
+                weights.qkv_scale,
+                stream,
+            )?;
+            cublaslt.fp8_gemm_bias(
+                scratch.hidden_fp8,
+                k_weight,
+                k_bias,
+                scratch.k_out,
+                dims.num_tokens as i32,
+                kv_dim as i32,
+                dims.hidden as i32,
+                scratch.hidden_scale,
+                weights.qkv_scale,
+                stream,
+            )?;
+            cublaslt.fp8_gemm_bias(
+                scratch.hidden_fp8,
+                v_weight,
+                v_bias,
+                scratch.v_out,
+                dims.num_tokens as i32,
+                kv_dim as i32,
+                dims.hidden as i32,
+                scratch.hidden_scale,
+                weights.qkv_scale,
+                stream,
+            )?;
+        } else {
+            cublaslt.fp8_gemm(
+                scratch.hidden_fp8,
+                q_weight,
+                scratch.q_out,
+                dims.num_tokens as i32,
+                q_dim as i32,
+                dims.hidden as i32,
+                scratch.hidden_scale,
+                weights.qkv_scale,
+                stream,
+            )?;
+            cublaslt.fp8_gemm(
+                scratch.hidden_fp8,
+                k_weight,
+                scratch.k_out,
+                dims.num_tokens as i32,
+                kv_dim as i32,
+                dims.hidden as i32,
+                scratch.hidden_scale,
+                weights.qkv_scale,
+                stream,
+            )?;
+            cublaslt.fp8_gemm(
+                scratch.hidden_fp8,
+                v_weight,
+                scratch.v_out,
+                dims.num_tokens as i32,
+                kv_dim as i32,
+                dims.hidden as i32,
+                scratch.hidden_scale,
+                weights.qkv_scale,
+                stream,
+            )?;
+        }
     }
     // Suppress unused warnings when cuda feature is off.
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (cublaslt, kernels.add_bias_f16, plans, qkv_n);
+        let _ = (cublaslt, kernels.add_bias_f16, plans);
     }
 
     #[cfg(feature = "cuda")]

@@ -99,10 +99,6 @@ compute_qkv_scales_kernel(
         }
     }
     float k_absmax = block_reduce_max(k_max, smem);
-    if (tid == 0) {
-        float scale = fmaxf(k_absmax / FP8_E4M3_MAX, 1e-12f);
-        k_scales[token] = scale;
-    }
 
     // V absmax: scan all KV heads, no rotation
     float v_max = 0.0f;
@@ -116,7 +112,18 @@ compute_qkv_scales_kernel(
     }
     float v_absmax = block_reduce_max(v_max, smem);
     if (tid == 0) {
-        float scale = fmaxf(v_absmax / FP8_E4M3_MAX, 1e-12f);
-        v_scales[token] = scale;
+        if (k_scales == v_scales) {
+            // Gemma 4 currently threads one shared KV descale into attention.
+            // When K/V outputs alias, preserve the larger absmax so neither
+            // cache clips before decode.
+            float kv_absmax = fmaxf(k_absmax, v_absmax);
+            float kv_scale = fmaxf(kv_absmax / FP8_E4M3_MAX, 1e-12f);
+            k_scales[token] = kv_scale;
+        } else {
+            float k_scale = fmaxf(k_absmax / FP8_E4M3_MAX, 1e-12f);
+            float v_scale = fmaxf(v_absmax / FP8_E4M3_MAX, 1e-12f);
+            k_scales[token] = k_scale;
+            v_scales[token] = v_scale;
+        }
     }
 }

@@ -188,7 +188,12 @@ impl GraphPool {
         current: &MetadataLayout,
     ) -> Result<&CapturedGraph> {
         let g = self.get(bucket, max_blocks).ok_or_else(|| {
-            RvllmError::graph(GraphError::BucketMissing { padded_batch: bucket }, bucket)
+            RvllmError::graph(
+                GraphError::BucketMissing {
+                    padded_batch: bucket,
+                },
+                bucket,
+            )
         })?;
         let h = current.hash();
         if h != g.layout_hash {

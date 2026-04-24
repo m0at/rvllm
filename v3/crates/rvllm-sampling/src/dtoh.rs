@@ -69,9 +69,7 @@ impl<'p> DtoHTicket<'p> {
         // Safety: TokenId is #[repr(transparent)] over u32; i32 and u32
         // have the same size/align. We reinterpret knowing the kernel
         // writes non-negative values only (argmax indices).
-        unsafe {
-            core::slice::from_raw_parts(slice.as_ptr() as *const TokenId, slice.len())
-        }
+        unsafe { core::slice::from_raw_parts(slice.as_ptr() as *const TokenId, slice.len()) }
     }
 
     pub fn num_tokens(&self) -> u32 {

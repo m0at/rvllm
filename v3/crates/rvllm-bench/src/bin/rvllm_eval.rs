@@ -14,9 +14,12 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use rvllm_core::{DType, ModelArch as HfModelArch, ModelConfig};
-use rvllm_runtime::{Bringup, EnginePaths};
+#[cfg(feature = "cuda")]
+use rvllm_core::DType;
+use rvllm_core::{ModelArch as HfModelArch, ModelConfig};
+#[cfg(feature = "cuda")]
 use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
+use rvllm_runtime::{Bringup, EnginePaths};
 
 fn env_path(k: &str) -> Result<PathBuf, String> {
     std::env::var(k)
@@ -33,6 +36,22 @@ fn is_gemma4_model_dir(model_dir: &std::path::Path) -> Result<bool, String> {
     ))
 }
 
+fn gemma4_generation_prompt(model_dir: &std::path::Path, prompt: &str) -> String {
+    if prompt.contains("<|turn>") || std::env::var("RVLLM_RAW_PROMPT").map_or(false, |v| v == "1")
+    {
+        return prompt.to_string();
+    }
+    let prompt = prompt.trim();
+    let wants_empty_thought = std::fs::read_to_string(model_dir.join("chat_template.jinja"))
+        .map(|s| s.contains("<|channel>thought"))
+        .unwrap_or(false);
+    if wants_empty_thought {
+        format!("<|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>")
+    } else {
+        format!("<|turn>user\n{prompt}<turn|>\n<|turn>model\n")
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -45,6 +64,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let model_dir = env_path("RVLLM_MODEL_DIR")?;
+    let is_gemma4 = is_gemma4_model_dir(&model_dir)?;
 
     // -- tokenizer --
     let tok_path = model_dir.join("tokenizer.json");
@@ -64,6 +84,15 @@ fn run() -> Result<(), String> {
     if prompt.is_empty() {
         return Err("empty prompt (set RVLLM_PROMPT or pipe to stdin)".into());
     }
+    let prompt = if is_gemma4 {
+        let framed = gemma4_generation_prompt(&model_dir, &prompt);
+        if framed != prompt {
+            eprintln!("[eval] applied Gemma4 chat framing");
+        }
+        framed
+    } else {
+        prompt
+    };
 
     let encoding = tokenizer
         .encode(prompt.as_str(), false)
@@ -85,7 +114,10 @@ fn run() -> Result<(), String> {
         fa3_so: env_path("RVLLM_FA3_SO")?,
         policy_json: env_path("RVLLM_POLICY")?,
     };
-    let arena_bytes: usize = if let Some(gb) = std::env::var("RVLLM_ARENA_GB").ok().and_then(|s| s.parse::<usize>().ok()) {
+    let arena_bytes: usize = if let Some(gb) = std::env::var("RVLLM_ARENA_GB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
         gb * 1024 * 1024 * 1024
     } else {
         #[cfg(feature = "cuda")]
@@ -106,58 +138,91 @@ fn run() -> Result<(), String> {
             };
             let reserve = 512 * 1024 * 1024; // 512MB headroom
             let arena = if free > reserve { free - reserve } else { free };
-            eprintln!("[eval] auto-sized arena: {:.1} GB ({:.1} GB free)", arena as f64 / 1e9, free as f64 / 1e9);
+            eprintln!(
+                "[eval] auto-sized arena: {:.1} GB ({:.1} GB free)",
+                arena as f64 / 1e9,
+                free as f64 / 1e9
+            );
             arena
         }
         #[cfg(not(feature = "cuda"))]
-        { 32 * 1024 * 1024 * 1024 }
+        {
+            32 * 1024 * 1024 * 1024
+        }
     };
     let t0 = Instant::now();
 
-    if is_gemma4_model_dir(&model_dir)? {
-        let g4_paths = Gemma4EnginePaths {
-            model_dir: paths.model_dir.clone(),
-            kernels_dir: paths.kernels_dir,
-            cutlass_so: paths.cutlass_so,
-            fa3_so: paths.fa3_so,
-            policy_json: paths.policy_json,
-        };
-        let g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
-            .map_err(|e| format!("gemma4 bringup: {e}"))?;
-        eprintln!("bringup: {:.2}s", t0.elapsed().as_secs_f64());
+    if is_gemma4 {
+        #[cfg(not(feature = "cuda"))]
+        {
+            return Err("Gemma4 eval requires rvllm-bench built with --features cuda".into());
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let g4_paths = Gemma4EnginePaths {
+                model_dir: paths.model_dir.clone(),
+                kernels_dir: paths.kernels_dir,
+                cutlass_so: paths.cutlass_so,
+                fa3_so: paths.fa3_so,
+                policy_json: paths.policy_json,
+            };
+            let g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
+                .map_err(|e| format!("gemma4 bringup: {e}"))?;
+            eprintln!("bringup: {:.2}s", t0.elapsed().as_secs_f64());
 
-        let embed_mod = g4.kernels
-            .load_ptx("embedding_gather_f16")
-            .map_err(|e| format!("load embedding_gather_f16: {e}"))?;
-        let fn_embed = embed_mod
-            .get_function("embedding_gather_f16_kernel")
-            .map_err(|e| format!("get embedding_gather_f16_kernel: {e}"))?;
+            let embed_mod = g4
+                .kernels
+                .load_ptx("embedding_gather_f16")
+                .map_err(|e| format!("load embedding_gather_f16: {e}"))?;
+            let fn_embed = embed_mod
+                .get_function("embedding_gather_f16_kernel")
+                .map_err(|e| format!("get embedding_gather_f16_kernel: {e}"))?;
 
-        let argmax_mod = g4.kernels
-            .load_ptx("argmax")
-            .map_err(|e| format!("load argmax: {e}"))?;
-        let fn_argmax = argmax_mod
-            .get_function("argmax_kernel")
-            .map_err(|e| format!("get argmax_kernel: {e}"))?;
+            let argmax_mod = g4
+                .kernels
+                .load_ptx("argmax")
+                .map_err(|e| format!("load argmax: {e}"))?;
+            let fn_argmax = argmax_mod
+                .get_function("argmax_f16_kernel")
+                .map_err(|e| format!("get argmax_f16_kernel: {e}"))?;
 
-        let prompt_with_bos: Vec<u32> = std::iter::once(2u32)
-            .chain(prompt_ids.iter().copied())
-            .collect();
-        let eos_ids: Vec<u32> = vec![1, 2, 107];
+            let prompt_with_bos: Vec<u32> = std::iter::once(2u32)
+                .chain(prompt_ids.iter().copied())
+                .collect();
+            let eos_ids: Vec<u32> = std::env::var("RVLLM_EOS")
+                .ok()
+                .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+                .unwrap_or_else(|| vec![1, 106, 50]);
 
-        let t_gen = Instant::now();
-        let output_ids = unsafe {
-            g4.run_generate(fn_embed, fn_argmax, &prompt_with_bos, max_new as usize, &eos_ids)
-        }.map_err(|e| format!("gemma4 generate: {e}"))?;
+            let t_gen = Instant::now();
+            let output_ids = unsafe {
+                g4.run_generate(
+                    fn_embed,
+                    fn_argmax,
+                    &prompt_with_bos,
+                    max_new as usize,
+                    &eos_ids,
+                )
+            }
+            .map_err(|e| format!("gemma4 generate: {e}"))?;
 
-        let elapsed = t_gen.elapsed();
-        let n = output_ids.len();
-        eprintln!("generated {} tokens in {:.2}s ({:.1} tok/s)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
-
-        let text = tokenizer.decode(&output_ids, true)
-            .map_err(|e| format!("detokenize: {e}"))?;
-        println!("{text}");
-        return Ok(());
+            let elapsed = t_gen.elapsed();
+            let n = output_ids.len();
+            eprintln!(
+                "generated {} tokens in {:.2}s ({:.1} tok/s)",
+                n,
+                elapsed.as_secs_f64(),
+                n as f64 / elapsed.as_secs_f64()
+            );
+            if std::env::var("RVLLM_PRINT_TOKEN_IDS").map_or(false, |v| v == "1") {
+                eprintln!("output_ids: {:?}", output_ids);
+            }
+            let text = tokenizer
+                .decode(&output_ids, true)
+                .map_err(|e| format!("detokenize: {e}"))?;
+            println!("{text}");
+            return Ok(());
+        }
     }
 
     let br = Bringup::load(paths, arena_bytes).map_err(|e| format!("bringup: {e}"))?;
@@ -218,86 +283,119 @@ unsafe fn generate(
     let arena = &br.arena;
 
     // Scratch regions sized for max(prompt_len, 1) tokens.
-    let hidden_fp8 = arena.region("hidden_fp8", (max_tokens * hidden) as usize, 16)
+    let hidden_fp8 = arena
+        .region("hidden_fp8", (max_tokens * hidden) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let hidden_scale = arena.region("hidden_scale", (max_tokens * 4) as usize, 16)
+    let hidden_scale = arena
+        .region("hidden_scale", (max_tokens * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let qkv_out_bytes = (max_tokens * qkv_rows * 2) as usize;
-    let qkv_out = arena.region("qkv_out", qkv_out_bytes, 16).map_err(|e| e.to_string())?;
-    let q_base = qkv_out.device_ptr();
-    // For decode (num_tokens=1) and prefill (num_tokens=prompt_len) the
-    // K/V offsets into the packed QKV buffer differ.
-    let k_base_decode = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
-    let v_base_decode = k_base_decode + (num_seqs as u64) * (kv_dim as u64) * 2;
-    let k_base_prefill = q_base + (prompt_len as u64) * (q_dim as u64) * 2;
-    let v_base_prefill = k_base_prefill + (prompt_len as u64) * (kv_dim as u64) * 2;
-    let attn_out = arena.region("attn_out", (max_tokens * q_dim * 2) as usize, 16)
+    let q_out = arena
+        .region("q_out", (max_tokens * q_dim * 2) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let attn_out_fp8 = arena.region("attn_out_fp8", (max_tokens * q_dim) as usize, 16)
+    let k_out = arena
+        .region("k_out", (max_tokens * kv_dim * 2) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let attn_out_scale = arena.region("attn_out_scale", (max_tokens * 4) as usize, 16)
+    let v_out = arena
+        .region("v_out", (max_tokens * kv_dim * 2) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let gate_up_out = arena.region("gate_up_out", (max_tokens * 2 * inter * 2) as usize, 16)
+    let attn_out = arena
+        .region("attn_out", (max_tokens * q_dim * 2) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let gate_up_fp8 = arena.region("gate_up_fp8", (max_tokens * 2 * inter) as usize, 16)
+    let attn_out_fp8 = arena
+        .region("attn_out_fp8", (max_tokens * q_dim) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let gate_up_scale = arena.region("gate_up_scale", (max_tokens * 4) as usize, 16)
+    let attn_out_scale = arena
+        .region("attn_out_scale", (max_tokens * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let mlp_out_fp8 = arena.region("mlp_out_fp8", (max_tokens * inter) as usize, 16)
+    let gate_up_out = arena
+        .region("gate_up_out", (max_tokens * 2 * inter * 2) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let mlp_out_scale = arena.region("mlp_out_scale", (max_tokens * 4) as usize, 16)
+    let gate_up_fp8 = arena
+        .region("gate_up_fp8", (max_tokens * 2 * inter) as usize, 16)
+        .map_err(|e| e.to_string())?;
+    let gate_up_scale = arena
+        .region("gate_up_scale", (max_tokens * 4) as usize, 16)
+        .map_err(|e| e.to_string())?;
+    let mlp_out_fp8 = arena
+        .region("mlp_out_fp8", (max_tokens * inter) as usize, 16)
+        .map_err(|e| e.to_string())?;
+    let mlp_out_scale = arena
+        .region("mlp_out_scale", (max_tokens * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
 
-    let kv_cache = arena.region(
-        "kv_cache",
-        (arch.num_hidden_layers as u64 * kv_per_layer as u64) as usize,
-        256,
-    ).map_err(|e| e.to_string())?;
-    let q_fp8 = arena.region("q_fp8", (max_tokens * q_dim) as usize, 16)
+    let kv_cache = arena
+        .region(
+            "kv_cache",
+            (arch.num_hidden_layers as u64 * kv_per_layer as u64) as usize,
+            256,
+        )
+        .map_err(|e| e.to_string())?;
+    let q_fp8 = arena
+        .region("q_fp8", (max_tokens * q_dim) as usize, 16)
         .map_err(|e| e.to_string())?;
     let q_scale_region = arena.region("q_scale", 4, 4).map_err(|e| e.to_string())?;
     let kv_scale_region = arena.region("kv_scale", 4, 4).map_err(|e| e.to_string())?;
     {
         let seed: f32 = 1.0 / 448.0;
-        q_scale_region.copy_from_host(&seed.to_le_bytes()).map_err(|e| e.to_string())?;
-        kv_scale_region.copy_from_host(&seed.to_le_bytes()).map_err(|e| e.to_string())?;
+        q_scale_region
+            .copy_from_host(&seed.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        kv_scale_region
+            .copy_from_host(&seed.to_le_bytes())
+            .map_err(|e| e.to_string())?;
     }
 
-    let cutlass_ws = arena.region("cutlass_ws", 16 * 1024 * 1024, 256).map_err(|e| e.to_string())?;
-    let fa3_ws = arena.region("fa3_ws", 64 * 1024 * 1024, 256).map_err(|e| e.to_string())?;
-    let residual = arena.region("residual", (max_tokens * hidden * 2) as usize, 16)
+    let cutlass_ws = arena
+        .region("cutlass_ws", 16 * 1024 * 1024, 256)
+        .map_err(|e| e.to_string())?;
+    let fa3_ws = arena
+        .region("fa3_ws", 64 * 1024 * 1024, 256)
+        .map_err(|e| e.to_string())?;
+    let residual = arena
+        .region("residual", (max_tokens * hidden * 2) as usize, 16)
         .map_err(|e| e.to_string())?;
 
     // Metadata regions.
-    let positions = arena.region("positions", (max_tokens * 4) as usize, 16)
+    let positions = arena
+        .region("positions", (max_tokens * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let slot_mapping = arena.region("slot_mapping", (max_tokens * 4) as usize, 16)
+    let slot_mapping = arena
+        .region("slot_mapping", (max_tokens * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let context_lens = arena.region("context_lens", (num_seqs * 4) as usize, 16)
+    let context_lens = arena
+        .region("context_lens", (num_seqs * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let block_tables = arena.region(
-        "block_tables",
-        (num_seqs * max_blocks_per_seq * 4) as usize,
-        16,
-    ).map_err(|e| e.to_string())?;
+    let block_tables = arena
+        .region(
+            "block_tables",
+            (num_seqs * max_blocks_per_seq * 4) as usize,
+            16,
+        )
+        .map_err(|e| e.to_string())?;
 
     // Token ID upload region (for embedding gather input).
-    let token_ids_region = arena.region("token_ids", (max_tokens * 4) as usize, 16)
+    let token_ids_region = arena
+        .region("token_ids", (max_tokens * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
     // Logits + sampled output.
-    let logits = arena.region("logits", (num_seqs * vocab * 2) as usize, 16)
+    let logits = arena
+        .region("logits", (num_seqs * vocab * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
-    let sampled_tokens = arena.region("sampled_tokens", (num_seqs * 4) as usize, 16)
+    let sampled_tokens = arena
+        .region("sampled_tokens", (num_seqs * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
 
     // Prefill cu_seqlens_q.
-    let cu_seqlens_q = arena.region("cu_seqlens_q", ((num_seqs + 1) * 4) as usize, 16)
+    let cu_seqlens_q = arena
+        .region("cu_seqlens_q", ((num_seqs + 1) * 4) as usize, 16)
         .map_err(|e| e.to_string())?;
 
     // Block tables: seq 0 owns blocks 0..max_blocks_per_seq.
     {
         let bt: Vec<i32> = (0..max_blocks_per_seq as i32).collect();
-        block_tables.copy_from_host(bytemuck_i32(&bt)).map_err(|e| e.to_string())?;
+        block_tables
+            .copy_from_host(bytemuck_i32(&bt))
+            .map_err(|e| e.to_string())?;
     }
 
     // GEMM plans for N=1 (decode) -- prefill plans use prompt_len as M.
@@ -307,18 +405,23 @@ unsafe fn generate(
         .map_err(|e| e.to_string())?;
     let plan_gate_up_d = Fp8GemmPlan::from_policy(&br.policy, 1, 2 * inter, hidden, DType::Fp8E4M3)
         .map_err(|e| e.to_string())?;
-    let plan_down_d = Fp8GemmPlan::from_policy_residual(&br.policy, 1, hidden, inter, DType::Fp8E4M3)
-        .map_err(|e| e.to_string())?;
+    let plan_down_d =
+        Fp8GemmPlan::from_policy_residual(&br.policy, 1, hidden, inter, DType::Fp8E4M3)
+            .map_err(|e| e.to_string())?;
 
     // Prefill plans (M = prompt_len).
-    let plan_qkv_p = Fp8GemmPlan::from_policy(&br.policy, prompt_len, qkv_rows, hidden, DType::Fp8E4M3)
-        .map_err(|e| e.to_string())?;
-    let plan_o_p = Fp8GemmPlan::from_policy_residual(&br.policy, prompt_len, hidden, q_dim, DType::Fp8E4M3)
-        .map_err(|e| e.to_string())?;
-    let plan_gate_up_p = Fp8GemmPlan::from_policy(&br.policy, prompt_len, 2 * inter, hidden, DType::Fp8E4M3)
-        .map_err(|e| e.to_string())?;
-    let plan_down_p = Fp8GemmPlan::from_policy_residual(&br.policy, prompt_len, hidden, inter, DType::Fp8E4M3)
-        .map_err(|e| e.to_string())?;
+    let plan_qkv_p =
+        Fp8GemmPlan::from_policy(&br.policy, prompt_len, qkv_rows, hidden, DType::Fp8E4M3)
+            .map_err(|e| e.to_string())?;
+    let plan_o_p =
+        Fp8GemmPlan::from_policy_residual(&br.policy, prompt_len, hidden, q_dim, DType::Fp8E4M3)
+            .map_err(|e| e.to_string())?;
+    let plan_gate_up_p =
+        Fp8GemmPlan::from_policy(&br.policy, prompt_len, 2 * inter, hidden, DType::Fp8E4M3)
+            .map_err(|e| e.to_string())?;
+    let plan_down_p =
+        Fp8GemmPlan::from_policy_residual(&br.policy, prompt_len, hidden, inter, DType::Fp8E4M3)
+            .map_err(|e| e.to_string())?;
 
     let stream = br.stream.raw();
 
@@ -333,7 +436,7 @@ unsafe fn generate(
         max_blocks_per_seq,
         num_blocks_total,
         attn_scale: 1.0 / (head_dim as f32).sqrt(),
-        rms_eps: 1e-6,
+        rms_eps: br.arch.rms_norm_eps,
     };
     let kernels = layer_exec::LayerKernels {
         fused_rmsnorm: br.fused_modules.fn_rmsnorm,
@@ -353,102 +456,115 @@ unsafe fn generate(
     // Wraps all unsafe kernel/GEMM calls in a single unsafe block.
     let run_forward = |phase: layer_exec::LayerPhase,
                        plans: &layer_exec::LayerGemmPlans,
-                       num_tokens: u32,
-                       k_base: u64,
-                       v_base: u64|
-        -> Result<(), String> { unsafe {
-        let mut dims = dims_base;
-        dims.num_tokens = num_tokens;
-        for (layer_idx, layer) in br.model.layers.iter().enumerate() {
-            let layer_kv_base =
-                kv_cache.device_ptr() + (layer_idx as u64) * (kv_per_layer as u64);
-            let w = layer_exec::LayerWeights {
-                attn_norm_gamma: layer.input_layernorm.offset_bytes,
-                qkv_fp8: layer.qkv.offset_bytes,
-                qkv_scale: layer.qkv.scale_ptr,
-                qkv_bias: layer.qkv_bias.as_ref().map_or(0, |b| b.offset_bytes),
-                o_fp8: layer.o_proj.offset_bytes,
-                o_scale: layer.o_proj.scale_ptr,
-                mlp_norm_gamma: layer.post_attention_layernorm.offset_bytes,
-                gate_up_fp8: layer.gate_up.offset_bytes,
-                gate_up_scale: layer.gate_up.scale_ptr,
-                down_fp8: layer.down_proj.offset_bytes,
-                down_scale: layer.down_proj.scale_ptr,
-            };
-            let scratch = layer_exec::LayerScratch {
-                hidden_fp8: hidden_fp8.device_ptr(),
-                hidden_scale: hidden_scale.device_ptr(),
-                q_out: q_base,
-                k_out: k_base,
-                v_out: v_base,
-                q_fp8: q_fp8.device_ptr(),
-                k_cache: layer_kv_base,
-                v_cache: layer_kv_base + (kv_per_layer / 2) as u64,
-                q_scale_ptr: q_scale_region.device_ptr(),
-                kv_scale_ptr: kv_scale_region.device_ptr(),
-                attn_out: attn_out.device_ptr(),
-                attn_out_fp8: attn_out_fp8.device_ptr(),
-                attn_out_scale: attn_out_scale.device_ptr(),
-                gate_up_out: gate_up_out.device_ptr(),
-                gate_up_fp8: gate_up_fp8.device_ptr(),
-                gate_up_scale: gate_up_scale.device_ptr(),
-                mlp_out_fp8: mlp_out_fp8.device_ptr(),
-                mlp_out_scale: mlp_out_scale.device_ptr(),
-                cutlass_workspace: cutlass_ws.device_ptr(),
-                cutlass_workspace_bytes: 16 * 1024 * 1024,
-                fa3_workspace: fa3_ws.device_ptr(),
-            };
-            let meta = layer_exec::MetadataPtrs {
-                positions: positions.device_ptr(),
-                slot_mapping: slot_mapping.device_ptr(),
-                cos: br.model.rope_cos.offset_bytes,
-                sin: br.model.rope_sin.offset_bytes,
-                block_tables: block_tables.device_ptr(),
-                context_lens: context_lens.device_ptr(),
-            };
-            layer_exec::forward_phase(
-                dims, &kernels, &w, &scratch, &meta, plans,
-                &br.cutlass, &br.cublaslt, &br.fa3,
-                residual_ptr, stream, phase,
-                br.arch.layer_types[layer_idx],
-            ).map_err(|e| e.to_string())?;
-        }
-        // Final norm + LM head + argmax (only for decode, prefill skips).
-        if matches!(phase, layer_exec::LayerPhase::Decode) {
-            rvllm_fused::FusedRmsnormFp8QuantLaunch {
-                num_tokens: 1,
-                hidden,
-                eps: 1e-6,
+                       num_tokens: u32|
+     -> Result<(), String> {
+        unsafe {
+            let mut dims = dims_base;
+            dims.num_tokens = num_tokens;
+            for (layer_idx, layer) in br.model.layers.iter().enumerate() {
+                let layer_kv_base =
+                    kv_cache.device_ptr() + (layer_idx as u64) * (kv_per_layer as u64);
+                let w = layer_exec::LayerWeights {
+                    attn_norm_gamma: layer.input_layernorm.offset_bytes,
+                    qkv_fp8: layer.qkv.offset_bytes,
+                    qkv_scale: layer.qkv.scale_ptr,
+                    qkv_bias: layer.qkv_bias.as_ref().map_or(0, |b| b.offset_bytes),
+                    o_fp8: layer.o_proj.offset_bytes,
+                    o_scale: layer.o_proj.scale_ptr,
+                    mlp_norm_gamma: layer.post_attention_layernorm.offset_bytes,
+                    gate_up_fp8: layer.gate_up.offset_bytes,
+                    gate_up_scale: layer.gate_up.scale_ptr,
+                    down_fp8: layer.down_proj.offset_bytes,
+                    down_scale: layer.down_proj.scale_ptr,
+                };
+                let scratch = layer_exec::LayerScratch {
+                    hidden_fp8: hidden_fp8.device_ptr(),
+                    hidden_scale: hidden_scale.device_ptr(),
+                    q_out: q_out.device_ptr(),
+                    k_out: k_out.device_ptr(),
+                    v_out: v_out.device_ptr(),
+                    q_fp8: q_fp8.device_ptr(),
+                    k_cache: layer_kv_base,
+                    v_cache: layer_kv_base + (kv_per_layer / 2) as u64,
+                    q_scale_ptr: q_scale_region.device_ptr(),
+                    kv_scale_ptr: kv_scale_region.device_ptr(),
+                    attn_out: attn_out.device_ptr(),
+                    attn_out_fp8: attn_out_fp8.device_ptr(),
+                    attn_out_scale: attn_out_scale.device_ptr(),
+                    gate_up_out: gate_up_out.device_ptr(),
+                    gate_up_fp8: gate_up_fp8.device_ptr(),
+                    gate_up_scale: gate_up_scale.device_ptr(),
+                    mlp_out_fp8: mlp_out_fp8.device_ptr(),
+                    mlp_out_scale: mlp_out_scale.device_ptr(),
+                    cutlass_workspace: cutlass_ws.device_ptr(),
+                    cutlass_workspace_bytes: 16 * 1024 * 1024,
+                    fa3_workspace: fa3_ws.device_ptr(),
+                };
+                let meta = layer_exec::MetadataPtrs {
+                    positions: positions.device_ptr(),
+                    slot_mapping: slot_mapping.device_ptr(),
+                    cos: br.model.rope_cos.offset_bytes,
+                    sin: br.model.rope_sin.offset_bytes,
+                    block_tables: block_tables.device_ptr(),
+                    context_lens: context_lens.device_ptr(),
+                };
+                layer_exec::forward_phase(
+                    dims,
+                    &kernels,
+                    &w,
+                    &scratch,
+                    &meta,
+                    plans,
+                    &br.cutlass,
+                    &br.cublaslt,
+                    &br.fa3,
+                    residual_ptr,
+                    stream,
+                    phase,
+                    br.arch.layer_types[layer_idx],
+                )
+                .map_err(|e| e.to_string())?;
             }
-            .launch(
-                br.fused_modules.fn_rmsnorm,
-                hidden_fp8.device_ptr(),
-                hidden_scale.device_ptr(),
-                residual_ptr,
-                br.model.final_norm.offset_bytes,
-                stream,
-            ).map_err(|e| e.to_string())?;
-            br.cublaslt.fp8_gemm(
-                hidden_fp8.device_ptr(),
-                br.model.lm_head_fp8.offset_bytes,
-                logits.device_ptr(),
-                1,
-                vocab as i32,
-                hidden as i32,
-                hidden_scale.device_ptr(),
-                br.model.lm_head_fp8.scale_ptr,
-                stream,
-            ).map_err(|e| e.to_string())?;
-            rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
+            // Final norm + LM head + argmax (only for decode, prefill skips).
+            if matches!(phase, layer_exec::LayerPhase::Decode) {
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                    num_tokens: 1,
+                    hidden,
+                    eps: br.arch.rms_norm_eps,
+                }
+                .launch(
+                    br.fused_modules.fn_rmsnorm_inplace,
+                    residual_ptr,
+                    br.model.final_norm.offset_bytes,
+                    stream,
+                )
+                .map_err(|e| e.to_string())?;
+                br.cublaslt
+                    .f16_gemm_f32(
+                        residual_ptr,
+                        br.model.lm_head_f16.offset_bytes,
+                        logits.device_ptr(),
+                        1,
+                        vocab as i32,
+                        hidden as i32,
+                        stream,
+                    )
+                    .map_err(|e| e.to_string())?;
+                rvllm_fused::ArgmaxLaunch {
+                    num_tokens: 1,
+                    vocab,
+                }
                 .launch(
                     br.fused_modules.fn_argmax,
                     logits.device_ptr(),
                     sampled_tokens.device_ptr(),
                     stream,
-                ).map_err(|e| e.to_string())?;
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
         }
-        Ok(())
-    } };
+    };
 
     // Pinned host buffer for reading back sampled token.
     let mut host_tok = rvllm_mem::PinnedBuf::<i32>::new(1).map_err(|e| e.to_string())?;
@@ -456,7 +572,9 @@ unsafe fn generate(
     // === PREFILL ===
     // Upload all prompt token IDs.
     let ids_i32: Vec<i32> = prompt_ids.iter().map(|&x| x as i32).collect();
-    token_ids_region.copy_from_host(bytemuck_i32(&ids_i32)).map_err(|e| e.to_string())?;
+    token_ids_region
+        .copy_from_host(bytemuck_i32(&ids_i32))
+        .map_err(|e| e.to_string())?;
 
     // Embedding gather: token_ids -> residual (f16 hidden states).
     rvllm_fused::EmbeddingGatherLaunch {
@@ -470,7 +588,8 @@ unsafe fn generate(
         br.model.embedding.offset_bytes,
         token_ids_region.device_ptr(),
         stream,
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     // Prefill metadata: positions [0..prompt_len), slots [0..prompt_len),
     // context_lens = [prompt_len].
@@ -479,10 +598,18 @@ unsafe fn generate(
         let slots: Vec<i32> = (0..prompt_len as i32).collect();
         let ctx: Vec<i32> = vec![prompt_len as i32];
         let cu: Vec<i32> = vec![0, prompt_len as i32];
-        positions.copy_from_host(bytemuck_i32(&pos)).map_err(|e| e.to_string())?;
-        slot_mapping.copy_from_host(bytemuck_i32(&slots)).map_err(|e| e.to_string())?;
-        context_lens.copy_from_host(bytemuck_i32(&ctx)).map_err(|e| e.to_string())?;
-        cu_seqlens_q.copy_from_host(bytemuck_i32(&cu)).map_err(|e| e.to_string())?;
+        positions
+            .copy_from_host(bytemuck_i32(&pos))
+            .map_err(|e| e.to_string())?;
+        slot_mapping
+            .copy_from_host(bytemuck_i32(&slots))
+            .map_err(|e| e.to_string())?;
+        context_lens
+            .copy_from_host(bytemuck_i32(&ctx))
+            .map_err(|e| e.to_string())?;
+        cu_seqlens_q
+            .copy_from_host(bytemuck_i32(&cu))
+            .map_err(|e| e.to_string())?;
     }
 
     let plans_prefill = layer_exec::LayerGemmPlans {
@@ -495,7 +622,7 @@ unsafe fn generate(
         cu_seqlens_q: cu_seqlens_q.device_ptr(),
         max_seqlen_q: prompt_len,
     };
-    run_forward(prefill_phase, &plans_prefill, prompt_len, k_base_prefill, v_base_prefill)?;
+    run_forward(prefill_phase, &plans_prefill, prompt_len)?;
     br.stream.fence().map_err(|e| e.to_string())?;
     let t_prefill = Instant::now();
     eprintln!("prefill done");
@@ -538,16 +665,24 @@ unsafe fn generate(
         let pos = [cur_pos as i32];
         let slot = [cur_pos as i32]; // linear slot = position
         let ctx_len = [cur_pos as i32 + 1]; // context includes this token
-        positions.copy_from_host(bytemuck_i32(&pos)).map_err(|e| e.to_string())?;
-        slot_mapping.copy_from_host(bytemuck_i32(&slot)).map_err(|e| e.to_string())?;
-        context_lens.copy_from_host(bytemuck_i32(&ctx_len)).map_err(|e| e.to_string())?;
+        positions
+            .copy_from_host(bytemuck_i32(&pos))
+            .map_err(|e| e.to_string())?;
+        slot_mapping
+            .copy_from_host(bytemuck_i32(&slot))
+            .map_err(|e| e.to_string())?;
+        context_lens
+            .copy_from_host(bytemuck_i32(&ctx_len))
+            .map_err(|e| e.to_string())?;
 
         // If this is not the first decode step, we need to embed the
         // previous sampled token into the residual buffer.
         if step > 0 {
             let last_tok = *output_ids.last().ok_or("no token")?;
             let tok_i32 = [last_tok as i32];
-            token_ids_region.copy_from_host(bytemuck_i32(&tok_i32)).map_err(|e| e.to_string())?;
+            token_ids_region
+                .copy_from_host(bytemuck_i32(&tok_i32))
+                .map_err(|e| e.to_string())?;
             rvllm_fused::EmbeddingGatherLaunch {
                 num_tokens: 1,
                 hidden,
@@ -559,16 +694,11 @@ unsafe fn generate(
                 br.model.embedding.offset_bytes,
                 token_ids_region.device_ptr(),
                 stream,
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
         }
 
-        run_forward(
-            layer_exec::LayerPhase::Decode,
-            &plans_decode,
-            1,
-            k_base_decode,
-            v_base_decode,
-        )?;
+        run_forward(layer_exec::LayerPhase::Decode, &plans_decode, 1)?;
 
         // DtoH: read sampled token.
         {

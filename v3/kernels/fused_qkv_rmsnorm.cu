@@ -31,44 +31,46 @@ __global__ void fused_qkv_rmsnorm_kernel(
 
     extern __shared__ float smem[];
 
-    const __half* src;
     __half* dst;
     const __half* gamma;
     int n_heads_this;
     int head_local;
     bool use_gamma;
+    int src_offset;
+
+    const int q_dim = num_heads * head_dim;
+    const int kv_dim = num_kv_heads * head_dim;
+    const int qkv_rows = q_dim + 2 * kv_dim;
+    const int row_base = token * qkv_rows;
 
     if (head_global < num_heads) {
-        // Q head
         head_local = head_global;
         n_heads_this = num_heads;
-        src = q_in;
         dst = q_out;
         gamma = q_gamma;
         use_gamma = true;
+        src_offset = row_base + head_local * head_dim;
     } else if (head_global < num_heads + num_kv_heads) {
-        // K head
         head_local = head_global - num_heads;
         n_heads_this = num_kv_heads;
-        src = k_in;
         dst = k_out;
         gamma = k_gamma;
         use_gamma = true;
+        src_offset = row_base + q_dim + head_local * head_dim;
     } else {
-        // V head (parameter-free)
         head_local = head_global - num_heads - num_kv_heads;
         n_heads_this = num_kv_heads;
-        src = v_inout;
         dst = v_inout;
         gamma = nullptr;
         use_gamma = false;
+        src_offset = row_base + q_dim + kv_dim + head_local * head_dim;
     }
 
-    const int offset = (token * n_heads_this + head_local) * head_dim;
+    const int dst_offset = (token * n_heads_this + head_local) * head_dim;
 
     float sum_sq = 0.0f;
     for (int i = tid; i < head_dim; i += blockDim.x) {
-        float v = __half2float(src[offset + i]);
+        float v = __half2float(q_in[src_offset + i]);
         sum_sq += v * v;
     }
 
@@ -92,8 +94,8 @@ __global__ void fused_qkv_rmsnorm_kernel(
     float rms_inv = smem[0];
 
     for (int i = tid; i < head_dim; i += blockDim.x) {
-        float v = __half2float(src[offset + i]) * rms_inv;
+        float v = __half2float(q_in[src_offset + i]) * rms_inv;
         if (use_gamma) v *= __half2float(gamma[i]);
-        dst[offset + i] = __float2half(v);
+        dst[dst_offset + i] = __float2half(v);
     }
 }

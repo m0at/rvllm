@@ -316,7 +316,8 @@ impl ArgmaxLaunch {
         Ok(())
     }
 
-    /// Kernel sig: `(logits_f32, out_i32, vocab)`.
+    /// Kernel sig depends on the loaded symbol, e.g.
+    /// `(logits_f16, out_i32, vocab)` or `(logits_f32, out_i32, vocab)`.
     ///
     /// # Safety
     /// Caller owns pointers for the call's duration.
@@ -356,7 +357,10 @@ pub struct FusedRopeKvWriteLaunch {
 impl FusedRopeKvWriteLaunch {
     pub fn validate(&self) -> Result<()> {
         if !matches!(self.head_dim, 128 | 256 | 512) {
-            return Err(invalid("head_dim", "v3 FA3 path requires head_dim in {128, 256, 512}"));
+            return Err(invalid(
+                "head_dim",
+                "v3 FA3 path requires head_dim in {128, 256, 512}",
+            ));
         }
         if self.num_kv_heads == 0 || self.num_heads % self.num_kv_heads != 0 {
             return Err(invalid(
@@ -482,7 +486,10 @@ pub struct FusedRopeCacheFp8KvLaunch {
 impl FusedRopeCacheFp8KvLaunch {
     pub fn validate(&self) -> Result<()> {
         if !matches!(self.head_dim, 128 | 256 | 512) {
-            return Err(invalid("head_dim", "v3 FA3 path requires head_dim in {128, 256, 512}"));
+            return Err(invalid(
+                "head_dim",
+                "v3 FA3 path requires head_dim in {128, 256, 512}",
+            ));
         }
         if self.num_kv_heads == 0 || self.num_heads % self.num_kv_heads != 0 {
             return Err(invalid(
@@ -576,13 +583,7 @@ impl ResidualAddF16Launch {
     ///
     /// # Safety
     /// Caller owns pointers for the call's duration.
-    pub unsafe fn launch(
-        &self,
-        kernel: KernelFn,
-        x: u64,
-        y: u64,
-        stream: u64,
-    ) -> Result<()> {
+    pub unsafe fn launch(&self, kernel: KernelFn, x: u64, y: u64, stream: u64) -> Result<()> {
         self.validate()?;
         let mut x = x;
         let mut y = y;
