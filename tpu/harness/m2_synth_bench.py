@@ -31,11 +31,12 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from m2_moe import moe_block_nvfp4
 from m2_moe_dense import moe_block_dense_b1
+from m2_moe_gather import moe_block_gather_topk
 
-# MoE dispatch strategy selector. Set via env var M2_MOE=dense|shardmap.
-# "dense" = compute all 32 local experts per shard, mask+psum (Agent 12).
-#          Better for small B. No all_to_all. Wastes compute on unselected experts.
-# "shardmap" = sort + all_to_all dispatch (default). Better at large B.
+# MoE dispatch strategy. Set via M2_MOE env:
+#   shardmap = sort + all_to_all dispatch (default)
+#   dense    = all 32 local experts + mask + psum (wasteful at B=1)
+#   gather   = dynamic-gather top-K per shard + batched matmul + psum (AGENT 16 recommended)
 _MOE_PATH = os.environ.get('M2_MOE', 'shardmap').lower()
 
 # --- Arch constants ---
@@ -143,6 +144,14 @@ def forward_step(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_hea
 
         if _MOE_PATH == 'dense':
             moe_out = moe_block_dense_b1(
+                h, layer_w['rg'], layer_w['rb'],
+                (layer_w['w1_p'], layer_w['w1_s'], layer_w['w1_s2']),
+                (layer_w['w2_p'], layer_w['w2_s'], layer_w['w2_s2']),
+                (layer_w['w3_p'], layer_w['w3_s'], layer_w['w3_s2']),
+                mesh,
+            )
+        elif _MOE_PATH == 'gather':
+            moe_out = moe_block_gather_topk(
                 h, layer_w['rg'], layer_w['rb'],
                 (layer_w['w1_p'], layer_w['w1_s'], layer_w['w1_s2']),
                 (layer_w['w2_p'], layer_w['w2_s'], layer_w['w2_s2']),
