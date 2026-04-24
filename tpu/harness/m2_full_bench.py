@@ -57,9 +57,18 @@ def encode_text(tk, text):
 
 def make_batched_empty_cache(mesh, nl, B, ctx, dtype):
     from jax.sharding import NamedSharding, PartitionSpec as P
-    rep = NamedSharding(mesh, P())
-    k = jax.device_put(jnp.zeros((nl, B, ctx, NKV, HEAD_DIM), dtype=dtype), rep)
-    v = jax.device_put(jnp.zeros((nl, B, ctx, NKV, HEAD_DIM), dtype=dtype), rep)
+    n_shards = 8
+    # Shard KV along batch axis when B is divisible — keeps per-chip KV small.
+    # Else shard along sequence axis; else replicate (B=1 only).
+    if 'expert' in mesh.axis_names and B % n_shards == 0:
+        spec = P(None, 'expert', None, None, None)  # shard batch axis
+    elif 'expert' in mesh.axis_names and ctx % n_shards == 0:
+        spec = P(None, None, 'expert', None, None)  # shard seq axis
+    else:
+        spec = P()
+    sharding = NamedSharding(mesh, spec)
+    k = jax.device_put(jnp.zeros((nl, B, ctx, NKV, HEAD_DIM), dtype=dtype), sharding)
+    v = jax.device_put(jnp.zeros((nl, B, ctx, NKV, HEAD_DIM), dtype=dtype), sharding)
     return k, v
 
 
