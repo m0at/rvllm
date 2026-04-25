@@ -28,4 +28,6 @@ pub use m2_prefill::{
     make_m2_prefill_input_specs, make_m2_prefill_inputs, M2PrefillHostInput, M2PrefillHostInputSpec,
 };
 pub use m2_runtime::{plan_m2_rust_prefill, M2RustPrefillConfig, M2RustPrefillPlan};
+#[cfg(feature = "tpu")]
+pub use m2_weight_plan::{M2UploadedWeightBuffer, M2UploadedWeights};
 pub use m2_weight_plan::{M2WeightRole, M2WeightUploadPlan, M2WeightUploadSpec};

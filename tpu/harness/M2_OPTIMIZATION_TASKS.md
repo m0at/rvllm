@@ -160,7 +160,11 @@ Rust verification:
   top-level JSON contract from Rust (`arch`, `slice`, `nl`, `ctx`, `kv_cache`,
   `moe_impl`, `load_seconds`, `sweep`, `ppl`, `generation`) plus ABI runtime
   facts. Current status is explicit `planned` until graph execution is wired.
-- [ ] Wire the weight upload plan into live PJRT device buffers.
+- [x] Wire the weight upload plan into live PJRT device buffers behind
+  `rvllm-xla/tpu`: every safetensors view is validated for dtype/shape/bytes
+  against the ABI before `PJRT_Client_BufferFromHostBuffer`.
+- [ ] Build the Rust MLIR/custom-call graph that consumes uploaded weight
+  buffers and runtime decode inputs.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.
 - [ ] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime.
