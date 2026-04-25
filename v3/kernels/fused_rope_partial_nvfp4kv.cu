@@ -26,6 +26,9 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include "../../kernels/nvfp4_utils.cuh"
+// === HADAMARD ROTATION ===
+#include "../../kernels/hadamard.cuh"
+// === END HADAMARD ROTATION ===
 
 using rvllm_nvfp4::fp4_encode;
 
@@ -135,12 +138,43 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
     int num_kv_heads,
     int head_dim,
     int rotary_dim,
-    int scale_policy    // RVLLM_NVFP4_POLICY_* (see top of file)
+    int scale_policy,   // RVLLM_NVFP4_POLICY_* (see top of file)
+    // === HADAMARD ROTATION ===
+    // Per-layer ±1 sign vectors of length `head_dim` (i8 storage).
+    // When BOTH pointers are non-null, the kernel applies signed
+    // Walsh-Hadamard rotation R = H * diag(D) to Q post-RoPE pre-FP8-
+    // quantize, and to K post-RoPE pre-NVFP4-quantize. V is NOT
+    // rotated (rotating V requires also rotating O-proj weights).
+    // When EITHER pointer is null, rotation is bypassed and the kernel
+    // runs byte-identical to the pre-Hadamard path. The two pointers
+    // refer to two separate sign vectors so Q and K can be rotated
+    // independently if a future revision wants asymmetric structure;
+    // current production use sets both to the same per-layer vector.
+    const signed char* __restrict__ hadamard_signs_q,
+    const signed char* __restrict__ hadamard_signs_k
+    // === END HADAMARD ROTATION ===
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
     const int tid       = threadIdx.x;
+    // === HADAMARD ROTATION ===
+    // We KEEP all threads alive (no early return for tid>=head_dim)
+    // when rotation is enabled, because FWHT requires every thread in
+    // the block to participate in __syncthreads() and shared-memory
+    // butterflies. Caller launches with blockDim.x == head_dim, so
+    // tid < head_dim is always true at the launcher level.
+    // === END HADAMARD ROTATION ===
     if (tid >= head_dim) return;
+
+    // === HADAMARD ROTATION ===
+    // Shared-memory scratch for FWHT. Sized for the largest Gemma 4
+    // head_dim (=512). Allocated unconditionally (2 KiB) — well under
+    // the per-block smem budget. Only used when rotation is enabled;
+    // otherwise dead.
+    __shared__ float s_hadamard[512];
+    const bool hadamard_on =
+        (hadamard_signs_q != nullptr) && (hadamard_signs_k != nullptr);
+    // === END HADAMARD ROTATION ===
 
     const int half_head    = head_dim >> 1;
     const int half_rotary  = rotary_dim >> 1;
@@ -175,8 +209,33 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
         const int q_base = (token_idx * num_heads + head_idx) * head_dim;
         const float q_scale_inv = 1.0f / (*q_scale_ptr);
         float v = rope_one(q_in, q_base);
+        // === HADAMARD ROTATION ===
+        // Apply R = H * diag(D) to Q post-RoPE, before FP8 quantize.
+        // x_rot[tid] = sum_j H[tid,j] * D[j] * x[j], normalized by
+        // 1/sqrt(head_dim). All threads in this block cooperate via
+        // smem (block is per-(token, head_idx), so the smem buffer
+        // exactly covers one Q vector of length head_dim).
+        if (hadamard_on) {
+            s_hadamard[tid] = v;
+            __syncthreads();
+            rvllm_hadamard::apply_signs_f32(
+                s_hadamard, hadamard_signs_q, head_dim);
+            rvllm_hadamard::fwht_inplace_f32(s_hadamard, head_dim);
+            v = s_hadamard[tid];
+            // Don't need __syncthreads() after — each thread reads its
+            // own slot and the smem is reused below for K (which has
+            // its own __syncthreads BEFORE writing).
+        }
+        // === END HADAMARD ROTATION ===
         q_fp8_out[q_base + tid] = __nv_fp8_e4m3(v * q_scale_inv);
     }
+    // === HADAMARD ROTATION ===
+    // Sync between Q-rotation smem use and K-rotation smem use
+    // below. Even when hadamard_on is false this is a no-op cost
+    // (~1 cycle); when on, it ensures the smem buffer is safe to
+    // reuse for K.
+    __syncthreads();
+    // === END HADAMARD ROTATION ===
 
     // ---- K, V: NVFP4-packed cache write. ----
     if (head_idx < num_kv_heads) {
@@ -188,14 +247,41 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
         const int cache_off_scales = (slot * num_kv_heads + head_idx) * groups_per_head;
 
         // Helper to pack one (K or V) head.
+        // === HADAMARD ROTATION ===
+        // `apply_rotation` controls whether to apply Hadamard R to the
+        // post-RoPE values before quantize. Set true ONLY for K when
+        // hadamard_on; V is never rotated (would require rotating
+        // O-proj weights, separate lift).
+        // === END HADAMARD ROTATION ===
         auto quant_and_write = [&] (
             const __half* in,
             uint8_t*       out_packed,
             __nv_fp8_e4m3* out_scales,
-            bool           apply_rope
+            bool           apply_rope,
+            // === HADAMARD ROTATION ===
+            bool           apply_rotation
+            // === END HADAMARD ROTATION ===
         ) {
             float v = apply_rope ? rope_one(in, k_base)
                                  : __half2float(in[k_base + tid]);
+
+            // === HADAMARD ROTATION ===
+            // K rotation: same R as Q (orthogonal, so Q*K^T invariant).
+            // The MSE scale policy below now picks scales over the
+            // ROTATED K values — that's the intended Hadamard regime,
+            // since rotation flattens outliers and MSE picks better
+            // scales on the rotated distribution.
+            if (apply_rotation) {
+                __syncthreads();
+                s_hadamard[tid] = v;
+                __syncthreads();
+                rvllm_hadamard::apply_signs_f32(
+                    s_hadamard, hadamard_signs_k, head_dim);
+                rvllm_hadamard::fwht_inplace_f32(s_hadamard, head_dim);
+                v = s_hadamard[tid];
+                __syncthreads();
+            }
+            // === END HADAMARD ROTATION ===
 
             // Per-16-block scale selection. Default path is the
             // range-preserving OCP baseline (peak/6). The MSE path
@@ -252,7 +338,13 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
             }
         };
 
-        quant_and_write(k_in, key_cache_packed,   key_cache_scale,   /*apply_rope=*/true);
-        quant_and_write(v_in, value_cache_packed, value_cache_scale, /*apply_rope=*/false);
+        // === HADAMARD ROTATION ===
+        // K rotated when hadamard_on (Q is rotated above by the same R,
+        // so Q*K^T stays invariant). V never rotated.
+        quant_and_write(k_in, key_cache_packed,   key_cache_scale,
+                        /*apply_rope=*/true,  /*apply_rotation=*/hadamard_on);
+        quant_and_write(v_in, value_cache_packed, value_cache_scale,
+                        /*apply_rope=*/false, /*apply_rotation=*/false);
+        // === END HADAMARD ROTATION ===
     }
 }

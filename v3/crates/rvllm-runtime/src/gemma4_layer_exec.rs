@@ -301,6 +301,21 @@ pub struct Gemma4LayerScratch {
     /// and BEFORE `rope_nvfp4kv` clobbers it with another RoPE pass.
     pub shadow_q_cache: u64,
     // === END NVFP4 SHADOW DIAGNOSTIC ===
+    // === HADAMARD ROTATION ===
+    /// Device pointer to this layer's ±1 sign vector (i8 storage,
+    /// length `head_dim`) used as `D` in the signed Walsh-Hadamard
+    /// rotation `R = H * diag(D)` applied to Q post-RoPE pre-FP8-
+    /// quantize. `0` when rotation is disabled
+    /// (`RVLLM_NVFP4_HADAMARD` unset or kv_dtype != Nvfp4). The
+    /// rope kernel treats either pointer being null as "disabled"
+    /// and runs byte-identical to the pre-Hadamard path.
+    pub hadamard_signs_q: u64,
+    /// Companion to `hadamard_signs_q` for K. Production paths set
+    /// both to the same per-layer vector — kept as separate fields
+    /// so future revisions can experiment with asymmetric Q/K
+    /// rotation structures without touching the kernel ABI again.
+    pub hadamard_signs_k: u64,
+    // === END HADAMARD ROTATION ===
 }
 
 // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
@@ -2055,6 +2070,15 @@ unsafe fn rope_nvfp4kv(
     let mut positions = meta.positions;
     let mut slot_mapping = meta.slot_mapping;
     let mut q_scale_ptr = scratch.q_scale_ptr;
+    // === HADAMARD ROTATION ===
+    // Per-layer ±1 sign vectors for signed Walsh-Hadamard rotation
+    // of Q and K post-RoPE (NVFP4 path only). Both are 0 when
+    // disabled (master env gate `RVLLM_NVFP4_HADAMARD` off, OR
+    // sign tables not allocated). Rope kernel's `hadamard_on`
+    // requires BOTH non-null, so passing 0 cleanly disables.
+    let mut hadamard_signs_q = scratch.hadamard_signs_q;
+    let mut hadamard_signs_k = scratch.hadamard_signs_k;
+    // === END HADAMARD ROTATION ===
     let mut nt = dims.num_tokens as i32;
     let mut nh = dims.num_heads as i32;
     let mut nkvh = dims.num_kv_heads as i32;
@@ -2093,6 +2117,10 @@ unsafe fn rope_nvfp4kv(
         (&mut hd) as *mut i32 as *mut core::ffi::c_void,
         (&mut rd) as *mut i32 as *mut core::ffi::c_void,
         (&mut scale_policy) as *mut i32 as *mut core::ffi::c_void,
+        // === HADAMARD ROTATION ===
+        (&mut hadamard_signs_q) as *mut u64 as *mut core::ffi::c_void,
+        (&mut hadamard_signs_k) as *mut u64 as *mut core::ffi::c_void,
+        // === END HADAMARD ROTATION ===
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);

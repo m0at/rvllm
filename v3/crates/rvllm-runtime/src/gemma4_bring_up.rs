@@ -221,7 +221,136 @@ pub struct Gemma4Bringup {
     /// One-shot latch for first-token dump.
     pub nvfp4_shadow_dumped: std::sync::atomic::AtomicBool,
     // === END NVFP4 SHADOW DIAGNOSTIC ===
+    // === HADAMARD ROTATION ===
+    /// Per-layer ±1 sign vectors for signed Walsh-Hadamard rotation
+    /// of NVFP4 KV-cache K (and matching Q rotation pre-FP8). `None`
+    /// when `RVLLM_NVFP4_HADAMARD` is unset OR kv_dtype != Nvfp4.
+    /// Lazy-init on first `run_generate` (same pattern as
+    /// `nvfp4_shadow`); deterministic seed so the same run
+    /// reproduces identical R matrices across calls.
+    pub nvfp4_hadamard: std::sync::Mutex<Option<NvFp4HadamardAlloc>>,
+    // === END HADAMARD ROTATION ===
 }
+
+// === HADAMARD ROTATION ===
+/// Per-layer ±1 sign vectors. Total size = `num_layers * head_dim`
+/// bytes (i8 storage). Layer `l`'s slice begins at
+/// `base + l * head_dim` (head_dim is uniform across Gemma 4 layers
+/// at the rope-input level — both sliding and global use the same
+/// per-head dimension; `arch.max_head_dim()` covers both).
+pub struct NvFp4HadamardAlloc {
+    pub base_ptr: u64,
+    pub bytes: u64,
+    pub head_dim: u32,
+    pub num_layers: u32,
+}
+
+impl NvFp4HadamardAlloc {
+    /// Device pointer for layer `layer_idx`. Returns 0 when out of
+    /// range (caller should treat as "rotation disabled" — kernel's
+    /// nullptr check then bypasses).
+    pub fn layer_ptr(&self, layer_idx: u32) -> u64 {
+        if layer_idx >= self.num_layers {
+            return 0;
+        }
+        self.base_ptr + (layer_idx as u64) * (self.head_dim as u64)
+    }
+}
+
+/// Master env gate. Default OFF — production paths byte-identical
+/// when unset. Operator opts in by setting
+/// `RVLLM_NVFP4_HADAMARD=1` (any non-empty/non-"0" value enables).
+pub fn nvfp4_hadamard_enabled() -> bool {
+    std::env::var("RVLLM_NVFP4_HADAMARD")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Generate a deterministic ±1 sign byte from
+/// (layer_idx, channel_idx). Uses SplitMix32 (Java SplittableRandom
+/// finalizer) for full 32-bit avalanche — an earlier FNV-1a + `(h&1)`
+/// extractor here collapsed to a degenerate stride-2 pattern
+/// `[1,-1,1,-1,...]` for adjacent channels because the prime
+/// multiplier (0x01000193) preserves LSB parity, so the extracted
+/// bit was effectively `channel_idx mod 2`. That broke the
+/// rotation: R = H · diag(stride-2-±1) is structurally equivalent
+/// to a Walsh-Hadamard variant of half the rank, not a random
+/// orthogonal rotation.
+///
+/// SplitMix32: any single extracted bit is uncorrelated with
+/// channel_idx LSB. Same seed → same chain → reproducible across
+/// runs.
+fn sign_byte_for(layer_idx: u32, channel_idx: u32) -> i8 {
+    let seed = 0x9E3779B1u32
+        .wrapping_mul(layer_idx.wrapping_add(0xC2B2AE35))
+        .wrapping_add(channel_idx);
+    let mut h = seed;
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85EBCA6B);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xC2B2AE35);
+    h ^= h >> 16;
+    if (h & 1) == 0 { 1 } else { -1 }
+}
+
+/// Build the i8 sign-vector buffer host-side and upload to device.
+/// Returns `None` when `RVLLM_NVFP4_HADAMARD` is off.
+///
+/// Uses the same arena.region(...) + std::mem::forget pattern that
+/// `nvfp4_shadow` uses — region lives until the arena is dropped,
+/// which is bring-up scope (the `Gemma4Bringup` arena is `'static`).
+#[cfg(feature = "cuda")]
+pub fn build_nvfp4_hadamard_signs(
+    num_layers: u32,
+    head_dim: u32,
+    arena: &HbmArena<'_>,
+) -> Result<Option<NvFp4HadamardAlloc>> {
+    if !nvfp4_hadamard_enabled() {
+        return Ok(None);
+    }
+    let bytes = (num_layers as u64) * (head_dim as u64);
+    let mut host: Vec<i8> = Vec::with_capacity(bytes as usize);
+    for l in 0..num_layers {
+        for c in 0..head_dim {
+            host.push(sign_byte_for(l, c));
+        }
+    }
+    let region = arena.region("nvfp4_hadamard_signs", bytes as usize, 16)?;
+    let base_ptr = region.device_ptr();
+    unsafe {
+        let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
+            base_ptr,
+            host.as_ptr() as *const _,
+            bytes as usize,
+        );
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            std::mem::forget(region);
+            return Err(rvllm_core::RvllmError::Cuda {
+                kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                op: "cuMemcpyHtoD nvfp4_hadamard_signs",
+                ctx: rvllm_core::CudaCtx {
+                    stream: 0,
+                    kernel: "nvfp4_hadamard_signs_upload",
+                    launch: None,
+                    device: 0,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+    }
+    std::mem::forget(region);
+    eprintln!(
+        "[hadamard] uploaded {} layers × {} signs ({} bytes) to {:#x}",
+        num_layers, head_dim, bytes, base_ptr
+    );
+    Ok(Some(NvFp4HadamardAlloc {
+        base_ptr,
+        bytes,
+        head_dim,
+        num_layers,
+    }))
+}
+// === END HADAMARD ROTATION ===
 
 // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
 /// Parallel to the main KV region but: (a) only the instrumented
@@ -458,6 +587,11 @@ impl Gemma4Bringup {
             // NVFP4 shadow diagnostic state (lazy-init in run_generate).
             nvfp4_shadow: std::sync::Mutex::new(None),
             nvfp4_shadow_dumped: std::sync::atomic::AtomicBool::new(false),
+            // === HADAMARD ROTATION ===
+            // Lazy-init in `run_generate` once we know the head_dim
+            // and num_layers (mirroring nvfp4_shadow's lazy alloc).
+            nvfp4_hadamard: std::sync::Mutex::new(None),
+            // === END HADAMARD ROTATION ===
         })
     }
 
@@ -974,6 +1108,16 @@ impl Gemma4Bringup {
                     shadow_k_cache: 0,
                     shadow_v_cache: 0,
                     shadow_q_cache: 0,
+                    // === HADAMARD ROTATION ===
+                    // Probe / profile paths don't use rotation; the
+                    // rope kernel treats nullptr (=0) as "rotation
+                    // off" and runs byte-identical to the pre-Hadamard
+                    // path. Live decode/prefill paths below compute
+                    // the per-layer pointer from
+                    // `self.nvfp4_hadamard`.
+                    hadamard_signs_q: 0,
+                    hadamard_signs_k: 0,
+                    // === END HADAMARD ROTATION ===
                 };
 
                 let meta = Gemma4MetadataPtrs {
@@ -1445,6 +1589,16 @@ impl Gemma4Bringup {
                     shadow_k_cache: 0,
                     shadow_v_cache: 0,
                     shadow_q_cache: 0,
+                    // === HADAMARD ROTATION ===
+                    // Probe / profile paths don't use rotation; the
+                    // rope kernel treats nullptr (=0) as "rotation
+                    // off" and runs byte-identical to the pre-Hadamard
+                    // path. Live decode/prefill paths below compute
+                    // the per-layer pointer from
+                    // `self.nvfp4_hadamard`.
+                    hadamard_signs_q: 0,
+                    hadamard_signs_k: 0,
+                    // === END HADAMARD ROTATION ===
                 };
 
                 let meta = Gemma4MetadataPtrs {
@@ -2181,6 +2335,28 @@ impl Gemma4Bringup {
         } else { (0, 0, 0) };
         // === END NVFP4 SHADOW DIAGNOSTIC ===
 
+        // === HADAMARD ROTATION ===
+        // Lazy-init the per-layer Hadamard sign vectors on first run
+        // (gated by env). All layers share the same head_dim at the
+        // rope-input level (Gemma 4: sliding heads use head_dim=256,
+        // global heads use head_dim=512 — but rotation buffer is
+        // sized to `arch.max_head_dim()` so both fit; sliding layers
+        // use the leading head_dim bytes of their slot).
+        let hadamard_base_ptr: u64 = if nvfp4_hadamard_enabled() {
+            let mut guard = self.nvfp4_hadamard.lock().unwrap();
+            if guard.is_none() {
+                let max_hd = arch.max_head_dim() as u32;
+                let nl = arch.num_hidden_layers as u32;
+                *guard = build_nvfp4_hadamard_signs(nl, max_hd, arena)?;
+            }
+            guard.as_ref().map(|a| a.base_ptr).unwrap_or(0)
+        } else {
+            0
+        };
+        let hadamard_head_dim_stride: u32 =
+            if hadamard_base_ptr != 0 { arch.max_head_dim() as u32 } else { 0 };
+        // === END HADAMARD ROTATION ===
+
         // Helper: run one token through all layers (decode path)
         let run_one_token = |tok_id: u32, step: usize| -> Result<()> {
             let tok_i32 = [tok_id as i32];
@@ -2319,6 +2495,21 @@ impl Gemma4Bringup {
                     0
                 };
                 // === END NVFP4 SHADOW DIAGNOSTIC ===
+                // === HADAMARD ROTATION ===
+                // Per-layer pointer into the sign-vector base buffer.
+                // Only enabled on NVFP4 layers (other dtypes' rope
+                // launchers don't read these fields). Both Q and K
+                // share the same per-layer vector — see comment on
+                // the field declaration.
+                let hadamard_layer_ptr: u64 = if hadamard_base_ptr != 0
+                    && kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                {
+                    hadamard_base_ptr
+                        + (layer_idx as u64) * (hadamard_head_dim_stride as u64)
+                } else {
+                    0
+                };
+                // === END HADAMARD ROTATION ===
                 let scratch = crate::gemma4_layer_exec::Gemma4LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(), hidden_scale: hidden_scale.device_ptr(),
                     q_out: q_base, k_out, v_out,
@@ -2344,6 +2535,10 @@ impl Gemma4Bringup {
                     shadow_k_cache: shadow_k,
                     shadow_v_cache: shadow_v,
                     shadow_q_cache: shadow_q,
+                    // === HADAMARD ROTATION ===
+                    hadamard_signs_q: hadamard_layer_ptr,
+                    hadamard_signs_k: hadamard_layer_ptr,
+                    // === END HADAMARD ROTATION ===
                 };
                 let meta = crate::gemma4_layer_exec::Gemma4MetadataPtrs {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
@@ -2665,6 +2860,16 @@ impl Gemma4Bringup {
                     0
                 };
                 // === END NVFP4 SHADOW DIAGNOSTIC ===
+                // === HADAMARD ROTATION ===
+                let prefill_hadamard_layer_ptr: u64 = if hadamard_base_ptr != 0
+                    && prefill_kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                {
+                    hadamard_base_ptr
+                        + (layer_idx as u64) * (hadamard_head_dim_stride as u64)
+                } else {
+                    0
+                };
+                // === END HADAMARD ROTATION ===
                 let scratch = crate::gemma4_layer_exec::Gemma4LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(), hidden_scale: hidden_scale.device_ptr(),
                     q_out: q_base, k_out, v_out,
@@ -2690,6 +2895,10 @@ impl Gemma4Bringup {
                     shadow_k_cache: prefill_shadow_k,
                     shadow_v_cache: prefill_shadow_v,
                     shadow_q_cache: prefill_shadow_q,
+                    // === HADAMARD ROTATION ===
+                    hadamard_signs_q: prefill_hadamard_layer_ptr,
+                    hadamard_signs_k: prefill_hadamard_layer_ptr,
+                    // === END HADAMARD ROTATION ===
                 };
                 let meta = crate::gemma4_layer_exec::Gemma4MetadataPtrs {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),

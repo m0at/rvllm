@@ -152,9 +152,9 @@
       "sha256": "8f9200f4742875d0e75b4e1480cab280e6a1a09cc7a82c968c1b0680457f903c"
     },
     "fused_rope_partial_nvfp4kv": {
-      "bytes": 30796,
+      "bytes": 33931,
       "path": "fused_rope_partial_nvfp4kv.ptx",
-      "sha256": "86d742df3ad1f94fd029ddd3f3d61b822d6868c18faa5b230503061723dd1716"
+      "sha256": "92bd84f911e21c93e625346a75f712d09fe05ab85b41aa2ff9b6d6fbfe4f1e21"
     },
     "fused_silu_fp8_quant": {
       "bytes": 21129,
@@ -242,5 +242,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "81e66fac75a646a6eabc5e287f0eedcc6528bd47-pscale-fix"
+  "revision": "e2fd52f"
 }
