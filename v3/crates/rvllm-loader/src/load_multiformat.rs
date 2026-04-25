@@ -658,7 +658,7 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
     let s: u8 = if v.to_bits() >> 31 != 0 { 0x80 } else { 0 };
     let a = v.abs();
     if a == 0.0 {
-        return s;
+        return 0;
     }
     if a > FP8_E4M3_MAX {
         return s | 0x7e;

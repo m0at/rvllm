@@ -1510,10 +1510,10 @@ mod tests {
     #[test]
     fn dequant_group32_matches_layout() {
         let packed = vec![
-            0x8765_4321i32,
+            0x8765_4321u32 as i32,
             0x0fed_cba9i32,
             0x7654_3210i32,
-            0xfedc_ba98i32,
+            0xfedc_ba98u32 as i32,
         ];
         let scales = vec![bf16::from_f32(2.0)];
         let out = dequant_int4_group32(&packed, &scales, 1, 32).unwrap();
@@ -1522,6 +1522,6 @@ mod tests {
         assert_eq!(out[1], -12.0);
         assert_eq!(out[7], 0.0);
         assert_eq!(out[8], 2.0);
-        assert_eq!(out[15], 16.0);
+        assert_eq!(out[15], -16.0);
     }
 }

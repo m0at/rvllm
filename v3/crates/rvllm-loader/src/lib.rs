@@ -16,11 +16,16 @@ pub mod gemma4_weights;
 pub mod k2_cpu;
 pub mod load;
 pub mod load_multiformat;
+pub mod minimax_m2;
 pub mod safetensors;
 pub mod weights;
 
 pub use fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, QuantResult, FP8_E4M3_MAX};
 pub use k2_cpu::{K2Arch, K2CpuExpertStore};
 pub use load::{load_model, LayerAttnType, MlpActivation, ModelArch};
+pub use minimax_m2::{
+    M2CheckpointIndex, M2CheckpointSummary, M2Nvfp4TensorNames, M2Nvfp4TensorView, M2Projection,
+    M2SafetensorsReader, M2TensorView,
+};
 pub use safetensors::{ShardHeader, ShardIndex, TensorEntry};
 pub use weights::{F16Weight, Fp8Weight, LayerWeights, LoadedModel};

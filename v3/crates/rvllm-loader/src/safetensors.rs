@@ -126,18 +126,17 @@ fn map_dtype(s: &str) -> Option<DType> {
         "F32" => DType::F32,
         "F16" => DType::F16,
         "BF16" => DType::Bf16,
-        "F8_E4M3" | "F8E4M3" => DType::Fp8E4M3,
+        "U8" | "UINT8" => DType::U8,
+        "I32" => DType::I32,
+        "U32" => DType::U32,
+        "F8_E4M3" | "F8E4M3" | "F8_E4M3FN" | "FLOAT8_E4M3FN" => DType::Fp8E4M3,
+        "F8_E5M2" | "F8E5M2" => DType::Fp8E5M2,
         _ => return None,
     })
 }
 
 fn dtype_bytes(d: DType) -> usize {
-    match d {
-        DType::F32 => 4,
-        DType::F16 | DType::Bf16 => 2,
-        DType::Fp8E4M3 => 1,
-        _ => 0,
-    }
+    d.bytes()
 }
 
 /// HF often ships sharded models: `model.safetensors.index.json`

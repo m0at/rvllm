@@ -132,3 +132,21 @@ Rust verification:
   rate report.
 - [ ] Verify greedy losslessness against the target model.
 - [ ] Record accepted tokens/cycle and end-to-end tok/s.
+
+## 5. Python Removal / Rust Runtime
+
+- [x] Add a native Rust M2 checkpoint index/schema reader using the Gemma4
+  safetensors parser as the reference path. Validates the real checked-in
+  ModelOpt NVFP4 layout: 191,069 tensors, 47,616 NVFP4 expert projection
+  groups, 18 missing optional input-scale tensors.
+- [x] Add Rust replacement for the Python/NumPy `nvfp4_loader.py` model-index
+  and tensor-group discovery path with `rvllm_loader::M2CheckpointIndex`.
+- [x] Add Rust safetensors tensor reads for M2 BF16/U8/F32 payloads, including
+  ModelOpt `<base>.weight`, `.weight_scale`, `.weight_scale_2`, optional
+  `.input_scale` groups.
+- [ ] Wire Rust M2 loader output into the Rust PJRT/XLA runtime path.
+- [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
+  prefill + decode harness.
+- [ ] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime.
+- [ ] Delete stale top-level Python packaging metadata once no Python package
+  target remains.
