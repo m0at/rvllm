@@ -144,6 +144,10 @@ Rust verification:
 - [x] Add Rust safetensors tensor reads for M2 BF16/U8/F32 payloads, including
   ModelOpt `<base>.weight`, `.weight_scale`, `.weight_scale_2`, optional
   `.input_scale` groups.
+- [x] Add Rust M2 prefill planning path in `rvllm-xla`: validates the M2
+  checkpoint index, builds BxT prompt metadata, emits PJRT input specs without
+  allocating the large KV buffer, and exposes `m2_rust_prefill` for dry-run or
+  TPU execution.
 - [ ] Wire Rust M2 loader output into the Rust PJRT/XLA runtime path.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.
