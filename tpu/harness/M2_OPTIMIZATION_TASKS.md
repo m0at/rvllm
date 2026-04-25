@@ -152,5 +152,5 @@ Rust verification:
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.
 - [ ] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime.
-- [ ] Delete stale top-level Python packaging metadata once no Python package
+- [x] Delete stale top-level Python packaging metadata once no Python package
   target remains.
