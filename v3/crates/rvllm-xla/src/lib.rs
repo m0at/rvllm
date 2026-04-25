@@ -32,7 +32,10 @@ pub use m2_graph_abi::{
 pub use m2_prefill::{
     make_m2_prefill_input_specs, make_m2_prefill_inputs, M2PrefillHostInput, M2PrefillHostInputSpec,
 };
-pub use m2_runtime::{plan_m2_rust_prefill, M2RustPrefillConfig, M2RustPrefillPlan};
+pub use m2_runtime::{
+    plan_m2_rust_prefill, plan_m2_rust_prefill_decode, M2DecodeRuntimeInputSpec,
+    M2RustPrefillConfig, M2RustPrefillDecodeConfig, M2RustPrefillDecodePlan, M2RustPrefillPlan,
+};
 #[cfg(feature = "tpu")]
 pub use m2_weight_plan::{M2UploadedWeightBuffer, M2UploadedWeights};
 pub use m2_weight_plan::{

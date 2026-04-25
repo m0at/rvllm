@@ -171,6 +171,11 @@ Rust verification:
   `weight_arena -> logits`, `next_token`, `kv_cache`).
 - [x] Replace the decode graph contract placeholder with real layer bodies /
   custom calls that consume arena offsets.
+- [x] Add Rust prefill+decode sequence runner: one batched prefill plan, one
+  decode graph plan, int8 KV contract, decode token/position seeds, optional
+  decode-MLIR emission, and TPU-gated batched-prefill execution.
+- [ ] Add flat weight-arena upload path for PJRT decode execution.
+- [ ] Wire PJRT decode execution loop over the Rust decode graph.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.
 - [ ] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime.
