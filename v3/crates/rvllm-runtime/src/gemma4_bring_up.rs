@@ -2954,6 +2954,36 @@ impl Gemma4Bringup {
             let next_id = host_tok[0] as u32;
             output_ids.push(next_id);
             if eos_ids.contains(&next_id) { break; }
+
+            // Repetition guard. When a low-precision KV path (e.g.
+            // pure NVFP4) lands in a near-tied logit state — typically
+            // inside tool-call markup or an unfamiliar prompt
+            // continuation — the model can lock into a single-token
+            // attractor and emit the same token thousands of times,
+            // wasting GPU and producing empty visible content (when
+            // the locked token sits inside markup that
+            // `strip_tool_markup` removes).
+            //
+            // Bound cost via `RVLLM_REPETITION_GUARD_N` (default 20,
+            // set 0 to disable). If the last N decoded tokens are
+            // all the same id, abort cleanly: callers see a normal
+            // stream end with whatever was produced so far. The
+            // guard only fires after at least N decode steps; short
+            // legitimate completions (e.g. classifier "REPLY")
+            // never trigger it.
+            let guard_n: usize = std::env::var("RVLLM_REPETITION_GUARD_N")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+            if guard_n >= 2 && output_ids.len() >= guard_n {
+                let tail = &output_ids[output_ids.len() - guard_n..];
+                if tail.iter().all(|&id| id == tail[0]) {
+                    eprintln!(
+                        "[repetition-guard] same token {} repeated {} times — \
+                         aborting decode at step {}",
+                        tail[0], guard_n, decode_step + 1
+                    );
+                    break;
+                }
+            }
         }
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
