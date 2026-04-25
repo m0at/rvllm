@@ -14,6 +14,7 @@ pub mod gemma4_launcher;
 pub mod gemma4_reference;
 pub mod launch_raw;
 pub mod launcher;
+pub mod m2_nvfp4;
 pub mod reference;
 
 pub use launch_raw::launch_raw;
@@ -22,6 +23,10 @@ pub use launcher::{
     FusedAddRmsnormFp8QuantLaunch, FusedRmsnormFp8QuantLaunch, FusedRopeCacheFp8KvLaunch,
     FusedRopeKvWriteLaunch, FusedSiluMulFp8QuantLaunch, QuantizeFp8PerTokenLaunch,
     ResidualAddF16Launch,
+};
+pub use m2_nvfp4::{
+    decode_fp4_e2m1, decode_fp8_e4m3, nvfp4_matmul_ref, nvfp4_weight_at,
+    M2Nvfp4MatmulShape, FP4_E2M1_LUT, NVFP4_GROUP,
 };
 pub use reference::{
     argmax_ref, embedding_gather_ref, fused_add_rmsnorm_fp8_quant_ref,

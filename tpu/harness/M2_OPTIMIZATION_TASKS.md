@@ -42,14 +42,21 @@ Recorded int8-KV results:
 
 ## 2. Custom Mosaic/MLIR Fused NVFP4 Matmul
 
-- [ ] Write a minimal Mosaic/MLIR custom-call scaffold outside the hot path.
-- [ ] Build the first kernel that accepts packed `uint8` NVFP4 weights and FP8
+- [x] Write a minimal Mosaic/MLIR custom-call scaffold outside the hot path.
+- [x] Build the first kernel that accepts packed `uint8` NVFP4 weights and FP8
   scales.
 - [ ] Decode FP4/FP8 in VMEM/registers and feed bf16 RHS tiles to TPU matmul
   without high-level Pallas layout inference.
 - [ ] Match `nvfp4_matmul` exactly on small random tensors.
 - [ ] Replace only one projection behind an env flag and verify B=8 output.
 - [ ] If faster, wire all MoE projections behind a correctness gate.
+
+Rust artifacts:
+
+- `rvllm_fused::m2_nvfp4`: exact Rust NVFP4 decode + matmul reference.
+- `m2_emit_nvfp4_mosaic`: emits the M2 Mosaic custom-call MLIR signature.
+- `tpu/out/m2/rvllm_m2_nvfp4_matmul.mlir`: generated B=8 gate/up kernel
+  scaffold (`x_bf16`, packed NVFP4 `uint8`, FP8 scales, global scale, bf16 out).
 
 ## 3. Batched Prefill
 
