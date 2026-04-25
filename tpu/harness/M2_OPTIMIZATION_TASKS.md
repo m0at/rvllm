@@ -152,7 +152,11 @@ Rust verification:
   inputs/outputs, flat KV byte buffer, logits/last-hidden outputs, dense BF16
   weight specs, and ModelOpt NVFP4 expert projection groups. Validated against
   the real 191,069-tensor M2 checkpoint index.
-- [ ] Wire Rust M2 loader output into the Rust PJRT/XLA runtime path.
+- [x] Wire Rust M2 loader/index output into a PJRT weight upload plan:
+  191,069 tensor specs, real shard filenames, dense BF16 weights, packed
+  NVFP4/FP8/global-scale/input-scale expert tensors, and total flat upload byte
+  budget without Python.
+- [ ] Wire the weight upload plan into live PJRT device buffers.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.
 - [ ] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime.
