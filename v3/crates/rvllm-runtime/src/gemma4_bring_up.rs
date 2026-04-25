@@ -3120,6 +3120,49 @@ impl Gemma4Bringup {
                     break;
                 }
             }
+            // Cycle-aware guard: catches multi-token attractors where
+            // a small set of tokens cycles (e.g. Korean lock observed
+            // 2026-04-25 with token 237372='서' alternating with
+            // 7246='으로', 237490='도', etc. — no token reaches
+            // `guard_n` consecutive but a 32-token window contains
+            // only 5-8 distinct ids, with one dominating ~50%+).
+            //
+            // Triggers when EITHER:
+            //   (a) some token covers >= MAX_FRAC of last K decoded
+            //       tokens (default K=32, MAX_FRAC=0.5 → 16/32);
+            //   (b) the last K tokens contain <= MAX_UNIQUE distinct
+            //       ids (default 5).
+            //
+            // RVLLM_REPETITION_CYCLE_K          window (default 32, 0=disabled)
+            // RVLLM_REPETITION_CYCLE_MAX_FRAC   ratio (default 0.5)
+            // RVLLM_REPETITION_CYCLE_MAX_UNIQUE distinct count (default 5)
+            let cycle_k: usize = std::env::var("RVLLM_REPETITION_CYCLE_K")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+            if cycle_k >= 8 && output_ids.len() >= cycle_k {
+                let cycle_frac: f32 = std::env::var("RVLLM_REPETITION_CYCLE_MAX_FRAC")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+                let cycle_max_unique: usize = std::env::var("RVLLM_REPETITION_CYCLE_MAX_UNIQUE")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+                let win = &output_ids[output_ids.len() - cycle_k..];
+                let mut counts: std::collections::HashMap<u32, u32> =
+                    std::collections::HashMap::new();
+                for &id in win { *counts.entry(id).or_insert(0) += 1; }
+                let unique_count = counts.len();
+                let max_count = counts.values().copied().max().unwrap_or(0);
+                let max_frac = (max_count as f32) / (cycle_k as f32);
+                if unique_count <= cycle_max_unique || max_frac >= cycle_frac {
+                    let dom_id = counts.iter().max_by_key(|(_, &c)| c)
+                        .map(|(id, _)| *id).unwrap_or(0);
+                    eprintln!(
+                        "[repetition-guard] cycle detected — last {} tokens \
+                         have {} unique ids (max id {} = {:.0}%) — aborting \
+                         decode at step {}",
+                        cycle_k, unique_count, dom_id,
+                        max_frac * 100.0, decode_step + 1
+                    );
+                    break;
+                }
+            }
         }
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
