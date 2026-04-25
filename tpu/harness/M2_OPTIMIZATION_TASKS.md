@@ -166,8 +166,11 @@ Rust verification:
 - [x] Add flat weight-arena planning: 191,069 logical tensors become one
   aligned byte-addressable arena ABI with per-tensor offsets, roles, shapes,
   and dtypes. This is the graph-facing layout; no 191k graph arguments.
-- [ ] Build the Rust MLIR/custom-call graph that consumes uploaded weight
-  buffers and runtime decode inputs.
+- [x] Emit the Rust decode MLIR/custom-call graph contract over runtime decode
+  inputs plus the flat weight arena (`token_ids`, `positions`, `kv_cache`,
+  `weight_arena -> logits`, `next_token`, `kv_cache`).
+- [ ] Replace the decode graph contract placeholder with real layer bodies /
+  custom calls that consume arena offsets.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.
 - [ ] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime.

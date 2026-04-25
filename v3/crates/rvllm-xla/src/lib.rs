@@ -3,6 +3,7 @@ pub mod artifact;
 pub mod client;
 pub mod ffi;
 pub mod m2_decode_bench;
+pub mod m2_decode_graph;
 pub mod m2_graph_abi;
 pub mod m2_prefill;
 pub mod m2_runtime;
@@ -19,6 +20,7 @@ pub use m2_decode_bench::{
     plan_m2_rust_decode_bench, M2RustDecodeBenchConfig, M2RustDecodeBenchReport,
     M2RustDecodeRuntimeReport, M2RustDecodeSweepItem,
 };
+pub use m2_decode_graph::m2_decode_graph_mlir;
 pub use m2_graph_abi::{
     M2GraphAbi, M2GraphPhase, M2GraphShape, M2GraphTensorSpec, M2LayerWeightAbi,
     M2Nvfp4ProjectionAbi, M2_HEAD_DIM, M2_HIDDEN, M2_MOE_INTER, M2_NUM_EXPERTS, M2_NUM_KV_HEADS,
