@@ -25,8 +25,9 @@ pub use launcher::{
     ResidualAddF16Launch,
 };
 pub use m2_nvfp4::{
-    decode_fp4_e2m1, decode_fp8_e4m3, nvfp4_matmul_ref, nvfp4_weight_at,
-    M2Nvfp4MatmulShape, FP4_E2M1_LUT, NVFP4_GROUP,
+    decode_fp4_e2m1, decode_fp8_e4m3, nvfp4_matmul_ref, nvfp4_weight_at, M2Nvfp4MatmulShape,
+    M2Nvfp4MosaicMemory, M2Nvfp4MosaicTilePlan, FP4_E2M1_LUT, M2_MOSAIC_DEFAULT_BK,
+    M2_MOSAIC_DEFAULT_BN, NVFP4_GROUP,
 };
 pub use reference::{
     argmax_ref, embedding_gather_ref, fused_add_rmsnorm_fp8_quant_ref,

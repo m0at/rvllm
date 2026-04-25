@@ -45,18 +45,30 @@ Recorded int8-KV results:
 - [x] Write a minimal Mosaic/MLIR custom-call scaffold outside the hot path.
 - [x] Build the first kernel that accepts packed `uint8` NVFP4 weights and FP8
   scales.
+- [x] Pin the Rust-side B=8 Mosaic tile contract (`BM=8, BN=512, BK=1024`),
+  including packed/scales/decoded-RHS/accumulator VMEM working-set accounting.
+- [x] Match the Rust NVFP4 matmul reference exactly against expanded dequant on
+  deterministic small tensors.
 - [ ] Decode FP4/FP8 in VMEM/registers and feed bf16 RHS tiles to TPU matmul
   without high-level Pallas layout inference.
-- [ ] Match `nvfp4_matmul` exactly on small random tensors.
+- [ ] Match TPU/JAX `nvfp4_matmul` exactly on small random tensors.
 - [ ] Replace only one projection behind an env flag and verify B=8 output.
 - [ ] If faster, wire all MoE projections behind a correctness gate.
 
 Rust artifacts:
 
 - `rvllm_fused::m2_nvfp4`: exact Rust NVFP4 decode + matmul reference.
-- `m2_emit_nvfp4_mosaic`: emits the M2 Mosaic custom-call MLIR signature.
+- `rvllm_fused::M2Nvfp4MosaicTilePlan`: B=8/B=16 tile contract and VMEM
+  working-set accounting for fused decode -> bf16 RHS tile -> TPU matmul.
+- `m2_emit_nvfp4_mosaic`: emits the M2 Mosaic custom-call MLIR signature plus
+  explicit `BM/BN/BK` tile metadata.
 - `tpu/out/m2/rvllm_m2_nvfp4_matmul.mlir`: generated B=8 gate/up kernel
-  scaffold (`x_bf16`, packed NVFP4 `uint8`, FP8 scales, global scale, bf16 out).
+  scaffold (`x_bf16`, packed NVFP4 `uint8`, FP8 scales, global scale, bf16 out;
+  `BM=8, BN=512, BK=1024`, 1.38 MB per-tile working set).
+
+Rust verification:
+
+- `cargo test -p rvllm-fused m2_nvfp4 --release` (6 tests passing)
 
 ## 3. Batched Prefill
 

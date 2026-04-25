@@ -7,6 +7,8 @@
 use rvllm_core::{ConfigError, Result, RvllmError};
 
 pub const NVFP4_GROUP: usize = 16;
+pub const M2_MOSAIC_DEFAULT_BN: usize = 512;
+pub const M2_MOSAIC_DEFAULT_BK: usize = 1024;
 
 pub const FP4_E2M1_LUT: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -17,6 +19,24 @@ pub struct M2Nvfp4MatmulShape {
     pub m: usize,
     pub n: usize,
     pub k: usize,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct M2Nvfp4MosaicTilePlan {
+    pub bm: usize,
+    pub bn: usize,
+    pub bk: usize,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct M2Nvfp4MosaicMemory {
+    pub x_bf16_bytes: usize,
+    pub rhs_packed_bytes: usize,
+    pub rhs_scale_bytes: usize,
+    pub rhs_decoded_bf16_bytes: usize,
+    pub acc_f32_bytes: usize,
+    pub out_bf16_bytes: usize,
+    pub total_bytes: usize,
 }
 
 impl M2Nvfp4MatmulShape {
@@ -46,11 +66,29 @@ impl M2Nvfp4MatmulShape {
         self.m * self.n
     }
 
+    pub fn default_mosaic_plan(self) -> M2Nvfp4MosaicTilePlan {
+        M2Nvfp4MosaicTilePlan {
+            bm: self.m.min(8),
+            bn: M2_MOSAIC_DEFAULT_BN.min(self.n),
+            bk: M2_MOSAIC_DEFAULT_BK.min(self.k),
+        }
+    }
+
     pub fn mosaic_mlir(self, kernel_name: &str) -> Result<String> {
+        self.mosaic_mlir_with_plan(kernel_name, self.default_mosaic_plan())
+    }
+
+    pub fn mosaic_mlir_with_plan(
+        self,
+        kernel_name: &str,
+        plan: M2Nvfp4MosaicTilePlan,
+    ) -> Result<String> {
         self.validate()?;
+        plan.validate_for(self)?;
         if !is_mlir_symbol(kernel_name) {
             return Err(invalid("kernel_name", "must be an MLIR symbol"));
         }
+        let mem = plan.memory();
         Ok(format!(
             r#"module attributes {{rvllm.kind = "m2_nvfp4_mosaic"}} {{
   func.func @{kernel_name}(
@@ -62,13 +100,31 @@ impl M2Nvfp4MatmulShape {
         rvllm.signature = "x_bf16,packed_u8,scale_fp8,global_f32,out_bf16",
         rvllm.layout = "row_major",
         rvllm.nvfp4_group = {group} : i64,
-        rvllm.lowering = "mosaic_custom_call"
+        rvllm.tile = "BM={bm},BN={bn},BK={bk}",
+        rvllm.tiles = "M={tm},N={tn},K={tk}",
+        rvllm.vmem_working_set_bytes = {working_set} : i64,
+        rvllm.lowering = "mosaic_custom_call",
+        rvllm.lowering_plan = "tpu.load packed/scales -> unpack nibbles -> fp8/fp4 decode in VMEM/registers -> bf16 RHS tile -> tpu.matmul -> tpu.store"
       }} {{
-    // TODO: lower body to Mosaic TPU dialect:
-    // 1. load packed uint8 and FP8 E4M3 scales from HBM
-    // 2. decode FP4 E2M1 nibbles and FP8 scales in VMEM/registers
-    // 3. feed bf16 RHS tiles to TPU matmul
-    // 4. write bf16 output tile to %out
+    // Tile contract:
+    //   x tile bf16 bytes: {x_bytes}
+    //   packed NVFP4 RHS tile bytes: {packed_bytes}
+    //   FP8 scale tile bytes: {scale_bytes}
+    //   decoded bf16 RHS tile bytes: {rhs_bf16_bytes}
+    //   f32 accumulator bytes: {acc_bytes}
+    //   output tile bf16 bytes: {out_bytes}
+    //
+    // Lowering outline for the real Mosaic body:
+    //   for m_tile, n_tile:
+    //     acc = f32[BM, BN]
+    //     for k_tile:
+    //       tpu.load x[BM, BK] as bf16
+    //       tpu.load packed[BN, BK/2] and scales[BN, BK/16]
+    //       tpu.unpack_subelements packed uint8 -> low/high FP4 E2M1 nibbles
+    //       decode FP8 E4M3 scales and multiply by global_scale
+    //       materialize only this RHS bf16[BN, BK] tile in VMEM/registers
+    //       tpu.matmul x[BM, BK] * rhs[BN, BK]^T into acc
+    //     tpu.store acc cast bf16 to out[BM, BN]
     return
   }}
 }}
@@ -79,7 +135,74 @@ impl M2Nvfp4MatmulShape {
             k_half = self.k / 2,
             k_scale = self.k / NVFP4_GROUP,
             group = NVFP4_GROUP,
+            bm = plan.bm,
+            bn = plan.bn,
+            bk = plan.bk,
+            tm = div_ceil(self.m, plan.bm),
+            tn = div_ceil(self.n, plan.bn),
+            tk = div_ceil(self.k, plan.bk),
+            working_set = mem.total_bytes,
+            x_bytes = mem.x_bf16_bytes,
+            packed_bytes = mem.rhs_packed_bytes,
+            scale_bytes = mem.rhs_scale_bytes,
+            rhs_bf16_bytes = mem.rhs_decoded_bf16_bytes,
+            acc_bytes = mem.acc_f32_bytes,
+            out_bytes = mem.out_bf16_bytes,
         ))
+    }
+}
+
+impl M2Nvfp4MosaicTilePlan {
+    pub const fn new(bm: usize, bn: usize, bk: usize) -> Self {
+        Self { bm, bn, bk }
+    }
+
+    pub fn validate_for(self, shape: M2Nvfp4MatmulShape) -> Result<()> {
+        if self.bm == 0 || self.bn == 0 || self.bk == 0 {
+            return Err(invalid("tile", "bm/bn/bk must be > 0"));
+        }
+        if self.bk % NVFP4_GROUP != 0 {
+            return Err(invalid("bk", "must be a multiple of 16"));
+        }
+        if self.bm > shape.m || self.bn > shape.n || self.bk > shape.k {
+            return Err(invalid("tile", "must not exceed shape"));
+        }
+        Ok(())
+    }
+
+    pub const fn rhs_packed_bytes(self) -> usize {
+        self.bn * (self.bk / 2)
+    }
+
+    pub const fn rhs_scale_bytes(self) -> usize {
+        self.bn * (self.bk / NVFP4_GROUP)
+    }
+
+    pub const fn memory(self) -> M2Nvfp4MosaicMemory {
+        let x_bf16_bytes = self.bm * self.bk * 2;
+        let rhs_packed_bytes = self.rhs_packed_bytes();
+        let rhs_scale_bytes = self.rhs_scale_bytes();
+        let rhs_decoded_bf16_bytes = self.bn * self.bk * 2;
+        let acc_f32_bytes = self.bm * self.bn * 4;
+        let out_bf16_bytes = self.bm * self.bn * 2;
+        M2Nvfp4MosaicMemory {
+            x_bf16_bytes,
+            rhs_packed_bytes,
+            rhs_scale_bytes,
+            rhs_decoded_bf16_bytes,
+            acc_f32_bytes,
+            out_bf16_bytes,
+            total_bytes: x_bf16_bytes
+                + rhs_packed_bytes
+                + rhs_scale_bytes
+                + rhs_decoded_bf16_bytes
+                + acc_f32_bytes
+                + out_bf16_bytes,
+        }
+    }
+
+    pub const fn fits_vmem(self, budget_bytes: usize) -> bool {
+        self.memory().total_bytes <= budget_bytes
     }
 }
 
@@ -172,6 +295,10 @@ fn is_mlir_symbol(s: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+const fn div_ceil(a: usize, b: usize) -> usize {
+    (a + b - 1) / b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,11 +337,81 @@ mod tests {
 
     #[test]
     fn emits_real_m2_signature() {
-        let shape = M2Nvfp4MatmulShape { m: 8, n: 1536, k: 3072 };
+        let shape = M2Nvfp4MatmulShape {
+            m: 8,
+            n: 1536,
+            k: 3072,
+        };
         let mlir = shape.mosaic_mlir("rvllm_m2_nvfp4_matmul").unwrap();
         assert!(mlir.contains("memref<8x3072xbf16>"));
         assert!(mlir.contains("memref<1536x1536xi8>"));
         assert!(mlir.contains("memref<1536x192xi8>"));
+        assert!(mlir.contains("rvllm.tile = \"BM=8,BN=512,BK=1024\""));
+        assert!(mlir.contains("rvllm.vmem_working_set_bytes = 1384448 : i64"));
         assert!(mlir.contains("rvllm.lowering = \"mosaic_custom_call\""));
+    }
+
+    #[test]
+    fn mosaic_tile_plan_fits_gate_up_and_down_shapes() {
+        let gate_up = M2Nvfp4MatmulShape {
+            m: 8,
+            n: 1536,
+            k: 3072,
+        };
+        let down = M2Nvfp4MatmulShape {
+            m: 8,
+            n: 3072,
+            k: 1536,
+        };
+        let plan = M2Nvfp4MosaicTilePlan::new(8, 512, 1024);
+        plan.validate_for(gate_up).unwrap();
+        plan.validate_for(down).unwrap();
+        let mem = plan.memory();
+        assert_eq!(mem.x_bf16_bytes, 16_384);
+        assert_eq!(mem.rhs_packed_bytes, 262_144);
+        assert_eq!(mem.rhs_scale_bytes, 32_768);
+        assert_eq!(mem.rhs_decoded_bf16_bytes, 1_048_576);
+        assert_eq!(mem.acc_f32_bytes, 16_384);
+        assert_eq!(mem.out_bf16_bytes, 8_192);
+        assert_eq!(mem.total_bytes, 1_384_448);
+        assert!(plan.fits_vmem(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn matmul_ref_matches_expanded_dequant_on_deterministic_tensor() {
+        let shape = M2Nvfp4MatmulShape { m: 3, n: 5, k: 32 };
+        let x: Vec<f32> = (0..shape.x_len())
+            .map(|i| ((i * 17 + 3) % 29) as f32 / 7.0 - 2.0)
+            .collect();
+        let packed: Vec<u8> = (0..shape.packed_len())
+            .map(|i| ((i * 13 + 7) & 0xff) as u8)
+            .collect();
+        let fp8_scales = [0x30u8, 0x34, 0x38, 0x3c, 0x40, 0x44, 0xb8];
+        let scales: Vec<u8> = (0..shape.scale_len())
+            .map(|i| fp8_scales[i % fp8_scales.len()])
+            .collect();
+        let global_scale = 0.375;
+        let mut got = vec![0.0f32; shape.out_len()];
+        nvfp4_matmul_ref(&x, &packed, &scales, global_scale, shape, &mut got).unwrap();
+
+        let mut expanded = vec![0.0f32; shape.n * shape.k];
+        for n in 0..shape.n {
+            for k in 0..shape.k {
+                expanded[n * shape.k + k] =
+                    nvfp4_weight_at(&packed, &scales, global_scale, shape, n, k);
+            }
+        }
+
+        let mut want = vec![0.0f32; shape.out_len()];
+        for m in 0..shape.m {
+            for n in 0..shape.n {
+                let mut acc = 0.0f32;
+                for k in 0..shape.k {
+                    acc += x[m * shape.k + k] * expanded[n * shape.k + k];
+                }
+                want[m * shape.n + n] = acc;
+            }
+        }
+        assert_eq!(got, want);
     }
 }
