@@ -1,15 +1,21 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rvllm_fused::M2PrefillKvDType;
 use rvllm_xla::{plan_m2_rust_prefill_decode, M2RustPrefillDecodeConfig, M2RustPrefillDecodePlan};
 
 #[cfg(feature = "tpu")]
-use rvllm_xla::{load_artifact, make_m2_prefill_inputs, PjrtClientHandle};
+use rvllm_loader::M2SafetensorsReader;
+#[cfg(feature = "tpu")]
+use rvllm_xla::{
+    load_artifact, make_m2_prefill_inputs, M2GraphAbi, M2WeightUploadPlan, PjrtClientHandle,
+    PjrtElementType,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(env::args().skip(1).collect())?;
+    let model_dir = args.model_dir.clone();
     let plan = plan_m2_rust_prefill_decode(&M2RustPrefillDecodeConfig {
         model_dir: args.model_dir,
         batch: args.batch,
@@ -52,6 +58,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.execute_prefill {
         execute_prefill(args.artifact_dir, &plan)?;
     }
+    if args.execute_decode {
+        execute_decode(&model_dir, &plan, args.max_weight_arena_bytes)?;
+    }
     Ok(())
 }
 
@@ -84,6 +93,80 @@ fn execute_prefill(
     Ok(())
 }
 
+#[cfg(feature = "tpu")]
+fn execute_decode(
+    model_dir: &Path,
+    plan: &M2RustPrefillDecodePlan,
+    max_weight_arena_bytes: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if max_weight_arena_bytes == 0 {
+        return Err("--execute-decode requires --max-weight-arena-bytes".into());
+    }
+    let reader = M2SafetensorsReader::open(model_dir)?;
+    let abi = M2GraphAbi::new(plan.decode_shape.clone())?;
+    let weights = M2WeightUploadPlan::from_index_dir(model_dir, &abi)?;
+    let arena = weights.flat_arena(128)?;
+    let client = PjrtClientHandle::new()?;
+    let exe = client.compile(&plan.decode_mlir)?;
+    let mut token_ids = plan.seed_decode_token_ids.clone();
+    let mut positions = plan.seed_decode_positions.clone();
+    let mut kv_buf = client.buffer_from_host(
+        &vec![0u8; plan.decode_shape.kv_cache_bytes()],
+        &[plan.decode_shape.kv_cache_bytes() as i64],
+        PjrtElementType::S8,
+        0,
+    )?;
+    let weight_arena =
+        arena.upload_flat_arena_to_pjrt(&reader, &client, 0, max_weight_arena_bytes)?;
+
+    for _step in 0..plan.decode_steps {
+        let token_buf = client.buffer_from_host(
+            &i32_bytes(&token_ids),
+            &[plan.decode_shape.batch as i64],
+            PjrtElementType::S32,
+            0,
+        )?;
+        let pos_buf = client.buffer_from_host(
+            &i32_bytes(&positions),
+            &[plan.decode_shape.batch as i64],
+            PjrtElementType::S32,
+            0,
+        )?;
+        let inputs = [&token_buf, &pos_buf, &kv_buf, &weight_arena];
+        let mut outputs = client.execute(&exe, &inputs)?;
+        if outputs.len() != 3 {
+            return Err(format!(
+                "decode graph returned {} outputs, expected 3",
+                outputs.len()
+            )
+            .into());
+        }
+        let next_token = outputs.remove(1);
+        let new_kv = outputs.remove(1);
+        let mut next_bytes = vec![0u8; plan.decode_shape.batch * 4];
+        client.buffer_to_host(&next_token, &mut next_bytes)?;
+        token_ids = read_i32s(&next_bytes);
+        for pos in &mut positions {
+            *pos += 1;
+        }
+        kv_buf = new_kv;
+    }
+    eprintln!(
+        "m2 rust decode loop executed: steps={} final_positions={:?} last_tokens={:?}",
+        plan.decode_steps, positions, token_ids
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "tpu"))]
+fn execute_decode(
+    _model_dir: &Path,
+    _plan: &M2RustPrefillDecodePlan,
+    _max_weight_arena_bytes: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("m2_rust_prefill_decode --execute-decode requires --features tpu".into())
+}
+
 #[cfg(not(feature = "tpu"))]
 fn execute_prefill(
     _artifact_dir: Option<PathBuf>,
@@ -103,6 +186,8 @@ struct Args {
     block_size: u32,
     kv_dtype: M2PrefillKvDType,
     execute_prefill: bool,
+    execute_decode: bool,
+    max_weight_arena_bytes: usize,
 }
 
 impl Args {
@@ -118,6 +203,8 @@ impl Args {
             block_size: 32,
             kv_dtype: M2PrefillKvDType::Int8,
             execute_prefill: false,
+            execute_decode: false,
+            max_weight_arena_bytes: 0,
         };
         let mut i = 0;
         while i < args.len() {
@@ -166,6 +253,14 @@ impl Args {
                     };
                 }
                 "--execute-prefill" => out.execute_prefill = true,
+                "--execute-decode" => out.execute_decode = true,
+                "--max-weight-arena-bytes" => {
+                    i += 1;
+                    out.max_weight_arena_bytes = parse(
+                        value(&args, i, "--max-weight-arena-bytes")?,
+                        "--max-weight-arena-bytes",
+                    )?;
+                }
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unknown arg {other:?}\n{}", usage())),
             }
@@ -189,6 +284,23 @@ where
         .map_err(|e| format!("{name}: expected number, got {s:?}: {e}"))
 }
 
+#[cfg(feature = "tpu")]
+fn i32_bytes(vals: &[i32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 4);
+    for val in vals {
+        out.extend_from_slice(&val.to_le_bytes());
+    }
+    out
+}
+
+#[cfg(feature = "tpu")]
+fn read_i32s(bytes: &[u8]) -> Vec<i32> {
+    bytes
+        .chunks_exact(4)
+        .map(|x| i32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+        .collect()
+}
+
 fn usage() -> String {
-    "usage: m2_rust_prefill_decode [--model-dir DIR] [--batch N] [--prompt-len N] [--decode-steps N] [--ctx N] [--block-size N] [--kv-dtype int8|bf16] [--emit-decode-mlir FILE] [--artifact-dir DIR] [--execute-prefill]".to_string()
+    "usage: m2_rust_prefill_decode [--model-dir DIR] [--batch N] [--prompt-len N] [--decode-steps N] [--ctx N] [--block-size N] [--kv-dtype int8|bf16] [--emit-decode-mlir FILE] [--artifact-dir DIR] [--execute-prefill] [--execute-decode --max-weight-arena-bytes N]".to_string()
 }

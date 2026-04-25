@@ -175,7 +175,9 @@ Rust verification:
   decode graph plan, int8 KV contract, decode token/position seeds, optional
   decode-MLIR emission, and TPU-gated batched-prefill execution.
 - [x] Add flat weight-arena upload path for PJRT decode execution.
-- [ ] Wire PJRT decode execution loop over the Rust decode graph.
+- [x] Wire PJRT decode execution loop over the Rust decode graph: compile
+  decode MLIR, upload token/position/KV/weight-arena buffers, execute repeated
+  steps, read `next_token`, and carry returned KV forward.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.
 - [ ] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime.
