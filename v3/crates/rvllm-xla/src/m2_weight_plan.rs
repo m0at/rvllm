@@ -1,9 +1,7 @@
 use std::path::{Path, PathBuf};
 
-#[cfg(any(test, feature = "tpu"))]
 use rvllm_core::DType;
 use rvllm_core::{ConfigError, Result, RvllmError};
-#[cfg(any(test, feature = "tpu"))]
 use rvllm_loader::M2TensorView;
 use rvllm_loader::{M2CheckpointIndex, M2Projection, M2SafetensorsReader};
 
@@ -53,6 +51,13 @@ pub struct M2WeightArenaPlan {
     pub alignment: usize,
     pub total_bytes: usize,
     pub entries: Vec<M2WeightArenaEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct M2FlatArenaHostBuffer {
+    pub bytes: Vec<u8>,
+    pub total_bytes: usize,
+    pub entries: usize,
 }
 
 #[cfg(feature = "tpu")]
@@ -214,6 +219,52 @@ impl M2WeightArenaPlan {
         self.get(name)
             .ok_or_else(|| invalid_owned("tensor", format!("missing arena tensor: {name}")))
     }
+
+    pub fn materialize_host_buffer(
+        &self,
+        reader: &M2SafetensorsReader,
+        max_bytes: usize,
+    ) -> Result<M2FlatArenaHostBuffer> {
+        if self.total_bytes > max_bytes {
+            return Err(invalid_owned(
+                "max_bytes",
+                format!(
+                    "flat arena is {} bytes, above configured max {}",
+                    self.total_bytes, max_bytes
+                ),
+            ));
+        }
+        let mut bytes = vec![0u8; self.total_bytes];
+        for entry in &self.entries {
+            let view = reader.tensor(&entry.name)?;
+            validate_arena_tensor(entry, &view)?;
+            let start = entry.offset;
+            let end = start + entry.nbytes;
+            bytes[start..end].copy_from_slice(view.bytes);
+        }
+        Ok(M2FlatArenaHostBuffer {
+            bytes,
+            total_bytes: self.total_bytes,
+            entries: self.entries.len(),
+        })
+    }
+
+    #[cfg(feature = "tpu")]
+    pub fn upload_flat_arena_to_pjrt(
+        &self,
+        reader: &M2SafetensorsReader,
+        client: &PjrtClientHandle,
+        device_idx: usize,
+        max_host_bytes: usize,
+    ) -> Result<PjrtBufferHandle> {
+        let host = self.materialize_host_buffer(reader, max_host_bytes)?;
+        client.buffer_from_host(
+            &host.bytes,
+            &[host.total_bytes as i64],
+            crate::PjrtElementType::S8,
+            device_idx,
+        )
+    }
 }
 
 fn align_up(x: usize, alignment: usize) -> usize {
@@ -259,7 +310,30 @@ fn validate_upload_tensor(spec: &M2WeightUploadSpec, view: &M2TensorView<'_>) ->
     Ok(())
 }
 
-#[cfg(any(test, feature = "tpu"))]
+fn validate_arena_tensor(entry: &M2WeightArenaEntry, view: &M2TensorView<'_>) -> Result<()> {
+    let expected_dtype = pjrt_to_loader_dtype(entry.dtype)?;
+    if view.entry.dtype != expected_dtype {
+        return Err(invalid_owned(
+            "dtype",
+            format!("{}: arena tensor dtype mismatch", entry.name),
+        ));
+    }
+    let expected_shape = entry.shape.iter().map(|&x| x as usize).collect::<Vec<_>>();
+    if view.entry.shape != expected_shape {
+        return Err(invalid_owned(
+            "shape",
+            format!("{}: arena tensor shape mismatch", entry.name),
+        ));
+    }
+    if view.bytes.len() != entry.nbytes {
+        return Err(invalid_owned(
+            "nbytes",
+            format!("{}: arena tensor byte length mismatch", entry.name),
+        ));
+    }
+    Ok(())
+}
+
 fn pjrt_to_loader_dtype(dtype: crate::PjrtElementType) -> Result<DType> {
     Ok(match dtype {
         crate::PjrtElementType::BF16 => DType::Bf16,
@@ -294,6 +368,9 @@ fn invalid_owned(field: &'static str, reason: String) -> RvllmError {
 mod tests {
     use super::*;
     use rvllm_loader::TensorEntry;
+    use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{M2GraphShape, PjrtElementType};
 
@@ -408,5 +485,75 @@ mod tests {
             bytes: &bytes,
         };
         assert!(validate_upload_tensor(&spec, &bad_view).is_err());
+    }
+
+    #[test]
+    fn materializes_flat_arena_host_buffer_with_padding() {
+        let dir = tiny_model_dir();
+        let reader = M2SafetensorsReader::open(&dir).unwrap();
+        let arena = M2WeightArenaPlan {
+            alignment: 8,
+            total_bytes: 16,
+            entries: vec![
+                M2WeightArenaEntry {
+                    role: M2WeightRole::Global,
+                    name: "a".to_string(),
+                    offset: 0,
+                    nbytes: 3,
+                    shape: vec![3],
+                    dtype: PjrtElementType::U8,
+                },
+                M2WeightArenaEntry {
+                    role: M2WeightRole::Global,
+                    name: "b".to_string(),
+                    offset: 8,
+                    nbytes: 4,
+                    shape: vec![1],
+                    dtype: PjrtElementType::F32,
+                },
+            ],
+        };
+        let host = arena.materialize_host_buffer(&reader, 64).unwrap();
+        assert_eq!(host.total_bytes, 16);
+        assert_eq!(host.entries, 2);
+        assert_eq!(&host.bytes[0..3], &[1, 2, 3]);
+        assert_eq!(&host.bytes[3..8], &[0, 0, 0, 0, 0]);
+        assert_eq!(&host.bytes[8..12], &[0x78, 0x56, 0x34, 0x12]);
+        assert!(arena.materialize_host_buffer(&reader, 8).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn tiny_model_dir() -> PathBuf {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rvllm-xla-flat-arena-{uniq}"));
+        fs::create_dir_all(&dir).unwrap();
+        let shard_name = "model-00001-of-00001.safetensors";
+        let payload = [1u8, 2, 3, 0x78, 0x56, 0x34, 0x12];
+        let header = json!({
+            "a": {"dtype": "U8", "shape": [3], "data_offsets": [0, 3]},
+            "b": {"dtype": "F32", "shape": [1], "data_offsets": [3, 7]}
+        });
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+        let mut shard = Vec::new();
+        shard.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        shard.extend_from_slice(&header_bytes);
+        shard.extend_from_slice(&payload);
+        fs::write(dir.join(shard_name), shard).unwrap();
+        let index = json!({
+            "metadata": {},
+            "weight_map": {
+                "a": shard_name,
+                "b": shard_name
+            }
+        });
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        dir
     }
 }

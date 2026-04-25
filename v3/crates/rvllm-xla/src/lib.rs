@@ -36,8 +36,9 @@ pub use m2_runtime::{
     plan_m2_rust_prefill, plan_m2_rust_prefill_decode, M2DecodeRuntimeInputSpec,
     M2RustPrefillConfig, M2RustPrefillDecodeConfig, M2RustPrefillDecodePlan, M2RustPrefillPlan,
 };
+pub use m2_weight_plan::{
+    M2FlatArenaHostBuffer, M2WeightArenaEntry, M2WeightArenaPlan, M2WeightRole, M2WeightUploadPlan,
+    M2WeightUploadSpec,
+};
 #[cfg(feature = "tpu")]
 pub use m2_weight_plan::{M2UploadedWeightBuffer, M2UploadedWeights};
-pub use m2_weight_plan::{
-    M2WeightArenaEntry, M2WeightArenaPlan, M2WeightRole, M2WeightUploadPlan, M2WeightUploadSpec,
-};
