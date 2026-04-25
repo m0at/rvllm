@@ -131,6 +131,34 @@ impl KvDtype {
         }
         KvDtype::Nvfp4
     }
+
+    /// Hybrid per-layer KV dtype for Gemma 4. When
+    /// `RVLLM_NVFP4_HYBRID_GLOBAL_FP8=1` is set, global-attention layers
+    /// (head_dim=512, see-everything) use FP8 while sliding-window
+    /// layers stay on the env-default (typically NVFP4). Hypothesis H1
+    /// for the long-context Rusty-persona garbage: outlier-channel
+    /// pressure hits the 10 global layers harder than the 50 sliding
+    /// layers; FP8 on globals + NVFP4 on slidings should rescue
+    /// quality while still saving most of the KV memory.
+    ///
+    /// When the env flag is absent or `0`, returns `from_env(f16_only)`
+    /// for every layer (uniform mode, default behaviour).
+    #[must_use]
+    pub fn for_layer_or_env(
+        layer_type: rvllm_loader::gemma4_arch::Gemma4LayerType,
+        f16_only: bool,
+    ) -> Self {
+        let default = Self::from_env(f16_only);
+        let hybrid = std::env::var("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
+            .map_or(false, |v| v != "0");
+        if hybrid && default == KvDtype::Nvfp4
+            && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention
+        {
+            KvDtype::Fp8
+        } else {
+            default
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -256,7 +284,52 @@ pub struct Gemma4LayerScratch {
     pub cutlass_workspace: u64,
     pub cutlass_workspace_bytes: usize,
     pub fa3_workspace: u64,
+    // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+    // When non-zero on an NVFP4 layer in the instrumented set, the layer
+    // performs a pre-write `rope_f16kv` into these pointers BEFORE the
+    // primary `rope_nvfp4kv`. The shadow region is sized for f16 KV of
+    // that layer only; the primary NVFP4 write is untouched. 0 = no
+    // shadow for this layer. See `parse_shadow_layers` and
+    // `NvFp4ShadowDumper` in gemma4_bring_up.rs.
+    pub shadow_k_cache: u64,
+    pub shadow_v_cache: u64,
+    /// When non-zero, post-RoPE f16 Q snapshot dst (device buffer),
+    /// size `num_tokens * num_heads * head_dim * 2` bytes. Populated
+    /// on decode step 0 only; the Rust-side gate in `run_one_token`
+    /// zeros this for every other step. Snapshot is taken AFTER
+    /// `rope_f16kv_shadow` writes post-RoPE Q into `scratch.q_normed`
+    /// and BEFORE `rope_nvfp4kv` clobbers it with another RoPE pass.
+    pub shadow_q_cache: u64,
+    // === END NVFP4 SHADOW DIAGNOSTIC ===
 }
+
+// === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+/// Parse `RVLLM_NVFP4_SHADOW_LAYERS` (comma-separated layer indices).
+/// Returns `None` when the master gate `RVLLM_NVFP4_SHADOW_F16` is off
+/// or the list parses empty. Default set applied by caller when the
+/// gate is on but the list env var is unset.
+pub fn parse_shadow_layers() -> Option<Vec<u32>> {
+    let gate = std::env::var("RVLLM_NVFP4_SHADOW_F16")
+        .map_or(false, |v| v != "0" && !v.is_empty());
+    if !gate {
+        return None;
+    }
+    let default_set: Vec<u32> = vec![0, 10, 20, 30, 40, 50, 59];
+    let raw = match std::env::var("RVLLM_NVFP4_SHADOW_LAYERS") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return Some(default_set),
+    };
+    let parsed: Vec<u32> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u32>().ok())
+        .collect();
+    if parsed.is_empty() {
+        Some(default_set)
+    } else {
+        Some(parsed)
+    }
+}
+// === END NVFP4 SHADOW DIAGNOSTIC ===
 
 #[derive(Clone, Debug)]
 pub struct Gemma4GemmPlans {
@@ -745,6 +818,17 @@ pub unsafe fn gemma4_forward_phase(
                 }
                 KvDtype::Nvfp4 => {
                     // NVFP4 path: dedicated RoPE + dedicated decode launcher.
+                    // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                    // Shadow rope writes f16 K/V to `shadow_k_cache` /
+                    // `shadow_v_cache` and rotated Q to
+                    // `shadow_q_cache` (per-layer slot on step-0
+                    // capture, shared throwaway otherwise). Must NOT
+                    // touch `q_normed` — the primary rope below reads
+                    // it as pre-RoPE and rotates exactly once.
+                    if scratch.shadow_k_cache != 0 {
+                        rope_f16kv_shadow(dims, kernels, scratch, meta, stream)?;
+                    }
+                    // === END NVFP4 SHADOW DIAGNOSTIC ===
                     rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
                     let decode = rvllm_attention::PagedDecodeNvfp4Launcher::new(attention);
 
@@ -847,6 +931,14 @@ pub unsafe fn gemma4_forward_phase(
             // was the raw embedding, manifesting as word-salad tokens
             // at the LM head regardless of prompt length.
             if dims.kv_dtype == KvDtype::Nvfp4 {
+                // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                // Shadow rope writes f16 K/V + rotated Q to the
+                // shadow slots without touching q_normed; primary rope
+                // below gets clean pre-RoPE Q.
+                if scratch.shadow_k_cache != 0 {
+                    rope_f16kv_shadow(dims, kernels, scratch, meta, stream)?;
+                }
+                // === END NVFP4 SHADOW DIAGNOSTIC ===
                 rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
                 let prefill_params = rvllm_attention::PagedPrefillParams {
                     num_tokens: dims.num_tokens,
@@ -1811,6 +1903,70 @@ unsafe fn rope_f16kv(
     let block = ((dims.head_dim / 2).max(32), 1, 1);
     rvllm_fused::launch_raw(kernels.fused_rope_partial_f16kv, grid, block, 0, stream, &args)
 }
+
+// === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+/// Ground-truth f16 KV write for a shadow region. Identical to
+/// `rope_f16kv` except K/V pointers are overridden to the shadow
+/// region and Q output goes to `scratch.shadow_q_cache` (per-layer
+/// slot on step-0 capture, shared throwaway otherwise).
+///
+/// CRITICAL: `q_out` must NOT alias `scratch.q_normed`. An earlier
+/// revision aliased them, which caused the subsequent primary
+/// `rope_nvfp4kv` to apply RoPE a second time on an already-rotated
+/// Q. Result: `q_fp8` was double-RoPE'd and every forward pass
+/// silently produced wrong attention whenever the shadow gate was on.
+/// Caller must guarantee `scratch.shadow_q_cache` is non-zero and
+/// points to a valid f16 buffer of at least
+/// `num_tokens * num_heads * head_dim * 2` bytes.
+#[cfg(feature = "cuda")]
+unsafe fn rope_f16kv_shadow(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    scratch: &Gemma4LayerScratch,
+    meta: &Gemma4MetadataPtrs,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(scratch.shadow_q_cache != 0,
+        "rope_f16kv_shadow called with shadow_q_cache=0; caller must route to \
+         per-layer slot or throwaway to avoid aliasing q_normed");
+    let mut q_in = scratch.q_normed;
+    let mut k_in = scratch.k_normed;
+    let mut v_in = scratch.v_normed;
+    let mut q_out = scratch.shadow_q_cache;
+    let mut k_cache = scratch.shadow_k_cache;
+    let mut v_cache = scratch.shadow_v_cache;
+    let mut cos = meta.cos;
+    let mut sin = meta.sin;
+    let mut positions = meta.positions;
+    let mut slot_mapping = meta.slot_mapping;
+    let mut nt = dims.num_tokens as i32;
+    let mut nh = dims.num_heads as i32;
+    let mut nkvh = dims.num_kv_heads as i32;
+    let mut hd = dims.head_dim as i32;
+    let mut rd = dims.rotary_dim as i32;
+    let args = [
+        (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_cache) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_cache) as *mut u64 as *mut core::ffi::c_void,
+        (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+        (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+        (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+        (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let max_heads = dims.num_heads.max(dims.num_kv_heads);
+    let grid = (dims.num_tokens, max_heads, 1);
+    let block = ((dims.head_dim / 2).max(32), 1, 1);
+    rvllm_fused::launch_raw(kernels.fused_rope_partial_f16kv, grid, block, 0, stream, &args)
+}
+// === END NVFP4 SHADOW DIAGNOSTIC ===
 
 #[cfg(feature = "cuda")]
 unsafe fn rope_fp8kv(

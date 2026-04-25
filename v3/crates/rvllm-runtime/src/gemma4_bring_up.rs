@@ -156,7 +156,48 @@ pub struct Gemma4Bringup {
     /// `run_generate` call; kept across subsequent calls so the
     /// KV cache survives the worker's scratch-checkpoint restore.
     pub prefix_cache: std::sync::Mutex<Option<PrefixCacheState>>,
+    // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+    /// Ground-truth F16 shadow KV region for the instrumented layer set.
+    /// Populated on first run_generate when RVLLM_NVFP4_SHADOW_F16=1.
+    pub nvfp4_shadow: std::sync::Mutex<Option<NvFp4ShadowAlloc>>,
+    /// One-shot latch for first-token dump.
+    pub nvfp4_shadow_dumped: std::sync::atomic::AtomicBool,
+    // === END NVFP4 SHADOW DIAGNOSTIC ===
 }
+
+// === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+/// Parallel to the main KV region but: (a) only the instrumented
+/// layers have a slot; (b) every instrumented layer is stored as F16
+/// regardless of the primary KV dtype. No scale region needed.
+pub struct NvFp4ShadowAlloc {
+    pub shadow_ptr: u64,
+    pub shadow_bytes: u64,
+    /// Per-layer byte offset into `shadow_ptr`. `u64::MAX` sentinel
+    /// for layers NOT in the instrumented set.
+    pub layer_offsets: Vec<u64>,
+    pub layer_indices: Vec<u32>,
+    /// Per-instrumented-layer Q snapshot region. Sized for
+    /// `num_shadow_layers * num_attention_heads * max_head_dim * 2`
+    /// bytes (f16). Populated on decode step 0 only, AFTER the shadow
+    /// f16 RoPE (which writes post-RoPE Q into `scratch.q_normed`)
+    /// and BEFORE the primary NVFP4 RoPE clobbers it. Per-layer slot
+    /// size is uniform (`q_per_layer_bytes`) even when the layer's
+    /// head_dim is smaller than max_head_dim — the tail of the slot
+    /// is then zero and the Python analyzer truncates using
+    /// `head_dim` from meta.json.
+    pub shadow_q_ptr: u64,
+    pub shadow_q_total_bytes: u64,
+    pub shadow_q_per_layer_bytes: u64,
+    /// Q throwaway scratch — a single-slot f16 buffer (same size as
+    /// one per-layer Q slot) that `rope_f16kv_shadow` targets when we
+    /// are NOT capturing (prefill steps, decode step > 0). Keeps
+    /// `scratch.q_normed` untouched so the subsequent primary
+    /// `rope_nvfp4kv` rotates Q exactly once. Without this, shadow
+    /// rope's q_out=q_normed caused double-RoPE on q_fp8 and
+    /// corrupted live inference whenever shadow was on.
+    pub shadow_q_throwaway_ptr: u64,
+}
+// === END NVFP4 SHADOW DIAGNOSTIC ===
 
 impl Gemma4Bringup {
     pub fn load(paths: Gemma4EnginePaths, arena_bytes: usize) -> Result<Self> {
@@ -356,6 +397,9 @@ impl Gemma4Bringup {
             policy,
             fused,
             prefix_cache: std::sync::Mutex::new(None),
+            // NVFP4 shadow diagnostic state (lazy-init in run_generate).
+            nvfp4_shadow: std::sync::Mutex::new(None),
+            nvfp4_shadow_dumped: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -386,6 +430,8 @@ impl Gemma4Bringup {
         let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
         let mut kv_total_bytes: u64 = 0;
         let mut kv_scale_total_bytes: u64 = 0;
+        let mut kv_dtype_per_layer: Vec<crate::gemma4_layer_exec::KvDtype> =
+            Vec::with_capacity(arch.num_hidden_layers);
         for l in 0..arch.num_hidden_layers {
             kv_layer_offsets.push(kv_total_bytes);
             kv_scale_layer_offsets.push(kv_scale_total_bytes);
@@ -396,14 +442,17 @@ impl Gemma4Bringup {
             let hd = arch.head_dim_for_layer(l) as u32;
             let layer_elems =
                 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-            kv_total_bytes += match kv_dtype {
+            let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_or_env(
+                arch.layer_types[l], false);
+            kv_dtype_per_layer.push(kv_dtype_l);
+            kv_total_bytes += match kv_dtype_l {
                 crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
                 crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
                 crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
             };
             let layer_scale_slots =
                 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
-            kv_scale_total_bytes += match kv_dtype {
+            kv_scale_total_bytes += match kv_dtype_l {
                 crate::gemma4_layer_exec::KvDtype::F16 => 0,
                 crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
                 crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
@@ -859,6 +908,12 @@ impl Gemma4Bringup {
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    // NVFP4 shadow diagnostic: default 0 (no shadow).
+                    // Overridden in the run_generate decode path when
+                    // RVLLM_NVFP4_SHADOW_F16 is on.
+                    shadow_k_cache: 0,
+                    shadow_v_cache: 0,
+                    shadow_q_cache: 0,
                 };
 
                 let meta = Gemma4MetadataPtrs {
@@ -1324,6 +1379,12 @@ impl Gemma4Bringup {
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    // NVFP4 shadow diagnostic: default 0 (no shadow).
+                    // Overridden in the run_generate decode path when
+                    // RVLLM_NVFP4_SHADOW_F16 is on.
+                    shadow_k_cache: 0,
+                    shadow_v_cache: 0,
+                    shadow_q_cache: 0,
                 };
 
                 let meta = Gemma4MetadataPtrs {
@@ -1621,6 +1682,13 @@ impl Gemma4Bringup {
         prompt_ids: &[u32],
         max_new: usize,
         eos_ids: &[u32],
+        // === NVFP4 SHADOW DIAGNOSTIC === per-request opt-in. When
+        // false, the shadow allocator and dump hook do nothing
+        // regardless of env settings. Gates the feature at the
+        // request boundary so upstream-client scaffold calls
+        // (zeroclaw classifier, internal probes) cannot accidentally
+        // burn the one-shot latch.
+        shadow_requested: bool,
     ) -> Result<Vec<u32>> {
         let arch = &self.arch;
         let hidden = arch.hidden_size as u32;
@@ -1728,14 +1796,16 @@ impl Gemma4Bringup {
                 let hd = arch.head_dim_for_layer(l) as u32;
                 let layer_elems =
                     2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-                kv_total_bytes += match kv_dtype {
+                let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_or_env(
+                    arch.layer_types[l], false);
+                kv_total_bytes += match kv_dtype_l {
                     crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
                     crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
                     crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
                 };
                 let layer_scale_slots =
                     2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
-                kv_scale_total_bytes += match kv_dtype {
+                kv_scale_total_bytes += match kv_dtype_l {
                     crate::gemma4_layer_exec::KvDtype::F16 => 0,
                     crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
                     crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
@@ -1832,6 +1902,139 @@ impl Gemma4Bringup {
         let max_layers = std::env::var("RVLLM_MAX_LAYERS")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(arch.num_hidden_layers);
 
+        // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+        // Build (or re-use) the f16 shadow KV region for the instrumented
+        // layers. Pure diagnostic — the allocation mirrors the primary
+        // allocator but forces F16 for every instrumented layer so the
+        // cache is ground-truth. Same layer-blocks / nkvh / hd sizing as
+        // the primary path; no scale region (f16 self-scaled).
+        // Per-request gate: even with RVLLM_NVFP4_SHADOW_F16=1 in env,
+        // skip shadow path unless the operator explicitly opted THIS
+        // request in via `X-Rvllm-Shadow: 1`. Closes the
+        // upstream-client-scaffold-burns-latch hole.
+        let shadow_set: Option<Vec<u32>> = if shadow_requested {
+            crate::gemma4_layer_exec::parse_shadow_layers()
+        } else {
+            None
+        };
+        // Compute per-layer shadow offsets (populated only for layers
+        // in the shadow set; sentinel u64::MAX otherwise). Needed both
+        // when we have to allocate the region now AND on subsequent
+        // calls when it already exists — cheap to recompute every call.
+        let shadow_layer_offsets: Vec<u64> = if let Some(ref lset) = shadow_set {
+            let mut offs = vec![u64::MAX; arch.num_hidden_layers];
+            let mut cursor: u64 = 0;
+            for l in 0..arch.num_hidden_layers {
+                if !lset.contains(&(l as u32)) { continue; }
+                offs[l] = cursor;
+                let is_global = arch.layer_types[l]
+                    == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+                let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+                let hd = arch.head_dim_for_layer(l) as u32;
+                // f16 = 2 bytes/elem; 2× for K and V.
+                let layer_bytes =
+                    2u64 * (layer_blocks as u64) * (block_size as u64)
+                        * (nkvh as u64) * (hd as u64) * 2;
+                cursor += layer_bytes;
+            }
+            offs
+        } else {
+            Vec::new()
+        };
+        let shadow_total_bytes: u64 = if let Some(ref lset) = shadow_set {
+            let mut sum: u64 = 0;
+            for l in 0..arch.num_hidden_layers {
+                if !lset.contains(&(l as u32)) { continue; }
+                let is_global = arch.layer_types[l]
+                    == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+                let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+                let hd = arch.head_dim_for_layer(l) as u32;
+                sum += 2u64 * (layer_blocks as u64) * (block_size as u64)
+                    * (nkvh as u64) * (hd as u64) * 2;
+            }
+            sum
+        } else { 0 };
+        // Per-layer Q slot size: num_attention_heads * max_head_dim * 2 (f16).
+        // Uniform across layers so indexing is a simple multiply. We dump
+        // exactly ONE Q row per layer (decode step 0's Q). Slot is fixed
+        // at single-token size regardless of how many tokens prefill
+        // wrote — the per-layer slot is only ever populated on decode
+        // step 0, when num_tokens == 1.
+        let shadow_q_per_layer_bytes: u64 = if shadow_set.is_some() {
+            2u64 * (arch.num_attention_heads as u64) * (arch.max_head_dim() as u64)
+        } else {
+            0
+        };
+        // Throwaway scratch — must hold the largest single
+        // rope_f16kv_shadow Q-output. Decode = 1 token; batch prefill
+        // = up to chunk_q tokens (bounded by num_blocks_total *
+        // block_size). Size for the prefill upper bound so batch
+        // prefill scratch construction can route shadow Q here
+        // safely. ~1 GiB worst case on Gemma 4 31B (32768 * 32 *
+        // 512 * 2). Trivial vs 128 GiB unified.
+        let shadow_q_throwaway_bytes: u64 = if shadow_set.is_some() {
+            (num_blocks_total as u64) * (block_size as u64) * shadow_q_per_layer_bytes
+        } else {
+            0
+        };
+        let shadow_q_total_bytes: u64 = if let Some(ref lset) = shadow_set {
+            shadow_q_per_layer_bytes * (lset.len() as u64)
+        } else {
+            0
+        };
+        let (shadow_ptr, shadow_q_ptr, shadow_q_throwaway_ptr): (u64, u64, u64) =
+            if let Some(ref lset) = shadow_set {
+            let mut guard = self.nvfp4_shadow.lock().unwrap();
+            if let Some(ref existing) = *guard {
+                (existing.shadow_ptr, existing.shadow_q_ptr, existing.shadow_q_throwaway_ptr)
+            } else {
+                let bytes = shadow_total_bytes.max(16) as usize;
+                let region = arena.region("nvfp4_shadow_kv", bytes, 256)?;
+                cudarc::driver::sys::cuMemsetD8_v2(region.device_ptr(), 0, bytes);
+                let ptr = region.device_ptr();
+                std::mem::forget(region);
+                // Per-layer Q snapshot region.
+                let q_bytes = shadow_q_total_bytes.max(16) as usize;
+                let q_region = arena.region("nvfp4_shadow_q", q_bytes, 256)?;
+                cudarc::driver::sys::cuMemsetD8_v2(q_region.device_ptr(), 0, q_bytes);
+                let q_ptr = q_region.device_ptr();
+                std::mem::forget(q_region);
+                // Q throwaway scratch: one slot. Shadow rope targets
+                // this when we're not capturing, so q_normed stays
+                // untouched and the subsequent primary nvfp4 rope
+                // gets pristine pre-RoPE Q as input (exactly-one-RoPE
+                // invariant restored).
+                let throwaway_bytes = shadow_q_throwaway_bytes.max(16) as usize;
+                let throwaway_region = arena.region(
+                    "nvfp4_shadow_q_throwaway", throwaway_bytes, 256)?;
+                cudarc::driver::sys::cuMemsetD8_v2(
+                    throwaway_region.device_ptr(), 0, throwaway_bytes);
+                let throwaway_ptr = throwaway_region.device_ptr();
+                std::mem::forget(throwaway_region);
+                *guard = Some(NvFp4ShadowAlloc {
+                    shadow_ptr: ptr,
+                    shadow_bytes: shadow_total_bytes,
+                    layer_offsets: shadow_layer_offsets.clone(),
+                    layer_indices: lset.clone(),
+                    shadow_q_ptr: q_ptr,
+                    shadow_q_total_bytes,
+                    shadow_q_per_layer_bytes,
+                    shadow_q_throwaway_ptr: throwaway_ptr,
+                });
+                eprintln!(
+                    "[nvfp4-shadow] allocated {} MiB f16 shadow KV + {} KiB per-layer Q for {} layers: {:?}",
+                    shadow_total_bytes / (1024 * 1024),
+                    shadow_q_total_bytes / 1024,
+                    lset.len(),
+                    lset,
+                );
+                (ptr, q_ptr, throwaway_ptr)
+            }
+        } else { (0, 0, 0) };
+        // === END NVFP4 SHADOW DIAGNOSTIC ===
+
         // Helper: run one token through all layers (decode path)
         let run_one_token = |tok_id: u32, step: usize| -> Result<()> {
             let tok_i32 = [tok_id as i32];
@@ -1861,6 +2064,9 @@ impl Gemma4Bringup {
                     kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
+                // Per-layer dtype: hybrid mode swaps global layers to FP8,
+                // sliding layers stay on env default.
+                let kv_dtype = crate::gemma4_layer_exec::KvDtype::for_layer_or_env(lt, false);
                 let (k_cache_scale, v_cache_scale) = if kv_dtype
                     == crate::gemma4_layer_exec::KvDtype::Nvfp4
                 {
@@ -1922,6 +2128,51 @@ impl Gemma4Bringup {
                     crate::gemma4_layer_exec::KvDtype::Fp8 => layer_kv_elems / 2,
                     crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_kv_elems / 4,
                 };
+                // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                // Populate shadow pointers only for instrumented NVFP4 layers.
+                let is_shadow_layer = shadow_ptr != 0
+                    && kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                    && layer_idx < shadow_layer_offsets.len()
+                    && shadow_layer_offsets[layer_idx] != u64::MAX;
+                let (shadow_k, shadow_v) = if is_shadow_layer {
+                    let base = shadow_ptr + shadow_layer_offsets[layer_idx];
+                    // f16 K/V: each is layer_kv_elems/2 elements × 2 bytes = layer_kv_elems bytes.
+                    (base, base + layer_kv_elems)
+                } else {
+                    (0u64, 0u64)
+                };
+                // Shadow Q target. Two roles:
+                //   (a) When the layer is instrumented AND this is the
+                //       first decode step (step 0 after prompt), point
+                //       at the per-layer Q slot so the Python analyzer
+                //       gets post-RoPE f16 Q for logit_err / topk /
+                //       out_err.
+                //   (b) When the layer is instrumented at any OTHER
+                //       step (all prefill steps + decode step >0),
+                //       point at the shared throwaway so shadow rope
+                //       has a valid q_out target WITHOUT clobbering
+                //       `scratch.q_normed`. This is load-bearing: if
+                //       q_normed is clobbered, the subsequent primary
+                //       rope_nvfp4kv rotates it a second time and
+                //       every forward pass is wrong.
+                //   (c) When the layer is NOT instrumented, 0 — shadow
+                //       rope doesn't run at all.
+                let shadow_q = if is_shadow_layer {
+                    if step == prompt_ids.len() && shadow_q_ptr != 0 {
+                        let pos_in_set = shadow_set
+                            .as_ref()
+                            .and_then(|s| s.iter().position(|&l| l as usize == layer_idx));
+                        match pos_in_set {
+                            Some(i) => shadow_q_ptr + (i as u64) * shadow_q_per_layer_bytes,
+                            None => shadow_q_throwaway_ptr,
+                        }
+                    } else {
+                        shadow_q_throwaway_ptr
+                    }
+                } else {
+                    0
+                };
+                // === END NVFP4 SHADOW DIAGNOSTIC ===
                 let scratch = crate::gemma4_layer_exec::Gemma4LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(), hidden_scale: hidden_scale.device_ptr(),
                     q_out: q_base, k_out, v_out,
@@ -1944,6 +2195,9 @@ impl Gemma4Bringup {
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
                     cutlass_workspace: cutlass_ws.device_ptr(), cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    shadow_k_cache: shadow_k,
+                    shadow_v_cache: shadow_v,
+                    shadow_q_cache: shadow_q,
                 };
                 let meta = crate::gemma4_layer_exec::Gemma4MetadataPtrs {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
@@ -2169,6 +2423,8 @@ impl Gemma4Bringup {
                     kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
+                // Per-layer dtype: hybrid swaps global to FP8 (sliding stays env default).
+                let kv_dtype = crate::gemma4_layer_exec::KvDtype::for_layer_or_env(lt, false);
                 // Prefill uses FP8 KV when the ambient dtype is F16
                 // (no F16 prefill kernel exists); NVFP4 prefill stays on NVFP4.
                 let prefill_kv_dtype = if kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4 {
@@ -2238,6 +2494,31 @@ impl Gemma4Bringup {
                     crate::gemma4_layer_exec::KvDtype::Fp8 => layer_kv_elems / 2,
                     crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_kv_elems / 4,
                 };
+                // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                // Mirror the decode-path scratch population so batch
+                // prefill ALSO writes f16 shadow K/V for the prompt
+                // tokens. Without this, prefill silently bypasses the
+                // shadow hook and the dump on decode step 0 only sees
+                // the single new-token write — useless for analysis.
+                // Q always routes to the shared throwaway during
+                // prefill (we only capture per-layer Q on decode
+                // step 0, which goes through run_one_token, not here).
+                let prefill_is_shadow_layer = shadow_ptr != 0
+                    && prefill_kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                    && layer_idx < shadow_layer_offsets.len()
+                    && shadow_layer_offsets[layer_idx] != u64::MAX;
+                let (prefill_shadow_k, prefill_shadow_v) = if prefill_is_shadow_layer {
+                    let base = shadow_ptr + shadow_layer_offsets[layer_idx];
+                    (base, base + layer_kv_elems)
+                } else {
+                    (0u64, 0u64)
+                };
+                let prefill_shadow_q = if prefill_is_shadow_layer {
+                    shadow_q_throwaway_ptr
+                } else {
+                    0
+                };
+                // === END NVFP4 SHADOW DIAGNOSTIC ===
                 let scratch = crate::gemma4_layer_exec::Gemma4LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(), hidden_scale: hidden_scale.device_ptr(),
                     q_out: q_base, k_out, v_out,
@@ -2260,6 +2541,9 @@ impl Gemma4Bringup {
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
                     cutlass_workspace: cutlass_ws.device_ptr(), cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    shadow_k_cache: prefill_shadow_k,
+                    shadow_v_cache: prefill_shadow_v,
+                    shadow_q_cache: prefill_shadow_q,
                 };
                 let meta = crate::gemma4_layer_exec::Gemma4MetadataPtrs {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
@@ -2369,6 +2653,201 @@ impl Gemma4Bringup {
         for decode_step in 0..max_new - 1 {
             let tok_id = *output_ids.last().unwrap();
             run_one_token(tok_id, prompt_ids.len() + decode_step)?;
+
+            // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+            // First-token dump: runs exactly once on decode_step == 0
+            // when the shadow region is live. After this the latch is
+            // set and every subsequent decode step is a no-op.
+            if decode_step == 0
+                && shadow_ptr != 0
+                && !self.nvfp4_shadow_dumped.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.stream.fence()?;
+                let dump_dir = std::env::var("RVLLM_NVFP4_SHADOW_DUMP_DIR")
+                    .unwrap_or_else(|_| "/tmp/nvfp4_shadow".to_string());
+                let _ = std::fs::create_dir_all(&dump_dir);
+                let _ctx_now = (prompt_ids.len() + 1) as u32;
+                let lset = shadow_set.as_ref().unwrap();
+                let first_tok = output_ids[0];
+                let bt_entries = max_blocks_per_seq as usize;
+                // Host staging for block_tables / context_lens / slot_mapping.
+                let mut bt_host = vec![0i32; bt_entries];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    bt_host.as_mut_ptr() as *mut _,
+                    block_tables.device_ptr(),
+                    (bt_entries * 4) as usize,
+                );
+                let mut ctx_host = [0i32; 1];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    ctx_host.as_mut_ptr() as *mut _,
+                    context_lens.device_ptr(),
+                    4,
+                );
+                let mut slot_host = [0i32; 1];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    slot_host.as_mut_ptr() as *mut _,
+                    slot_mapping.device_ptr(),
+                    4,
+                );
+                // Build per-layer metadata + dump bin files.
+                let mut layer_meta_json = String::new();
+                for &l in lset.iter() {
+                    let l = l as usize;
+                    if l >= arch.num_hidden_layers { continue; }
+                    if l >= shadow_layer_offsets.len() { continue; }
+                    if shadow_layer_offsets[l] == u64::MAX { continue; }
+                    let lt = arch.layer_types[l];
+                    let is_global = lt == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+                    let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                    let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+                    let hd = arch.head_dim_for_layer(l) as u32;
+                    let layer_elems = 2u64 * (layer_blocks as u64) * (block_size as u64)
+                        * (nkvh as u64) * (hd as u64);
+                    // Shadow region: f16, layer_elems bytes for K then layer_elems bytes for V.
+                    let shadow_base = shadow_ptr + shadow_layer_offsets[l];
+                    let shadow_half_bytes = layer_elems; // f16 half-size per K or V
+                    let mut k_shadow_host = vec![0u8; shadow_half_bytes as usize];
+                    let mut v_shadow_host = vec![0u8; shadow_half_bytes as usize];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        k_shadow_host.as_mut_ptr() as *mut _,
+                        shadow_base,
+                        shadow_half_bytes as usize,
+                    );
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        v_shadow_host.as_mut_ptr() as *mut _,
+                        shadow_base + shadow_half_bytes,
+                        shadow_half_bytes as usize,
+                    );
+                    let _ = std::fs::write(
+                        format!("{}/layer_{}_k_shadow.bin", dump_dir, l),
+                        &k_shadow_host,
+                    );
+                    let _ = std::fs::write(
+                        format!("{}/layer_{}_v_shadow.bin", dump_dir, l),
+                        &v_shadow_host,
+                    );
+                    // Primary NVFP4 K/V (packed bytes). The total NVFP4
+                    // allocation per layer is `layer_elems / 2` bytes
+                    // (because `layer_elems = 2 * X` already counts K+V
+                    // and NVFP4 packs 2 elems/byte). Each of K and V is
+                    // therefore `layer_elems / 4` bytes within the
+                    // layer, matching `bytes_per_half_kv = layer_kv_elems / 4`
+                    // used by the rope launcher's `v_cache` offset.
+                    // An earlier revision of this dump used
+                    // `layer_elems / 2` for the per-side size, which
+                    // (a) read past the layer's allocation for V
+                    // and (b) made the dumped V file actually contain
+                    // the NEXT layer's K data — producing apparent
+                    // 100%+ V rel_err in the analyzer when in fact V
+                    // was never read from the right offset.
+                    let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[l];
+                    let primary_half_bytes = layer_elems / 4; // K-or-V bytes
+                    let mut k_host = vec![0u8; primary_half_bytes as usize];
+                    let mut v_host = vec![0u8; primary_half_bytes as usize];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        k_host.as_mut_ptr() as *mut _,
+                        layer_kv_base,
+                        primary_half_bytes as usize,
+                    );
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        v_host.as_mut_ptr() as *mut _,
+                        layer_kv_base + primary_half_bytes,
+                        primary_half_bytes as usize,
+                    );
+                    let _ = std::fs::write(format!("{}/layer_{}_k.bin", dump_dir, l), &k_host);
+                    let _ = std::fs::write(format!("{}/layer_{}_v.bin", dump_dir, l), &v_host);
+                    // NVFP4 scale region: E4M3, layer_elems/16 bytes total; first
+                    // half for K, second half for V.
+                    let layer_kv_scale_base =
+                        kv_scale_cache.device_ptr() + kv_scale_layer_offsets[l];
+                    let scale_half_bytes = layer_elems / 32; // each of K,V = /32
+                    let mut k_scale_host = vec![0u8; scale_half_bytes as usize];
+                    let mut v_scale_host = vec![0u8; scale_half_bytes as usize];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        k_scale_host.as_mut_ptr() as *mut _,
+                        layer_kv_scale_base,
+                        scale_half_bytes as usize,
+                    );
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        v_scale_host.as_mut_ptr() as *mut _,
+                        layer_kv_scale_base + scale_half_bytes,
+                        scale_half_bytes as usize,
+                    );
+                    let _ = std::fs::write(
+                        format!("{}/layer_{}_k_scale.bin", dump_dir, l),
+                        &k_scale_host,
+                    );
+                    let _ = std::fs::write(
+                        format!("{}/layer_{}_v_scale.bin", dump_dir, l),
+                        &v_scale_host,
+                    );
+                    // Per-layer Q dump (f16, post-RoPE). Snapshot written by
+                    // `rope_f16kv_shadow` → memcpy hook in layer_exec.rs on
+                    // decode step 0 into a dedicated per-layer slot of size
+                    // `shadow_q_per_layer_bytes = num_attention_heads *
+                    // max_head_dim * 2`. Tail may be zero when this layer's
+                    // head_dim < max_head_dim; Python analyzer truncates
+                    // using `head_dim` from meta.json.
+                    let pos_in_set = lset.iter().position(|&li| li as usize == l);
+                    if let Some(pi) = pos_in_set {
+                        if shadow_q_ptr != 0 {
+                            let q_slot_base =
+                                shadow_q_ptr + (pi as u64) * shadow_q_per_layer_bytes;
+                            let mut q_host = vec![0u8; shadow_q_per_layer_bytes as usize];
+                            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                                q_host.as_mut_ptr() as *mut _,
+                                q_slot_base,
+                                shadow_q_per_layer_bytes as usize,
+                            );
+                            let _ = std::fs::write(
+                                format!("{}/layer_{}_q.bin", dump_dir, l),
+                                &q_host,
+                            );
+                        }
+                    }
+                    if !layer_meta_json.is_empty() {
+                        layer_meta_json.push_str(",\n");
+                    }
+                    layer_meta_json.push_str(&format!(
+                        "    {{\"layer\": {}, \"layer_type\": \"{:?}\", \"head_dim\": {}, \"num_kv_heads\": {}, \"num_blocks\": {}}}",
+                        l, lt, hd, nkvh, layer_blocks,
+                    ));
+                }
+                // Keep legacy single-layer Q dump (last executed layer, FP8)
+                // for backward compat with older analyzer runs; per-layer
+                // f16 Q files (layer_{L}_q.bin) are the canonical source.
+                let q_bytes = (arch.num_attention_heads as u64) * (arch.max_head_dim() as u64);
+                let mut q_host = vec![0u8; q_bytes as usize];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    q_host.as_mut_ptr() as *mut _,
+                    q_fp8.device_ptr(),
+                    q_bytes as usize,
+                );
+                let _ = std::fs::write(format!("{}/q_last_layer.bin", dump_dir), &q_host);
+                // meta.json
+                let max_head_dim = arch.max_head_dim();
+                let meta_json = format!(
+                    "{{\n  \"prompt_len\": {},\n  \"num_layers\": {},\n  \"block_size\": {},\n  \"num_heads\": {},\n  \"max_head_dim\": {},\n  \"q_dtype\": \"f16\",\n  \"q_per_layer_bytes\": {},\n  \"context_len\": {},\n  \"slot_mapping\": {},\n  \"first_token_id\": {},\n  \"shadow_layer_indices\": {:?},\n  \"block_table\": {:?},\n  \"layers\": [\n{}\n  ]\n}}\n",
+                    prompt_ids.len(),
+                    arch.num_hidden_layers,
+                    block_size,
+                    arch.num_attention_heads,
+                    max_head_dim,
+                    shadow_q_per_layer_bytes,
+                    ctx_host[0],
+                    slot_host[0],
+                    first_tok,
+                    lset,
+                    bt_host,
+                    layer_meta_json,
+                );
+                let _ = std::fs::write(format!("{}/meta.json", dump_dir), &meta_json);
+                eprintln!(
+                    "[nvfp4-shadow] dumped {} instrumented layers to {} (ctx={}, first_tok={})",
+                    lset.len(), dump_dir, ctx_host[0], first_tok,
+                );
+            }
+            // === END NVFP4 SHADOW DIAGNOSTIC ===
 
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: 1, hidden, eps: arch.rms_norm_eps,

@@ -26,6 +26,15 @@ pub struct GenerateRequest {
     pub stop_token_ids: Vec<u32>,
     pub events_tx: mpsc::Sender<GenerateEvent>,
     pub cancelled: Arc<AtomicBool>,
+    /// === NVFP4 SHADOW DIAGNOSTIC ===
+    /// Set when the operator opts this specific request into the
+    /// f16-shadow KV-cache diagnostic via the `X-Rvllm-Shadow: 1`
+    /// header. Without it the shadow allocator and dump hook do
+    /// nothing, even if RVLLM_NVFP4_SHADOW_F16=1 is set in the
+    /// environment. This is the gate that distinguishes operator-
+    /// target generations from upstream-client scaffold calls
+    /// (zeroclaw classifier, internal probes, etc).
+    pub shadow_requested: bool,
 }
 
 /// Events produced by the worker, consumed by the handler for
@@ -156,6 +165,7 @@ mod tests {
                 stop_token_ids: vec![],
                 events_tx: tx,
                 cancelled: Arc::new(AtomicBool::new(false)),
+                shadow_requested: false,
             })
             .await
             .expect("submit");
@@ -196,6 +206,7 @@ mod tests {
                 stop_token_ids: vec![],
                 events_tx: tx,
                 cancelled: cancel.clone(),
+                shadow_requested: false,
             })
             .await
             .expect("submit");

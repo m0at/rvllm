@@ -89,6 +89,67 @@ fn dump_write(request_id: &Uuid, suffix: &str, body: &serde_json::Value) {
     }
 }
 
+// === SLASH-COMMAND SHORT-CIRCUIT helpers ===
+// `/new`, `/clear`, `/reset` are treated as session-control no-ops at
+// the HTTP boundary. They never tokenise, never reach the cuda worker,
+// never burn the NVFP4 shadow latch — important because clients
+// (zeroclaw, rusty-dashboard) historically forward `/new` as a real
+// 3057-token prompt that fires shadow allocation + dump on a request
+// the operator did NOT mean to instrument.
+
+/// Pick the canned reply for a slash-command-only chat request, or
+/// `None` if the request is real work. Compares the LAST user message,
+/// trimmed; case-sensitive on the command word; whole-message match
+/// only (embedded "/new" in a longer prompt is NOT a slash command).
+fn slash_command_reply(req: &crate::openai::chat::ChatCompletionRequest) -> Option<&'static str> {
+    let last_user = req.messages.iter().rev()
+        .find(|m| m.role == Role::User)?
+        .content.as_deref()?;
+    match last_user.trim() {
+        "/new"   => Some("Session reset."),
+        "/clear" => Some("Session cleared."),
+        "/reset" => Some("Session reset."),
+        _ => None,
+    }
+}
+
+/// One-shot SSE body for the streaming case of a slash-command short-
+/// circuit. Emits a single ChatCompletionChunk with the canned reply
+/// + finish_reason=stop, then `[DONE]`.
+fn slash_command_sse(
+    body: ChatCompletionResponse,
+    request_id: Uuid,
+) -> Sse<SseStream> {
+    use futures::stream;
+    let chunk_id = body.id.clone();
+    let model = body.model.clone();
+    let created = body.created;
+    let content = body.choices.first()
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+    let chunk = ChatCompletionChunk {
+        id: chunk_id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatDelta {
+                role: Some(Role::Assistant),
+                content: Some(content),
+                tool_calls: None,
+            },
+            finish_reason: Some(FinishReason::Stop),
+        }],
+    };
+    let _ = request_id;
+    let events: SseStream = Box::pin(stream::iter(vec![
+        Ok(sse_json(&chunk)),
+        Ok(Event::default().data("[DONE]")),
+    ]));
+    Sse::new(events)
+}
+
 use crate::error::{ApiError, ApiResult};
 use crate::openai::chat::{
     ChatAssistantMessage, ChatChoice, ChatChunkChoice, ChatCompletionChunk,
@@ -118,9 +179,28 @@ use crate::worker::{GenerateEvent, GenerateRequest};
 /// on `req.stream`.
 pub async fn chat_completions(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> ApiResult<ChatCompletionsResponse> {
     let request_id = Uuid::new_v4();
+    // === NVFP4 SHADOW DIAGNOSTIC ===
+    // `X-Rvllm-Shadow: 1` (or `kv-f16-v1`) opts THIS request into the
+    // f16-shadow KV-cache diagnostic. The header is transport
+    // metadata, not part of the OpenAI request body — it does not
+    // pollute the chat schema, is not echoed in responses or logs as
+    // a model param, and cannot be set accidentally by upstream
+    // clients (zeroclaw classifier etc.) that don't know about it.
+    let shadow_requested = headers
+        .get("x-rvllm-shadow")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| matches!(s.trim(), "1" | "true" | "kv-f16-v1"))
+        .unwrap_or(false);
+    if shadow_requested {
+        tracing::info!(
+            request_id = %request_id,
+            "X-Rvllm-Shadow set — request will fire NVFP4 shadow diagnostic if latch fresh"
+        );
+    }
     let span = tracing::info_span!(
         "chat_completions",
         request_id = %request_id,
@@ -151,6 +231,43 @@ pub async fn chat_completions(
             "messages",
             "empty_messages",
         ));
+    }
+
+    // === SLASH-COMMAND SHORT-CIRCUIT ===
+    // When a client sends a session-control command like `/new` or
+    // `/clear` as a chat message, treat it as a no-op at the rvllm
+    // boundary: return a canned assistant reply, never tokenise, never
+    // reach the worker, never allocate shadow KV, never burn the
+    // diagnostic latch. Comparison is case-sensitive and the command
+    // must be the entire user message after trim — embedding "/new"
+    // inside a real prompt does NOT trigger.
+    if let Some(reply) = slash_command_reply(&req) {
+        tracing::info!(
+            request_id = %request_id,
+            "slash-command short-circuit (no GPU work, no shadow burn)"
+        );
+        let body = ChatCompletionResponse {
+            id: new_chat_completion_id(),
+            object: "chat.completion",
+            created: unix_now_secs(),
+            model: req.model.clone(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatAssistantMessage {
+                    role: Role::Assistant,
+                    content: Some(reply.into()),
+                    tool_calls: None,
+                },
+                finish_reason: Some(FinishReason::Stop),
+            }],
+            usage: Usage::new(0, 0),
+        };
+        if req.stream {
+            return Ok(ChatCompletionsResponse::Stream(
+                slash_command_sse(body, request_id).into_response()
+            ));
+        }
+        return Ok(ChatCompletionsResponse::Json(Json(body)));
     }
 
     let sampling = req.sampling_params().ensure_supported()?;
@@ -186,6 +303,7 @@ pub async fn chat_completions(
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         events_tx,
         cancelled: cancelled.clone(),
+        shadow_requested,
     };
     tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
@@ -785,6 +903,7 @@ fn sse_json<T: serde::Serialize>(value: &T) -> Event {
 
 pub async fn completions(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> ApiResult<CompletionsResponse> {
     let request_id = Uuid::new_v4();
@@ -794,6 +913,12 @@ pub async fn completions(
         stream = req.stream,
     );
     let _enter = span.enter();
+    // === NVFP4 SHADOW DIAGNOSTIC === see chat_completions for full doc.
+    let shadow_requested = headers
+        .get("x-rvllm-shadow")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| matches!(s.trim(), "1" | "true" | "kv-f16-v1"))
+        .unwrap_or(false);
 
     ensure_model_matches(&state, &req.model)?;
     reject_v1_unsupported_completions(&req)?;
@@ -843,6 +968,7 @@ pub async fn completions(
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         events_tx,
         cancelled: cancelled.clone(),
+        shadow_requested,
     };
     tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;

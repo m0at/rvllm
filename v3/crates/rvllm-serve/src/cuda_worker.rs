@@ -184,6 +184,7 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             &req.prompt_ids,
             req.max_new_tokens as usize,
             &req.stop_token_ids,
+            req.shadow_requested,
         )
     };
 
