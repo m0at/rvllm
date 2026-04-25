@@ -38,6 +38,7 @@ from m2_moe_gather import moe_block_gather_topk
 #   dense    = all 32 local experts + mask + psum (wasteful at B=1)
 #   gather   = dynamic-gather top-K per shard + batched matmul + psum (AGENT 16 recommended)
 _MOE_PATH = os.environ.get('M2_MOE', 'shardmap').lower()
+_KV_MODE = os.environ.get('RVLLM_M2_KV', 'bf16').strip().lower()
 
 # --- Arch constants ---
 H = 3072
@@ -98,6 +99,47 @@ def rope_partial(x, cos, sin):
     return jnp.concatenate([rotated, xp], axis=-1)
 
 
+def kv_cache_mode():
+    if _KV_MODE in ('int8', 'i8'):
+        return 'int8'
+    return 'bf16'
+
+
+def _is_int8_kv(cache):
+    return isinstance(cache, tuple)
+
+
+def _cache_ctx(cache):
+    if _is_int8_kv(cache):
+        return cache[0].shape[1]
+    return cache.shape[1]
+
+
+def _index_layer_cache(cache, i):
+    if _is_int8_kv(cache):
+        return tuple(jax.lax.dynamic_index_in_dim(c, i, axis=0, keepdims=False)
+                     for c in cache)
+    return jax.lax.dynamic_index_in_dim(cache, i, axis=0, keepdims=False)
+
+
+def _update_layer_cache(cache, value, i):
+    if _is_int8_kv(cache):
+        return tuple(jax.lax.dynamic_update_index_in_dim(c, v, i, axis=0)
+                     for c, v in zip(cache, value))
+    return jax.lax.dynamic_update_index_in_dim(cache, value, i, axis=0)
+
+
+def quantize_kv(x):
+    x32 = x.astype(jnp.float32)
+    scale = jnp.max(jnp.abs(x32), axis=-1).clip(min=1e-8) / 127.0
+    q = jnp.round(x32 / scale[..., None]).clip(-127, 127).astype(jnp.int8)
+    return q, scale.astype(jnp.bfloat16)
+
+
+def dequantize_kv(q, scale, dtype):
+    return (q.astype(dtype) * scale[..., None].astype(dtype)).astype(dtype)
+
+
 def attn_layer(x, wq, wk, wv, wo, qn, kn, ln, k_cache, v_cache, pos, cos, sin):
     h = rms_norm(x, ln)
     q = (h @ wq.T).reshape(-1, NH, HEAD_DIM)
@@ -107,16 +149,57 @@ def attn_layer(x, wq, wk, wv, wo, qn, kn, ln, k_cache, v_cache, pos, cos, sin):
     k = head_rms(k, kn)
     q = rope_partial(q, cos[pos], sin[pos])
     k = rope_partial(k, cos[pos], sin[pos])
-    k_cache = jax.lax.dynamic_update_slice(k_cache, k[:, None], (0, pos, 0, 0))
-    v_cache = jax.lax.dynamic_update_slice(v_cache, v[:, None], (0, pos, 0, 0))
+
+    if _is_int8_kv(k_cache):
+        k_q_cache, k_s_cache = k_cache
+        v_q_cache, v_s_cache = v_cache
+        k_q, k_s = quantize_kv(k)
+        v_q, v_s = quantize_kv(v)
+        k_q_cache = jax.lax.dynamic_update_slice(
+            k_q_cache, k_q[:, None], (0, pos, 0, 0))
+        v_q_cache = jax.lax.dynamic_update_slice(
+            v_q_cache, v_q[:, None], (0, pos, 0, 0))
+        k_s_cache = jax.lax.dynamic_update_slice(
+            k_s_cache, k_s[:, None], (0, pos, 0))
+        v_s_cache = jax.lax.dynamic_update_slice(
+            v_s_cache, v_s[:, None], (0, pos, 0))
+        k_cache = (k_q_cache, k_s_cache)
+        v_cache = (v_q_cache, v_s_cache)
+    else:
+        k_cache = jax.lax.dynamic_update_slice(
+            k_cache, k[:, None].astype(k_cache.dtype), (0, pos, 0, 0))
+        v_cache = jax.lax.dynamic_update_slice(
+            v_cache, v[:, None].astype(v_cache.dtype), (0, pos, 0, 0))
+
     B_ = q.shape[0]
     q_g = q.reshape(B_, NKV, NH // NKV, HEAD_DIM)
     scale = 1.0 / jnp.sqrt(float(HEAD_DIM))
-    scores = jnp.einsum('bhgd,bkhd->bhgk', q_g, k_cache.astype(q.dtype)) * scale
-    mask = (jnp.arange(k_cache.shape[1]) <= pos)
+
+    if _is_int8_kv(k_cache):
+        k_q_cache, k_s_cache = k_cache
+        raw_scores = jnp.einsum(
+            'bhgd,bkhd->bhgk', q_g, k_q_cache.astype(q.dtype))
+        k_scale = jnp.swapaxes(k_s_cache, 1, 2)[:, :, None, :].astype(q.dtype)
+        scores = raw_scores * k_scale * scale
+    else:
+        scores = jnp.einsum(
+            'bhgd,bkhd->bhgk', q_g, k_cache.astype(q.dtype)) * scale
+
+    mask = (jnp.arange(_cache_ctx(k_cache)) <= pos)
     scores = jnp.where(mask[None, None, None, :], scores, -1e30)
     p = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(q.dtype)
-    ctx = jnp.einsum('bhgk,bkhd->bhgd', p, v_cache.astype(q.dtype))
+
+    if _is_int8_kv(v_cache):
+        v_q_cache, v_s_cache = v_cache
+        v_scale = jnp.swapaxes(v_s_cache, 1, 2)[:, :, None, :].astype(p.dtype)
+        ctx = jnp.einsum(
+            'bhgk,bkhd->bhgd',
+            p * v_scale,
+            v_q_cache.astype(q.dtype),
+        )
+    else:
+        ctx = jnp.einsum('bhgk,bkhd->bhgd', p, v_cache.astype(q.dtype))
+
     ctx = ctx.reshape(B_, NH * HEAD_DIM)
     out = ctx @ wo.T
     return out, k_cache, v_cache
@@ -125,14 +208,14 @@ def attn_layer(x, wq, wk, wv, wo, qn, kn, ln, k_cache, v_cache, pos, cos, sin):
 # --- Scan over layers. One layer's weights slice out of the stacked pytree
 # per scan step, so XLA streams them through HBM instead of holding all 62. ---
 
-def forward_step(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_head, mesh):
+def forward_logits(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_head, mesh):
     """stacked: pytree with leading axis = NL for every leaf."""
 
     def layer_body(carry, layer_w):
         x, k_cache, v_cache, i = carry
         # Slice the per-layer k_cache/v_cache (axis 0 is NL)
-        k_i = jax.lax.dynamic_index_in_dim(k_cache, i, axis=0, keepdims=False)
-        v_i = jax.lax.dynamic_index_in_dim(v_cache, i, axis=0, keepdims=False)
+        k_i = _index_layer_cache(k_cache, i)
+        v_i = _index_layer_cache(v_cache, i)
 
         att_out, k_i_new, v_i_new = attn_layer(
             x,
@@ -168,8 +251,8 @@ def forward_step(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_hea
             )
         x = x + moe_out
 
-        k_cache = jax.lax.dynamic_update_index_in_dim(k_cache, k_i_new, i, axis=0)
-        v_cache = jax.lax.dynamic_update_index_in_dim(v_cache, v_i_new, i, axis=0)
+        k_cache = _update_layer_cache(k_cache, k_i_new, i)
+        v_cache = _update_layer_cache(v_cache, v_i_new, i)
         return (x, k_cache, v_cache, i + 1), None
 
     (x, k_cache, v_cache, _), _ = jax.lax.scan(
@@ -177,6 +260,13 @@ def forward_step(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_hea
 
     h = rms_norm(x, final_norm)
     logits = h @ lm_head.T
+    return logits, k_cache, v_cache
+
+
+def forward_step(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_head, mesh):
+    """stacked: pytree with leading axis = NL for every leaf."""
+    logits, k_cache, v_cache = forward_logits(
+        x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_head, mesh)
     tok = jnp.argmax(logits, axis=-1).astype(jnp.int32)
     return tok, k_cache, v_cache
 

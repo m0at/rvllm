@@ -15,9 +15,10 @@ OpenAI-compatible API server.
 - **Current throughput** (as of this commit):
   - Load: ~80s (parallel ThreadPool over 61 safetensors shards)
   - **B=1**: 726 ms/step = **1.4 tok/s**
-  - **B=8**: 146 ms/step = **54.7 tok/s** (replicate-token MoE + inactive-expert skip)
-  - **B=16**: 155 ms/step = **103.3 tok/s**
-  - B≥32 still needs a fresh sweep after the B=16 path fit
+  - **B=8**: 145 ms/step = **55.1 tok/s** (`RVLLM_M2_KV=int8`)
+  - **B=16**: 155 ms/step = **103.5 tok/s**
+  - **B=32**: 187 ms/step = **171.3 tok/s**
+  - Short correctness gate: **PPL 5.60** and coherent 64-token generation
 
 ---
 
@@ -129,12 +130,13 @@ export JAX_COMPILATION_CACHE_DIR="$HOME/.jax_cache"
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
 export M2_MOE=shardmap
-# default: RVLLM_M2_MOE_IMPL=auto, which uses replicate-token MoE for B=8
+# default: RVLLM_M2_MOE_IMPL=auto, which uses replicate-token MoE for B=8/16/32
+export RVLLM_M2_KV=int8
 
 cd /tmp
 python3 -u m2_full_bench.py \
   --model-dir /dev/shm/m2-nvfp4 \
-  --batches 1,8 \
+  --batches 1,8,16,32 \
   --ctx 2048 \
   --iters 10 \
   --warmup 3 \
@@ -157,7 +159,7 @@ export OPT_LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true \
   --xla_tpu_overlap_compute_collective_tc=true"
 
 MODEL_DIR=/dev/shm/m2-nvfp4 \
-BATCHES="1 8" \
+BATCHES="1 8 16 32" \
 OUT_DIR=/tmp/m2_sweep \
 LOG_DIR=/tmp/m2_sweep_logs \
 bash ~/runs/$SHA/tpu/harness/run_sweep_subproc.sh
@@ -182,7 +184,7 @@ Flag reference:
 
 | Flag | Effect |
 |---|---|
-| `--batches 1,8` | Batch sizes to sweep (comma-separated) |
+| `--batches 1,8,16,32` | Batch sizes to sweep (comma-separated) |
 | `--ctx 2048` | Max sequence length |
 | `--iters 10` | Timing iterations per batch after warmup |
 | `--warmup 3` | Warmup iterations (JIT compile happens here) |
@@ -201,7 +203,7 @@ Flag reference:
 `M2_MOE=shardmap` selects the main NVFP4 MoE implementation. Inside that path,
 `RVLLM_M2_MOE_IMPL=auto` is the default:
 
-- B=8/B=16 use exact replicate-token MoE: tokens/routing stay replicated, each
+- B=8/B=16/B=32 use exact replicate-token MoE: tokens/routing stay replicated, each
   chip skips inactive local experts with `lax.cond`, and outputs combine with `psum`.
 - Other batch sizes use the original padded all-to-all path unless overridden.
 
@@ -212,11 +214,21 @@ Measured B=8:
 
 | Impl | B=8 perf | Notes |
 |---|---:|---|
-| `auto` / `replicate_tokens` | **54.7 tok/s** | exact token match vs all-to-all on B=8 probe |
+| `auto` / `replicate_tokens` | **55.1 tok/s** with int8 KV | exact token match vs all-to-all on B=8 probe |
 | `all_to_all` | 10.0 tok/s | previous baseline |
 | `RVLLM_NVFP4_BACKEND=pallas` | 7.2 tok/s | exact but slower two-stage Pallas matmul |
 
-B=16 with `auto` measured **103.3 tok/s**.
+B=16 with `auto` + int8 KV measured **103.5 tok/s**. B=32 with replicate-token
+MoE + int8 KV measured **171.3 tok/s** and is now included in `auto`.
+
+### KV cache variants
+
+Set before running:
+
+| Value | Cache | Notes |
+|---|---|---|
+| `RVLLM_M2_KV=bf16` | bf16 KV | Default, simplest path |
+| `RVLLM_M2_KV=int8` | int8 KV + bf16 per-vector scales | Preserved short PPL/coherence gate; B=8 55.1 tok/s, B=32 171.3 tok/s |
 
 ### Legacy `M2_MOE` variants
 
@@ -224,7 +236,7 @@ Set before running:
 
 | Value | Impl | B=1 perf | B=8+ perf |
 |---|---|---|---|
-| `shardmap` (default) | expert-sharded MoE (`RVLLM_M2_MOE_IMPL=auto`) | **1.4 tok/s** | **54.7 tok/s @ B=8**, **103.3 tok/s @ B=16** |
+| `shardmap` (default) | expert-sharded MoE (`RVLLM_M2_MOE_IMPL=auto`) | **1.4 tok/s** | **55.1 tok/s @ B=8**, **103.5 tok/s @ B=16**, **171.3 tok/s @ B=32** |
 | `dense` | compute all 32 local experts per shard | compile hangs | n/a |
 | `gather` | dynamic-gather top-K + vmap | 0.02 tok/s (vmap doesn't fuse) | n/a |
 
@@ -455,17 +467,18 @@ Set `RVLLM_API` to the forwarded port from Section 6.
 ## 9. What next (performance)
 
 Current bottleneck: small-batch MoE still launches per-active-expert NVFP4
-matmuls. B=8/B=16 avoid padded all-to-all and empty expert matmuls now, but B=1
+matmuls. B=8/B=16/B=32 avoid padded all-to-all and empty expert matmuls now, but B=1
 still needs a better kernel.
 Known paths that would move the needle:
 
-1. **True fused Pallas NVFP4 matmul kernel**. The current two-stage Pallas
+1. **Mosaic/MLIR fused NVFP4 matmul kernel**. The current two-stage Pallas
    backend is correct but slower; high-level Pallas currently crashes Mosaic
    when a uint8-derived RHS feeds TPU matmul.
-2. **int8 KV cache** — unblocks B ≥ 16 (currently OOMs on replicated KV).
-3. **Prefill batching** — 20-token prompt currently costs 14s TTFT because
+2. **Prefill batching** — 20-token prompt currently costs 14s TTFT because
    prefill runs serial B=1. Packing the prompt into one (1, 20) forward pass
    gives ~16× TTFT speedup.
+3. **Flatten API/infer wrappers** onto the same scanned full-bench forward path
+   before making int8 KV the serving default.
 4. **Async collective flags** (`LIBTPU_INIT_ARGS`) — Gemma4 uses these for
    ~5% gain at larger batch sizes. Free to add.
 5. **EAGLE-3 speculative decode** — existing `tpu/harness/eagle3_*.py` scaffold,

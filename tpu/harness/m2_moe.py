@@ -321,7 +321,7 @@ def _moe_shard_map_nvfp4(
     """
     impl = os.environ.get('RVLLM_M2_MOE_IMPL', 'auto').strip().lower()
     if impl == 'auto':
-        impl = 'replicate_tokens' if x.shape[0] in (8, 16) else 'all_to_all'
+        impl = 'replicate_tokens' if x.shape[0] in (8, 16, 32) else 'all_to_all'
     if impl in ('replicate', 'replicated', 'replicate_tokens'):
         return _moe_replicate_tokens_nvfp4(
             x, router_w, router_bias,

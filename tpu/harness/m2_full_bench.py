@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from m2_synth_bench import (
     NL_FULL, NH, NKV, HEAD_DIM, H, MOE_INTER, NUM_EXPERTS, TOP_K,
     VOCAB, ROPE_THETA, ROTARY_DIM, DTYPE,
-    make_mesh_v6e8, precompute_rope, forward_step,
+    make_mesh_v6e8, precompute_rope, forward_step, forward_logits, kv_cache_mode,
 )
 from m2_real_bench import load_model_stacked
 
@@ -62,11 +62,29 @@ def make_batched_empty_cache(mesh, nl, B, ctx, dtype):
     # Else shard along sequence axis; else replicate (B=1 only).
     if 'expert' in mesh.axis_names and B % n_shards == 0:
         spec = P(None, 'expert', None, None, None)  # shard batch axis
+        scale_spec = P(None, 'expert', None, None)
     elif 'expert' in mesh.axis_names and ctx % n_shards == 0:
         spec = P(None, None, 'expert', None, None)  # shard seq axis
+        scale_spec = P(None, None, 'expert', None)
     else:
         spec = P()
+        scale_spec = P()
     sharding = NamedSharding(mesh, spec)
+
+    if kv_cache_mode() == 'int8':
+        scale_sharding = NamedSharding(mesh, scale_spec)
+        q_shape = (nl, B, ctx, NKV, HEAD_DIM)
+        s_shape = (nl, B, ctx, NKV)
+        k = (
+            jax.device_put(jnp.zeros(q_shape, dtype=jnp.int8), sharding),
+            jax.device_put(jnp.zeros(s_shape, dtype=jnp.bfloat16), scale_sharding),
+        )
+        v = (
+            jax.device_put(jnp.zeros(q_shape, dtype=jnp.int8), sharding),
+            jax.device_put(jnp.zeros(s_shape, dtype=jnp.bfloat16), scale_sharding),
+        )
+        return k, v
+
     k = jax.device_put(jnp.zeros((nl, B, ctx, NKV, HEAD_DIM), dtype=dtype), sharding)
     v = jax.device_put(jnp.zeros((nl, B, ctx, NKV, HEAD_DIM), dtype=dtype), sharding)
     return k, v
@@ -184,36 +202,8 @@ def compute_ppl(mesh, model_state, tk, text, ctx):
     k_cache, v_cache = make_batched_empty_cache(mesh, NL_FULL, 1, ctx, DTYPE)
 
     def _forward_logits(x, stacked, k_cache, v_cache, pos, cos, sin, final_norm, lm_head):
-        from m2_synth_bench import rms_norm
-        # Replicate forward_step internals but return logits, not argmax.
-        def layer_body(carry, layer_w):
-            x, k_cache, v_cache, i = carry
-            k_i = jax.lax.dynamic_index_in_dim(k_cache, i, axis=0, keepdims=False)
-            v_i = jax.lax.dynamic_index_in_dim(v_cache, i, axis=0, keepdims=False)
-            from m2_synth_bench import attn_layer, rms_norm as rn
-            from m2_moe import moe_block_nvfp4
-            att_out, k_i_new, v_i_new = attn_layer(
-                x, layer_w['attn_q'], layer_w['attn_k'], layer_w['attn_v'], layer_w['attn_o'],
-                layer_w['attn_qn'], layer_w['attn_kn'], layer_w['ln1'],
-                k_i, v_i, pos, cos, sin)
-            x = x + att_out
-            h = rn(x, layer_w['ln2'])
-            moe_out = moe_block_nvfp4(
-                h, layer_w['rg'], layer_w['rb'],
-                (layer_w['w1_p'], layer_w['w1_s'], layer_w['w1_s2']),
-                (layer_w['w2_p'], layer_w['w2_s'], layer_w['w2_s2']),
-                (layer_w['w3_p'], layer_w['w3_s'], layer_w['w3_s2']),
-                mesh,
-            )
-            x = x + moe_out
-            k_cache = jax.lax.dynamic_update_index_in_dim(k_cache, k_i_new, i, axis=0)
-            v_cache = jax.lax.dynamic_update_index_in_dim(v_cache, v_i_new, i, axis=0)
-            return (x, k_cache, v_cache, i + 1), None
-        (x, k_cache, v_cache, _), _ = jax.lax.scan(
-            layer_body, (x, k_cache, v_cache, jnp.int32(0)), stacked)
-        h = rms_norm(x, final_norm)
-        logits = h @ lm_head.T
-        return logits, k_cache, v_cache
+        return forward_logits(x, stacked, k_cache, v_cache, pos, cos, sin,
+                              final_norm, lm_head, mesh)
 
     forward_jit = jax.jit(_forward_logits)
 
@@ -273,6 +263,8 @@ def main():
         'slice': 'v6e-8',
         'nl': NL_FULL,
         'ctx': args.ctx,
+        'kv_cache': kv_cache_mode(),
+        'moe_impl': os.environ.get('RVLLM_M2_MOE_IMPL', 'auto'),
         'load_seconds': load_s,
         'sweep': None,
         'ppl': None,

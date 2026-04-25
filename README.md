@@ -130,13 +130,15 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 |---|---|
 | Model load (136 GB via parallel ThreadPool) | 79 s |
 | B=1 | 726 ms/step, 1.4 tok/s |
-| **B=8** | **146 ms/step, 54.7 tok/s** (`RVLLM_M2_MOE_IMPL=auto`, replicate-token MoE + inactive-expert skip) |
-| **B=16** | **155 ms/step, 103.3 tok/s** (`RVLLM_M2_MOE_IMPL=auto`, replicate-token MoE + inactive-expert skip) |
+| **B=8, bf16 KV** | **146 ms/step, 54.7 tok/s** (`RVLLM_M2_MOE_IMPL=auto`, replicate-token MoE + inactive-expert skip) |
+| **B=8, int8 KV** | **145 ms/step, 55.1 tok/s** (`RVLLM_M2_KV=int8`) |
+| **B=16, int8 KV** | **155 ms/step, 103.5 tok/s** |
+| **B=32, int8 KV** | **187 ms/step, 171.3 tok/s** (`replicate_tokens`; now included in `auto`) |
 | B=8, previous all-to-all MoE | 802 ms/step, 10.0 tok/s |
 | B=8, opt-in Pallas bf16 matmul (`RVLLM_NVFP4_BACKEND=pallas`, `BN=512`) | 1105 ms/step, 7.2 tok/s |
-| B=32+ | not yet re-benchmarked after B=16 fit |
 | PPL probe (318 scored tokens) | **5.63** |
 | PPL probe with replicate-token MoE (750 scored tokens) | **5.14** |
+| PPL probe with int8 KV (318 scored tokens) | **5.60** |
 | Gen sample (32 tok) | `"Explain angular momentum. The angular momentum of a particle about a point \\(O\\) is defined as \\(\\vec{L}=\\vec{r} \\times \\vec{p}\\) where \\(\\vec{r"` |
 
 ### What this demonstrates
@@ -144,26 +146,27 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 - v6e-8 provisioning (spot), 130 GB HF download in 1m45s (authed)
 - NVFP4 safetensors loader (modelopt 4-tensor format: packed + weight_scale + weight_scale_2 + input_scale)
 - Correct bf16 checkpoint loading: safetensors bf16 payloads are bitcast from raw `uint16`, not numerically cast
-- Expert-parallel sharding: 256 experts across 8 chips (32/chip) via `shard_map`; B=8 uses replicate-token + `psum`, while the legacy path uses `jax.lax.all_to_all`
+- Expert-parallel sharding: 256 experts across 8 chips (32/chip) via `shard_map`; B=8/B=16/B=32 use replicate-token + `psum`, while the legacy path uses `jax.lax.all_to_all`
 - `lax.scan` over 62 layers so XLA streams one layer's weights at a time (fits in 32 GB HBM/chip)
 - Sigmoid+bias top-8 router with aux-loss-free scoring (`scoring_func: sigmoid`, `use_routing_bias: true`)
 - Partial RoPE (rotary_dim=64 of head_dim=128), QK-norm per layer, GQA softmax
 - Per-batch JAX compile cache persisted to HuggingFace (`and-y/rvllm-m2-build`) so next boot skips install + JIT
-- B=8/B=16 now use exact replicate-token MoE by default: tokens stay replicated across expert shards, each shard skips inactive local experts with `lax.cond`, and outputs combine with `psum`. This avoids padded all-to-all buckets and empty expert matmuls.
+- B=8/B=16/B=32 now use exact replicate-token MoE by default: tokens stay replicated across expert shards, each shard skips inactive local experts with `lax.cond`, and outputs combine with `psum`. This avoids padded all-to-all buckets and empty expert matmuls.
+- `RVLLM_M2_KV=int8` adds Gemma-style per-vector int8 KV cache. It preserves the short PPL/coherence gate and keeps B=8/B=16 throughput flat while fitting B=32 at 171 tok/s.
 
 ### Known issues blocking production
 
-1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. B=8/B=16 avoid padded token all-to-all now; B=1 still needs a better small-batch kernel.
-2. **KV cache memory still limits larger batches / longer ctx**. B=16 now fits with batch-sharded KV; int8 KV quant (Gemma4 reference) is still the next memory lever.
+1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. B=8/B=16/B=32 avoid padded token all-to-all now; B=1 still needs a better small-batch kernel.
+2. **KV cache is opt-in int8 for now**. The full-bench path supports `RVLLM_M2_KV=int8`; the older API/infer wrappers still need the same flat cache surface before int8 becomes the serving default.
 3. **Full validation still needed**. The short corrected probe is coherent (`tpu/out/m2/m2_fix_probe.json`), but the next run should score a longer Wikitext slice and capture a 256+ token sample.
 
 ### Build list (ranked, from 16-agent perf advisor spec)
 
 See [`tpu/harness/M2_PERF_ADVISOR_SPEC.md`](tpu/harness/M2_PERF_ADVISOR_SPEC.md) for the full analysis.
 
-1. True fused Pallas NVFP4→MXU matmul kernel — high-level Pallas currently crashes Mosaic when a uint8-derived RHS feeds TPU matmul; the current two-stage Pallas matmul is slower than XLA dot
-2. int8 KV cache → unblock B≥16
-3. Batched prefill → 16× TTFT (20-token prompt currently 14s)
+1. Mosaic/MLIR custom-call fused NVFP4→MXU matmul kernel — high-level Pallas currently crashes Mosaic when a uint8-derived RHS feeds TPU matmul; the current two-stage Pallas matmul is slower than XLA dot
+2. Batched prefill → 16× TTFT (20-token prompt currently 14s)
+3. Flatten API/infer wrappers onto the same scanned full-bench forward path
 4. Async collective flags (`LIBTPU_INIT_ARGS`) — ~5% at larger B
 5. EAGLE-3 speculative decode (scaffold exists, needs draft-head training)
 
