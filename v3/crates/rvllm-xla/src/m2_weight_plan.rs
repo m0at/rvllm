@@ -38,6 +38,23 @@ pub struct M2WeightUploadPlan {
     pub optional_input_scales_missing: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct M2WeightArenaEntry {
+    pub role: M2WeightRole,
+    pub name: String,
+    pub offset: usize,
+    pub nbytes: usize,
+    pub shape: Vec<i64>,
+    pub dtype: crate::PjrtElementType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct M2WeightArenaPlan {
+    pub alignment: usize,
+    pub total_bytes: usize,
+    pub entries: Vec<M2WeightArenaEntry>,
+}
+
 #[cfg(feature = "tpu")]
 pub struct M2UploadedWeightBuffer {
     pub role: M2WeightRole,
@@ -131,6 +148,33 @@ impl M2WeightUploadPlan {
         self.specs.iter().filter(|spec| spec.role == role).count()
     }
 
+    pub fn flat_arena(&self, alignment: usize) -> Result<M2WeightArenaPlan> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(invalid("alignment", "must be a nonzero power of two"));
+        }
+        let mut offset = 0usize;
+        let mut entries = Vec::with_capacity(self.specs.len());
+        for spec in &self.specs {
+            offset = align_up(offset, alignment);
+            entries.push(M2WeightArenaEntry {
+                role: spec.role,
+                name: spec.name.clone(),
+                offset,
+                nbytes: spec.tensor.nbytes,
+                shape: spec.tensor.shape.clone(),
+                dtype: spec.tensor.dtype,
+            });
+            offset = offset
+                .checked_add(spec.tensor.nbytes)
+                .ok_or_else(|| invalid("total_bytes", "weight arena overflow"))?;
+        }
+        Ok(M2WeightArenaPlan {
+            alignment,
+            total_bytes: align_up(offset, alignment),
+            entries,
+        })
+    }
+
     #[cfg(feature = "tpu")]
     pub fn upload_to_pjrt(
         &self,
@@ -159,6 +203,10 @@ impl M2WeightUploadPlan {
             total_bytes: self.total_device_bytes(),
         })
     }
+}
+
+fn align_up(x: usize, alignment: usize) -> usize {
+    (x + alignment - 1) & !(alignment - 1)
 }
 
 fn push_required(
@@ -272,6 +320,28 @@ mod tests {
         let plan = M2WeightUploadPlan::from_index_dir(schema_dir(), &abi).unwrap();
         assert!(plan.total_device_bytes() > 120_000_000_000);
         assert!(plan.total_device_bytes() < 150_000_000_000);
+    }
+
+    #[test]
+    fn flat_arena_offsets_all_weight_tensors_without_allocating() {
+        let abi = M2GraphAbi::new(M2GraphShape::decode(8, 2048, 1)).unwrap();
+        let plan = M2WeightUploadPlan::from_index_dir(schema_dir(), &abi).unwrap();
+        let arena = plan.flat_arena(128).unwrap();
+        assert_eq!(arena.alignment, 128);
+        assert_eq!(arena.entries.len(), 191_069);
+        assert!(arena.total_bytes >= plan.total_device_bytes());
+        assert_eq!(arena.total_bytes % 128, 0);
+        assert_eq!(arena.entries[0].offset, 0);
+        for entry in &arena.entries {
+            assert_eq!(entry.offset % 128, 0);
+        }
+        let w1 = arena
+            .entries
+            .iter()
+            .find(|entry| entry.name == "model.layers.0.block_sparse_moe.experts.0.w1.weight")
+            .unwrap();
+        assert_eq!(w1.shape, vec![1_536, 1_536]);
+        assert_eq!(w1.dtype, PjrtElementType::U8);
     }
 
     #[test]

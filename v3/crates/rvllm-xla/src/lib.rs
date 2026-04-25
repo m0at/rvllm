@@ -30,4 +30,6 @@ pub use m2_prefill::{
 pub use m2_runtime::{plan_m2_rust_prefill, M2RustPrefillConfig, M2RustPrefillPlan};
 #[cfg(feature = "tpu")]
 pub use m2_weight_plan::{M2UploadedWeightBuffer, M2UploadedWeights};
-pub use m2_weight_plan::{M2WeightRole, M2WeightUploadPlan, M2WeightUploadSpec};
+pub use m2_weight_plan::{
+    M2WeightArenaEntry, M2WeightArenaPlan, M2WeightRole, M2WeightUploadPlan, M2WeightUploadSpec,
+};

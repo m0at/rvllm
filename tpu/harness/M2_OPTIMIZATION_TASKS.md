@@ -163,6 +163,9 @@ Rust verification:
 - [x] Wire the weight upload plan into live PJRT device buffers behind
   `rvllm-xla/tpu`: every safetensors view is validated for dtype/shape/bytes
   against the ABI before `PJRT_Client_BufferFromHostBuffer`.
+- [x] Add flat weight-arena planning: 191,069 logical tensors become one
+  aligned byte-addressable arena ABI with per-tensor offsets, roles, shapes,
+  and dtypes. This is the graph-facing layout; no 191k graph arguments.
 - [ ] Build the Rust MLIR/custom-call graph that consumes uploaded weight
   buffers and runtime decode inputs.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
