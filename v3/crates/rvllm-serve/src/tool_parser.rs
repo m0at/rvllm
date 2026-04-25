@@ -42,11 +42,15 @@ const CHANNEL_CLOSE: &str = "<channel|>";
 // They all close with `<channel|>` and must be dropped from user content
 // wholesale — the inner prose is the model's "what do I think the answer is"
 // draft, which should never be shown to the user.
-const THOUGHT_BLOCK_OPENERS: &[&str] = &[
+pub const THOUGHT_BLOCK_OPENERS: &[&str] = &[
     "<|channel>",
     "<|tool_response>",
     "<thought",
 ];
+
+/// Tier-1 tool-call opener. Public so the streaming SSE path can hold
+/// back content when an opener is in flight without its closer.
+pub const TOOL_CALL_OPENER: &str = "<|tool_call>";
 
 /// Extract all Gemma 4 tool calls from decoded text.
 ///

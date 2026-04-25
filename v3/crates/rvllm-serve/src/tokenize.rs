@@ -301,6 +301,24 @@ impl TokenizerHandle {
             tokenizer: self.inner.clone(),
             ids: Vec::new(),
             emitted_chars: 0,
+            keep_special: false,
+        }
+    }
+
+    /// Streaming decoder that PRESERVES special tokens (`<|tool_call>`,
+    /// `<|channel>`, …). Used by the chat-completions SSE path so the
+    /// caller can run `tool_parser::strip_tool_markup` on the raw view
+    /// before deciding what to emit as user-visible `delta.content`.
+    /// Without this, the streaming path leaked thought-block prose and
+    /// orphan tool-call markers — non-streaming preserved them via
+    /// `decode_raw` then stripped structurally; streaming was dropping
+    /// the very markers it needed to recognise the spans.
+    pub fn stream_decoder_raw(&self) -> StreamDecoder {
+        StreamDecoder {
+            tokenizer: self.inner.clone(),
+            ids: Vec::new(),
+            emitted_chars: 0,
+            keep_special: true,
         }
     }
 
@@ -379,6 +397,10 @@ pub struct StreamDecoder {
     /// client. Tracked in bytes (not chars) so we can slice the
     /// decoded string without re-scanning.
     emitted_chars: usize,
+    /// When true, `decode(..., skip_special_tokens=false)` so callers
+    /// see `<|tool_call>` / `<|channel>` markers verbatim. Set via
+    /// `TokenizerHandle::stream_decoder_raw()`.
+    keep_special: bool,
 }
 
 impl StreamDecoder {
@@ -394,7 +416,7 @@ impl StreamDecoder {
         let full = self
             .tokenizer
             .tokenizer
-            .decode(&self.ids, true)
+            .decode(&self.ids, /*skip_special_tokens*/ !self.keep_special)
             .map_err(|e| ApiError::Tokenize(format!("{e}")))?;
 
         // Emit bytes past the last high-water mark, but only up to

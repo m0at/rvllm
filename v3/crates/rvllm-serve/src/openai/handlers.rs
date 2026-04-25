@@ -103,7 +103,10 @@ use crate::openai::types::{
     new_chat_completion_id, new_completion_id, new_tool_call_id, unix_now_secs, FinishReason,
     Role, ToolCall, ToolCallFunction, Usage,
 };
-use crate::tool_parser::{parse_gemma4_tool_calls, strip_tool_markup};
+use crate::tool_parser::{
+    parse_gemma4_tool_calls, strip_tool_markup,
+    THOUGHT_BLOCK_OPENERS, TOOL_CALL_OPENER,
+};
 use crate::router::AppState;
 use crate::worker::{GenerateEvent, GenerateRequest};
 
@@ -199,6 +202,7 @@ pub async fn chat_completions(
             cancelled,
             state.config.sse_keepalive,
             request_timeout,
+            request_id,
         )))
     } else {
         let _cancel_guard = CancelOnDrop(cancelled.clone());
@@ -353,36 +357,61 @@ fn chat_stream_sse(
     cancelled: Arc<AtomicBool>,
     keepalive: std::time::Duration,
     request_timeout: std::time::Duration,
+    request_id: Uuid,
 ) -> axum::response::Response {
     let id = new_chat_completion_id();
     let created = unix_now_secs();
     let model_for_chunk = model_id.clone();
-    let decoder = tokenizer.stream_decoder();
+    // RAW decoder — preserves `<|tool_call>` / `<|channel>` / etc so
+    // `strip_tool_markup` and the tool parser can match them. Pre-fix
+    // we used `stream_decoder()` (skip_special_tokens=true), which
+    // dropped the markers before they could be recognised, leaking
+    // thought-channel prose to the client and producing different
+    // visible text than the non-streaming path.
+    let decoder = tokenizer.stream_decoder_raw();
     let deadline = tokio::time::Instant::now() + request_timeout;
 
     // State transitions:
     //   Role       — emit the first `delta.role = assistant` chunk
-    //   Content    — forward incremental text deltas (with gated
-    //                buffering so we never leak a Gemma 4 `<|tool_call>`
-    //                tag into `delta.content`)
-    //   FlushToolCalls(calls) — emit the parsed tool_calls as one delta
-    //   Finish(r)  — emit the terminal chunk with finish_reason
-    //   Done       — emit "data: [DONE]\n\n"
-    //   End        — stream over
+    //                (carries the same content fields so the next loop
+    //                iteration can transition to Content without
+    //                re-allocating).
+    //   Content    — forward incremental visible-text deltas. `accum`
+    //                is the RAW decoded run with control markers
+    //                preserved; `strip_tool_markup` is applied to a
+    //                safe prefix on each token to compute the visible
+    //                view, and only its new suffix ships as content.
+    //   FlushToolCalls — emit the parsed tool_calls as one delta.
+    //   Finish(r)  — emit the terminal chunk with finish_reason.
+    //   Done       — emit "data: [DONE]\n\n".
+    //   End        — stream over.
+    //
+    // Per-request disk dump (gated by RVLLM_DUMP_REQUEST_DIR) ships at
+    // GenerateEvent::Done so the response file pairs with the
+    // request file written by the parent handler.
     enum S {
-        Role,
+        Role {
+            rx: mpsc::Receiver<GenerateEvent>,
+            decoder: crate::tokenize::StreamDecoder,
+            accum: String,
+            emitted: usize,
+            in_tool: bool,
+            token_ids: Vec<u32>,
+            streamed_visible: String,
+        },
         Content {
             rx: mpsc::Receiver<GenerateEvent>,
             decoder: crate::tokenize::StreamDecoder,
-            /// Full decoded text so far. Needed to parse tool calls at
-            /// `Done` time, and to check whether a pending tail could be
-            /// the start of `<|tool_call>`.
+            /// Full RAW decoded text so far (markers preserved).
             accum: String,
-            /// Bytes of `accum` already flushed as `content` deltas.
+            /// Bytes of the *visible* (post-strip) text already flushed.
             emitted: usize,
-            /// Flipped the moment we see the start tag — from then on
-            /// no more `content` deltas go out.
+            /// Latched once we see the tool-call opener — from then on
+            /// nothing more goes out as content.
             in_tool: bool,
+            /// Captured for the response dump.
+            token_ids: Vec<u32>,
+            streamed_visible: String,
         },
         FlushToolCalls(Vec<ToolCall>),
         Finish(FinishReason),
@@ -397,6 +426,7 @@ fn chat_stream_sse(
         model: String,
         cancelled: Arc<AtomicBool>,
         deadline: tokio::time::Instant,
+        request_id: Uuid,
     }
 
     impl Drop for Ctx {
@@ -407,28 +437,32 @@ fn chat_stream_sse(
         }
     }
 
-    let mut ctx = Ctx {
-        state: S::Role,
+    let ctx = Ctx {
+        state: S::Role {
+            rx: events_rx,
+            decoder,
+            accum: String::new(),
+            emitted: 0,
+            in_tool: false,
+            token_ids: Vec::new(),
+            streamed_visible: String::new(),
+        },
         id,
         created,
         model: model_for_chunk,
         cancelled,
         deadline,
-    };
-    ctx.state = S::Content {
-        rx: events_rx,
-        decoder,
-        accum: String::new(),
-        emitted: 0,
-        in_tool: false,
+        request_id,
     };
     let _ = tokenizer; // keep for clone clarity
 
     let stream = stream::unfold(ctx, |mut ctx| async move {
         loop {
             match std::mem::replace(&mut ctx.state, S::End) {
-                S::Role => {
-                    // First chunk: announce the role.
+                S::Role { rx, decoder, accum, emitted, in_tool, token_ids, streamed_visible } => {
+                    // First chunk: announce the role. Then transition
+                    // to Content with the same buffers so the next
+                    // loop iteration can attach them.
                     let chunk = ChatCompletionChunk {
                         id: ctx.id.clone(),
                         object: "chat.completion.chunk",
@@ -440,13 +474,15 @@ fn chat_stream_sse(
                             finish_reason: None,
                         }],
                     };
-                    // Restore content state; caller must set rx/decoder before.
-                    // (This arm never runs in practice — we transition to
-                    // Content immediately above.)
-                    let ev = sse_json(&chunk);
-                    return Some((Ok(ev), ctx));
+                    ctx.state = S::Content {
+                        rx, decoder, accum, emitted, in_tool, token_ids, streamed_visible,
+                    };
+                    return Some((Ok(sse_json(&chunk)), ctx));
                 }
-                S::Content { mut rx, mut decoder, mut accum, mut emitted, mut in_tool } => {
+                S::Content {
+                    mut rx, mut decoder, mut accum, mut emitted, mut in_tool,
+                    mut token_ids, mut streamed_visible,
+                } => {
                     let deadline = ctx.deadline;
                     let ev = tokio::select! {
                         biased;
@@ -460,47 +496,63 @@ fn chat_stream_sse(
                     };
                     match ev {
                         Some(GenerateEvent::Token { id, .. }) => {
+                            token_ids.push(id);
                             match decoder.step(id) {
                                 Ok(text) if text.is_empty() => {
-                                    ctx.state = S::Content { rx, decoder, accum, emitted, in_tool };
+                                    ctx.state = S::Content {
+                                        rx, decoder, accum, emitted, in_tool,
+                                        token_ids, streamed_visible,
+                                    };
                                     continue;
                                 }
                                 Ok(text) => {
                                     accum.push_str(&text);
+                                    // Latch in_tool the moment a tool-call
+                                    // marker appears anywhere in accum.
                                     if !in_tool
-                                        && (accum.contains("<|tool_call>")
+                                        && (accum.contains(TOOL_CALL_OPENER)
                                             || find_anchored_call(&accum, 0)
                                                 .map(|p| accum[p + 5..].contains('{'))
                                                 .unwrap_or(false))
                                     {
                                         in_tool = true;
                                     }
-                                    // Decide how much of the accumulated
-                                    // text is safe to emit as `content`.
+                                    // Compute the safe RAW prefix (holds back
+                                    // anything that could start an unclosed
+                                    // marker), then strip control markup to
+                                    // get the visible view, then ship only
+                                    // the new visible suffix.
                                     let safe_end = safe_content_emit_end(
-                                        &accum, emitted, in_tool,
+                                        &accum, 0, in_tool,
                                     );
-                                    if safe_end > emitted {
-                                        let chunk_text = accum[emitted..safe_end].to_string();
-                                        emitted = safe_end;
-                                        let chunk = ChatCompletionChunk {
-                                            id: ctx.id.clone(),
-                                            object: "chat.completion.chunk",
-                                            created: ctx.created,
-                                            model: ctx.model.clone(),
-                                            choices: vec![ChatChunkChoice {
-                                                index: 0,
-                                                delta: ChatDelta::content(chunk_text),
-                                                finish_reason: None,
-                                            }],
-                                        };
-                                        ctx.state = S::Content {
-                                            rx, decoder, accum, emitted, in_tool,
-                                        };
-                                        return Some((Ok(sse_json(&chunk)), ctx));
+                                    if safe_end > 0 {
+                                        let visible = strip_tool_markup(&accum[..safe_end]);
+                                        if visible.len() > emitted {
+                                            let chunk_text =
+                                                visible[emitted..].to_string();
+                                            emitted = visible.len();
+                                            streamed_visible.push_str(&chunk_text);
+                                            let chunk = ChatCompletionChunk {
+                                                id: ctx.id.clone(),
+                                                object: "chat.completion.chunk",
+                                                created: ctx.created,
+                                                model: ctx.model.clone(),
+                                                choices: vec![ChatChunkChoice {
+                                                    index: 0,
+                                                    delta: ChatDelta::content(chunk_text),
+                                                    finish_reason: None,
+                                                }],
+                                            };
+                                            ctx.state = S::Content {
+                                                rx, decoder, accum, emitted, in_tool,
+                                                token_ids, streamed_visible,
+                                            };
+                                            return Some((Ok(sse_json(&chunk)), ctx));
+                                        }
                                     }
                                     ctx.state = S::Content {
                                         rx, decoder, accum, emitted, in_tool,
+                                        token_ids, streamed_visible,
                                     };
                                     continue;
                                 }
@@ -510,14 +562,26 @@ fn chat_stream_sse(
                                 }
                             }
                         }
-                        Some(GenerateEvent::Done { finish, .. }) => {
+                        Some(GenerateEvent::Done { finish, prompt_tokens, completion_tokens }) => {
+                            // Dump streaming response (no-op unless
+                            // RVLLM_DUMP_REQUEST_DIR set). Pairs with
+                            // the request dump written at handler entry.
+                            let prefix_n = token_ids.len().min(32);
+                            dump_write(&ctx.request_id, "response_stream", &serde_json::json!({
+                                "first_32_token_ids": &token_ids[..prefix_n],
+                                "total_generated_tokens": token_ids.len(),
+                                "full_raw_text": &accum,
+                                "streamed_visible_text": &streamed_visible,
+                                "finish_reason": finish,
+                                "usage_prompt_tokens": prompt_tokens,
+                                "usage_completion_tokens": completion_tokens,
+                            }));
+
                             // At Done, inspect the full buffer: if it
                             // carries tool-call markup, emit one final
                             // `tool_calls` delta and flip finish to
-                            // ToolCalls. Otherwise the buffer is just
-                            // prose — everything already flushed by the
-                            // safe-emit rule above (nothing buffered
-                            // outside the start-tag prefix window).
+                            // ToolCalls. Otherwise drain any visible
+                            // suffix held back by safe_content_emit_end.
                             let parsed = parse_gemma4_tool_calls(&accum);
                             if !parsed.is_empty() {
                                 let calls = parsed
@@ -534,10 +598,13 @@ fn chat_stream_sse(
                                 ctx.state = S::FlushToolCalls(calls);
                                 continue;
                             }
-                            // No tool call — flush any residue that
-                            // was being held back for start-tag safety.
-                            if emitted < accum.len() {
-                                let tail = accum[emitted..].to_string();
+                            // No tool call — drain residue. Apply
+                            // strip_tool_markup to the FULL accum (no
+                            // tail-keep at finalisation) and emit the
+                            // suffix beyond what was already streamed.
+                            let visible_full = strip_tool_markup(&accum);
+                            if visible_full.len() > emitted {
+                                let tail = visible_full[emitted..].to_string();
                                 let chunk = ChatCompletionChunk {
                                     id: ctx.id.clone(),
                                     object: "chat.completion.chunk",
@@ -607,34 +674,68 @@ fn chat_stream_sse(
     { let boxed: SseStream = Box::pin(stream); Sse::new(boxed).keep_alive(axum::response::sse::KeepAlive::new().interval(keepalive)).into_response() }
 }
 
-/// How many bytes of `accum` can safely leave the server as SSE
-/// `delta.content`. Rules:
+/// How many bytes of the raw `accum` can safely leave the server as
+/// SSE `delta.content` after `strip_tool_markup` is applied.
+///
+/// Rules:
 ///   * `in_tool == true` — hold everything; the FlushToolCalls stage
 ///     will emit the parsed calls.
 ///   * otherwise — emit up to the earliest byte that could start a
-///     Gemma 4 tool call:
-///       - tier-1: the `<|tool_call>` tag (the tokenizer may surface
-///         it when `skip_special_tokens=false` ever lands);
+///     Gemma 4 control marker WHOSE CLOSER HASN'T ARRIVED YET:
+///       - tier-1 tool call: `<|tool_call>` opener.
+///       - thought blocks: any of `THOUGHT_BLOCK_OPENERS` whose
+///         `<channel|>` / `<turn|>` closer hasn't appeared in `accum`.
+///         Holding here is what stops the streaming path from leaking
+///         thought-channel prose: `strip_tool_markup` on a span that
+///         contains an open `<|channel>` without its closer drops
+///         only the opener and keeps the prose, which used to slip
+///         through to the client. By holding the cursor at the opener
+///         until the closer arrives, the eventual strip removes the
+///         WHOLE block in one shot.
 ///       - tier-2: a word-anchored `call:` sequence.
-///     Also hold back the final `max(tag.len()) - 1` bytes in case a
-///     marker is straddling chunks. Split on UTF-8 boundaries.
+///     Also hold back the final `max(opener.len()) - 1` bytes in case
+///     a marker is straddling chunks. Split on UTF-8 boundaries.
 fn safe_content_emit_end(accum: &str, emitted: usize, in_tool: bool) -> usize {
     if in_tool {
         return emitted;
     }
     // Earliest anchored tier-2 marker in the unemitted region.
     let tier2 = find_anchored_call(accum, emitted);
-    // Earliest tier-1 wrapper start.
-    let tier1 = accum[emitted..].find("<|tool_call>").map(|r| emitted + r);
-    let earliest = match (tier1, tier2) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
+    // Earliest tier-1 wrapper start (tool-call opener — always hold,
+    // even if the closer is already present, so we can detect it as a
+    // real call at Done time and emit `tool_calls` instead of content).
+    let tier1 = accum[emitted..]
+        .find(TOOL_CALL_OPENER)
+        .map(|r| emitted + r);
+    // Earliest UNCLOSED thought-block opener. If the opener IS closed,
+    // strip_tool_markup will collapse the whole block — safe to emit
+    // through. If it's NOT closed, we must hold back until the closer
+    // arrives so the inner prose doesn't leak.
+    let thought = THOUGHT_BLOCK_OPENERS
+        .iter()
+        .filter_map(|&op| {
+            let pos = accum[emitted..].find(op).map(|r| emitted + r)?;
+            let after_opener = pos + op.len();
+            // Closer search: prefer `<channel|>`, accept `<turn|>` too
+            // (matches strip_tool_markup behaviour).
+            let tail = &accum[after_opener..];
+            let has_close = tail.contains("<channel|>") || tail.contains("<turn|>");
+            if has_close { None } else { Some(pos) }
+        })
+        .min();
+    let earliest = [tier1, tier2, thought]
+        .into_iter()
+        .flatten()
+        .min();
 
+    let max_opener_len = THOUGHT_BLOCK_OPENERS
+        .iter()
+        .map(|s| s.len())
+        .chain(std::iter::once(TOOL_CALL_OPENER.len()))
+        .max()
+        .unwrap_or(0);
     let ceiling_by_tail = {
-        let keep_back = "<|tool_call>".len() - 1; // >= "call:".len()
+        let keep_back = max_opener_len.saturating_sub(1); // >= "call:".len() = 5
         accum.len().saturating_sub(keep_back)
     };
     let mut cand = match earliest {
