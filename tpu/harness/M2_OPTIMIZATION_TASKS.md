@@ -77,6 +77,8 @@ Rust verification:
   `max_seqlen_q`.
 - [x] Verify Rust batched metadata matches serial prompt metadata for single
   prompt and offsets slots correctly for multi-request prefill.
+- [x] Add Rust prefill scan/custom-call contract for one compiled M2 prefill
+  step (`B*T` tokens, int8/bf16 KV shape, last-hidden output).
 - [ ] Add a prefill path that processes prompt length T as one compiled
   Rust/XLA step over positions instead of T serial host calls.
 - [ ] Preserve KV cache writes for every prompt position.
@@ -88,10 +90,16 @@ Rust artifacts:
 
 - `rvllm_core::BatchedPrefillPlan`: request -> one prefill batch metadata.
 - `rvllm_core::serial_prompt_metadata`: serial decode metadata reference.
+- `rvllm_fused::M2PrefillScanShape`: Rust/XLA prefill scan shape contract.
+- `m2_emit_prefill_scan`: emits the M2 prefill scan MLIR signature.
+- `tpu/out/m2/rvllm_m2_prefill_scan.mlir`: generated B=1/T=20/int8-KV
+  contract (`tokens`, positions, slots, `cu_seqlens_q`, context lens, KV cache,
+  last hidden).
 
 Rust verification:
 
 - `cargo test -p rvllm-core prefill --release` (3 tests passing)
+- `cargo test -p rvllm-fused m2_prefill --release` (3 tests passing)
 
 ## 4. EAGLE-3 / Spec Decode
 

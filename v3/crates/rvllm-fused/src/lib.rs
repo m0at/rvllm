@@ -15,6 +15,7 @@ pub mod gemma4_reference;
 pub mod launch_raw;
 pub mod launcher;
 pub mod m2_nvfp4;
+pub mod m2_prefill;
 pub mod reference;
 
 pub use launch_raw::launch_raw;
@@ -29,6 +30,7 @@ pub use m2_nvfp4::{
     M2Nvfp4MosaicMemory, M2Nvfp4MosaicTilePlan, FP4_E2M1_LUT, M2_MOSAIC_DEFAULT_BK,
     M2_MOSAIC_DEFAULT_BN, NVFP4_GROUP,
 };
+pub use m2_prefill::{M2PrefillKvDType, M2PrefillScanShape};
 pub use reference::{
     argmax_ref, embedding_gather_ref, fused_add_rmsnorm_fp8_quant_ref,
     fused_gelu_mul_fp8_quant_ref, fused_silu_mul_fp8_quant_ref, quantize_fp8_per_token_ref,
