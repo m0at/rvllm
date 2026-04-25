@@ -42,7 +42,7 @@ pub fn make_m2_prefill_input_specs(
         M2PrefillHostInputSpec {
             name: "kv_cache",
             shape: vec![shape.kv_cache_bytes() as i64],
-            dtype: shape.kv_dtype.into(),
+            dtype: PjrtElementType::S8,
             nbytes: shape.kv_cache_bytes(),
         },
     ])
@@ -83,7 +83,7 @@ pub fn make_m2_prefill_inputs(
         M2PrefillHostInput {
             name: "kv_cache",
             shape: vec![shape.kv_cache_bytes() as i64],
-            dtype: shape.kv_dtype.into(),
+            dtype: PjrtElementType::S8,
             bytes: vec![0u8; shape.kv_cache_bytes()],
         },
     ])
@@ -252,6 +252,32 @@ mod tests {
         assert_eq!(specs[0].shape, vec![1, 4]);
         assert_eq!(specs[0].nbytes, 16);
         assert_eq!(specs[5].name, "kv_cache");
+        assert_eq!(specs[5].nbytes, shape.kv_cache_bytes());
+    }
+
+    #[test]
+    fn bf16_kv_cache_is_still_a_flat_byte_buffer_for_pjrt() {
+        let prompt = [TokenId(10), TokenId(11)];
+        let plan = BatchedPrefillPlan::from_requests(&[PrefillRequest {
+            req_id: ReqId(1),
+            prompt_tokens: &prompt,
+            max_blocks_per_seq: 1,
+            block_size: 32,
+        }])
+        .unwrap();
+        let shape = M2PrefillScanShape {
+            batch: 1,
+            prompt_len: 2,
+            hidden: 3072,
+            ctx: 2,
+            num_layers: 62,
+            num_kv_heads: 8,
+            head_dim: 128,
+            kv_dtype: M2PrefillKvDType::Bf16,
+        };
+        let specs = make_m2_prefill_input_specs(&plan, shape).unwrap();
+        assert_eq!(specs[5].dtype, PjrtElementType::S8);
+        assert_eq!(specs[5].shape, vec![shape.kv_cache_bytes() as i64]);
         assert_eq!(specs[5].nbytes, shape.kv_cache_bytes());
     }
 

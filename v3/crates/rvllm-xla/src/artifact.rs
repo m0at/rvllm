@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use rvllm_core::{ConfigError, Result, RvllmError};
-use rvllm_fused::{M2PrefillKvDType, M2PrefillScanShape};
+use rvllm_fused::M2PrefillScanShape;
 use serde::{Deserialize, Serialize};
 
 use crate::ffi::PjrtElementType;
@@ -50,10 +50,6 @@ pub fn m2_prefill_artifact_manifest(
     if num_partitions == 0 {
         return Err(invalid("num_partitions", "must be > 0"));
     }
-    let kv_dtype = match shape.kv_dtype {
-        M2PrefillKvDType::Bf16 => PjrtElementType::BF16,
-        M2PrefillKvDType::Int8 => PjrtElementType::S8,
-    };
     Ok(XlaArtifact {
         mlir_file: mlir_file.into(),
         inputs: vec![
@@ -70,7 +66,7 @@ pub fn m2_prefill_artifact_manifest(
             ),
             tensor("cu_seqlens_q", &[shape.batch + 1], PjrtElementType::S32),
             tensor("context_lens", &[shape.batch], PjrtElementType::S32),
-            tensor("kv_cache", &[shape.kv_cache_bytes()], kv_dtype),
+            tensor("kv_cache", &[shape.kv_cache_bytes()], PjrtElementType::S8),
         ],
         outputs: vec![tensor(
             "last_hidden",
@@ -148,6 +144,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use rvllm_fused::M2PrefillKvDType;
+
     use super::*;
 
     fn m2_shape() -> M2PrefillScanShape {
@@ -175,6 +173,19 @@ mod tests {
         assert_eq!(artifact.inputs[5].shape, vec![260_046_848]);
         assert_eq!(artifact.outputs[0].shape, vec![1, 3072]);
         assert_eq!(artifact.num_partitions, 8);
+    }
+
+    #[test]
+    fn kv_cache_manifest_is_flat_bytes_even_for_bf16_kv() {
+        let mut shape = m2_shape();
+        shape.kv_dtype = M2PrefillKvDType::Bf16;
+        let artifact = m2_prefill_artifact_manifest("model.mlir", shape, 8).unwrap();
+        assert_eq!(artifact.inputs[5].name, "kv_cache");
+        assert_eq!(artifact.inputs[5].dtype, PjrtElementType::S8);
+        assert_eq!(
+            artifact.inputs[5].shape,
+            vec![shape.kv_cache_bytes() as i64]
+        );
     }
 
     #[test]
