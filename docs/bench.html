@@ -104,6 +104,18 @@ tbody tr.highlight td{background:rgba(132,230,183,0.06)}
 .note-box{margin:0.8rem 0 1.2rem;padding:1rem 1.2rem;background:#0c0f14;border-left:3px solid #444;font-size:0.9rem;color:#d0d0d0;border-radius:0 6px 6px 0}
 .note-box strong{color:#fff}
 
+.bench-callout{margin:2rem 0 2.4rem;padding:1.2rem;background:#101318;border:1px solid #253041;border-radius:8px}
+.bench-callout h2{margin:0 0 0.4rem;font-size:1.8rem}
+.bench-callout .lede{color:#c8ced8;font-size:0.94rem;max-width:70rem;line-height:1.55;margin-bottom:0.9rem}
+.bench-callout .mini-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0.55rem;margin:1rem 0}
+@media(max-width:860px){.bench-callout .mini-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:520px){.bench-callout .mini-grid{grid-template-columns:1fr}}
+.bench-callout .mini-stat{background:#0b1018;border:1px solid #1d2836;border-radius:8px;padding:0.75rem 0.85rem}
+.bench-callout .mini-stat .k{font-size:0.66rem;color:#8d98aa;text-transform:uppercase;letter-spacing:0}
+.bench-callout .mini-stat .v{font-size:1.45rem;color:#fff;font-weight:700;letter-spacing:0;line-height:1.15;margin-top:0.18rem}
+.bench-callout .mini-stat .d{font-size:0.76rem;color:#8f9bae;margin-top:0.25rem;line-height:1.35}
+.status-pill{display:inline-flex;align-items:center;padding:0.16rem 0.48rem;border-radius:999px;font-size:0.67rem;font-weight:700;letter-spacing:0;text-transform:uppercase;border:1px solid rgba(132,230,183,0.35);color:#84E6B7;background:rgba(132,230,183,0.1);vertical-align:middle;margin-left:0.45rem}
+
 .method-box{font-size:0.88rem;color:#c0c0c0;background:#0c0f14;padding:1rem 1.2rem;border-radius:8px;margin:1.2rem 0;line-height:1.7}
 .method-box code{background:#151c28;color:#b0d4ff;padding:2px 7px;border-radius:3px;font-size:0.8rem;font-family:ui-monospace,Menlo,Consolas,monospace}
 
@@ -137,6 +149,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="paper/rvllm.pdf">Paper</a>
     <a href="arch.md">Architecture</a>
+    <a href="#minimax-m2">MiniMax M2</a>
     <a href="#b200-tpu-comparison">B200 vs TPU</a>
   </div>
 </header>
@@ -154,6 +167,35 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 </tbody>
 </table>
 <div class="footnote">TPU: v6e-4, $5.20/hr, int8 weights, bf16 KV, max-ctx 2048. GPU: H100 SXM, $1.92/hr, FP8+F16 KV. *E4B GPU PPL is the 4B FP8 gate spot check. E4B B=30 is same-prompt broadcast throughput, not heterogeneous batching.</div>
+
+<section id="minimax-m2" class="bench-callout">
+  <h2>MiniMax-M2.7-NVFP4 on TPU v6e-8 <span class="status-pill">New full run</span></h2>
+  <p class="lede">
+    230B total / 10B active MoE on one v6e-8 slice. These are total batch throughput numbers, not per-request rates. The run is useful and reproducible, but still experimental: PPL is good, B=32 is the throughput peak at ctx 2048, and the 256-token sample starts coherent before repeating math text.
+  </p>
+
+  <div class="mini-grid">
+    <div class="mini-stat"><div class="k">Peak throughput</div><div class="v">171.25 tok/s</div><div class="d">B=32 total batch throughput</div></div>
+    <div class="mini-stat"><div class="k">B=8</div><div class="v">55.09 tok/s</div><div class="d">6.89 tok/s per request</div></div>
+    <div class="mini-stat"><div class="k">PPL gate</div><div class="v">6.73</div><div class="d">2047 scored tokens, gate passed</div></div>
+    <div class="mini-stat"><div class="k">Batch ceiling</div><div class="v">B=64 OOM</div><div class="d">ctx 2048, int8 KV</div></div>
+  </div>
+
+  <table>
+    <thead><tr><th>Batch</th><th class="r">Total tok/s</th><th class="r">tok/s per request</th><th class="r">ms/step</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td class="r">1.38</td><td class="r">1.38</td><td class="r">726.75</td><td>B=1 is MoE dispatch dominated</td></tr>
+      <tr><td>8</td><td class="r pos"><strong>55.09</strong></td><td class="r">6.89</td><td class="r">145.21</td><td>Primary interactive batch target</td></tr>
+      <tr><td>16</td><td class="r">103.47</td><td class="r">6.47</td><td class="r">154.63</td><td>Scales cleanly</td></tr>
+      <tr class="highlight"><td><strong>32</strong></td><td class="r pos"><strong>171.25</strong></td><td class="r">5.35</td><td class="r">186.87</td><td>Best measured total throughput</td></tr>
+      <tr><td>64</td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td>OOM: 992 MB allocation with 850 MB free</td></tr>
+    </tbody>
+  </table>
+
+  <div class="footnote">
+    Run: <code>bb800cc21</code>, v6e-8, ctx 2048, <code>RVLLM_M2_KV=int8</code>, <code>RVLLM_M2_MOE_IMPL=auto</code>. Artifact path: <code>tpu/out/m2/full_equiv_bb800cc21/final.json</code>. Caveat: measured path is the legacy JAX reproduction harness; Rust PJRT graph/server scaffolding exists, but executable Mosaic NVFP4 custom-call matmul is still the blocker for a fully native runtime.
+  </div>
+</section>
 
 <h3 id="b200-tpu-comparison">B200 vs TPU v6e equivalent</h3>
 <div class="note-box" style="border-left-color:#e06080">
