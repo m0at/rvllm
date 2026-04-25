@@ -19,7 +19,9 @@ OpenAI-compatible API server.
   - **B=8**: 145 ms/step = **55.1 tok/s** (`RVLLM_M2_KV=int8`)
   - **B=16**: 155 ms/step = **103.5 tok/s**
   - **B=32**: 187 ms/step = **171.3 tok/s**
-  - Short correctness gate: **PPL 5.60** and coherent 64-token generation
+  - **B=64**: OOM at ctx 2048
+  - Full correctness gate: **PPL 6.73** on 2047 tokens; 256-token generation
+    starts coherent but repeats math text after the opening.
 
 ---
 
@@ -269,7 +271,8 @@ Measured B=8:
 | `RVLLM_NVFP4_BACKEND=pallas` | 7.2 tok/s | exact but slower two-stage Pallas matmul |
 
 B=16 with `auto` + int8 KV measured **103.5 tok/s**. B=32 with replicate-token
-MoE + int8 KV measured **171.3 tok/s** and is now included in `auto`.
+MoE + int8 KV measured **171.3 tok/s** and is now included in `auto`. B=64
+OOMs at ctx 2048 with a 992 MB allocation and 850 MB free.
 
 ### KV cache variants
 
@@ -278,7 +281,7 @@ Set before running:
 | Value | Cache | Notes |
 |---|---|---|
 | `RVLLM_M2_KV=bf16` | bf16 KV | Default, simplest path |
-| `RVLLM_M2_KV=int8` | int8 KV + bf16 per-vector scales | Preserved short PPL/coherence gate; B=8 55.1 tok/s, B=32 171.3 tok/s |
+| `RVLLM_M2_KV=int8` | int8 KV + bf16 per-vector scales | Full PPL gate 6.73; B=8 55.1 tok/s, B=32 171.3 tok/s |
 
 ### Legacy `M2_MOE` variants
 
@@ -450,6 +453,7 @@ Known paths that would move the needle:
    target-model decode is executable.
 
 See `tpu/harness/M2_PERF_ADVISOR_SPEC.md` for the 16-agent perf analysis.
+The full run JSONs are checked in under `tpu/out/m2/full_equiv_bb800cc21/`.
 
 ---
 

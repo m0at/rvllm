@@ -1,0 +1,23 @@
+{
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "kv_cache": "int8",
+  "moe_impl": "auto",
+  "load_seconds": 78.6957905292511,
+  "sweep": null,
+  "ppl": {
+    "n_tokens_scored": 2047,
+    "avg_nll": 1.90687982162161,
+    "ppl": 6.732050795104447
+  },
+  "generation": {
+    "prompt_len": 4,
+    "gen_tokens": 256,
+    "ms_per_tok": 727.0213034843778,
+    "tok_per_s": 1.3754755124881812,
+    "text": "Explain angular momentum. The angular momentum of a particle with respect to a point \\(O\\) is defined as \\(\\vec{L}=\\vec{r} \\times \\vec{p}\\) where \\(\\vec{r}\\) is the position vector of the particle with respect to O and \\(\\\\vec{p}}=\\vec{p} \\times \\ \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\times \\vec{p} \\{p} \\times \\vec{p} \\times \\vec{p} \\times \\{p} \\times \\vec{p} \\times \\vec{p} \\",
+    "prompt": "Explain angular momentum."
+  }
+}

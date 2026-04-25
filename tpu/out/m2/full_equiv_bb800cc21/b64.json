@@ -1,0 +1,17 @@
+{
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "kv_cache": "int8",
+  "moe_impl": "auto",
+  "load_seconds": 79.1727032661438,
+  "sweep": [
+    {
+      "batch": 64,
+      "error": "RESOURCE_EXHAUSTED: Error allocating device buffer: Attempting to allocate 992.00M. That was not possible. There are 850.25M free.; (0x0x0_HBM0)"
+    }
+  ],
+  "ppl": null,
+  "generation": null
+}

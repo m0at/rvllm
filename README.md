@@ -134,12 +134,12 @@ Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/Mini
 | **B=8, int8 KV** | **145 ms/step, 55.1 tok/s** (`RVLLM_M2_KV=int8`) |
 | **B=16, int8 KV** | **155 ms/step, 103.5 tok/s** |
 | **B=32, int8 KV** | **187 ms/step, 171.3 tok/s** (`replicate_tokens`; now included in `auto`) |
+| B=64, int8 KV | OOM at ctx 2048 (`992 MB` allocation, `850 MB` free) |
 | B=8, previous all-to-all MoE | 802 ms/step, 10.0 tok/s |
 | B=8, opt-in Pallas bf16 matmul (`RVLLM_NVFP4_BACKEND=pallas`, `BN=512`) | 1105 ms/step, 7.2 tok/s |
-| PPL probe (318 scored tokens) | **5.63** |
-| PPL probe with replicate-token MoE (750 scored tokens) | **5.14** |
-| PPL probe with int8 KV (318 scored tokens) | **5.60** |
-| Gen sample (32 tok) | `"Explain angular momentum. The angular momentum of a particle about a point \\(O\\) is defined as \\(\\vec{L}=\\vec{r} \\times \\vec{p}\\) where \\(\\vec{r"` |
+| Full PPL gate (2047 scored tokens) | **6.73** |
+| Correctness gate | **pass** (`0.0` PPL delta, 736-char generation prefix match) |
+| Gen sample (256 tok) | Starts coherent, then repeats `\\vec{p}`; decode loop works, long-form coherence still needs attention/spec-decode work |
 
 ### What this demonstrates
 
@@ -159,7 +159,7 @@ Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/Mini
 
 1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. B=8/B=16/B=32 avoid padded token all-to-all now; B=1 still needs a better small-batch kernel.
 2. **Executable Rust decode still needs custom-call bodies**. The Rust graph/arena/server ABI exists; the Mosaic NVFP4 custom calls still need the TPU body before the Rust path can replace the legacy JAX reproduction run for final tok/s.
-3. **Full validation still needed**. The short corrected probe is coherent (`tpu/out/m2/m2_fix_probe.json`), but the next run should score a longer Wikitext slice and capture a 256+ token sample.
+3. **Long-form generation degenerates**. The full gate scores PPL 6.73 and passes prefix matching, but the 256-token angular-momentum sample falls into repetitive math text after the coherent opening.
 
 ### Build list (ranked, from 16-agent perf advisor spec)
 
@@ -200,6 +200,7 @@ runtime work should not add Python paths.
 
 Full walkthrough in [`tpu/harness/M2_SETUP_GUIDE.md`](tpu/harness/M2_SETUP_GUIDE.md).
 Python/JAX M2 files are quarantined in [`tpu/harness/PYTHON_LEGACY.md`](tpu/harness/PYTHON_LEGACY.md).
+Full v6e-4-equivalent M2 run artifacts are in [`tpu/out/m2/full_equiv_bb800cc21/`](tpu/out/m2/full_equiv_bb800cc21/).
 
 
 ## GPU: 31B Gemma 4 on H100

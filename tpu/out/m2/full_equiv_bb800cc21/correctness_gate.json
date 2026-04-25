@@ -1,0 +1,9 @@
+{
+  "baseline_ppl": 6.732050795104447,
+  "candidate_ppl": 6.732050795104447,
+  "ppl_abs_delta": 0.0,
+  "ppl_rel_delta": 0.0,
+  "generation_common_prefix_chars": 736,
+  "passed": true,
+  "failures": []
+}
