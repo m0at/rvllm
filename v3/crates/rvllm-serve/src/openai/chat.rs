@@ -81,7 +81,7 @@ impl ChatCompletionRequest {
 }
 
 /// `stop` can be a string, array of strings, or null.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum StopField {
     One(String),
@@ -114,7 +114,7 @@ impl StopField {
 /// full matrix. The previous struct required `content: String` and
 /// 422'd the moment zeroclaw replayed an assistant-with-tool-calls
 /// message on a follow-up turn.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct ChatMessage {
     pub role: Role,
     #[serde(default)]

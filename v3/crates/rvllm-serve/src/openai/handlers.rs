@@ -52,6 +52,43 @@ impl Drop for CancelOnDrop {
     }
 }
 
+// Request/response dump hook (env-gated via `RVLLM_DUMP_REQUEST_DIR`).
+// Writes per-request JSON files capturing the full request + generated
+// token prefix so the failing prompt can be replayed byte-for-byte
+// outside of the original caller (zeroclaw / client). Introduced to
+// close the instrumentation gap during NVFP4 quality investigation.
+// See v3/GB10_SPEC.md (if present) or commit message for the matching
+// cap-sweep experiment design.
+use std::sync::OnceLock;
+static RVLLM_DUMP_DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+fn dump_dir() -> Option<&'static std::path::Path> {
+    RVLLM_DUMP_DIR
+        .get_or_init(|| {
+            std::env::var("RVLLM_DUMP_REQUEST_DIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .as_deref()
+}
+
+fn dump_write(request_id: &Uuid, suffix: &str, body: &serde_json::Value) {
+    let Some(dir) = dump_dir() else { return };
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let path = dir.join(format!("{}_{}.json", request_id, suffix));
+    match serde_json::to_vec_pretty(body) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, &bytes) {
+                tracing::warn!(?path, error = %e, "dump write failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "dump serialize failed"),
+    }
+}
+
 use crate::error::{ApiError, ApiResult};
 use crate::openai::chat::{
     ChatAssistantMessage, ChatChoice, ChatChunkChoice, ChatCompletionChunk,
@@ -88,6 +125,20 @@ pub async fn chat_completions(
     );
     let _enter = span.enter();
 
+    // Request dump (no-op unless RVLLM_DUMP_REQUEST_DIR is set). The
+    // request body is already owned (from the `Json(req)` extractor);
+    // reserialise selected fields into a stable shape for replay.
+    dump_write(&request_id, "request", &serde_json::json!({
+        "model": &req.model,
+        "messages": &req.messages,
+        "tools": &req.tools,
+        "temperature": req.temperature,
+        "top_p": req.top_p,
+        "max_tokens": req.max_tokens,
+        "stream": req.stream,
+        "stop": &req.stop,
+    }));
+
     ensure_model_matches(&state, &req.model)?;
     reject_v1_unsupported_chat(&req)?;
 
@@ -106,6 +157,15 @@ pub async fn chat_completions(
 
     let prompt_ids = state.tokenizer.render_chat(&req.messages, req.tools.as_ref())?;
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
+
+    // Dump prompt_tokens count + first 32 IDs for the request. The
+    // full prompt_ids are stored in the `_request.json` dump's
+    // `messages` array, reconstructable via `render_chat()`.
+    dump_write(&request_id, "prompt_tokens", &serde_json::json!({
+        "prompt_tokens": prompt_ids.len(),
+        "first_32_prompt_ids": &prompt_ids[..prompt_ids.len().min(32)],
+        "last_32_prompt_ids": &prompt_ids[prompt_ids.len().saturating_sub(32)..],
+    }));
 
     // Channel + cancellation. Buffer 64 tokens before worker blocks —
     // enough to absorb a slow client without starving the GPU.
@@ -144,6 +204,7 @@ pub async fn chat_completions(
         let _cancel_guard = CancelOnDrop(cancelled.clone());
         let body = chat_collect(
             &model_id, &tokenizer, events_rx, cancelled, request_timeout,
+            request_id,
         )
         .await?;
         Ok(ChatCompletionsResponse::Json(Json(body)))
@@ -174,6 +235,7 @@ async fn chat_collect(
     mut events_rx: mpsc::Receiver<GenerateEvent>,
     cancelled: Arc<AtomicBool>,
     request_timeout: std::time::Duration,
+    request_id: Uuid,
 ) -> ApiResult<ChatCompletionResponse> {
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
@@ -212,6 +274,25 @@ async fn chat_collect(
     // `<|channel>thought\n...<channel|>` markers verbatim.
     // `shape_assistant_message` produces the user-visible content view.
     let text = tokenizer.decode_raw(&token_ids)?;
+
+    // Response dump (no-op unless RVLLM_DUMP_REQUEST_DIR set). Captures
+    // the generated token prefix for collapse-index analysis on the
+    // cap-sweep experiment (32/128/256/512/1024 under NVFP4-MSE vs FP8).
+    // Note `text` is the RAW decoded output with special tokens kept —
+    // the user-visible content is derived by `shape_assistant_message`
+    // below.
+    let prefix_ids = &token_ids[..token_ids.len().min(32)];
+    let prefix_text = tokenizer.decode_raw(prefix_ids).unwrap_or_default();
+    dump_write(&request_id, "response", &serde_json::json!({
+        "first_32_token_ids": prefix_ids,
+        "first_32_decoded_raw": prefix_text,
+        "total_generated_tokens": token_ids.len(),
+        "finish_reason": finish,
+        "usage_prompt_tokens": usage.prompt_tokens,
+        "usage_completion_tokens": usage.completion_tokens,
+        "full_raw_text": &text,
+    }));
+
     let (message, finish_reason) = shape_assistant_message(text, finish);
     Ok(ChatCompletionResponse {
         id: new_chat_completion_id(),
