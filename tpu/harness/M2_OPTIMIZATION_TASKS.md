@@ -86,6 +86,8 @@ Rust verification:
 - [x] Add Rust host-input packer from `BatchedPrefillPlan` to exact PJRT input
   buffers (`token_ids`, positions, slots, `cu_seqlens_q`, context lens,
   zeroed KV cache).
+- [x] Add Rust TPU smoke driver that loads the prefill artifact, compiles it
+  through PJRT, uploads packed host inputs, and executes.
 - [ ] Add a prefill path that processes prompt length T as one compiled
   Rust/XLA step over positions instead of T serial host calls.
 - [ ] Preserve KV cache writes for every prompt position.
@@ -108,6 +110,8 @@ Rust artifacts:
   compile/execute on TPU VMs.
 - `rvllm_xla::make_m2_prefill_inputs`: packs a Rust prefill plan into the six
   PJRT host buffers required by the artifact.
+- `m2_prefill_smoke` (`--features tpu`): one-command Rust PJRT compile/upload/
+  execute harness for the prefill artifact.
 - `tpu/out/m2/prefill_scan_artifact/`: generated B=1/T=20/int8-KV artifact
   with donate index 5 for KV cache.
 
@@ -118,6 +122,7 @@ Rust verification:
 - `cargo test -p rvllm-xla --release` (4 tests passing)
 - `cargo build -p rvllm-xla --bin m2_prefill_artifact --release`
 - `cargo check -p rvllm-xla --features tpu --release`
+- `cargo check -p rvllm-xla --features tpu --bin m2_prefill_smoke --release`
 
 ## 4. EAGLE-3 / Spec Decode
 
