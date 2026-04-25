@@ -72,12 +72,26 @@ Rust verification:
 
 ## 3. Batched Prefill
 
+- [x] Add Rust `BatchedPrefillPlan` metadata contract: flattened prompt tokens,
+  `cu_seqlens_q`, per-token positions, slot mapping, context lengths, and
+  `max_seqlen_q`.
+- [x] Verify Rust batched metadata matches serial prompt metadata for single
+  prompt and offsets slots correctly for multi-request prefill.
 - [ ] Add a prefill path that processes prompt length T as one compiled
-  `lax.scan` over positions instead of T serial host calls.
+  Rust/XLA step over positions instead of T serial host calls.
 - [ ] Preserve KV cache writes for every prompt position.
 - [ ] Verify generated text matches serial prefill for the angular-momentum
   prompt.
 - [ ] Record TTFT before/after for 20-token and 128-token prompts.
+
+Rust artifacts:
+
+- `rvllm_core::BatchedPrefillPlan`: request -> one prefill batch metadata.
+- `rvllm_core::serial_prompt_metadata`: serial decode metadata reference.
+
+Rust verification:
+
+- `cargo test -p rvllm-core prefill --release` (3 tests passing)
 
 ## 4. EAGLE-3 / Spec Decode
 

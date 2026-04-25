@@ -13,6 +13,7 @@ pub mod dtype;
 pub mod env;
 pub mod error;
 pub mod ids;
+pub mod prefill;
 pub mod shape;
 
 pub use config::{
@@ -26,4 +27,5 @@ pub use error::{
     SampleCtx, SamplingError, ScheduleId, SchedulerError,
 };
 pub use ids::{BlockId, ReqId, SeqId, TokenId};
+pub use prefill::{serial_prompt_metadata, BatchedPrefillPlan, PrefillRequest};
 pub use shape::{Shape, MAX_RANK};
