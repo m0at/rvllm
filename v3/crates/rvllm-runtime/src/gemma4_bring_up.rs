@@ -1795,6 +1795,17 @@ impl Gemma4Bringup {
             .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
         let rep_window: usize = std::env::var("RVLLM_REPETITION_PENALTY_WINDOW")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        // Frequency gate. Default 1 = penalize on first occurrence
+        // (HuggingFace transformers behavior). Raise to 2 or 3 to
+        // ONLY penalize tokens that appeared multiple times — keeps
+        // common German function words / subwords intact while still
+        // breaking lock attractors. Per GPT-5.5 review of pure-NVFP4
+        // multilingual leakage at moderate margins (e.g. step 86 of
+        // R2 emitting Italian " facendo"), the un-gated penalty is
+        // too blunt for greedy decode; min_count=2 + penalty=1.05
+        // is recommended starting point.
+        let rep_min_count: u32 = std::env::var("RVLLM_REPETITION_PENALTY_MIN_COUNT")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
         let rep_active = rep_penalty > 1.0 + f32::EPSILON;
         // === END REPETITION PENALTY ===
 
@@ -3010,8 +3021,18 @@ impl Gemma4Bringup {
             if rep_active && !output_ids.is_empty() {
                 self.stream.fence()?;
                 let start_idx = output_ids.len().saturating_sub(rep_window);
-                let mut recent: std::collections::HashSet<u32> =
-                    output_ids[start_idx..].iter().copied().collect();
+                // Count occurrences in the window, then keep only IDs
+                // that meet the min_count threshold.
+                let mut counts: std::collections::HashMap<u32, u32> =
+                    std::collections::HashMap::new();
+                for &id in &output_ids[start_idx..] {
+                    *counts.entry(id).or_insert(0) += 1;
+                }
+                let mut recent: std::collections::HashSet<u32> = counts
+                    .iter()
+                    .filter(|(_, &c)| c >= rep_min_count)
+                    .map(|(&id, _)| id)
+                    .collect();
                 // Don't penalize EOS / stop tokens — let them fire when
                 // the model wants to terminate.
                 for sid in eos_ids { recent.remove(sid); }
