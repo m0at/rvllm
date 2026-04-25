@@ -169,7 +169,7 @@ Rust verification:
 - [x] Emit the Rust decode MLIR/custom-call graph contract over runtime decode
   inputs plus the flat weight arena (`token_ids`, `positions`, `kv_cache`,
   `weight_arena -> logits`, `next_token`, `kv_cache`).
-- [ ] Replace the decode graph contract placeholder with real layer bodies /
+- [x] Replace the decode graph contract placeholder with real layer bodies /
   custom calls that consume arena offsets.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.

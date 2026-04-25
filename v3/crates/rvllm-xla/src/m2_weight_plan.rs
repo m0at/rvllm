@@ -205,6 +205,17 @@ impl M2WeightUploadPlan {
     }
 }
 
+impl M2WeightArenaPlan {
+    pub fn get(&self, name: &str) -> Option<&M2WeightArenaEntry> {
+        self.entries.iter().find(|entry| entry.name == name)
+    }
+
+    pub fn entry(&self, name: &str) -> Result<&M2WeightArenaEntry> {
+        self.get(name)
+            .ok_or_else(|| invalid_owned("tensor", format!("missing arena tensor: {name}")))
+    }
+}
+
 fn align_up(x: usize, alignment: usize) -> usize {
     (x + alignment - 1) & !(alignment - 1)
 }
@@ -264,6 +275,16 @@ fn invalid(field: &'static str, reason: &'static str) -> RvllmError {
         ConfigError::InvalidField {
             name: field,
             reason: reason.to_string(),
+        },
+        "m2_weight_plan",
+    )
+}
+
+fn invalid_owned(field: &'static str, reason: String) -> RvllmError {
+    RvllmError::config(
+        ConfigError::InvalidField {
+            name: field,
+            reason,
         },
         "m2_weight_plan",
     )
@@ -342,6 +363,13 @@ mod tests {
             .unwrap();
         assert_eq!(w1.shape, vec![1_536, 1_536]);
         assert_eq!(w1.dtype, PjrtElementType::U8);
+        assert_eq!(
+            arena
+                .entry("model.layers.0.block_sparse_moe.experts.0.w1.weight")
+                .unwrap(),
+            w1
+        );
+        assert!(arena.entry("model.layers.99.nope.weight").is_err());
     }
 
     #[test]
