@@ -34,8 +34,9 @@ pub use m2_prefill::{
 };
 pub use m2_runtime::{
     m2_bf16_logits_nll, m2_ppl_from_nll, plan_m2_rust_prefill, plan_m2_rust_prefill_decode,
-    M2DecodeRuntimeInputSpec, M2PplResult, M2RustPrefillConfig, M2RustPrefillDecodeConfig,
-    M2RustPrefillDecodePlan, M2RustPrefillPlan,
+    M2DecodeRuntimeInputSpec, M2GenerateOutput, M2GenerateRequest, M2PplResult, M2Runtime,
+    M2RuntimeConfig, M2RustPrefillConfig, M2RustPrefillDecodeConfig, M2RustPrefillDecodePlan,
+    M2RustPrefillPlan,
 };
 pub use m2_weight_plan::{
     M2FlatArenaHostBuffer, M2WeightArenaEntry, M2WeightArenaPlan, M2WeightRole, M2WeightUploadPlan,

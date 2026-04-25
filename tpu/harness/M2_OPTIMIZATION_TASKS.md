@@ -187,9 +187,10 @@ Rust verification:
   PPL scoring run inside `m2_rust_prefill_decode`.
 - [x] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime:
   `rvllm-server` now owns `/health`, `/v1/models`, and
-  `/v1/chat/completions` validation over the Rust M2 prefill/decode plan. Chat
-  returns a guarded backend-unavailable response until tokenizer + executable
-  decode custom calls land.
+  `/v1/chat/completions` over `rvllm_xla::M2Runtime`. Chat accepts
+  `prompt_token_ids`, calls the Rust PJRT decode loop, and returns a guarded
+  backend-unavailable response only when built without TPU support or when
+  executable Mosaic custom-call bodies are missing.
 - [x] Delete stale top-level Python packaging metadata once no Python package
   target remains.
 - [x] Quarantine remaining M2 Python/JAX harnesses as legacy reproduction only:

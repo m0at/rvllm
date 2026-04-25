@@ -158,7 +158,7 @@ Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/Mini
 ### Known issues blocking production
 
 1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. B=8/B=16/B=32 avoid padded token all-to-all now; B=1 still needs a better small-batch kernel.
-2. **Executable Rust decode still needs custom-call bodies**. The Rust graph/arena/server ABI exists; the Mosaic NVFP4 custom calls still need the TPU body before the Rust path can replace the legacy JAX reproduction run for final tok/s.
+2. **Executable Rust decode still needs custom-call bodies**. `rvllm-server` now calls `rvllm_xla::M2Runtime` from `/v1/chat/completions`; the Mosaic NVFP4 custom calls still need the TPU body before the Rust path can replace the legacy JAX reproduction run for final tok/s.
 3. **Long-form generation degenerates**. The full gate scores PPL 6.73 and passes prefix matching, but the 256-token angular-momentum sample falls into repetitive math text after the coherent opening.
 
 ### Build list (ranked, from 16-agent perf advisor spec)
@@ -321,7 +321,7 @@ RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
 
 ### Native HTTP server (experimental)
 
-The native OpenAI-compatible server lives in [`v3/crates/rvllm-serve`](/Users/andy/rvllm/v3/crates/rvllm-serve) and produces a `rvllm-server` binary. For M2 it owns `/health`, `/v1/models`, and guarded `/v1/chat/completions` validation over the Rust PJRT plan. Until tokenizer + executable decode custom calls land, M2 chat accepts `prompt_token_ids` and returns a backend-unavailable response instead of pretending inference is live. No Python server is on the new serving path.
+The native OpenAI-compatible server lives in [`v3/crates/rvllm-serve`](/Users/andy/rvllm/v3/crates/rvllm-serve) and produces a `rvllm-server` binary. For M2 it owns `/health`, `/v1/models`, and `/v1/chat/completions` over `rvllm_xla::M2Runtime`. Until tokenizer/chat-template support lands, M2 chat accepts `prompt_token_ids`; on non-TPU builds or missing Mosaic custom-call bodies it returns a backend-unavailable response. No Python server is on the new serving path.
 
 ### Kernels
 

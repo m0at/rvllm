@@ -159,13 +159,14 @@ The OpenAI-compatible server is also Rust-owned:
 
 ```bash
 cd $HOME/runs/$SHA/v3
-cargo run --release -p rvllm-serve --bin rvllm-server -- \
+cargo run --release -p rvllm-serve --features tpu --bin rvllm-server -- \
   --model-dir /dev/shm/m2-nvfp4 \
   --host 0.0.0.0 \
   --port 8080 \
   --batch-size 8 \
   --prompt-len 20 \
-  --decode-steps 256
+  --decode-steps 256 \
+  --max-weight-arena-bytes 160000000000
 ```
 
 ### Legacy JAX reproduction of measured numbers
@@ -330,13 +331,14 @@ Run it on the TPU VM:
 
 ```bash
 cd $HOME/runs/$SHA/v3
-cargo run --release -p rvllm-serve --bin rvllm-server -- \
+cargo run --release -p rvllm-serve --features tpu --bin rvllm-server -- \
   --model-dir /dev/shm/m2-nvfp4 \
   --host 0.0.0.0 \
   --port 8080 \
   --batch-size 8 \
   --prompt-len 20 \
-  --decode-steps 256
+  --decode-steps 256 \
+  --max-weight-arena-bytes 160000000000
 ```
 
 Forward port from local:
@@ -355,9 +357,10 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 Until tokenizer/chat-template support lands in Rust, pass `prompt_token_ids`
-directly. The server owns request validation and the Rust M2 plan surface; it
-returns a guarded backend-unavailable response until the executable decode
-custom calls are present.
+directly. The server owns request validation, loads `rvllm_xla::M2Runtime`, and
+routes `/v1/chat/completions` into the Rust PJRT decode loop. On a non-TPU
+build or while Mosaic custom-call bodies are missing, it returns a guarded
+backend-unavailable response.
 
 ---
 

@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rvllm_fused::M2PrefillKvDType;
-use rvllm_xla::{plan_m2_rust_prefill_decode, M2RustPrefillDecodeConfig, M2RustPrefillDecodePlan};
+use rvllm_xla::{
+    plan_m2_rust_prefill_decode, M2GenerateRequest, M2Runtime, M2RustPrefillDecodeConfig,
+    M2RustPrefillDecodePlan, M2_VOCAB,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -20,6 +23,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         block_size: args.block_size,
         kv_dtype: M2PrefillKvDType::Int8,
     })?;
+    let runtime = match M2Runtime::from_plan(
+        args.model_dir.clone(),
+        plan.clone(),
+        args.max_weight_arena_bytes,
+        args.device_idx,
+    ) {
+        Ok(runtime) => {
+            eprintln!(
+                "rvllm-server m2: runtime ready tpu_feature={} weight_arena_bytes={}",
+                cfg!(feature = "tpu"),
+                plan.weight_arena_bytes
+            );
+            Some(runtime)
+        }
+        Err(err) => {
+            eprintln!("rvllm-server m2: runtime unavailable: {err}");
+            None
+        }
+    };
     let listener = TcpListener::bind((args.host.as_str(), args.port))?;
     eprintln!(
         "rvllm-server m2: listening on {}:{} model={} batch={} ctx={} decode_steps={}",
@@ -29,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_name: args.model_name,
         max_ctx: args.max_ctx,
         plan,
+        runtime,
     };
     for stream in listener.incoming() {
         match stream {
@@ -47,6 +70,7 @@ struct ServerState {
     model_name: String,
     max_ctx: usize,
     plan: M2RustPrefillDecodePlan,
+    runtime: Option<M2Runtime>,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +105,8 @@ struct Args {
     decode_steps: usize,
     max_ctx: usize,
     block_size: u32,
+    max_weight_arena_bytes: usize,
+    device_idx: usize,
 }
 
 impl Args {
@@ -95,6 +121,8 @@ impl Args {
             decode_steps: 256,
             max_ctx: 2048,
             block_size: 32,
+            max_weight_arena_bytes: 160_000_000_000,
+            device_idx: 0,
         };
         let mut i = 0;
         while i < args.len() {
@@ -135,6 +163,17 @@ impl Args {
                     i += 1;
                     out.block_size = parse(value(&args, i, "--block-size")?, "--block-size")?;
                 }
+                "--max-weight-arena-bytes" => {
+                    i += 1;
+                    out.max_weight_arena_bytes = parse(
+                        value(&args, i, "--max-weight-arena-bytes")?,
+                        "--max-weight-arena-bytes",
+                    )?;
+                }
+                "--device-idx" => {
+                    i += 1;
+                    out.device_idx = parse(value(&args, i, "--device-idx")?, "--device-idx")?;
+                }
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unknown arg {other:?}\n{}", usage())),
             }
@@ -157,6 +196,8 @@ fn handle_stream(
                 "status": "ok",
                 "model": state.model_name,
                 "runtime": "rust-m2-pjrt",
+                "runtime_loaded": state.runtime.is_some(),
+                "tpu_feature": cfg!(feature = "tpu"),
                 "decode_graph_bytes": state.plan.decode_mlir.len(),
                 "weight_arena_bytes": state.plan.weight_arena_bytes,
             }),
@@ -226,29 +267,122 @@ fn handle_chat(body: &[u8], state: &ServerState) -> (u16, serde_json::Value) {
         }
     };
     let max_tokens = req.max_tokens.unwrap_or(state.plan.decode_steps);
-    if prompt_ids.len() + max_tokens >= state.max_ctx {
+    if prompt_ids.len() + max_tokens > state.max_ctx {
         return (
             400,
             error_json(400, "prompt_token_ids + max_tokens exceeds max_ctx"),
         );
     }
-    (
-        503,
-        json!({
-            "error": {
-                "message": "Rust M2 HTTP surface is live, but decode custom calls are not executable yet",
-                "type": "backend_unavailable",
-                "code": 503
+    if max_tokens == 0 {
+        return (400, error_json(400, "max_tokens must be > 0"));
+    }
+    if max_tokens > state.plan.decode_steps {
+        return (
+            400,
+            error_json(400, "max_tokens exceeds compiled decode_steps"),
+        );
+    }
+    if prompt_ids
+        .iter()
+        .any(|token| *token < 0 || *token as usize >= M2_VOCAB)
+    {
+        return (
+            400,
+            error_json(400, "prompt_token_ids contains id outside M2 vocab"),
+        );
+    }
+    let model = req.model.unwrap_or_else(|| state.model_name.clone());
+    let runtime = match &state.runtime {
+        Some(runtime) => runtime,
+        None => {
+            return (
+                503,
+                json!({
+                    "error": {
+                        "message": "Rust M2 runtime is not loaded; build with --features tpu on the TPU VM and ensure decode custom calls compile",
+                        "type": "backend_unavailable",
+                        "code": 503
+                    },
+                    "rvllm": {
+                        "model": model,
+                        "prompt_tokens": prompt_ids.len(),
+                        "max_tokens": max_tokens,
+                        "batch": state.plan.decode_shape.batch,
+                        "weight_arena_bytes": state.plan.weight_arena_bytes,
+                        "tpu_feature": cfg!(feature = "tpu")
+                    }
+                }),
+            );
+        }
+    };
+    match runtime.generate_token_ids(&M2GenerateRequest {
+        prompt_token_ids: prompt_ids,
+        max_tokens,
+    }) {
+        Ok(out) => (
+            200,
+            chat_response(&model, out.prompt_tokens, &out.generated_token_ids),
+        ),
+        Err(err) => (
+            503,
+            json!({
+                "error": {
+                    "message": format!("M2 runtime generation failed: {err}"),
+                    "type": "backend_unavailable",
+                    "code": 503
+                },
+                "rvllm": {
+                    "model": model,
+                    "batch": state.plan.decode_shape.batch,
+                    "weight_arena_bytes": state.plan.weight_arena_bytes,
+                    "tpu_feature": cfg!(feature = "tpu")
+                }
+            }),
+        ),
+    }
+}
+
+fn chat_response(
+    model: &str,
+    prompt_tokens: usize,
+    generated_token_ids: &[i32],
+) -> serde_json::Value {
+    let completion_tokens = generated_token_ids.len();
+    let content = token_id_text(generated_token_ids);
+    json!({
+        "id": format!("chatcmpl-{}", now_unix()),
+        "object": "chat.completion",
+        "created": now_unix(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content,
             },
-            "rvllm": {
-                "model": req.model.unwrap_or_else(|| state.model_name.clone()),
-                "prompt_tokens": prompt_ids.len(),
-                "max_tokens": max_tokens,
-                "batch": state.plan.decode_shape.batch,
-                "weight_arena_bytes": state.plan.weight_arena_bytes
-            }
-        }),
-    )
+            "finish_reason": "length",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        "rvllm": {
+            "generated_token_ids": generated_token_ids,
+            "tokenizer": "pending-rust-port",
+        }
+    })
+}
+
+fn token_id_text(tokens: &[i32]) -> String {
+    let mut out = String::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&token.to_string());
+    }
+    out
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, Box<dyn std::error::Error>> {
@@ -352,5 +486,5 @@ where
 }
 
 fn usage() -> String {
-    "usage: rvllm-server --model-dir DIR [--host HOST] [--port PORT] [--model-name NAME] [--batch-size N] [--prompt-len N] [--decode-steps N] [--max-ctx N] [--block-size N]".to_string()
+    "usage: rvllm-server --model-dir DIR [--host HOST] [--port PORT] [--model-name NAME] [--batch-size N] [--prompt-len N] [--decode-steps N] [--max-ctx N] [--block-size N] [--max-weight-arena-bytes N] [--device-idx N]".to_string()
 }
