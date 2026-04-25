@@ -178,8 +178,9 @@ Rust verification:
 - [x] Wire PJRT decode execution loop over the Rust decode graph: compile
   decode MLIR, upload token/position/KV/weight-arena buffers, execute repeated
   steps, read `next_token`, and carry returned KV forward.
-- [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
-  prefill + decode harness.
+- [x] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
+  prefill + decode harness: generated token-id dump and optional BF16-logit
+  PPL scoring run inside `m2_rust_prefill_decode`.
 - [ ] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime.
 - [x] Delete stale top-level Python packaging metadata once no Python package
   target remains.

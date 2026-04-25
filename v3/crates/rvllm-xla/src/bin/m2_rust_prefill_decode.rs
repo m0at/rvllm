@@ -9,8 +9,8 @@ use rvllm_xla::{plan_m2_rust_prefill_decode, M2RustPrefillDecodeConfig, M2RustPr
 use rvllm_loader::M2SafetensorsReader;
 #[cfg(feature = "tpu")]
 use rvllm_xla::{
-    load_artifact, make_m2_prefill_inputs, M2GraphAbi, M2WeightUploadPlan, PjrtClientHandle,
-    PjrtElementType,
+    load_artifact, m2_bf16_logits_nll, m2_ppl_from_nll, make_m2_prefill_inputs, M2GraphAbi,
+    M2WeightUploadPlan, PjrtClientHandle, PjrtElementType, M2_VOCAB,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,7 +59,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         execute_prefill(args.artifact_dir, &plan)?;
     }
     if args.execute_decode {
-        execute_decode(&model_dir, &plan, args.max_weight_arena_bytes)?;
+        let target_ids = args
+            .ppl_target_ids
+            .as_ref()
+            .map(|path| read_token_ids(path))
+            .transpose()?;
+        let report = execute_decode(
+            &model_dir,
+            &plan,
+            args.max_weight_arena_bytes,
+            target_ids.as_deref(),
+        )?;
+        if let Some(path) = args.out_token_ids {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, token_lines(&report.generated_token_ids))?;
+            eprintln!("wrote {}", path.display());
+        }
     }
     Ok(())
 }
@@ -98,9 +115,16 @@ fn execute_decode(
     model_dir: &Path,
     plan: &M2RustPrefillDecodePlan,
     max_weight_arena_bytes: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+    ppl_target_ids: Option<&[i32]>,
+) -> Result<M2DecodeExecutionReport, Box<dyn std::error::Error>> {
     if max_weight_arena_bytes == 0 {
         return Err("--execute-decode requires --max-weight-arena-bytes".into());
+    }
+    if let Some(targets) = ppl_target_ids {
+        let needed = plan.decode_steps * plan.decode_shape.batch;
+        if targets.len() < needed {
+            return Err(format!("PPL target ids need at least {needed} ids").into());
+        }
     }
     let reader = M2SafetensorsReader::open(model_dir)?;
     let abi = M2GraphAbi::new(plan.decode_shape.clone())?;
@@ -110,6 +134,8 @@ fn execute_decode(
     let exe = client.compile(&plan.decode_mlir)?;
     let mut token_ids = plan.seed_decode_token_ids.clone();
     let mut positions = plan.seed_decode_positions.clone();
+    let mut generated_token_ids = Vec::with_capacity(plan.decode_steps * plan.decode_shape.batch);
+    let mut nll = Vec::new();
     let mut kv_buf = client.buffer_from_host(
         &vec![0u8; plan.decode_shape.kv_cache_bytes()],
         &[plan.decode_shape.kv_cache_bytes() as i64],
@@ -141,11 +167,24 @@ fn execute_decode(
             )
             .into());
         }
+        if let Some(targets) = ppl_target_ids {
+            let target_start = _step * plan.decode_shape.batch;
+            let target_end = target_start + plan.decode_shape.batch;
+            let mut logits = vec![0u8; plan.decode_shape.batch * M2_VOCAB * 2];
+            client.buffer_to_host(&outputs[0], &mut logits)?;
+            nll.extend(m2_bf16_logits_nll(
+                &logits,
+                &targets[target_start..target_end],
+                plan.decode_shape.batch,
+                M2_VOCAB,
+            )?);
+        }
         let next_token = outputs.remove(1);
         let new_kv = outputs.remove(1);
         let mut next_bytes = vec![0u8; plan.decode_shape.batch * 4];
         client.buffer_to_host(&next_token, &mut next_bytes)?;
         token_ids = read_i32s(&next_bytes);
+        generated_token_ids.extend_from_slice(&token_ids);
         for pos in &mut positions {
             *pos += 1;
         }
@@ -155,7 +194,16 @@ fn execute_decode(
         "m2 rust decode loop executed: steps={} final_positions={:?} last_tokens={:?}",
         plan.decode_steps, positions, token_ids
     );
-    Ok(())
+    if !nll.is_empty() {
+        let ppl = m2_ppl_from_nll(&nll)?;
+        eprintln!(
+            "m2 rust ppl: n_tokens_scored={} avg_nll={:.6} ppl={:.6}",
+            ppl.n_tokens_scored, ppl.avg_nll, ppl.ppl
+        );
+    }
+    Ok(M2DecodeExecutionReport {
+        generated_token_ids,
+    })
 }
 
 #[cfg(not(feature = "tpu"))]
@@ -163,8 +211,13 @@ fn execute_decode(
     _model_dir: &Path,
     _plan: &M2RustPrefillDecodePlan,
     _max_weight_arena_bytes: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+    _ppl_target_ids: Option<&[i32]>,
+) -> Result<M2DecodeExecutionReport, Box<dyn std::error::Error>> {
     Err("m2_rust_prefill_decode --execute-decode requires --features tpu".into())
+}
+
+struct M2DecodeExecutionReport {
+    generated_token_ids: Vec<i32>,
 }
 
 #[cfg(not(feature = "tpu"))]
@@ -188,6 +241,8 @@ struct Args {
     execute_prefill: bool,
     execute_decode: bool,
     max_weight_arena_bytes: usize,
+    out_token_ids: Option<PathBuf>,
+    ppl_target_ids: Option<PathBuf>,
 }
 
 impl Args {
@@ -205,6 +260,8 @@ impl Args {
             execute_prefill: false,
             execute_decode: false,
             max_weight_arena_bytes: 0,
+            out_token_ids: None,
+            ppl_target_ids: None,
         };
         let mut i = 0;
         while i < args.len() {
@@ -254,6 +311,14 @@ impl Args {
                 }
                 "--execute-prefill" => out.execute_prefill = true,
                 "--execute-decode" => out.execute_decode = true,
+                "--out-token-ids" => {
+                    i += 1;
+                    out.out_token_ids = Some(PathBuf::from(value(&args, i, "--out-token-ids")?));
+                }
+                "--ppl-target-ids" => {
+                    i += 1;
+                    out.ppl_target_ids = Some(PathBuf::from(value(&args, i, "--ppl-target-ids")?));
+                }
                 "--max-weight-arena-bytes" => {
                     i += 1;
                     out.max_weight_arena_bytes = parse(
@@ -284,6 +349,24 @@ where
         .map_err(|e| format!("{name}: expected number, got {s:?}: {e}"))
 }
 
+fn read_token_ids(path: &Path) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+    let text = fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for word in text.split_whitespace() {
+        out.push(word.parse::<i32>()?);
+    }
+    Ok(out)
+}
+
+fn token_lines(tokens: &[i32]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        out.push_str(&token.to_string());
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(feature = "tpu")]
 fn i32_bytes(vals: &[i32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vals.len() * 4);
@@ -302,5 +385,5 @@ fn read_i32s(bytes: &[u8]) -> Vec<i32> {
 }
 
 fn usage() -> String {
-    "usage: m2_rust_prefill_decode [--model-dir DIR] [--batch N] [--prompt-len N] [--decode-steps N] [--ctx N] [--block-size N] [--kv-dtype int8|bf16] [--emit-decode-mlir FILE] [--artifact-dir DIR] [--execute-prefill] [--execute-decode --max-weight-arena-bytes N]".to_string()
+    "usage: m2_rust_prefill_decode [--model-dir DIR] [--batch N] [--prompt-len N] [--decode-steps N] [--ctx N] [--block-size N] [--kv-dtype int8|bf16] [--emit-decode-mlir FILE] [--artifact-dir DIR] [--execute-prefill] [--execute-decode --max-weight-arena-bytes N] [--out-token-ids FILE] [--ppl-target-ids FILE]".to_string()
 }

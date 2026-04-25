@@ -62,6 +62,13 @@ pub struct M2RustPrefillDecodePlan {
     pub decode_mlir: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct M2PplResult {
+    pub n_tokens_scored: usize,
+    pub avg_nll: f64,
+    pub ppl: f64,
+}
+
 impl M2RustPrefillPlan {
     pub fn total_host_input_bytes(&self) -> usize {
         self.input_specs.iter().map(|spec| spec.nbytes).sum()
@@ -146,6 +153,51 @@ pub fn plan_m2_rust_prefill_decode(
         weight_arena_bytes: arena.total_bytes,
         weight_entries: arena.entries.len(),
         decode_mlir,
+    })
+}
+
+pub fn m2_bf16_logits_nll(
+    logits_bf16: &[u8],
+    target_ids: &[i32],
+    batch: usize,
+    vocab: usize,
+) -> Result<Vec<f64>> {
+    if target_ids.len() != batch {
+        return Err(invalid("target_ids", "must have one target per batch row"));
+    }
+    if logits_bf16.len() != batch * vocab * 2 {
+        return Err(invalid("logits", "bf16 byte length must be batch*vocab*2"));
+    }
+    let mut out = Vec::with_capacity(batch);
+    for row in 0..batch {
+        let target = target_ids[row];
+        if target < 0 || target as usize >= vocab {
+            return Err(invalid("target_ids", "target id outside vocab"));
+        }
+        let row_bytes = &logits_bf16[row * vocab * 2..(row + 1) * vocab * 2];
+        let mut max_logit = f32::NEG_INFINITY;
+        for col in 0..vocab {
+            max_logit = max_logit.max(read_bf16(row_bytes, col));
+        }
+        let mut exp_sum = 0.0f64;
+        for col in 0..vocab {
+            exp_sum += ((read_bf16(row_bytes, col) - max_logit) as f64).exp();
+        }
+        let target_logit = read_bf16(row_bytes, target as usize);
+        out.push((max_logit as f64 + exp_sum.ln()) - target_logit as f64);
+    }
+    Ok(out)
+}
+
+pub fn m2_ppl_from_nll(nll: &[f64]) -> Result<M2PplResult> {
+    if nll.is_empty() {
+        return Err(invalid("nll", "must not be empty"));
+    }
+    let avg_nll = nll.iter().sum::<f64>() / nll.len() as f64;
+    Ok(M2PplResult {
+        n_tokens_scored: nll.len(),
+        avg_nll,
+        ppl: avg_nll.exp(),
     })
 }
 
@@ -288,6 +340,12 @@ fn element_size(dtype: PjrtElementType) -> usize {
     }
 }
 
+fn read_bf16(bytes: &[u8], idx: usize) -> f32 {
+    let lo = bytes[idx * 2];
+    let hi = bytes[idx * 2 + 1];
+    f32::from_bits((u16::from_le_bytes([lo, hi]) as u32) << 16)
+}
+
 fn invalid(field: &'static str, reason: &'static str) -> RvllmError {
     RvllmError::config(
         ConfigError::InvalidField {
@@ -370,5 +428,25 @@ mod tests {
         assert_eq!(plan.decode_input_specs[3].name, "weight_arena");
         assert_eq!(plan.decode_input_specs[3].nbytes, plan.weight_arena_bytes);
         assert!(plan.decode_mlir.contains("\"rvllm.m2.decode_layer\""));
+    }
+
+    #[test]
+    fn scores_bf16_logits_for_ppl_without_python() {
+        fn bf16(v: f32, out: &mut Vec<u8>) {
+            let bits = (v.to_bits() >> 16) as u16;
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+
+        let mut logits = Vec::new();
+        for v in [1.0f32, 2.0, 3.0, 4.0, 0.0, -1.0] {
+            bf16(v, &mut logits);
+        }
+        let nll = m2_bf16_logits_nll(&logits, &[2, 0], 2, 3).unwrap();
+        assert_eq!(nll.len(), 2);
+        assert!(nll[0] < 0.5);
+        assert!(nll[1] < 0.5);
+        let ppl = m2_ppl_from_nll(&nll).unwrap();
+        assert_eq!(ppl.n_tokens_scored, 2);
+        assert!(ppl.ppl > 1.0);
     }
 }
