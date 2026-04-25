@@ -181,6 +181,10 @@ Rust verification:
 - [x] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness: generated token-id dump and optional BF16-logit
   PPL scoring run inside `m2_rust_prefill_decode`.
-- [ ] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime.
+- [x] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime:
+  `rvllm-server` now owns `/health`, `/v1/models`, and
+  `/v1/chat/completions` validation over the Rust M2 prefill/decode plan. Chat
+  returns a guarded backend-unavailable response until tokenizer + executable
+  decode custom calls land.
 - [x] Delete stale top-level Python packaging metadata once no Python package
   target remains.

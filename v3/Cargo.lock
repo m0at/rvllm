@@ -797,7 +797,11 @@ name = "rvllm-serve"
 version = "0.3.0"
 dependencies = [
  "rvllm-core",
+ "rvllm-fused",
  "rvllm-runtime",
+ "rvllm-xla",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
