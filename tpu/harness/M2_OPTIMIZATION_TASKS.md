@@ -83,6 +83,9 @@ Rust verification:
   module, including KV donation metadata.
 - [x] Add feature-gated Rust PJRT client (`rvllm-xla/tpu`) for `libtpu.so`
   loading, MLIR compile, host buffer upload, execute, and copy-to-host.
+- [x] Add Rust host-input packer from `BatchedPrefillPlan` to exact PJRT input
+  buffers (`token_ids`, positions, slots, `cu_seqlens_q`, context lens,
+  zeroed KV cache).
 - [ ] Add a prefill path that processes prompt length T as one compiled
   Rust/XLA step over positions instead of T serial host calls.
 - [ ] Preserve KV cache writes for every prompt position.
@@ -103,6 +106,8 @@ Rust artifacts:
   directory (`model.mlir`, `manifest.json`).
 - `rvllm_xla::PjrtClientHandle` (`--features tpu`): Rust PJRT client for
   compile/execute on TPU VMs.
+- `rvllm_xla::make_m2_prefill_inputs`: packs a Rust prefill plan into the six
+  PJRT host buffers required by the artifact.
 - `tpu/out/m2/prefill_scan_artifact/`: generated B=1/T=20/int8-KV artifact
   with donate index 5 for KV cache.
 
@@ -110,7 +115,7 @@ Rust verification:
 
 - `cargo test -p rvllm-core prefill --release` (3 tests passing)
 - `cargo test -p rvllm-fused m2_prefill --release` (3 tests passing)
-- `cargo test -p rvllm-xla --release` (2 tests passing)
+- `cargo test -p rvllm-xla --release` (4 tests passing)
 - `cargo build -p rvllm-xla --bin m2_prefill_artifact --release`
 - `cargo check -p rvllm-xla --features tpu --release`
 
