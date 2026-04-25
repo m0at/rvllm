@@ -9,6 +9,7 @@ use rvllm_core::{ConfigError, Result, RvllmError};
 pub const NVFP4_GROUP: usize = 16;
 pub const M2_MOSAIC_DEFAULT_BN: usize = 512;
 pub const M2_MOSAIC_DEFAULT_BK: usize = 1024;
+pub const M2_NVFP4_CUSTOM_CALL_TARGET: &str = "rvllm.m2.nvfp4_decode_bf16_matmul";
 
 pub const FP4_E2M1_LUT: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -37,6 +38,17 @@ pub struct M2Nvfp4MosaicMemory {
     pub acc_f32_bytes: usize,
     pub out_bf16_bytes: usize,
     pub total_bytes: usize,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct M2Nvfp4CustomCallAbi {
+    pub target: &'static str,
+    pub shape: M2Nvfp4MatmulShape,
+    pub tile: M2Nvfp4MosaicTilePlan,
+    pub vmem_working_set_bytes: usize,
+    pub packed_bytes: usize,
+    pub scale_bytes: usize,
+    pub out_bytes: usize,
 }
 
 impl M2Nvfp4MatmulShape {
@@ -88,7 +100,7 @@ impl M2Nvfp4MatmulShape {
         if !is_mlir_symbol(kernel_name) {
             return Err(invalid("kernel_name", "must be an MLIR symbol"));
         }
-        let mem = plan.memory();
+        let abi = self.custom_call_abi(plan)?;
         Ok(format!(
             r#"module attributes {{rvllm.kind = "m2_nvfp4_mosaic"}} {{
   func.func @{kernel_name}(
@@ -103,28 +115,20 @@ impl M2Nvfp4MatmulShape {
         rvllm.tile = "BM={bm},BN={bn},BK={bk}",
         rvllm.tiles = "M={tm},N={tn},K={tk}",
         rvllm.vmem_working_set_bytes = {working_set} : i64,
+        rvllm.custom_call_target = "{target}",
         rvllm.lowering = "mosaic_custom_call",
         rvllm.lowering_plan = "tpu.load packed/scales -> unpack nibbles -> fp8/fp4 decode in VMEM/registers -> bf16 RHS tile -> tpu.matmul -> tpu.store"
       }} {{
-    // Tile contract:
-    //   x tile bf16 bytes: {x_bytes}
-    //   packed NVFP4 RHS tile bytes: {packed_bytes}
-    //   FP8 scale tile bytes: {scale_bytes}
-    //   decoded bf16 RHS tile bytes: {rhs_bf16_bytes}
-    //   f32 accumulator bytes: {acc_bytes}
-    //   output tile bf16 bytes: {out_bytes}
-    //
-    // Lowering outline for the real Mosaic body:
-    //   for m_tile, n_tile:
-    //     acc = f32[BM, BN]
-    //     for k_tile:
-    //       tpu.load x[BM, BK] as bf16
-    //       tpu.load packed[BN, BK/2] and scales[BN, BK/16]
-    //       tpu.unpack_subelements packed uint8 -> low/high FP4 E2M1 nibbles
-    //       decode FP8 E4M3 scales and multiply by global_scale
-    //       materialize only this RHS bf16[BN, BK] tile in VMEM/registers
-    //       tpu.matmul x[BM, BK] * rhs[BN, BK]^T into acc
-    //     tpu.store acc cast bf16 to out[BM, BN]
+    "{target}"(%x, %packed, %scales, %global_scale, %out) {{
+      rvllm.tile_bm = {bm} : i64,
+      rvllm.tile_bn = {bn} : i64,
+      rvllm.tile_bk = {bk} : i64,
+      rvllm.nvfp4_group = {group} : i64,
+      rvllm.vmem_working_set_bytes = {working_set} : i64,
+      rvllm.packed_bytes = {packed_bytes} : i64,
+      rvllm.scale_bytes = {scale_bytes} : i64,
+      rvllm.out_bytes = {out_bytes} : i64
+    }} : (memref<{m}x{k}xbf16>, memref<{n}x{k_half}xi8>, memref<{n}x{k_scale}xi8>, memref<f32>, memref<{m}x{n}xbf16>) -> ()
     return
   }}
 }}
@@ -141,14 +145,27 @@ impl M2Nvfp4MatmulShape {
             tm = div_ceil(self.m, plan.bm),
             tn = div_ceil(self.n, plan.bn),
             tk = div_ceil(self.k, plan.bk),
-            working_set = mem.total_bytes,
-            x_bytes = mem.x_bf16_bytes,
-            packed_bytes = mem.rhs_packed_bytes,
-            scale_bytes = mem.rhs_scale_bytes,
-            rhs_bf16_bytes = mem.rhs_decoded_bf16_bytes,
-            acc_bytes = mem.acc_f32_bytes,
-            out_bytes = mem.out_bf16_bytes,
+            target = abi.target,
+            working_set = abi.vmem_working_set_bytes,
+            packed_bytes = abi.packed_bytes,
+            scale_bytes = abi.scale_bytes,
+            out_bytes = abi.out_bytes,
         ))
+    }
+
+    pub fn custom_call_abi(self, plan: M2Nvfp4MosaicTilePlan) -> Result<M2Nvfp4CustomCallAbi> {
+        self.validate()?;
+        plan.validate_for(self)?;
+        let mem = plan.memory();
+        Ok(M2Nvfp4CustomCallAbi {
+            target: M2_NVFP4_CUSTOM_CALL_TARGET,
+            shape: self,
+            tile: plan,
+            vmem_working_set_bytes: mem.total_bytes,
+            packed_bytes: self.packed_len(),
+            scale_bytes: self.scale_len(),
+            out_bytes: self.out_len() * 2,
+        })
     }
 }
 
@@ -348,7 +365,32 @@ mod tests {
         assert!(mlir.contains("memref<1536x192xi8>"));
         assert!(mlir.contains("rvllm.tile = \"BM=8,BN=512,BK=1024\""));
         assert!(mlir.contains("rvllm.vmem_working_set_bytes = 1384448 : i64"));
+        assert!(mlir.contains("rvllm.custom_call_target = \"rvllm.m2.nvfp4_decode_bf16_matmul\""));
         assert!(mlir.contains("rvllm.lowering = \"mosaic_custom_call\""));
+        assert!(mlir.contains(
+            "\"rvllm.m2.nvfp4_decode_bf16_matmul\"(%x, %packed, %scales, %global_scale, %out)"
+        ));
+        assert!(mlir.contains("rvllm.packed_bytes = 2359296 : i64"));
+        assert!(mlir.contains("rvllm.scale_bytes = 294912 : i64"));
+        assert!(mlir.contains("rvllm.out_bytes = 24576 : i64"));
+    }
+
+    #[test]
+    fn custom_call_abi_pins_b8_gate_up_contract() {
+        let shape = M2Nvfp4MatmulShape {
+            m: 8,
+            n: 1536,
+            k: 3072,
+        };
+        let plan = M2Nvfp4MosaicTilePlan::new(8, 512, 1024);
+        let abi = shape.custom_call_abi(plan).unwrap();
+        assert_eq!(abi.target, M2_NVFP4_CUSTOM_CALL_TARGET);
+        assert_eq!(abi.shape, shape);
+        assert_eq!(abi.tile, plan);
+        assert_eq!(abi.vmem_working_set_bytes, 1_384_448);
+        assert_eq!(abi.packed_bytes, 2_359_296);
+        assert_eq!(abi.scale_bytes, 294_912);
+        assert_eq!(abi.out_bytes, 24_576);
     }
 
     #[test]

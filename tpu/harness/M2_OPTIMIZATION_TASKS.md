@@ -49,6 +49,8 @@ Recorded int8-KV results:
   including packed/scales/decoded-RHS/accumulator VMEM working-set accounting.
 - [x] Match the Rust NVFP4 matmul reference exactly against expanded dequant on
   deterministic small tensors.
+- [x] Pin the custom-call ABI target and byte contract:
+  `rvllm.m2.nvfp4_decode_bf16_matmul` with packed/scales/output byte metadata.
 - [ ] Decode FP4/FP8 in VMEM/registers and feed bf16 RHS tiles to TPU matmul
   without high-level Pallas layout inference.
 - [ ] Match TPU/JAX `nvfp4_matmul` exactly on small random tensors.
@@ -62,6 +64,8 @@ Rust artifacts:
   working-set accounting for fused decode -> bf16 RHS tile -> TPU matmul.
 - `m2_emit_nvfp4_mosaic`: emits the M2 Mosaic custom-call MLIR signature plus
   explicit `BM/BN/BK` tile metadata.
+- `rvllm_fused::M2Nvfp4CustomCallAbi`: stable Rust ABI for the Mosaic/custom-call
+  target and operand byte contract.
 - `tpu/out/m2/rvllm_m2_nvfp4_matmul.mlir`: generated B=8 gate/up kernel
   scaffold (`x_bf16`, packed NVFP4 `uint8`, FP8 scales, global scale, bf16 out;
   `BM=8, BN=512, BK=1024`, 1.38 MB per-tile working set).
