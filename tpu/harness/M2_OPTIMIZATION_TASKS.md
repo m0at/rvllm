@@ -192,3 +192,6 @@ Rust verification:
   decode custom calls land.
 - [x] Delete stale top-level Python packaging metadata once no Python package
   target remains.
+- [x] Quarantine remaining M2 Python/JAX harnesses as legacy reproduction only:
+  `PYTHON_LEGACY.md`, `M2_SETUP_GUIDE.md`, and `README.md` point new work at
+  Rust `rvllm-xla`, `rvllm-loader`, `rvllm-fused`, and `rvllm-server`.

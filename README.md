@@ -122,7 +122,7 @@ Requires 50K+ training examples for production tau. Current: 2K examples, loss 7
 
 ## MiniMax-M2.7-NVFP4 on TPU v6e-8 (experimental)
 
-Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukealonso/MiniMax-M2.7-NVFP4`) on a single v6e-8 slice. 16-agent swarm built the wiring in one day; a second 16-agent perf swarm analyzed the bottlenecks. The execution pipeline works end-to-end: model load, forward pass, batched MoE dispatch across 8 chips, compiled JIT graph, PPL, and coherent generation.
+Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/MiniMax-M2.7-NVFP4`) on a single v6e-8 slice. The measured throughput below is from the legacy JAX reproduction harness; new runtime work is in Rust PJRT/XLA under `v3/crates/`, with Python quarantined as reference-only.
 
 ### Measured (v6e-8, spot, europe-west4-a, `M2_MOE=shardmap`)
 
@@ -150,14 +150,15 @@ Scaled the same JAX+XLA stack up to a 230B-total / 10B-active MoE model (`lukeal
 - `lax.scan` over 62 layers so XLA streams one layer's weights at a time (fits in 32 GB HBM/chip)
 - Sigmoid+bias top-8 router with aux-loss-free scoring (`scoring_func: sigmoid`, `use_routing_bias: true`)
 - Partial RoPE (rotary_dim=64 of head_dim=128), QK-norm per layer, GQA softmax
-- Per-batch JAX compile cache persisted to HuggingFace (`and-y/rvllm-m2-build`) so next boot skips install + JIT
+- Per-batch legacy JAX compile cache persisted to HuggingFace (`and-y/rvllm-m2-build`) so next boot skips install + JIT for reproduction runs
+- Rust M2 runtime path now owns checkpoint indexing, safetensors reads, flat weight-arena planning/upload, decode MLIR generation, PPL/gen token loop, and the OpenAI-compatible server surface
 - B=8/B=16/B=32 now use exact replicate-token MoE by default: tokens stay replicated across expert shards, each shard skips inactive local experts with `lax.cond`, and outputs combine with `psum`. This avoids padded all-to-all buckets and empty expert matmuls.
 - `RVLLM_M2_KV=int8` adds Gemma-style per-vector int8 KV cache. It preserves the short PPL/coherence gate and keeps B=8/B=16 throughput flat while fitting B=32 at 171 tok/s.
 
 ### Known issues blocking production
 
 1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. B=8/B=16/B=32 avoid padded token all-to-all now; B=1 still needs a better small-batch kernel.
-2. **KV cache is opt-in int8 for now**. The full-bench path supports `RVLLM_M2_KV=int8`; the older API/infer wrappers still need the same flat cache surface before int8 becomes the serving default.
+2. **Executable Rust decode still needs custom-call bodies**. The Rust graph/arena/server ABI exists; the Mosaic NVFP4 custom calls still need the TPU body before the Rust path can replace the legacy JAX reproduction run for final tok/s.
 3. **Full validation still needed**. The short corrected probe is coherent (`tpu/out/m2/m2_fix_probe.json`), but the next run should score a longer Wikitext slice and capture a 256+ token sample.
 
 ### Build list (ranked, from 16-agent perf advisor spec)
@@ -182,18 +183,23 @@ SPOT=1 ZONE=europe-west4-a HF_TOKEN=$(cat ~/.cache/huggingface/token) \
 On the VM:
 
 ```bash
-export PATH="$HOME/.local/bin:$PATH"
-export JAX_COMPILATION_CACHE_DIR="$HOME/.jax_cache"
-export M2_MOE=shardmap
-bash ~/runs/$SHA/tpu/harness/run_sweep_subproc.sh
+cd $HOME/runs/$SHA/v3
+cargo run --release -p rvllm-xla --bin m2_rust_prefill_decode -- \
+  --model-dir /dev/shm/m2-nvfp4 \
+  --batch 8 \
+  --prompt-len 20 \
+  --decode-steps 256 \
+  --ctx 2048 \
+  --kv-dtype int8 \
+  --emit-decode-mlir /tmp/rvllm_m2_decode_graph.mlir
 ```
 
-`run_sweep_subproc.sh` runs each batch in a fresh process and then gates any
-optimized TPU env against a `M2_MOE=shardmap` baseline: PPL must stay within
-`max(0.10 absolute, 3% relative)`, generation must keep the same prefix, and
-control-character floods fail the run. Results land in `/tmp/m2_sweep/final.json`.
+The legacy reproduction command remains documented in
+[`tpu/harness/M2_SETUP_GUIDE.md`](tpu/harness/M2_SETUP_GUIDE.md), but new M2
+runtime work should not add Python paths.
 
 Full walkthrough in [`tpu/harness/M2_SETUP_GUIDE.md`](tpu/harness/M2_SETUP_GUIDE.md).
+Python/JAX M2 files are quarantined in [`tpu/harness/PYTHON_LEGACY.md`](tpu/harness/PYTHON_LEGACY.md).
 
 
 ## GPU: 31B Gemma 4 on H100
@@ -314,9 +320,7 @@ RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
 
 ### Native HTTP server (experimental)
 
-The native OpenAI-compatible server lives in [`v3/crates/rvllm-serve`](/Users/andy/rvllm/v3/crates/rvllm-serve) and produces a `rvllm-server` binary. It reuses `step_launch` / `step_collect` from the runtime and the same `RVLLM_*` env set above -- no Python in the serving path.
-
-It is currently a Phase-D scaffold (`main.rs` exits with "not yet implemented"). The in-repo, production-grade OpenAI-compatible endpoint today is the TPU path: [`tpu/harness/api_server.py`](/Users/andy/rvllm/tpu/harness/api_server.py). A GPU HTTP server is an open contribution track -- see `CONTRIBUTING.md`.
+The native OpenAI-compatible server lives in [`v3/crates/rvllm-serve`](/Users/andy/rvllm/v3/crates/rvllm-serve) and produces a `rvllm-server` binary. For M2 it owns `/health`, `/v1/models`, and guarded `/v1/chat/completions` validation over the Rust PJRT plan. Until tokenizer + executable decode custom calls land, M2 chat accepts `prompt_token_ids` and returns a backend-unavailable response instead of pretending inference is live. No Python server is on the new serving path.
 
 ### Kernels
 
@@ -351,7 +355,7 @@ v3/crates/
   rvllm-sampling     argmax tail, pinned DtoH
   rvllm-graph        captured-graph pool keyed on MetaLayoutHash
   rvllm-runtime      Engine, scheduler, layer_exec, bring_up
-  rvllm-serve        HTTP / OpenAI-compatible serve loop (bin: rvllm-server) -- Phase D scaffold
+  rvllm-serve        HTTP / OpenAI-compatible serve loop (bin: rvllm-server)
   rvllm-bench        RVLLM_* env-driven bench binary
   rvllm-deploy       SHA-pinned tarball + manifest.json verification (bin: rvllm-deploy) -- Phase D scaffold
   rvllm-invariants   DAG-dep test, no-megakernel gate

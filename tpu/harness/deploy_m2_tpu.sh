@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy MiniMax-M2.7-NVFP4 on TPU v6e-8.
-# One-shot: create VM, upload SHA-pinned tarball, build zig, download model,
-# smoke-run the JAX inference harness.
+# One-shot: create VM, upload SHA-pinned tarball, install Rust, download model,
+# smoke-run the Rust M2 planner harness.
 #
 # Usage:
 #   ./deploy_m2_tpu.sh [--dry-run]
@@ -205,7 +205,7 @@ echo ">> (5c) unpack tarball into ${RUN_DIR} and write REVISION"
 UNPACK_CMD="${SSH_BASE} --command=\"set -euo pipefail; cd '${RUN_DIR}' && tar xzf '${REMOTE_TAR}' --strip-components=1 && echo '${SHA}' > '${RUN_DIR}/REVISION' && ls -la '${RUN_DIR}' | head\""
 run "$UNPACK_CMD"
 
-echo ">> (6) install deps on remote (try HF-cached env first, fall back to pip install)"
+echo ">> (6) install deps on remote (Rust + optional legacy JAX env)"
 INSTALL_SCRIPT=$(cat <<EOS
 set -euo pipefail
 echo "host cores: \$(nproc)"
@@ -245,6 +245,15 @@ if [[ ! -x "$ZIG_DIR/zig" ]]; then
 fi
 export PATH="$ZIG_DIR:$PATH"
 zig version
+
+# Rust toolchain for the M2 PJRT/runtime path.
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "installing rustup/cargo"
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+fi
+source "$HOME/.cargo/env"
+rustc --version
+cargo --version
 EOS
 )
 INSTALL_SCRIPT="${INSTALL_SCRIPT//\$/\\\$}"
@@ -252,10 +261,9 @@ INSTALL_CMD="${SSH_BASE} --command=\"${INSTALL_SCRIPT//\"/\\\"}\""
 run "$INSTALL_CMD"
 
 echo ">> (7) build zig project in ${RUN_DIR}/zig (SKIPPED: path A does not need Zig)"
-# Path A (default) uses pure JAX for NVFP4 dequant and falls back to HF tokenizers
-# for BPE. Zig is only needed for Path B (int8 upcast at load) and Zig BPE. The
-# current agent code has Zig 0.13 vs 0.15 API divergence; ship smoke without
-# librvllm_zig.so and revisit later.
+# The current M2 path is Rust PJRT/XLA. Zig is only needed for older experiments
+# and Zig BPE. The current agent code has Zig 0.13 vs 0.15 API divergence; ship
+# smoke without librvllm_zig.so and revisit later.
 if [[ "${BUILD_ZIG:-0}" == "1" ]]; then
   BUILD_ZIG_SCRIPT=$(cat <<EOS
 set -euo pipefail
@@ -297,10 +305,11 @@ HF_SCRIPT="${HF_SCRIPT//\$/\\\$}"
 HF_CMD="${SSH_BASE} --command=\"${HF_SCRIPT//\"/\\\"}\""
 run "$HF_CMD"
 
-echo ">> (9) smoke run: m2_tpu_infer --max-tokens 16"
+echo ">> (9) smoke run: Rust m2_rust_prefill_decode dry-run"
 SMOKE_SCRIPT=$(cat <<EOS
 set -euo pipefail
 export PATH="\$HOME/.local/bin:\$PATH"
+source "\$HOME/.cargo/env"
 # Turn on JAX on-disk compile cache so this run populates ~/.jax_cache for HF upload.
 export JAX_COMPILATION_CACHE_DIR="\$HOME/.jax_cache"
 export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
@@ -308,10 +317,21 @@ export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
 mkdir -p "\$HOME/.jax_cache"
 cd '${RUN_DIR}'
 cat REVISION
-python3 tpu/harness/m2_tpu_infer.py \
+cargo run --manifest-path v3/Cargo.toml --release -p rvllm-xla --bin m2_rust_prefill_decode -- \
   --model-dir /dev/shm/m2-nvfp4 \
-  --max-tokens 16 \
-  --prompt 'Hello'
+  --batch 8 \
+  --prompt-len 20 \
+  --decode-steps 16 \
+  --ctx 2048 \
+  --kv-dtype int8 \
+  --emit-decode-mlir /tmp/rvllm_m2_decode_graph.mlir
+
+if [[ "\${M2_LEGACY_JAX_SMOKE:-0}" == "1" ]]; then
+  python3 tpu/harness/m2_tpu_infer.py \
+    --model-dir /dev/shm/m2-nvfp4 \
+    --max-tokens 16 \
+    --prompt 'Hello'
+fi
 EOS
 )
 SMOKE_SCRIPT="${SMOKE_SCRIPT//\$/\\\$}"

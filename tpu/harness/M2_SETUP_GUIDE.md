@@ -11,7 +11,8 @@ OpenAI-compatible API server.
 - **Target model**: `lukealonso/MiniMax-M2.7-NVFP4` (230B params total, 10B active,
   MoE 256 experts top-8, NVFP4 quantized, 62 layers, 3072 hidden, 196K max ctx).
 - **Hardware**: 1× Google Cloud TPU v6e-8 slice (8 chips × 32 GB HBM, single host).
-- **Software**: pure JAX + XLA on TPU. No custom CUDA / Rust for the inference path.
+- **Software**: Rust PJRT/XLA runtime work under `v3/crates/`. The old
+  Python/JAX harnesses are legacy reproduction/reference only.
 - **Current throughput** (as of this commit):
   - Load: ~80s (parallel ThreadPool over 61 safetensors shards)
   - **B=1**: 726 ms/step = **1.4 tok/s**
@@ -80,9 +81,10 @@ The repo ships a one-shot deploy script: `tpu/harness/deploy_m2_tpu.sh`. It:
 1. Creates a v6e-8 VM (spot by default — save ~50%)
 2. Uploads the repo as a SHA-pinned tarball
 3. Installs `jax[tpu]`, safetensors, tokenizers, ml_dtypes
-4. (Skips Zig build — Path A uses pure JAX)
+4. Builds/runs the Rust M2 planner path for the current runtime surface
 5. Downloads the 130 GB model to `/dev/shm` (tmpfs, ~2 min with HF auth)
-6. Runs a smoke inference (`python3 m2_tpu_infer.py --max-tokens 16`)
+6. Leaves legacy Python/JAX smoke available only for reproducing historical
+   numbers. See `PYTHON_LEGACY.md`.
 
 ### Quick deploy
 
@@ -110,7 +112,7 @@ gcloud compute tpus tpu-vm delete rvllm-m2 --zone=europe-west4-a
 
 ---
 
-## 4. Run the bench (same numbers we measured)
+## 4. Run the Rust M2 path
 
 SSH to the VM:
 
@@ -118,9 +120,57 @@ SSH to the VM:
 gcloud compute tpus tpu-vm ssh rvllm-m2 --zone=europe-west4-a
 ```
 
-On the VM, the full-bench harness is `/tmp/m2_full_bench.py` (after deploy).
-It sweeps batch sizes, runs perplexity on wikitext-2, and generates 2048 tokens
-from a prompt.
+On the VM, new M2 runtime work goes through Rust. The prefill/decode runner
+plans the real M2 checkpoint, emits the Rust decode MLIR, owns the token loop,
+and can execute through PJRT when built with `--features tpu` and the decode
+custom calls are available.
+
+```bash
+cd $HOME/runs/$SHA/v3
+cargo run --release -p rvllm-xla --bin m2_rust_prefill_decode -- \
+  --model-dir /dev/shm/m2-nvfp4 \
+  --batch 8 \
+  --prompt-len 20 \
+  --decode-steps 256 \
+  --ctx 2048 \
+  --kv-dtype int8 \
+  --emit-decode-mlir /tmp/rvllm_m2_decode_graph.mlir
+```
+
+PJRT execution is guarded until the Mosaic NVFP4 custom calls are executable:
+
+```bash
+cargo run --release -p rvllm-xla --features tpu --bin m2_rust_prefill_decode -- \
+  --model-dir /dev/shm/m2-nvfp4 \
+  --batch 8 \
+  --prompt-len 20 \
+  --decode-steps 256 \
+  --ctx 2048 \
+  --kv-dtype int8 \
+  --execute-prefill \
+  --execute-decode \
+  --max-weight-arena-bytes 160000000000 \
+  --out-token-ids /tmp/m2_rust_generated_ids.txt
+```
+
+The OpenAI-compatible server is also Rust-owned:
+
+```bash
+cd $HOME/runs/$SHA/v3
+cargo run --release -p rvllm-serve --bin rvllm-server -- \
+  --model-dir /dev/shm/m2-nvfp4 \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --batch-size 8 \
+  --prompt-len 20 \
+  --decode-steps 256
+```
+
+### Legacy JAX reproduction of measured numbers
+
+The measured B=8/B=16/B=32 numbers below came from the legacy Python/JAX harness
+before the Rust graph was wired. Keep this for reproduction only; do not add new
+runtime behavior here.
 
 ```bash
 # All-in-one run matching our measured numbers.
@@ -267,103 +317,23 @@ On a fresh VM, the deploy script will auto-pull via `pull_cache_from_hf.sh`.
 | VM preempted (spot) | Google reclaimed | Delete + recreate; model re-downloads |
 | `huggingface-cli: command not found` | HF 1.5+ renamed to `hf` | Deploy script accepts both; manual commands use `hf download ...` |
 | `zig build` fails | Zig 0.13/0.15 API divergence in this repo | Not needed for Path A; `BUILD_ZIG=1` deploy flag if you want it |
-| Gen takes forever (14s TTFT for 20-token prompt) | Prefill is serial at B=1 | See Optimization Plan (prefill batching is the fix) |
+| Rust server returns backend unavailable | Decode custom-call bodies are guarded, not executable yet | Finish Mosaic NVFP4 custom-call implementation |
 
 ---
 
-## 6. Option A — Use the OpenAI-compatible API server
-
-The repo ships `tpu/harness/api_server.py` but it's hardcoded to Gemma 4. To
-serve MiniMax-M2.7, create a thin wrapper that reuses the m2 load + forward:
-
-```python
-# /tmp/m2_api_server.py  — minimal single-user OpenAI-compatible server
-import argparse, json, os, sys, time, uuid, threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-import jax
-import jax.numpy as jnp
-import numpy as np
-from jax.sharding import NamedSharding, PartitionSpec as P
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from m2_full_bench import load_tokenizer, encode_text, decode_tokens
-from m2_real_bench import load_model_stacked
-from m2_synth_bench import make_mesh_v6e8, forward_step
-
-GEN_LOCK = threading.Lock()
-
-class Handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        if self.path != "/v1/chat/completions":
-            self.send_error(404); return
-        n = int(self.headers.get("Content-Length", "0"))
-        req = json.loads(self.rfile.read(n))
-        messages = req["messages"]
-        max_tokens = req.get("max_tokens", 512)
-        prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant: "
-        with GEN_LOCK:
-            ids = encode_text(TK, prompt)
-            out_ids = self.server._generate(ids, max_tokens)
-        text = decode_tokens(TK, out_ids[len(ids):])
-        resp = {
-            "id": f"chatcmpl-{uuid.uuid4()}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": "minimax-m2.7-nvfp4",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                         "finish_reason": "length"}],
-        }
-        body = json.dumps(resp).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--model-dir", default="/dev/shm/m2-nvfp4")
-    p.add_argument("--port", type=int, default=8080)
-    args = p.parse_args()
-
-    mesh = make_mesh_v6e8()
-    STATE = load_model_stacked(args.model_dir, mesh, max_ctx=2048, B=1, n_workers=32)
-    embed, final_norm, lm_head, stacked, k_cache, v_cache, cos, sin = STATE
-    TK = load_tokenizer(args.model_dir)
-
-    @jax.jit
-    def _fwd(x, stacked, k, v, pos, cos, sin, fn, lh):
-        return forward_step(x, stacked, k, v, pos, cos, sin, fn, lh, mesh)
-
-    def _generate(ids, max_new):
-        nonlocal_k, nonlocal_v = k_cache, v_cache
-        out = list(map(int, ids))
-        for i, tid in enumerate(ids):
-            x = embed[jnp.array([int(tid)], dtype=jnp.int32)]
-            tok, nonlocal_k, nonlocal_v = _fwd(
-                x, stacked, nonlocal_k, nonlocal_v,
-                jnp.int32(i), cos, sin, final_norm, lm_head)
-        out.append(int(tok[0]))
-        for i in range(max_new - 1):
-            x = embed[tok]
-            tok, nonlocal_k, nonlocal_v = _fwd(
-                x, stacked, nonlocal_k, nonlocal_v,
-                jnp.int32(len(ids) + i), cos, sin, final_norm, lm_head)
-            out.append(int(tok[0]))
-        return out
-
-    server = HTTPServer(("0.0.0.0", args.port), Handler)
-    server._generate = _generate
-    print(f"listening on :{args.port}")
-    server.serve_forever()
-```
+## 6. Option A — Use the Rust OpenAI-compatible API server
 
 Run it on the TPU VM:
 
 ```bash
-python3 -u /tmp/m2_api_server.py --model-dir /dev/shm/m2-nvfp4 --port 8080 &
+cd $HOME/runs/$SHA/v3
+cargo run --release -p rvllm-serve --bin rvllm-server -- \
+  --model-dir /dev/shm/m2-nvfp4 \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --batch-size 8 \
+  --prompt-len 20 \
+  --decode-steps 256
 ```
 
 Forward port from local:
@@ -378,19 +348,20 @@ Hit it from your laptop:
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Explain angular momentum."}],"max_tokens":256}'
+  -d '{"model":"minimax-m2.7-nvfp4","prompt_token_ids":[1,2,3,4],"max_tokens":256}'
 ```
 
-Single-user, single-request-at-a-time. For real multi-tenant serving you'd
-need vLLM or SGLang, but those don't target TPU v6e + NVFP4 today (Apr 2026).
+Until tokenizer/chat-template support lands in Rust, pass `prompt_token_ids`
+directly. The server owns request validation and the Rust M2 plan surface; it
+returns a guarded backend-unavailable response until the executable decode
+custom calls are present.
 
 ---
 
-## 7. Option B — Browser chat client
+## 7. Option B — Browser smoke client
 
-A minimal single-file HTML that hits the API above. Save as `chat.html` and
-open locally — it posts to `http://localhost:8080/v1/chat/completions` via the
-port forward.
+A minimal single-file HTML that hits the Rust API above. Until tokenizer support
+is ported, it sends comma-separated token IDs and prints the JSON response.
 
 ```html
 <!doctype html>
@@ -408,30 +379,27 @@ body { font: 14px/1.4 -apple-system, sans-serif; margin: 2em auto; max-width: 48
 <body>
 <h2>MiniMax M2.7-NVFP4 — TPU v6e-8</h2>
 <div id="log"></div>
-<p><input id="in" placeholder="type and press enter..." /></p>
+<p><input id="in" placeholder="token ids, e.g. 1,2,3,4" /></p>
 <script>
 const log = document.getElementById('log');
 const input = document.getElementById('in');
-const history = [];
 
 input.addEventListener('keydown', async (e) => {
   if (e.key !== 'Enter') return;
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
-  history.push({role: 'user', content: text});
-  log.innerHTML += `<span class="u">user:</span> ${text}\n`;
+  const ids = text.split(',').map(x => Number.parseInt(x.trim(), 10)).filter(Number.isFinite);
+  log.innerHTML += `<span class="u">prompt_token_ids:</span> ${ids.join(',')}\n`;
   log.scrollTop = log.scrollHeight;
 
   const r = await fetch('http://localhost:8080/v1/chat/completions', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({messages: history, max_tokens: 512}),
+    body: JSON.stringify({model: 'MiniMax-M2.7-NVFP4', prompt_token_ids: ids, max_tokens: 256}),
   });
   const j = await r.json();
-  const reply = j.choices[0].message.content;
-  history.push({role: 'assistant', content: reply});
-  log.innerHTML += `<span class="a">assistant:</span> ${reply}\n\n`;
+  log.innerHTML += `<span class="a">server:</span> ${JSON.stringify(j, null, 2)}\n\n`;
   log.scrollTop = log.scrollHeight;
 });
 </script>
@@ -441,16 +409,16 @@ input.addEventListener('keydown', async (e) => {
 
 1. Run the API server on the TPU VM (Section 6).
 2. Keep the gcloud SSH port-forward open.
-3. Open `chat.html` in any browser. Type, press enter.
+3. Open `chat.html` in any browser. Type comma-separated token IDs, press enter.
 
 ---
 
 ## 8. Option C — egui native client
 
 The repo already has `v3/crates/rvllm-swarm-egui/` — that's the swarm
-controller for GPU workloads. For a chat GUI against the TPU API, the
-cleanest path is to reuse that crate's HTTP client and point it at the
-m2-api-server. Minimal chat-only egui:
+controller for GPU workloads. For a chat GUI against the TPU API, reuse that
+crate's HTTP client and point it at the Rust server from Section 6. Minimal
+chat-only egui:
 
 ```bash
 # From repo root
@@ -467,22 +435,19 @@ Set `RVLLM_API` to the forwarded port from Section 6.
 ## 9. What next (performance)
 
 Current bottleneck: small-batch MoE still launches per-active-expert NVFP4
-matmuls. B=8/B=16/B=32 avoid padded all-to-all and empty expert matmuls now, but B=1
-still needs a better kernel.
+matmuls. B=8/B=16/B=32 avoid padded all-to-all and empty expert matmuls now,
+but B=1 still needs a better kernel.
 Known paths that would move the needle:
 
-1. **Mosaic/MLIR fused NVFP4 matmul kernel**. The current two-stage Pallas
-   backend is correct but slower; high-level Pallas currently crashes Mosaic
-   when a uint8-derived RHS feeds TPU matmul.
-2. **Prefill batching** — 20-token prompt currently costs 14s TTFT because
-   prefill runs serial B=1. Packing the prompt into one (1, 20) forward pass
-   gives ~16× TTFT speedup.
-3. **Flatten API/infer wrappers** onto the same scanned full-bench forward path
-   before making int8 KV the serving default.
+1. **Mosaic/MLIR fused NVFP4 matmul kernel**. The Rust custom-call ABI is
+   pinned; the next step is the executable TPU body.
+2. **Tokenizer/chat-template port** into Rust so `/v1/chat/completions` accepts
+   normal OpenAI `messages` instead of low-level `prompt_token_ids`.
+3. **Longer Rust PPL/coherence gate** once decode custom calls execute.
 4. **Async collective flags** (`LIBTPU_INIT_ARGS`) — Gemma4 uses these for
    ~5% gain at larger batch sizes. Free to add.
-5. **EAGLE-3 speculative decode** — existing `tpu/harness/eagle3_*.py` scaffold,
-   requires training the draft head (~$2-5K on 8× H100).
+5. **EAGLE-3 speculative decode** — port the existing scaffold to Rust after
+   target-model decode is executable.
 
 See `tpu/harness/M2_PERF_ADVISOR_SPEC.md` for the 16-agent perf analysis.
 
@@ -493,26 +458,18 @@ See `tpu/harness/M2_PERF_ADVISOR_SPEC.md` for the 16-agent perf analysis.
 ```
 tpu/harness/
 ├── M2_SETUP_GUIDE.md          # this file
+├── PYTHON_LEGACY.md           # legacy Python/JAX quarantine map
 ├── deploy_m2_tpu.sh           # one-shot TPU deploy
 ├── pull_cache_from_hf.sh      # fast re-boot from cached env
 ├── push_cache_to_hf.sh        # save compile cache to HF
-├── m2_full_bench.py           # main bench harness (sweep + PPL + gen)
-├── m2_synth_bench.py          # forward-step impl (shared)
-├── m2_real_bench.py           # real-model loader (parallel ThreadPool)
-├── m2_moe.py                  # shard_map MoE (production path)
-├── m2_moe_dense.py            # dense-B1 variant (compile hangs)
-├── m2_moe_gather.py           # gather-top-K variant (regresses)
-├── nvfp4_jax_ops.py           # pure-JAX NVFP4 matmul
-├── nvfp4_matmul_pallas.py     # opt-in two-stage Pallas matmul backend
-├── nvfp4_loader.py            # safetensors NVFP4 reader
 ├── m2_checkpoint_schema/      # ground-truth tensor names + real_schema.md
 │   ├── REAL_SCHEMA.md
 │   ├── model.safetensors.index.json
 │   └── tensor_names_canonical.txt
-└── m2_tpu_infer.py            # single-prompt inference (CLI match Gemma4)
+└── *.py                       # legacy JAX reproduction/reference only
 ```
 
-One-file entry points:
-- Bench: `m2_full_bench.py`
-- Single-prompt: `m2_tpu_infer.py` (same CLI as `gemma4_tpu_infer.py`)
-- API: `m2_api_server.py` (copy-paste from Section 6)
+Rust entry points:
+- Bench/PPL/gen loop: `v3/crates/rvllm-xla/src/bin/m2_rust_prefill_decode.rs`
+- API: `v3/crates/rvllm-serve/src/main.rs` (`rvllm-server`)
+- Fused NVFP4 ABI: `v3/crates/rvllm-fused/src/m2_nvfp4.rs`
