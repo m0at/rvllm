@@ -94,10 +94,26 @@ pub async fn spawn_cuda_worker(
             // what makes the MVP vLLM-style prefix reuse work on
             // zeroclaw's "identical 15k-token persona every request"
             // pattern.
-            if let Err(e) = bringup.init_prefix_cache() {
-                let _ = ready_tx.send(Err(format!("init_prefix_cache: {e:?}")));
-                return;
+            // === DIAGNOSTIC: RVLLM_DISABLE_PREFIX_CACHE gate ===
+            // When set, skip prefix-cache initialization entirely so
+            // every request goes through the per-call fallback KV
+            // allocation path (full prefill, no cross-request reuse).
+            // Used to discriminate "prefix-cache reuse causes the
+            // R1≠R2 divergence" from "deeper non-determinism." Remove
+            // after the prefix-cache hypothesis is settled.
+            let disable_prefix_cache = std::env::var("RVLLM_DISABLE_PREFIX_CACHE")
+                .ok()
+                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false);
+            if disable_prefix_cache {
+                tracing::warn!("RVLLM_DISABLE_PREFIX_CACHE=1 — skipping init_prefix_cache (diagnostic mode)");
+            } else {
+                if let Err(e) = bringup.init_prefix_cache() {
+                    let _ = ready_tx.send(Err(format!("init_prefix_cache: {e:?}")));
+                    return;
+                }
             }
+            // === END DIAGNOSTIC ===
             let scratch_ck = bringup.arena.checkpoint();
             tracing::info!(
                 compute_cap = ?bringup.ctx.compute_capability(),
