@@ -136,6 +136,64 @@ pub struct PrefixCacheState {
     pub kv_scale_layer_offsets: Vec<u64>,
     pub num_blocks_total: u32,
     pub block_size: u32,
+    /// Length (in tokens) of the prefix from `last_tokens` that
+    /// is SAFE to reuse across a subsequent request. Capped at
+    /// the last full prefill-chunk boundary so subsequent prompts
+    /// that match this prefix are guaranteed to find KV entries
+    /// written under the SAME chunk shape as the new request would
+    /// use for those positions.
+    ///
+    /// Without this cap, a short request (e.g. classifier, 3057
+    /// tokens prefilled in chunks 2048+1009) leaves slots
+    /// [2048..3057) populated under chunk_q=1009. A subsequent
+    /// long request (e.g. 15k tokens) would have written those
+    /// same slots inside its own first chunk_q=2048. Optimized
+    /// NVFP4 kernels are batch-variant; reusing classifier-shape
+    /// KV at slots [2048..2922) inside the 15k request produces
+    /// catastrophic garbage ("la la la × 1024" repetition collapse,
+    /// observed in production via zeroclaw classifier-then-persona
+    /// chains).
+    ///
+    /// Set to `floor(prompt_len / chunk_size) * chunk_size` after
+    /// each request completes (or `prompt_len` when chunk_size = 0,
+    /// i.e. no chunking).
+    pub committed_prefix_len: u32,
+    /// Provenance tuple. Cache is INVALIDATED on mismatch — KV
+    /// entries written under different policy configuration are
+    /// not generally reusable. Cheap to check; protects against
+    /// silent miscompare across env-var flips between requests.
+    pub provenance: PrefixProvenance,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PrefixProvenance {
+    pub chunk_size: u32,
+    pub kv_dtype: crate::gemma4_layer_exec::KvDtype,
+    pub hybrid_global_fp8: bool,
+    pub scale_policy: u32,        // 0 = amax6, 1 = mse, etc.
+    pub batch_prefill: bool,
+    pub unified_prefill: bool,
+}
+
+impl PrefixProvenance {
+    /// Read current env into a provenance tuple.
+    pub fn from_env() -> Self {
+        let chunk_size: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
+        let hybrid_global_fp8 = std::env::var("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
+            .map(|v| v != "0").unwrap_or(false);
+        let scale_policy = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
+            .ok().and_then(|s| match s.as_str() {
+                "amax6" | "0" => Some(0u32),
+                "mse" | "1" => Some(1u32),
+                _ => None,
+            }).unwrap_or(0);
+        let batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
+        let unified_prefill = std::env::var_os("RVLLM_UNIFIED_PREFILL").is_some();
+        Self { chunk_size, kv_dtype, hybrid_global_fp8, scale_policy,
+               batch_prefill, unified_prefill }
+    }
 }
 
 pub struct Gemma4Bringup {
@@ -492,6 +550,8 @@ impl Gemma4Bringup {
             kv_scale_layer_offsets,
             num_blocks_total,
             block_size,
+            committed_prefix_len: 0,
+            provenance: PrefixProvenance::from_env(),
         });
         Ok(())
     }
@@ -1751,6 +1811,38 @@ impl Gemma4Bringup {
                     {
                         prefix += 1;
                     }
+                    // Provenance check: invalidate cache entirely
+                    // when batch shape / dtype / hybrid / scale
+                    // policy / prefill mode differs from when the
+                    // KV was written. Optimized NVFP4 kernels are
+                    // batch-variant; reusing KV across mismatched
+                    // policies produces silent miscompare.
+                    let cur_prov = PrefixProvenance::from_env();
+                    if cur_prov != pc.provenance {
+                        eprintln!(
+                            "[prefix-cache] provenance mismatch — invalidating \
+                             (was {:?}, now {:?})",
+                            pc.provenance, cur_prov
+                        );
+                        prefix = 0;
+                    } else {
+                        // Chunk-shape cap: only reuse up to the last
+                        // FULLY-WRITTEN chunk boundary of the
+                        // previous request. Slots written by a
+                        // shorter trailing chunk are unsafe to reuse
+                        // because they were quantized under a
+                        // different batch shape. Fixes "la la la"
+                        // garbage on classifier-then-persona chains.
+                        let cap = pc.committed_prefix_len as usize;
+                        if cap < prefix {
+                            eprintln!(
+                                "[prefix-cache] capping reuse {}→{} \
+                                 (last committed chunk boundary)",
+                                prefix, cap
+                            );
+                            prefix = cap;
+                        }
+                    }
                     // Leave at least one token for the prefill to
                     // process (otherwise there's nothing to decode
                     // the last hidden state from).
@@ -2882,6 +2974,28 @@ impl Gemma4Bringup {
                 if let Some(pc) = guard.as_mut() {
                     pc.last_tokens.clear();
                     pc.last_tokens.extend_from_slice(prompt_ids);
+                    // Cap committed prefix at the last full chunk
+                    // boundary. Slots written by a trailing partial
+                    // chunk are unsafe to reuse — see
+                    // PrefixCacheState::committed_prefix_len doc.
+                    let chunk_size: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let prompt_len_u32 = prompt_ids.len() as u32;
+                    pc.committed_prefix_len = if chunk_size > 0 && prompt_len_u32 >= chunk_size {
+                        (prompt_len_u32 / chunk_size) * chunk_size
+                    } else {
+                        // No chunking, or prompt fits in a single
+                        // chunk → entire prompt was written under
+                        // one (unique-shape) launch. Reusing it is
+                        // ONLY safe when the next request would
+                        // also fit in one chunk; the provenance
+                        // chunk_size mismatch will catch that.
+                        prompt_len_u32
+                    };
+                    // Refresh provenance so subsequent provenance
+                    // checks compare against the env that ACTUALLY
+                    // wrote this KV state.
+                    pc.provenance = PrefixProvenance::from_env();
                 }
             }
         }
