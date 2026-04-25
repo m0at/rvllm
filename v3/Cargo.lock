@@ -803,6 +803,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvllm-xla"
+version = "0.3.0"
+dependencies = [
+ "rvllm-core",
+ "rvllm-fused",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"

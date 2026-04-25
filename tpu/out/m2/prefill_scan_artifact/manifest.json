@@ -1,0 +1,62 @@
+{
+  "mlir_file": "model.mlir",
+  "inputs": [
+    {
+      "name": "token_ids",
+      "shape": [
+        1,
+        20
+      ],
+      "dtype": "s32"
+    },
+    {
+      "name": "positions",
+      "shape": [
+        20
+      ],
+      "dtype": "s32"
+    },
+    {
+      "name": "slot_mapping",
+      "shape": [
+        20
+      ],
+      "dtype": "s32"
+    },
+    {
+      "name": "cu_seqlens_q",
+      "shape": [
+        2
+      ],
+      "dtype": "s32"
+    },
+    {
+      "name": "context_lens",
+      "shape": [
+        1
+      ],
+      "dtype": "s32"
+    },
+    {
+      "name": "kv_cache",
+      "shape": [
+        260046848
+      ],
+      "dtype": "s8"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "last_hidden",
+      "shape": [
+        1,
+        3072
+      ],
+      "dtype": "bf16"
+    }
+  ],
+  "donate_indices": [
+    5
+  ],
+  "num_partitions": 8
+}

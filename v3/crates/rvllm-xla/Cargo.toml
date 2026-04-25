@@ -1,0 +1,13 @@
+[package]
+name = "rvllm-xla"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rvllm-core.workspace = true
+rvllm-fused.workspace = true
+serde.workspace = true
+serde_json.workspace = true

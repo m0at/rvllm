@@ -79,6 +79,8 @@ Rust verification:
   prompt and offsets slots correctly for multi-request prefill.
 - [x] Add Rust prefill scan/custom-call contract for one compiled M2 prefill
   step (`B*T` tokens, int8/bf16 KV shape, last-hidden output).
+- [x] Add Rust XLA artifact manifest/load/write path for the M2 prefill scan
+  module, including KV donation metadata.
 - [ ] Add a prefill path that processes prompt length T as one compiled
   Rust/XLA step over positions instead of T serial host calls.
 - [ ] Preserve KV cache writes for every prompt position.
@@ -95,11 +97,17 @@ Rust artifacts:
 - `tpu/out/m2/rvllm_m2_prefill_scan.mlir`: generated B=1/T=20/int8-KV
   contract (`tokens`, positions, slots, `cu_seqlens_q`, context lens, KV cache,
   last hidden).
+- `rvllm_xla::write_m2_prefill_artifact`: writes a PJRT-style artifact
+  directory (`model.mlir`, `manifest.json`).
+- `tpu/out/m2/prefill_scan_artifact/`: generated B=1/T=20/int8-KV artifact
+  with donate index 5 for KV cache.
 
 Rust verification:
 
 - `cargo test -p rvllm-core prefill --release` (3 tests passing)
 - `cargo test -p rvllm-fused m2_prefill --release` (3 tests passing)
+- `cargo test -p rvllm-xla --release` (2 tests passing)
+- `cargo build -p rvllm-xla --bin m2_prefill_artifact --release`
 
 ## 4. EAGLE-3 / Spec Decode
 

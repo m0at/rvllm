@@ -12,6 +12,7 @@ members = [
     "crates/rvllm-loader",
     "crates/rvllm-sampling",
     "crates/rvllm-runtime",
+    "crates/rvllm-xla",
     "crates/rvllm-serve",
     "crates/rvllm-bench",
     "crates/rvllm-deploy",
@@ -38,6 +39,7 @@ rvllm-graph     = { path = "crates/rvllm-graph" }
 rvllm-loader    = { path = "crates/rvllm-loader" }
 rvllm-sampling  = { path = "crates/rvllm-sampling" }
 rvllm-runtime   = { path = "crates/rvllm-runtime" }
+rvllm-xla       = { path = "crates/rvllm-xla" }
 
 half = "2"
 serde = { version = "1", features = ["derive"] }
