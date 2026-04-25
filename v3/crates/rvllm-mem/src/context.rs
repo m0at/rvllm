@@ -130,6 +130,30 @@ impl CudaContextHandle {
         })
     }
 
+    /// Rebind the retained primary context as current for the
+    /// *calling* thread. `init` already does this on the thread it
+    /// runs on; callers that dequeue requests on a long-lived worker
+    /// thread should call this once per request as a belt-and-
+    /// suspenders guard — empirically on GB10 a context binding that
+    /// goes idle around `mpsc::Receiver::blocking_recv` can drop,
+    /// producing `cuLaunchKernel` failures on the next launch. One
+    /// driver call per request is negligible next to decode cost.
+    ///
+    /// `Ok(())` under `not(cuda)` — host stub.
+    pub fn bind_to_current_thread(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys::*;
+            if self._ctx.is_null() {
+                return Ok(()); // host stub case
+            }
+            if unsafe { cuCtxSetCurrent(self._ctx) } != CUresult::CUDA_SUCCESS {
+                return Err(cuda_err("cuCtxSetCurrent(rebind)", self.device));
+            }
+        }
+        Ok(())
+    }
+
     pub fn host_stub() -> Self {
         Self {
             device: -1,

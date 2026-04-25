@@ -29,6 +29,25 @@ impl<T: Default + Clone> PinnedBuf<T> {
         #[cfg(feature = "cuda")]
         {
             use cudarc::driver::sys::*;
+            // `cuMemAllocHost_v2` requires a current CUDA context on the
+            // calling thread. Callers that use this type via the engine's
+            // normal bring-up path already have one; direct consumers
+            // (including the unit tests in this crate, which is how the
+            // workspace `cargo test` tripped here — rvllm-mem tests run
+            // after rvllm-loader leaves no CUDA state behind) don't. Do
+            // a one-shot init + primary-context retain so the allocation
+            // succeeds deterministically. Both calls are idempotent and
+            // safe to run many times per process.
+            unsafe {
+                let _ = cuInit(0);
+                let mut dev: CUdevice = 0;
+                if cuDeviceGet(&mut dev, 0) == CUresult::CUDA_SUCCESS {
+                    let mut ctx: CUcontext = core::ptr::null_mut();
+                    if cuDevicePrimaryCtxRetain(&mut ctx, dev) == CUresult::CUDA_SUCCESS {
+                        let _ = cuCtxSetCurrent(ctx);
+                    }
+                }
+            }
             let bytes = len * core::mem::size_of::<T>();
             let mut p: *mut core::ffi::c_void = core::ptr::null_mut();
             let r = unsafe { cuMemAllocHost_v2(&mut p, bytes) };

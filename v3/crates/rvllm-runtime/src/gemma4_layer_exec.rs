@@ -37,6 +37,130 @@ use rvllm_attention::{AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParam
 
 use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
+/// Storage dtype of the paged KV cache. Picked once at bring-up time
+/// per the `RVLLM_NVFP4_KV` / `RVLLM_F16_KV` env-flag priority and
+/// threaded through on every attention launch.
+///
+///   * `F16`  — 2 bytes per element, dense. CPU-host-visible path,
+///              still the engine default when no env flag is set.
+///   * `Fp8`  — 1 byte per element, per-tensor E4M3 descale. Current
+///              sm_121 hot path (`RVLLM_F16_KV=0`).
+///   * `Nvfp4`— 4 bits per element packed two-per-byte + 1 E4M3
+///              microscale per 16 elements. `RVLLM_NVFP4_KV=1`.
+///              Storage = elements × 0.5 bytes, scale region =
+///              elements × 0.0625 bytes, total 4.5 effective bits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KvDtype {
+    F16,
+    Fp8,
+    Nvfp4,
+}
+
+impl KvDtype {
+    /// Main-cache bytes per element (scale region is separate).
+    #[must_use]
+    pub fn cache_bytes_per_elem(&self) -> u32 {
+        match self {
+            KvDtype::F16 => 2,
+            KvDtype::Fp8 => 1,
+            // Packed 4-bit → 0.5 byte per element. Callers that need
+            // an integer byte count should compute on multiples of 16
+            // elements (which NVFP4 requires anyway for the scale
+            // block). Returned here as `0` to force the caller to
+            // explicitly use `nvfp4_total_bytes` below.
+            KvDtype::Nvfp4 => 0,
+        }
+    }
+
+    /// Scale-region bytes per element. 0 for F16/Fp8 (per-tensor
+    /// descale lives in a separate 4-byte f32). For NVFP4, 1 E4M3
+    /// scale per 16 elements → 1/16 byte/elem.
+    #[must_use]
+    pub fn scale_bytes_per_elem_x16(&self) -> u32 {
+        match self {
+            KvDtype::Nvfp4 => 1,
+            _ => 0,
+        }
+    }
+
+    /// Is this an NVFP4 packed layout?
+    #[must_use]
+    pub fn is_nvfp4(&self) -> bool {
+        matches!(self, KvDtype::Nvfp4)
+    }
+
+    /// Is the cache dense F16 (no descale)?
+    #[must_use]
+    pub fn is_f16(&self) -> bool {
+        matches!(self, KvDtype::F16)
+    }
+
+    /// Resolve from the engine env flags. Precedence (post-Phase-2b
+    /// of task aa01001nvf4f16mma, commit 8e8f517 — NVFP4 + f16-MMA
+    /// unified prefill is 13× faster than the per-qi kernel and
+    /// beats FP8 unified prefill at 1082-tok prompts, so NVFP4 is
+    /// now the default KV dtype):
+    ///
+    ///   1. `RVLLM_NVFP4_KV=1`    → Nvfp4 (explicit opt-in).
+    ///   2. `RVLLM_F16_KV=1`      → F16.
+    ///   3. `RVLLM_FP8_KV=1`      → Fp8.
+    ///   4. `RVLLM_NVFP4_KV=0`    → F16 (explicit opt-out of the
+    ///                              NVFP4 default — matches the
+    ///                              pre-2b engine default for
+    ///                              legacy tests / probes).
+    ///   5. unset → Nvfp4.
+    ///
+    /// `f16_only` short-circuits to F16 — used by the bench path
+    /// when the caller explicitly asks for f16 regardless of env.
+    #[must_use]
+    pub fn from_env(f16_only: bool) -> Self {
+        if f16_only {
+            return KvDtype::F16;
+        }
+        if std::env::var("RVLLM_NVFP4_KV").map_or(false, |v| v != "0") {
+            return KvDtype::Nvfp4;
+        }
+        if std::env::var("RVLLM_F16_KV").map_or(false, |v| v != "0") {
+            return KvDtype::F16;
+        }
+        if std::env::var("RVLLM_FP8_KV").map_or(false, |v| v != "0") {
+            return KvDtype::Fp8;
+        }
+        if std::env::var("RVLLM_NVFP4_KV").map_or(false, |v| v == "0") {
+            return KvDtype::F16;
+        }
+        KvDtype::Nvfp4
+    }
+
+    /// Hybrid per-layer KV dtype for Gemma 4. When
+    /// `RVLLM_NVFP4_HYBRID_GLOBAL_FP8=1` is set, global-attention layers
+    /// (head_dim=512, see-everything) use FP8 while sliding-window
+    /// layers stay on the env-default (typically NVFP4). Hypothesis H1
+    /// for the long-context Rusty-persona garbage: outlier-channel
+    /// pressure hits the 10 global layers harder than the 50 sliding
+    /// layers; FP8 on globals + NVFP4 on slidings should rescue
+    /// quality while still saving most of the KV memory.
+    ///
+    /// When the env flag is absent or `0`, returns `from_env(f16_only)`
+    /// for every layer (uniform mode, default behaviour).
+    #[must_use]
+    pub fn for_layer_or_env(
+        layer_type: rvllm_loader::gemma4_arch::Gemma4LayerType,
+        f16_only: bool,
+    ) -> Self {
+        let default = Self::from_env(f16_only);
+        let hybrid = std::env::var("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
+            .map_or(false, |v| v != "0");
+        if hybrid && default == KvDtype::Nvfp4
+            && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention
+        {
+            KvDtype::Fp8
+        } else {
+            default
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Gemma4LayerDims {
     pub num_tokens: u32,
@@ -49,11 +173,22 @@ pub struct Gemma4LayerDims {
     pub block_size: u32,
     pub max_blocks_per_seq: u32,
     pub num_blocks_total: u32,
+    /// Current-step upper bound on KV context length across the active
+    /// batch, when the caller can compute it cheaply (e.g. decode step
+    /// knows `step + 1`). Used by the split-KV decode dispatch to skip
+    /// the split path when the current context is short enough that
+    /// the single-CTA kernel wins, without conflating it with the
+    /// bucket max that still sizes workspace. `None` falls back to
+    /// `max_blocks_per_seq * block_size` — correct but conservative.
+    pub current_max_context_len: Option<u32>,
     pub attn_scale: f32,
     pub rms_eps: f32,
     pub layer_type: Gemma4LayerType,
     pub sliding_window: u32,
+    /// Retained for existing branches that still key on the bool
+    /// (rope_f16kv vs rope_fp8kv). Equivalent to `kv_dtype.is_f16()`.
     pub f16_kv: bool,
+    pub kv_dtype: KvDtype,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -114,6 +249,11 @@ pub struct Gemma4LayerScratch {
     pub q_fp8: u64,
     pub k_cache: u64,
     pub v_cache: u64,
+    /// NVFP4 scale regions. 0 when `kv_dtype != Nvfp4`. Sized at
+    /// `layer_elems / 16 * 1` bytes per layer; offsets mirror the
+    /// main `k_cache` / `v_cache` layer layout.
+    pub k_cache_scale: u64,
+    pub v_cache_scale: u64,
     pub q_scale_ptr: u64,
     pub kv_scale_ptr: u64,
     /// Per-slot-per-head f32 K scale cache, shape
@@ -144,7 +284,52 @@ pub struct Gemma4LayerScratch {
     pub cutlass_workspace: u64,
     pub cutlass_workspace_bytes: usize,
     pub fa3_workspace: u64,
+    // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+    // When non-zero on an NVFP4 layer in the instrumented set, the layer
+    // performs a pre-write `rope_f16kv` into these pointers BEFORE the
+    // primary `rope_nvfp4kv`. The shadow region is sized for f16 KV of
+    // that layer only; the primary NVFP4 write is untouched. 0 = no
+    // shadow for this layer. See `parse_shadow_layers` and
+    // `NvFp4ShadowDumper` in gemma4_bring_up.rs.
+    pub shadow_k_cache: u64,
+    pub shadow_v_cache: u64,
+    /// When non-zero, post-RoPE f16 Q snapshot dst (device buffer),
+    /// size `num_tokens * num_heads * head_dim * 2` bytes. Populated
+    /// on decode step 0 only; the Rust-side gate in `run_one_token`
+    /// zeros this for every other step. Snapshot is taken AFTER
+    /// `rope_f16kv_shadow` writes post-RoPE Q into `scratch.q_normed`
+    /// and BEFORE `rope_nvfp4kv` clobbers it with another RoPE pass.
+    pub shadow_q_cache: u64,
+    // === END NVFP4 SHADOW DIAGNOSTIC ===
 }
+
+// === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+/// Parse `RVLLM_NVFP4_SHADOW_LAYERS` (comma-separated layer indices).
+/// Returns `None` when the master gate `RVLLM_NVFP4_SHADOW_F16` is off
+/// or the list parses empty. Default set applied by caller when the
+/// gate is on but the list env var is unset.
+pub fn parse_shadow_layers() -> Option<Vec<u32>> {
+    let gate = std::env::var("RVLLM_NVFP4_SHADOW_F16")
+        .map_or(false, |v| v != "0" && !v.is_empty());
+    if !gate {
+        return None;
+    }
+    let default_set: Vec<u32> = vec![0, 10, 20, 30, 40, 50, 59];
+    let raw = match std::env::var("RVLLM_NVFP4_SHADOW_LAYERS") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return Some(default_set),
+    };
+    let parsed: Vec<u32> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u32>().ok())
+        .collect();
+    if parsed.is_empty() {
+        Some(default_set)
+    } else {
+        Some(parsed)
+    }
+}
+// === END NVFP4 SHADOW DIAGNOSTIC ===
 
 #[derive(Clone, Debug)]
 pub struct Gemma4GemmPlans {
@@ -170,6 +355,12 @@ pub struct Gemma4LayerKernels {
     pub fused_rmsnorm_fp8_quant: KernelFn,
     pub fused_qk_rmsnorm: KernelFn,
     pub fused_rope_partial_fp8kv: KernelFn,
+    /// RoPE + NVFP4-packed KV write. `None` when the NVFP4 PTX
+    /// module isn't built into `$KERNELS_DIR` (pre-NVFP4 branches
+    /// or TPU-focused kernel trees). Populated iff
+    /// `Fa2PtxKernels::fn_rope_nvfp4kv` is `Some`. Layer-exec
+    /// dispatch guards on this when `kv_dtype == Nvfp4`.
+    pub fused_rope_partial_nvfp4kv: Option<KernelFn>,
     pub fused_gelu_mul: KernelFn,
     pub quantize_fp8_per_token: KernelFn,
     pub residual_scale_f16: KernelFn,
@@ -256,14 +447,23 @@ pub unsafe fn gemma4_forward_phase(
 ) -> Result<()> {
     // Route O / gate_up / down through the f16-in GEMV fast path when
     // `num_tokens <= FAST_PATH_M_MAX`. That kernel is a per-row GEMV
-    // (grid.y = M, each block reloads the weight tile), so throughput
-    // plateaus quickly as M grows: on Gemma 4 31B at batch=128 it's
-    // ~35× slower than the cuBLASLt FP8-channelscale fallback. The
-    // fallback is numerically correct now (per-row `scale_rows_f32_ratio`
-    // correction landed in the prior commit), so for large M the
-    // fallback is the right choice on both precision and perf. 16 is
-    // generous for typical prefill prompts and avoids slowing bench.
-    const FAST_PATH_M_MAX: u32 = 16;
+    // (grid.y = M, each block reloads the weight tile) and preserves
+    // the full 2-D `[N/128, K/128]` weight blockscale.
+    //
+    // The other option — `fp8_gemm_channelscale_or_fallback` — routes
+    // M>=128 through CUTLASS SM120 (full blockscale preserved) and
+    // smaller M through a cuBLASLt-scalar + `scale_cols_f32` path
+    // that applies only the 1-D per-row `b_chscale` approximation.
+    // For Gemma 4 fp8-block weights, the K-axis blockscale has
+    // meaningful variation, so the 1-D approximation measurably
+    // degrades output (RVLLM_DIAG_COMPARE against the per-token
+    // decode reference: 38% row-0 / 93% row-(N-1) rel_err at
+    // prompt_len=18 on fp8-block weights over 60 layers).
+    //
+    // Cap at 127 so the bad zone (16 < M < 128, blockscale-present)
+    // takes the GEMV fast path instead of the lossy fallback.
+    // CUTLASS SM120 continues to cover M>=128.
+    const FAST_PATH_M_MAX: u32 = 127;
     let q_dim = dims.num_heads * dims.head_dim;
     let _kv_dim = dims.num_kv_heads * dims.head_dim;
     let qkv_rows = (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim;
@@ -577,44 +777,255 @@ pub unsafe fn gemma4_forward_phase(
                 scale: dims.attn_scale,
                 window_size_left,
             };
-            if dims.f16_kv {
-                // F16 KV cache path: RoPE outputs F16 Q and F16 KV cache
-                rope_f16kv(dims, kernels, scratch, meta, stream)?;
-                let decode = rvllm_attention::PagedDecodeLauncher::new(attention);
-                decode.launch(
-                    decode_params,
-                    scratch.attn_out,
-                    scratch.q_normed,
-                    scratch.k_cache,
-                    scratch.v_cache,
-                    meta.block_tables,
-                    meta.context_lens,
-                    scratch.fa3_workspace,
-                    stream,
-                )?;
-            } else {
-                rope_fp8kv(dims, kernels, scratch, meta, stream)?;
-                let decode = PagedDecodeFp8Launcher::new(attention);
-                decode.launch(
-                    decode_params,
-                    scratch.attn_out,
-                    scratch.q_fp8,
-                    scratch.k_cache,
-                    scratch.v_cache,
-                    scratch.k_scale_cache,
-                    scratch.v_scale_cache,
-                    scratch.q_scale_cache,
-                    0, // k_descale_fallback (unused when per-slot populated)
-                    0, // v_descale_fallback
-                    meta.block_tables,
-                    meta.context_lens,
-                    scratch.fa3_workspace,
-                    scratch.q_scale_ptr,
-                    stream,
-                )?;
+            match dims.kv_dtype {
+                KvDtype::F16 => {
+                    // F16 KV cache path: RoPE outputs F16 Q and F16 KV cache.
+                    rope_f16kv(dims, kernels, scratch, meta, stream)?;
+                    let decode = rvllm_attention::PagedDecodeLauncher::new(attention);
+                    decode.launch(
+                        decode_params,
+                        scratch.attn_out,
+                        scratch.q_normed,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        meta.block_tables,
+                        meta.context_lens,
+                        scratch.fa3_workspace,
+                        stream,
+                    )?;
+                }
+                KvDtype::Fp8 => {
+                    // FP8 path with F-series per-slot scale signature.
+                    rope_fp8kv(dims, kernels, scratch, meta, stream)?;
+                    let decode = PagedDecodeFp8Launcher::new(attention);
+                    decode.launch(
+                        decode_params,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_scale_cache,
+                        scratch.v_scale_cache,
+                        scratch.q_scale_cache,
+                        0, // k_descale_fallback (unused when per-slot populated)
+                        0, // v_descale_fallback
+                        meta.block_tables,
+                        meta.context_lens,
+                        scratch.fa3_workspace,
+                        scratch.q_scale_ptr,
+                        stream,
+                    )?;
+                }
+                KvDtype::Nvfp4 => {
+                    // NVFP4 path: dedicated RoPE + dedicated decode launcher.
+                    // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                    // Shadow rope writes f16 K/V to `shadow_k_cache` /
+                    // `shadow_v_cache` and rotated Q to
+                    // `shadow_q_cache` (per-layer slot on step-0
+                    // capture, shared throwaway otherwise). Must NOT
+                    // touch `q_normed` — the primary rope below reads
+                    // it as pre-RoPE and rotates exactly once.
+                    if scratch.shadow_k_cache != 0 {
+                        rope_f16kv_shadow(dims, kernels, scratch, meta, stream)?;
+                    }
+                    // === END NVFP4 SHADOW DIAGNOSTIC ===
+                    rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
+                    let decode = rvllm_attention::PagedDecodeNvfp4Launcher::new(attention);
+
+                    // Split-KV decode (paged_attention_v2-style) —
+                    // default ON. Opt-out via `RVLLM_NVFP4_SPLIT_KV=0`
+                    // for A/B comparisons. Engages only when the split
+                    // kernels exist AND the context is long enough to
+                    // benefit (single-partition would waste phase-2
+                    // overhead).
+                    //
+                    // Measured +75% on 15k-ctx bs=1 decode vs the
+                    // single-CTA path (2.0 → 3.5 tok/s on GB10); was
+                    // the gating change that got zeroclaw's 14795-tok
+                    // prompt under the 600s gateway timeout.
+                    //
+                    // Partition size follows vLLM's default (512).
+                    // `max_num_parts` is sized for the engine's max
+                    // context window so the workspace layout is
+                    // stable across calls — running at a shorter ctx
+                    // just writes sentinels to the tail partitions.
+                    let split_env_on = std::env::var("RVLLM_NVFP4_SPLIT_KV")
+                        .map(|s| !matches!(s.as_str(),
+                            "0" | "false" | "FALSE" | "no" | "off" | ""))
+                        .unwrap_or(true);
+                    const PARTITION_SIZE: u32 = 512;
+                    // Bucket max ctx = max_blocks_per_seq * block_size.
+                    // Workspace is sized off this so the layout is
+                    // stable across iterations regardless of current
+                    // context growth.
+                    let bucket_ctx = (dims.max_blocks_per_seq as u32)
+                        * (dims.block_size as u32);
+                    let max_num_parts = bucket_ctx.div_ceil(PARTITION_SIZE).max(1);
+                    // Current-step max ctx — used only for the dispatch
+                    // gate, NOT for workspace sizing. Earlier revisions
+                    // used `bucket_ctx` here, which over-fired the split
+                    // path on short-context turns (each empty partition
+                    // still launches a CTA, just writing sentinels).
+                    // Fall back to bucket_ctx when caller didn't supply.
+                    let current_ctx = dims
+                        .current_max_context_len
+                        .unwrap_or(bucket_ctx);
+                    let current_num_parts =
+                        current_ctx.div_ceil(PARTITION_SIZE).max(1);
+                    // Skip split path if: env gate off, split kernels
+                    // missing, current ctx short enough that one CTA
+                    // per (seq, head) fits comfortably, or workspace
+                    // can't fit the scratch layout.
+                    let slots = (decode_params.num_seqs as u64)
+                        * (dims.num_heads as u64)
+                        * (max_num_parts as u64);
+                    let ws_need = slots * (dims.head_dim as u64) * 2
+                        + slots * 4 * 2;
+                    let use_split = split_env_on
+                        && decode.has_split_kernels()
+                        && current_num_parts > 1
+                        && ws_need <= 16 * 1024 * 1024; // fa3_ws is 16MiB
+                    if use_split {
+                        decode.launch_split(
+                            decode_params,
+                            scratch.attn_out,
+                            scratch.q_fp8,
+                            scratch.k_cache,
+                            scratch.v_cache,
+                            scratch.k_cache_scale,
+                            scratch.v_cache_scale,
+                            meta.block_tables,
+                            meta.context_lens,
+                            scratch.q_scale_ptr,
+                            scratch.fa3_workspace,
+                            PARTITION_SIZE,
+                            max_num_parts,
+                            stream,
+                        )?;
+                    } else {
+                        decode.launch(
+                            decode_params,
+                            scratch.attn_out,
+                            scratch.q_fp8,
+                            scratch.k_cache,
+                            scratch.v_cache,
+                            scratch.k_cache_scale,
+                            scratch.v_cache_scale,
+                            meta.block_tables,
+                            meta.context_lens,
+                            scratch.q_scale_ptr,
+                            stream,
+                        )?;
+                    }
+                }
             }
         }
-        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q: _, num_seqs: _ } => {
+        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q, num_seqs: _ } => {
+            // NVFP4 prefill: dedicated RoPE + attention launcher. Must
+            // fall through to the shared post-attention block below
+            // (O proj + post-attn norm + residual add + MLP + post-FF
+            // norm + residual add), same as the FP8 path does after
+            // its unified/decode-per-qi attention. A previous revision
+            // `return Ok(())`'d here, which turned every NVFP4-prefill
+            // layer into a no-op on the residual — end-to-end output
+            // was the raw embedding, manifesting as word-salad tokens
+            // at the LM head regardless of prompt length.
+            if dims.kv_dtype == KvDtype::Nvfp4 {
+                // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                // Shadow rope writes f16 K/V + rotated Q to the
+                // shadow slots without touching q_normed; primary rope
+                // below gets clean pre-RoPE Q.
+                if scratch.shadow_k_cache != 0 {
+                    rope_f16kv_shadow(dims, kernels, scratch, meta, stream)?;
+                }
+                // === END NVFP4 SHADOW DIAGNOSTIC ===
+                rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
+                let prefill_params = rvllm_attention::PagedPrefillParams {
+                    num_tokens: dims.num_tokens,
+                    num_seqs: 1,
+                    num_heads: dims.num_heads,
+                    num_kv_heads: dims.num_kv_heads,
+                    head_dim: dims.head_dim,
+                    block_size: dims.block_size,
+                    max_blocks_per_seq: dims.max_blocks_per_seq,
+                    num_blocks_total: dims.num_blocks_total,
+                    scale: dims.attn_scale,
+                    window_size_left,
+                };
+                let prefill = rvllm_attention::PagedPrefillNvfp4Launcher::new(attention);
+
+                // Phase 2b of aa01001nvf4f16mma: route multi-query
+                // prefill through the f16-MMA unified kernel when it
+                // loaded into Fa2PtxKernels. Matches the FP8 unified
+                // dispatch gate above — opt-out via
+                // `RVLLM_UNIFIED_PREFILL=0` for bisect bisect/quality
+                // comparisons. Falls back to the per-qi dedicated
+                // kernel when the unified PTX is missing (old kernel
+                // trees) or disabled via env.
+                let unified_enabled_nvfp4 = std::env::var_os("RVLLM_UNIFIED_PREFILL")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+                let have_nvfp4_unified = match attention {
+                    rvllm_attention::AttentionBackend::Fa2Ptx(k)
+                        if k.has_unified_prefill_nvfp4() => true,
+                    _ => false,
+                };
+                if unified_enabled_nvfp4 && have_nvfp4_unified && dims.num_tokens > 1 {
+                    // Tile size matches the FP8 unified heuristic —
+                    // head_dim ≤ 256 gets tile_size=32 (sliding), else
+                    // 16 (global, smem-tight at head_dim=512).
+                    let tile_size = if dims.head_dim <= 256 { 32u32 } else { 16u32 };
+                    let num_queries_per_kv = dims.num_heads / dims.num_kv_heads;
+                    let block_q = rvllm_attention::UNIFIED_PREFILL_BLOCK_M
+                        / num_queries_per_kv.max(1);
+                    let unified = rvllm_attention::UnifiedPrefillParams {
+                        num_queries_per_kv,
+                        tile_size,
+                        block_q,
+                        use_mma: true,
+                    };
+                    // rope_nvfp4kv encodes Q with the per-tensor
+                    // scalar `scratch.q_scale_ptr`, NOT the per-(token,
+                    // head) cache the FP8 path uses. Pass 0 for
+                    // q_scale_cache so the unified kernel falls back
+                    // to `*q_descale` per row — consistent with how
+                    // rope_nvfp4kv wrote the Q bytes.
+                    prefill.launch_nvfp4kv_unified_sm121(
+                        prefill_params,
+                        unified,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_cache_scale,
+                        scratch.v_cache_scale,
+                        0, // q_scale_cache = nullptr → fall back to *q_descale
+                        meta.block_tables,
+                        cu_seqlens_q,
+                        meta.context_lens,
+                        scratch.q_scale_ptr,
+                        stream,
+                    )?;
+                } else {
+                    prefill.launch(
+                        prefill_params,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_cache_scale,
+                        scratch.v_cache_scale,
+                        meta.block_tables,
+                        meta.context_lens,
+                        cu_seqlens_q,
+                        scratch.q_scale_ptr,
+                        max_seqlen_q,
+                        stream,
+                    )?;
+                }
+            } else {
+            // FP8 / F16 prefill: share the FP8 write path (no F16 prefill
+            // kernel on sm_121). F-series unified-or-fallback structure:
             // Prefill always uses FP8 KV path (no F16 prefill kernel).
             rope_fp8kv(dims, kernels, scratch, meta, stream)?;
 
@@ -773,6 +1184,7 @@ pub unsafe fn gemma4_forward_phase(
             // Ensure ctx_host lives until the stream has consumed it.
             std::hint::black_box(&ctx_host);
             } // end of decode-per-qi fallback
+            } // end of FP8/F16 prefill (else of NVFP4 branch)
         }
     }
     #[cfg(not(feature = "cuda"))]
@@ -1492,6 +1904,70 @@ unsafe fn rope_f16kv(
     rvllm_fused::launch_raw(kernels.fused_rope_partial_f16kv, grid, block, 0, stream, &args)
 }
 
+// === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+/// Ground-truth f16 KV write for a shadow region. Identical to
+/// `rope_f16kv` except K/V pointers are overridden to the shadow
+/// region and Q output goes to `scratch.shadow_q_cache` (per-layer
+/// slot on step-0 capture, shared throwaway otherwise).
+///
+/// CRITICAL: `q_out` must NOT alias `scratch.q_normed`. An earlier
+/// revision aliased them, which caused the subsequent primary
+/// `rope_nvfp4kv` to apply RoPE a second time on an already-rotated
+/// Q. Result: `q_fp8` was double-RoPE'd and every forward pass
+/// silently produced wrong attention whenever the shadow gate was on.
+/// Caller must guarantee `scratch.shadow_q_cache` is non-zero and
+/// points to a valid f16 buffer of at least
+/// `num_tokens * num_heads * head_dim * 2` bytes.
+#[cfg(feature = "cuda")]
+unsafe fn rope_f16kv_shadow(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    scratch: &Gemma4LayerScratch,
+    meta: &Gemma4MetadataPtrs,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(scratch.shadow_q_cache != 0,
+        "rope_f16kv_shadow called with shadow_q_cache=0; caller must route to \
+         per-layer slot or throwaway to avoid aliasing q_normed");
+    let mut q_in = scratch.q_normed;
+    let mut k_in = scratch.k_normed;
+    let mut v_in = scratch.v_normed;
+    let mut q_out = scratch.shadow_q_cache;
+    let mut k_cache = scratch.shadow_k_cache;
+    let mut v_cache = scratch.shadow_v_cache;
+    let mut cos = meta.cos;
+    let mut sin = meta.sin;
+    let mut positions = meta.positions;
+    let mut slot_mapping = meta.slot_mapping;
+    let mut nt = dims.num_tokens as i32;
+    let mut nh = dims.num_heads as i32;
+    let mut nkvh = dims.num_kv_heads as i32;
+    let mut hd = dims.head_dim as i32;
+    let mut rd = dims.rotary_dim as i32;
+    let args = [
+        (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_cache) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_cache) as *mut u64 as *mut core::ffi::c_void,
+        (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+        (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+        (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+        (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let max_heads = dims.num_heads.max(dims.num_kv_heads);
+    let grid = (dims.num_tokens, max_heads, 1);
+    let block = ((dims.head_dim / 2).max(32), 1, 1);
+    rvllm_fused::launch_raw(kernels.fused_rope_partial_f16kv, grid, block, 0, stream, &args)
+}
+// === END NVFP4 SHADOW DIAGNOSTIC ===
+
 #[cfg(feature = "cuda")]
 unsafe fn rope_fp8kv(
     dims: Gemma4LayerDims,
@@ -1525,6 +2001,103 @@ unsafe fn rope_fp8kv(
         scratch.q_scale_ptr,
         stream,
     )
+}
+
+/// RoPE + NVFP4 paged-KV write. Mirrors `rope_fp8kv` but writes the
+/// K/V cache as packed 4-bit bytes + per-16-element E4M3 microscale
+/// into the separate `k_cache_scale` / `v_cache_scale` regions. Q
+/// still lands in `q_fp8` per-tensor (the FA2 NVFP4 decode/prefill
+/// kernels read Q as FP8).
+#[cfg(feature = "cuda")]
+unsafe fn rope_nvfp4kv(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    scratch: &Gemma4LayerScratch,
+    meta: &Gemma4MetadataPtrs,
+    stream: u64,
+) -> Result<()> {
+    // `fused_rope_partial_nvfp4kv` is `None` when the NVFP4 PTX isn't
+    // built into $KERNELS_DIR. That means the operator asked for
+    // `RVLLM_NVFP4_KV=1` but their kernel tree predates the NVFP4
+    // branch — fail clean with a typed attention error (closest
+    // match in rvllm-core; we don't have a KernelError variant).
+    let kernel = kernels.fused_rope_partial_nvfp4kv.ok_or_else(|| {
+        rvllm_core::RvllmError::Attention {
+            err: rvllm_core::AttentionError::FeatureNotAvailable {
+                backend: "Fa2Ptx",
+                op: "rope_nvfp4kv (fused_rope_partial_nvfp4kv.ptx not in $KERNELS_DIR)",
+            },
+            ctx: rvllm_core::AttnCtx {
+                op: "rope_nvfp4kv",
+                stream,
+                num_seqs: dims.num_tokens,
+                head_dim: dims.head_dim,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        }
+    })?;
+    let mut q_in = scratch.q_normed;
+    let mut k_in = scratch.k_normed;
+    // Gemma 4 applies a parameter-free v-norm BEFORE writing V to the
+    // KV cache — the FP8 rope reads `scratch.v_normed` for the same
+    // reason. Reading pre-norm `v_out` here put raw QKV-GEMM output
+    // into the NVFP4 V cache with a different magnitude distribution
+    // than the attention kernel expected; that's where the
+    // end-to-end PPL blow-up came from (71 FP8 → 6.4M NVFP4).
+    let mut v_in = scratch.v_normed;
+    let mut q_out = scratch.q_fp8;
+    let mut k_packed = scratch.k_cache;
+    let mut v_packed = scratch.v_cache;
+    let mut k_scale = scratch.k_cache_scale;
+    let mut v_scale = scratch.v_cache_scale;
+    let mut cos = meta.cos;
+    let mut sin = meta.sin;
+    let mut positions = meta.positions;
+    let mut slot_mapping = meta.slot_mapping;
+    let mut q_scale_ptr = scratch.q_scale_ptr;
+    let mut nt = dims.num_tokens as i32;
+    let mut nh = dims.num_heads as i32;
+    let mut nkvh = dims.num_kv_heads as i32;
+    let mut hd = dims.head_dim as i32;
+    let mut rd = dims.rotary_dim as i32;
+    // NVFP4 scale policy — read env lazily. Stable across a run once
+    // chosen. `amax6` (0) = OCP baseline (range-preserving, outlier-
+    // insensitive — produces garbage on Gemma 4 at 15k). `mse` (1) =
+    // blockwise MSE search over 4 outlier-aware candidates (see
+    // fused_rope_partial_nvfp4kv.cu for the candidate set).
+    let mut scale_policy: i32 = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "amax6" | "0" => Some(0),
+            "mse" | "1" => Some(1),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let args = [
+        (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_packed) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_packed) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_scale) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_scale) as *mut u64 as *mut core::ffi::c_void,
+        (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+        (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+        (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+        (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+        (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut scale_policy) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let max_heads = dims.num_heads.max(dims.num_kv_heads);
+    let grid = (dims.num_tokens, max_heads, 1);
+    let block = (dims.head_dim, 1, 1);
+    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
 }
 
 pub unsafe fn logit_softcap(

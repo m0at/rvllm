@@ -159,7 +159,7 @@ fn run() -> Result<(), String> {
 
         let t_gen = Instant::now();
         let output_ids = unsafe {
-            g4.run_generate(fn_embed, fn_argmax, &prompt_with_bos, max_new as usize, &eos_ids)
+            g4.run_generate(fn_embed, fn_argmax, &prompt_with_bos, max_new as usize, &eos_ids, false)
         }.map_err(|e| format!("gemma4 generate: {e}"))?;
 
         let elapsed = t_gen.elapsed();

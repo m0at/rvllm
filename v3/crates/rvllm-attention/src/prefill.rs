@@ -470,6 +470,380 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
     }
 }
 
+/// NVFP4 KV-cache paged-prefill launcher. Same shape as
+/// `PagedPrefillFp8Launcher` but threads per-block E4M3 microscale
+/// pointers and a packed 4-bit cache layout. Only `Fa2Ptx` implements
+/// it; FA3 returns `FeatureNotAvailable`.
+pub struct PagedPrefillNvfp4Launcher<'a> {
+    backend: &'a super::AttentionBackend,
+}
+
+impl<'a> PagedPrefillNvfp4Launcher<'a> {
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { backend }
+    }
+
+    /// # Safety
+    /// Same invariants as the FP8 prefill launcher, plus:
+    ///   * `k_cache_packed` / `v_cache_packed`: 4-bit bytes.
+    ///   * `k_cache_scale` / `v_cache_scale`: per-16-element E4M3.
+    ///   * `q_descale_ptr`: single f32 scalar (Q stays FP8 per-tensor).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        params: PagedPrefillParams,
+        o_f16: u64,
+        q_fp8: u64,
+        k_cache_packed: u64,
+        v_cache_packed: u64,
+        k_cache_scale: u64,
+        v_cache_scale: u64,
+        block_tables: u64,
+        context_lens: u64,
+        cu_seqlens_q: u64,
+        q_descale_ptr: u64,
+        max_seqlen_q: u32,
+        stream: u64,
+    ) -> Result<()> {
+        params.validate()?;
+        #[cfg(feature = "cuda")]
+        {
+            let fa2 = match self.backend {
+                super::AttentionBackend::Fa2Ptx(fa2) => fa2,
+                _ => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "non-Fa2Ptx",
+                            op: "paged_prefill_nvfp4",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_prefill_nvfp4",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            use cudarc::driver::sys::*;
+            const FA2_THREADS: i32 = 128;
+            let hd = params.head_dim as i32;
+            let (kernel_opt, fa2_bc) = if hd > 256 {
+                (fa2.fn_prefill_nvfp4kv_bc16, 16)
+            } else {
+                (fa2.fn_prefill_nvfp4kv, 32)
+            };
+            let kernel_fn = kernel_opt.ok_or_else(|| RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "Fa2Ptx",
+                    op: "paged_prefill_nvfp4 (kernel missing from PTX)",
+                },
+                ctx: AttnCtx {
+                    op: "paged_prefill_nvfp4",
+                    stream,
+                    num_seqs: params.num_seqs,
+                    head_dim: params.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })?;
+
+            // Phase 2a (aa01001nvf4f16mma): K/V dequant target is
+            // f16 smem (2 bytes/elem) — see the matching comment in
+            // decode.rs's PagedDecodeNvfp4Launcher.
+            let smem_bytes =
+                2 * fa2_bc * hd * 2 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
+            if smem_bytes as u32 >= 48 * 1024 {
+                let _ = cuFuncSetAttribute(
+                    kernel_fn.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes,
+                );
+            }
+
+            let scale = params.scale;
+            let num_heads = params.num_heads as i32;
+            let num_kv_heads = params.num_kv_heads as i32;
+            let head_dim = params.head_dim as i32;
+            let block_size = params.block_size as i32;
+            let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+            let window_size_left = params.window_size_left;
+
+            let mut arg_out = o_f16;
+            let mut arg_q = q_fp8;
+            let mut arg_kp = k_cache_packed;
+            let mut arg_vp = v_cache_packed;
+            let mut arg_ks = k_cache_scale;
+            let mut arg_vs = v_cache_scale;
+            let mut arg_bt = block_tables;
+            let mut arg_cl = context_lens;
+            let mut arg_cu = cu_seqlens_q;
+            let mut arg_qd = q_descale_ptr;
+            let _ = max_seqlen_q; // qi-loop drives over cu_seqlens_q
+
+            let args: [*mut core::ffi::c_void; 17] = [
+                &mut arg_out as *mut _ as *mut _,
+                &mut arg_q   as *mut _ as *mut _,
+                &mut arg_kp  as *mut _ as *mut _,
+                &mut arg_vp  as *mut _ as *mut _,
+                &mut arg_ks  as *mut _ as *mut _,
+                &mut arg_vs  as *mut _ as *mut _,
+                &mut arg_bt  as *mut _ as *mut _,
+                &mut arg_cl  as *mut _ as *mut _,
+                &mut arg_cu  as *mut _ as *mut _,
+                &mut arg_qd  as *mut _ as *mut _,
+                &scale as *const _ as *mut _,
+                &num_heads as *const _ as *mut _,
+                &num_kv_heads as *const _ as *mut _,
+                &head_dim as *const _ as *mut _,
+                &block_size as *const _ as *mut _,
+                &max_blocks_per_seq as *const _ as *mut _,
+                &window_size_left as *const _ as *mut _,
+            ];
+
+            let rc = cuLaunchKernel(
+                kernel_fn.raw() as CUfunction,
+                params.num_seqs as u32,
+                params.num_heads as u32,
+                1,
+                FA2_THREADS as u32,
+                1,
+                1,
+                smem_bytes as u32,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_prefill_nvfp4 (Fa2Ptx)",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (o_f16, q_fp8, k_cache_packed, v_cache_packed,
+                     k_cache_scale, v_cache_scale, block_tables,
+                     context_lens, cu_seqlens_q, q_descale_ptr,
+                     max_seqlen_q, stream);
+        }
+        Ok(())
+    }
+}
+
+impl<'a> PagedPrefillNvfp4Launcher<'a> {
+    /// Multi-query NVFP4 prefill with `m16n8k16` f16 MMA inner loop
+    /// (task aa01001nvf4f16mma Phase 2b). Grid + smem layout mirrors
+    /// `launch_fp8kv_unified_sm121` but reads the KV cache as NVFP4
+    /// packed bytes + per-16-element E4M3 microscale, dequants to
+    /// f16 smem via `cvt.rn.f16x2.e2m1x2`, and drives the tensor
+    /// core through `f16_mma_frag_pack.cuh`.
+    ///
+    /// # Safety
+    /// Same invariants as the FP8 unified launcher. Additionally:
+    ///   * `k_cache_scale` / `v_cache_scale` must be
+    ///     `[num_blocks * block_size * num_kv_heads * head_dim/16]`
+    ///     E4M3 microscales.
+    ///   * `q_scale_cache` may be null; the kernel falls back to
+    ///     `*q_descale_fallback` per row in that case.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4kv_unified_sm121(
+        &self,
+        params: PagedPrefillParams,
+        unified: UnifiedPrefillParams,
+        o_f16: u64,
+        q_fp8: u64,
+        k_cache_packed: u64,
+        v_cache_packed: u64,
+        k_cache_scale: u64,
+        v_cache_scale: u64,
+        q_scale_cache: u64,
+        block_tables: u64,
+        cu_seqlens_q: u64,
+        context_lens: u64,
+        q_descale_fallback: u64,
+        stream: u64,
+    ) -> Result<()> {
+        params.validate()?;
+        #[cfg(feature = "cuda")]
+        {
+            let fa2 = match self.backend {
+                super::AttentionBackend::Fa2Ptx(fa2) => fa2,
+                _ => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "non-Fa2Ptx",
+                            op: "paged_prefill_nvfp4_unified",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_prefill_nvfp4_unified",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            use cudarc::driver::sys::*;
+            const FA2_THREADS: i32 = 128;
+            let kernel_fn = fa2.fn_prefill_nvfp4kv_unified.ok_or_else(|| {
+                RvllmError::Attention {
+                    err: AttentionError::FeatureNotAvailable {
+                        backend: "Fa2Ptx",
+                        op: "paged_prefill_nvfp4_unified (kernel missing from PTX)",
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_prefill_nvfp4_unified",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                }
+            })?;
+
+            // Smem layout must match `flash_attention_unified_prefill_nvfp4kv.cu`.
+            const MMA_K: u32 = 16;
+            let block_m: u32 = UNIFIED_PREFILL_BLOCK_M;
+            let hd = params.head_dim;
+            let ts = unified.tile_size;
+            let s_s_stride = ts.max(MMA_K);
+            let smem_bytes: u32 = block_m * hd * 2        // s_q_f16
+                + block_m * 4                              // s_q_scale
+                + ts * hd * 2                              // s_k_f16
+                + ts * hd * 2                              // s_v_f16
+                + MMA_K * hd * 2                           // s_v_f16_T
+                + block_m * s_s_stride * 4                 // s_s
+                + block_m * 4 * 3                          // s_m + s_l + s_alpha
+                + block_m * MMA_K * 2                      // s_p_f16
+                + block_m * 4                              // s_p_scale
+                + block_m * hd * 4                         // s_acc
+                + 256;                                     // alignment cushion
+
+            if smem_bytes >= 48 * 1024 {
+                let _ = cuFuncSetAttribute(
+                    kernel_fn.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes as i32,
+                );
+            }
+
+            let scale = params.scale;
+            let num_heads = params.num_heads as i32;
+            let num_kv_heads = params.num_kv_heads as i32;
+            let head_dim = params.head_dim as i32;
+            let block_size = params.block_size as i32;
+            let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+            let tile_size = unified.tile_size as i32;
+            let num_queries_per_kv = unified.num_queries_per_kv as i32;
+            let block_q = unified.block_q as i32;
+            let num_seqs = params.num_seqs as i32;
+            let window_size_left = params.window_size_left;
+
+            let mut arg_out  = o_f16;
+            let mut arg_q    = q_fp8;
+            let mut arg_kp   = k_cache_packed;
+            let mut arg_vp   = v_cache_packed;
+            let mut arg_ks   = k_cache_scale;
+            let mut arg_vs   = v_cache_scale;
+            let mut arg_qs   = q_scale_cache;
+            let mut arg_bt   = block_tables;
+            let mut arg_cu   = cu_seqlens_q;
+            let mut arg_cl   = context_lens;
+            let mut arg_qd   = q_descale_fallback;
+
+            let args: [*mut core::ffi::c_void; 22] = [
+                &mut arg_out as *mut _ as *mut _,
+                &mut arg_q   as *mut _ as *mut _,
+                &mut arg_kp  as *mut _ as *mut _,
+                &mut arg_vp  as *mut _ as *mut _,
+                &mut arg_ks  as *mut _ as *mut _,
+                &mut arg_vs  as *mut _ as *mut _,
+                &mut arg_qs  as *mut _ as *mut _,
+                &mut arg_bt  as *mut _ as *mut _,
+                &mut arg_cu  as *mut _ as *mut _,
+                &mut arg_cl  as *mut _ as *mut _,
+                &mut arg_qd  as *mut _ as *mut _,
+                &scale as *const _ as *mut _,
+                &num_heads as *const _ as *mut _,
+                &num_kv_heads as *const _ as *mut _,
+                &head_dim as *const _ as *mut _,
+                &block_size as *const _ as *mut _,
+                &max_blocks_per_seq as *const _ as *mut _,
+                &tile_size as *const _ as *mut _,
+                &num_queries_per_kv as *const _ as *mut _,
+                &block_q as *const _ as *mut _,
+                &num_seqs as *const _ as *mut _,
+                &window_size_left as *const _ as *mut _,
+            ];
+
+            // Grid: (total_num_q_blocks, num_kv_heads) — same shape as
+            // the FP8 unified launcher.
+            let total_num_q_blocks =
+                params.num_tokens.div_ceil(unified.block_q) + params.num_seqs;
+
+            let rc = cuLaunchKernel(
+                kernel_fn.raw() as CUfunction,
+                total_num_q_blocks,
+                params.num_kv_heads,
+                1,
+                FA2_THREADS as u32,
+                1,
+                1,
+                smem_bytes,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_prefill_nvfp4_unified (Fa2Ptx)",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (params, unified, o_f16, q_fp8, k_cache_packed, v_cache_packed,
+                     k_cache_scale, v_cache_scale, q_scale_cache,
+                     block_tables, cu_seqlens_q, context_lens,
+                     q_descale_fallback, stream);
+            Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    op: "paged_prefill_nvfp4_unified (non-cuda build)",
+                    backend: "mock",
+                },
+                ctx: AttnCtx {
+                    op: "launch_nvfp4kv_unified_sm121",
+                    stream,
+                    num_seqs: params.num_seqs,
+                    head_dim: params.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -46,6 +46,19 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# rvllm-serve stack
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+axum = { version = "0.8", features = ["macros", "http2"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "util"] }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+minijinja = { version = "2.5", features = ["loader"] }
+minijinja-contrib = { version = "2.5", features = ["pycompat"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+bytes = "1"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

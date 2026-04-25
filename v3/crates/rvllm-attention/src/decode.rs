@@ -323,10 +323,37 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     use cudarc::driver::sys::*;
                     const FA2_THREADS: i32 = 128;
                     const FA2_BC: i32 = 16;
+                    const MAX_GQA_DECODE: i32 = 4;
                     let hd = params.head_dim as i32;
-                    let kernel_fn = fa2.fn_decode_fp8kv;
+                    // GQA-grouped dispatch: one CTA per (seq, kv_head)
+                    // amortizes KV dequant across the GQA query group.
+                    // Transparent fallback to per-head kernel when the
+                    // GQA symbol is absent (older PTX) or ratio is out
+                    // of range.
+                    let gqa_ratio = if params.num_kv_heads > 0 {
+                        params.num_heads / params.num_kv_heads
+                    } else {
+                        1
+                    };
+                    // FP8 GQA decode is opt-in via env gate until the
+                    // fp64 harness is ported to FP8. NVFP4 GQA has
+                    // harness coverage and defaults on. Set
+                    // `RVLLM_FP8_DECODE_GQA=1` to enable.
+                    let gqa_env_on = std::env::var("RVLLM_FP8_DECODE_GQA")
+                        .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                        .unwrap_or(false);
+                    let use_gqa = gqa_env_on
+                        && gqa_ratio > 1
+                        && gqa_ratio <= MAX_GQA_DECODE as u32
+                        && fa2.fn_decode_fp8kv_gqa.is_some();
+                    let kernel_fn = if use_gqa {
+                        fa2.fn_decode_fp8kv_gqa.unwrap()
+                    } else {
+                        fa2.fn_decode_fp8kv
+                    };
+                    let score_rows = if use_gqa { MAX_GQA_DECODE } else { 1 };
                     let smem_bytes =
-                        2 * FA2_BC * hd * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+                        2 * FA2_BC * hd * 4 + score_rows * FA2_BC * 4 + (FA2_THREADS / 32) * 4;
                     if smem_bytes as u32 >= 48 * 1024 {
                         let _ = cuFuncSetAttribute(
                             kernel_fn.raw() as CUfunction,
@@ -380,10 +407,15 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                         &window_size_left as *const _ as *mut _,
                     ];
 
+                    let grid_y = if use_gqa {
+                        params.num_kv_heads as u32
+                    } else {
+                        params.num_heads as u32
+                    };
                     let rc = cuLaunchKernel(
                         kernel_fn.raw() as CUfunction,
                         params.num_seqs as u32,
-                        params.num_heads as u32,
+                        grid_y,
                         1,
                         FA2_THREADS as u32,
                         1,
@@ -468,6 +500,499 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
         }
         Ok(())
     }
+}
+
+/// NVFP4 KV-cache paged-decode launcher. Same shape as
+/// `PagedDecodeFp8Launcher` but threads per-block E4M3 microscale
+/// pointers instead of per-tensor descales, and the K/V cache
+/// pointers reference the packed 4-bit byte layout.
+///
+/// Only the `Fa2Ptx` backend implements this — FA3 (SM90) has no
+/// NVFP4 path and returns `FeatureNotAvailable`.
+pub struct PagedDecodeNvfp4Launcher<'a> {
+    backend: &'a super::AttentionBackend,
+}
+
+impl<'a> PagedDecodeNvfp4Launcher<'a> {
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { backend }
+    }
+
+    /// # Safety
+    /// Every pointer must be valid device memory.
+    ///   * `k_cache_packed` / `v_cache_packed`: packed 4-bit bytes
+    ///     `[num_blocks * block_size * num_kv_heads * head_dim/2]`.
+    ///   * `k_cache_scale` / `v_cache_scale`: `__nv_fp8_e4m3`
+    ///     `[num_blocks * block_size * num_kv_heads * head_dim/16]`.
+    ///   * `q_descale_ptr`: single f32 scalar (Q stays FP8 per-tensor).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        params: PagedDecodeParams,
+        o_f16: u64,
+        q_fp8: u64,
+        k_cache_packed: u64,
+        v_cache_packed: u64,
+        k_cache_scale: u64,
+        v_cache_scale: u64,
+        block_tables: u64,
+        context_lens: u64,
+        q_descale_ptr: u64,
+        stream: u64,
+    ) -> Result<()> {
+        params.validate()?;
+        #[cfg(feature = "cuda")]
+        {
+            let fa2 = match self.backend {
+                super::AttentionBackend::Fa2Ptx(fa2) => fa2,
+                _ => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "non-Fa2Ptx",
+                            op: "paged_decode_nvfp4",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_decode_nvfp4",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            use cudarc::driver::sys::*;
+            const FA2_THREADS: i32 = 128;
+            const MAX_GQA_DECODE: u32 = 4;
+            let hd = params.head_dim as i32;
+            // GQA-grouped path: one CTA per (seq, kv_head) shares a
+            // single KV dequant across all queries in the group. Only
+            // valid when ratio > 1 and ≤ MAX_GQA_DECODE (matches the
+            // compile-time cap on per-thread register arrays in the
+            // kernel). Transparent fallback to per-head kernel when
+            // the GQA symbol is absent (older PTX tree).
+            let gqa_ratio = if params.num_kv_heads > 0 {
+                params.num_heads / params.num_kv_heads
+            } else {
+                1
+            };
+            // NVFP4 GQA decode — harness-validated in isolation but
+            // gated off by default in production until stability is
+            // confirmed end-to-end on 15k-ctx workloads. Set
+            // `RVLLM_NVFP4_DECODE_GQA=1` to opt in.
+            let gqa_env_on = std::env::var("RVLLM_NVFP4_DECODE_GQA")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false);
+            let use_gqa = gqa_env_on && gqa_ratio > 1 && gqa_ratio <= MAX_GQA_DECODE;
+            let (kernel_opt, fa2_bc) = if hd > 256 {
+                let k = if use_gqa {
+                    fa2.fn_decode_nvfp4kv_gqa_bc16.or(fa2.fn_decode_nvfp4kv_bc16)
+                } else {
+                    fa2.fn_decode_nvfp4kv_bc16
+                };
+                (k, 16)
+            } else {
+                let k = if use_gqa {
+                    fa2.fn_decode_nvfp4kv_gqa.or(fa2.fn_decode_nvfp4kv)
+                } else {
+                    fa2.fn_decode_nvfp4kv
+                };
+                (k, 32)
+            };
+            let gqa_dispatched = use_gqa
+                && if hd > 256 {
+                    fa2.fn_decode_nvfp4kv_gqa_bc16.is_some()
+                } else {
+                    fa2.fn_decode_nvfp4kv_gqa.is_some()
+                };
+            let kernel_fn = kernel_opt.ok_or_else(|| RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "Fa2Ptx",
+                    op: "paged_decode_nvfp4 (kernel missing from PTX — rebuild kernels/ with rusty_sm121_nvfp4)",
+                },
+                ctx: AttnCtx {
+                    op: "paged_decode_nvfp4",
+                    stream,
+                    num_seqs: params.num_seqs,
+                    head_dim: params.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })?;
+
+            // Phase 2a (aa01001nvf4f16mma): K/V dequant target is
+            // f16 smem (2 bytes/elem) instead of f32 (4 bytes/elem),
+            // halving the K/V tile footprint. s_score and s_reduce
+            // stay f32 for softmax precision. GQA path widens s_score
+            // by MAX_GQA_DECODE (one scores row per query in group).
+            let score_rows = if gqa_dispatched { MAX_GQA_DECODE as i32 } else { 1 };
+            let smem_bytes =
+                2 * fa2_bc * hd * 2 + score_rows * fa2_bc * 4 + (FA2_THREADS / 32) * 4;
+            if smem_bytes as u32 >= 48 * 1024 {
+                let _ = cuFuncSetAttribute(
+                    kernel_fn.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes,
+                );
+            }
+
+            let scale = params.scale;
+            let num_heads = params.num_heads as i32;
+            let num_kv_heads = params.num_kv_heads as i32;
+            let head_dim = params.head_dim as i32;
+            let block_size = params.block_size as i32;
+            let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+            let window_size_left = params.window_size_left;
+
+            let mut arg_out = o_f16;
+            let mut arg_q = q_fp8;
+            let mut arg_kp = k_cache_packed;
+            let mut arg_vp = v_cache_packed;
+            let mut arg_ks = k_cache_scale;
+            let mut arg_vs = v_cache_scale;
+            let mut arg_bt = block_tables;
+            let mut arg_cl = context_lens;
+            let mut arg_qd = q_descale_ptr;
+
+            let args: [*mut core::ffi::c_void; 16] = [
+                &mut arg_out as *mut _ as *mut _,
+                &mut arg_q   as *mut _ as *mut _,
+                &mut arg_kp  as *mut _ as *mut _,
+                &mut arg_vp  as *mut _ as *mut _,
+                &mut arg_ks  as *mut _ as *mut _,
+                &mut arg_vs  as *mut _ as *mut _,
+                &mut arg_bt  as *mut _ as *mut _,
+                &mut arg_cl  as *mut _ as *mut _,
+                &mut arg_qd  as *mut _ as *mut _,
+                &scale as *const _ as *mut _,
+                &num_heads as *const _ as *mut _,
+                &num_kv_heads as *const _ as *mut _,
+                &head_dim as *const _ as *mut _,
+                &block_size as *const _ as *mut _,
+                &max_blocks_per_seq as *const _ as *mut _,
+                &window_size_left as *const _ as *mut _,
+            ];
+
+            let grid_y = if gqa_dispatched {
+                params.num_kv_heads as u32
+            } else {
+                params.num_heads as u32
+            };
+            let rc = cuLaunchKernel(
+                kernel_fn.raw() as CUfunction,
+                params.num_seqs as u32,
+                grid_y,
+                1,
+                FA2_THREADS as u32,
+                1,
+                1,
+                smem_bytes as u32,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_decode_nvfp4 (Fa2Ptx)",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (o_f16, q_fp8, k_cache_packed, v_cache_packed,
+                     k_cache_scale, v_cache_scale, block_tables,
+                     context_lens, q_descale_ptr, stream);
+        }
+        Ok(())
+    }
+
+    /// Split-KV decode (paged_attention_v2-style, phase-1 + phase-2).
+    /// Launches:
+    ///   Phase 1: `(num_seqs, num_heads, max_num_partitions)` CTAs
+    ///            into `workspace_ptr` (tmp_out / max_logits / exp_sums).
+    ///   Phase 2: `(num_seqs, num_heads)` CTAs combining partitions.
+    ///
+    /// Target: 3-5× speedup at bs=1 long context where the single-CTA
+    /// per-head kernel under-fills GB10's 108 SMs (32 CTAs → ~30%).
+    ///
+    /// Caller invariants:
+    ///   * `workspace_ptr` must have at least
+    ///     `num_seqs * num_heads * max_num_partitions *
+    ///     (head_dim * 2 + 8)` bytes (f16 tmp_out + 2×f32 metadata).
+    ///   * `max_num_partitions >= ceil(max_ctx_len / partition_size)`.
+    ///   * `partition_size` must be a multiple of 16 (our FA2 block size).
+    ///
+    /// Returns `FeatureNotAvailable` if the split kernels aren't in the
+    /// PTX module (older kernel tree). Caller should fall back to
+    /// `launch`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_split(
+        &self,
+        params: PagedDecodeParams,
+        o_f16: u64,
+        q_fp8: u64,
+        k_cache_packed: u64,
+        v_cache_packed: u64,
+        k_cache_scale: u64,
+        v_cache_scale: u64,
+        block_tables: u64,
+        context_lens: u64,
+        q_descale_ptr: u64,
+        workspace_ptr: u64,
+        partition_size: u32,
+        max_num_partitions: u32,
+        stream: u64,
+    ) -> Result<()> {
+        params.validate()?;
+        #[cfg(feature = "cuda")]
+        {
+            let fa2 = match self.backend {
+                super::AttentionBackend::Fa2Ptx(fa2) => fa2,
+                _ => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "non-Fa2Ptx",
+                            op: "paged_decode_nvfp4_split",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_decode_nvfp4_split",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            use cudarc::driver::sys::*;
+            const FA2_THREADS: i32 = 128;
+            const REDUCE_THREADS: i32 = 128;
+            let hd = params.head_dim as i32;
+
+            let split_fn = if hd > 256 {
+                fa2.fn_decode_nvfp4kv_split_bc16
+            } else {
+                fa2.fn_decode_nvfp4kv_split
+            }
+            .ok_or_else(|| RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "Fa2Ptx",
+                    op: "paged_decode_nvfp4_split (split kernel missing — rebuild kernels/)",
+                },
+                ctx: AttnCtx {
+                    op: "paged_decode_nvfp4_split",
+                    stream,
+                    num_seqs: params.num_seqs,
+                    head_dim: params.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })?;
+            let reduce_fn = fa2.fn_paged_attn_reduce_f16.ok_or_else(|| {
+                RvllmError::Attention {
+                    err: AttentionError::FeatureNotAvailable {
+                        backend: "Fa2Ptx",
+                        op: "paged_decode_nvfp4_split (reduce kernel missing)",
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_decode_nvfp4_split",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                }
+            })?;
+
+            let fa2_bc: i32 = if hd > 256 { 16 } else { 32 };
+            // Phase-1 smem: 2 * BC * D (f16 K+V) + BC * 4 (scores) +
+            // (FA2_THREADS/32) * 4 (reduce scratch).
+            let split_smem =
+                2 * fa2_bc * hd * 2 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
+            if split_smem as u32 >= 48 * 1024 {
+                let _ = cuFuncSetAttribute(
+                    split_fn.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    split_smem,
+                );
+            }
+            // Phase-2 smem: 2 * max_num_partitions * 4 (max_logits +
+            // rescaled exp_sums) + (REDUCE_THREADS/32) * 4 (reduce scratch).
+            let reduce_smem =
+                (2 * max_num_partitions as i32) * 4 + (REDUCE_THREADS / 32) * 4;
+            if reduce_smem as u32 >= 48 * 1024 {
+                let _ = cuFuncSetAttribute(
+                    reduce_fn.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    reduce_smem,
+                );
+            }
+
+            // Workspace layout inside `workspace_ptr`:
+            //   [0,                       tmp_bytes)    — tmp_out f16 [S,H,P,D]
+            //   [tmp_bytes,               +meta_bytes)  — max_logits f32 [S,H,P]
+            //   [tmp_bytes+meta_bytes,    +meta_bytes)  — exp_sums   f32 [S,H,P]
+            let slots = (params.num_seqs as u64)
+                * (params.num_heads as u64)
+                * (max_num_partitions as u64);
+            let tmp_bytes  = slots * (params.head_dim as u64) * 2;
+            let meta_bytes = slots * 4;
+            let d_tmp_out    = workspace_ptr;
+            let d_max_logits = workspace_ptr + tmp_bytes;
+            let d_exp_sums   = workspace_ptr + tmp_bytes + meta_bytes;
+
+            let scale = params.scale;
+            let num_heads         = params.num_heads as i32;
+            let num_kv_heads      = params.num_kv_heads as i32;
+            let head_dim          = params.head_dim as i32;
+            let block_size        = params.block_size as i32;
+            let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+            let window_size_left  = params.window_size_left;
+            let partition_size_i  = partition_size as i32;
+            let max_parts_i       = max_num_partitions as i32;
+
+            // --- Phase 1: split kernel ---
+            let mut a_tmp   = d_tmp_out;
+            let mut a_maxl  = d_max_logits;
+            let mut a_esum  = d_exp_sums;
+            let mut a_q     = q_fp8;
+            let mut a_kp    = k_cache_packed;
+            let mut a_vp    = v_cache_packed;
+            let mut a_ks    = k_cache_scale;
+            let mut a_vs    = v_cache_scale;
+            let mut a_bt    = block_tables;
+            let mut a_cl    = context_lens;
+            let mut a_qd    = q_descale_ptr;
+
+            let split_args: [*mut core::ffi::c_void; 20] = [
+                &mut a_tmp  as *mut _ as *mut _,
+                &mut a_maxl as *mut _ as *mut _,
+                &mut a_esum as *mut _ as *mut _,
+                &mut a_q    as *mut _ as *mut _,
+                &mut a_kp   as *mut _ as *mut _,
+                &mut a_vp   as *mut _ as *mut _,
+                &mut a_ks   as *mut _ as *mut _,
+                &mut a_vs   as *mut _ as *mut _,
+                &mut a_bt   as *mut _ as *mut _,
+                &mut a_cl   as *mut _ as *mut _,
+                &mut a_qd   as *mut _ as *mut _,
+                &scale              as *const _ as *mut _,
+                &num_heads          as *const _ as *mut _,
+                &num_kv_heads       as *const _ as *mut _,
+                &head_dim           as *const _ as *mut _,
+                &block_size         as *const _ as *mut _,
+                &max_blocks_per_seq as *const _ as *mut _,
+                &window_size_left   as *const _ as *mut _,
+                &partition_size_i   as *const _ as *mut _,
+                &max_parts_i        as *const _ as *mut _,
+            ];
+
+            let rc = cuLaunchKernel(
+                split_fn.raw() as CUfunction,
+                params.num_seqs as u32,
+                params.num_heads as u32,
+                max_num_partitions,
+                FA2_THREADS as u32,
+                1,
+                1,
+                split_smem as u32,
+                stream as CUstream,
+                split_args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_decode_nvfp4_split phase-1",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+
+            // --- Phase 2: reduce ---
+            let mut r_out = o_f16;
+            let mut r_tmp = d_tmp_out;
+            let mut r_mxl = d_max_logits;
+            let mut r_esm = d_exp_sums;
+            let mut r_cl  = context_lens;
+            let reduce_args: [*mut core::ffi::c_void; 9] = [
+                &mut r_out as *mut _ as *mut _,
+                &mut r_tmp as *mut _ as *mut _,
+                &mut r_mxl as *mut _ as *mut _,
+                &mut r_esm as *mut _ as *mut _,
+                &mut r_cl  as *mut _ as *mut _,
+                &num_heads          as *const _ as *mut _,
+                &head_dim           as *const _ as *mut _,
+                &max_parts_i        as *const _ as *mut _,
+                &partition_size_i   as *const _ as *mut _,
+            ];
+            let rc = cuLaunchKernel(
+                reduce_fn.raw() as CUfunction,
+                params.num_seqs as u32,
+                params.num_heads as u32,
+                1,
+                REDUCE_THREADS as u32,
+                1,
+                1,
+                reduce_smem as u32,
+                stream as CUstream,
+                reduce_args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_decode_nvfp4_split phase-2 reduce",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (o_f16, q_fp8, k_cache_packed, v_cache_packed,
+                     k_cache_scale, v_cache_scale, block_tables,
+                     context_lens, q_descale_ptr, workspace_ptr,
+                     partition_size, max_num_partitions, stream);
+        }
+        Ok(())
+    }
+
+    /// Returns true iff the PTX module exposes the split + reduce
+    /// kernels. Callers use this to decide whether to attempt the
+    /// split path vs the single-CTA fallback.
+    #[cfg(feature = "cuda")]
+    pub fn has_split_kernels(&self) -> bool {
+        match self.backend {
+            super::AttentionBackend::Fa2Ptx(fa2) => {
+                fa2.fn_decode_nvfp4kv_split.is_some()
+                    && fa2.fn_decode_nvfp4kv_split_bc16.is_some()
+                    && fa2.fn_paged_attn_reduce_f16.is_some()
+            }
+            _ => false,
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    pub fn has_split_kernels(&self) -> bool { false }
 }
 
 #[cfg(test)]

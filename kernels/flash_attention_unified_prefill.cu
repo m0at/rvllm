@@ -530,14 +530,12 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
             }
         }
         __syncthreads();
-        // -- Rescale running acc by alpha ------------------------------
-        // Only needed if any row had a prior non-empty max; cheap
-        // enough to always apply.
-        for (int idx = tid; idx < BLOCK_M * head_dim; idx += FA2_THREADS) {
-            const int m = idx / head_dim;
-            s_acc[idx] *= s_alpha[m];
-        }
-        __syncthreads();
+        // -- (Phase F12) alpha-rescale of s_acc is FUSED into the
+        //    P·V step below. Scalar path folds it into its s_acc
+        //    write; MMA path loads `s_acc * alpha / p_scale` into
+        //    the MMA C operand so that one tensor-core op replaces
+        //    the former "rescale + accumulate" pair. No dedicated
+        //    s_acc pass before V load anymore.
 
         // -- Load V tile (FP8 in smem) + per-slot v_scale --
         {
@@ -668,25 +666,52 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
             const int n_tiles_per_warp = n_tiles_total >> 2;
             uint32_t a[4];
             rvllm::pack_a_frag_row_major_m16k32(s_p_fp8, MMA_K, a, lane);
+            // Phase F12 — fused alpha rescale via MMA C operand.
+            //
+            // Pre-F12 each tile did:
+            //   s_acc *= alpha                  (dedicated pass, R+W)
+            //   d = a · b  (zero C)             (MMA)
+            //   s_acc += d * p_scale            (R+W)
+            //
+            // Now we exploit the MMA's `D = A·B + C` semantics: load
+            //   C = s_acc_old * alpha / p_scale
+            // into the accumulator, run the MMA, write back
+            //   s_acc_new = d * p_scale
+            //             = a·b * p_scale + C * p_scale
+            //             = <this tile's contribution> + s_acc_old * alpha
+            // in a single smem R + W per cell instead of two.
+            const int r_lo = lane >> 2;
+            const int r_hi = r_lo + 8;
+            const int c    = (lane & 3) << 1;
+            const float alpha_lo = s_alpha[r_lo];
+            const float alpha_hi = s_alpha[r_hi];
             #pragma unroll 1
             for (int nt = 0; nt < n_tiles_per_warp; nt++) {
                 const int n_base = (warp_id * n_tiles_per_warp + nt) * 8;
+                const int d_lo = n_base + c;
+                const int d_hi = d_lo + 1;
+                const float pscale_lo = s_p_scale[r_lo];
+                const float pscale_hi = s_p_scale[r_hi];
+                const float inv_ps_lo = 1.0f / pscale_lo;
+                const float inv_ps_hi = 1.0f / pscale_hi;
                 uint32_t b[2];
-                float d_frag[4]; rvllm::zero_mma_d_frag(d_frag);
                 rvllm::pack_b_frag_col_major_n8k32(
                     s_v_fp8_T + n_base * MMA_K, MMA_K, b, lane);
+                float d_frag[4];
+                d_frag[0] = s_acc[r_lo * head_dim + d_lo] * alpha_lo * inv_ps_lo;
+                d_frag[1] = s_acc[r_lo * head_dim + d_hi] * alpha_lo * inv_ps_lo;
+                d_frag[2] = s_acc[r_hi * head_dim + d_lo] * alpha_hi * inv_ps_hi;
+                d_frag[3] = s_acc[r_hi * head_dim + d_hi] * alpha_hi * inv_ps_hi;
                 rvllm::mma_m16n8k32_e4m3_e4m3_f32(d_frag, a, b);
-
-                const int r_lo = lane >> 2;
-                const int r_hi = r_lo + 8;
-                const int c    = (lane & 3) << 1;
-                const int d_lo = n_base + c;
-                const int d_hi = d_lo + 1;                s_acc[r_lo * head_dim + d_lo] += d_frag[0] * s_p_scale[r_lo];
-                s_acc[r_lo * head_dim + d_hi] += d_frag[1] * s_p_scale[r_lo];
-                s_acc[r_hi * head_dim + d_lo] += d_frag[2] * s_p_scale[r_hi];
-                s_acc[r_hi * head_dim + d_hi] += d_frag[3] * s_p_scale[r_hi];
+                s_acc[r_lo * head_dim + d_lo] = d_frag[0] * pscale_lo;
+                s_acc[r_lo * head_dim + d_hi] = d_frag[1] * pscale_lo;
+                s_acc[r_hi * head_dim + d_lo] = d_frag[2] * pscale_hi;
+                s_acc[r_hi * head_dim + d_hi] = d_frag[3] * pscale_hi;
             }
         } else {
+            // Phase F12 — fold alpha rescale into the scalar
+            // accumulator write. One smem R+W per cell instead of
+            // the former "rescale pass + += pass" two R+W.
             for (int idx = tid; idx < BLOCK_M * head_dim; idx += FA2_THREADS) {
                 const int m = idx / head_dim;
                 const int d = idx - m * head_dim;
@@ -696,7 +721,7 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
                     const float v = fp8kv_decode_byte(s_v_fp8[t * head_dim + d]);
                     sum += p * v * s_v_scale[t];
                 }
-                s_acc[idx] += sum;
+                s_acc[idx] = s_acc[idx] * s_alpha[m] + sum;
             }
         }
         __syncthreads();
