@@ -84,7 +84,7 @@
     "flash_attention_unified_prefill_nvfp4kv": {
       "bytes": 53063,
       "path": "flash_attention_unified_prefill_nvfp4kv.ptx",
-      "sha256": "e864e066d645fda3350e97158cd03989826e03b27e2f1c9f1808cb74ca892de6"
+      "sha256": "9c261078c9a48ad488cb958aff78c25d13fa937c1ff861b11f3687b844910951"
     },
     "fp8_e4m3_mma_probe": {
       "bytes": 1570,
@@ -242,5 +242,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "348bd1d49916fc0059c7440be003fd17353f200a-shadow-diag"
+  "revision": "81e66fac75a646a6eabc5e287f0eedcc6528bd47-pscale-fix"
 }

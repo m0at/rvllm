@@ -535,7 +535,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
                 float d_frag[4];
                 d_frag[0] = s_acc[r_lo * head_dim + d_lo] * alpha_lo * inv_ps_lo;
                 d_frag[1] = s_acc[r_lo * head_dim + d_hi] * alpha_lo * inv_ps_lo;
-                d_frag[2] = s_acc[r_hi * head_dim + d_lo] * alpha_hi * inv_ps_lo;
+                d_frag[2] = s_acc[r_hi * head_dim + d_lo] * alpha_hi * inv_ps_hi;
                 d_frag[3] = s_acc[r_hi * head_dim + d_hi] * alpha_hi * inv_ps_hi;
                 rvllm_f16mma::mma_m16n8k16_f16_f16_f32(d_frag, a, b);
                 s_acc[r_lo * head_dim + d_lo] = d_frag[0] * pscale_lo;
