@@ -863,6 +863,49 @@ fn safe_content_emit_end(accum: &str, emitted: usize, in_tool: bool) -> usize {
     if cand < emitted {
         return emitted;
     }
+    // If `cand` falls INSIDE a closed thought block — opener arrived,
+    // closer arrived, but `ceiling_by_tail` happens to cut between
+    // them — push `cand` to the byte after the closer so the slice
+    // `accum[..cand]` contains the entire block. Otherwise
+    // `strip_tool_markup` sees an opener with no closer in the slice,
+    // strips only the opener, and leaks the inner prose ("thought\n
+    // <channel|>In Bern...") to the streaming client.
+    //
+    // Verified failure mode (real Telegram traffic, 2026-04-25):
+    //   accum = "<|channel>thought\nIn Bern ist es aktuell 1나°C.<channel|>..."
+    //   ceiling_by_tail cuts at byte ~35 → strip_tool_markup sees
+    //   "<|channel>thought\nIn Bern..." → strips opener only, leaks
+    //   "thought\nIn Bern..." to user.
+    for &op in THOUGHT_BLOCK_OPENERS {
+        let mut search_from = emitted;
+        while let Some(rel) = accum[search_from..].find(op) {
+            let opener_pos = search_from + rel;
+            let after_opener = opener_pos + op.len();
+            let tail = &accum[after_opener..];
+            let close_at = ["<channel|>", "<turn|>"]
+                .iter()
+                .filter_map(|c| tail.find(c).map(|r| after_opener + r + c.len()))
+                .min();
+            match close_at {
+                Some(closer_end) => {
+                    // Block is closed in `accum`. If `cand` lands
+                    // inside, extend to the byte AFTER the closer.
+                    if cand >= opener_pos && cand < closer_end {
+                        cand = closer_end;
+                    }
+                    // Continue scanning past this block — there may
+                    // be additional thought blocks after it.
+                    search_from = closer_end;
+                }
+                None => {
+                    // Unclosed; the `earliest` upper bound already
+                    // capped `cand` at the opener_pos. Stop scanning
+                    // for this opener type.
+                    break;
+                }
+            }
+        }
+    }
     while cand > emitted && !accum.is_char_boundary(cand) {
         cand -= 1;
     }
