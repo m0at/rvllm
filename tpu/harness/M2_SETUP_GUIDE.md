@@ -15,8 +15,9 @@ OpenAI-compatible API server.
 - **Current throughput** (as of this commit):
   - Load: ~80s (parallel ThreadPool over 61 safetensors shards)
   - **B=1**: 726 ms/step = **1.4 tok/s**
-  - **B=8**: 745 ms/step = **10.7 tok/s** (replicate-token MoE)
-  - B≥16 currently OOMs on KV cache (see "Known limits" below)
+  - **B=8**: 146 ms/step = **54.7 tok/s** (replicate-token MoE + inactive-expert skip)
+  - **B=16**: 155 ms/step = **103.3 tok/s**
+  - B≥32 still needs a fresh sweep after the B=16 path fit
 
 ---
 
@@ -200,8 +201,8 @@ Flag reference:
 `M2_MOE=shardmap` selects the main NVFP4 MoE implementation. Inside that path,
 `RVLLM_M2_MOE_IMPL=auto` is the default:
 
-- B=8 uses exact replicate-token MoE: tokens/routing stay replicated, each chip
-  computes its 32 local experts, and outputs combine with `psum`.
+- B=8/B=16 use exact replicate-token MoE: tokens/routing stay replicated, each
+  chip skips inactive local experts with `lax.cond`, and outputs combine with `psum`.
 - Other batch sizes use the original padded all-to-all path unless overridden.
 
 Set `RVLLM_M2_MOE_IMPL=all_to_all` to force the old path, or
@@ -211,9 +212,11 @@ Measured B=8:
 
 | Impl | B=8 perf | Notes |
 |---|---:|---|
-| `auto` / `replicate_tokens` | **10.7 tok/s** | exact, PPL 5.14 on 750-token probe |
+| `auto` / `replicate_tokens` | **54.7 tok/s** | exact token match vs all-to-all on B=8 probe |
 | `all_to_all` | 10.0 tok/s | previous baseline |
 | `RVLLM_NVFP4_BACKEND=pallas` | 7.2 tok/s | exact but slower two-stage Pallas matmul |
+
+B=16 with `auto` measured **103.3 tok/s**.
 
 ### Legacy `M2_MOE` variants
 
@@ -221,7 +224,7 @@ Set before running:
 
 | Value | Impl | B=1 perf | B=8+ perf |
 |---|---|---|---|
-| `shardmap` (default) | expert-sharded MoE (`RVLLM_M2_MOE_IMPL=auto`) | **1.4 tok/s** | **10.7 tok/s** |
+| `shardmap` (default) | expert-sharded MoE (`RVLLM_M2_MOE_IMPL=auto`) | **1.4 tok/s** | **54.7 tok/s @ B=8**, **103.3 tok/s @ B=16** |
 | `dense` | compute all 32 local experts per shard | compile hangs | n/a |
 | `gather` | dynamic-gather top-K + vmap | 0.02 tok/s (vmap doesn't fuse) | n/a |
 
@@ -451,8 +454,9 @@ Set `RVLLM_API` to the forwarded port from Section 6.
 
 ## 9. What next (performance)
 
-Current bottleneck: small-batch MoE still launches many per-expert NVFP4
-matmuls. B=8 avoids padded all-to-all now, but B=1 still needs a better kernel.
+Current bottleneck: small-batch MoE still launches per-active-expert NVFP4
+matmuls. B=8/B=16 avoid padded all-to-all and empty expert matmuls now, but B=1
+still needs a better kernel.
 Known paths that would move the needle:
 
 1. **True fused Pallas NVFP4 matmul kernel**. The current two-stage Pallas

@@ -321,7 +321,7 @@ def _moe_shard_map_nvfp4(
     """
     impl = os.environ.get('RVLLM_M2_MOE_IMPL', 'auto').strip().lower()
     if impl == 'auto':
-        impl = 'replicate_tokens' if x.shape[0] == 8 else 'all_to_all'
+        impl = 'replicate_tokens' if x.shape[0] in (8, 16) else 'all_to_all'
     if impl in ('replicate', 'replicated', 'replicate_tokens'):
         return _moe_replicate_tokens_nvfp4(
             x, router_w, router_bias,
@@ -535,18 +535,26 @@ def _moe_replicate_tokens_nvfp4(
                 axis=-1,
             )
             active = coeff != jnp.asarray(0, coeff.dtype)
-            x_e = x_l * active[:, None].astype(x_l.dtype)
-            gate = nvfp4_matmul(
-                x_e, w1p_l[e], w1s_l[e], w1g_l[e], inter_dim, H_dim
-            )
-            up = nvfp4_matmul(
-                x_e, w3p_l[e], w3s_l[e], w3g_l[e], inter_dim, H_dim
-            )
-            h = jax.nn.silu(gate) * up
-            d = nvfp4_matmul(
-                h, w2p_l[e], w2s_l[e], w2g_l[e], H_dim, inter_dim
-            )
-            local_out = local_out + d * coeff[:, None].astype(d.dtype)
+
+            def _run_expert(_):
+                x_e = x_l * active[:, None].astype(x_l.dtype)
+                gate = nvfp4_matmul(
+                    x_e, w1p_l[e], w1s_l[e], w1g_l[e], inter_dim, H_dim
+                )
+                up = nvfp4_matmul(
+                    x_e, w3p_l[e], w3s_l[e], w3g_l[e], inter_dim, H_dim
+                )
+                h = jax.nn.silu(gate) * up
+                d = nvfp4_matmul(
+                    h, w2p_l[e], w2s_l[e], w2g_l[e], H_dim, inter_dim
+                )
+                return d * coeff[:, None].astype(d.dtype)
+
+            def _skip_expert(_):
+                return jnp.zeros_like(x_l)
+
+            local_out = local_out + jax.lax.cond(
+                jnp.any(active), _run_expert, _skip_expert, operand=None)
 
         return jax.lax.psum(local_out, 'expert')
 
