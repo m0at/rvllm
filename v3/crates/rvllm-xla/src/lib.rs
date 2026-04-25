@@ -2,6 +2,7 @@ pub mod artifact;
 #[cfg(feature = "tpu")]
 pub mod client;
 pub mod ffi;
+pub mod m2_graph_abi;
 pub mod m2_prefill;
 pub mod m2_runtime;
 
@@ -12,6 +13,11 @@ pub use artifact::{
 #[cfg(feature = "tpu")]
 pub use client::{CompiledExecutable, PjrtBufferHandle, PjrtClientHandle};
 pub use ffi::PjrtElementType;
+pub use m2_graph_abi::{
+    M2GraphAbi, M2GraphPhase, M2GraphShape, M2GraphTensorSpec, M2LayerWeightAbi,
+    M2Nvfp4ProjectionAbi, M2_HEAD_DIM, M2_HIDDEN, M2_MOE_INTER, M2_NUM_EXPERTS, M2_NUM_KV_HEADS,
+    M2_NUM_LAYERS, M2_NUM_Q_HEADS, M2_NVFP4_GROUP, M2_ROTARY_DIM, M2_TOP_K, M2_VOCAB,
+};
 pub use m2_prefill::{
     make_m2_prefill_input_specs, make_m2_prefill_inputs, M2PrefillHostInput, M2PrefillHostInputSpec,
 };

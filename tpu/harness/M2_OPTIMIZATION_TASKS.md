@@ -148,6 +148,10 @@ Rust verification:
   checkpoint index, builds BxT prompt metadata, emits PJRT input specs without
   allocating the large KV buffer, and exposes `m2_rust_prefill` for dry-run or
   TPU execution.
+- [x] Define the Rust M2 graph ABI for decode and prefill: runtime
+  inputs/outputs, flat KV byte buffer, logits/last-hidden outputs, dense BF16
+  weight specs, and ModelOpt NVFP4 expert projection groups. Validated against
+  the real 191,069-tensor M2 checkpoint index.
 - [ ] Wire Rust M2 loader output into the Rust PJRT/XLA runtime path.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.
