@@ -156,6 +156,10 @@ Rust verification:
   191,069 tensor specs, real shard filenames, dense BF16 weights, packed
   NVFP4/FP8/global-scale/input-scale expert tensors, and total flat upload byte
   budget without Python.
+- [x] Add Rust decode bench harness shell: emits the `m2_full_bench.py`
+  top-level JSON contract from Rust (`arch`, `slice`, `nl`, `ctx`, `kv_cache`,
+  `moe_impl`, `load_seconds`, `sweep`, `ppl`, `generation`) plus ABI runtime
+  facts. Current status is explicit `planned` until graph execution is wired.
 - [ ] Wire the weight upload plan into live PJRT device buffers.
 - [ ] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
   prefill + decode harness.
