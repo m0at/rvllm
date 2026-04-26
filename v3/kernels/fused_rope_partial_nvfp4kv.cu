@@ -133,12 +133,26 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
     const int*     __restrict__ positions,
     const int*     __restrict__ slot_mapping,
     const float*   __restrict__ q_scale_ptr,
+    // === DYNAMIC NVFP4 Q SCALE ===
+    // Per-(token, head) Q scale output. When non-null, the kernel
+    // computes amax(|Q_post_rotation|) per (token, head_idx), derives
+    // a fresh FP8 scale = max(amax/448, 1e-12), writes it here, and
+    // quantizes Q with that dynamic scale. NVFP4 attention kernels
+    // (decode + prefill) read the same `[num_tokens, num_heads]` f32
+    // table to dequant Q. When null, falls back to the static scalar
+    // `*q_scale_ptr` — backwards compatible with the pre-Hadamard
+    // path. Required for `RVLLM_NVFP4_HADAMARD=1` because rotated Q
+    // values can grow up to √D per channel and saturate the static
+    // (typically 0.1) scalar.
+    float*         __restrict__ q_scale_cache,
+    // === END DYNAMIC NVFP4 Q SCALE ===
     int num_tokens,
     int num_heads,
     int num_kv_heads,
     int head_dim,
     int rotary_dim,
-    int scale_policy,   // RVLLM_NVFP4_POLICY_* (see top of file)
+    int scale_policy,    // K scale policy (RVLLM_NVFP4_POLICY_*)
+    int v_scale_policy,  // V scale policy (independent, for K/V split diagnostic)
     // === HADAMARD ROTATION ===
     // Per-layer ±1 sign vectors of length `head_dim` (i8 storage).
     // When BOTH pointers are non-null, the kernel applies signed
@@ -207,7 +221,6 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
     // ---- Q: stays FP8 per-tensor (MMA input side still fp8). ----
     if (head_idx < num_heads) {
         const int q_base = (token_idx * num_heads + head_idx) * head_dim;
-        const float q_scale_inv = 1.0f / (*q_scale_ptr);
         float v = rope_one(q_in, q_base);
         // === HADAMARD ROTATION ===
         // Apply R = H * diag(D) to Q post-RoPE, before FP8 quantize.
@@ -222,12 +235,58 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
                 s_hadamard, hadamard_signs_q, head_dim);
             rvllm_hadamard::fwht_inplace_f32(s_hadamard, head_dim);
             v = s_hadamard[tid];
-            // Don't need __syncthreads() after — each thread reads its
-            // own slot and the smem is reused below for K (which has
-            // its own __syncthreads BEFORE writing).
+            // NB: NO __syncthreads() here in the legacy path because
+            // each thread reads its own slot. With dynamic Q scale we
+            // reuse `s_hadamard` for the amax block-reduce below, so
+            // the reduction sequence has its own sync.
         }
         // === END HADAMARD ROTATION ===
+
+        // === DYNAMIC NVFP4 Q SCALE ===
+        // Per-(token, head) dynamic Q scale: block-reduce amax over
+        // `head_dim` threads, derive scale = max(amax/448, 1e-12),
+        // thread 0 writes to `q_scale_cache[token_idx*num_heads + head_idx]`,
+        // all threads quantize with 1/scale. When `q_scale_cache` is
+        // null, fall back to the static scalar (legacy behaviour).
+        float q_scale_inv;
+        if (q_scale_cache != nullptr) {
+            // Stage own value, warp+block reduce. Reuse s_hadamard as
+            // scratch (size 512 floats, head_dim<=512, plenty of room).
+            __syncthreads();  // ensure prior s_hadamard reads are done
+            float my_abs = fabsf(v);
+            // Warp-shuffle reduce within each 32-lane warp.
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                my_abs = fmaxf(my_abs,
+                    __shfl_xor_sync(0xFFFFFFFFu, my_abs, off));
+            }
+            const int lane = tid & 31;
+            const int warp = tid >> 5;
+            // Stash one value per warp into smem.
+            if (lane == 0) s_hadamard[warp] = my_abs;
+            __syncthreads();
+            const int num_warps = (head_dim + 31) >> 5;
+            // First warp reduces across warps, broadcasts via slot 0.
+            if (warp == 0) {
+                float a = (lane < num_warps) ? s_hadamard[lane] : 0.0f;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, off));
+                }
+                if (lane == 0) {
+                    float scale = fmaxf(a * (1.0f / 448.0f), 1e-12f);
+                    s_hadamard[0] = scale;
+                    q_scale_cache[token_idx * num_heads + head_idx] = scale;
+                }
+            }
+            __syncthreads();
+            float q_scale_dyn = s_hadamard[0];
+            q_scale_inv = 1.0f / q_scale_dyn;
+        } else {
+            q_scale_inv = 1.0f / (*q_scale_ptr);
+        }
         q_fp8_out[q_base + tid] = __nv_fp8_e4m3(v * q_scale_inv);
+        // === END DYNAMIC NVFP4 Q SCALE ===
     }
     // === HADAMARD ROTATION ===
     // Sync between Q-rotation smem use and K-rotation smem use
@@ -259,8 +318,9 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
             __nv_fp8_e4m3* out_scales,
             bool           apply_rope,
             // === HADAMARD ROTATION ===
-            bool           apply_rotation
+            bool           apply_rotation,
             // === END HADAMARD ROTATION ===
+            int            policy
         ) {
             float v = apply_rope ? rope_one(in, k_base)
                                  : __half2float(in[k_base + tid]);
@@ -290,7 +350,7 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
             // over the 16-element block.
             float peak = block16_peak_abs(v);
             float scale_f32;
-            if (scale_policy == RVLLM_NVFP4_POLICY_MSE && peak > 0.0f) {
+            if (policy == RVLLM_NVFP4_POLICY_MSE && peak > 0.0f) {
                 float second = block16_second_largest_abs(v, peak);
                 // 4 candidates (E4M3-rounded before scoring, to match
                 // what the production path would actually store).
@@ -342,9 +402,11 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
         // K rotated when hadamard_on (Q is rotated above by the same R,
         // so Q*K^T stays invariant). V never rotated.
         quant_and_write(k_in, key_cache_packed,   key_cache_scale,
-                        /*apply_rope=*/true,  /*apply_rotation=*/hadamard_on);
+                        /*apply_rope=*/true,  /*apply_rotation=*/hadamard_on,
+                        scale_policy);
         quant_and_write(v_in, value_cache_packed, value_cache_scale,
-                        /*apply_rope=*/false, /*apply_rotation=*/false);
+                        /*apply_rope=*/false, /*apply_rotation=*/false,
+                        v_scale_policy);
         // === END HADAMARD ROTATION ===
     }
 }

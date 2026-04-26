@@ -535,6 +535,12 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         v_cache_packed: u64,
         k_cache_scale: u64,
         v_cache_scale: u64,
+        // === DYNAMIC NVFP4 Q SCALE ===
+        // Optional `[num_seqs, num_heads]` f32 per-(seq, head) Q
+        // descale. When non-zero, kernel reads from this; when 0,
+        // falls back to the scalar `q_descale_ptr`.
+        q_scale_cache: u64,
+        // === END DYNAMIC NVFP4 Q SCALE ===
         block_tables: u64,
         context_lens: u64,
         q_descale_ptr: u64,
@@ -649,17 +655,23 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let mut arg_vp = v_cache_packed;
             let mut arg_ks = k_cache_scale;
             let mut arg_vs = v_cache_scale;
+            // === DYNAMIC NVFP4 Q SCALE ===
+            let mut arg_qsc = q_scale_cache;
+            // === END DYNAMIC NVFP4 Q SCALE ===
             let mut arg_bt = block_tables;
             let mut arg_cl = context_lens;
             let mut arg_qd = q_descale_ptr;
 
-            let args: [*mut core::ffi::c_void; 16] = [
+            let args: [*mut core::ffi::c_void; 17] = [
                 &mut arg_out as *mut _ as *mut _,
                 &mut arg_q   as *mut _ as *mut _,
                 &mut arg_kp  as *mut _ as *mut _,
                 &mut arg_vp  as *mut _ as *mut _,
                 &mut arg_ks  as *mut _ as *mut _,
                 &mut arg_vs  as *mut _ as *mut _,
+                // === DYNAMIC NVFP4 Q SCALE ===
+                &mut arg_qsc as *mut _ as *mut _,
+                // === END DYNAMIC NVFP4 Q SCALE ===
                 &mut arg_bt  as *mut _ as *mut _,
                 &mut arg_cl  as *mut _ as *mut _,
                 &mut arg_qd  as *mut _ as *mut _,
@@ -708,7 +720,8 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = (o_f16, q_fp8, k_cache_packed, v_cache_packed,
-                     k_cache_scale, v_cache_scale, block_tables,
+                     k_cache_scale, v_cache_scale, q_scale_cache,
+                     block_tables,
                      context_lens, q_descale_ptr, stream);
         }
         Ok(())
@@ -743,6 +756,9 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         v_cache_packed: u64,
         k_cache_scale: u64,
         v_cache_scale: u64,
+        // === DYNAMIC NVFP4 Q SCALE ===
+        q_scale_cache: u64,
+        // === END DYNAMIC NVFP4 Q SCALE ===
         block_tables: u64,
         context_lens: u64,
         q_descale_ptr: u64,
@@ -867,11 +883,14 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let mut a_vp    = v_cache_packed;
             let mut a_ks    = k_cache_scale;
             let mut a_vs    = v_cache_scale;
+            // === DYNAMIC NVFP4 Q SCALE ===
+            let mut a_qsc   = q_scale_cache;
+            // === END DYNAMIC NVFP4 Q SCALE ===
             let mut a_bt    = block_tables;
             let mut a_cl    = context_lens;
             let mut a_qd    = q_descale_ptr;
 
-            let split_args: [*mut core::ffi::c_void; 20] = [
+            let split_args: [*mut core::ffi::c_void; 21] = [
                 &mut a_tmp  as *mut _ as *mut _,
                 &mut a_maxl as *mut _ as *mut _,
                 &mut a_esum as *mut _ as *mut _,
@@ -880,6 +899,9 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 &mut a_vp   as *mut _ as *mut _,
                 &mut a_ks   as *mut _ as *mut _,
                 &mut a_vs   as *mut _ as *mut _,
+                // === DYNAMIC NVFP4 Q SCALE ===
+                &mut a_qsc  as *mut _ as *mut _,
+                // === END DYNAMIC NVFP4 Q SCALE ===
                 &mut a_bt   as *mut _ as *mut _,
                 &mut a_cl   as *mut _ as *mut _,
                 &mut a_qd   as *mut _ as *mut _,
@@ -970,7 +992,8 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = (o_f16, q_fp8, k_cache_packed, v_cache_packed,
-                     k_cache_scale, v_cache_scale, block_tables,
+                     k_cache_scale, v_cache_scale, q_scale_cache,
+                     block_tables,
                      context_lens, q_descale_ptr, workspace_ptr,
                      partition_size, max_num_partitions, stream);
         }

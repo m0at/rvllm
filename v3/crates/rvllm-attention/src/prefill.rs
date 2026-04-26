@@ -498,6 +498,9 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
         v_cache_packed: u64,
         k_cache_scale: u64,
         v_cache_scale: u64,
+        // === DYNAMIC NVFP4 Q SCALE ===
+        q_scale_cache: u64,
+        // === END DYNAMIC NVFP4 Q SCALE ===
         block_tables: u64,
         context_lens: u64,
         cu_seqlens_q: u64,
@@ -575,19 +578,25 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
             let mut arg_vp = v_cache_packed;
             let mut arg_ks = k_cache_scale;
             let mut arg_vs = v_cache_scale;
+            // === DYNAMIC NVFP4 Q SCALE ===
+            let mut arg_qsc = q_scale_cache;
+            // === END DYNAMIC NVFP4 Q SCALE ===
             let mut arg_bt = block_tables;
             let mut arg_cl = context_lens;
             let mut arg_cu = cu_seqlens_q;
             let mut arg_qd = q_descale_ptr;
             let _ = max_seqlen_q; // qi-loop drives over cu_seqlens_q
 
-            let args: [*mut core::ffi::c_void; 17] = [
+            let args: [*mut core::ffi::c_void; 18] = [
                 &mut arg_out as *mut _ as *mut _,
                 &mut arg_q   as *mut _ as *mut _,
                 &mut arg_kp  as *mut _ as *mut _,
                 &mut arg_vp  as *mut _ as *mut _,
                 &mut arg_ks  as *mut _ as *mut _,
                 &mut arg_vs  as *mut _ as *mut _,
+                // === DYNAMIC NVFP4 Q SCALE ===
+                &mut arg_qsc as *mut _ as *mut _,
+                // === END DYNAMIC NVFP4 Q SCALE ===
                 &mut arg_bt  as *mut _ as *mut _,
                 &mut arg_cl  as *mut _ as *mut _,
                 &mut arg_cu  as *mut _ as *mut _,
@@ -632,7 +641,8 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = (o_f16, q_fp8, k_cache_packed, v_cache_packed,
-                     k_cache_scale, v_cache_scale, block_tables,
+                     k_cache_scale, v_cache_scale, q_scale_cache,
+                     block_tables,
                      context_lens, cu_seqlens_q, q_descale_ptr,
                      max_seqlen_q, stream);
         }

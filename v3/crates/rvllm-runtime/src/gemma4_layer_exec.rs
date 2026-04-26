@@ -900,6 +900,18 @@ pub unsafe fn gemma4_forward_phase(
                         && decode.has_split_kernels()
                         && current_num_parts > 1
                         && ws_need <= 16 * 1024 * 1024; // fa3_ws is 16MiB
+                    // === DYNAMIC NVFP4 Q SCALE ===
+                    // When `RVLLM_PER_TOKEN_Q_SCALE=1`, pass the per-
+                    // (token, head) Q descale table populated by
+                    // `rope_nvfp4kv`. Required for `RVLLM_NVFP4_HADAMARD=1`
+                    // where rotated Q saturates the static scalar.
+                    let nvfp4_per_token_q = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
+                        .map(|s| matches!(s.as_str(),
+                            "1" | "true" | "TRUE" | "yes" | "on"))
+                        .unwrap_or(false);
+                    let nvfp4_q_scale_cache: u64 =
+                        if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
+                    // === END DYNAMIC NVFP4 Q SCALE ===
                     if use_split {
                         decode.launch_split(
                             decode_params,
@@ -909,6 +921,9 @@ pub unsafe fn gemma4_forward_phase(
                             scratch.v_cache,
                             scratch.k_cache_scale,
                             scratch.v_cache_scale,
+                            // === DYNAMIC NVFP4 Q SCALE ===
+                            nvfp4_q_scale_cache,
+                            // === END DYNAMIC NVFP4 Q SCALE ===
                             meta.block_tables,
                             meta.context_lens,
                             scratch.q_scale_ptr,
@@ -926,6 +941,9 @@ pub unsafe fn gemma4_forward_phase(
                             scratch.v_cache,
                             scratch.k_cache_scale,
                             scratch.v_cache_scale,
+                            // === DYNAMIC NVFP4 Q SCALE ===
+                            nvfp4_q_scale_cache,
+                            // === END DYNAMIC NVFP4 Q SCALE ===
                             meta.block_tables,
                             meta.context_lens,
                             scratch.q_scale_ptr,
@@ -999,12 +1017,21 @@ pub unsafe fn gemma4_forward_phase(
                         block_q,
                         use_mma: true,
                     };
-                    // rope_nvfp4kv encodes Q with the per-tensor
-                    // scalar `scratch.q_scale_ptr`, NOT the per-(token,
-                    // head) cache the FP8 path uses. Pass 0 for
-                    // q_scale_cache so the unified kernel falls back
-                    // to `*q_descale` per row — consistent with how
-                    // rope_nvfp4kv wrote the Q bytes.
+                    // === DYNAMIC NVFP4 Q SCALE ===
+                    // When `RVLLM_PER_TOKEN_Q_SCALE=1`, rope_nvfp4kv
+                    // writes a fresh per-(token, head) FP8 scale into
+                    // scratch.q_scale_cache (mirroring the FP8 sibling).
+                    // Pass that cache through so the attention kernel
+                    // dequants Q with the same scale rope used at
+                    // quantize time. Required for RVLLM_NVFP4_HADAMARD
+                    // where rotated Q can saturate the static scalar.
+                    let nvfp4_per_token_q = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
+                        .map(|s| matches!(s.as_str(),
+                            "1" | "true" | "TRUE" | "yes" | "on"))
+                        .unwrap_or(false);
+                    let nvfp4_q_scale_cache: u64 =
+                        if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
+                    // === END DYNAMIC NVFP4 Q SCALE ===
                     prefill.launch_nvfp4kv_unified_sm121(
                         prefill_params,
                         unified,
@@ -1014,7 +1041,7 @@ pub unsafe fn gemma4_forward_phase(
                         scratch.v_cache,
                         scratch.k_cache_scale,
                         scratch.v_cache_scale,
-                        0, // q_scale_cache = nullptr → fall back to *q_descale
+                        nvfp4_q_scale_cache,
                         meta.block_tables,
                         cu_seqlens_q,
                         meta.context_lens,
@@ -1022,6 +1049,14 @@ pub unsafe fn gemma4_forward_phase(
                         stream,
                     )?;
                 } else {
+                    // === DYNAMIC NVFP4 Q SCALE ===
+                    let nvfp4_per_token_q = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
+                        .map(|s| matches!(s.as_str(),
+                            "1" | "true" | "TRUE" | "yes" | "on"))
+                        .unwrap_or(false);
+                    let nvfp4_q_scale_cache: u64 =
+                        if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
+                    // === END DYNAMIC NVFP4 Q SCALE ===
                     prefill.launch(
                         prefill_params,
                         scratch.attn_out,
@@ -1030,6 +1065,9 @@ pub unsafe fn gemma4_forward_phase(
                         scratch.v_cache,
                         scratch.k_cache_scale,
                         scratch.v_cache_scale,
+                        // === DYNAMIC NVFP4 Q SCALE ===
+                        nvfp4_q_scale_cache,
+                        // === END DYNAMIC NVFP4 Q SCALE ===
                         meta.block_tables,
                         meta.context_lens,
                         cu_seqlens_q,
@@ -2070,6 +2108,20 @@ unsafe fn rope_nvfp4kv(
     let mut positions = meta.positions;
     let mut slot_mapping = meta.slot_mapping;
     let mut q_scale_ptr = scratch.q_scale_ptr;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    // When `RVLLM_PER_TOKEN_Q_SCALE=1`, pass `scratch.q_scale_cache`
+    // so the rope kernel computes a fresh per-(token, head) FP8 Q
+    // scale. Required for `RVLLM_NVFP4_HADAMARD=1` because rotated Q
+    // values can saturate the static scalar (default 0.1). When 0,
+    // the kernel reads the static `q_scale_ptr` (pre-Hadamard
+    // behaviour, byte-identical to the prior path).
+    let per_token_q_scale = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
+        .map(|s| matches!(s.as_str(),
+            "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false);
+    let mut q_scale_cache_arg: u64 =
+        if per_token_q_scale { scratch.q_scale_cache } else { 0 };
+    // === END DYNAMIC NVFP4 Q SCALE ===
     // === HADAMARD ROTATION ===
     // Per-layer ±1 sign vectors for signed Walsh-Hadamard rotation
     // of Q and K post-RoPE (NVFP4 path only). Both are 0 when
@@ -2089,14 +2141,25 @@ unsafe fn rope_nvfp4kv(
     // insensitive — produces garbage on Gemma 4 at 15k). `mse` (1) =
     // blockwise MSE search over 4 outlier-aware candidates (see
     // fused_rope_partial_nvfp4kv.cu for the candidate set).
-    let mut scale_policy: i32 = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
-        .ok()
-        .and_then(|s| match s.as_str() {
+    fn parse_policy(v: &str) -> Option<i32> {
+        match v {
             "amax6" | "0" => Some(0),
             "mse" | "1" => Some(1),
             _ => None,
-        })
+        }
+    }
+    let global_policy: i32 = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
+        .ok()
+        .and_then(|s| parse_policy(&s))
         .unwrap_or(0);
+    let mut scale_policy: i32 = std::env::var("RVLLM_NVFP4_K_SCALE_POLICY")
+        .ok()
+        .and_then(|s| parse_policy(&s))
+        .unwrap_or(global_policy);
+    let mut v_scale_policy: i32 = std::env::var("RVLLM_NVFP4_V_SCALE_POLICY")
+        .ok()
+        .and_then(|s| parse_policy(&s))
+        .unwrap_or(global_policy);
     let args = [
         (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
         (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
@@ -2111,12 +2174,16 @@ unsafe fn rope_nvfp4kv(
         (&mut positions) as *mut u64 as *mut core::ffi::c_void,
         (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
         (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+        // === DYNAMIC NVFP4 Q SCALE ===
+        (&mut q_scale_cache_arg) as *mut u64 as *mut core::ffi::c_void,
+        // === END DYNAMIC NVFP4 Q SCALE ===
         (&mut nt) as *mut i32 as *mut core::ffi::c_void,
         (&mut nh) as *mut i32 as *mut core::ffi::c_void,
         (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
         (&mut hd) as *mut i32 as *mut core::ffi::c_void,
         (&mut rd) as *mut i32 as *mut core::ffi::c_void,
         (&mut scale_policy) as *mut i32 as *mut core::ffi::c_void,
+        (&mut v_scale_policy) as *mut i32 as *mut core::ffi::c_void,
         // === HADAMARD ROTATION ===
         (&mut hadamard_signs_q) as *mut u64 as *mut core::ffi::c_void,
         (&mut hadamard_signs_k) as *mut u64 as *mut core::ffi::c_void,

@@ -142,6 +142,9 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_kernel(
     const uint8_t*       __restrict__ value_cache_packed,
     const __nv_fp8_e4m3* __restrict__ key_cache_scale,
     const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float*         __restrict__ q_scale_cache,
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int*           __restrict__ block_tables,
     const int*           __restrict__ context_lens,
     const float*         __restrict__ q_descale,
@@ -191,7 +194,11 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_kernel(
         ? head_idx
         : (head_idx / (num_heads / num_kv_heads));
 
-    const float q_scale = *q_descale;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float q_scale = (q_scale_cache != nullptr)
+        ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
+        : *q_descale;
+    // === END DYNAMIC NVFP4 Q SCALE ===
 
     // Sliding-window bounds (same formula as the non-split kernel).
     const int decode_q_abs_pos = context_len - 1;
@@ -394,6 +401,9 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_bc16_kernel(
     const uint8_t*       __restrict__ value_cache_packed,
     const __nv_fp8_e4m3* __restrict__ key_cache_scale,
     const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float*         __restrict__ q_scale_cache,
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int*           __restrict__ block_tables,
     const int*           __restrict__ context_lens,
     const float*         __restrict__ q_descale,
@@ -430,7 +440,11 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_bc16_kernel(
         ? head_idx
         : (head_idx / (num_heads / num_kv_heads));
 
-    const float q_scale = *q_descale;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float q_scale = (q_scale_cache != nullptr)
+        ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
+        : *q_descale;
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int decode_q_abs_pos = context_len - 1;
     const int window_start = (window_size_left < 0)
         ? 0 : max(0, decode_q_abs_pos - window_size_left);

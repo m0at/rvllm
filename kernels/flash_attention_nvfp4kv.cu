@@ -125,9 +125,12 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
     const uint8_t*       __restrict__ value_cache_packed,     // [B*bs*KH*D/2] u8
     const __nv_fp8_e4m3* __restrict__ key_cache_scale,        // [B*bs*KH*D/16] e4m3
     const __nv_fp8_e4m3* __restrict__ value_cache_scale,      // [B*bs*KH*D/16] e4m3
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float*         __restrict__ q_scale_cache,          // [S, H] f32 (optional)
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int*           __restrict__ block_tables,           // [S, max_blocks]
     const int*           __restrict__ context_lens,           // [S]
-    const float*         __restrict__ q_descale,              // single f32
+    const float*         __restrict__ q_descale,              // single f32 fallback
     float scale,
     int num_heads,
     int num_kv_heads,
@@ -147,7 +150,11 @@ __global__ void flash_attention_2_decode_nvfp4kv_kernel(
         ? head_idx
         : (head_idx / (num_heads / num_kv_heads));
 
-    const float q_scale = *q_descale;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float q_scale = (q_scale_cache != nullptr)
+        ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
+        : *q_descale;
+    // === END DYNAMIC NVFP4 Q SCALE ===
 
     // Sliding-window bounds. On Gemma 4 the 50 sliding layers set
     // `window_size_left = sliding_window - 1 = 1023`, so only the
@@ -355,6 +362,9 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
     const uint8_t*       __restrict__ value_cache_packed,
     const __nv_fp8_e4m3* __restrict__ key_cache_scale,
     const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float*         __restrict__ q_scale_cache,
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int*           __restrict__ block_tables,
     const int*           __restrict__ context_lens,
     const float*         __restrict__ q_descale,
@@ -382,7 +392,11 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_kernel(
     const int kv_head_idx = (num_kv_heads == num_heads)
         ? head_idx
         : (head_idx / (num_heads / num_kv_heads));
-    const float q_scale = *q_descale;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float q_scale = (q_scale_cache != nullptr)
+        ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
+        : *q_descale;
+    // === END DYNAMIC NVFP4 Q SCALE ===
 
     extern __shared__ unsigned char smem_u8[];
     __half* s_key = reinterpret_cast<__half*>(smem_u8);
@@ -576,6 +590,9 @@ __global__ void flash_attention_2_decode_nvfp4kv_gqa_kernel(
     const uint8_t*       __restrict__ value_cache_packed,
     const __nv_fp8_e4m3* __restrict__ key_cache_scale,
     const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float*         __restrict__ q_scale_cache,
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int*           __restrict__ block_tables,
     const int*           __restrict__ context_lens,
     const float*         __restrict__ q_descale,
@@ -598,7 +615,12 @@ __global__ void flash_attention_2_decode_nvfp4kv_gqa_kernel(
     // Runtime guard — the compile-time cap on register arrays.
     if (GQA <= 0 || GQA > MAX_GQA_DECODE) return;
 
-    const float q_scale = *q_descale;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    // GQA shares one KV but each query head needs its own descale.
+    // Read per-q below at q_reg load time; this fallback is used only
+    // when q_scale_cache is null.
+    const float q_scale_fallback = *q_descale;
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int decode_q_abs_pos = context_len - 1;
     const int window_start = (window_size_left < 0)
         ? 0
@@ -633,6 +655,11 @@ __global__ void flash_attention_2_decode_nvfp4kv_gqa_kernel(
     }
     for (int q = 0; q < GQA; ++q) {
         const int head_idx = kv_head * GQA + q;
+        // === DYNAMIC NVFP4 Q SCALE ===
+        const float q_scale = (q_scale_cache != nullptr)
+            ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
+            : q_scale_fallback;
+        // === END DYNAMIC NVFP4 Q SCALE ===
         #pragma unroll
         for (int r = 0; r < 8; ++r) {
             int d = tid + r * FA2_THREADS;
@@ -780,6 +807,9 @@ __global__ void flash_attention_2_decode_nvfp4kv_gqa_bc16_kernel(
     const uint8_t*       __restrict__ value_cache_packed,
     const __nv_fp8_e4m3* __restrict__ key_cache_scale,
     const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float*         __restrict__ q_scale_cache,
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int*           __restrict__ block_tables,
     const int*           __restrict__ context_lens,
     const float*         __restrict__ q_descale,
@@ -800,7 +830,9 @@ __global__ void flash_attention_2_decode_nvfp4kv_gqa_bc16_kernel(
     if (context_len == 0) return;
     const int GQA = num_heads / num_kv_heads;
     if (GQA <= 0 || GQA > MAX_GQA_DECODE) return;
-    const float q_scale = *q_descale;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float q_scale_fallback = *q_descale;
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int decode_q_abs_pos = context_len - 1;
     const int window_start = (window_size_left < 0)
         ? 0 : max(0, decode_q_abs_pos - window_size_left);
@@ -829,6 +861,11 @@ __global__ void flash_attention_2_decode_nvfp4kv_gqa_bc16_kernel(
     }
     for (int q = 0; q < GQA; ++q) {
         const int head_idx = kv_head * GQA + q;
+        // === DYNAMIC NVFP4 Q SCALE ===
+        const float q_scale = (q_scale_cache != nullptr)
+            ? __ldg(&q_scale_cache[seq_idx * num_heads + head_idx])
+            : q_scale_fallback;
+        // === END DYNAMIC NVFP4 Q SCALE ===
         #pragma unroll
         for (int r = 0; r < 8; ++r) {
             int d = tid + r * FA2_THREADS;
@@ -982,6 +1019,9 @@ __global__ void flash_attention_2_prefill_nvfp4kv_kernel(
     const uint8_t*       __restrict__ value_cache_packed,
     const __nv_fp8_e4m3* __restrict__ key_cache_scale,
     const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float*         __restrict__ q_scale_cache,
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int*           __restrict__ block_tables,
     const int*           __restrict__ context_lens,
     const int*           __restrict__ cu_seqlens_q,
@@ -1010,7 +1050,9 @@ __global__ void flash_attention_2_prefill_nvfp4kv_kernel(
         ? head_idx
         : (head_idx / (num_heads / num_kv_heads));
 
-    const float q_scale = *q_descale;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float q_scale_fallback = *q_descale;
+    // === END DYNAMIC NVFP4 Q SCALE ===
 
     extern __shared__ unsigned char smem_u8[];
     __half* s_key = reinterpret_cast<__half*>(smem_u8);
@@ -1026,6 +1068,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_kernel(
     for (int qi = 0; qi < q_len; ++qi) {
         const int q_pos_global = q_start + qi;
 
+        // === DYNAMIC NVFP4 Q SCALE ===
+        const float q_scale = (q_scale_cache != nullptr)
+            ? __ldg(&q_scale_cache[q_pos_global * num_heads + head_idx])
+            : q_scale_fallback;
+        // === END DYNAMIC NVFP4 Q SCALE ===
         float q_reg[8];
         #pragma unroll
         for (int r = 0; r < 8; ++r) {
@@ -1162,6 +1209,9 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_kernel(
     const uint8_t*       __restrict__ value_cache_packed,
     const __nv_fp8_e4m3* __restrict__ key_cache_scale,
     const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float*         __restrict__ q_scale_cache,
+    // === END DYNAMIC NVFP4 Q SCALE ===
     const int*           __restrict__ block_tables,
     const int*           __restrict__ context_lens,
     const int*           __restrict__ cu_seqlens_q,
@@ -1190,7 +1240,9 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_kernel(
     const int kv_head_idx = (num_kv_heads == num_heads)
         ? head_idx
         : (head_idx / (num_heads / num_kv_heads));
-    const float q_scale = *q_descale;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    const float q_scale_fallback = *q_descale;
+    // === END DYNAMIC NVFP4 Q SCALE ===
 
     extern __shared__ unsigned char smem_u8[];
     __half* s_key = reinterpret_cast<__half*>(smem_u8);
@@ -1205,6 +1257,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_kernel(
 
     for (int qi = 0; qi < q_len; ++qi) {
         const int q_pos_global = q_start + qi;
+        // === DYNAMIC NVFP4 Q SCALE ===
+        const float q_scale = (q_scale_cache != nullptr)
+            ? __ldg(&q_scale_cache[q_pos_global * num_heads + head_idx])
+            : q_scale_fallback;
+        // === END DYNAMIC NVFP4 Q SCALE ===
         float q_reg[8];
         #pragma unroll
         for (int r = 0; r < 8; ++r) {
