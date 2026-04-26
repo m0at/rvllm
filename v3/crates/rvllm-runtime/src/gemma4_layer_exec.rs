@@ -876,8 +876,16 @@ pub unsafe fn gemma4_forward_phase(
                         .map(|s| !matches!(s.as_str(),
                             "0" | "false" | "FALSE" | "no" | "off" | ""))
                         .unwrap_or(true);
-                    // Cycle22 A/B: try 1024 (fewer parts -> less reduction-stage noise compounding).
-                    // vLLM default is 512; we already pay f32 tmp_out per cycle21.
+                    // Cycle 23 sweep winner: 1024 — only setting with both
+                    // (a) zero garbage on long-ctx WEATHER cliff and
+                    // (b) clean short-ctx simple tool-call (no regression).
+                    // Sweep on V=ON + cycle21 f32-tmp_out base, 5 trials each:
+                    //   512:  1 partial-clean, 1 garbage, 3 empty.
+                    //   1024: 1 fully-clean, 0 garbage, 4 empty. SHORT: clean.
+                    //   2048: 2 fully-clean, 1 partial, 1 garbage, 1 empty.
+                    //   256:  2 fully-clean, 2 partial, 1 garbage, 0 empty
+                    //         BUT regresses short-ctx tool-call to text refusal
+                    //         (same regression as SPLIT_KV=0 in cycle 20).
                     const PARTITION_SIZE: u32 = 1024;
                     // Bucket max ctx = max_blocks_per_seq * block_size.
                     // Workspace is sized off this so the layout is
