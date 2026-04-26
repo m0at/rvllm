@@ -385,23 +385,9 @@ async fn chat_collect(
     // `<|channel>thought\n...<channel|>` markers verbatim.
     // `shape_assistant_message` produces the user-visible content view.
     let mut text = tokenizer.decode_raw(&token_ids)?;
-    // Cycle 34 P0 fix (codex bug #1): user-supplied stop strings were
-    // validated upstream but never enforced — generation continued past
-    // them. Apply post-decode truncation here. We truncate at the
-    // FIRST occurrence of ANY stop string and bump finish_reason to
-    // Stop. Operates on raw decoded text (with special tokens) so the
-    // tool_parser still sees the markup that survived the cut.
-    if !stop_text.is_empty() {
-        let mut earliest: Option<usize> = None;
-        for s in stop_text {
-            if let Some(pos) = text.find(s.as_str()) {
-                earliest = Some(earliest.map_or(pos, |e| e.min(pos)));
-            }
-        }
-        if let Some(pos) = earliest {
-            text.truncate(pos);
-            finish = Some(FinishReason::Stop);
-        }
+    // Cycle 34 P0 fix (codex bug #1): user-supplied stop strings.
+    if apply_stop_truncation(&mut text, stop_text) {
+        finish = Some(FinishReason::Stop);
     }
 
     // Response dump (no-op unless RVLLM_DUMP_REQUEST_DIR set). Captures
@@ -441,6 +427,97 @@ async fn chat_collect(
 /// `tool_parser`). If the decoded text contains any `<|tool_call>...`
 /// markup, hoist it into OpenAI's `tool_calls` shape and flip
 /// `finish_reason` to `ToolCalls`. Otherwise return the text verbatim.
+/// Truncate `text` at the FIRST occurrence of ANY stop string.
+/// Returns true when truncation happened (caller should set
+/// `finish_reason = Stop`). Empty stop list is a no-op.
+///
+/// Pure function: no I/O, no allocations beyond the find. Safe to
+/// unit test without a tokenizer or worker.
+pub(crate) fn apply_stop_truncation(text: &mut String, stops: &[String]) -> bool {
+    if stops.is_empty() {
+        return false;
+    }
+    let mut earliest: Option<usize> = None;
+    for s in stops {
+        if s.is_empty() {
+            continue;
+        }
+        if let Some(pos) = text.find(s.as_str()) {
+            earliest = Some(earliest.map_or(pos, |e| e.min(pos)));
+        }
+    }
+    match earliest {
+        Some(pos) => {
+            text.truncate(pos);
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod stop_truncation_tests {
+    use super::apply_stop_truncation;
+
+    #[test]
+    fn empty_stops_is_noop() {
+        let mut t = "hello world".to_string();
+        assert!(!apply_stop_truncation(&mut t, &[]));
+        assert_eq!(t, "hello world");
+    }
+
+    #[test]
+    fn single_stop_truncates() {
+        let mut t = "hello STOP world".to_string();
+        let stops = vec!["STOP".to_string()];
+        assert!(apply_stop_truncation(&mut t, &stops));
+        assert_eq!(t, "hello ");
+    }
+
+    #[test]
+    fn earliest_of_multiple_stops_wins() {
+        let mut t = "a B c D e".to_string();
+        let stops = vec!["D".to_string(), "B".to_string()];
+        assert!(apply_stop_truncation(&mut t, &stops));
+        assert_eq!(t, "a "); // B comes before D
+    }
+
+    #[test]
+    fn no_match_leaves_text_intact() {
+        let mut t = "no stop here".to_string();
+        let stops = vec!["XYZ".to_string()];
+        assert!(!apply_stop_truncation(&mut t, &stops));
+        assert_eq!(t, "no stop here");
+    }
+
+    #[test]
+    fn empty_stop_string_is_skipped() {
+        // An empty needle would match at index 0 and truncate everything.
+        // Sanity: validate_stops should reject these upstream, but the
+        // truncator is defensive — still skip empty needles.
+        let mut t = "keep this".to_string();
+        let stops = vec!["".to_string()];
+        assert!(!apply_stop_truncation(&mut t, &stops));
+        assert_eq!(t, "keep this");
+    }
+
+    #[test]
+    fn utf8_stop_string_works() {
+        let mut t = "Es regnet in München.".to_string();
+        let stops = vec!["München".to_string()];
+        assert!(apply_stop_truncation(&mut t, &stops));
+        assert_eq!(t, "Es regnet in ");
+    }
+
+    #[test]
+    fn stop_at_index_zero_yields_empty() {
+        let mut t = "STOP_at_start".to_string();
+        let stops = vec!["STOP".to_string()];
+        assert!(apply_stop_truncation(&mut t, &stops));
+        assert_eq!(t, "");
+    }
+}
+
 fn shape_assistant_message(
     text: String,
     model_finish: Option<FinishReason>,
@@ -1114,17 +1191,8 @@ async fn completion_collect(
     }
     let mut text = tokenizer.decode(&token_ids)?;
     // Cycle 34 P0 (codex bug #1): post-decode stop-string truncation.
-    if !stop_text.is_empty() {
-        let mut earliest: Option<usize> = None;
-        for s in stop_text {
-            if let Some(pos) = text.find(s.as_str()) {
-                earliest = Some(earliest.map_or(pos, |e| e.min(pos)));
-            }
-        }
-        if let Some(pos) = earliest {
-            text.truncate(pos);
-            finish = Some(FinishReason::Stop);
-        }
+    if apply_stop_truncation(&mut text, stop_text) {
+        finish = Some(FinishReason::Stop);
     }
     Ok(CompletionResponse {
         id: new_completion_id(),
@@ -1233,8 +1301,18 @@ fn completion_stream_sse(
                         ctx.state = S::Finish(finish);
                         continue;
                     }
-                    Some(GenerateEvent::Error(_)) | None => {
-                        ctx.state = S::Finish(FinishReason::Stop);
+                    // Cycle 35 P1 fix (codex bug #2): completion SSE was
+                    // mapping worker errors AND channel close to
+                    // FinishReason::Stop — mirror the cycle 34 chat-SSE
+                    // fix so CUDA faults are not silently clean here either.
+                    Some(GenerateEvent::Error(msg)) => {
+                        tracing::error!(error = %msg, "completion SSE worker error event — terminating stream");
+                        ctx.state = S::Finish(FinishReason::Cancelled);
+                        continue;
+                    }
+                    None => {
+                        tracing::error!("completion SSE worker channel closed without Done — terminating stream");
+                        ctx.state = S::Finish(FinishReason::Cancelled);
                         continue;
                     }
                     }
@@ -1296,21 +1374,28 @@ fn reject_v1_unsupported_chat(req: &ChatCompletionRequest) -> ApiResult<()> {
     // `tools` is threaded into the Gemma 4 chat template so the model
     // emits native `<|tool_call>call:NAME{...}<tool_call|>` blocks,
     // which `tool_parser` extracts back into OpenAI `tool_calls`.
-    // `tool_choice` beyond "auto" / None isn't honoured — warn once if
-    // a client forces a specific tool, but don't fail the request.
+    //
+    // Cycle 35 P1 fix (codex bug #4): the runtime can express
+    // "auto" / "none" / "required" via the chat template, but it
+    // CANNOT enforce a specific {"type":"function","function":{"name":...}}
+    // tool_choice — there's no logit-biasing/grammar-constrained
+    // generation in this build. Previously we silently downgraded to
+    // "auto" and just logged a one-shot warning. Now we reject the
+    // unsupported form so callers don't get incorrect tool dispatch.
+    // String forms still pass through.
     if let Some(choice) = &req.tool_choice {
-        let is_auto = choice
+        let is_simple_string = choice
             .as_str()
-            .map(|s| s == "auto" || s == "none" || s == "required")
+            .map(|s| matches!(s, "auto" | "none" | "required"))
             .unwrap_or(false);
-        if !is_auto {
-            static WARN_TC: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-            WARN_TC.get_or_init(|| {
-                tracing::warn!(
-                    "tool_choice with specific function not enforced by \
-                     v1 runtime — treated as `auto`. Fires once per process."
-                );
-            });
+        if !is_simple_string {
+            return Err(ApiError::invalid_param(
+                "tool_choice with a specific function name is not yet \
+                 supported (no constrained-decoding path); use \"auto\" \
+                 or \"required\" to let the model pick from `tools`",
+                "tool_choice",
+                "tool_choice_specific_unsupported",
+            ));
         }
     }
     Ok(())
