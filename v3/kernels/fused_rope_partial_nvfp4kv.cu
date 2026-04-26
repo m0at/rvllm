@@ -157,15 +157,16 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
     // Per-layer ±1 sign vectors of length `head_dim` (i8 storage).
     // When BOTH pointers are non-null, the kernel applies signed
     // Walsh-Hadamard rotation R = H * diag(D) to Q post-RoPE pre-FP8-
-    // quantize, and to K post-RoPE pre-NVFP4-quantize. V is NOT
-    // rotated (rotating V requires also rotating O-proj weights).
-    // When EITHER pointer is null, rotation is bypassed and the kernel
-    // runs byte-identical to the pre-Hadamard path. The two pointers
-    // refer to two separate sign vectors so Q and K can be rotated
-    // independently if a future revision wants asymmetric structure;
-    // current production use sets both to the same per-layer vector.
+    // quantize, and to K post-RoPE pre-NVFP4-quantize. When EITHER
+    // hadamard_signs_q / hadamard_signs_k pointer is null, Q+K
+    // rotation is bypassed.
+    // V rotation is gated independently by `rotate_v` (when 1, V is
+    // also rotated using `hadamard_signs_k`, the SAME R as K). The
+    // companion kernel hadamard_unrotate_f16 then multiplies attn_out
+    // by R^T before O-proj to recover the original P·V.
     const signed char* __restrict__ hadamard_signs_q,
-    const signed char* __restrict__ hadamard_signs_k
+    const signed char* __restrict__ hadamard_signs_k,
+    int rotate_v
     // === END HADAMARD ROTATION ===
 ) {
     const int token_idx = blockIdx.x;
@@ -400,14 +401,17 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
 
         // === HADAMARD ROTATION ===
         // K rotated when hadamard_on (Q is rotated above by the same R,
-        // so Q*K^T stays invariant). V never rotated (would require
-        // matching R^T un-rotation on attn_out before O-proj — task
-        // aa01001vrot tracks the lift).
+        // so Q*K^T stays invariant). V is rotated when rotate_v != 0
+        // (using same R as K). The post-attention `hadamard_unrotate_f16`
+        // kernel must multiply attn_out by R^T before O-proj to recover
+        // the original P·V; without that companion, O-proj sees rotated
+        // input and the model output is wrong.
+        const bool v_rotate_now = hadamard_on && (rotate_v != 0);
         quant_and_write(k_in, key_cache_packed,   key_cache_scale,
                         /*apply_rope=*/true,  /*apply_rotation=*/hadamard_on,
                         scale_policy);
         quant_and_write(v_in, value_cache_packed, value_cache_scale,
-                        /*apply_rope=*/false, /*apply_rotation=*/false,
+                        /*apply_rope=*/false, /*apply_rotation=*/v_rotate_now,
                         v_scale_policy);
         // === END HADAMARD ROTATION ===
     }

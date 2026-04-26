@@ -2122,6 +2122,14 @@ unsafe fn rope_nvfp4kv(
     // requires BOTH non-null, so passing 0 cleanly disables.
     let mut hadamard_signs_q = scratch.hadamard_signs_q;
     let mut hadamard_signs_k = scratch.hadamard_signs_k;
+    // V rotation gate (companion: post-attention hadamard_unrotate_f16
+    // multiplies attn_out by R^T before O-proj). Default OFF until the
+    // dispatch is wired AND quality-validated. RVLLM_NVFP4_HADAMARD_V=1
+    // turns it on. The rope kernel reads a separate i32 param so we
+    // can A/B without touching the Q+K rotation.
+    let mut rotate_v: i32 =
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
+            .unwrap_or(false) { 1 } else { 0 };
     // === END HADAMARD ROTATION ===
     let mut nt = dims.num_tokens as i32;
     let mut nh = dims.num_heads as i32;
@@ -2179,6 +2187,7 @@ unsafe fn rope_nvfp4kv(
         // === HADAMARD ROTATION ===
         (&mut hadamard_signs_q) as *mut u64 as *mut core::ffi::c_void,
         (&mut hadamard_signs_k) as *mut u64 as *mut core::ffi::c_void,
+        (&mut rotate_v) as *mut i32 as *mut core::ffi::c_void,
         // === END HADAMARD ROTATION ===
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
