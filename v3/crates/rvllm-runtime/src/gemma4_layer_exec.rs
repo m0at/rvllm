@@ -902,7 +902,9 @@ pub unsafe fn gemma4_forward_phase(
                     let slots = (decode_params.num_seqs as u64)
                         * (dims.num_heads as u64)
                         * (max_num_parts as u64);
-                    let ws_need = slots * (dims.head_dim as u64) * 2
+                    // tmp_out widened to f32 in cycle21 (codex precision fix):
+                    // 4 bytes/elem instead of 2. Metadata still f32 (max_logits + exp_sums = 2*4 bytes/slot).
+                    let ws_need = slots * (dims.head_dim as u64) * 4
                         + slots * 4 * 2;
                     let use_split = split_env_on
                         && decode.has_split_kernels()

@@ -89,7 +89,7 @@ __device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
 // device lambdas need `--extended-lambda`; we don't pass it, so this
 // is a named function instead.
 __device__ __forceinline__ void write_split_empty_partition(
-    __half* __restrict__ tmp_out,
+    float*  __restrict__ tmp_out,
     float*  __restrict__ max_logits,
     float*  __restrict__ exp_sums,
     int scratch_idx,
@@ -102,7 +102,7 @@ __device__ __forceinline__ void write_split_empty_partition(
         exp_sums  [scratch_idx] = 0.0f;
     }
     for (int d = tid; d < head_dim; d += FA2_THREADS) {
-        tmp_out[tmp_out_row + d] = __float2half(0.0f);
+        tmp_out[tmp_out_row + d] = 0.0f;
     }
 }
 
@@ -134,7 +134,7 @@ __device__ __forceinline__ void dequant_nvfp4_row_to_smem(
 // ---------------------------------------------------------------------
 extern "C"
 __global__ void flash_attention_2_decode_nvfp4kv_split_kernel(
-    __half*              __restrict__ tmp_out,          // [S, H, P, D] f16
+    float*               __restrict__ tmp_out,          // [S, H, P, D] f32 (was f16; codex cycle21 — fp32 partials avoid f16 round-trip precision loss)
     float*               __restrict__ max_logits,       // [S, H, P]    f32
     float*               __restrict__ exp_sums,         // [S, H, P]    f32
     const unsigned char* __restrict__ query,            // [S, H, D]    fp8
@@ -374,7 +374,7 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_kernel(
     for (int r = 0; r < 8; ++r) {
         int d = tid + r * FA2_THREADS;
         if (r < dims_per_thread && d < head_dim) {
-            tmp_out[tmp_out_row + d] = __float2half(acc[r] * inv_sum);
+            tmp_out[tmp_out_row + d] = acc[r] * inv_sum;
         }
     }
     if (tid == 0) {
@@ -589,7 +589,7 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_bc16_kernel(
     for (int r = 0; r < 8; ++r) {
         int d = tid + r * FA2_THREADS;
         if (r < dims_per_thread && d < head_dim) {
-            tmp_out[tmp_out_row + d] = __float2half(acc[r] * inv_sum);
+            tmp_out[tmp_out_row + d] = acc[r] * inv_sum;
         }
     }
     if (tid == 0) {
@@ -609,8 +609,10 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_bc16_kernel(
 //   Smem : 2 * max_num_partitions * 4   (max_logits + rescaled exp_sums)
 //        + (REDUCE_THREADS/32) * 4      (reduce scratch)
 //
-// Head-dtype agnostic — takes f16 tmp_out, writes f16 output. Phase-1
-// guarantees tmp_out is already divided by the partition's own
+// Phase-1 writes fp32 tmp_out (codex cycle21 fix: avoids f16 round-trip
+// precision loss when many partition partials are linearly combined).
+// Final output cast to f16 once at the end of reduce.
+// Phase-1 guarantees tmp_out is already divided by the partition's own
 // exp_sum, so we only reweight with the online-softmax combine:
 //   w[p]   = exp_sums[p] * exp(max_logits[p] - global_max)
 //   inv    = 1 / (sum_p(w[p]) + 1e-6)
@@ -623,7 +625,7 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_bc16_kernel(
 extern "C"
 __global__ void paged_attention_reduce_f16_kernel(
     __half*       __restrict__ output,         // [S, H, D]
-    const __half* __restrict__ tmp_out,        // [S, H, P, D]
+    const float*  __restrict__ tmp_out,        // [S, H, P, D] f32
     const float*  __restrict__ max_logits,     // [S, H, P]
     const float*  __restrict__ exp_sums,       // [S, H, P]
     const int*    __restrict__ context_lens,   // [S]
@@ -657,7 +659,7 @@ __global__ void paged_attention_reduce_f16_kernel(
     // num_partitions == 1: pure copy, no combine needed.
     if (num_partitions == 1) {
         for (int d = tid; d < head_dim; d += REDUCE_THREADS) {
-            output[out_base + d] = tmp_out[tmp_out_base + d];
+            output[out_base + d] = __float2half(tmp_out[tmp_out_base + d]);
         }
         return;
     }
@@ -752,7 +754,7 @@ __global__ void paged_attention_reduce_f16_kernel(
         float acc = 0.0f;
         for (int p = 0; p < num_partitions; ++p) {
             float w = shared_rescaled_sum[p] * inv_global;
-            float v = __half2float(tmp_out[tmp_out_base + p * head_dim + d]);
+            float v = tmp_out[tmp_out_base + p * head_dim + d];
             acc += v * w;
         }
         output[out_base + d] = __float2half(acc);

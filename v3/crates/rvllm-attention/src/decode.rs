@@ -739,7 +739,11 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
     /// Caller invariants:
     ///   * `workspace_ptr` must have at least
     ///     `num_seqs * num_heads * max_num_partitions *
-    ///     (head_dim * 2 + 8)` bytes (f16 tmp_out + 2×f32 metadata).
+    ///     (head_dim * 4 + 8)` bytes (f32 tmp_out + 2×f32 metadata).
+    ///     (was f16 tmp_out — codex cycle21 fix: NVFP4 split-decode
+    ///     was losing precision via f16 round-trip on many independently
+    ///     normalized partial outputs; bumped to f32 to match single-CTA's
+    ///     "one final f16 cast" behavior.)
     ///   * `max_num_partitions >= ceil(max_ctx_len / partition_size)`.
     ///   * `partition_size` must be a multiple of 16 (our FA2 block size).
     ///
@@ -852,13 +856,17 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             }
 
             // Workspace layout inside `workspace_ptr`:
-            //   [0,                       tmp_bytes)    — tmp_out f16 [S,H,P,D]
+            //   [0,                       tmp_bytes)    — tmp_out f32 [S,H,P,D]
             //   [tmp_bytes,               +meta_bytes)  — max_logits f32 [S,H,P]
             //   [tmp_bytes+meta_bytes,    +meta_bytes)  — exp_sums   f32 [S,H,P]
+            // tmp_out widened from f16 to f32 in cycle21 (codex diag): the
+            // f16 round-trip between phase-1 normalize and phase-2 reduce
+            // was the main precision regression vs single-CTA decode — see
+            // kernels/flash_attention_split_decode_nvfp4kv.cu header.
             let slots = (params.num_seqs as u64)
                 * (params.num_heads as u64)
                 * (max_num_partitions as u64);
-            let tmp_bytes  = slots * (params.head_dim as u64) * 2;
+            let tmp_bytes  = slots * (params.head_dim as u64) * 4;
             let meta_bytes = slots * 4;
             let d_tmp_out    = workspace_ptr;
             let d_max_logits = workspace_ptr + tmp_bytes;
