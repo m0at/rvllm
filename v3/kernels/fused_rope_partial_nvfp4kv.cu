@@ -400,7 +400,9 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
 
         // === HADAMARD ROTATION ===
         // K rotated when hadamard_on (Q is rotated above by the same R,
-        // so Q*K^T stays invariant). V never rotated.
+        // so Q*K^T stays invariant). V never rotated (would require
+        // matching R^T un-rotation on attn_out before O-proj — task
+        // aa01001vrot tracks the lift).
         quant_and_write(k_in, key_cache_packed,   key_cache_scale,
                         /*apply_rope=*/true,  /*apply_rotation=*/hadamard_on,
                         scale_policy);
