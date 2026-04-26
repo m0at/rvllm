@@ -200,11 +200,11 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             &req.prompt_ids,
             req.max_new_tokens as usize,
             &req.stop_token_ids,
-            // shadow_requested: per-request shadow header was removed
-            // (X-Rvllm-Shadow). Hard-coded to false; the env-gated
-            // RVLLM_NVFP4_SHADOW_F16 path inside run_generate is what
-            // remains for ad-hoc debug if it's ever needed again.
-            false,
+            // shadow_requested: per-request header was removed; gate on
+            // the env var directly so cycle-26 ShadowDumper analysis can
+            // fire without needing to restore the header path.
+            std::env::var("RVLLM_NVFP4_SHADOW_F16")
+                .map_or(false, |v| v != "0" && !v.is_empty()),
         )
     };
 
