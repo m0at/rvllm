@@ -148,7 +148,38 @@ impl KvDtype {
         layer_type: rvllm_loader::gemma4_arch::Gemma4LayerType,
         f16_only: bool,
     ) -> Self {
+        Self::for_layer_index_or_env(layer_type, /*layer_idx=*/usize::MAX, f16_only)
+    }
+
+    /// Layer-index-aware variant. Adds a comma-separated list env var
+    /// `RVLLM_FP8_KV_LAYERS=0,30,59` that forces specific layer indices
+    /// to FP8 KV when the default would have been NVFP4. Strictly
+    /// generalizes `RVLLM_NVFP4_HYBRID_GLOBAL_FP8` (which forces the
+    /// 10 global layers to FP8). Cycle 24: targeted-FP8 attack on
+    /// high-divergence layers identified empirically.
+    ///
+    /// `layer_idx == usize::MAX` is the "unknown index" sentinel — only
+    /// the global-fp8 hybrid env applies, list env is ignored. Call
+    /// sites with the index available should pass the real index.
+    #[must_use]
+    pub fn for_layer_index_or_env(
+        layer_type: rvllm_loader::gemma4_arch::Gemma4LayerType,
+        layer_idx: usize,
+        f16_only: bool,
+    ) -> Self {
         let default = Self::from_env(f16_only);
+        // Env-list override fires first. Most targeted, lets operators
+        // pin specific layer indices to FP8 even if hybrid is off.
+        if default == KvDtype::Nvfp4 && layer_idx != usize::MAX {
+            if let Ok(list) = std::env::var("RVLLM_FP8_KV_LAYERS") {
+                if list.split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .any(|i| i == layer_idx)
+                {
+                    return KvDtype::Fp8;
+                }
+            }
+        }
         let hybrid = std::env::var("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
             .map_or(false, |v| v != "0");
         if hybrid && default == KvDtype::Nvfp4

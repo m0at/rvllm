@@ -706,8 +706,8 @@ impl Gemma4Bringup {
             let hd = arch.head_dim_for_layer(l) as u32;
             let layer_elems =
                 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-            let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_or_env(
-                arch.layer_types[l], false);
+            let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                arch.layer_types[l], l, false);
             kv_dtype_per_layer.push(kv_dtype_l);
             kv_total_bytes += match kv_dtype_l {
                 crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
@@ -2516,8 +2516,11 @@ impl Gemma4Bringup {
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
                 // Per-layer dtype: hybrid mode swaps global layers to FP8,
-                // sliding layers stay on env default.
-                let kv_dtype = crate::gemma4_layer_exec::KvDtype::for_layer_or_env(lt, false);
+                // sliding layers stay on env default. Cycle 24: pass
+                // layer_idx so RVLLM_FP8_KV_LAYERS list env is honored
+                // (must match the allocation-side decision in load_gemma4_fused
+                // — layer 709 — or the cache layout disagrees with dispatch).
+                let kv_dtype = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(lt, layer_idx, false);
                 let (k_cache_scale, v_cache_scale) = if kv_dtype
                     == crate::gemma4_layer_exec::KvDtype::Nvfp4
                 {
@@ -2894,7 +2897,8 @@ impl Gemma4Bringup {
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
                 // Per-layer dtype: hybrid swaps global to FP8 (sliding stays env default).
-                let kv_dtype = crate::gemma4_layer_exec::KvDtype::for_layer_or_env(lt, false);
+                // Cycle 24: pass layer_idx for RVLLM_FP8_KV_LAYERS list env.
+                let kv_dtype = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(lt, layer_idx, false);
                 // Prefill uses FP8 KV when the ambient dtype is F16
                 // (no F16 prefill kernel exists); NVFP4 prefill stays on NVFP4.
                 let prefill_kv_dtype = if kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4 {
