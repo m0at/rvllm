@@ -166,8 +166,18 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
     // by R^T before O-proj to recover the original P·V.
     const signed char* __restrict__ hadamard_signs_q,
     const signed char* __restrict__ hadamard_signs_k,
-    int rotate_v
+    int rotate_v,
     // === END HADAMARD ROTATION ===
+    // === CYCLE 28 PRE-QUANT K F16 SIDECAR (codex pre-quant probe) ===
+    // When non-null, kernel writes the exact f32 K value used for
+    // NVFP4 packing (post-RoPE + post-optional-Hadamard) as f16 to
+    // this buffer at offset (slot * num_kv_heads + head_idx) * head_dim
+    // + tid. This bypasses the shadow-vs-primary cross-path comparison
+    // ambiguity by giving the analyzer the EXACT input the quantizer
+    // saw — apples-to-apples with my Python dequant of the packed nibbles
+    // + scale.
+    __half*        __restrict__ debug_k_prequant
+    // === END CYCLE 28 ===
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -321,7 +331,10 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
             // === HADAMARD ROTATION ===
             bool           apply_rotation,
             // === END HADAMARD ROTATION ===
-            int            policy
+            int            policy,
+            // === CYCLE 28 PRE-QUANT SIDECAR ===
+            __half*        debug_prequant
+            // === END CYCLE 28 ===
         ) {
             float v = apply_rope ? rope_one(in, k_base)
                                  : __half2float(in[k_base + tid]);
@@ -343,6 +356,17 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
                 __syncthreads();
             }
             // === END HADAMARD ROTATION ===
+
+            // === CYCLE 28 PRE-QUANT SIDECAR ===
+            // Write the exact f32 input the quantizer is about to consume
+            // (post-RoPE + post-optional-Hadamard) as f16 to the debug
+            // buffer. Same indexing as primary K cache: (slot * nkvh +
+            // head) * head_dim + tid. Caller passes nullptr to disable.
+            if (debug_prequant != nullptr) {
+                debug_prequant[(slot * num_kv_heads + head_idx) * head_dim + tid]
+                    = __float2half(v);
+            }
+            // === END CYCLE 28 ===
 
             // Per-16-block scale selection. Default path is the
             // range-preserving OCP baseline (peak/6). The MSE path
@@ -409,10 +433,10 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
         const bool v_rotate_now = hadamard_on && (rotate_v != 0);
         quant_and_write(k_in, key_cache_packed,   key_cache_scale,
                         /*apply_rope=*/true,  /*apply_rotation=*/hadamard_on,
-                        scale_policy);
+                        scale_policy, /*debug_prequant=*/debug_k_prequant);
         quant_and_write(v_in, value_cache_packed, value_cache_scale,
                         /*apply_rope=*/false, /*apply_rotation=*/v_rotate_now,
-                        v_scale_policy);
+                        v_scale_policy, /*debug_prequant=*/nullptr);
         // === END HADAMARD ROTATION ===
     }
 }

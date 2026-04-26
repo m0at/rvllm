@@ -2200,6 +2200,20 @@ unsafe fn rope_nvfp4kv(
         if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
             .unwrap_or(false) { 1 } else { 0 };
     // === END HADAMARD ROTATION ===
+    // === CYCLE 28 PRE-QUANT K SIDECAR ===
+    // Reuse the shadow K region: when shadow is enabled, primary
+    // overwrites what rope_f16kv_shadow wrote with the EXACT f32 K
+    // value (cast to f16) the NVFP4 quantizer is about to consume,
+    // post-RoPE + post-optional-Hadamard. Layout matches
+    // (slot * num_kv_heads + head) * head_dim. Analyzer then compares
+    // this f16 prequant against its Python dequant of the packed
+    // nibbles + E4M3 scales — apples-to-apples within the same path.
+    // Layout is identical to shadow's so files dumped by ShadowDumper
+    // (`layer_{L}_k_shadow.bin`) now contain pre-quant K under this
+    // gate. Shadow K vs shadow comparison is lost in this mode but
+    // that comparison was uncorrelated anyway (codex review).
+    let mut debug_k_prequant: u64 = scratch.shadow_k_cache;
+    // === END CYCLE 28 ===
     let mut nt = dims.num_tokens as i32;
     let mut nh = dims.num_heads as i32;
     let mut nkvh = dims.num_kv_heads as i32;
@@ -2258,6 +2272,9 @@ unsafe fn rope_nvfp4kv(
         (&mut hadamard_signs_k) as *mut u64 as *mut core::ffi::c_void,
         (&mut rotate_v) as *mut i32 as *mut core::ffi::c_void,
         // === END HADAMARD ROTATION ===
+        // === CYCLE 28 PRE-QUANT SIDECAR ===
+        (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
+        // === END CYCLE 28 ===
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);
