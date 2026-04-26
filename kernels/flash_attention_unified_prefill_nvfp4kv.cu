@@ -231,8 +231,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
     float*  s_l        = s_m + BLOCK_M;
     float*  s_alpha    = s_l + BLOCK_M;
     __half* s_p_f16    = reinterpret_cast<__half*>(s_alpha + BLOCK_M);
-    float*  s_p_scale  = reinterpret_cast<float*>(s_p_f16 + BLOCK_M * MMA_K);
-    float*  s_acc      = s_p_scale + BLOCK_M;
+    // P safety scale (s_p_scale) removed: post-softmax P is in [0, 1] which
+    // fits f16 trivially, so the per-row max-reduce + divide + multiply was
+    // always identity (commit 2026-04-26). Saves BLOCK_M × 4 bytes of smem
+    // + a row_reduce_max_8 + per-cell inv_ps multiply per P·V tile.
+    float*  s_acc      = reinterpret_cast<float*>(s_p_f16 + BLOCK_M * MMA_K);
 
     const int row         = tid >> 3;
     const int lane_in_row = tid & 7;
@@ -447,22 +450,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
         }
         __syncthreads();
 
-        // -- Per-row P safety scale (applied so f16 MMA operands stay
-        //    inside the f16 dynamic range). P ∈ [0, 1] post-softmax so
-        //    the clamp is usually a no-op.
+        // P safety scale removed (post-softmax P is in [0, 1], so the
+        // clamp was always identity). Saves a row_reduce_max_8 + a
+        // BLOCK_M-wide smem write per tile iteration.
         const int pv_row = tid >> 3;
         const int pv_lr  = tid & 7;
-        if (pv_row < BLOCK_M) {
-            float local_max = 0.0f;
-            for (int t = pv_lr; t < tile_len; t += 8) {
-                local_max = fmaxf(local_max, fabsf(s_s[pv_row * tile_len + t]));
-            }
-            const float row_max = row_reduce_max_8(local_max);
-            if (pv_lr == 0) {
-                s_p_scale[pv_row] = (row_max > 1.0f) ? row_max : 1.0f;
-            }
-        }
-        __syncthreads();
 
         // -- P·V loop over k sub-tiles of width MMA_K = 16. tile_size
         //    = 16 runs once; tile_size = 32 (sliding layers) runs twice.
@@ -488,14 +480,13 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
             __syncthreads();
 
             // (2) Pack P[m, t=k_base_t..k_base_t+MMA_K) into s_p_f16
-            //     [m, 0..MMA_K) with per-row inv scale, zero-pad past
-            //     tile_len.
+            //     [m, 0..MMA_K) directly. Post-softmax P ∈ [0, 1] so
+            //     no inv-scale needed (former s_p_scale was always 1.0).
             if (pv_row < BLOCK_M) {
-                const float inv_scale = 1.0f / s_p_scale[pv_row];
                 for (int t = pv_lr; t < MMA_K; t += 8) {
                     const int t_src = k_base_t + t;
                     const float p = (t_src < tile_len)
-                        ? s_s[pv_row * tile_len + t_src] * inv_scale
+                        ? s_s[pv_row * tile_len + t_src]
                         : 0.0f;
                     s_p_f16[pv_row * MMA_K + t] = __float2half(p);
                 }
@@ -524,24 +515,22 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
                 const int n_base = (warp_id * n_tiles_per_warp + nt) * 8;
                 const int d_lo = n_base + c;
                 const int d_hi = d_lo + 1;
-                const float pscale_lo = s_p_scale[r_lo];
-                const float pscale_hi = s_p_scale[r_hi];
-                const float inv_ps_lo = 1.0f / pscale_lo;
-                const float inv_ps_hi = 1.0f / pscale_hi;
                 uint32_t b[2];
                 rvllm_f16mma::pack_b_frag_col_major_n8k16_f16(
                     s_v_f16_T + n_base * MMA_K,
                     /*stride_bytes=*/MMA_K * (int)sizeof(__half), b, lane);
+                // s_p_scale removed — load s_acc directly with alpha
+                // applied (former pscale_lo / inv_ps_lo were identity).
                 float d_frag[4];
-                d_frag[0] = s_acc[r_lo * head_dim + d_lo] * alpha_lo * inv_ps_lo;
-                d_frag[1] = s_acc[r_lo * head_dim + d_hi] * alpha_lo * inv_ps_lo;
-                d_frag[2] = s_acc[r_hi * head_dim + d_lo] * alpha_hi * inv_ps_hi;
-                d_frag[3] = s_acc[r_hi * head_dim + d_hi] * alpha_hi * inv_ps_hi;
+                d_frag[0] = s_acc[r_lo * head_dim + d_lo] * alpha_lo;
+                d_frag[1] = s_acc[r_lo * head_dim + d_hi] * alpha_lo;
+                d_frag[2] = s_acc[r_hi * head_dim + d_lo] * alpha_hi;
+                d_frag[3] = s_acc[r_hi * head_dim + d_hi] * alpha_hi;
                 rvllm_f16mma::mma_m16n8k16_f16_f16_f32(d_frag, a, b);
-                s_acc[r_lo * head_dim + d_lo] = d_frag[0] * pscale_lo;
-                s_acc[r_lo * head_dim + d_hi] = d_frag[1] * pscale_lo;
-                s_acc[r_hi * head_dim + d_lo] = d_frag[2] * pscale_hi;
-                s_acc[r_hi * head_dim + d_hi] = d_frag[3] * pscale_hi;
+                s_acc[r_lo * head_dim + d_lo] = d_frag[0];
+                s_acc[r_lo * head_dim + d_hi] = d_frag[1];
+                s_acc[r_hi * head_dim + d_lo] = d_frag[2];
+                s_acc[r_hi * head_dim + d_hi] = d_frag[3];
             }
             __syncthreads();
         }

@@ -736,7 +736,7 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
                 + block_m * s_s_stride * 4                 // s_s
                 + block_m * 4 * 3                          // s_m + s_l + s_alpha
                 + block_m * MMA_K * 2                      // s_p_f16
-                + block_m * 4                              // s_p_scale
+                // s_p_scale removed (post-softmax P in [0,1] = identity scale)
                 + block_m * hd * 4                         // s_acc
                 + 256;                                     // alignment cushion
 
