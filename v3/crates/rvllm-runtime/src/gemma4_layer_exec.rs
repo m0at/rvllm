@@ -185,10 +185,20 @@ impl KvDtype {
         if hybrid && default == KvDtype::Nvfp4
             && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention
         {
-            KvDtype::Fp8
-        } else {
-            default
+            return KvDtype::Fp8;
         }
+        // Inverse hybrid (cycle 25 research): all SLIDING layers FP8,
+        // globals stay NVFP4. Tests whether sliding-layer cumulative
+        // noise dominates over global-layer noise, given that the prior
+        // global-FP8 hybrid did not close the WEATHER cliff.
+        let hybrid_sliding = std::env::var("RVLLM_NVFP4_HYBRID_SLIDING_FP8")
+            .map_or(false, |v| v != "0");
+        if hybrid_sliding && default == KvDtype::Nvfp4
+            && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+        {
+            return KvDtype::Fp8;
+        }
+        default
     }
 }
 
