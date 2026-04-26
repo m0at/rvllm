@@ -421,7 +421,9 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
                 s_alpha[row] = alpha;
             }
         }
-        __syncthreads();
+        // Sync removed: V load below writes s_v_f16, doesn't read the
+        // online-softmax state (s_m / s_l / s_alpha / s_s). Cross-tile
+        // ordering is gated by the post-V-load sync further down.
 
         // -- Load V tile (NVFP4 → f16 smem). Same parallel pattern
         //    as the K load above.
@@ -477,7 +479,9 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
                     : __float2half(0.0f);
                 s_v_f16_T[d * MMA_K + k_off] = v;
             }
-            __syncthreads();
+            // Sync removed: P-pack below writes s_p_f16 and reads s_s,
+            // doesn't read s_v_f16_T. The downstream sync after P-pack
+            // gates both s_p_f16 + s_v_f16_T visibility for the MMA.
 
             // (2) Pack P[m, t=k_base_t..k_base_t+MMA_K) into s_p_f16
             //     [m, 0..MMA_K) directly. Post-softmax P ∈ [0, 1] so
