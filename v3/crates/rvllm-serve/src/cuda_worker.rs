@@ -29,6 +29,12 @@ use crate::error::ApiError;
 use crate::openai::types::FinishReason;
 use crate::worker::{GenerateEvent, GenerateRequest, WorkerHandle};
 
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Minimum config needed to bring up the CUDA worker. Mirrors the
 /// `probe-gemma4-load` flags so operators can move directly from
 /// probe to serve.
@@ -101,10 +107,7 @@ pub async fn spawn_cuda_worker(
             // Used to discriminate "prefix-cache reuse causes the
             // R1≠R2 divergence" from "deeper non-determinism." Remove
             // after the prefix-cache hypothesis is settled.
-            let disable_prefix_cache = std::env::var("RVLLM_DISABLE_PREFIX_CACHE")
-                .ok()
-                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-                .unwrap_or(false);
+            let disable_prefix_cache = env_truthy("RVLLM_DISABLE_PREFIX_CACHE");
             if disable_prefix_cache {
                 tracing::warn!("RVLLM_DISABLE_PREFIX_CACHE=1 — skipping init_prefix_cache (diagnostic mode)");
             } else {
@@ -203,8 +206,7 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             // shadow_requested: per-request header was removed; gate on
             // the env var directly so cycle-26 ShadowDumper analysis can
             // fire without needing to restore the header path.
-            std::env::var("RVLLM_NVFP4_SHADOW_F16")
-                .map_or(false, |v| v != "0" && !v.is_empty()),
+            env_truthy("RVLLM_NVFP4_SHADOW_F16"),
         )
     };
 

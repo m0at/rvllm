@@ -117,16 +117,16 @@ impl KvDtype {
         if f16_only {
             return KvDtype::F16;
         }
-        if std::env::var("RVLLM_NVFP4_KV").map_or(false, |v| v != "0") {
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_KV").unwrap_or(false) {
             return KvDtype::Nvfp4;
         }
-        if std::env::var("RVLLM_F16_KV").map_or(false, |v| v != "0") {
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_F16_KV").unwrap_or(false) {
             return KvDtype::F16;
         }
-        if std::env::var("RVLLM_FP8_KV").map_or(false, |v| v != "0") {
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_FP8_KV").unwrap_or(false) {
             return KvDtype::Fp8;
         }
-        if std::env::var("RVLLM_NVFP4_KV").map_or(false, |v| v == "0") {
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_KV") == Some(false) {
             return KvDtype::F16;
         }
         KvDtype::Nvfp4
@@ -180,8 +180,8 @@ impl KvDtype {
                 }
             }
         }
-        let hybrid = std::env::var("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
-            .map_or(false, |v| v != "0");
+        let hybrid = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
+            .unwrap_or(false);
         if hybrid && default == KvDtype::Nvfp4
             && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention
         {
@@ -191,8 +191,9 @@ impl KvDtype {
         // globals stay NVFP4. Tests whether sliding-layer cumulative
         // noise dominates over global-layer noise, given that the prior
         // global-FP8 hybrid did not close the WEATHER cliff.
-        let hybrid_sliding = std::env::var("RVLLM_NVFP4_HYBRID_SLIDING_FP8")
-            .map_or(false, |v| v != "0");
+        let hybrid_sliding =
+            crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HYBRID_SLIDING_FP8")
+                .unwrap_or(false);
         if hybrid_sliding && default == KvDtype::Nvfp4
             && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
         {
@@ -365,8 +366,8 @@ pub struct Gemma4LayerScratch {
 /// or the list parses empty. Default set applied by caller when the
 /// gate is on but the list env var is unset.
 pub fn parse_shadow_layers() -> Option<Vec<u32>> {
-    let gate = std::env::var("RVLLM_NVFP4_SHADOW_F16")
-        .map_or(false, |v| v != "0" && !v.is_empty());
+    let gate = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_SHADOW_F16")
+        .unwrap_or(false);
     if !gate {
         return None;
     }
@@ -913,10 +914,9 @@ pub unsafe fn gemma4_forward_phase(
                     // context window so the workspace layout is
                     // stable across calls — running at a shorter ctx
                     // just writes sentinels to the tail partitions.
-                    let split_env_on = std::env::var("RVLLM_NVFP4_SPLIT_KV")
-                        .map(|s| !matches!(s.as_str(),
-                            "0" | "false" | "FALSE" | "no" | "off" | ""))
-                        .unwrap_or(true);
+                    let split_env_on =
+                        crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_SPLIT_KV")
+                            .unwrap_or(true);
                     // Cycle 23 sweep winner: 1024 — only setting with both
                     // (a) zero garbage on long-ctx WEATHER cliff and
                     // (b) clean short-ctx simple tool-call (no regression).
@@ -1057,9 +1057,9 @@ pub unsafe fn gemma4_forward_phase(
                 // comparisons. Falls back to the per-qi dedicated
                 // kernel when the unified PTX is missing (old kernel
                 // trees) or disabled via env.
-                let unified_enabled_nvfp4 = std::env::var_os("RVLLM_UNIFIED_PREFILL")
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+                let unified_enabled_nvfp4 =
+                    crate::gemma4_bring_up::parse_truthy_env("RVLLM_UNIFIED_PREFILL")
+                        .unwrap_or(true);
                 let have_nvfp4_unified = match attention {
                     rvllm_attention::AttentionBackend::Fa2Ptx(k)
                         if k.has_unified_prefill_nvfp4() => true,
@@ -1156,9 +1156,9 @@ pub unsafe fn gemma4_forward_phase(
             // Otherwise we fall back to the decode-per-qi loop below —
             // retained both as a bisect tool and as the reference path
             // rvllm-ppl validates bit-for-bit.
-            let unified_enabled = std::env::var_os("RVLLM_UNIFIED_PREFILL")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            let unified_enabled =
+                crate::gemma4_bring_up::parse_truthy_env("RVLLM_UNIFIED_PREFILL")
+                    .unwrap_or(true);
             let fa2_unified = if unified_enabled {
                 match attention {
                     rvllm_attention::AttentionBackend::Fa2Ptx(k) if k.has_unified_prefill() => true,
@@ -1189,9 +1189,9 @@ pub unsafe fn gemma4_forward_phase(
                 // `RVLLM_UNIFIED_PREFILL_MMA=1` flips on the
                 // sm_121a `mma.sync.kind::f8f6f4` tensor-core path;
                 // unset / `0` keeps the scalar FMA reference.
-                let use_mma = std::env::var_os("RVLLM_UNIFIED_PREFILL_MMA")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+                let use_mma =
+                    crate::gemma4_bring_up::parse_truthy_env("RVLLM_UNIFIED_PREFILL_MMA")
+                        .unwrap_or(false);
                 let unified = rvllm_attention::UnifiedPrefillParams {
                     num_queries_per_kv,
                     tile_size,
@@ -1834,7 +1834,8 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     // exactly how aa01001pftrope0 manifested).
     let cutlass_sm120_enabled = m >= 128
         && b_blockscale != 0
-        && std::env::var("RVLLM_FP8_GEMM_CUTLASS_SM120").ok().as_deref() != Some("0");
+        && crate::gemma4_bring_up::parse_truthy_env("RVLLM_FP8_GEMM_CUTLASS_SM120")
+            .unwrap_or(true);
     if cutlass_sm120_enabled {
         if let CutlassBackend::SoSm120(lib) = cutlass {
             if lib.prep_sfa.is_some() && lib.prep_sfb.is_some() {

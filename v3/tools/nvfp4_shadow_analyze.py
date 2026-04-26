@@ -38,15 +38,18 @@ def dequant_nvfp4(packed: np.ndarray, scale_e4m3: np.ndarray, n_elems: int) -> n
     mag = FP4_MAG[nibbles & 0x07]
     vals = np.where(sign == 1, -mag, mag)
     # Decode E4M3 scale: S(1)|E(4)|M(3), bias=7.
+    # Cast to int16 BEFORE arithmetic to avoid uint8 underflow when
+    # exp_s - 7 goes negative.
     s_bits = scale_e4m3.astype(np.uint8)
-    sign_s = (s_bits >> 7) & 1
-    exp_s = (s_bits >> 3) & 0x0F
-    man_s = s_bits & 0x07
+    sign_s = ((s_bits >> 7) & 1).astype(np.int16)
+    exp_s = ((s_bits >> 3) & 0x0F).astype(np.int16)
+    man_s = (s_bits & 0x07).astype(np.int16)
     # Normal: (1 + man/8) * 2^(exp-7); subnormal exp=0: (man/8) * 2^(-6).
+    pow_normal = np.power(2.0, (exp_s - 7).astype(np.float32))
     f_scale = np.where(
         exp_s == 0,
         (man_s.astype(np.float32) / 8.0) * (2.0 ** -6),
-        (1.0 + man_s.astype(np.float32) / 8.0) * (2.0 ** (exp_s.astype(np.int32) - 7)),
+        (1.0 + man_s.astype(np.float32) / 8.0) * pow_normal,
     )
     f_scale = np.where(sign_s == 1, -f_scale, f_scale)
     # Each 16-elem block uses one scale.

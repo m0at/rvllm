@@ -219,8 +219,8 @@ impl PrefixProvenance {
         let chunk_size: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
-        let hybrid_global_fp8 = std::env::var("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
-            .map(|v| v != "0").unwrap_or(false);
+        let hybrid_global_fp8 =
+            parse_truthy_env("RVLLM_NVFP4_HYBRID_GLOBAL_FP8").unwrap_or(false);
         fn parse_policy(v: &str) -> Option<u32> {
             match v {
                 "amax6" | "0" => Some(0),
@@ -241,15 +241,18 @@ impl PrefixProvenance {
         // when env is unset, intentionally, but parsing is unified.
         let per_token_q_scale = parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(false);
         let hadamard_v = parse_truthy_env("RVLLM_NVFP4_HADAMARD_V").unwrap_or(false);
-        let batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
-        let unified_prefill = std::env::var_os("RVLLM_UNIFIED_PREFILL").is_some();
+        let batch_prefill = parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false)
+            && kv_dtype != crate::gemma4_layer_exec::KvDtype::F16;
+        // Match the NVFP4/FP8 prefill dispatch gate: unified prefill is
+        // default-on and only explicit false-ish values disable it. Using
+        // mere env presence here made `RVLLM_UNIFIED_PREFILL=0` and `=1`
+        // look identical to the prefix cache even though they route through
+        // different attention kernels.
+        let unified_prefill = parse_truthy_env("RVLLM_UNIFIED_PREFILL").unwrap_or(true);
         // Default ON in dispatch (gemma4_layer_exec.rs line ~870), opt-out via "0"/etc.
-        let split_kv = std::env::var("RVLLM_NVFP4_SPLIT_KV")
-            .map(|s| !matches!(s.as_str(),
-                "0" | "false" | "FALSE" | "no" | "off" | ""))
-            .unwrap_or(true);
-        let hybrid_sliding_fp8 = std::env::var("RVLLM_NVFP4_HYBRID_SLIDING_FP8")
-            .map(|v| v != "0").unwrap_or(false);
+        let split_kv = parse_truthy_env("RVLLM_NVFP4_SPLIT_KV").unwrap_or(true);
+        let hybrid_sliding_fp8 =
+            parse_truthy_env("RVLLM_NVFP4_HYBRID_SLIDING_FP8").unwrap_or(false);
         let fp8_kv_layers = std::env::var("RVLLM_FP8_KV_LAYERS")
             .unwrap_or_default();
         let stoch_round_v = parse_truthy_env("RVLLM_NVFP4_STOCH_ROUND_V").unwrap_or(false);
@@ -2243,8 +2246,8 @@ impl Gemma4Bringup {
                 let hd = arch.head_dim_for_layer(l) as u32;
                 let layer_elems =
                     2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-                let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_or_env(
-                    arch.layer_types[l], false);
+                let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                    arch.layer_types[l], l, false);
                 kv_total_bytes += match kv_dtype_l {
                     crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
                     crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
@@ -2733,7 +2736,15 @@ impl Gemma4Bringup {
         // batch path (diagnostic: verifies CUTLASS >=128 correctness,
         // or measures the collapsed-scalar quality floor at <128).
         let skip_decode = std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
-        let use_batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
+        let requested_batch_prefill = parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false);
+        let use_batch_prefill =
+            requested_batch_prefill && kv_dtype != crate::gemma4_layer_exec::KvDtype::F16;
+        if requested_batch_prefill && !use_batch_prefill {
+            eprintln!(
+                "[prefill] RVLLM_BATCH_PREFILL=1 ignored for F16 KV; \
+                 using per-token path to keep KV dtype consistent"
+            );
+        }
         if !skip_decode && !use_batch_prefill {
             // Prefix-cache fast path: if common_prefix_len > 0, the
             // persistent KV region already holds valid entries for
@@ -3459,6 +3470,19 @@ impl Gemma4Bringup {
             let next_id = host_tok[0] as u32;
             output_ids.push(next_id);
             if eos_ids.contains(&next_id) { break; }
+            // Cycle 33 fix (codex bug #5): tool-call close `<tool_call|>`
+            // (token 49) was not a generation stop. After a valid tool
+            // call closed, the model kept emitting hallucinated prose
+            // (`<|tool_response>` text, "The weather in Zurich is 12°C..."
+            // narration, multiple redundant tool calls). With this guard,
+            // once token 48 (`<|tool_call>`) has been seen in the output
+            // and we then emit token 49, treat it as a structural stop.
+            // Standalone token 49 without prior 48 is not a stop (the
+            // tag could appear in fragmented form during partial
+            // streaming reuse — preserve previous behavior there).
+            if next_id == 49u32 && output_ids.iter().rev().any(|&t| t == 48u32) {
+                break;
+            }
 
             // Repetition guard. When a low-precision KV path (e.g.
             // pure NVFP4) lands in a near-tied logit state — typically
@@ -3559,16 +3583,24 @@ impl Gemma4Bringup {
                     // PrefixCacheState::committed_prefix_len doc.
                     let chunk_size: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
                         .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let batch_prefill =
+                        parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false);
                     let prompt_len_u32 = prompt_ids.len() as u32;
-                    pc.committed_prefix_len = if chunk_size > 0 && prompt_len_u32 >= chunk_size {
+                    pc.committed_prefix_len = if batch_prefill && chunk_size == 0 {
+                        // One-shot batch prefill is batch-shape dependent:
+                        // slots written for a 3k-token request are not
+                        // guaranteed equivalent to the same positions inside
+                        // a later 15k-token request. Fixed chunks give stable
+                        // chunk shapes; without them, keep the cache metadata
+                        // for diagnostics but do not reuse it.
+                        0
+                    } else if chunk_size > 0 && prompt_len_u32 >= chunk_size {
                         (prompt_len_u32 / chunk_size) * chunk_size
                     } else {
-                        // No chunking, or prompt fits in a single
-                        // chunk → entire prompt was written under
-                        // one (unique-shape) launch. Reusing it is
-                        // ONLY safe when the next request would
-                        // also fit in one chunk; the provenance
-                        // chunk_size mismatch will catch that.
+                        // Per-token decode prefill is shape-stable, so the
+                        // whole prompt is safe to reuse. For fixed chunked
+                        // batch prefill where the prompt fits in one chunk,
+                        // the single chunk is likewise the committed unit.
                         prompt_len_u32
                     };
                     // Refresh provenance so subsequent provenance

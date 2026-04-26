@@ -196,7 +196,6 @@ mod tests {
                 stop_token_ids: vec![],
                 events_tx: tx,
                 cancelled: cancel.clone(),
-                shadow_requested: false,
             })
             .await
             .expect("submit");

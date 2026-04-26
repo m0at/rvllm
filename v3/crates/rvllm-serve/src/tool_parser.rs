@@ -287,7 +287,14 @@ pub fn strip_tool_markup(text: &str) -> String {
                     (Some(_a), Some(b)) => START.len() + b + END_B.len(),
                     (Some(a), None) => START.len() + a + END_A.len(),
                     (None, Some(b)) => START.len() + b + END_B.len(),
-                    (None, None) => bytes.len() - i,
+                    // Cycle 33 fix (codex bug #6): malformed opener with no
+                    // close was silently swallowing the rest of the reply,
+                    // turning a broken tool-call attempt into "" content.
+                    // That hid the actual model output during cliff trials
+                    // (cycle 19+). Now skip ONLY the opener tag itself so
+                    // the body content past it surfaces in `content` —
+                    // ugly UX but the user can see the model misbehaved.
+                    (None, None) => START.len(),
                 };
                 i += skip;
                 continue;
