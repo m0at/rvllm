@@ -296,7 +296,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
     for (int idx = tid; idx < BLOCK_M * head_dim; idx += FA2_THREADS) {
         s_acc[idx] = 0.0f;
     }
-    __syncthreads();
+    // Sync removed: K load below writes s_k_f16, doesn't read s_m /
+    // s_l / s_alpha / s_acc / s_q_scale. The post-K-load sync gates
+    // visibility for the Q·K^T MMA and the mask_pack that reads
+    // s_q_scale. The first online-softmax read of s_l / s_m / s_alpha
+    // happens after two more syncs (post-K-load + post-Q·K^T-MMA).
 
     const int half_D       = head_dim >> 1;   // NVFP4 packed bytes per row
     const int scales_per_D = head_dim >> 4;   // E4M3 scales per row
