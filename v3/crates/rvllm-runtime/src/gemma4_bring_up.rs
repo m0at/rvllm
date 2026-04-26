@@ -1997,6 +1997,20 @@ impl Gemma4Bringup {
         // burn the one-shot latch.
         shadow_requested: bool,
     ) -> Result<Vec<u32>> {
+        // Cycle 37 P2 (codex audit): max_new=0 used to underflow at
+        // `0..max_new - 1`. Caller (handlers.rs::resolve_max_new) already
+        // rejects 0 at the HTTP layer, but defend the runtime entry too
+        // so internal callers (probes, future schedulers) cannot trip it.
+        if max_new == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "max_new",
+                    reason: "must be >= 1; max_new=0 underflows the decode loop"
+                        .into(),
+                },
+                field: "max_new",
+            });
+        }
         let arch = &self.arch;
         let hidden = arch.hidden_size as u32;
         let vocab = arch.vocab_size as u32;

@@ -256,6 +256,19 @@ pub async fn chat_completions(
     let max_new = resolve_max_new(req.max_tokens, state.config.max_new_tokens_cap)?;
     let stop_text = req.stop.as_ref().map(|s| extract_stop(s)).unwrap_or_default();
     validate_stops(&stop_text)?;
+    // Cycle 37 P1 (codex audit): cycle-36 reject of stream+stop fired
+    // AFTER tokenization + worker submit, leaking GPU work for a
+    // request we then 400. Lift the rejection above the tokenize/submit
+    // sequence so it's a free-cost validation error.
+    if req.stream && !stop_text.is_empty() {
+        return Err(ApiError::invalid_param(
+            "`stop` is not yet supported with stream=true (would be \
+             silently ignored). Use stream=false, or wait for \
+             streaming-truncation support.",
+            "stop",
+            "stop_with_stream_unsupported",
+        ));
+    }
 
     let prompt_ids = state.tokenizer.render_chat(&req.messages, req.tools.as_ref())?;
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
@@ -294,21 +307,7 @@ pub async fn chat_completions(
     let request_timeout = state.config.request_timeout;
 
     if req.stream {
-        // Cycle 36 P1 (codex bug #1 follow-up): SSE has no stop-string
-        // truncation yet — the cycle 34 fix only covered non-streaming
-        // chat_collect. Rather than silently violate the caller's stop
-        // contract, reject up front. Proper streaming truncation needs
-        // an incremental decoded-buffer matcher that handles stops
-        // spanning chunks; tracked for cycle 37+.
-        if !stop_text.is_empty() {
-            return Err(ApiError::invalid_param(
-                "`stop` is not yet supported with stream=true (would be \
-                 silently ignored). Use stream=false, or wait for \
-                 streaming-truncation support.",
-                "stop",
-                "stop_with_stream_unsupported",
-            ));
-        }
+        // Cycle 37: stream+stop rejection lifted to pre-tokenize above.
         Ok(ChatCompletionsResponse::Stream(chat_stream_sse(
             model_id,
             tokenizer,
@@ -1112,6 +1111,17 @@ pub async fn completions(
     // Mirror chat-handler validation + post-decode truncation below.
     let stop_text = req.stop.as_ref().map(|s| extract_stop(s)).unwrap_or_default();
     validate_stops(&stop_text)?;
+    // Cycle 37 P1 (codex audit): mirror the chat-handler fix — reject
+    // stream+stop BEFORE tokenization so it's a zero-GPU-cost 400.
+    if req.stream && !stop_text.is_empty() {
+        return Err(ApiError::invalid_param(
+            "`stop` is not yet supported with stream=true (would be \
+             silently ignored). Use stream=false, or wait for \
+             streaming-truncation support.",
+            "stop",
+            "stop_with_stream_unsupported",
+        ));
+    }
 
     let prompt_ids = state.tokenizer.encode(&prompt_text)?;
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
@@ -1136,17 +1146,7 @@ pub async fn completions(
     let request_timeout = state.config.request_timeout;
 
     if req.stream {
-        // Cycle 36 P1: reject stop on streaming completions for the
-        // same reason as chat — proper SSE truncation is cycle 37 work.
-        if !stop_text.is_empty() {
-            return Err(ApiError::invalid_param(
-                "`stop` is not yet supported with stream=true (would be \
-                 silently ignored). Use stream=false, or wait for \
-                 streaming-truncation support.",
-                "stop",
-                "stop_with_stream_unsupported",
-            ));
-        }
+        // Cycle 37: stream+stop rejection lifted to pre-tokenize above.
         Ok(CompletionsResponse::Stream(completion_stream_sse(
             model_id,
             tokenizer,
@@ -1429,18 +1429,53 @@ fn reject_v1_unsupported_chat(req: &ChatCompletionRequest) -> ApiResult<()> {
     // unsupported form so callers don't get incorrect tool dispatch.
     // String forms still pass through.
     if let Some(choice) = &req.tool_choice {
-        let is_simple_string = choice
-            .as_str()
-            .map(|s| matches!(s, "auto" | "none" | "required"))
-            .unwrap_or(false);
-        if !is_simple_string {
-            return Err(ApiError::invalid_param(
-                "tool_choice with a specific function name is not yet \
-                 supported (no constrained-decoding path); use \"auto\" \
-                 or \"required\" to let the model pick from `tools`",
-                "tool_choice",
-                "tool_choice_specific_unsupported",
-            ));
+        // Cycle 37 P1 (codex audit): "none" / "required" were silently
+        // accepted but not enforced — `tools` was still rendered into
+        // the chat template either way, so "none" could still produce
+        // tool calls and "required" was indistinguishable from "auto".
+        // Reject the unenforced forms (none / required) too, until the
+        // template path can honour them properly. "auto" stays the
+        // only honoured value.
+        let s = choice.as_str();
+        match s {
+            Some("auto") => {}
+            Some("none") => {
+                return Err(ApiError::invalid_param(
+                    "tool_choice=\"none\" is not enforced (`tools` would \
+                     still be rendered into the prompt). Omit `tools` \
+                     entirely to disable tool calls.",
+                    "tool_choice",
+                    "tool_choice_none_unenforced",
+                ));
+            }
+            Some("required") => {
+                return Err(ApiError::invalid_param(
+                    "tool_choice=\"required\" is not enforced \
+                     (no constrained-decoding path); the model still \
+                     decides whether to emit a call. Use \"auto\" and \
+                     accept a non-tool response.",
+                    "tool_choice",
+                    "tool_choice_required_unenforced",
+                ));
+            }
+            Some(_) => {
+                return Err(ApiError::invalid_param(
+                    "tool_choice must be the string \"auto\" — \
+                     specific-function and other forms are not yet \
+                     supported (no constrained-decoding path).",
+                    "tool_choice",
+                    "tool_choice_unsupported_string",
+                ));
+            }
+            None => {
+                // Object form (specific function) was previously here.
+                return Err(ApiError::invalid_param(
+                    "tool_choice with a specific function name is not yet \
+                     supported (no constrained-decoding path); use \"auto\".",
+                    "tool_choice",
+                    "tool_choice_specific_unsupported",
+                ));
+            }
         }
     }
     Ok(())

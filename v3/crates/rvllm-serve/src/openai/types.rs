@@ -14,7 +14,12 @@ pub enum Role {
 }
 
 /// Why a completion stopped. Mirrors OpenAI's `finish_reason`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+///
+/// Cycle 37 (codex audit): added `Deserialize` so tests can parse the
+/// JSON envelope without a separate stub type. No production handler
+/// reads this field as input — the `Serialize` direction is what
+/// matters at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     /// Hit the model's natural stop (EOS token).
@@ -106,6 +111,32 @@ mod tests {
     fn finish_reason_serializes_snake() {
         let j = serde_json::to_string(&FinishReason::ContentFilter).expect("ok");
         assert_eq!(j, "\"content_filter\"");
+    }
+
+    // === Cycle 37 finish-reason serde roundtrip tests ===
+
+    #[test]
+    fn finish_reason_all_variants_roundtrip() {
+        for (variant, expected) in [
+            (FinishReason::Stop, "\"stop\""),
+            (FinishReason::Length, "\"length\""),
+            (FinishReason::Cancelled, "\"cancelled\""),
+            (FinishReason::ContentFilter, "\"content_filter\""),
+            (FinishReason::ToolCalls, "\"tool_calls\""),
+        ] {
+            let j = serde_json::to_string(&variant).expect("serialize");
+            assert_eq!(j, expected, "serialize {variant:?}");
+            let back: FinishReason =
+                serde_json::from_str(expected).expect("deserialize");
+            assert_eq!(back, variant, "roundtrip {variant:?}");
+        }
+    }
+
+    #[test]
+    fn finish_reason_unknown_string_rejected() {
+        let r: Result<FinishReason, _> =
+            serde_json::from_str("\"definitely_not_a_finish_reason\"");
+        assert!(r.is_err(), "unknown finish_reason must fail to parse");
     }
 
     #[test]
