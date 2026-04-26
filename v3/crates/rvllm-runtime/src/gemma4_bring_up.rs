@@ -171,6 +171,13 @@ pub struct PrefixProvenance {
     pub kv_dtype: crate::gemma4_layer_exec::KvDtype,
     pub hybrid_global_fp8: bool,
     pub scale_policy: u32,        // 0 = amax6, 1 = mse, etc.
+    // K/V scale-policy split (each falls back to scale_policy when unset).
+    // Tracked here so the prefix cache invalidates if either side flips.
+    pub k_scale_policy: u32,
+    pub v_scale_policy: u32,
+    // NVFP4 quality knobs that change how K/Q-side state is interpreted.
+    pub hadamard: bool,
+    pub per_token_q_scale: bool,
     pub batch_prefill: bool,
     pub unified_prefill: bool,
 }
@@ -183,15 +190,29 @@ impl PrefixProvenance {
         let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
         let hybrid_global_fp8 = std::env::var("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
             .map(|v| v != "0").unwrap_or(false);
-        let scale_policy = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
-            .ok().and_then(|s| match s.as_str() {
-                "amax6" | "0" => Some(0u32),
-                "mse" | "1" => Some(1u32),
+        fn parse_policy(v: &str) -> Option<u32> {
+            match v {
+                "amax6" | "0" => Some(0),
+                "mse" | "1" => Some(1),
                 _ => None,
-            }).unwrap_or(0);
+            }
+        }
+        let scale_policy = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
+            .ok().and_then(|s| parse_policy(&s)).unwrap_or(0);
+        let k_scale_policy = std::env::var("RVLLM_NVFP4_K_SCALE_POLICY")
+            .ok().and_then(|s| parse_policy(&s)).unwrap_or(scale_policy);
+        let v_scale_policy = std::env::var("RVLLM_NVFP4_V_SCALE_POLICY")
+            .ok().and_then(|s| parse_policy(&s)).unwrap_or(scale_policy);
+        let hadamard = std::env::var("RVLLM_NVFP4_HADAMARD")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false);
+        let per_token_q_scale = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false);
         let batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
         let unified_prefill = std::env::var_os("RVLLM_UNIFIED_PREFILL").is_some();
         Self { chunk_size, kv_dtype, hybrid_global_fp8, scale_policy,
+               k_scale_policy, v_scale_policy, hadamard, per_token_q_scale,
                batch_prefill, unified_prefill }
     }
 }
