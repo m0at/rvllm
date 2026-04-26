@@ -1956,20 +1956,6 @@ impl Gemma4Bringup {
         let vocab = arch.vocab_size as u32;
         let stream = self.stream.raw();
 
-        // === LOGIT-MARGIN DIAGNOSTIC ===
-        // RVLLM_DUMP_LOGITS=1 captures per-decode-step top-10 logits
-        // (token id + raw f32 score) and dumps to disk after the run.
-        // Used to investigate per-step argmax stability under low-
-        // precision KV (e.g. pure NVFP4). Cost when on: one DtoH
-        // copy of `vocab` f32s per decode step (~1.05 MiB for Gemma 4
-        // vocab=263168), plus a small partial-sort. Off-by-default;
-        // production paths see zero overhead.
-        let dump_logits: bool = std::env::var_os("RVLLM_DUMP_LOGITS").is_some();
-        let mut logit_history: Vec<(u32, Vec<(u32, f32)>)> = Vec::new();
-        let dump_logits_dir = std::env::var("RVLLM_DUMP_LOGITS_DIR")
-            .unwrap_or_else(|_| "/tmp/rvllm_logits".to_string());
-        // === END LOGIT-MARGIN DIAGNOSTIC ===
-
         // === REPETITION PENALTY ===
         // Greedy-compatible logits processor. When set, divides the
         // logit of any token in `recent_ids` by `penalty` (positive
@@ -3035,23 +3021,6 @@ impl Gemma4Bringup {
         }.launch(kernels.fused_rmsnorm, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
         self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
             logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
-        // === LOGIT-MARGIN DIAGNOSTIC: prefill output's top-10 ===
-        if dump_logits {
-            self.stream.fence()?;
-            let mut host_logits = vec![0f32; vocab as usize];
-            cudarc::driver::sys::cuMemcpyDtoH_v2(
-                host_logits.as_mut_ptr() as *mut _,
-                logits_f32.device_ptr(),
-                (vocab as usize) * 4,
-            );
-            let mut idx: Vec<(u32, f32)> = host_logits.iter().enumerate()
-                .map(|(i, &v)| (i as u32, v)).collect();
-            idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            idx.truncate(10);
-            // step 0 = prefill output (the first generated token)
-            logit_history.push((0u32, idx));
-        }
-        // === END ===
         rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
             .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
 
@@ -3319,25 +3288,6 @@ impl Gemma4Bringup {
                 }
             }
             // === END REPETITION PENALTY ===
-            // === LOGIT-MARGIN DIAGNOSTIC: decode-step top-10 ===
-            if dump_logits {
-                self.stream.fence()?;
-                let mut host_logits = vec![0f32; vocab as usize];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    host_logits.as_mut_ptr() as *mut _,
-                    logits_f32.device_ptr(),
-                    (vocab as usize) * 4,
-                );
-                let mut idx: Vec<(u32, f32)> = host_logits.iter().enumerate()
-                    .map(|(i, &v)| (i as u32, v)).collect();
-                idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                idx.truncate(10);
-                // decode_step is 0-based for the 2nd token onwards;
-                // store as step = decode_step + 1 since prefill output
-                // is step 0.
-                logit_history.push(((decode_step as u32) + 1, idx));
-            }
-            // === END ===
             rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
                 .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
 
@@ -3424,46 +3374,6 @@ impl Gemma4Bringup {
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let decode_ms = total_ms - prefill_ms;
 
-        // === LOGIT-MARGIN DIAGNOSTIC: write captured top-10 history ===
-        if dump_logits && !logit_history.is_empty() {
-            let _ = std::fs::create_dir_all(&dump_logits_dir);
-            // Filename includes nanosecond ts so consecutive requests
-            // don't overwrite each other.
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos()).unwrap_or(0);
-            let path = format!("{}/logits_{}.json", dump_logits_dir, ts);
-            // Build JSON manually to avoid pulling serde_json in here:
-            // [{"step":N,"emitted":<id>,"top10":[[id,score],...]}, ...]
-            let mut buf = String::from("{\n  \"prompt_tokens\": ");
-            buf.push_str(&prompt_ids.len().to_string());
-            buf.push_str(",\n  \"output_ids\": [");
-            for (i, t) in output_ids.iter().enumerate() {
-                if i > 0 { buf.push(','); }
-                buf.push_str(&t.to_string());
-            }
-            buf.push_str("],\n  \"steps\": [\n");
-            for (si, (step, top)) in logit_history.iter().enumerate() {
-                if si > 0 { buf.push_str(",\n"); }
-                let emitted = output_ids.get(*step as usize).copied().unwrap_or(u32::MAX);
-                buf.push_str(&format!(
-                    "    {{\"step\":{},\"emitted\":{},\"top10\":[",
-                    step, emitted));
-                for (ti, (id, score)) in top.iter().enumerate() {
-                    if ti > 0 { buf.push(','); }
-                    buf.push_str(&format!("[{},{:.6}]", id, score));
-                }
-                buf.push_str("]}");
-            }
-            buf.push_str("\n  ]\n}\n");
-            if let Err(e) = std::fs::write(&path, &buf) {
-                tracing::warn!(?path, error = %e, "logit-margin dump write failed");
-            } else {
-                eprintln!("[logit-margin] dumped {} steps × top-10 to {}",
-                    logit_history.len(), path);
-            }
-        }
-        // === END LOGIT-MARGIN DIAGNOSTIC ===
         eprintln!("[generate] {} tokens decoded in {:.1}ms ({:.1} tok/s)",
             output_ids.len(), decode_ms, output_ids.len() as f64 / (decode_ms / 1000.0));
 
