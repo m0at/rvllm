@@ -905,10 +905,8 @@ pub unsafe fn gemma4_forward_phase(
                     // (token, head) Q descale table populated by
                     // `rope_nvfp4kv`. Required for `RVLLM_NVFP4_HADAMARD=1`
                     // where rotated Q saturates the static scalar.
-                    let nvfp4_per_token_q = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
-                        .map(|s| matches!(s.as_str(),
-                            "1" | "true" | "TRUE" | "yes" | "on"))
-                        .unwrap_or(false);
+                    let nvfp4_per_token_q =
+                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/false);
                     let nvfp4_q_scale_cache: u64 =
                         if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
                     // === END DYNAMIC NVFP4 Q SCALE ===
@@ -1025,10 +1023,8 @@ pub unsafe fn gemma4_forward_phase(
                     // dequants Q with the same scale rope used at
                     // quantize time. Required for RVLLM_NVFP4_HADAMARD
                     // where rotated Q can saturate the static scalar.
-                    let nvfp4_per_token_q = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
-                        .map(|s| matches!(s.as_str(),
-                            "1" | "true" | "TRUE" | "yes" | "on"))
-                        .unwrap_or(false);
+                    let nvfp4_per_token_q =
+                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/false);
                     let nvfp4_q_scale_cache: u64 =
                         if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
                     // === END DYNAMIC NVFP4 Q SCALE ===
@@ -1050,10 +1046,8 @@ pub unsafe fn gemma4_forward_phase(
                     )?;
                 } else {
                     // === DYNAMIC NVFP4 Q SCALE ===
-                    let nvfp4_per_token_q = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
-                        .map(|s| matches!(s.as_str(),
-                            "1" | "true" | "TRUE" | "yes" | "on"))
-                        .unwrap_or(false);
+                    let nvfp4_per_token_q =
+                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/false);
                     let nvfp4_q_scale_cache: u64 =
                         if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
                     // === END DYNAMIC NVFP4 Q SCALE ===
@@ -2115,10 +2109,8 @@ unsafe fn rope_nvfp4kv(
     // values can saturate the static scalar (default 0.1). When 0,
     // the kernel reads the static `q_scale_ptr` (pre-Hadamard
     // behaviour, byte-identical to the prior path).
-    let per_token_q_scale = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
-        .map(|s| matches!(s.as_str(),
-            "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false);
+    let per_token_q_scale =
+        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/false);
     let mut q_scale_cache_arg: u64 =
         if per_token_q_scale { scratch.q_scale_cache } else { 0 };
     // === END DYNAMIC NVFP4 Q SCALE ===

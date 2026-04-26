@@ -203,12 +203,12 @@ impl PrefixProvenance {
             .ok().and_then(|s| parse_policy(&s)).unwrap_or(scale_policy);
         let v_scale_policy = std::env::var("RVLLM_NVFP4_V_SCALE_POLICY")
             .ok().and_then(|s| parse_policy(&s)).unwrap_or(scale_policy);
-        let hadamard = std::env::var("RVLLM_NVFP4_HADAMARD")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-            .unwrap_or(false);
-        let per_token_q_scale = std::env::var("RVLLM_PER_TOKEN_Q_SCALE")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-            .unwrap_or(false);
+        let hadamard = parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(false);
+        // Provenance tracks the NVFP4 path's effective gate (default OFF).
+        // The FP8 scratch-allocation path uses default ON via
+        // per_token_q_scale_enabled(true); the two record different bools
+        // when env is unset, intentionally, but parsing is unified.
+        let per_token_q_scale = parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(false);
         let batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
         let unified_prefill = std::env::var_os("RVLLM_UNIFIED_PREFILL").is_some();
         Self { chunk_size, kv_dtype, hybrid_global_fp8, scale_policy,
@@ -278,13 +278,39 @@ impl NvFp4HadamardAlloc {
     }
 }
 
+/// Tri-state env truthiness parser used by every NVFP4/FP8 quality
+/// gate. Returns `Some(true)` for `"1"|"true"|"TRUE"|"yes"|"on"`,
+/// `Some(false)` for `"0"|"false"|"FALSE"|"no"|"off"|""`, and `None`
+/// for anything else so the caller falls back to a documented default.
+/// Centralised so a profile typo (e.g. `RVLLM_PER_TOKEN_Q_SCALE=yess`)
+/// behaves consistently across allocation, rope, decode, prefill, and
+/// the prefix-cache provenance check.
+pub(crate) fn parse_truthy_env(name: &str) -> Option<bool> {
+    let v = std::env::var(name).ok()?;
+    match v.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "on" => Some(true),
+        "0" | "false" | "FALSE" | "no" | "off" | "" => Some(false),
+        _ => None,
+    }
+}
+
 /// Master env gate. Default OFF — production paths byte-identical
-/// when unset. Operator opts in by setting
-/// `RVLLM_NVFP4_HADAMARD=1` (any non-empty/non-"0" value enables).
+/// when unset. Operator opts in by setting `RVLLM_NVFP4_HADAMARD=1`.
 pub fn nvfp4_hadamard_enabled() -> bool {
-    std::env::var("RVLLM_NVFP4_HADAMARD")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
+    parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(false)
+}
+
+/// Per-token Q scale gate.
+/// * For the FP8-KV path the scratch allocation defaults ON because
+///   per-token Q materially helps PPL on prose (memory aa010018 in the
+///   rvllm-coder scenario). Operator opts out via
+///   `RVLLM_PER_TOKEN_Q_SCALE=0`.
+/// * For the NVFP4-KV path the rope launcher gates separately and
+///   defaults OFF; operator opts in via `RVLLM_PER_TOKEN_Q_SCALE=1`.
+/// The asymmetry is intentional but the parsing must agree, otherwise a
+/// profile typo silently changes Q dequant behavior on one path only.
+pub(crate) fn per_token_q_scale_enabled(default_on: bool) -> bool {
+    parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(default_on)
 }
 
 /// Generate a deterministic ±1 sign byte from
@@ -848,10 +874,10 @@ impl Gemma4Bringup {
         // the scalar q_scale_ptr (pre-c69f641 behaviour) so PPL can be
         // compared across the two calibration strategies without a rebuild.
         let q_scale_cache_ptr: u64 =
-            if std::env::var("RVLLM_PER_TOKEN_Q_SCALE").ok().as_deref() == Some("0") {
-                0
-            } else {
+            if per_token_q_scale_enabled(/*default_on=*/true) {
                 q_scale_scratch.device_ptr()
+            } else {
+                0
             };
         #[cfg(feature = "cuda")]
         {
@@ -1394,10 +1420,10 @@ impl Gemma4Bringup {
             q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
         // See run_bench: RVLLM_PER_TOKEN_Q_SCALE=0 opts out.
         let q_scale_cache_ptr: u64 =
-            if std::env::var("RVLLM_PER_TOKEN_Q_SCALE").ok().as_deref() == Some("0") {
-                0
-            } else {
+            if per_token_q_scale_enabled(/*default_on=*/true) {
                 q_scale_scratch.device_ptr()
+            } else {
+                0
             };
 
         let q_scale_region = arena.region("q_scale", 4, 4)?;
@@ -2175,10 +2201,10 @@ impl Gemma4Bringup {
             q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
         // See run_bench: RVLLM_PER_TOKEN_Q_SCALE=0 opts out.
         let q_scale_cache_ptr: u64 =
-            if std::env::var("RVLLM_PER_TOKEN_Q_SCALE").ok().as_deref() == Some("0") {
-                0
-            } else {
+            if per_token_q_scale_enabled(/*default_on=*/true) {
                 q_scale_scratch.device_ptr()
+            } else {
+                0
             };
 
         let q_scale_region = arena.region("gen_q_scale", 4, 4)?;
