@@ -207,6 +207,10 @@ pub struct PrefixProvenance {
     /// default is NVFP4. Stored as the raw env string so flipping any
     /// element triggers invalidation; `String::new()` when unset.
     pub fp8_kv_layers: String,
+    /// Cycle 31: stochastic-rounding gate for V. Changes packed V bytes
+    /// (different fp4_encode path) so flipping mid-session would silently
+    /// reuse incompatible V data on prefix-cache hits.
+    pub stoch_round_v: bool,
 }
 
 impl PrefixProvenance {
@@ -248,10 +252,11 @@ impl PrefixProvenance {
             .map(|v| v != "0").unwrap_or(false);
         let fp8_kv_layers = std::env::var("RVLLM_FP8_KV_LAYERS")
             .unwrap_or_default();
+        let stoch_round_v = parse_truthy_env("RVLLM_NVFP4_STOCH_ROUND_V").unwrap_or(false);
         Self { chunk_size, kv_dtype, hybrid_global_fp8, scale_policy,
                k_scale_policy, v_scale_policy, hadamard, hadamard_v,
                per_token_q_scale, batch_prefill, unified_prefill, split_kv,
-               hybrid_sliding_fp8, fp8_kv_layers }
+               hybrid_sliding_fp8, fp8_kv_layers, stoch_round_v }
     }
 }
 

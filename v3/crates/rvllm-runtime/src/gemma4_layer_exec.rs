@@ -2220,6 +2220,14 @@ unsafe fn rope_nvfp4kv(
     // V never gets RoPE) instead of shadow_rope's f16 V output.
     let mut debug_v_prequant: u64 = scratch.shadow_v_cache;
     // === END CYCLE 29 ===
+    // === CYCLE 31 STOCHASTIC V ROUNDING ===
+    // Opt-in via RVLLM_NVFP4_STOCH_ROUND_V=1. Default OFF (deterministic
+    // round-to-nearest preserves byte-identical legacy behavior). Seed
+    // is per-(slot,head,lane) so prefix-cache reuse stays consistent.
+    let mut stoch_round_v: i32 =
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_STOCH_ROUND_V")
+            .unwrap_or(false) { 1 } else { 0 };
+    // === END CYCLE 31 ===
     let mut nt = dims.num_tokens as i32;
     let mut nh = dims.num_heads as i32;
     let mut nkvh = dims.num_kv_heads as i32;
@@ -2284,6 +2292,9 @@ unsafe fn rope_nvfp4kv(
         // === CYCLE 29 V PRE-QUANT SIDECAR ===
         (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
         // === END CYCLE 29 ===
+        // === CYCLE 31 STOCHASTIC V ROUNDING ===
+        (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
+        // === END CYCLE 31 ===
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);

@@ -80,6 +80,57 @@ __device__ __forceinline__ uint32_t fp4_encode(float scaled) {
     return sign | e;
 }
 
+/// Cycle 31: stochastic-rounding variant of fp4_encode. For values
+/// between two FP4 levels `a < x < b`, rounds UP with probability
+/// `(x - a) / (b - a)`, else rounds to `a`. Produces an unbiased
+/// estimator: `E[fp4_decode(stoch(x))] = x` (when scale is exact).
+///
+/// Round-to-nearest produces correlated per-element bias that
+/// compounds across 60 attention layers; stochastic rounding averages
+/// out under attention sums (V is summed weighted by P, so the noise
+/// terms tend to cancel — an unbiased noise floor instead of a
+/// systematic shift).
+///
+/// Seed should be unique per (token, head, lane, step) so the same
+/// position uses the same random across re-quantization of identical
+/// inputs (otherwise prefix-cache reuse would diverge).
+__device__ __forceinline__ uint32_t fp4_encode_stochastic(float scaled, uint32_t seed) {
+    uint32_t sign = (scaled < 0.0f) ? 0x8u : 0x0u;
+    float mag = fabsf(scaled);
+
+    // FP4 magnitude levels.
+    static constexpr float L[8] =
+        {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+    // Find lower-bracket index e_lo such that L[e_lo] <= mag < L[e_lo+1].
+    // Saturates at 7 for mag >= L[7] = 6.
+    uint32_t e_lo;
+    if      (mag < L[1]) e_lo = 0;
+    else if (mag < L[2]) e_lo = 1;
+    else if (mag < L[3]) e_lo = 2;
+    else if (mag < L[4]) e_lo = 3;
+    else if (mag < L[5]) e_lo = 4;
+    else if (mag < L[6]) e_lo = 5;
+    else if (mag < L[7]) e_lo = 6;
+    else                 return sign | 7u;  // saturate, no randomization
+    uint32_t e_hi = e_lo + 1u;
+
+    float lower = L[e_lo];
+    float upper = L[e_hi];
+    float frac = (mag - lower) / (upper - lower);  // ∈ [0, 1)
+
+    // SplitMix32 — same finalizer used elsewhere in the codebase.
+    uint32_t z = seed + 0x9E3779B9u;
+    z = (z ^ (z >> 16)) * 0x85EBCA6Bu;
+    z = (z ^ (z >> 13)) * 0xC2B2AE35u;
+    z =  z ^ (z >> 16);
+    // Uniform in [0, 1) using top 24 bits.
+    float u = __uint2float_rn(z >> 8) * (1.0f / 16777216.0f);
+
+    uint32_t e = (u < frac) ? e_hi : e_lo;
+    return sign | e;
+}
+
 /// Pick the per-16-element E4M3 scale for a block of FP32 values.
 /// The scale picks the block's peak magnitude and maps it to the
 /// largest representable NVFP4 magnitude (6.0). Clamps to the

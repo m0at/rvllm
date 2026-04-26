@@ -179,8 +179,11 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
     __half*        __restrict__ debug_k_prequant,
     // === END CYCLE 28 ===
     // === CYCLE 29 V PRE-QUANT SIDECAR ===
-    __half*        __restrict__ debug_v_prequant
+    __half*        __restrict__ debug_v_prequant,
     // === END CYCLE 29 ===
+    // === CYCLE 31 STOCHASTIC ROUNDING (V only) ===
+    int            stoch_round_v
+    // === END CYCLE 31 ===
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -336,8 +339,16 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
             // === END HADAMARD ROTATION ===
             int            policy,
             // === CYCLE 28 PRE-QUANT SIDECAR ===
-            __half*        debug_prequant
+            __half*        debug_prequant,
             // === END CYCLE 28 ===
+            // === CYCLE 31 STOCHASTIC ROUNDING ===
+            // Per-side gate. K stays deterministic (round-to-nearest)
+            // because randomizing K would jitter softmax routing across
+            // re-prefills of the same prompt. V uses stochastic when
+            // gate is set — under attention's weighted sum the unbiased
+            // noise tends to average out across long contexts.
+            bool           stoch_round
+            // === END CYCLE 31 ===
         ) {
             float v = apply_rope ? rope_one(in, k_base)
                                  : __half2float(in[k_base + tid]);
@@ -414,7 +425,21 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
             }
 
             // Each thread encodes its own 4-bit nibble.
-            uint32_t nibble = fp4_encode(v * inv_scale);
+            // === CYCLE 31 STOCHASTIC ROUNDING ===
+            // Seed = (slot, head, lane) packed — deterministic per
+            // position so re-prefill of the same token reuses the same
+            // random draw (otherwise prefix-cache would silently
+            // diverge). Mixed via SplitMix32 inside fp4_encode_stochastic.
+            uint32_t nibble;
+            if (stoch_round) {
+                uint32_t seed = static_cast<uint32_t>(slot) * 65521u
+                              + static_cast<uint32_t>(head_idx) * 257u
+                              + static_cast<uint32_t>(tid);
+                nibble = fp4_encode_stochastic(v * inv_scale, seed);
+            } else {
+                nibble = fp4_encode(v * inv_scale);
+            }
+            // === END CYCLE 31 ===
 
             // Pair lanes (even, odd) combine into one byte: low = even,
             // high = odd. Use shuffle to pull the odd nibble to the
@@ -436,10 +461,12 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
         const bool v_rotate_now = hadamard_on && (rotate_v != 0);
         quant_and_write(k_in, key_cache_packed,   key_cache_scale,
                         /*apply_rope=*/true,  /*apply_rotation=*/hadamard_on,
-                        scale_policy, /*debug_prequant=*/debug_k_prequant);
+                        scale_policy, /*debug_prequant=*/debug_k_prequant,
+                        /*stoch_round=*/false);
         quant_and_write(v_in, value_cache_packed, value_cache_scale,
                         /*apply_rope=*/false, /*apply_rotation=*/v_rotate_now,
-                        v_scale_policy, /*debug_prequant=*/debug_v_prequant);
+                        v_scale_policy, /*debug_prequant=*/debug_v_prequant,
+                        /*stoch_round=*/(stoch_round_v != 0));
         // === END HADAMARD ROTATION ===
     }
 }
