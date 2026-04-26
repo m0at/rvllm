@@ -185,9 +185,20 @@ pub struct PrefixProvenance {
     pub v_scale_policy: u32,
     // NVFP4 quality knobs that change how K/Q-side state is interpreted.
     pub hadamard: bool,
+    /// Whether V was Hadamard-rotated before NVFP4 packing. Cached V
+    /// bytes differ between rotated/unrotated, so flipping this gate
+    /// across requests on the same prefix-cache slot reuses
+    /// incompatible V data — must invalidate the cache.
+    pub hadamard_v: bool,
     pub per_token_q_scale: bool,
     pub batch_prefill: bool,
     pub unified_prefill: bool,
+    /// Split-KV decode (paged_attention_v2 style). The split kernel
+    /// has documented quality issues on long-context tool-call
+    /// prompts even with Hadamard rotation; tracked here because
+    /// flipping it changes which kernel reads the V cache and a
+    /// silent flip mid-session could mask the failure mode.
+    pub split_kv: bool,
 }
 
 impl PrefixProvenance {
@@ -217,11 +228,17 @@ impl PrefixProvenance {
         // per_token_q_scale_enabled(true); the two record different bools
         // when env is unset, intentionally, but parsing is unified.
         let per_token_q_scale = parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(false);
+        let hadamard_v = parse_truthy_env("RVLLM_NVFP4_HADAMARD_V").unwrap_or(false);
         let batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
         let unified_prefill = std::env::var_os("RVLLM_UNIFIED_PREFILL").is_some();
+        // Default ON in dispatch (gemma4_layer_exec.rs line ~870), opt-out via "0"/etc.
+        let split_kv = std::env::var("RVLLM_NVFP4_SPLIT_KV")
+            .map(|s| !matches!(s.as_str(),
+                "0" | "false" | "FALSE" | "no" | "off" | ""))
+            .unwrap_or(true);
         Self { chunk_size, kv_dtype, hybrid_global_fp8, scale_policy,
-               k_scale_policy, v_scale_policy, hadamard, per_token_q_scale,
-               batch_prefill, unified_prefill }
+               k_scale_policy, v_scale_policy, hadamard, hadamard_v,
+               per_token_q_scale, batch_prefill, unified_prefill, split_kv }
     }
 }
 
