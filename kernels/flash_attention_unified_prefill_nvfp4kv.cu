@@ -65,6 +65,20 @@ __device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
 #endif
 }
 
+// Direct fp8→half cast — skips the f32 round-trip when the consumer
+// stores f16 anyway (Q load → s_q_f16). On sm_121 this is one PTX
+// `cvt.rn.f16.e4m3` instruction; the older fallback path goes via
+// the float decoder + __float2half.
+__device__ __forceinline__ __half fp8kv_decode_byte_half(unsigned char b) {
+#if __CUDA_ARCH__ >= 1000
+    __half_raw hr = __nv_cvt_fp8_to_halfraw(
+        (__nv_fp8_storage_t)b, __NV_E4M3);
+    return __half(hr);
+#else
+    return __float2half(fp8kv_decode_byte(b));
+#endif
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -254,7 +268,9 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
         }
         const int tok = seq_q_start + q_pos_in_seq;
         unsigned char qb = query[(tok * num_heads + q_head) * head_dim + d];
-        s_q_f16[idx] = __float2half(fp8kv_decode_byte(qb));
+        // Direct fp8→f16 (skips the f32 round-trip the older
+        // fp8kv_decode_byte path goes through).
+        s_q_f16[idx] = fp8kv_decode_byte_half(qb);
     }
     if (tid < BLOCK_M) {
         const int m = tid;
