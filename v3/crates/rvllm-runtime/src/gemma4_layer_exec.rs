@@ -2214,6 +2214,12 @@ unsafe fn rope_nvfp4kv(
     // that comparison was uncorrelated anyway (codex review).
     let mut debug_k_prequant: u64 = scratch.shadow_k_cache;
     // === END CYCLE 28 ===
+    // === CYCLE 29 V PRE-QUANT SIDECAR ===
+    // Mirror the cycle-28 K patch for V. Reuses scratch.shadow_v_cache —
+    // shadow region holds primary's pre-quant V (post-optional-Hadamard,
+    // V never gets RoPE) instead of shadow_rope's f16 V output.
+    let mut debug_v_prequant: u64 = scratch.shadow_v_cache;
+    // === END CYCLE 29 ===
     let mut nt = dims.num_tokens as i32;
     let mut nh = dims.num_heads as i32;
     let mut nkvh = dims.num_kv_heads as i32;
@@ -2275,6 +2281,9 @@ unsafe fn rope_nvfp4kv(
         // === CYCLE 28 PRE-QUANT SIDECAR ===
         (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
         // === END CYCLE 28 ===
+        // === CYCLE 29 V PRE-QUANT SIDECAR ===
+        (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
+        // === END CYCLE 29 ===
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);

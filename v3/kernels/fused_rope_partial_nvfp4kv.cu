@@ -176,8 +176,11 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
     // ambiguity by giving the analyzer the EXACT input the quantizer
     // saw — apples-to-apples with my Python dequant of the packed nibbles
     // + scale.
-    __half*        __restrict__ debug_k_prequant
+    __half*        __restrict__ debug_k_prequant,
     // === END CYCLE 28 ===
+    // === CYCLE 29 V PRE-QUANT SIDECAR ===
+    __half*        __restrict__ debug_v_prequant
+    // === END CYCLE 29 ===
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -436,7 +439,7 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
                         scale_policy, /*debug_prequant=*/debug_k_prequant);
         quant_and_write(v_in, value_cache_packed, value_cache_scale,
                         /*apply_rope=*/false, /*apply_rotation=*/v_rotate_now,
-                        v_scale_policy, /*debug_prequant=*/nullptr);
+                        v_scale_policy, /*debug_prequant=*/debug_v_prequant);
         // === END HADAMARD ROTATION ===
     }
 }
