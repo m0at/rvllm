@@ -3021,6 +3021,36 @@ impl Gemma4Bringup {
         }.launch(kernels.fused_rmsnorm, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
         self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
             logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
+        // === TOOL-CALL OPEN-TAG BIAS (cycle 14 pragmatic fix) ===
+        // Cumulative quantization noise over 60 layers gives ~1.5 logit
+        // units of consistent bias toward token 49 ("<tool_call|>",
+        // close-tag) over token 48 ("<|tool_call>", open-tag) at
+        // decode-step 0 of long-context tool-eligible prompts. The
+        // model gets razor-thin margins (0.27 vs 17+ in clean WHO)
+        // and greedy lands on the wrong special token, which has no
+        // valid training continuation → garbage spiral.
+        // Apply a small positive bias to token 48 to nudge the choice
+        // toward the training-shape canonical open-tag. Env-gated so
+        // it can be A/B'd. Default OFF for safety.
+        let tool_call_bias = std::env::var("RVLLM_TOOL_CALL_OPEN_BIAS")
+            .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        if tool_call_bias != 0.0 {
+            // Token 48 = `<|tool_call>` (training-shape open). Add the
+            // bias to its logit position.
+            let mut logit_48: f32 = 0.0;
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                &mut logit_48 as *mut _ as *mut _,
+                logits_f32.device_ptr() + 48 * 4,
+                4,
+            );
+            let new_logit = logit_48 + tool_call_bias;
+            cudarc::driver::sys::cuMemcpyHtoD_v2(
+                logits_f32.device_ptr() + 48 * 4,
+                &new_logit as *const _ as *const _,
+                4,
+            );
+        }
+        // === END TOOL-CALL OPEN-TAG BIAS ===
         rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
             .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
 
