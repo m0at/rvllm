@@ -183,24 +183,6 @@ pub async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> ApiResult<ChatCompletionsResponse> {
     let request_id = Uuid::new_v4();
-    // === NVFP4 SHADOW DIAGNOSTIC ===
-    // `X-Rvllm-Shadow: 1` (or `kv-f16-v1`) opts THIS request into the
-    // f16-shadow KV-cache diagnostic. The header is transport
-    // metadata, not part of the OpenAI request body — it does not
-    // pollute the chat schema, is not echoed in responses or logs as
-    // a model param, and cannot be set accidentally by upstream
-    // clients (zeroclaw classifier etc.) that don't know about it.
-    let shadow_requested = headers
-        .get("x-rvllm-shadow")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| matches!(s.trim(), "1" | "true" | "kv-f16-v1"))
-        .unwrap_or(false);
-    if shadow_requested {
-        tracing::info!(
-            request_id = %request_id,
-            "X-Rvllm-Shadow set — request will fire NVFP4 shadow diagnostic if latch fresh"
-        );
-    }
     let span = tracing::info_span!(
         "chat_completions",
         request_id = %request_id,
@@ -303,7 +285,6 @@ pub async fn chat_completions(
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         events_tx,
         cancelled: cancelled.clone(),
-        shadow_requested,
     };
     tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
@@ -956,12 +937,6 @@ pub async fn completions(
         stream = req.stream,
     );
     let _enter = span.enter();
-    // === NVFP4 SHADOW DIAGNOSTIC === see chat_completions for full doc.
-    let shadow_requested = headers
-        .get("x-rvllm-shadow")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| matches!(s.trim(), "1" | "true" | "kv-f16-v1"))
-        .unwrap_or(false);
 
     ensure_model_matches(&state, &req.model)?;
     reject_v1_unsupported_completions(&req)?;
@@ -1011,7 +986,6 @@ pub async fn completions(
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         events_tx,
         cancelled: cancelled.clone(),
-        shadow_requested,
     };
     tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
