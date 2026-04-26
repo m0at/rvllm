@@ -44,6 +44,24 @@ impl SamplingParams {
     /// Negative values (temperature < 0, top_p < 0) are still a hard
     /// 400 because they're nonsensical, not just unsupported.
     pub fn ensure_supported(self) -> Result<GreedyParams, ApiError> {
+        // Cycle 36 P1 (codex audit): NaN previously slipped through every
+        // <0 / >1 comparison and got silently coerced to greedy. Reject
+        // any non-finite first so callers see a clear 400 instead of
+        // unspecified behavior.
+        if !self.temperature.is_finite() {
+            return Err(ApiError::invalid_param(
+                "temperature must be a finite number",
+                "temperature",
+                "invalid_value",
+            ));
+        }
+        if !self.top_p.is_finite() {
+            return Err(ApiError::invalid_param(
+                "top_p must be a finite number",
+                "top_p",
+                "invalid_value",
+            ));
+        }
         if self.temperature < 0.0 {
             return Err(ApiError::invalid_param(
                 "temperature must be non-negative",
@@ -137,5 +155,42 @@ mod tests {
     fn out_of_range_top_p_rejected() {
         let p = SamplingParams { temperature: 0.0, top_p: 1.5, ..Default::default() };
         assert!(p.ensure_supported().is_err());
+    }
+
+    // === Cycle 36 NaN/inf rejection tests ===
+
+    #[test]
+    fn nan_temperature_rejected() {
+        let p = SamplingParams { temperature: f32::NAN, ..Default::default() };
+        let err = p.ensure_supported().expect_err("NaN must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("temperature"), "wrong field in error: {msg}");
+    }
+
+    #[test]
+    fn nan_top_p_rejected() {
+        let p = SamplingParams { temperature: 0.0, top_p: f32::NAN, ..Default::default() };
+        let err = p.ensure_supported().expect_err("NaN top_p must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("top_p"), "wrong field in error: {msg}");
+    }
+
+    #[test]
+    fn positive_infinity_temperature_rejected() {
+        let p = SamplingParams { temperature: f32::INFINITY, ..Default::default() };
+        assert!(p.ensure_supported().is_err());
+    }
+
+    #[test]
+    fn negative_infinity_temperature_rejected() {
+        let p = SamplingParams { temperature: f32::NEG_INFINITY, ..Default::default() };
+        assert!(p.ensure_supported().is_err());
+    }
+
+    #[test]
+    fn top_p_zero_accepted() {
+        // top_p=0 is technically valid (means "argmax"); not a rejection case.
+        let p = SamplingParams { temperature: 0.0, top_p: 0.0, ..Default::default() };
+        assert!(p.ensure_supported().is_ok());
     }
 }

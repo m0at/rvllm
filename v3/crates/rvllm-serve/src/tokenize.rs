@@ -611,6 +611,72 @@ mod tests {
         );
     }
 
+    // === Cycle 36 pure unit tests for normalize_tool_calls edge cases ===
+
+    #[test]
+    fn normalize_tool_calls_handles_empty_array() {
+        let calls = serde_json::json!([]);
+        let normalized = normalize_tool_calls(&calls);
+        assert_eq!(normalized, serde_json::json!([]));
+    }
+
+    #[test]
+    fn normalize_tool_calls_skips_call_without_function() {
+        let calls = serde_json::json!([{"id": "c1", "type": "function"}]);
+        let normalized = normalize_tool_calls(&calls);
+        assert_eq!(normalized, calls); // unchanged
+    }
+
+    #[test]
+    fn normalize_tool_calls_skips_call_without_arguments() {
+        let calls = serde_json::json!([{"function": {"name": "foo"}}]);
+        let normalized = normalize_tool_calls(&calls);
+        assert_eq!(normalized, calls); // unchanged
+    }
+
+    #[test]
+    fn normalize_tool_calls_handles_nested_object_args() {
+        // When args is a JSON-object string like `{"options":{"deep":1}}`,
+        // the parsed object should preserve the nested structure.
+        let calls = serde_json::json!([{
+            "function": { "name": "foo", "arguments": "{\"options\":{\"deep\":1}}" }
+        }]);
+        let normalized = normalize_tool_calls(&calls);
+        let args = &normalized[0]["function"]["arguments"];
+        assert!(args.is_object());
+        assert_eq!(args["options"]["deep"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn normalize_tool_calls_leaves_array_arguments_alone() {
+        // If args is a JSON ARRAY string (not object), the existing
+        // policy keeps it as a string. Defensive: array form is rare.
+        let calls = serde_json::json!([{
+            "function": { "name": "foo", "arguments": "[1,2,3]" }
+        }]);
+        let normalized = normalize_tool_calls(&calls);
+        let args = &normalized[0]["function"]["arguments"];
+        // The current policy: only OBJECT is parsed. Array string stays string.
+        assert!(args.is_string(), "expected string, got {args:?}");
+    }
+
+    #[test]
+    fn normalize_tool_calls_leaves_invalid_json_alone() {
+        let calls = serde_json::json!([{
+            "function": { "name": "foo", "arguments": "{bad json,," }
+        }]);
+        let normalized = normalize_tool_calls(&calls);
+        assert_eq!(normalized[0]["function"]["arguments"], serde_json::json!("{bad json,,"));
+    }
+
+    #[test]
+    fn normalize_tool_calls_top_level_non_array_is_passthrough() {
+        // Defensive: should not panic if calls is somehow not an array.
+        let calls = serde_json::json!({"not": "an array"});
+        let normalized = normalize_tool_calls(&calls);
+        assert_eq!(normalized, calls);
+    }
+
     #[test]
     fn stream_decoder_incrementally_emits() {
         let Some(dir) = std::env::var_os("RVLLM_TEST_MODEL_DIR") else {

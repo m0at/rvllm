@@ -294,6 +294,21 @@ pub async fn chat_completions(
     let request_timeout = state.config.request_timeout;
 
     if req.stream {
+        // Cycle 36 P1 (codex bug #1 follow-up): SSE has no stop-string
+        // truncation yet — the cycle 34 fix only covered non-streaming
+        // chat_collect. Rather than silently violate the caller's stop
+        // contract, reject up front. Proper streaming truncation needs
+        // an incremental decoded-buffer matcher that handles stops
+        // spanning chunks; tracked for cycle 37+.
+        if !stop_text.is_empty() {
+            return Err(ApiError::invalid_param(
+                "`stop` is not yet supported with stream=true (would be \
+                 silently ignored). Use stream=false, or wait for \
+                 streaming-truncation support.",
+                "stop",
+                "stop_with_stream_unsupported",
+            ));
+        }
         Ok(ChatCompletionsResponse::Stream(chat_stream_sse(
             model_id,
             tokenizer,
@@ -691,7 +706,11 @@ fn chat_stream_sse(
                         _ = tokio::time::sleep_until(deadline) => {
                             ctx.cancelled.store(true, Ordering::Relaxed);
                             tracing::warn!("sse request timeout — cancelling worker");
-                            ctx.state = S::Finish(FinishReason::Length);
+                            // Cycle 36 P1 (codex audit): timeout was reported
+                            // as FinishReason::Length, indistinguishable from
+                            // hitting max_tokens. Now Cancelled — clients can
+                            // tell wall-clock-timeout apart from natural stop.
+                            ctx.state = S::Finish(FinishReason::Cancelled);
                             continue;
                         }
                         ev = rx.recv() => ev,
@@ -758,8 +777,14 @@ fn chat_stream_sse(
                                     };
                                     continue;
                                 }
-                                Err(_e) => {
-                                    ctx.state = S::Finish(FinishReason::Stop);
+                                Err(e) => {
+                                    // Cycle 36 P1 (codex audit): decoder
+                                    // step errors were silently mapped to
+                                    // FinishReason::Stop, hiding tokenizer
+                                    // failures. Log + Cancelled instead.
+                                    tracing::error!(error = ?e,
+                                        "chat SSE decoder step failed — terminating stream");
+                                    ctx.state = S::Finish(FinishReason::Cancelled);
                                     continue;
                                 }
                             }
@@ -1111,6 +1136,17 @@ pub async fn completions(
     let request_timeout = state.config.request_timeout;
 
     if req.stream {
+        // Cycle 36 P1: reject stop on streaming completions for the
+        // same reason as chat — proper SSE truncation is cycle 37 work.
+        if !stop_text.is_empty() {
+            return Err(ApiError::invalid_param(
+                "`stop` is not yet supported with stream=true (would be \
+                 silently ignored). Use stream=false, or wait for \
+                 streaming-truncation support.",
+                "stop",
+                "stop_with_stream_unsupported",
+            ));
+        }
         Ok(CompletionsResponse::Stream(completion_stream_sse(
             model_id,
             tokenizer,
@@ -1265,7 +1301,11 @@ fn completion_stream_sse(
                         _ = tokio::time::sleep_until(deadline) => {
                             ctx.cancelled.store(true, Ordering::Relaxed);
                             tracing::warn!("sse request timeout — cancelling worker");
-                            ctx.state = S::Finish(FinishReason::Length);
+                            // Cycle 36 P1 (codex audit): timeout was reported
+                            // as FinishReason::Length, indistinguishable from
+                            // hitting max_tokens. Now Cancelled — clients can
+                            // tell wall-clock-timeout apart from natural stop.
+                            ctx.state = S::Finish(FinishReason::Cancelled);
                             continue;
                         }
                         ev = rx.recv() => ev,
@@ -1292,8 +1332,13 @@ fn completion_stream_sse(
                             ctx.state = S::Content { rx, decoder };
                             return Some((Ok(sse_json(&chunk)), ctx));
                         }
-                        Err(_) => {
-                            ctx.state = S::Finish(FinishReason::Stop);
+                        Err(e) => {
+                            // Cycle 36 P1 (codex audit): completion SSE
+                            // decoder errors were also silently Stop. Now
+                            // Cancelled with log to match chat SSE.
+                            tracing::error!(error = ?e,
+                                "completion SSE decoder step failed — terminating stream");
+                            ctx.state = S::Finish(FinishReason::Cancelled);
                             continue;
                         }
                     },
