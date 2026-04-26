@@ -520,4 +520,57 @@ mod tests {
         let s = r#"Let me check. <|tool_call>call:foo{"a":1}<tool_call|> done."#;
         assert_eq!(strip_tool_markup(s), "Let me check.  done.");
     }
+
+    // === Cycle 33/34 regression tests for parser visibility/safety ===
+
+    #[test]
+    fn malformed_opener_no_close_preserves_body() {
+        // Cycle 33 fix: prior code skipped to EOF when `<|tool_call>` had
+        // no matching `<tool_call|>` close, turning the model's broken
+        // tool-call attempt into "" content. Now we strip ONLY the opener
+        // tag itself so the body content surfaces — ugly UX but real
+        // diagnostic visibility.
+        let s = r#"<|tool_call>_- garbage la la la"#;
+        let stripped = strip_tool_markup(s);
+        // Opener tag is gone, but the body must remain visible.
+        assert!(!stripped.contains("<|tool_call>"));
+        assert!(stripped.contains("garbage"));
+    }
+
+    #[test]
+    fn malformed_opener_then_valid_call_preserves_call() {
+        // Even with a stray opener earlier in the stream, a real call
+        // later must still parse. Defensive — the bug-fix should not
+        // regress the multi-call mixed-content path.
+        let s = r#"<|tool_call> stray text <|tool_call>call:get_weather{"city":"Bern"}<tool_call|>"#;
+        let calls = parse_gemma4_tool_calls(s);
+        // At least one valid call is recovered.
+        assert!(!calls.is_empty(), "expected ≥1 valid call, got {}", calls.len());
+        assert!(calls.iter().any(|c| c.name == "get_weather"));
+    }
+
+    #[test]
+    fn empty_input_yields_empty_calls_and_empty_strip() {
+        assert_eq!(parse_gemma4_tool_calls("").len(), 0);
+        assert_eq!(strip_tool_markup(""), "");
+    }
+
+    #[test]
+    fn lone_close_tag_does_not_panic() {
+        // A stray `<tool_call|>` with no opener must not crash the parser.
+        let s = "some prose <tool_call|> more prose";
+        let _stripped = strip_tool_markup(s);
+        let _calls = parse_gemma4_tool_calls(s);
+        // No assertion on output shape — just that we got here.
+    }
+
+    #[test]
+    fn utf8_inside_tool_call_args() {
+        // German umlauts inside the JSON args of a valid call must
+        // round-trip. Regression for the panic discovered in cycle 13ish.
+        let s = r#"<|tool_call>call:weather{"city":"München"}<tool_call|>"#;
+        let calls = parse_gemma4_tool_calls(s);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].arguments.contains("München"));
+    }
 }

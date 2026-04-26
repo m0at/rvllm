@@ -307,7 +307,7 @@ pub async fn chat_completions(
         let _cancel_guard = CancelOnDrop(cancelled.clone());
         let body = chat_collect(
             &model_id, &tokenizer, events_rx, cancelled, request_timeout,
-            request_id,
+            request_id, &stop_text,
         )
         .await?;
         Ok(ChatCompletionsResponse::Json(Json(body)))
@@ -339,6 +339,7 @@ async fn chat_collect(
     cancelled: Arc<AtomicBool>,
     request_timeout: std::time::Duration,
     request_id: Uuid,
+    stop_text: &[String],
 ) -> ApiResult<ChatCompletionResponse> {
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
@@ -367,7 +368,14 @@ async fn chat_collect(
                     break;
                 }
                 Some(GenerateEvent::Error(msg)) => return Err(ApiError::Internal(msg)),
-                None => break, // worker channel closed
+                // Cycle 34 P0 fix (codex bug #2): worker channel closing
+                // without a Done event is a worker crash, not a clean
+                // completion. Returning Ok with finish=None lets clients
+                // mistake a CUDA fault for a normal short response. Surface
+                // it as a 500 instead.
+                None => return Err(ApiError::Internal(
+                    "worker channel closed before Done event".into(),
+                )),
             },
         }
     }
@@ -376,7 +384,25 @@ async fn chat_collect(
     // strip can match `<|tool_call>...<tool_call|>` and
     // `<|channel>thought\n...<channel|>` markers verbatim.
     // `shape_assistant_message` produces the user-visible content view.
-    let text = tokenizer.decode_raw(&token_ids)?;
+    let mut text = tokenizer.decode_raw(&token_ids)?;
+    // Cycle 34 P0 fix (codex bug #1): user-supplied stop strings were
+    // validated upstream but never enforced — generation continued past
+    // them. Apply post-decode truncation here. We truncate at the
+    // FIRST occurrence of ANY stop string and bump finish_reason to
+    // Stop. Operates on raw decoded text (with special tokens) so the
+    // tool_parser still sees the markup that survived the cut.
+    if !stop_text.is_empty() {
+        let mut earliest: Option<usize> = None;
+        for s in stop_text {
+            if let Some(pos) = text.find(s.as_str()) {
+                earliest = Some(earliest.map_or(pos, |e| e.min(pos)));
+            }
+        }
+        if let Some(pos) = earliest {
+            text.truncate(pos);
+            finish = Some(FinishReason::Stop);
+        }
+    }
 
     // Response dump (no-op unless RVLLM_DUMP_REQUEST_DIR set). Captures
     // the generated token prefix for collapse-index analysis on the
@@ -721,12 +747,21 @@ fn chat_stream_sse(
                             ctx.state = S::Finish(finish);
                             continue;
                         }
-                        Some(GenerateEvent::Error(_)) => {
-                            ctx.state = S::Finish(FinishReason::Stop);
+                        // Cycle 34 P0 fix (codex bug #2): SSE was mapping
+                        // worker error AND channel-close to FinishReason::Stop —
+                        // a CUDA crash looked like a clean completion to the
+                        // client. Now we log loudly + emit an error-flavored
+                        // SSE sentinel chunk so operators can see the failure
+                        // in journalctl AND clients can detect via the
+                        // non-`stop` finish_reason.
+                        Some(GenerateEvent::Error(msg)) => {
+                            tracing::error!(error = %msg, "SSE worker error event — terminating stream");
+                            ctx.state = S::Finish(FinishReason::Cancelled);
                             continue;
                         }
                         None => {
-                            ctx.state = S::Finish(FinishReason::Stop);
+                            tracing::error!("SSE worker channel closed without Done — terminating stream");
+                            ctx.state = S::Finish(FinishReason::Cancelled);
                             continue;
                         }
                     }
@@ -971,6 +1006,10 @@ pub async fn completions(
 
     let sampling = req.sampling_params().ensure_supported()?;
     let max_new = resolve_max_new(req.max_tokens, state.config.max_new_tokens_cap)?;
+    // Cycle 34 P0 (codex bug #1): completions did not even parse `stop`.
+    // Mirror chat-handler validation + post-decode truncation below.
+    let stop_text = req.stop.as_ref().map(|s| extract_stop(s)).unwrap_or_default();
+    validate_stops(&stop_text)?;
 
     let prompt_ids = state.tokenizer.encode(&prompt_text)?;
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
@@ -1011,6 +1050,7 @@ pub async fn completions(
             events_rx,
             cancelled,
             request_timeout,
+            &stop_text,
         )
         .await?;
         Ok(CompletionsResponse::Json(Json(body)))
@@ -1037,6 +1077,7 @@ async fn completion_collect(
     mut events_rx: mpsc::Receiver<GenerateEvent>,
     cancelled: Arc<AtomicBool>,
     request_timeout: std::time::Duration,
+    stop_text: &[String],
 ) -> ApiResult<CompletionResponse> {
     let mut token_ids: Vec<u32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
@@ -1062,11 +1103,29 @@ async fn completion_collect(
                     break;
                 }
                 Some(GenerateEvent::Error(msg)) => return Err(ApiError::Internal(msg)),
-                None => break,
+                // Cycle 34 P0 fix (codex bug #2): same fix as the chat
+                // handler — channel close before Done is a worker fault,
+                // not a successful empty completion.
+                None => return Err(ApiError::Internal(
+                    "worker channel closed before Done event".into(),
+                )),
             },
         }
     }
-    let text = tokenizer.decode(&token_ids)?;
+    let mut text = tokenizer.decode(&token_ids)?;
+    // Cycle 34 P0 (codex bug #1): post-decode stop-string truncation.
+    if !stop_text.is_empty() {
+        let mut earliest: Option<usize> = None;
+        for s in stop_text {
+            if let Some(pos) = text.find(s.as_str()) {
+                earliest = Some(earliest.map_or(pos, |e| e.min(pos)));
+            }
+        }
+        if let Some(pos) = earliest {
+            text.truncate(pos);
+            finish = Some(FinishReason::Stop);
+        }
+    }
     Ok(CompletionResponse {
         id: new_completion_id(),
         object: "text_completion",
