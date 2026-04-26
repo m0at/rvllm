@@ -199,6 +199,14 @@ pub struct PrefixProvenance {
     /// flipping it changes which kernel reads the V cache and a
     /// silent flip mid-session could mask the failure mode.
     pub split_kv: bool,
+    /// Inverse hybrid (cycle 25): all sliding layers FP8 KV when set.
+    /// Changes per-layer dtype dispatch so different bytes land in K/V
+    /// cache for sliding layers — must invalidate prefix cache on flip.
+    pub hybrid_sliding_fp8: bool,
+    /// Comma-separated layer-index list (cycle 24) forced to FP8 KV when
+    /// default is NVFP4. Stored as the raw env string so flipping any
+    /// element triggers invalidation; `String::new()` when unset.
+    pub fp8_kv_layers: String,
 }
 
 impl PrefixProvenance {
@@ -236,9 +244,14 @@ impl PrefixProvenance {
             .map(|s| !matches!(s.as_str(),
                 "0" | "false" | "FALSE" | "no" | "off" | ""))
             .unwrap_or(true);
+        let hybrid_sliding_fp8 = std::env::var("RVLLM_NVFP4_HYBRID_SLIDING_FP8")
+            .map(|v| v != "0").unwrap_or(false);
+        let fp8_kv_layers = std::env::var("RVLLM_FP8_KV_LAYERS")
+            .unwrap_or_default();
         Self { chunk_size, kv_dtype, hybrid_global_fp8, scale_policy,
                k_scale_policy, v_scale_policy, hadamard, hadamard_v,
-               per_token_q_scale, batch_prefill, unified_prefill, split_kv }
+               per_token_q_scale, batch_prefill, unified_prefill, split_kv,
+               hybrid_sliding_fp8, fp8_kv_layers }
     }
 }
 
