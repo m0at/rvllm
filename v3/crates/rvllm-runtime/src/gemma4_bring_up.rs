@@ -1956,6 +1956,77 @@ impl Gemma4Bringup {
         let vocab = arch.vocab_size as u32;
         let stream = self.stream.raw();
 
+        // === HOST-SIDE TEMPERATURE SAMPLING (cycle 16) ===
+        // Greedy argmax at razor-thin margins (~0.1-0.5 logit units)
+        // makes long-context tool-call generation produce confident
+        // garbage. Sampling at temp>0 lets the model explore alternative
+        // continuations when the top-1 winner is questionable. Env-
+        // gated; default 0.0 → existing argmax path. The first
+        // `RVLLM_SAMPLING_TEMPERATURE>0` request seeds an LCG; same
+        // process keeps state across requests for variety.
+        let sampling_temp: f32 = std::env::var("RVLLM_SAMPLING_TEMPERATURE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let sampling_top_p: f32 = std::env::var("RVLLM_SAMPLING_TOP_P")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0.95);
+        // LCG state — seeded once per request from current time.
+        let mut rng_state: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+            ^ 0x517cc1b727220a95u64;
+        let mut next_rand_f32 = || -> f32 {
+            // 64-bit LCG (Knuth) → take high 24 bits as fraction in [0, 1)
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng_state >> 40) as f32) / (1u32 << 24) as f32
+        };
+        let host_sample_token = |logits_dev_ptr: u64,
+                                 vocab: u32,
+                                 temp: f32,
+                                 top_p: f32,
+                                 rng_f32: &mut dyn FnMut() -> f32| -> u32 {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let mut host_logits = vec![0f32; vocab as usize];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    host_logits.as_mut_ptr() as *mut _,
+                    logits_dev_ptr,
+                    (vocab as usize) * 4,
+                );
+                // Apply temperature: divide by temp (clamped to >=1e-3 to
+                // avoid div-by-zero on sloppy callers).
+                let inv_temp = 1.0f32 / temp.max(1e-3);
+                let mut scaled: Vec<(u32, f32)> = host_logits.iter().enumerate()
+                    .map(|(i, &v)| (i as u32, v * inv_temp)).collect();
+                // top_p: sort, take cumulative-prob window covering top_p mass
+                scaled.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                // Softmax-stabilise on the top slice (avoids overflow on
+                // huge logits — Gemma 4 sees 60+).
+                let max_l = scaled[0].1;
+                let mut probs: Vec<f32> = scaled.iter().map(|&(_, l)| (l - max_l).exp()).collect();
+                let z: f32 = probs.iter().sum();
+                if z > 0.0 { for p in &mut probs { *p /= z; } }
+                // top_p: keep tokens until cumulative >= top_p, drop rest.
+                let mut cum = 0.0f32;
+                let mut cutoff = scaled.len();
+                for (i, &p) in probs.iter().enumerate() {
+                    cum += p;
+                    if cum >= top_p { cutoff = i + 1; break; }
+                }
+                // Re-normalize over the top_p window
+                let z2: f32 = probs[..cutoff].iter().sum();
+                if z2 > 0.0 { for p in &mut probs[..cutoff] { *p /= z2; } }
+                // Sample
+                let r = rng_f32();
+                let mut acc = 0.0f32;
+                for (i, &p) in probs[..cutoff].iter().enumerate() {
+                    acc += p;
+                    if r < acc { return scaled[i].0; }
+                }
+                scaled[cutoff - 1].0
+            }
+            #[cfg(not(feature = "cuda"))]
+            { let _ = (logits_dev_ptr, vocab, temp, top_p, rng_f32); 0 }
+        };
+        // === END HOST-SIDE TEMPERATURE SAMPLING ===
+
         // === REPETITION PENALTY ===
         // Greedy-compatible logits processor. When set, divides the
         // logit of any token in `recent_ids` by `penalty` (positive
@@ -3051,12 +3122,20 @@ impl Gemma4Bringup {
             );
         }
         // === END TOOL-CALL OPEN-TAG BIAS ===
-        rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
-            .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
-
-        self.stream.fence()?;
         let mut host_tok = [0i32; 1];
-        cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
+        if sampling_temp > 0.0 {
+            // Host-side temperature sampling
+            self.stream.fence()?;
+            host_tok[0] = host_sample_token(
+                logits_f32.device_ptr(), vocab, sampling_temp, sampling_top_p,
+                &mut next_rand_f32,
+            ) as i32;
+        } else {
+            rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
+                .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
+            self.stream.fence()?;
+            cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
+        }
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[prefill] {} tokens in {:.1}ms (TTFT={:.1}ms)",
             prompt_ids.len(), prefill_ms, prefill_ms);
@@ -3318,11 +3397,18 @@ impl Gemma4Bringup {
                 }
             }
             // === END REPETITION PENALTY ===
-            rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
-                .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
-
-            self.stream.fence()?;
-            cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
+            if sampling_temp > 0.0 {
+                self.stream.fence()?;
+                host_tok[0] = host_sample_token(
+                    logits_f32.device_ptr(), vocab, sampling_temp, sampling_top_p,
+                    &mut next_rand_f32,
+                ) as i32;
+            } else {
+                rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
+                    .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
+                self.stream.fence()?;
+                cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
+            }
             let next_id = host_tok[0] as u32;
             output_ids.push(next_id);
             if eos_ids.contains(&next_id) { break; }
