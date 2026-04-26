@@ -876,7 +876,9 @@ pub unsafe fn gemma4_forward_phase(
                         .map(|s| !matches!(s.as_str(),
                             "0" | "false" | "FALSE" | "no" | "off" | ""))
                         .unwrap_or(true);
-                    const PARTITION_SIZE: u32 = 512;
+                    // Cycle22 A/B: try 1024 (fewer parts -> less reduction-stage noise compounding).
+                    // vLLM default is 512; we already pay f32 tmp_out per cycle21.
+                    const PARTITION_SIZE: u32 = 1024;
                     // Bucket max ctx = max_blocks_per_seq * block_size.
                     // Workspace is sized off this so the layout is
                     // stable across iterations regardless of current
