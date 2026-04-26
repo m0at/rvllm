@@ -111,6 +111,14 @@ pub struct Gemma4FusedModules {
     /// directly off f16 activations, skipping the FP8 activation-
     /// quant step that cuBLASLt requires.
     pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    /// Companion to the V-rotation arm of the NVFP4 RoPE kernel: when
+    /// V is stored rotated (V_cache = V·R), attn_out = P·V·R, and we
+    /// need to right-multiply attn_out by R^T per (token, head) before
+    /// the O-projection. `None` on branches without the PTX or when
+    /// loading fails — the dispatch site falls back to "no V rotation"
+    /// in that case.
+    pub hadamard_unrotate_f16_mod: Option<LoadedModule>,
+    pub fn_hadamard_unrotate_f16: Option<KernelFn>,
 }
 
 /// Session-level prefix cache state. Populated on first `run_generate`
@@ -3575,6 +3583,7 @@ impl Gemma4Bringup {
             fused_qkv_rmsnorm: self.fused.fn_fused_qkv_rmsnorm,
             scale_cols_f16: self.fused.fn_scale_cols_f16,
             fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,
+            hadamard_unrotate_f16: self.fused.fn_hadamard_unrotate_f16,
         }
     }
 }
@@ -3668,6 +3677,14 @@ fn load_gemma4_fused(
     let scale_cols_f16_mod = loader.load_ptx("scale_cols_f16")?;
     let fn_scale_cols_f16 = scale_cols_f16_mod.get_function("scale_cols_f16_kernel")?;
 
+    // NVFP4 V-rotation companion (fwht then signs). PTX may be absent
+    // on older kernel trees; fall through to None and the dispatch
+    // site behaves as if RVLLM_NVFP4_HADAMARD_V is off.
+    let hadamard_unrotate_f16_mod = loader.load_ptx("hadamard_unrotate_f16").ok();
+    let fn_hadamard_unrotate_f16 = hadamard_unrotate_f16_mod
+        .as_ref()
+        .and_then(|m| m.get_function("hadamard_unrotate_f16_kernel").ok());
+
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
         rmsnorm_inplace_mod,
@@ -3721,5 +3738,7 @@ fn load_gemma4_fused(
         scale_cols_f16_mod,
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_native_f16in,
+        hadamard_unrotate_f16_mod,
+        fn_hadamard_unrotate_f16,
     })
 }

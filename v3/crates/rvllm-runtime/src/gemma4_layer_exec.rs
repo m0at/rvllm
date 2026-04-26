@@ -415,6 +415,14 @@ pub struct Gemma4LayerKernels {
     /// activation FP8-quant step and runs this kernel directly on the
     /// f16 rmsnorm output.
     pub fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    /// Companion to the V-rotation arm of the NVFP4 RoPE kernel.
+    /// When `RVLLM_NVFP4_HADAMARD_V=1` and the rope kernel rotated V
+    /// before NVFP4-packing it, this kernel right-multiplies the
+    /// attention output by R^T per (token, head) so the downstream
+    /// O-projection sees un-rotated P·V. `None` when the PTX wasn't
+    /// built into `$KERNELS_DIR`; dispatch site treats absent kernel
+    /// as "V rotation disabled" and runs unchanged.
+    pub hadamard_unrotate_f16: Option<KernelFn>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -948,6 +956,9 @@ pub unsafe fn gemma4_forward_phase(
                             stream,
                         )?;
                     }
+                    // Strip V's R rotation from attn_out before the
+                    // O-projection sees it. No-op unless RVLLM_NVFP4_HADAMARD_V=1.
+                    unrotate_attn_out_v_if_enabled(dims, kernels, scratch, stream)?;
                 }
             }
         }
@@ -1070,6 +1081,11 @@ pub unsafe fn gemma4_forward_phase(
                         stream,
                     )?;
                 }
+                // Strip V's R rotation from attn_out before O-proj sees it.
+                // No-op unless RVLLM_NVFP4_HADAMARD_V=1. Both prefill paths
+                // (unified + per-qi) above wrote into scratch.attn_out, so
+                // a single call here covers both.
+                unrotate_attn_out_v_if_enabled(dims, kernels, scratch, stream)?;
             } else {
             // FP8 / F16 prefill: share the FP8 write path (no F16 prefill
             // kernel on sm_121). F-series unified-or-fallback structure:
@@ -2192,6 +2208,51 @@ unsafe fn rope_nvfp4kv(
     ];
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);
+    let block = (dims.head_dim, 1, 1);
+    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
+}
+
+/// Apply R^T = diag(D)·H to attn_out per (token, head) in place. Companion
+/// to the V-rotation in `rope_nvfp4kv`: V_cache = V·R, attn_out = P·V·R,
+/// this strips the trailing R so the O-projection sees raw P·V.
+///
+/// No-op (returns Ok) when:
+///   * `RVLLM_NVFP4_HADAMARD_V` is not truthy, OR
+///   * the un-rotation kernel isn't loaded (PTX absent), OR
+///   * `hadamard_signs_k` is null (rotation tables not allocated).
+///
+/// Each branch must match the rope kernel's V-rotate gate or attn_out
+/// gets mangled. Reuses `signs_k` because rope's V-arm shares the same
+/// sign vector as K (single per-layer D, both Q and V/K share when
+/// rotate_v is on).
+#[cfg(feature = "cuda")]
+unsafe fn unrotate_attn_out_v_if_enabled(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    scratch: &Gemma4LayerScratch,
+    stream: u64,
+) -> Result<()> {
+    let rotate_v = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
+        .unwrap_or(false);
+    if !rotate_v { return Ok(()); }
+    let kernel = match kernels.hadamard_unrotate_f16 {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+    if scratch.hadamard_signs_k == 0 { return Ok(()); }
+    let mut x = scratch.attn_out;
+    let mut signs = scratch.hadamard_signs_k;
+    let mut nt = dims.num_tokens as i32;
+    let mut nh = dims.num_heads as i32;
+    let mut hd = dims.head_dim as i32;
+    let args = [
+        (&mut x) as *mut u64 as *mut core::ffi::c_void,
+        (&mut signs) as *mut u64 as *mut core::ffi::c_void,
+        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let grid = (dims.num_tokens, dims.num_heads, 1);
     let block = (dims.head_dim, 1, 1);
     rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
 }
