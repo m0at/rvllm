@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deploy MiniMax-M2.7-NVFP4 on TPU v6e-8.
 # One-shot: create VM, upload SHA-pinned tarball, install Rust, download model,
-# smoke-run the Rust M2 planner harness.
+# smoke-run the Rust M2/XLA planner harness. This default path does not install
+# JAX and does not run the legacy Python/JAX harness.
 #
 # Usage:
 #   ./deploy_m2_tpu.sh [--dry-run]
@@ -209,7 +210,7 @@ echo ">> (5c) unpack tarball into ${RUN_DIR} and write REVISION"
 UNPACK_CMD="${SSH_BASE} --command=\"set -euo pipefail; cd '${RUN_DIR}' && tar xzf '${REMOTE_TAR}' --strip-components=1 && echo '${SHA}' > '${RUN_DIR}/REVISION' && ls -la '${RUN_DIR}' | head\""
 run "$UNPACK_CMD"
 
-echo ">> (6) install deps on remote (Rust + optional legacy JAX env)"
+echo ">> (6) install deps on remote (Rust + HF CLI; no JAX)"
 HF_TOKEN_EXPORT=""
 if [[ -n "${HF_TOKEN:-}" ]]; then
   HF_TOKEN_EXPORT="export HF_TOKEN='${HF_TOKEN}'; export HUGGING_FACE_HUB_TOKEN='${HF_TOKEN}';"
@@ -219,30 +220,13 @@ set -euo pipefail
 echo "host cores: \$(nproc)"
 python3 --version
 
-# Try to pull cached python env + JAX compile cache from HF.
 ${HF_TOKEN_EXPORT}
-export SHA=${SHA}
-export ACCEL=${ACCELERATOR}
-export REPO=and-y/rvllm-m2-build
 export PATH="\$HOME/.local/bin:\$PATH"
 
-if [[ "\${SKIP_HF_CACHE:-0}" != "1" ]]; then
-  bash '${RUN_DIR}/tpu/harness/pull_cache_from_hf.sh' || echo "HF cache pull failed (non-fatal)"
+if ! command -v hf >/dev/null 2>&1 && ! command -v huggingface-cli >/dev/null 2>&1; then
+  echo "installing HF CLI only"
+  pip3 install --quiet --user huggingface_hub
 fi
-
-# If py-env wasn't hit (or explicitly skipped), pip install fresh.
-if ! python3 -c "import jax" 2>/dev/null; then
-  echo "installing jax[tpu] + deps fresh (no cache hit)"
-  pip3 install --quiet --upgrade pip
-  pip3 install --quiet --upgrade \\
-    "jax[tpu]" \\
-    safetensors \\
-    huggingface_hub \\
-    tokenizers \\
-    ml_dtypes \\
-    numpy
-fi
-python3 -c "import jax; print('jax', jax.__version__, 'backend', jax.default_backend(), 'devs', len(jax.devices()))"
 
 # Zig toolchain (pinned; matches agent 5's expectations).
 ZIG_VER=0.15.1
@@ -299,7 +283,9 @@ set -euo pipefail
 export PATH="\$HOME/.local/bin:\$PATH"
 ${HF_TOKEN_EXPORT}
 mkdir -p /dev/shm
-pip3 install --quiet --upgrade huggingface_hub
+if ! command -v hf >/dev/null 2>&1 && ! command -v huggingface-cli >/dev/null 2>&1; then
+  pip3 install --quiet --user huggingface_hub
+fi
 # Prefer new hf CLI (huggingface_hub 1.5+), fall back to legacy name.
 if command -v hf >/dev/null 2>&1; then
   hf download '${MODEL_REPO}' --local-dir /dev/shm/m2-nvfp4 --max-workers 32
@@ -316,56 +302,28 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   eval "$HF_CMD"
 fi
 
-echo ">> (9) smoke run: Rust m2_rust_prefill_decode dry-run"
+echo ">> (9) smoke run: Rust M2/XLA decode graph emit"
 SMOKE_SCRIPT=$(cat <<EOS
 set -euo pipefail
 export PATH="\$HOME/.local/bin:\$PATH"
 source "\$HOME/.cargo/env"
-# Turn on JAX on-disk compile cache so this run populates ~/.jax_cache for HF upload.
-export JAX_COMPILATION_CACHE_DIR="\$HOME/.jax_cache"
-export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
-export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
-mkdir -p "\$HOME/.jax_cache"
 cd '${RUN_DIR}'
 cat REVISION
-cargo run --manifest-path v3/Cargo.toml --release -p rvllm-xla --bin m2_rust_prefill_decode -- \
+cargo run --manifest-path v3/Cargo.toml --release -p rvllm-xla --bin m2_rust_decode_bench -- \
   --model-dir /dev/shm/m2-nvfp4 \
-  --batch 8 \
-  --prompt-len 20 \
-  --decode-steps 16 \
+  --emit-decode-artifacts \
+  --batches 8 \
   --ctx 2048 \
-  --kv-dtype int8 \
-  --emit-decode-mlir /tmp/rvllm_m2_decode_graph.mlir
-
-if [[ "\${M2_LEGACY_JAX_SMOKE:-0}" == "1" ]]; then
-  python3 tpu/harness/m2_tpu_infer.py \
-    --model-dir /dev/shm/m2-nvfp4 \
-    --max-tokens 16 \
-    --prompt 'Hello'
-fi
+  --iters 1 \
+  --warmup 0 \
+  --kv-cache int8 \
+  --artifact-dir /tmp/rvllm_m2_decode_artifacts \
+  --out /tmp/rvllm_m2_decode_artifacts/plan.json
 EOS
 )
 SMOKE_SCRIPT="${SMOKE_SCRIPT//\$/\\\$}"
 SMOKE_CMD="${SSH_BASE} --command=\"${SMOKE_SCRIPT//\"/\\\"}\""
 run "$SMOKE_CMD"
-
-# Optional: push the populated cache + env to HF so next fresh VM boots fast.
-if [[ "${PUSH_CACHE:-0}" == "1" && "${DRY_RUN}" -eq 0 ]]; then
-  echo ">> (10) push JAX compile cache + py-env to HF"
-  PUSH_SCRIPT=$(cat <<EOS2
-set -euo pipefail
-export PATH="\\\$HOME/.local/bin:\\\$PATH"
-${HF_TOKEN_EXPORT}
-export SHA=${SHA}
-export ACCEL=${ACCELERATOR}
-export JAX_CACHE_DIR="\\\$HOME/.jax_cache"
-bash '${RUN_DIR}/tpu/harness/push_cache_to_hf.sh'
-EOS2
-)
-  PUSH_SCRIPT="${PUSH_SCRIPT//\$/\\\$}"
-  PUSH_CMD="${SSH_BASE} --command=\"${PUSH_SCRIPT//\"/\\\"}\""
-  run "$PUSH_CMD"
-fi
 
 echo ">> done. Run dir on ${TPU_NAME}: ${RUN_DIR}"
 echo ">> to teardown: gcloud compute tpus tpu-vm delete ${TPU_NAME} --zone=${ZONE} --project=${PROJECT}"
