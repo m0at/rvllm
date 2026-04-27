@@ -53,6 +53,10 @@ NAME_TO_SOURCE = {
     "f32_to_f16_sat": SCRIPT_DIR / "f32_to_f16_sat.cu",
     "rmsnorm_inplace_bf16": SCRIPT_DIR / "rmsnorm_inplace_bf16.cu",
     "vector_add_bf16_to_f16": SCRIPT_DIR / "vector_add_bf16_to_f16.cu",
+    # Cycle 53+ Stage 1: BF16 residual chain (env-gated RVLLM_RESIDUAL_BF16=1)
+    "f16_to_bf16": SCRIPT_DIR / "f16_to_bf16.cu",
+    "fused_norm_add_residual_bf16": SCRIPT_DIR / "fused_norm_add_residual_bf16.cu",
+    "fused_rmsnorm_fp8_quant_bf16in": SCRIPT_DIR / "fused_rmsnorm_fp8_quant_bf16in.cu",
 }
 
 

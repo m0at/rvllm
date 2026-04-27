@@ -46,6 +46,11 @@
       "path": "f16_mma_probe.ptx",
       "sha256": "5e4e97c1e8b388017e767f21810d2319d0babee1db0432d55c4e6f360d783ec7"
     },
+    "f16_to_bf16": {
+      "bytes": 1219,
+      "path": "f16_to_bf16.ptx",
+      "sha256": "f6f454b0c24eb0dac53715cc520232310cf983dc1f6837b071340685fe830d94"
+    },
     "f32_to_bf16": {
       "bytes": 1178,
       "path": "f32_to_bf16.ptx",
@@ -126,6 +131,11 @@
       "path": "fused_norm_add_residual.ptx",
       "sha256": "f197ddfd6e93f6ba7c3852a0d7f7c45cf968621a3c00597c28ee109c1e762ada"
     },
+    "fused_norm_add_residual_bf16": {
+      "bytes": 26723,
+      "path": "fused_norm_add_residual_bf16.ptx",
+      "sha256": "b7776acb4d8eab7178b4d593ec780e4d7e3a2a98166c02f2109c97dd4750c113"
+    },
     "fused_norm_add_residual_f16": {
       "bytes": 27355,
       "path": "fused_norm_add_residual_f16.ptx",
@@ -145,6 +155,11 @@
       "bytes": 39669,
       "path": "fused_rmsnorm_fp8_quant.ptx",
       "sha256": "f61ad7db7a2f8ebec2bdb4c865684f5d8739edceb463978355c470565249ff4b"
+    },
+    "fused_rmsnorm_fp8_quant_bf16in": {
+      "bytes": 15108,
+      "path": "fused_rmsnorm_fp8_quant_bf16in.ptx",
+      "sha256": "545e4dae170dd32b8eaa03924a8e87a97e779fc8363e6fd9d9016306849af41f"
     },
     "fused_rope_cache_fp8kv": {
       "bytes": 6172,
@@ -262,5 +277,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "469ca32"
+  "revision": "4b85a25"
 }

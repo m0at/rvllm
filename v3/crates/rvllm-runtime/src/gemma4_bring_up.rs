@@ -111,6 +111,10 @@ pub struct Gemma4FusedModules {
     pub fused_gelu_mul_f16_mod: LoadedModule,
     pub fused_rope_partial_f16kv_mod: LoadedModule,
     pub fused_norm_add_residual_mod: LoadedModule,
+    // Cycle 53+ Stage 1: BF16 residual chain modules.
+    pub f16_to_bf16_mod: LoadedModule,
+    pub fused_norm_add_residual_bf16_mod: LoadedModule,
+    pub fused_rmsnorm_fp8_quant_bf16in_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
@@ -125,6 +129,11 @@ pub struct Gemma4FusedModules {
     pub fn_bf16_to_f16_sat: KernelFn,
     pub fn_rmsnorm_inplace_bf16: KernelFn,
     pub fn_vector_add_bf16_to_f16: KernelFn,
+    // Cycle 53+ Stage 1: BF16 residual chain function handles.
+    pub fn_f16_to_bf16: KernelFn,
+    pub fn_fused_norm_add_residual_bf16: KernelFn,
+    pub fn_fused_norm_add_residual_bf16_f16in: KernelFn,
+    pub fn_fused_rmsnorm_fp8_quant_bf16in: KernelFn,
     pub fn_f32_to_bf16: KernelFn,
     pub fn_f32_to_f16_sat: KernelFn,
     pub fn_scale_cols_f32: KernelFn,
@@ -3846,6 +3855,12 @@ fn load_gemma4_fused(
     let vector_add_bf16_to_f16_mod = loader.load_ptx("vector_add_bf16_to_f16")?;
     let f32_to_bf16_mod = loader.load_ptx("f32_to_bf16")?;
     let f32_to_f16_sat_mod = loader.load_ptx("f32_to_f16_sat")?;
+    // Cycle 53+ Stage 1: BF16 residual chain.
+    let f16_to_bf16_mod = loader.load_ptx("f16_to_bf16")?;
+    let fused_norm_add_residual_bf16_mod =
+        loader.load_ptx("fused_norm_add_residual_bf16")?;
+    let fused_rmsnorm_fp8_quant_bf16in_mod =
+        loader.load_ptx("fused_rmsnorm_fp8_quant_bf16in")?;
 
     let rmsnorm_inplace_mod = loader.load_ptx("rmsnorm_inplace_f16")?;
     let fn_rmsnorm = rmsnorm_inplace_mod.get_function("rmsnorm_inplace_f16_kernel")?;
@@ -3866,6 +3881,14 @@ fn load_gemma4_fused(
         vector_add_bf16_to_f16_mod.get_function("vector_add_bf16_to_f16_kernel")?;
     let fn_f32_to_bf16 = f32_to_bf16_mod.get_function("f32_to_bf16_kernel")?;
     let fn_f32_to_f16_sat = f32_to_f16_sat_mod.get_function("f32_to_f16_sat_kernel")?;
+    // Cycle 53+ Stage 1: BF16 residual chain function handles.
+    let fn_f16_to_bf16 = f16_to_bf16_mod.get_function("f16_to_bf16_kernel")?;
+    let fn_fused_norm_add_residual_bf16 =
+        fused_norm_add_residual_bf16_mod.get_function("fused_norm_add_residual_bf16_kernel")?;
+    let fn_fused_norm_add_residual_bf16_f16in =
+        fused_norm_add_residual_bf16_mod.get_function("fused_norm_add_residual_bf16_f16in_kernel")?;
+    let fn_fused_rmsnorm_fp8_quant_bf16in =
+        fused_rmsnorm_fp8_quant_bf16in_mod.get_function("fused_rmsnorm_fp8_quant_bf16in_kernel")?;
 
     let scale_cols_f32_mod = loader.load_ptx("scale_cols_f32")?;
     let fn_scale_cols_f32 = scale_cols_f32_mod.get_function("scale_cols_f32_kernel")?;
@@ -3958,6 +3981,10 @@ fn load_gemma4_fused(
         fused_gelu_mul_f16_mod,
         fused_rope_partial_f16kv_mod,
         fused_norm_add_residual_mod,
+        // Cycle 53+ Stage 1: BF16 residual chain.
+        f16_to_bf16_mod,
+        fused_norm_add_residual_bf16_mod,
+        fused_rmsnorm_fp8_quant_bf16in_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
@@ -3972,6 +3999,11 @@ fn load_gemma4_fused(
         fn_bf16_to_f16_sat,
         fn_rmsnorm_inplace_bf16,
         fn_vector_add_bf16_to_f16,
+        // Cycle 53+ Stage 1: BF16 residual chain function handles.
+        fn_f16_to_bf16,
+        fn_fused_norm_add_residual_bf16,
+        fn_fused_norm_add_residual_bf16_f16in,
+        fn_fused_rmsnorm_fp8_quant_bf16in,
         fn_f32_to_bf16,
         fn_f32_to_f16_sat,
         fn_scale_cols_f32,
