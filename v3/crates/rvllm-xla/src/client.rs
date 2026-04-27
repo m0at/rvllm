@@ -197,12 +197,13 @@ impl PjrtClientHandle {
             format: format_bytes.as_ptr(),
             format_size: format_bytes.len(),
         };
-        let default_opts: [u8; 6] = [0x22, 0x04, 0x18, 0x01, 0x20, 0x01];
-        let opts = self
-            .inner
-            .compile_options
-            .as_deref()
-            .unwrap_or(&default_opts);
+        let default_opts;
+        let opts = if let Some(opts) = self.inner.compile_options.as_deref() {
+            opts
+        } else {
+            default_opts = compile_options_proto(1, self.num_devices())?;
+            &default_opts
+        };
         let raw = unsafe {
             let mut args = PJRT_Client_Compile_Args {
                 struct_size: std::mem::size_of::<PJRT_Client_Compile_Args>(),
@@ -512,6 +513,86 @@ impl PjrtClientHandle {
             (self.inner.fns.event_destroy)(&mut destroy);
         }
         Ok(())
+    }
+}
+
+pub fn compile_options_proto(num_replicas: usize, num_partitions: usize) -> Result<Vec<u8>> {
+    if num_replicas == 0 {
+        return Err(xla_err("num_replicas must be > 0"));
+    }
+    if num_partitions == 0 {
+        return Err(xla_err("num_partitions must be > 0"));
+    }
+
+    let mut comp_devices = Vec::new();
+    for partition in 0..num_partitions {
+        let mut device_ids = Vec::new();
+        for replica in 0..num_replicas {
+            push_varint_field(
+                &mut device_ids,
+                1,
+                (replica * num_partitions + partition) as u64,
+            );
+        }
+        push_bytes_field(&mut comp_devices, 3, &device_ids);
+    }
+
+    let mut device_assignment = Vec::new();
+    push_varint_field(&mut device_assignment, 1, num_replicas as u64);
+    push_varint_field(&mut device_assignment, 2, num_partitions as u64);
+    device_assignment.extend_from_slice(&comp_devices);
+
+    let mut exec_build_options = Vec::new();
+    push_varint_field(&mut exec_build_options, 1, num_replicas as u64);
+    push_varint_field(&mut exec_build_options, 2, num_partitions as u64);
+    push_varint_field(&mut exec_build_options, 3, 1);
+    push_bytes_field(&mut exec_build_options, 6, &device_assignment);
+
+    let mut compile_options = Vec::new();
+    push_bytes_field(&mut compile_options, 4, &exec_build_options);
+    Ok(compile_options)
+}
+
+fn push_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
+    push_varint(out, field << 3);
+    push_varint(out, value);
+}
+
+fn push_bytes_field(out: &mut Vec<u8>, field: u64, value: &[u8]) {
+    push_varint(out, (field << 3) | 2);
+    push_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value > 0x7f {
+        out.push(((value & 0x7f) as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compile_options_encode_replicas_partitions_and_assignment() {
+        let one = compile_options_proto(1, 1).unwrap();
+        assert_eq!(
+            one,
+            vec![
+                0x22, 0x10, 0x08, 0x01, 0x10, 0x01, 0x18, 0x01, 0x32, 0x08, 0x08, 0x01, 0x10, 0x01,
+                0x1a, 0x02, 0x08, 0x00
+            ]
+        );
+
+        let eight = compile_options_proto(1, 8).unwrap();
+        assert_eq!(eight[0], 0x22);
+        assert_eq!(eight[1], 0x2c);
+        assert!(eight.windows(2).any(|w| w == [0x10, 0x08]));
+        assert!(compile_options_proto(0, 8).is_err());
+        assert!(compile_options_proto(1, 0).is_err());
     }
 }
 
