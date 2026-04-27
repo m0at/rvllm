@@ -3891,8 +3891,16 @@ impl Gemma4Bringup {
             rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv,
             _ => None,
         };
+        // Cycle 55 step 8 (Phase B): bf16-input sibling.
+        #[cfg(feature = "cuda")]
+        let fused_rope_partial_nvfp4kv_bf16in = match &self.sliding_attention {
+            rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv_bf16in,
+            _ => None,
+        };
         #[cfg(not(feature = "cuda"))]
         let fused_rope_partial_nvfp4kv = None;
+        #[cfg(not(feature = "cuda"))]
+        let fused_rope_partial_nvfp4kv_bf16in = None;
 
         Gemma4LayerKernels {
             fused_rmsnorm: self.fused.fn_rmsnorm,
@@ -3902,6 +3910,7 @@ impl Gemma4Bringup {
             fused_rope_partial_fp8kv: self.fused.fn_rope_partial_fp8kv,
             fused_rope_partial_fp8kv_bf16in: self.fused.fn_rope_partial_fp8kv_bf16in,
             fused_rope_partial_nvfp4kv,
+            fused_rope_partial_nvfp4kv_bf16in,
             fused_gelu_mul: self.fused.fn_gelu_mul,
             quantize_fp8_per_token: self.fused.fn_quantize,
             residual_scale_f16: self.fused.fn_residual_scale,

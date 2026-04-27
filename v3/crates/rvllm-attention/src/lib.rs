@@ -344,6 +344,9 @@ pub struct Fa2PtxKernels {
     /// `fused_rope_partial_nvfp4kv_kernel` entry point.
     #[cfg(feature = "cuda")]
     pub fused_rope_nvfp4kv_mod: Option<rvllm_kernels::LoadedModule>,
+    /// Cycle 55 step 8 (Phase B): bf16-input sibling of
+    /// `fused_rope_nvfp4kv_mod`. None if PTX absent on this build.
+    pub fused_rope_nvfp4kv_bf16in_mod: Option<rvllm_kernels::LoadedModule>,
     /// `flash_attention_2_decode_nvfp4kv_kernel` — NVFP4 KV decode,
     /// BC=32 variant for head_dim ≤ 256.
     #[cfg(feature = "cuda")]
@@ -385,6 +388,10 @@ pub struct Fa2PtxKernels {
     /// path when `kv_dtype == Nvfp4`).
     #[cfg(feature = "cuda")]
     pub fn_rope_nvfp4kv: Option<rvllm_kernels::KernelFn>,
+    /// Cycle 55 step 8: bf16-input sibling of fn_rope_nvfp4kv. Same
+    /// launch ABI; Q/K/V activation inputs flip f16 → bf16. cos/sin
+    /// tables stay f16 (Phase D revisits).
+    pub fn_rope_nvfp4kv_bf16in: Option<rvllm_kernels::KernelFn>,
 
     // ---- Split-KV decode path (paged_attention_v2-style) ----
     //
@@ -496,6 +503,17 @@ impl Fa2PtxKernels {
                     }
                     Err(_) => (None, None),
                 };
+            // Cycle 55 step 8 (Phase B): bf16-input sibling. Separate
+            // PTX module so older kernel trees still bring up; runtime
+            // dispatch gates on `is_some()`.
+            let (fused_rope_nvfp4kv_bf16in_mod, fn_rope_nvfp4kv_bf16in) =
+                match loader.load_ptx("fused_rope_partial_nvfp4kv_bf16in") {
+                    Ok(m) => {
+                        let f = m.get_function("fused_rope_partial_nvfp4kv_bf16in_kernel").ok();
+                        (Some(m), f)
+                    }
+                    Err(_) => (None, None),
+                };
 
             // Unified NVFP4 prefill — Phase 2b follow-up. Separate PTX
             // so old kernel trees can still bring up (runtime gates
@@ -546,6 +564,7 @@ impl Fa2PtxKernels {
                 unified_prefill_mod,
                 flash_attention_nvfp4kv_mod,
                 fused_rope_nvfp4kv_mod,
+                fused_rope_nvfp4kv_bf16in_mod,
                 fn_decode_nvfp4kv,
                 fn_decode_nvfp4kv_bc16,
                 fn_decode_nvfp4kv_gqa,
@@ -555,6 +574,7 @@ impl Fa2PtxKernels {
                 fn_prefill_nvfp4kv_unified,
                 unified_prefill_nvfp4kv_mod,
                 fn_rope_nvfp4kv,
+                fn_rope_nvfp4kv_bf16in,
                 split_decode_nvfp4kv_mod,
                 fn_decode_nvfp4kv_split,
                 fn_decode_nvfp4kv_split_bc16,

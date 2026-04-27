@@ -600,6 +600,12 @@ pub struct Gemma4LayerKernels {
     /// `Fa2PtxKernels::fn_rope_nvfp4kv` is `Some`. Layer-exec
     /// dispatch guards on this when `kv_dtype == Nvfp4`.
     pub fused_rope_partial_nvfp4kv: Option<KernelFn>,
+    /// Cycle 55 step 8 (Phase B): bf16-input sibling of
+    /// `fused_rope_partial_nvfp4kv`. Same launch ABI; Q/K/V activation
+    /// inputs flip f16 → bf16. cos/sin tables stay f16. Production
+    /// NVFP4 KV path; eventually selected when Phase B completes the
+    /// upstream bf16 chain.
+    pub fused_rope_partial_nvfp4kv_bf16in: Option<KernelFn>,
     pub fused_gelu_mul: KernelFn,
     pub quantize_fp8_per_token: KernelFn,
     pub residual_scale_f16: KernelFn,
