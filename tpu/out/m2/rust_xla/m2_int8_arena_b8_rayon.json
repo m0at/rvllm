@@ -1,0 +1,19 @@
+{
+  "alignment": 128,
+  "batch": 8,
+  "copy_dense_tensors": false,
+  "ctx": 2048,
+  "materialize_seconds": 213.189077965,
+  "max_bytes": 300000000000,
+  "model_dir": "/dev/shm/m2-nvfp4",
+  "plan_seconds": 0.252550128,
+  "reader_seconds": 0.57758368,
+  "schema": "rvllm.m2.int8_arena_bench.v1",
+  "source_format": "nvfp4_modelopt",
+  "total_bytes": 233100453632,
+  "total_seconds": 214.019221303,
+  "upload_seconds": null,
+  "uploaded_to_pjrt": false,
+  "weight_entries": 191069,
+  "weight_format": "int8"
+}
