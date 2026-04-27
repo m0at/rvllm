@@ -3152,6 +3152,51 @@ impl Gemma4Bringup {
                     &self.cublaslt, &self.cutlass, &self.sliding_attention, &self.global_attention,
                     residual_ptr, stream, phase,
                 )?;
+                // Cycle 53 step 4: per-layer residual L2-norm dump for the
+                // last chunk's last few rows. Gated by
+                // RVLLM_DUMP_RESIDUAL_NORMS=1. Only dumps for the final
+                // chunk (where the last token is what the LM head will
+                // consume). Goal: localize the layer where residual
+                // magnitude collapses on long-ctx WEATHER vs stays sane
+                // on long-ctx WHO.
+                if std::env::var("RVLLM_DUMP_RESIDUAL_NORMS").is_ok()
+                    && chunk_end_abs == prompt_len
+                    && chunk_q > 0
+                {
+                    self.stream.fence()?;
+                    let n_rows: u32 = chunk_q.min(5);
+                    let row0 = (chunk_q - n_rows) as u64;
+                    let bytes_per_row = (hidden as u64) * 2;
+                    let mut buf = vec![0u16; (n_rows as usize) * (hidden as usize)];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr() as *mut _,
+                        residual_ptr + row0 * bytes_per_row,
+                        ((n_rows as u64) * bytes_per_row) as usize,
+                    );
+                    let mut norms = String::new();
+                    let mut nan_or_inf = false;
+                    for r in 0..n_rows as usize {
+                        let mut sum_sq = 0.0f64;
+                        let mut amax = 0.0f32;
+                        for c in 0..hidden as usize {
+                            let f = crate::bring_up::f16_to_f32(buf[r * hidden as usize + c]);
+                            if !f.is_finite() { nan_or_inf = true; }
+                            sum_sq += (f as f64) * (f as f64);
+                            if f.abs() > amax { amax = f.abs(); }
+                        }
+                        let l2 = (sum_sq / hidden as f64).sqrt();
+                        norms.push_str(&format!(" r{}={:.3e}/amax={:.3e}", r, l2, amax));
+                    }
+                    let last_row_off = (n_rows as usize - 1) * hidden as usize;
+                    let last4: Vec<f32> = (hidden as usize - 4..hidden as usize)
+                        .map(|i| crate::bring_up::f16_to_f32(buf[last_row_off + i])).collect();
+                    eprintln!(
+                        "[res-norm] L{} chunk{}{}{} last4={:?}",
+                        layer_idx, chunk_idx,
+                        if nan_or_inf { " NAN/INF" } else { "" },
+                        norms, last4,
+                    );
+                }
             }
                 chunk_start_abs = chunk_end_abs;
                 chunk_idx += 1;
