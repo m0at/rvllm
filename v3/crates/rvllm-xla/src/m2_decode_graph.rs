@@ -301,7 +301,15 @@ pub fn m2_decode_smoke_mlir(kernel_name: &str, shape: &M2GraphShape) -> Result<S
           tensor<{kv_bytes}xi8> {{jax.result_info = "kv_cache"}}) {{
     %zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
     %logits = stablehlo.broadcast_in_dim %zero, dims = [] : (tensor<bf16>) -> tensor<{batch}x{vocab}xbf16>
-    %next_token = stablehlo.constant dense<0> : tensor<{batch}xi32>
+    %zero_i32 = stablehlo.constant dense<0> : tensor<i32>
+    %zero_vec = stablehlo.broadcast_in_dim %zero_i32, dims = [] : (tensor<i32>) -> tensor<{batch}xi32>
+    %positions_zero = stablehlo.multiply %positions, %zero_vec : tensor<{batch}xi32>
+    %arena_i32 = stablehlo.convert %weight_arena : (tensor<1xi8>) -> tensor<1xi32>
+    %arena_scalar = stablehlo.reshape %arena_i32 : (tensor<1xi32>) -> tensor<i32>
+    %arena_vec = stablehlo.broadcast_in_dim %arena_scalar, dims = [] : (tensor<i32>) -> tensor<{batch}xi32>
+    %arena_zero = stablehlo.multiply %arena_vec, %zero_vec : tensor<{batch}xi32>
+    %token_pos = stablehlo.add %token_ids, %positions_zero : tensor<{batch}xi32>
+    %next_token = stablehlo.add %token_pos, %arena_zero : tensor<{batch}xi32>
     return %logits, %next_token, %kv_cache : tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>
   }}
 }}
