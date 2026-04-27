@@ -305,8 +305,7 @@ pub fn m2_decode_smoke_mlir(kernel_name: &str, shape: &M2GraphShape) -> Result<S
     %zero_vec = stablehlo.broadcast_in_dim %zero_i32, dims = [] : (tensor<i32>) -> tensor<{batch}xi32>
     %positions_zero = stablehlo.multiply %positions, %zero_vec : tensor<{batch}xi32>
     %arena_i32 = stablehlo.convert %weight_arena : (tensor<1xi8>) -> tensor<1xi32>
-    %arena_scalar = stablehlo.reshape %arena_i32 : (tensor<1xi32>) -> tensor<i32>
-    %arena_vec = stablehlo.broadcast_in_dim %arena_scalar, dims = [] : (tensor<i32>) -> tensor<{batch}xi32>
+    %arena_vec = stablehlo.broadcast_in_dim %arena_i32, dims = [0] : (tensor<1xi32>) -> tensor<{batch}xi32>
     %arena_zero = stablehlo.multiply %arena_vec, %zero_vec : tensor<{batch}xi32>
     %token_pos = stablehlo.add %token_ids, %positions_zero : tensor<{batch}xi32>
     %next_token = stablehlo.add %token_pos, %arena_zero : tensor<{batch}xi32>
