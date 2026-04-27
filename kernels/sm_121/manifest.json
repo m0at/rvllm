@@ -11,6 +11,11 @@
       "path": "argmax.ptx",
       "sha256": "91336a9928546748a48bd5b4cfd6a68ef04d1187a2b613c174a1e40142885027"
     },
+    "awq_int4_gemv_f16": {
+      "bytes": 10845,
+      "path": "awq_int4_gemv_f16.ptx",
+      "sha256": "94365e4858022a8aa32fd5d8e4893c5d0066e1b18643047c212a89ee93adbd64"
+    },
     "bf16_to_f16_sat": {
       "bytes": 1314,
       "path": "bf16_to_f16_sat.ptx",
@@ -201,6 +206,11 @@
       "path": "paged_attention_sm89.ptx",
       "sha256": "b9c9cb0326069a19ce1945a5c64fcbc630d98912663a6a67ce3be8d4024ca52b"
     },
+    "probe_green_ctx": {
+      "bytes": 202,
+      "path": "probe_green_ctx.ptx",
+      "sha256": "7fddcc1223529f89736a859f33a5b7fab538c90ee2411dffb3282b9cec1f57fc"
+    },
     "residual_scale_f16": {
       "bytes": 1513,
       "path": "residual_scale_f16.ptx",
@@ -247,5 +257,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "a40df09"
+  "revision": "52f4244"
 }
