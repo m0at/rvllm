@@ -1,0 +1,41 @@
+{
+  "schema": "rvllm.m2.int8_weight_compile_probe.v1",
+  "variant": "w1_observable_unrolled_bk32x96_full_k",
+  "k_coverage": {
+    "k_step": 32,
+    "k_tiles": 96,
+    "k_covered": 3072,
+    "k_total": 3072,
+    "fraction": 1.0
+  },
+  "n_coverage": {
+    "n_per_call": 128,
+    "n_total_per_layer_w1": 1536,
+    "tile_fraction_of_w1_n": 0.0833,
+    "note": "single N-tile per layer; full N=1536 coverage requires either 12 custom_calls/layer or widening the operand"
+  },
+  "observable": true,
+  "body_bytes": 58416,
+  "graph_bytes": 8113710,
+  "n_layers": 62,
+  "tpu_pjrt_compile": "passed",
+  "remote_artifact": "/workspace/models/runs/mlir_probe/m2_decode_b8_int8_w1_unroll96_140301.mlir",
+  "math_ops_per_tile": [
+    "vector.load %w1_block_t -> vector<32x128xi8>",
+    "arith.sitofp -> vector<32x128xf32>",
+    "arith.mulf w_scaled by row scales",
+    "vector.load %hidden -> vector<8x32xbf16>",
+    "arith.extf -> vector<8x32xf32>",
+    "vector.contract (lowered to tpu.matmul) -> vector<8x128xf32>"
+  ],
+  "body_format": "lowered",
+  "decode_layer_body_path": "tpu/out/m2/rust_xla/m2_decode_layer_body_int8_b8.mlir",
+  "env_flag": "RVLLM_M2_W1_K_TILES=96",
+  "lessons": [
+    "scf.for cannot prove K stride alignment for i8 even at step=32",
+    "affine.for is not yet implemented in Mosaic infer-vector-layout",
+    "static K-tile unroll (96 iterations) at lowered text fits PJRT parser at 8.1 MB graph",
+    "mosaic-serde bytecode pre-gen is NOT required for full K W1 on v6e-8"
+  ],
+  "pass": true
+}

@@ -53,7 +53,10 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
     let n_cols = 128usize;
     let k_total = M2_HIDDEN;
     let k_step = 32usize;
-    let k_tiles = 4usize;
+    let k_tiles = std::env::var("RVLLM_M2_W1_K_TILES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4);
     if k_total % k_step != 0 {
         return Err(invalid(
             "k_total",
