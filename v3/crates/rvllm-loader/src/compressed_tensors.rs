@@ -398,6 +398,69 @@ pub fn stage_awq_linear(
     Ok(AwqLinearStaged { layout, packed, scale, zero_point, shape })
 }
 
+/// Cycle 43 step 3d (GPU side): one AWQ-quantized linear's three resident
+/// device tensors, mirroring how `Fp8Weight` stores arena-relative offsets.
+///
+/// `weight_shape` from the source checkpoint is **not** uploaded — it's
+/// I64 [2] metadata redundant with `dense`, validated host-side at stage
+/// time, and the GEMV kernel does not consume it.
+#[derive(Debug, Clone)]
+pub struct AwqLinearWeight {
+    /// Arena-relative byte offset of `weight_packed` (I32 [N, K/8]).
+    pub packed_offset_bytes: u64,
+    /// Arena-relative byte offset of `weight_scale` (BF16 [N, K/g]).
+    pub scale_offset_bytes: u64,
+    /// Arena-relative byte offset of `weight_zero_point` (I32 [N/8, K/g]).
+    pub zero_point_offset_bytes: u64,
+    /// Original dense `[N, K]` shape of the linear.
+    pub dense: [usize; 2],
+    /// AWQ block-scale group size along K. `K % group_size == 0`.
+    pub group_size: u32,
+}
+
+/// Upload one staged AWQ linear into the HBM arena. Mirrors the
+/// `upload_fp8_from` pattern in `load.rs`: three sync `cuMemcpyHtoD`s,
+/// arena-relative offsets handed back so layer-major callers can store
+/// them next to existing FP8 offsets without leaking raw device pointers.
+///
+/// Region tags use static names because [`rvllm_mem::HbmArena::region`]
+/// requires `&'static str` — the layer index is not encoded; tags are
+/// debug aids only. Per-region size is the staged byte buffer's length,
+/// 16-byte aligned (matches the FP8 path).
+///
+/// Note on the `*_offset_bytes` naming: matches `F16Weight` /
+/// `Fp8Weight` convention in [`crate::weights`]. `load.rs::arena_base()`
+/// currently returns 0, so the field stores the absolute device
+/// pointer; if a future change moves the arena to a non-zero base the
+/// FP8 path and this path will both pick it up uniformly.
+pub fn upload_awq_linear<'a>(
+    arena: &'a rvllm_mem::HbmArena<'a>,
+    staged: &AwqLinearStaged,
+) -> rvllm_core::Result<AwqLinearWeight> {
+    let pr = arena.region("awq_packed", staged.packed.len(), 16)?;
+    unsafe { pr.copy_from_host(&staged.packed)? };
+    let packed_offset_bytes = pr.device_ptr();
+
+    let sr = arena.region("awq_scale", staged.scale.len(), 16)?;
+    unsafe { sr.copy_from_host(&staged.scale)? };
+    let scale_offset_bytes = sr.device_ptr();
+
+    let zr = arena.region("awq_zero_point", staged.zero_point.len(), 16)?;
+    unsafe { zr.copy_from_host(&staged.zero_point)? };
+    let zero_point_offset_bytes = zr.device_ptr();
+
+    let group_size =
+        (staged.layout.dense[1] / staged.layout.expected.scale_shape[1]) as u32;
+
+    Ok(AwqLinearWeight {
+        packed_offset_bytes,
+        scale_offset_bytes,
+        zero_point_offset_bytes,
+        dense: staged.layout.dense,
+        group_size,
+    })
+}
+
 /// Result of validating one AWQ linear against the safetensors entries
 /// the shard index resolved.
 pub fn validate_awq_linear(
