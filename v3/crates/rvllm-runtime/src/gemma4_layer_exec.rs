@@ -1109,36 +1109,60 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gemm_f32_tmp,
             stream,
         )?;
-    } else if let (true, Some(fn_gemv)) = (
+    } else if let Some(fn_gemv) = if weights.qkv_blockscale != 0 && dims.num_tokens == 1 {
         // Blockscale gate: `Fp8GemvF16InLaunch` reads a 2-D
         // `[N/128, K/128]` tensor. Only enable it when the loader has
         // actually uploaded one (`*_blockscale != 0`). Weights whose
         // scale was per-row or synthesized have `blockscale == 0` and
         // stay on the channelscale-preserving fallback below.
-        weights.qkv_blockscale != 0 && dims.num_tokens == 1,
-        kernels.fp8_gemv_wpr_native_f16in,
-    ) {
+        // Cycle 55 step 13 (Phase B dispatch, gated): pick bf16-input
+        // GEMV when residual chain is bf16 AND the experimental fast
+        // path is enabled via RVLLM_BF16_NATIVE_QKV_FAST_PATH=1.
+        // Default-OFF — iteration 12 empirics showed long-context
+        // regression (gibberish on WHO@17k while short prompts work).
+        // Production stays on the cycle-54 stage-2.1 narrowing.
+        let gate = dims.bf16_residual
+            && crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled();
+        if gate {
+            kernels.fp8_gemv_wpr_native_bf16in
+        } else {
+            kernels.fp8_gemv_wpr_native_f16in
+        }
+    } else {
+        None
+    } {
         // sm_121 fast path: skip the activation FP8-quant entirely
-        // and run `fp8_gemv_blockwise_wpr_native_f16in_kernel` directly
-        // against the f16 rmsnorm output. Wins over the
+        // and run `fp8_gemv_blockwise_wpr_native_{f16,bf16}in_kernel`
+        // directly against the rmsnorm output. Wins over the
         // `fp8_gemm_channelscale_or_fallback` path on two axes:
         //
         //   * Quality: preserves the per-channel weight block-scale that
         //     the cuBLASLt fallback drops (the cuBLASLt FP8 channelscale
         //     heuristic `LaunchFailed`s on Blackwell consumer, so the
         //     fallback currently collapses to a scalar weight scale).
-        //   * Speed: one kernel (f16 GEMV) instead of two (FP8 quant +
+        //   * Speed: one kernel (GEMV) instead of two (FP8 quant +
         //     cuBLASLt FP8 GEMM), no scratch round-trip through f32.
         //
-        // The extra memcpy + rmsnorm-inplace here duplicates the work
-        // already done by `fused_rmsnorm_fp8_quant` in step 1 — at M=1
-        // that's ~5 KiB of rmsnorm work against a >30 MiB weight GEMV,
-        // well below the noise floor.
-        // Cycle 54 Stage 2.1: this is the M=1 decode QKV hot path.
-        // Narrow bf16→f16-sat at branch entry when the residual chain
-        // is bf16 so the f16-typed rmsnorm + Fp8GemvF16InLaunch consume
-        // valid f16 (was a silent dtype mismatch in Stage 2.0).
-        if dims.bf16_residual {
+        // Cycle 55 step 13 dispatch table:
+        //   bf16_residual + RVLLM_BF16_NATIVE_QKV_FAST_PATH=1
+        //     → memcpy bf16 → rmsnorm_inplace_bf16 → Fp8GemvBf16In
+        //       → bf16→f16-sat narrow at GEMV output
+        //   bf16_residual (default, gate OFF)
+        //     → cycle-54 stage-2.1: bf16→f16-sat narrow at branch
+        //       entry → fused_rmsnorm → Fp8GemvF16In
+        //   !bf16_residual (legacy f16 path)
+        //     → memcpy f16 → fused_rmsnorm → Fp8GemvF16In
+        let bf16_native = dims.bf16_residual
+            && crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled();
+        if bf16_native {
+            // bf16 → bf16 memcpy (same byte layout, no conversion)
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            );
+        } else if dims.bf16_residual {
             gemma4_launcher::Bf16ToF16SatLaunch {
                 n: dims.num_tokens * dims.hidden,
             }
@@ -1151,13 +1175,18 @@ pub unsafe fn gemma4_forward_phase(
                 stream as _,
             );
         }
+        let rmsnorm_kernel = if bf16_native {
+            kernels.rmsnorm_inplace_bf16
+        } else {
+            kernels.fused_rmsnorm
+        };
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_rmsnorm,
+            rmsnorm_kernel,
             scratch.delta_f16,
             weights.attn_norm_gamma,
             stream,
@@ -1175,6 +1204,19 @@ pub unsafe fn gemma4_forward_phase(
             scratch.delta_f16,
             stream,
         )?;
+        // Cycle 55 step 13: when bf16-native fast path is enabled,
+        // GEMV produced bf16 q_out; narrow to f16 for downstream
+        // RoPE+attention which is still f16-typed. Net narrow count
+        // unchanged from cycle-54 stage-2.1 (now at output rather than
+        // input). Empirically REGRESSES long-context (iteration 12
+        // gibberish on WHO@17k) — env-gated default OFF until the
+        // mechanism is understood and addressed.
+        if bf16_native {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * qkv_rows,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.q_out, scratch.q_out, stream)?;
+        }
     } else if weights.qkv_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
             cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,

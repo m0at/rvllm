@@ -462,6 +462,26 @@ pub fn bf16_residual_enabled() -> bool {
     parse_truthy_env("RVLLM_RESIDUAL_BF16").unwrap_or(true)
 }
 
+/// Cycle 55 step 13 experimental: enable bf16-native dispatch on the
+/// M=1 decode QKV F16-in fast path (the production decode hot path).
+/// When ON, the residual is consumed as bf16 directly by
+/// `rmsnorm_inplace_bf16` + `Fp8GemvBf16In`, with a bf16→f16-sat
+/// narrow at the GEMV output to keep the downstream RoPE+attention
+/// chain on f16. **Default OFF** because empirical testing in
+/// iteration 12 showed long-context regression — bf16-rmsnorm
+/// produces subtly different rms values than the f16-narrowed
+/// rmsnorm, and that compounds across 60 layers × 17k tokens into
+/// gibberish at the WHO@17k webhook probe. Short prompts (40 tokens)
+/// were unaffected.
+///
+/// Kept in code as an opt-in research path for diagnosing the
+/// precision compounding mechanism. Future steps will need to address
+/// the long-context regression before this becomes a production
+/// default.
+pub fn bf16_native_qkv_fast_path_enabled() -> bool {
+    parse_truthy_env("RVLLM_BF16_NATIVE_QKV_FAST_PATH").unwrap_or(false)
+}
+
 /// Per-token Q scale gate.
 /// * For the FP8-KV path the scratch allocation defaults ON because
 ///   per-token Q materially helps PPL on prose (memory aa010018 in the
