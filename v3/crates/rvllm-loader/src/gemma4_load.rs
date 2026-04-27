@@ -519,6 +519,10 @@ pub fn load_gemma4_model(
             q_norm,
             k_norm,
             layer_scalar,
+            // Cycle 46 step 5c: AWQ load path is wired in cycle 47.
+            // For now every checkpoint falls through the FP8 cascade
+            // and `Gemma4AwqLayerPtrs` defaults all-zero in bring-up.
+            awq: None,
         });
     }
 

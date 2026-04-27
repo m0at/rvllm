@@ -19,6 +19,46 @@ use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
 use crate::gemma4_layer_exec::Gemma4LayerKernels;
 
+/// Cycle 46 step 5c: convert the loader's optional per-layer AWQ weight
+/// table into the runtime's flat-pointer struct. Returns the all-zero
+/// default when no AWQ tensors were uploaded for this layer (every
+/// non-AWQ checkpoint), so the existing FP8 dispatch cascade runs.
+fn awq_layer_ptrs(
+    awq: Option<&rvllm_loader::AwqLayerWeights>,
+) -> crate::gemma4_layer_exec::Gemma4AwqLayerPtrs {
+    let Some(a) = awq else {
+        return Default::default();
+    };
+    // group_size is the same across all 7 linears (AwqConfig contract:
+    // one Linear config group). Pick from q_proj — any of them is
+    // identical by construction.
+    let group_size = a.q_proj.group_size;
+    crate::gemma4_layer_exec::Gemma4AwqLayerPtrs {
+        q_packed:    a.q_proj.packed_offset_bytes,
+        q_scale:     a.q_proj.scale_offset_bytes,
+        q_zero:      a.q_proj.zero_point_offset_bytes,
+        k_packed:    a.k_proj.packed_offset_bytes,
+        k_scale:     a.k_proj.scale_offset_bytes,
+        k_zero:      a.k_proj.zero_point_offset_bytes,
+        v_packed:    a.v_proj.packed_offset_bytes,
+        v_scale:     a.v_proj.scale_offset_bytes,
+        v_zero:      a.v_proj.zero_point_offset_bytes,
+        o_packed:    a.o_proj.packed_offset_bytes,
+        o_scale:     a.o_proj.scale_offset_bytes,
+        o_zero:      a.o_proj.zero_point_offset_bytes,
+        gate_packed: a.gate_proj.packed_offset_bytes,
+        gate_scale:  a.gate_proj.scale_offset_bytes,
+        gate_zero:   a.gate_proj.zero_point_offset_bytes,
+        up_packed:   a.up_proj.packed_offset_bytes,
+        up_scale:    a.up_proj.scale_offset_bytes,
+        up_zero:     a.up_proj.zero_point_offset_bytes,
+        down_packed: a.down_proj.packed_offset_bytes,
+        down_scale:  a.down_proj.scale_offset_bytes,
+        down_zero:   a.down_proj.zero_point_offset_bytes,
+        group_size,
+    }
+}
+
 pub use crate::bring_up::HbmArenaCheckpoint;
 
 /// Default per-tensor Q / KV scale for the FP8 E4M3 attention cache.
@@ -1168,7 +1208,7 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
-                    awq: Default::default(),
+                    awq: awq_layer_ptrs(layer.awq.as_ref()),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -1650,7 +1690,7 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
-                    awq: Default::default(),
+                    awq: awq_layer_ptrs(layer.awq.as_ref()),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -2614,7 +2654,7 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
-                    awq: Default::default(),
+                    awq: awq_layer_ptrs(layer.awq.as_ref()),
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;
@@ -3003,7 +3043,7 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
-                    awq: Default::default(),
+                    awq: awq_layer_ptrs(layer.awq.as_ref()),
                 };
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
                 // point at row 0's K / V sub-slice. The rmsnorm kernel

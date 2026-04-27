@@ -32,7 +32,7 @@
 //!   layer_scalar:  [1]
 //!   *_layernorm:   [5376]
 
-use crate::weights::{F16Weight, Fp8Weight};
+use crate::weights::{AwqLayerWeights, F16Weight, Fp8Weight};
 
 #[derive(Debug)]
 pub struct Gemma4LayerWeights {
@@ -51,6 +51,19 @@ pub struct Gemma4LayerWeights {
     pub q_norm: F16Weight,
     pub k_norm: F16Weight,
     pub layer_scalar: F16Weight,
+    /// Cycle 46 step 5c: optional AWQ INT4 W4A16 weights for this layer.
+    /// `None` = FP8 path stays in charge for every linear in the layer
+    /// (no behavior change for non-AWQ checkpoints). `Some` = the seven
+    /// projections (q/k/v/o + gate/up/down) have AWQ tensors uploaded
+    /// via `compressed_tensors::upload_gemma4_awq_layer`; bring-up
+    /// reads this and populates `Gemma4AwqLayerPtrs` so exec_layer
+    /// dispatches through `awq_int4_gemv_f16_kernel`.
+    ///
+    /// Populated by an AWQ-aware load path that is wired in cycle 47;
+    /// the field is added here so the runtime crate can already
+    /// thread it through bring-up without a follow-up data-shape
+    /// change.
+    pub awq: Option<AwqLayerWeights>,
 }
 
 #[derive(Debug)]
