@@ -294,7 +294,8 @@ fn emit_decode_body(
     let mut out = String::new();
 
     out.push_str(&format!(
-        r#"    %h_embed = stablehlo.custom_call @rvllm_m2_embed(%token_ids, %weight_arena) {{
+        r#"    %h_embed = "stablehlo.custom_call"(%token_ids, %weight_arena) {{
+      call_target_name = "rvllm.m2.embed",
       backend_config = "target=rvllm.m2.embed;embed_offset={embed_offset};embed_nbytes={embed_nbytes}",
       called_computations = [],
       has_side_effect = false,
@@ -328,7 +329,8 @@ fn emit_decode_body(
     }
 
     out.push_str(&format!(
-        r#"    %logits, %next_token = stablehlo.custom_call @rvllm_m2_final_logits({final_hidden}, %weight_arena) {{
+        r#"    %logits, %next_token = "stablehlo.custom_call"({final_hidden}, %weight_arena) {{
+      call_target_name = "rvllm.m2.final_logits",
       backend_config = "target=rvllm.m2.final_logits;norm_offset={norm_offset};lm_head_offset={lm_head_offset};vocab={vocab}",
       called_computations = [],
       has_side_effect = false,
@@ -363,7 +365,8 @@ fn emit_layer_call(
     let offsets = abi.weight_offsets;
     let expert_directory = expert_directory_attr(layer);
     Ok(format!(
-        r#"    {dst}, {kv_dst} = stablehlo.custom_call @rvllm_m2_decode_layer_fused_attention_nvfp4_moe_{layer_idx}({src}, %positions, {kv_src}, %weight_arena) {{
+        r#"    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, %weight_arena) {{
+      call_target_name = "rvllm.m2.decode_layer.fused_attention_nvfp4_moe",
       backend_config = "target={target};custom_call_abi={custom_call_abi};layer={layer_idx};batch={batch};ctx={ctx};kv_dtype={kv_dtype};kv_cache_bytes={kv_cache_bytes};hidden={hidden};num_q_heads={num_q_heads};num_kv_heads={num_kv_heads};head_dim={head_dim};rotary_dim={rotary_dim};top_k={top_k};expert_count={expert_count};nvfp4_group={nvfp4_group};weight_arena=flat_i8_offsets;weight_arena_bytes={weight_arena_bytes};weight_arena_alignment={weight_arena_alignment};weight_arena_dense_offsets={dense_offsets};input_norm_offset={input_norm};post_attention_norm_offset={post_attention_norm};q_proj_offset={q_proj};k_proj_offset={k_proj};v_proj_offset={v_proj};o_proj_offset={o_proj};q_norm_offset={q_norm};k_norm_offset={k_norm};router_offset={router};router_bias_offset={router_bias};w1_first_packed_offset={w1_first_packed};w1_first_scale_offset={w1_first_scale};w1_first_global_scale_offset={w1_first_global};w1_first_input_scale_offset={w1_first_input};w2_first_packed_offset={w2_first_packed};w3_first_packed_offset={w3_first_packed};w3_last_packed_offset={w3_last_packed};input_scales_missing={missing_input_scales};expert_directory=packed_i64_offsets;expert_directory_cols={expert_directory_cols};expert_directory_i64={expert_directory_compact};dispatch=fused_attention_topk_nvfp4_moe;lowering=rust_xla_custom_call",
       called_computations = [],
       has_side_effect = false,
@@ -634,7 +637,7 @@ mod tests {
         assert!(mlir.contains("rvllm.weight_input_scales_missing = 18 : i64"));
         assert!(mlir.contains("rvllm.lowering = \"rust_xla_custom_call\""));
         assert_eq!(
-            mlir.matches("stablehlo.custom_call @rvllm_m2_decode_layer_fused_attention_nvfp4_moe_")
+            mlir.matches("call_target_name = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\"")
                 .count(),
             M2_NUM_LAYERS
         );
