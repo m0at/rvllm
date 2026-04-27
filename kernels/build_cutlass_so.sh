@@ -24,7 +24,14 @@ OBJ_DIR="$ARCH/obj"
 mkdir -p "$OBJ_DIR"
 
 NVCC=${NVCC:-nvcc}
-NVCC_FLAGS="-std=c++17 -arch=${ARCH}a --expt-relaxed-constexpr -O3 --use_fast_math \
+# sm_90+ supports arch-specific features suffix (for TMA, WGMMA, FP8 tensor cores)
+# sm_80 and sm_86 do not have these features and nvcc rejects the 'a' suffix
+case "$ARCH" in
+    sm_90|sm_100|sm_120|sm_122) ARCH_FLAG="${ARCH}a" ;;
+    *) ARCH_FLAG="$ARCH" ;;
+esac
+
+NVCC_FLAGS="-std=c++17 -arch=${ARCH_FLAG} --expt-relaxed-constexpr -O3 --use_fast_math \
     -I${CUTLASS_DIR}/include \
     -I${CUTLASS_DIR}/tools/util/include \
     -I${CUTLASS_DIR}/examples/45_dual_gemm \
