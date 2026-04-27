@@ -237,8 +237,13 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
                 ("q_fp8",              q_fp8),
                 ("k_cache_fp8",        k_cache_fp8),
                 ("v_cache_fp8",        v_cache_fp8),
-                ("k_descale_fallback", k_descale_fallback),
-                ("v_descale_fallback", v_descale_fallback),
+                // k_descale_fallback / v_descale_fallback NOT in
+                // require_nonnull — for hybrid (FP8 globals + NVFP4
+                // sliding) and pure-FP8 path the kernel can use
+                // either k_scale_cache (per-slot) OR the fallback
+                // (scalar). Cycle 52 step 12b: at least one of each
+                // must be non-zero (checked below); zero in both is
+                // the actual bug.
                 ("block_tables",       block_tables),
                 ("cu_seqlens_q",       cu_seqlens_q),
                 ("context_lens",       context_lens),
@@ -251,6 +256,35 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
             self.backend, params.head_dim,
             "paged_prefill_fp8_unified", stream, params.num_seqs,
         )?;
+        // Cycle 52 step 12b: K/V need at least one scale source.
+        // Hybrid path (NVFP4 sliding + FP8 globals) and pure-FP8 path
+        // pass k_scale_cache=0 + k_descale_fallback non-zero, or vice
+        // versa. The cycle-11b unconditional fallback-required check
+        // killed the hybrid global-FP8 cell of the kv_policy_matrix.
+        if k_scale_cache == 0 && k_descale_fallback == 0 {
+            eprintln!("[attn] FP8 unified prefill: both k_scale_cache and k_descale_fallback are 0");
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op: "paged_prefill_fp8_unified — K scale source missing",
+                },
+                ctx: AttnCtx { op: "paged_prefill_fp8_unified", stream,
+                    num_seqs: params.num_seqs, head_dim: params.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if v_scale_cache == 0 && v_descale_fallback == 0 {
+            eprintln!("[attn] FP8 unified prefill: both v_scale_cache and v_descale_fallback are 0");
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op: "paged_prefill_fp8_unified — V scale source missing",
+                },
+                ctx: AttnCtx { op: "paged_prefill_fp8_unified", stream,
+                    num_seqs: params.num_seqs, head_dim: params.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
         #[cfg(feature = "cuda")]
         {
             let fa2 = match self.backend {
