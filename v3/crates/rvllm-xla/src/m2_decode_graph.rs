@@ -4,10 +4,10 @@ use rvllm_core::{ConfigError, Result, RvllmError};
 use rvllm_loader::M2Projection;
 
 use crate::m2_graph_abi::{M2DecodeLayerArenaOffsets, M2DecodeLayerCustomCallAbi};
+use crate::m2_tpu_custom_call::{tpu_custom_call_backend_config, TPU_CUSTOM_CALL_TARGET};
 use crate::{
     M2GraphPhase, M2GraphShape, M2Nvfp4ProjectionAbi, M2WeightArenaEntry, M2WeightArenaPlan,
-    PjrtElementType, M2_HEAD_DIM, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_KV_HEADS, M2_NUM_LAYERS,
-    M2_NUM_Q_HEADS, M2_NVFP4_GROUP, M2_ROTARY_DIM, M2_VOCAB,
+    PjrtElementType, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_LAYERS, M2_VOCAB,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,18 +292,22 @@ fn emit_decode_body(
     let token_ty = format!("tensor<{}xi32>", shape.batch);
     let logits_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_VOCAB);
     let mut out = String::new();
+    let empty_mosaic_body = "";
 
     out.push_str(&format!(
         r#"    %h_embed = "stablehlo.custom_call"(%token_ids, %weight_arena) {{
-      call_target_name = "rvllm.m2.embed",
-      backend_config = "target=rvllm.m2.embed;embed_offset={embed_offset};embed_nbytes={embed_nbytes}",
+      call_target_name = "{tpu_custom_call}",
+      backend_config = "{backend_config}",
       called_computations = [],
       has_side_effect = false,
-      api_version = 2 : i32
+      api_version = 1 : i32,
+      kernel_name = "rvllm.m2.embed",
+      operand_layouts = [dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>],
+      result_layouts = [dense<[1, 0]> : tensor<2xindex>]
     }} : ({token_ty}, {arena_ty}) -> {hidden_ty}
 "#,
-        embed_offset = plan.embed.offset,
-        embed_nbytes = plan.embed.nbytes,
+        tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
+        backend_config = tpu_custom_call_backend_config(empty_mosaic_body),
     ));
 
     let mut hidden = "%h_embed".to_string();
@@ -313,7 +317,6 @@ fn emit_decode_body(
         let next_kv = format!("%kv_l{}", layer.layer);
         out.push_str(&emit_layer_call(
             shape,
-            arena,
             layer,
             &hidden,
             &kv,
@@ -323,6 +326,7 @@ fn emit_decode_body(
             &token_ty,
             &kv_ty,
             &arena_ty,
+            empty_mosaic_body,
         )?);
         hidden = next_hidden;
         kv = next_kv;
@@ -330,26 +334,27 @@ fn emit_decode_body(
 
     out.push_str(&format!(
         r#"    %logits, %next_token = "stablehlo.custom_call"({final_hidden}, %weight_arena) {{
-      call_target_name = "rvllm.m2.final_logits",
-      backend_config = "target=rvllm.m2.final_logits;norm_offset={norm_offset};lm_head_offset={lm_head_offset};vocab={vocab}",
+      call_target_name = "{tpu_custom_call}",
+      backend_config = "{backend_config}",
       called_computations = [],
       has_side_effect = false,
-      api_version = 2 : i32
+      api_version = 1 : i32,
+      kernel_name = "rvllm.m2.final_logits",
+      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>],
+      result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>]
     }} : ({hidden_ty}, {arena_ty}) -> ({logits_ty}, {token_ty})
     return %logits, %next_token, {final_kv} : {logits_ty}, {token_ty}, {kv_ty}
 "#,
         final_hidden = hidden,
         final_kv = kv,
-        norm_offset = plan.final_norm.offset,
-        lm_head_offset = plan.lm_head.offset,
-        vocab = M2_VOCAB,
+        tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
+        backend_config = tpu_custom_call_backend_config(empty_mosaic_body),
     ));
     Ok(out)
 }
 
 fn emit_layer_call(
     shape: &M2GraphShape,
-    arena: &M2WeightArenaPlan,
     layer: &M2DecodeLayerPlan,
     src: &str,
     kv_src: &str,
@@ -359,86 +364,29 @@ fn emit_layer_call(
     token_ty: &str,
     kv_ty: &str,
     arena_ty: &str,
+    mosaic_body_b64: &str,
 ) -> Result<String> {
-    let abi = layer.custom_call_abi(shape)?;
-    let target = abi.call.target();
-    let offsets = abi.weight_offsets;
-    let expert_directory = expert_directory_backend_config(layer);
+    let target = layer.custom_call_abi(shape)?.call.target();
     Ok(format!(
         r#"    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, %weight_arena) {{
-      call_target_name = "rvllm.m2.decode_layer.fused_attention_nvfp4_moe",
-      backend_config = "target={target};custom_call_abi={custom_call_abi};layer={layer_idx};batch={batch};ctx={ctx};kv_dtype={kv_dtype};kv_cache_bytes={kv_cache_bytes};hidden={hidden};num_q_heads={num_q_heads};num_kv_heads={num_kv_heads};head_dim={head_dim};rotary_dim={rotary_dim};top_k={top_k};expert_count={expert_count};nvfp4_group={nvfp4_group};weight_arena=flat_i8_offsets;weight_arena_bytes={weight_arena_bytes};weight_arena_alignment={weight_arena_alignment};weight_arena_dense_offsets={dense_offsets};input_norm_offset={input_norm};post_attention_norm_offset={post_attention_norm};q_proj_offset={q_proj};k_proj_offset={k_proj};v_proj_offset={v_proj};o_proj_offset={o_proj};q_norm_offset={q_norm};k_norm_offset={k_norm};router_offset={router};router_bias_offset={router_bias};w1_first_packed_offset={w1_first_packed};w1_first_scale_offset={w1_first_scale};w1_first_global_scale_offset={w1_first_global};w1_first_input_scale_offset={w1_first_input};w2_first_packed_offset={w2_first_packed};w3_first_packed_offset={w3_first_packed};w3_last_packed_offset={w3_last_packed};input_scales_missing={missing_input_scales};expert_directory=packed_i64_offsets;expert_directory_cols={expert_directory_cols};{expert_directory};dispatch=fused_attention_topk_nvfp4_moe;lowering=rust_xla_custom_call",
+      call_target_name = "{tpu_custom_call}",
+      backend_config = "{backend_config}",
       called_computations = [],
       has_side_effect = false,
-      api_version = 2 : i32
+      api_version = 1 : i32,
+      kernel_name = "{target}",
+      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>],
+      result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>]
     }} : ({hidden_ty}, {token_ty}, {kv_ty}, {arena_ty}) -> ({hidden_ty}, {kv_ty})
 "#,
+        tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
+        backend_config = tpu_custom_call_backend_config(mosaic_body_b64),
         target = target,
-        custom_call_abi = abi.call.abi(),
         src = src,
         kv_src = kv_src,
         dst = dst,
         kv_dst = kv_dst,
-        layer_idx = layer.layer,
-        batch = abi.batch,
-        ctx = abi.ctx,
-        kv_dtype = abi.kv_dtype.as_mlir_dtype(),
-        kv_cache_bytes = abi.kv_cache_bytes,
-        hidden = abi.hidden,
-        num_q_heads = M2_NUM_Q_HEADS,
-        num_kv_heads = M2_NUM_KV_HEADS,
-        head_dim = M2_HEAD_DIM,
-        rotary_dim = M2_ROTARY_DIM,
-        top_k = abi.top_k,
-        expert_count = abi.expert_count,
-        nvfp4_group = M2_NVFP4_GROUP,
-        weight_arena_bytes = arena.total_bytes,
-        weight_arena_alignment = arena.alignment,
-        dense_offsets = M2DecodeLayerArenaOffsets::DENSE_ATTRS,
-        input_norm = offsets.input_norm,
-        post_attention_norm = offsets.post_attention_norm,
-        q_proj = offsets.q_proj,
-        k_proj = offsets.k_proj,
-        v_proj = offsets.v_proj,
-        o_proj = offsets.o_proj,
-        q_norm = offsets.q_norm,
-        k_norm = offsets.k_norm,
-        router = offsets.router,
-        router_bias = offsets.router_bias,
-        w1_first_packed = offsets.w1_first_packed,
-        w1_first_scale = offsets.w1_first_scale,
-        w1_first_global = offsets.w1_first_global_scale,
-        w1_first_input = offsets.w1_first_input_scale,
-        w2_first_packed = offsets.w2_first_packed,
-        w3_first_packed = offsets.w3_first_packed,
-        w3_last_packed = offsets.w3_last_packed,
-        missing_input_scales = layer.input_scale_missing_count(),
-        expert_directory_cols = abi.expert_directory_cols,
-        expert_directory = expert_directory,
     ))
-}
-
-fn expert_directory_backend_config(layer: &M2DecodeLayerPlan) -> String {
-    let rows = layer.expert_directory();
-    let first = rows.first().expect("M2 layer has experts");
-    let last = rows.last().expect("M2 layer has experts");
-    format!(
-        "expert_directory_first={};expert_directory_last={}",
-        compact_i64_row(&first.as_i64_row()),
-        compact_i64_row(&last.as_i64_row())
-    )
-}
-
-fn compact_i64_row<const N: usize>(row: &[i64; N]) -> String {
-    let mut out = String::from("[");
-    for (idx, value) in row.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&value.to_string());
-    }
-    out.push(']');
-    out
 }
 
 fn dense(lookup: &ArenaLookup<'_>, layer: usize, suffix: &str) -> Result<M2ArenaTensor> {
@@ -627,36 +575,24 @@ mod tests {
         assert!(mlir.contains("rvllm.weight_input_scales_missing = 18 : i64"));
         assert!(mlir.contains("rvllm.lowering = \"rust_xla_custom_call\""));
         assert_eq!(
-            mlir.matches("call_target_name = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\"")
+            mlir.matches("call_target_name = \"tpu_custom_call\"")
                 .count(),
-            M2_NUM_LAYERS
+            M2_NUM_LAYERS + 2
         );
         assert_eq!(
-            mlir.matches("target=rvllm.m2.decode_layer.fused_attention_nvfp4_moe")
+            mlir.matches("kernel_name = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\"")
                 .count(),
             M2_NUM_LAYERS
         );
-        assert!(mlir.contains("custom_call_abi=m2_decode_layer_v1"));
+        assert!(mlir.contains("kernel_name = \"rvllm.m2.embed\""));
+        assert!(mlir.contains("kernel_name = \"rvllm.m2.final_logits\""));
+        assert!(mlir.contains("\\22custom_call_config\\22"));
+        assert!(mlir.contains("\\22serialization_format\\22: 1"));
+        assert!(mlir.contains("\\22needs_layout_passes\\22: true"));
+        assert!(mlir.contains("\\22implicit_sharding\\22"));
         assert!(mlir.contains("rvllm.batch = 8 : i64"));
         assert!(mlir.contains("rvllm.ctx = 2048 : i64"));
-        assert!(mlir.contains("kv_dtype=i8"));
-        assert!(mlir.contains("kv_cache_bytes=2080374784"));
-        assert!(mlir.contains("num_q_heads=48"));
-        assert!(mlir.contains("num_kv_heads=8"));
-        assert!(mlir.contains("head_dim=128"));
-        assert!(mlir.contains("rotary_dim=64"));
-        assert!(mlir.contains("nvfp4_group=16"));
-        assert!(mlir.contains("weight_arena=flat_i8_offsets"));
-        assert!(mlir.contains(&format!("weight_arena_bytes={}", arena.total_bytes)));
-        assert!(mlir.contains("weight_arena_alignment=128"));
-        assert!(mlir.contains("weight_arena_dense_offsets=input_norm,post_attention_norm,q_proj,k_proj,v_proj,o_proj,q_norm,k_norm,router,router_bias"));
-        assert!(mlir.contains("q_proj_offset="));
-        assert!(mlir.contains("w1_first_packed_offset="));
-        assert!(mlir.contains("expert_directory=packed_i64_offsets"));
-        assert!(mlir.contains("expert_directory_cols=13"));
-        assert!(mlir.contains("expert_directory_first=[0,"));
-        assert!(mlir.contains("expert_directory_last=[255,"));
-        assert!(mlir.contains("dispatch=fused_attention_topk_nvfp4_moe"));
+        assert!(!mlir.contains("target=rvllm.m2.decode_layer.fused_attention_nvfp4_moe"));
         assert!(!mlir.contains("Contract body placeholder"));
     }
 

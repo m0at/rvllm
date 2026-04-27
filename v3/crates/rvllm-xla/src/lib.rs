@@ -8,6 +8,7 @@ pub mod m2_decode_graph;
 pub mod m2_graph_abi;
 pub mod m2_prefill;
 pub mod m2_runtime;
+pub mod m2_tpu_custom_call;
 pub mod m2_weight_plan;
 
 pub use artifact::{
@@ -43,6 +44,7 @@ pub use m2_runtime::{
     M2RuntimeConfig, M2RustPrefillConfig, M2RustPrefillDecodeConfig, M2RustPrefillDecodePlan,
     M2RustPrefillPlan,
 };
+pub use m2_tpu_custom_call::{tpu_custom_call_backend_config, TPU_CUSTOM_CALL_TARGET};
 pub use m2_weight_plan::{
     M2FlatArenaHostBuffer, M2WeightArenaEntry, M2WeightArenaPlan, M2WeightRole, M2WeightUploadPlan,
     M2WeightUploadSpec,

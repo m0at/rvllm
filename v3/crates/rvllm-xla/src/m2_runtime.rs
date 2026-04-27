@@ -849,7 +849,10 @@ mod tests {
         assert_eq!(plan.decode_input_specs[3].nbytes, plan.weight_arena_bytes);
         assert!(plan
             .decode_mlir
-            .contains("target=rvllm.m2.decode_layer.fused_attention_nvfp4_moe"));
+            .contains("kernel_name = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\""));
+        assert!(plan
+            .decode_mlir
+            .contains("call_target_name = \"tpu_custom_call\""));
     }
 
     #[test]

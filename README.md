@@ -122,7 +122,7 @@ Requires 50K+ training examples for production tau. Current: 2K examples, loss 7
 
 ## MiniMax-M2.7-NVFP4 on TPU v6e-8 (experimental)
 
-Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/MiniMax-M2.7-NVFP4`) on a single v6e-8 slice. The measured throughput below is from the legacy JAX reproduction harness; new runtime work is in Rust PJRT/XLA under `v3/crates/`, with Python quarantined as reference-only.
+Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/MiniMax-M2.7-NVFP4`) on a single v6e-8 slice. The measured throughput below is from the legacy JAX reproduction harness; the production path is now Rust + M2 checkpoint loader + PJRT/XLA under `v3/crates/`, with Python/JAX quarantined as reference-only.
 
 ### Measured (v6e-8, spot, europe-west4-a, `M2_MOE=shardmap`)
 
@@ -155,21 +155,43 @@ Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/Mini
 - B=8/B=16/B=32 now use exact replicate-token MoE by default: tokens stay replicated across expert shards, each shard skips inactive local experts with `lax.cond`, and outputs combine with `psum`. This avoids padded all-to-all buckets and empty expert matmuls.
 - `RVLLM_M2_KV=int8` adds Gemma-style per-vector int8 KV cache. It preserves the short PPL/coherence gate and keeps B=8/B=16 throughput flat while fitting B=32 at 171 tok/s.
 
+### Rust + XLA status (no JAX runtime)
+
+The Rust path is real but not executable yet. It currently owns:
+
+- MiniMax M2 checkpoint indexing and safetensors schema validation
+- Flat `i8` weight-arena planning for the 134 GB NVFP4 checkpoint
+- int8/bf16 KV sizing and host input/output specs
+- Decode StableHLO/MLIR emission for B=8/B=16/B=32 shapes
+- Rust PJRT client wiring to `libtpu.so`
+- OpenAI-compatible `/v1/chat/completions` server surface over `rvllm_xla::M2Runtime`
+
+What we found while compiling the Rust MLIR directly on the TPU:
+
+- Arbitrary custom-call names do not work on TPU. `call_target_name = "rvllm.m2.embed"` fails at XLA compile with `Custom emitter for rvllm.m2.embed not found`.
+- The TPU backend has a registered lowering emitter for exactly `call_target_name = "tpu_custom_call"`.
+- `tpu_custom_call` requires JSON `backend_config` shaped like `{"custom_call_config":{"body":"<base64 Mosaic bytecode>","serialization_format":1,"needs_layout_passes":true},"implicit_sharding":{"type":"MANUAL"}}`.
+- The `body` is not our semicolon metadata string. It is serialized Mosaic MLIR bytecode produced by the Mosaic serde pass.
+- Therefore the remaining blocker is not Python, tokenization, serving, or PJRT. It is linking a real serialized Mosaic body for embed/final/decode-layer kernels, or decomposing embed/final into native StableHLO and reserving Mosaic only for the fused NVFP4 MoE matmul.
+- The HF repo `and-y/rvllm-m2-build` is a private dataset containing legacy JAX cache artifacts only. It is useful for reproduction, not for the Rust-native runtime.
+
 ### Known issues blocking production
 
 1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. B=8/B=16/B=32 avoid padded token all-to-all now; B=1 still needs a better small-batch kernel.
-2. **Executable Rust decode still needs custom-call bodies**. `rvllm-server` now calls `rvllm_xla::M2Runtime` from `/v1/chat/completions`; the Mosaic NVFP4 custom calls still need the TPU body before the Rust path can replace the legacy JAX reproduction run for final tok/s.
+2. **Executable Rust decode still needs TPU custom-call bodies**. `rvllm-server` now calls `rvllm_xla::M2Runtime` from `/v1/chat/completions`, but TPU XLA only lowers `tpu_custom_call` with a serialized Mosaic body. The Rust emitter must stop using fake `rvllm.m2.*` targets and either emit native StableHLO for simple ops or attach real Mosaic bytecode for fused kernels.
 3. **Long-form generation degenerates**. The full gate scores PPL 6.73 and passes prefix matching, but the 256-token angular-momentum sample falls into repetitive math text after the coherent opening.
 
 ### Build list (ranked, from 16-agent perf advisor spec)
 
 See [`tpu/harness/M2_PERF_ADVISOR_SPEC.md`](tpu/harness/M2_PERF_ADVISOR_SPEC.md) for the full analysis.
 
-1. Mosaic/MLIR custom-call fused NVFP4→MXU matmul kernel — high-level Pallas currently crashes Mosaic when a uint8-derived RHS feeds TPU matmul; the current two-stage Pallas matmul is slower than XLA dot
-2. Batched prefill → 16× TTFT (20-token prompt currently 14s)
-3. Flatten API/infer wrappers onto the same scanned full-bench forward path
-4. Async collective flags (`LIBTPU_INIT_ARGS`) — ~5% at larger B
-5. EAGLE-3 speculative decode (scaffold exists, needs draft-head training)
+1. Rust emitter: use TPU's real `tpu_custom_call` target and JSON backend-config contract
+2. Native StableHLO fallback for embed/final logits so only the hard NVFP4 layer needs Mosaic
+3. Mosaic/MLIR custom-call fused NVFP4->MXU matmul kernel; high-level Pallas was slower/crash-prone, so this needs serialized Mosaic body control
+4. Batched prefill -> 16x TTFT (20-token prompt currently 14s)
+5. Flatten API/infer wrappers onto the same scanned full-bench forward path
+6. Async collective flags (`LIBTPU_INIT_ARGS`) -> around 5% at larger B
+7. EAGLE-3 speculative decode (scaffold exists, needs draft-head training)
 
 ### Reproduce
 
@@ -180,18 +202,20 @@ SPOT=1 ZONE=europe-west4-a HF_TOKEN=$(cat ~/.cache/huggingface/token) \
   bash tpu/harness/deploy_m2_tpu.sh
 ```
 
-On the VM:
+Rust-only compile probe on the VM. This path does not run Python or JAX:
 
 ```bash
 cd $HOME/runs/$SHA/v3
-cargo run --release -p rvllm-xla --bin m2_rust_prefill_decode -- \
-  --model-dir /dev/shm/m2-nvfp4 \
-  --batch 8 \
-  --prompt-len 20 \
-  --decode-steps 256 \
+cargo run --release -p rvllm-xla --features tpu --bin m2_rust_decode_bench -- \
+  --model-dir ../tpu/harness/m2_checkpoint_schema \
+  --artifact-dir /tmp/m2_rust_xla \
+  --out /tmp/m2_rust_xla/final.json \
+  --compile-decode \
+  --batches 8 \
   --ctx 2048 \
-  --kv-dtype int8 \
-  --emit-decode-mlir /tmp/rvllm_m2_decode_graph.mlir
+  --iters 10 --warmup 3 \
+  --kv-cache int8 \
+  --moe-impl auto
 ```
 
 The legacy reproduction command remains documented in
