@@ -1,9 +1,11 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use rvllm_xla::m2_decode_bench::{
-    check_m2_rust_decode_bench_json, M2_DEFAULT_DECODE_BENCH_BATCHES,
+    check_m2_rust_decode_bench_json, m2_rust_decode_timing, M2RustDecodeExecutedTiming,
+    M2RustDecodeTimingSource, M2_DEFAULT_DECODE_BENCH_BATCHES,
 };
 use rvllm_xla::m2_runtime::{m2_decode_mlir_execution_blocker, M2RuntimeMode};
 use rvllm_xla::{
@@ -37,11 +39,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Vec::new()
         };
     let mut compiled = false;
-    match args.runtime_mode {
-        M2RuntimeMode::PlanningOnly => {}
+    let timings = match args.runtime_mode {
+        M2RuntimeMode::PlanningOnly => Vec::new(),
         M2RuntimeMode::CompileOnly => {
             compile_decode_artifacts(&artifacts)?;
             compiled = true;
+            Vec::new()
         }
         M2RuntimeMode::Execute => {
             if let Some(reason) = artifacts
@@ -50,9 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return Err(reason.into());
             }
-            return Err("m2_rust_decode_bench execute mode is not wired until decode custom-call bodies are linked".into());
+            execute_decode_artifacts(&artifacts, &args)?
         }
-    }
+    };
 
     let mut report = plan_m2_rust_decode_bench(&M2RustDecodeBenchConfig {
         model_dir: args.model_dir.clone(),
@@ -74,6 +77,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             item.error = None;
         }
     }
+    if !timings.is_empty() {
+        for (item, timing) in report.sweep.iter_mut().zip(timings) {
+            item.status = "executed";
+            item.error = None;
+            item.timing = Some(timing);
+        }
+    }
 
     let json = serde_json::to_vec_pretty(&report)?;
     if let Some(out) = args.out {
@@ -92,6 +102,9 @@ struct DecodeArtifact {
     mlir: String,
     #[cfg_attr(not(feature = "tpu"), allow(dead_code))]
     mlir_path: PathBuf,
+    batch: usize,
+    shape: M2GraphShape,
+    weight_arena_bytes: usize,
 }
 
 fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn std::error::Error>> {
@@ -154,7 +167,13 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
             args.artifact_dir.join(&mlir_name).display(),
             args.artifact_dir.join(&json_name).display()
         );
-        out.push(DecodeArtifact { mlir, mlir_path });
+        out.push(DecodeArtifact {
+            mlir,
+            mlir_path,
+            batch,
+            shape,
+            weight_arena_bytes,
+        });
     }
     Ok(out)
 }
@@ -201,6 +220,96 @@ fn compile_decode_artifacts(
         eprintln!("compiled decode MLIR through PJRT");
     }
     Ok(())
+}
+
+#[cfg(feature = "tpu")]
+fn execute_decode_artifacts(
+    artifacts: &[DecodeArtifact],
+    args: &Args,
+) -> Result<Vec<M2RustDecodeExecutedTiming>, Box<dyn std::error::Error>> {
+    let client = PjrtClientHandle::new()?;
+    let mut out = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let mlir = fs::read_to_string(&artifact.mlir_path)?;
+        let exe = client.compile(&mlir)?;
+        let token_buf = client.buffer_from_host(
+            &vec![0u8; artifact.shape.batch * 4],
+            &[artifact.shape.batch as i64],
+            PjrtElementType::S32,
+            0,
+        )?;
+        let pos_buf = client.buffer_from_host(
+            &vec![0u8; artifact.shape.batch * 4],
+            &[artifact.shape.batch as i64],
+            PjrtElementType::S32,
+            0,
+        )?;
+        let mut kv_buf = client.buffer_from_host(
+            &vec![0u8; artifact.shape.kv_cache_bytes()],
+            &[artifact.shape.kv_cache_bytes() as i64],
+            PjrtElementType::S8,
+            0,
+        )?;
+        let weight_arena = client.buffer_from_host(
+            &vec![0u8; artifact.weight_arena_bytes],
+            &[artifact.weight_arena_bytes as i64],
+            PjrtElementType::S8,
+            0,
+        )?;
+        let mut samples = Vec::with_capacity(args.iters);
+        for step in 0..(args.warmup + args.iters) {
+            let start = Instant::now();
+            let inputs = [&token_buf, &pos_buf, &kv_buf, &weight_arena];
+            let mut outputs = client.execute(&exe, &inputs)?;
+            if outputs.len() != 3 {
+                return Err(
+                    format!("decode returned {} outputs, expected 3", outputs.len()).into(),
+                );
+            }
+            let next_token = outputs.remove(1);
+            let new_kv = outputs.remove(1);
+            let mut next_bytes = vec![0u8; artifact.shape.batch * 4];
+            client.buffer_to_host(&next_token, &mut next_bytes)?;
+            if step >= args.warmup {
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            kv_buf = new_kv;
+        }
+        samples.sort_by(|a, b| a.total_cmp(b));
+        let ms_min = *samples.first().ok_or("no timing samples")?;
+        let ms_max = *samples.last().ok_or("no timing samples")?;
+        let ms_mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let ms_p50 = samples[samples.len() / 2];
+        let timing = m2_rust_decode_timing(
+            M2RustDecodeTimingSource {
+                runtime: "rust_xla",
+                executed: true,
+                device: "tpu:0".to_string(),
+                executable: "pjrt_mlir_decode".to_string(),
+            },
+            artifact.batch,
+            ms_min,
+            ms_mean,
+            ms_max,
+            ms_p50,
+        )?;
+        eprintln!(
+            "executed B={} mean={:.3} ms tok/s={:.2}",
+            artifact.batch,
+            ms_mean,
+            1000.0 * artifact.batch as f64 / ms_mean
+        );
+        out.push(timing);
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "tpu"))]
+fn execute_decode_artifacts(
+    _artifacts: &[DecodeArtifact],
+    _args: &Args,
+) -> Result<Vec<M2RustDecodeExecutedTiming>, Box<dyn std::error::Error>> {
+    Err("m2_rust_decode_bench execute mode requires --features tpu".into())
 }
 
 #[cfg(not(feature = "tpu"))]
