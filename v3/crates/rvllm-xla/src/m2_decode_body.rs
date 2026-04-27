@@ -52,7 +52,8 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
     let mut k_constants = String::new();
     let mut k_tiles = String::new();
     let mut acc_prev = "%zero".to_string();
-    for (tile_idx, k) in (0..M2_HIDDEN).step_by(128).enumerate() {
+    const K_TILE: usize = 512;
+    for (tile_idx, k) in (0..M2_HIDDEN).step_by(K_TILE).enumerate() {
         let k_idx = if k == 0 {
             "%c0".to_string()
         } else {
@@ -61,10 +62,10 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
         };
         let acc_next = format!("%acc_{tile_idx}");
         k_tiles.push_str(&format!(
-            r#"    %h_bf16_{tile_idx} = vector.load %hidden[%c0, {k_idx}] : memref<{batch}x{hidden}xbf16>, vector<{batch}x128xbf16>
-    %h_mat_{tile_idx} = arith.extf %h_bf16_{tile_idx} : vector<{batch}x128xbf16> to vector<{batch}x128xf32>
-    %w_i8_{tile_idx} = vector.load %w1_block_t[{k_idx}, %c0] : memref<{hidden}x128xi8>, vector<128x128xi8>
-    %w_f32_{tile_idx} = arith.sitofp %w_i8_{tile_idx} : vector<128x128xi8> to vector<128x128xf32>
+            r#"    %h_bf16_{tile_idx} = vector.load %hidden[%c0, {k_idx}] : memref<{batch}x{hidden}xbf16>, vector<{batch}x{k_tile}xbf16>
+    %h_mat_{tile_idx} = arith.extf %h_bf16_{tile_idx} : vector<{batch}x{k_tile}xbf16> to vector<{batch}x{k_tile}xf32>
+    %w_i8_{tile_idx} = vector.load %w1_block_t[{k_idx}, %c0] : memref<{hidden}x128xi8>, vector<{k_tile}x128xi8>
+    %w_f32_{tile_idx} = arith.sitofp %w_i8_{tile_idx} : vector<{k_tile}x128xi8> to vector<{k_tile}x128xf32>
     {acc_next} = vector.contract {{
       indexing_maps = [
         affine_map<(m, n, k) -> (m, k)>,
@@ -73,10 +74,11 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
       ],
       iterator_types = ["parallel", "parallel", "reduction"],
       kind = #vector.kind<add>
-    }} %h_mat_{tile_idx}, %w_f32_{tile_idx}, {acc_prev} : vector<{batch}x128xf32>, vector<128x128xf32> into vector<{batch}x128xf32>
+    }} %h_mat_{tile_idx}, %w_f32_{tile_idx}, {acc_prev} : vector<{batch}x{k_tile}xf32>, vector<{k_tile}x128xf32> into vector<{batch}x128xf32>
 "#,
             batch = shape.batch,
             hidden = M2_HIDDEN,
+            k_tile = K_TILE,
         ));
         acc_prev = acc_next;
     }
@@ -156,14 +158,14 @@ mod tests {
         assert!(mlir.contains("memref<3072x128xi8>"));
         assert!(mlir.contains("memref<128xf32>"));
         assert!(mlir.contains("vector<8x128xbf16>"));
-        assert!(mlir.contains("vector<128x128xi8>"));
-        assert!(mlir.contains("vector<8x128xf32>"));
+        assert!(mlir.contains("vector<512x128xi8>"));
+        assert!(mlir.contains("vector<8x512xf32>"));
         assert!(mlir.contains("vector<128xf32>"));
         assert!(mlir.contains("vector.contract"));
         assert!(mlir.contains("arith.sitofp"));
         assert!(mlir.contains("arith.mulf"));
         assert!(!mlir.contains("scf.for"));
-        assert!(mlir.contains("%c2944 = arith.constant 2944 : index"));
+        assert!(mlir.contains("%c2560 = arith.constant 2560 : index"));
         assert!(mlir.contains("vector<8x128xbf16>"));
     }
 }
