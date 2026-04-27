@@ -31,6 +31,7 @@
 // === END HADAMARD ROTATION ===
 
 using rvllm_nvfp4::fp4_encode;
+using rvllm_nvfp4::fp4_encode_stochastic;
 
 // Reduce the absolute-value peak across a 16-lane group within a warp.
 // `lane_id` is `threadIdx.x & 31`; the group is determined by
