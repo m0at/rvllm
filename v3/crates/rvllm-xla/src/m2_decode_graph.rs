@@ -310,7 +310,7 @@ pub fn m2_decode_smoke_mlir(kernel_name: &str, shape: &M2GraphShape) -> Result<S
       }} {{
     %logits = stablehlo.constant dense<0.000000e+00> : tensor<{batch}x{vocab}xbf16>
     %next_token = stablehlo.constant dense<0> : tensor<{batch}xi32>
-    return %logits, %next_token, %kv_cache : tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>
+    func.return %logits, %next_token, %kv_cache : tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>
   }}
 }}
 "#,
