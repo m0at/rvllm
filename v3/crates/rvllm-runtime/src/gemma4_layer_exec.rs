@@ -741,17 +741,19 @@ pub unsafe fn gemma4_forward_phase(
                 && weights.awq.linear_active(AwqLinearKind::V),
             "AWQ QKV must be all-or-nothing (Q/K/V flags inconsistent)"
         );
-        // Prefill (M>1) is opt-in via RVLLM_AWQ_PREFILL_LOOP=1. The
-        // loop re-reads the full weight matrix per token (~50ms/token);
-        // production prefill answer is the cycle 51c-d CUTLASS SM120
-        // AWQ GEMM. Default behavior fails loud rather than silently
-        // running pathologically slow prefill.
+        // Prefill (M>1) preference order:
+        //   1. WMMA AWQ GEMM kernel (cycle 51d) when its PTX is present.
+        //   2. Per-token GEMV loop opt-in via RVLLM_AWQ_PREFILL_LOOP=1
+        //      (debug fallback, ~50ms/token).
+        //   3. Otherwise FeatureNotAvailable — the kernel tree predates
+        //      the GEMM and the user hasn't opted into the slow loop.
         let prefill_loop_enabled = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
-        if dims.num_tokens != 1 && !prefill_loop_enabled {
+        let gemm_available = kernels.awq_int4_gemm_sm120_wmma.is_some();
+        if dims.num_tokens != 1 && !gemm_available && !prefill_loop_enabled {
             return Err(rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     backend: "AwqInt4GemvF16",
-                    op: "awq qkv prefill (M>1) not yet implemented; set RVLLM_AWQ_PREFILL_LOOP=1 for slow per-token fallback",
+                    op: "awq qkv prefill (M>1): GEMM kernel PTX absent and RVLLM_AWQ_PREFILL_LOOP not set",
                 },
                 ctx: rvllm_core::AttnCtx {
                     op: "awq_qkv",
@@ -807,6 +809,13 @@ pub unsafe fn gemma4_forward_phase(
         // prefill (M>1), three per-token-loop launches with
         // out_stride=qkv_rows so each token's output lands at the
         // right row.
+        // Cycle 51d.4c: dispatch precedence is M=1 → GEMV; M>1 +
+        // GEMM-kernel-available + NOT loop-opt-out → GEMM (~6 TFLOPS,
+        // 30ms M=2048 vs 100s loop); else per-token GEMV loop fallback.
+        let force_loop = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
+        let use_gemm = dims.num_tokens > 1
+            && !force_loop
+            && kernels.awq_int4_gemm_sm120_wmma.is_some();
         unsafe {
             if dims.num_tokens == 1 {
                 gemma4_launcher::AwqInt4GemvF16Launch {
@@ -824,8 +833,27 @@ pub unsafe fn gemma4_forward_phase(
                 }.launch(fn_awq, scratch.delta_f16,
                     weights.awq.v_packed, weights.awq.v_scale, weights.awq.v_zero,
                     scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2, stream)?;
+            } else if use_gemm {
+                // Prefill via WMMA GEMM. 3 launches compose into one
+                // [num_tokens, qkv_rows] scratch via ld_d=qkv_rows +
+                // column-offset destination pointers.
+                let fn_gemm = kernels.awq_int4_gemm_sm120_wmma.unwrap();
+                let mk_gemm = |n: u32| gemma4_launcher::AwqInt4GemmSm120WmmaLaunch {
+                    m: dims.num_tokens, n, k, group_size: g, ld_d: qkv_rows_u,
+                };
+                mk_gemm(q_dim_u).launch(fn_gemm, scratch.q_out, scratch.delta_f16,
+                    weights.awq.q_packed, weights.awq.q_scale, weights.awq.q_zero,
+                    stream)?;
+                mk_gemm(kv_dim).launch(fn_gemm,
+                    scratch.q_out + (q_dim_u as u64) * 2, scratch.delta_f16,
+                    weights.awq.k_packed, weights.awq.k_scale, weights.awq.k_zero,
+                    stream)?;
+                mk_gemm(kv_dim).launch(fn_gemm,
+                    scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2, scratch.delta_f16,
+                    weights.awq.v_packed, weights.awq.v_scale, weights.awq.v_zero,
+                    stream)?;
             } else {
-                // Per-token prefill loop — debug fallback only.
+                // Per-token GEMV loop fallback (debug-only, slow).
                 let mk_loop = |n: u32| gemma4_launcher::AwqInt4GemvF16PrefillLoop {
                     num_tokens: dims.num_tokens, n, k, group_size: g,
                     in_stride_elems:  k,
@@ -1534,11 +1562,12 @@ pub unsafe fn gemma4_forward_phase(
         // writes f16 staging in gemm_f32_tmp, then the standard f16-in
         // post-attn-norm + residual epilogue rolls it into `residual`.
         let prefill_loop_enabled = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
-        if dims.num_tokens != 1 && !prefill_loop_enabled {
+        let gemm_available = kernels.awq_int4_gemm_sm120_wmma.is_some();
+        if dims.num_tokens != 1 && !gemm_available && !prefill_loop_enabled {
             return Err(rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     backend: "AwqInt4GemvF16",
-                    op: "awq o_proj prefill (M>1) not yet implemented; set RVLLM_AWQ_PREFILL_LOOP=1 for slow per-token fallback",
+                    op: "awq o_proj prefill (M>1): GEMM kernel PTX absent and RVLLM_AWQ_PREFILL_LOOP not set",
                 },
                 ctx: rvllm_core::AttnCtx {
                     op: "awq_o", stream,
@@ -1558,6 +1587,7 @@ pub unsafe fn gemma4_forward_phase(
             }
         })?;
         let o_out_f16 = scratch.gemm_f32_tmp;
+        let use_gemm = dims.num_tokens > 1 && !prefill_loop_enabled && gemm_available;
         unsafe {
             if dims.num_tokens == 1 {
                 gemma4_launcher::AwqInt4GemvF16Launch {
@@ -1567,10 +1597,21 @@ pub unsafe fn gemma4_forward_phase(
                 }.launch(fn_awq, scratch.attn_out,
                     weights.awq.o_packed, weights.awq.o_scale, weights.awq.o_zero,
                     o_out_f16, stream)?;
+            } else if use_gemm {
+                // O proj prefill via GEMM: ld_d=hidden (output is
+                // [num_tokens, hidden] contiguous in gemm_f32_tmp).
+                gemma4_launcher::AwqInt4GemmSm120WmmaLaunch {
+                    m: dims.num_tokens,
+                    n: dims.hidden as u32,
+                    k: q_dim as u32,
+                    group_size: weights.awq.group_size,
+                    ld_d: dims.hidden as u32,
+                }.launch(kernels.awq_int4_gemm_sm120_wmma.unwrap(),
+                    o_out_f16, scratch.attn_out,
+                    weights.awq.o_packed, weights.awq.o_scale, weights.awq.o_zero,
+                    stream)?;
             } else {
-                // O proj prefill: in_stride=q_dim (attn_out is
-                // [num_tokens, q_dim] f16), out_stride=hidden
-                // (gemm_f32_tmp staged as [num_tokens, hidden] f16).
+                // O proj prefill loop fallback.
                 gemma4_launcher::AwqInt4GemvF16PrefillLoop {
                     num_tokens: dims.num_tokens,
                     n: dims.hidden as u32,
@@ -1723,11 +1764,12 @@ pub unsafe fn gemma4_forward_phase(
         debug_assert!(weights.awq.linear_active(AwqLinearKind::Up),
             "AWQ gate/up must be all-or-nothing");
         let prefill_loop_enabled = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
-        if dims.num_tokens != 1 && !prefill_loop_enabled {
+        let gemm_available = kernels.awq_int4_gemm_sm120_wmma.is_some();
+        if dims.num_tokens != 1 && !gemm_available && !prefill_loop_enabled {
             return Err(rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     backend: "AwqInt4GemvF16",
-                    op: "awq gate_up prefill (M>1) not yet implemented; set RVLLM_AWQ_PREFILL_LOOP=1 for slow per-token fallback",
+                    op: "awq gate_up prefill (M>1): GEMM kernel PTX absent and RVLLM_AWQ_PREFILL_LOOP not set",
                 },
                 ctx: rvllm_core::AttnCtx { op: "awq_gate_up", stream,
                     num_seqs: dims.num_tokens, head_dim: dims.head_dim },
@@ -1760,6 +1802,7 @@ pub unsafe fn gemma4_forward_phase(
         let inter = dims.intermediate as u32;
         let k = dims.hidden as u32;
         let g = weights.awq.group_size;
+        let use_gemm = dims.num_tokens > 1 && !prefill_loop_enabled && gemm_available;
         unsafe {
             if dims.num_tokens == 1 {
                 // gate -> scratch.gate_up_out + 0
@@ -1772,8 +1815,24 @@ pub unsafe fn gemma4_forward_phase(
                     .launch(fn_awq, scratch.delta_f16,
                         weights.awq.up_packed, weights.awq.up_scale, weights.awq.up_zero,
                         scratch.gate_up_out + (inter as u64) * 2, stream)?;
+            } else if use_gemm {
+                // gate||up prefill via GEMM: ld_d=2*intermediate
+                // (fused [gate || up] layout), 2 launches at column
+                // offsets 0 / intermediate.
+                let fn_gemm = kernels.awq_int4_gemm_sm120_wmma.unwrap();
+                let mk_gemm = || gemma4_launcher::AwqInt4GemmSm120WmmaLaunch {
+                    m: dims.num_tokens, n: inter, k, group_size: g,
+                    ld_d: 2 * inter,
+                };
+                mk_gemm().launch(fn_gemm, scratch.gate_up_out, scratch.delta_f16,
+                    weights.awq.gate_packed, weights.awq.gate_scale, weights.awq.gate_zero,
+                    stream)?;
+                mk_gemm().launch(fn_gemm,
+                    scratch.gate_up_out + (inter as u64) * 2, scratch.delta_f16,
+                    weights.awq.up_packed, weights.awq.up_scale, weights.awq.up_zero,
+                    stream)?;
             } else {
-                // gate||up prefill: in_stride=hidden,
+                // gate||up prefill loop fallback. in_stride=hidden,
                 // out_stride=2*intermediate (fused [gate || up] layout
                 // downstream GELU-mul expects).
                 let mk_loop = |n: u32| gemma4_launcher::AwqInt4GemvF16PrefillLoop {
@@ -1895,11 +1954,12 @@ pub unsafe fn gemma4_forward_phase(
         // gemm_f32_tmp (used as f16 staging), then the standard
         // f16-in post-FF-norm + residual epilogue.
         let prefill_loop_enabled = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
-        if dims.num_tokens != 1 && !prefill_loop_enabled {
+        let gemm_available = kernels.awq_int4_gemm_sm120_wmma.is_some();
+        if dims.num_tokens != 1 && !gemm_available && !prefill_loop_enabled {
             return Err(rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     backend: "AwqInt4GemvF16",
-                    op: "awq down_proj prefill (M>1) not yet implemented; set RVLLM_AWQ_PREFILL_LOOP=1 for slow per-token fallback",
+                    op: "awq down_proj prefill (M>1): GEMM kernel PTX absent and RVLLM_AWQ_PREFILL_LOOP not set",
                 },
                 ctx: rvllm_core::AttnCtx { op: "awq_down", stream,
                     num_seqs: dims.num_tokens, head_dim: dims.head_dim },
@@ -1930,6 +1990,7 @@ pub unsafe fn gemma4_forward_phase(
             let grid = (dims.num_tokens, 1, 1);
             rvllm_fused::launch_raw(kernels.fused_gelu_mul_f16, grid, block, 0, stream, &args)?;
         }
+        let use_gemm = dims.num_tokens > 1 && !prefill_loop_enabled && gemm_available;
         unsafe {
             if dims.num_tokens == 1 {
                 gemma4_launcher::AwqInt4GemvF16Launch {
@@ -1939,10 +2000,24 @@ pub unsafe fn gemma4_forward_phase(
                 }.launch(fn_awq, scratch.gate_up_fp8,
                     weights.awq.down_packed, weights.awq.down_scale, weights.awq.down_zero,
                     scratch.gemm_f32_tmp, stream)?;
+            } else if use_gemm {
+                // down prefill via GEMM: ld_d=hidden (output is
+                // [num_tokens, hidden] contiguous in gemm_f32_tmp).
+                gemma4_launcher::AwqInt4GemmSm120WmmaLaunch {
+                    m: dims.num_tokens,
+                    n: dims.hidden as u32,
+                    k: dims.intermediate as u32,
+                    group_size: weights.awq.group_size,
+                    ld_d: dims.hidden as u32,
+                }.launch(kernels.awq_int4_gemm_sm120_wmma.unwrap(),
+                    scratch.gemm_f32_tmp, scratch.gate_up_fp8,
+                    weights.awq.down_packed, weights.awq.down_scale, weights.awq.down_zero,
+                    stream)?;
             } else {
-                // down prefill: in_stride=intermediate (gate_up_fp8 alias
-                // holds [num_tokens, intermediate] f16 GELU output),
-                // out_stride=hidden (gemm_f32_tmp staged).
+                // down prefill loop fallback. in_stride=intermediate
+                // (gate_up_fp8 alias holds [num_tokens, intermediate]
+                // f16 GELU output), out_stride=hidden (gemm_f32_tmp
+                // staged).
                 gemma4_launcher::AwqInt4GemvF16PrefillLoop {
                     num_tokens: dims.num_tokens,
                     n: dims.hidden as u32,
