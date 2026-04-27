@@ -504,8 +504,13 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
             // gates both s_p_f16 + s_v_f16_T visibility for the MMA.
 
             // (2) Pack P[m, t=k_base_t..k_base_t+MMA_K) into s_p_f16
-            //     [m, 0..MMA_K) directly. Post-softmax P ∈ [0, 1] so
-            //     no inv-scale needed (former s_p_scale was always 1.0).
+            //     [m, 0..MMA_K) directly. UN-normalized softmax
+            //     numerator (P = exp(score - new_M)) — row sum
+            //     accumulates into s_l[m] and is applied as 1/s_l in
+            //     the epilogue, NOT before P*V. P ∈ [0, 1] so f16
+            //     mantissa is sufficient (codex 52e review).
+            //     The former s_p_scale was always 1.0; no inv-scale
+            //     needed at this point.
             if (pv_row < BLOCK_M) {
                 for (int t = pv_lr; t < MMA_K; t += 8) {
                     const int t_src = k_base_t + t;
