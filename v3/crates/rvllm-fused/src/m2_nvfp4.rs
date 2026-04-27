@@ -1,8 +1,8 @@
 //! MiniMax-M2 NVFP4 helpers for the Rust TPU path.
 //!
-//! This is the Rust-side ground truth for the lower-level Mosaic/custom-call
-//! route: shape validation, exact NVFP4 decode semantics, and an MLIR scaffold
-//! emitter with the real M2 matmul signature.
+//! This is the Rust-side ground truth for the lower-level XLA custom-call route:
+//! shape validation, exact NVFP4 decode semantics, and a deterministic MLIR
+//! interface emitter with the real M2 matmul signature.
 
 use rvllm_core::{ConfigError, Result, RvllmError};
 
@@ -10,6 +10,8 @@ pub const NVFP4_GROUP: usize = 16;
 pub const M2_MOSAIC_DEFAULT_BN: usize = 512;
 pub const M2_MOSAIC_DEFAULT_BK: usize = 1024;
 pub const M2_NVFP4_CUSTOM_CALL_TARGET: &str = "rvllm.m2.nvfp4_decode_bf16_matmul";
+pub const M2_NVFP4_CUSTOM_CALL_ABI_VERSION: u32 = 1;
+pub const M2_NVFP4_DESCRIPTOR_FORMAT: &str = "rvllm.m2.nvfp4.custom_call.v1";
 
 pub const FP4_E2M1_LUT: [f32; 16] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -20,6 +22,38 @@ pub struct M2Nvfp4MatmulShape {
     pub m: usize,
     pub n: usize,
     pub k: usize,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum M2Nvfp4IoDType {
+    Bf16,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum M2Nvfp4PackedDType {
+    U8,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum M2Nvfp4ScaleDType {
+    Fp8E4M3,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum M2Nvfp4ScalarDType {
+    F32,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct M2Nvfp4KernelDescriptor {
+    pub target: &'static str,
+    pub shape: M2Nvfp4MatmulShape,
+    pub x_dtype: M2Nvfp4IoDType,
+    pub packed_dtype: M2Nvfp4PackedDType,
+    pub scale_dtype: M2Nvfp4ScaleDType,
+    pub global_scale_dtype: M2Nvfp4ScalarDType,
+    pub out_dtype: M2Nvfp4IoDType,
+    pub block_size: usize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -43,6 +77,7 @@ pub struct M2Nvfp4MosaicMemory {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct M2Nvfp4CustomCallAbi {
     pub target: &'static str,
+    pub descriptor: M2Nvfp4KernelDescriptor,
     pub shape: M2Nvfp4MatmulShape,
     pub tile: M2Nvfp4MosaicTilePlan,
     pub vmem_working_set_bytes: usize,
@@ -78,6 +113,10 @@ impl M2Nvfp4MatmulShape {
         self.m * self.n
     }
 
+    pub const fn kernel_descriptor(self) -> M2Nvfp4KernelDescriptor {
+        M2Nvfp4KernelDescriptor::new(self)
+    }
+
     pub fn default_mosaic_plan(self) -> M2Nvfp4MosaicTilePlan {
         M2Nvfp4MosaicTilePlan {
             bm: self.m.min(8),
@@ -86,8 +125,21 @@ impl M2Nvfp4MatmulShape {
         }
     }
 
+    pub fn custom_call_mlir(self, kernel_name: &str) -> Result<String> {
+        self.custom_call_mlir_with_plan(kernel_name, self.default_mosaic_plan())
+    }
+
+    pub fn custom_call_mlir_with_plan(
+        self,
+        kernel_name: &str,
+        plan: M2Nvfp4MosaicTilePlan,
+    ) -> Result<String> {
+        self.kernel_descriptor()
+            .custom_call_mlir_with_plan(kernel_name, plan)
+    }
+
     pub fn mosaic_mlir(self, kernel_name: &str) -> Result<String> {
-        self.mosaic_mlir_with_plan(kernel_name, self.default_mosaic_plan())
+        self.custom_call_mlir(kernel_name)
     }
 
     pub fn mosaic_mlir_with_plan(
@@ -95,77 +147,345 @@ impl M2Nvfp4MatmulShape {
         kernel_name: &str,
         plan: M2Nvfp4MosaicTilePlan,
     ) -> Result<String> {
-        self.validate()?;
-        plan.validate_for(self)?;
-        if !is_mlir_symbol(kernel_name) {
-            return Err(invalid("kernel_name", "must be an MLIR symbol"));
+        self.custom_call_mlir_with_plan(kernel_name, plan)
+    }
+
+    pub fn custom_call_abi(self, plan: M2Nvfp4MosaicTilePlan) -> Result<M2Nvfp4CustomCallAbi> {
+        self.kernel_descriptor().custom_call_abi(plan)
+    }
+}
+
+impl M2Nvfp4IoDType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
         }
-        let abi = self.custom_call_abi(plan)?;
+    }
+
+    pub const fn mlir_dtype(self) -> &'static str {
+        self.as_str()
+    }
+
+    pub const fn elem_bytes(self) -> usize {
+        match self {
+            Self::Bf16 => 2,
+        }
+    }
+}
+
+impl M2Nvfp4PackedDType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::U8 => "u8",
+        }
+    }
+
+    pub const fn mlir_storage_dtype(self) -> &'static str {
+        match self {
+            Self::U8 => "i8",
+        }
+    }
+
+    pub const fn elem_bytes(self) -> usize {
+        match self {
+            Self::U8 => 1,
+        }
+    }
+}
+
+impl M2Nvfp4ScaleDType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fp8E4M3 => "fp8_e4m3",
+        }
+    }
+
+    pub const fn mlir_storage_dtype(self) -> &'static str {
+        match self {
+            Self::Fp8E4M3 => "i8",
+        }
+    }
+
+    pub const fn elem_bytes(self) -> usize {
+        match self {
+            Self::Fp8E4M3 => 1,
+        }
+    }
+}
+
+impl M2Nvfp4ScalarDType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+        }
+    }
+
+    pub const fn mlir_dtype(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl M2Nvfp4KernelDescriptor {
+    pub const fn new(shape: M2Nvfp4MatmulShape) -> Self {
+        Self {
+            target: M2_NVFP4_CUSTOM_CALL_TARGET,
+            shape,
+            x_dtype: M2Nvfp4IoDType::Bf16,
+            packed_dtype: M2Nvfp4PackedDType::U8,
+            scale_dtype: M2Nvfp4ScaleDType::Fp8E4M3,
+            global_scale_dtype: M2Nvfp4ScalarDType::F32,
+            out_dtype: M2Nvfp4IoDType::Bf16,
+            block_size: NVFP4_GROUP,
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        self.shape.validate()?;
+        if self.target != M2_NVFP4_CUSTOM_CALL_TARGET {
+            return Err(invalid("target", "must be the M2 NVFP4 custom-call target"));
+        }
+        if self.block_size != NVFP4_GROUP {
+            return Err(invalid("block_size", "must be 16"));
+        }
+        Ok(())
+    }
+
+    pub const fn x_dims(self) -> [usize; 2] {
+        [self.shape.m, self.shape.k]
+    }
+
+    pub const fn packed_dims(self) -> [usize; 2] {
+        [self.shape.n, self.shape.k / 2]
+    }
+
+    pub const fn scale_dims(self) -> [usize; 2] {
+        [self.shape.n, self.shape.k / NVFP4_GROUP]
+    }
+
+    pub const fn out_dims(self) -> [usize; 2] {
+        [self.shape.m, self.shape.n]
+    }
+
+    pub fn descriptor_text(self) -> Result<String> {
+        self.validate()?;
         Ok(format!(
-            r#"module attributes {{rvllm.kind = "m2_nvfp4_mosaic"}} {{
-  func.func @{kernel_name}(
-      %x: memref<{m}x{k}xbf16>,
-      %packed: memref<{n}x{k_half}xi8>,
-      %scales: memref<{n}x{k_scale}xi8>,
-      %global_scale: memref<f32>,
-      %out: memref<{m}x{n}xbf16>) attributes {{
-        rvllm.signature = "x_bf16,packed_u8,scale_fp8,global_f32,out_bf16",
-        rvllm.layout = "row_major",
-        rvllm.nvfp4_group = {group} : i64,
-        rvllm.tile = "BM={bm},BN={bn},BK={bk}",
-        rvllm.tiles = "M={tm},N={tn},K={tk}",
-        rvllm.vmem_working_set_bytes = {working_set} : i64,
-        rvllm.custom_call_target = "{target}",
-        rvllm.lowering = "mosaic_custom_call",
-        rvllm.lowering_plan = "tpu.load packed/scales -> unpack nibbles -> fp8/fp4 decode in VMEM/registers -> bf16 RHS tile -> tpu.matmul -> tpu.store"
-      }} {{
-    "{target}"(%x, %packed, %scales, %global_scale, %out) {{
-      rvllm.tile_bm = {bm} : i64,
-      rvllm.tile_bn = {bn} : i64,
-      rvllm.tile_bk = {bk} : i64,
-      rvllm.nvfp4_group = {group} : i64,
-      rvllm.vmem_working_set_bytes = {working_set} : i64,
-      rvllm.packed_bytes = {packed_bytes} : i64,
-      rvllm.scale_bytes = {scale_bytes} : i64,
-      rvllm.out_bytes = {out_bytes} : i64
-    }} : (memref<{m}x{k}xbf16>, memref<{n}x{k_half}xi8>, memref<{n}x{k_scale}xi8>, memref<f32>, memref<{m}x{n}xbf16>) -> ()
-    return
-  }}
-}}
-"#,
-            m = self.m,
-            n = self.n,
-            k = self.k,
-            k_half = self.k / 2,
-            k_scale = self.k / NVFP4_GROUP,
-            group = NVFP4_GROUP,
-            bm = plan.bm,
-            bn = plan.bn,
-            bk = plan.bk,
-            tm = div_ceil(self.m, plan.bm),
-            tn = div_ceil(self.n, plan.bn),
-            tk = div_ceil(self.k, plan.bk),
-            target = abi.target,
-            working_set = abi.vmem_working_set_bytes,
-            packed_bytes = abi.packed_bytes,
-            scale_bytes = abi.scale_bytes,
-            out_bytes = abi.out_bytes,
+            "format={format}\nabi_version={abi_version}\ntarget={target}\nx_dtype={x_dtype}\npacked_dtype={packed_dtype}\nscale_dtype={scale_dtype}\nglobal_scale_dtype={global_scale_dtype}\nout_dtype={out_dtype}\nblock_size={block_size}\nm={m}\nn={n}\nk={k}\nx_dims={m}x{k}\npacked_dims={n}x{k_half}\nscale_dims={n}x{k_scale}\nout_dims={m}x{n}\n",
+            format = M2_NVFP4_DESCRIPTOR_FORMAT,
+            abi_version = M2_NVFP4_CUSTOM_CALL_ABI_VERSION,
+            target = self.target,
+            x_dtype = self.x_dtype.as_str(),
+            packed_dtype = self.packed_dtype.as_str(),
+            scale_dtype = self.scale_dtype.as_str(),
+            global_scale_dtype = self.global_scale_dtype.as_str(),
+            out_dtype = self.out_dtype.as_str(),
+            block_size = self.block_size,
+            m = self.shape.m,
+            n = self.shape.n,
+            k = self.shape.k,
+            k_half = self.shape.k / 2,
+            k_scale = self.shape.k / NVFP4_GROUP,
+        ))
+    }
+
+    pub fn descriptor_inline(self) -> Result<String> {
+        self.validate()?;
+        Ok(format!(
+            "format={format};abi_version={abi_version};target={target};x_dtype={x_dtype};packed_dtype={packed_dtype};scale_dtype={scale_dtype};global_scale_dtype={global_scale_dtype};out_dtype={out_dtype};block_size={block_size};m={m};n={n};k={k};x_dims={m}x{k};packed_dims={n}x{k_half};scale_dims={n}x{k_scale};out_dims={m}x{n}",
+            format = M2_NVFP4_DESCRIPTOR_FORMAT,
+            abi_version = M2_NVFP4_CUSTOM_CALL_ABI_VERSION,
+            target = self.target,
+            x_dtype = self.x_dtype.as_str(),
+            packed_dtype = self.packed_dtype.as_str(),
+            scale_dtype = self.scale_dtype.as_str(),
+            global_scale_dtype = self.global_scale_dtype.as_str(),
+            out_dtype = self.out_dtype.as_str(),
+            block_size = self.block_size,
+            m = self.shape.m,
+            n = self.shape.n,
+            k = self.shape.k,
+            k_half = self.shape.k / 2,
+            k_scale = self.shape.k / NVFP4_GROUP,
         ))
     }
 
     pub fn custom_call_abi(self, plan: M2Nvfp4MosaicTilePlan) -> Result<M2Nvfp4CustomCallAbi> {
         self.validate()?;
-        plan.validate_for(self)?;
+        plan.validate_for(self.shape)?;
         let mem = plan.memory();
         Ok(M2Nvfp4CustomCallAbi {
-            target: M2_NVFP4_CUSTOM_CALL_TARGET,
-            shape: self,
+            target: self.target,
+            descriptor: self,
+            shape: self.shape,
             tile: plan,
             vmem_working_set_bytes: mem.total_bytes,
-            packed_bytes: self.packed_len(),
-            scale_bytes: self.scale_len(),
-            out_bytes: self.out_len() * 2,
+            packed_bytes: self.shape.packed_len() * self.packed_dtype.elem_bytes(),
+            scale_bytes: self.shape.scale_len() * self.scale_dtype.elem_bytes(),
+            out_bytes: self.shape.out_len() * self.out_dtype.elem_bytes(),
         })
+    }
+
+    pub fn custom_call_body(self, plan: M2Nvfp4MosaicTilePlan) -> Result<String> {
+        let abi = self.custom_call_abi(plan)?;
+        let descriptor = self.descriptor_inline()?;
+        Ok(format!(
+            r#"    "{target}"(%x, %packed, %scales, %global_scale, %out) {{
+      rvllm.abi = "{format}",
+      rvllm.abi_version = {abi_version} : i64,
+      rvllm.descriptor = "{descriptor}",
+      rvllm.target = "{target}",
+      rvllm.x_dtype = "{x_dtype}",
+      rvllm.packed_dtype = "{packed_dtype}",
+      rvllm.scale_dtype = "{scale_dtype}",
+      rvllm.global_scale_dtype = "{global_scale_dtype}",
+      rvllm.out_dtype = "{out_dtype}",
+      rvllm.block_size = {block_size} : i64,
+      rvllm.x_dims = "{m}x{k}",
+      rvllm.packed_dims = "{n}x{k_half}",
+      rvllm.scale_dims = "{n}x{k_scale}",
+      rvllm.out_dims = "{m}x{n}",
+      rvllm.tile_bm = {bm} : i64,
+      rvllm.tile_bn = {bn} : i64,
+      rvllm.tile_bk = {bk} : i64,
+      rvllm.tiles_m = {tm} : i64,
+      rvllm.tiles_n = {tn} : i64,
+      rvllm.tiles_k = {tk} : i64,
+      rvllm.vmem_working_set_bytes = {working_set} : i64,
+      rvllm.packed_bytes = {packed_bytes} : i64,
+      rvllm.scale_bytes = {scale_bytes} : i64,
+      rvllm.out_bytes = {out_bytes} : i64
+    }} : ({x_ty}, {packed_ty}, {scales_ty}, {global_scale_ty}, {out_ty}) -> ()
+"#,
+            target = self.target,
+            format = M2_NVFP4_DESCRIPTOR_FORMAT,
+            abi_version = M2_NVFP4_CUSTOM_CALL_ABI_VERSION,
+            descriptor = descriptor,
+            x_dtype = self.x_dtype.as_str(),
+            packed_dtype = self.packed_dtype.as_str(),
+            scale_dtype = self.scale_dtype.as_str(),
+            global_scale_dtype = self.global_scale_dtype.as_str(),
+            out_dtype = self.out_dtype.as_str(),
+            block_size = self.block_size,
+            m = self.shape.m,
+            n = self.shape.n,
+            k = self.shape.k,
+            k_half = self.shape.k / 2,
+            k_scale = self.shape.k / NVFP4_GROUP,
+            bm = abi.tile.bm,
+            bn = abi.tile.bn,
+            bk = abi.tile.bk,
+            tm = div_ceil(self.shape.m, abi.tile.bm),
+            tn = div_ceil(self.shape.n, abi.tile.bn),
+            tk = div_ceil(self.shape.k, abi.tile.bk),
+            working_set = abi.vmem_working_set_bytes,
+            packed_bytes = abi.packed_bytes,
+            scale_bytes = abi.scale_bytes,
+            out_bytes = abi.out_bytes,
+            x_ty = self.x_memref_ty(),
+            packed_ty = self.packed_memref_ty(),
+            scales_ty = self.scales_memref_ty(),
+            global_scale_ty = self.global_scale_memref_ty(),
+            out_ty = self.out_memref_ty(),
+        ))
+    }
+
+    pub fn custom_call_mlir(self, kernel_name: &str) -> Result<String> {
+        self.custom_call_mlir_with_plan(kernel_name, self.shape.default_mosaic_plan())
+    }
+
+    pub fn custom_call_mlir_with_plan(
+        self,
+        kernel_name: &str,
+        plan: M2Nvfp4MosaicTilePlan,
+    ) -> Result<String> {
+        self.validate()?;
+        if !is_mlir_symbol(kernel_name) {
+            return Err(invalid("kernel_name", "must be an MLIR symbol"));
+        }
+        let abi = self.custom_call_abi(plan)?;
+        let body = self.custom_call_body(plan)?;
+        Ok(format!(
+            r#"module attributes {{rvllm.kind = "m2_nvfp4_custom_call"}} {{
+  func.func @{kernel_name}(
+      %x: {x_ty},
+      %packed: {packed_ty},
+      %scales: {scales_ty},
+      %global_scale: {global_scale_ty},
+      %out: {out_ty}) attributes {{
+        rvllm.signature = "x_bf16,packed_u8,scale_fp8_e4m3,global_f32,out_bf16",
+        rvllm.abi = "{format}",
+        rvllm.abi_version = {abi_version} : i64,
+        rvllm.layout = "row_major",
+        rvllm.block_size = {block_size} : i64,
+        rvllm.tile = "BM={bm},BN={bn},BK={bk}",
+        rvllm.tiles = "M={tm},N={tn},K={tk}",
+        rvllm.vmem_working_set_bytes = {working_set} : i64,
+        rvllm.custom_call_target = "{target}",
+        rvllm.lowering = "rust_xla_custom_call",
+        rvllm.lowering_plan = "XLA custom call receives bf16 activations, packed u8 NVFP4 weights, fp8_e4m3 scales, f32 global scale, and bf16 output buffer"
+      }} {{
+{body}    return
+  }}
+}}
+"#,
+            kernel_name = kernel_name,
+            x_ty = self.x_memref_ty(),
+            packed_ty = self.packed_memref_ty(),
+            scales_ty = self.scales_memref_ty(),
+            global_scale_ty = self.global_scale_memref_ty(),
+            out_ty = self.out_memref_ty(),
+            format = M2_NVFP4_DESCRIPTOR_FORMAT,
+            abi_version = M2_NVFP4_CUSTOM_CALL_ABI_VERSION,
+            block_size = self.block_size,
+            bm = abi.tile.bm,
+            bn = abi.tile.bn,
+            bk = abi.tile.bk,
+            tm = div_ceil(self.shape.m, abi.tile.bm),
+            tn = div_ceil(self.shape.n, abi.tile.bn),
+            tk = div_ceil(self.shape.k, abi.tile.bk),
+            working_set = abi.vmem_working_set_bytes,
+            target = self.target,
+            body = body,
+        ))
+    }
+
+    fn x_memref_ty(self) -> String {
+        format!(
+            "memref<{}x{}x{}>",
+            self.shape.m,
+            self.shape.k,
+            self.x_dtype.mlir_dtype()
+        )
+    }
+
+    fn packed_memref_ty(self) -> String {
+        format!(
+            "memref<{}x{}x{}>",
+            self.shape.n,
+            self.shape.k / 2,
+            self.packed_dtype.mlir_storage_dtype()
+        )
+    }
+
+    fn scales_memref_ty(self) -> String {
+        format!(
+            "memref<{}x{}x{}>",
+            self.shape.n,
+            self.shape.k / NVFP4_GROUP,
+            self.scale_dtype.mlir_storage_dtype()
+        )
+    }
+
+    fn global_scale_memref_ty(self) -> String {
+        format!("memref<{}>", self.global_scale_dtype.mlir_dtype())
+    }
+
+    fn out_memref_ty(self) -> String {
+        format!(
+            "memref<{}x{}x{}>",
+            self.shape.m,
+            self.shape.n,
+            self.out_dtype.mlir_dtype()
+        )
     }
 }
 
@@ -353,26 +673,81 @@ mod tests {
     }
 
     #[test]
-    fn emits_real_m2_signature() {
+    fn kernel_descriptor_pins_dtype_and_dims() {
+        let shape = M2Nvfp4MatmulShape {
+            m: 8,
+            n: 1536,
+            k: 3072,
+        };
+        let desc = shape.kernel_descriptor();
+        desc.validate().unwrap();
+        assert_eq!(desc.target, M2_NVFP4_CUSTOM_CALL_TARGET);
+        assert_eq!(desc.x_dtype, M2Nvfp4IoDType::Bf16);
+        assert_eq!(desc.packed_dtype, M2Nvfp4PackedDType::U8);
+        assert_eq!(desc.scale_dtype, M2Nvfp4ScaleDType::Fp8E4M3);
+        assert_eq!(desc.global_scale_dtype, M2Nvfp4ScalarDType::F32);
+        assert_eq!(desc.out_dtype, M2Nvfp4IoDType::Bf16);
+        assert_eq!(desc.block_size, 16);
+        assert_eq!(desc.x_dims(), [8, 3072]);
+        assert_eq!(desc.packed_dims(), [1536, 1536]);
+        assert_eq!(desc.scale_dims(), [1536, 192]);
+        assert_eq!(desc.out_dims(), [8, 1536]);
+    }
+
+    #[test]
+    fn kernel_descriptor_rejects_non_contract_values() {
+        let shape = M2Nvfp4MatmulShape { m: 1, n: 1, k: 16 };
+        let mut desc = shape.kernel_descriptor();
+        desc.block_size = 8;
+        assert!(desc.validate().is_err());
+
+        let mut desc = shape.kernel_descriptor();
+        desc.target = "rvllm.m2.other";
+        assert!(desc.validate().is_err());
+
+        let bad_shape = M2Nvfp4MatmulShape { m: 1, n: 1, k: 15 }.kernel_descriptor();
+        assert!(bad_shape.validate().is_err());
+    }
+
+    #[test]
+    fn descriptor_text_is_deterministic() {
+        let desc = M2Nvfp4MatmulShape { m: 2, n: 4, k: 16 }.kernel_descriptor();
+        let expected = "format=rvllm.m2.nvfp4.custom_call.v1\nabi_version=1\ntarget=rvllm.m2.nvfp4_decode_bf16_matmul\nx_dtype=bf16\npacked_dtype=u8\nscale_dtype=fp8_e4m3\nglobal_scale_dtype=f32\nout_dtype=bf16\nblock_size=16\nm=2\nn=4\nk=16\nx_dims=2x16\npacked_dims=4x8\nscale_dims=4x1\nout_dims=2x4\n";
+        assert_eq!(desc.descriptor_text().unwrap(), expected);
+        assert_eq!(desc.descriptor_text().unwrap(), expected);
+    }
+
+    #[test]
+    fn emits_real_m2_custom_call_signature() {
         let shape = M2Nvfp4MatmulShape {
             m: 8,
             n: 1536,
             k: 3072,
         };
         let mlir = shape.mosaic_mlir("rvllm_m2_nvfp4_matmul").unwrap();
+        assert!(mlir.contains("rvllm.kind = \"m2_nvfp4_custom_call\""));
         assert!(mlir.contains("memref<8x3072xbf16>"));
         assert!(mlir.contains("memref<1536x1536xi8>"));
         assert!(mlir.contains("memref<1536x192xi8>"));
+        assert!(mlir.contains("rvllm.abi = \"rvllm.m2.nvfp4.custom_call.v1\""));
+        assert!(mlir.contains("rvllm.block_size = 16 : i64"));
+        assert!(mlir.contains("rvllm.packed_dtype = \"u8\""));
+        assert!(mlir.contains("rvllm.scale_dtype = \"fp8_e4m3\""));
+        assert!(mlir.contains("rvllm.x_dims = \"8x3072\""));
+        assert!(mlir.contains("rvllm.out_dims = \"8x1536\""));
         assert!(mlir.contains("rvllm.tile = \"BM=8,BN=512,BK=1024\""));
         assert!(mlir.contains("rvllm.vmem_working_set_bytes = 1384448 : i64"));
         assert!(mlir.contains("rvllm.custom_call_target = \"rvllm.m2.nvfp4_decode_bf16_matmul\""));
-        assert!(mlir.contains("rvllm.lowering = \"mosaic_custom_call\""));
+        assert!(mlir.contains("rvllm.lowering = \"rust_xla_custom_call\""));
         assert!(mlir.contains(
             "\"rvllm.m2.nvfp4_decode_bf16_matmul\"(%x, %packed, %scales, %global_scale, %out)"
         ));
+        assert!(mlir.contains("rvllm.descriptor = \"format=rvllm.m2.nvfp4.custom_call.v1;abi_version=1;target=rvllm.m2.nvfp4_decode_bf16_matmul;x_dtype=bf16;packed_dtype=u8;scale_dtype=fp8_e4m3;global_scale_dtype=f32;out_dtype=bf16;block_size=16;m=8;n=1536;k=3072;x_dims=8x3072;packed_dims=1536x1536;scale_dims=1536x192;out_dims=8x1536\""));
         assert!(mlir.contains("rvllm.packed_bytes = 2359296 : i64"));
         assert!(mlir.contains("rvllm.scale_bytes = 294912 : i64"));
         assert!(mlir.contains("rvllm.out_bytes = 24576 : i64"));
+        assert!(!mlir.contains("mosaic_custom_call"));
+        assert!(!mlir.to_ascii_lowercase().contains("pallas"));
     }
 
     #[test]
@@ -385,6 +760,7 @@ mod tests {
         let plan = M2Nvfp4MosaicTilePlan::new(8, 512, 1024);
         let abi = shape.custom_call_abi(plan).unwrap();
         assert_eq!(abi.target, M2_NVFP4_CUSTOM_CALL_TARGET);
+        assert_eq!(abi.descriptor, shape.kernel_descriptor());
         assert_eq!(abi.shape, shape);
         assert_eq!(abi.tile, plan);
         assert_eq!(abi.vmem_working_set_bytes, 1_384_448);

@@ -27,8 +27,10 @@ pub use launcher::{
 };
 pub use m2_nvfp4::{
     decode_fp4_e2m1, decode_fp8_e4m3, nvfp4_matmul_ref, nvfp4_weight_at, M2Nvfp4CustomCallAbi,
-    M2Nvfp4MatmulShape, M2Nvfp4MosaicMemory, M2Nvfp4MosaicTilePlan, FP4_E2M1_LUT,
-    M2_MOSAIC_DEFAULT_BK, M2_MOSAIC_DEFAULT_BN, M2_NVFP4_CUSTOM_CALL_TARGET, NVFP4_GROUP,
+    M2Nvfp4IoDType, M2Nvfp4KernelDescriptor, M2Nvfp4MatmulShape, M2Nvfp4MosaicMemory,
+    M2Nvfp4MosaicTilePlan, M2Nvfp4PackedDType, M2Nvfp4ScalarDType, M2Nvfp4ScaleDType, FP4_E2M1_LUT,
+    M2_MOSAIC_DEFAULT_BK, M2_MOSAIC_DEFAULT_BN, M2_NVFP4_CUSTOM_CALL_ABI_VERSION,
+    M2_NVFP4_CUSTOM_CALL_TARGET, M2_NVFP4_DESCRIPTOR_FORMAT, NVFP4_GROUP,
 };
 pub use m2_prefill::{M2PrefillKvDType, M2PrefillScanShape};
 pub use reference::{
