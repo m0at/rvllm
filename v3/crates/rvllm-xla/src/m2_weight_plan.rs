@@ -336,6 +336,23 @@ impl M2WeightArenaPlan {
         reader: &M2SafetensorsReader,
         max_bytes: usize,
     ) -> Result<M2FlatArenaHostBuffer> {
+        self.materialize_int8_host_buffer_inner(reader, max_bytes, true)
+    }
+
+    pub fn materialize_int8_expert_host_buffer(
+        &self,
+        reader: &M2SafetensorsReader,
+        max_bytes: usize,
+    ) -> Result<M2FlatArenaHostBuffer> {
+        self.materialize_int8_host_buffer_inner(reader, max_bytes, false)
+    }
+
+    fn materialize_int8_host_buffer_inner(
+        &self,
+        reader: &M2SafetensorsReader,
+        max_bytes: usize,
+        copy_dense: bool,
+    ) -> Result<M2FlatArenaHostBuffer> {
         if self.total_bytes > max_bytes {
             return Err(invalid_owned(
                 "max_bytes",
@@ -349,11 +366,13 @@ impl M2WeightArenaPlan {
         for entry in &self.entries {
             match entry.role {
                 M2WeightRole::Global | M2WeightRole::LayerDense | M2WeightRole::Int8InputScale => {
-                    let view = reader.tensor(&entry.name)?;
-                    validate_arena_tensor(entry, &view)?;
-                    let start = entry.offset;
-                    let end = start + entry.nbytes;
-                    bytes[start..end].copy_from_slice(view.bytes);
+                    if copy_dense {
+                        let view = reader.tensor(&entry.name)?;
+                        validate_arena_tensor(entry, &view)?;
+                        let start = entry.offset;
+                        let end = start + entry.nbytes;
+                        bytes[start..end].copy_from_slice(view.bytes);
+                    }
                 }
                 M2WeightRole::Int8Weight => {
                     materialize_int8_weight(entry, self, reader, &mut bytes)?;

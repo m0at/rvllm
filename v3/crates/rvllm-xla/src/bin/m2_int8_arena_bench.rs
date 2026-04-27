@@ -23,7 +23,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plan_seconds = plan_start.elapsed().as_secs_f64();
 
     let materialize_start = Instant::now();
-    let host = arena.materialize_int8_host_buffer(&reader, args.max_bytes)?;
+    let host = if args.copy_dense {
+        arena.materialize_int8_host_buffer(&reader, args.max_bytes)?
+    } else {
+        arena.materialize_int8_expert_host_buffer(&reader, args.max_bytes)?
+    };
     let materialize_seconds = materialize_start.elapsed().as_secs_f64();
 
     let mut upload_seconds = None;
@@ -40,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "weight_format": "int8",
         "source_format": "nvfp4_modelopt",
         "weight_entries": host.entries,
+        "copy_dense_tensors": args.copy_dense,
         "total_bytes": host.total_bytes,
         "max_bytes": args.max_bytes,
         "reader_seconds": reader_seconds,
@@ -86,6 +91,7 @@ struct Args {
     alignment: usize,
     max_bytes: usize,
     upload: bool,
+    copy_dense: bool,
     out: Option<PathBuf>,
 }
 
@@ -98,6 +104,7 @@ impl Args {
             alignment: 128,
             max_bytes: 300_000_000_000,
             upload: false,
+            copy_dense: false,
             out: None,
         };
         let mut i = 0;
@@ -124,6 +131,7 @@ impl Args {
                     out.max_bytes = parse(value(&args, i, "--max-bytes")?, "--max-bytes")?;
                 }
                 "--upload" => out.upload = true,
+                "--copy-dense" => out.copy_dense = true,
                 "--out" => {
                     i += 1;
                     out.out = Some(PathBuf::from(value(&args, i, "--out")?));
@@ -155,5 +163,5 @@ where
 }
 
 fn usage() -> String {
-    "usage: m2_int8_arena_bench [--model-dir DIR] [--batch N] [--ctx N] [--alignment N] [--max-bytes N] [--upload] [--out JSON]".to_string()
+    "usage: m2_int8_arena_bench [--model-dir DIR] [--batch N] [--ctx N] [--alignment N] [--max-bytes N] [--copy-dense] [--upload] [--out JSON]".to_string()
 }
