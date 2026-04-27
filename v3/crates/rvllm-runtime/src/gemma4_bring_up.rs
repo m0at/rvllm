@@ -2905,7 +2905,27 @@ impl Gemma4Bringup {
             //
             // Diag mode forces L=0 + single chunk so the row-0 /
             // row-(N-1) rel_err comparison stays meaningful.
-            let prefix_skip = if diag_compare { 0 } else { common_prefix_len };
+            // Cycle 52 step 13 (codex audit of WEATHER-gibberish-after-WHO):
+            // unified-prefill + prefix-cache reuse passes
+            // `cu_seqlens_q=[0, chunk_q]` + `context_lens=chunk_end_abs`
+            // to the kernel, but the kernel's causal mask is local-qi-based
+            // and the kernel ABI has no absolute `q_start` parameter.
+            // Suffix query 0 (absolute pos = prefix_skip) ends up masked
+            // as if it were at pos 0 → attends to the wrong key window
+            // → garbage decode. The bug was latent until cycle 52 step 11d
+            // gave the BC16 split-decode kernel a working ABI; before then
+            // the WHO prefill itself produced garbage so prefix-cache reuse
+            // never saw real KV and the mask bug was invisible.
+            //
+            // Quickfix: force prefix_skip=0 in the unified-prefill path
+            // (`use_batch_prefill` is the gate this branch lives inside).
+            // Re-prefilling from scratch wastes the prefix-cache hit, but
+            // produces correct output. The proper fix — plumb absolute
+            // q_start into the unified NVFP4/FP8 prefill kernel ABI — is
+            // multi-cycle work tracked separately.
+            let prefix_skip = 0u32;
+            let _ = common_prefix_len; // suppress unused-var warning when diag_compare is false
+            let _ = diag_compare;
             let total_new_q = prompt_len - prefix_skip;
             let chunk_env: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
