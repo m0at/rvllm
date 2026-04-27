@@ -15,7 +15,6 @@ pub use compressed_tensors::{
     AwqLinearWeight, AwqPackFormat, AwqTensorNames, AwqWeightScheme, read_awq_config_from_dir,
     stage_awq_linear, validate_awq_linear,
 };
-#[cfg(feature = "cuda")]
 pub use compressed_tensors::{upload_awq_linear, upload_gemma4_awq_layer};
 pub use weights::AwqLayerWeights;
 pub mod fp8_quant;

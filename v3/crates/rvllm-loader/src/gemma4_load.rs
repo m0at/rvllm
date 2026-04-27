@@ -1128,7 +1128,7 @@ fn load_gemma4_awq_model_inner(
     model_dir: &Path,
     arena: &HbmArena,
     arch: &crate::gemma4_arch::Gemma4Arch,
-    _awq: &crate::compressed_tensors::AwqConfig,
+    awq: &crate::compressed_tensors::AwqConfig,
     shards: &[ShardMap],
     tensors: &BTreeMap<String, (usize, TensorEntry)>,
 ) -> Result<Gemma4LoadedModel> {
@@ -1268,34 +1268,97 @@ fn load_gemma4_awq_model_inner(
         let k_norm = upload_f16("k_norm", &ln("self_attn.k_norm.weight"))?;
         let layer_scalar = upload_f16("layer_scalar", &ln("layer_scalar"))?;
 
-        // Cycle 49 step 8c stub: AWQ tensor upload + Gemma4LayerWeights
-        // construction is the next sub-step. Bail out cleanly so the
-        // already-uploaded norms aren't silently dropped (the arena
-        // bump will reset on the caller's `?` short-circuit).
-        let _ = (input_layernorm.offset_bytes, post_attention_layernorm.offset_bytes,
-                 pre_feedforward_layernorm.offset_bytes, post_feedforward_layernorm.offset_bytes,
-                 q_norm.offset_bytes, k_norm.offset_bytes, layer_scalar.offset_bytes);
-        if l == 0 {
+        // Cycle 49 step 8c: AWQ tensor upload via upload_gemma4_awq_layer.
+        // Build a byte_lookup closure that maps safetensors entry name
+        // to (DType, shape, owned bytes Vec). For global layers
+        // (attention_k_eq_v=true), self_attn.v_proj.* aliases to
+        // self_attn.k_proj.* — runtime sees v_packed/scale/zero
+        // pointers identical to k_packed/scale/zero, the AWQ kernel
+        // happily produces the V output by re-running on K's weights.
+        let (_q_out, _kv_out, _o_in, has_v_proj) = awq_layer_shape_for(arch, l);
+        let layer_prefix = format!("{prefix}.layers.{l}");
+        let v_alias_prefix = format!("{layer_prefix}.self_attn.v_proj.");
+        let k_alias_prefix = format!("{layer_prefix}.self_attn.k_proj.");
+        let byte_lookup = |name: &str| -> Option<(rvllm_core::DType, Vec<usize>, Vec<u8>)> {
+            // Global-layer alias: redirect any v_proj.* lookup to k_proj.*
+            // so upload_gemma4_awq_layer's "all 7 linears" contract
+            // succeeds without a synthetic v_proj tensor.
+            let aliased: String;
+            let resolved = if !has_v_proj && name.starts_with(&v_alias_prefix) {
+                aliased = format!("{}{}", k_alias_prefix, &name[v_alias_prefix.len()..]);
+                aliased.as_str()
+            } else {
+                name
+            };
+            let (si, e) = tensors.get(resolved)?.clone();
+            let raw = bytes_of(si, &e).to_vec();
+            Some((e.dtype, e.shape.clone(), raw))
+        };
+        let geom = crate::compressed_tensors::AwqLayerShapes {
+            q_out:            arch.num_attention_heads * if has_v_proj { arch.head_dim_sliding } else { arch.head_dim_global },
+            kv_out:           if has_v_proj { arch.num_kv_heads_sliding * arch.head_dim_sliding }
+                              else          { arch.num_kv_heads_global  * arch.head_dim_global  },
+            o_out:            arch.hidden_size,
+            o_in:             arch.num_attention_heads * if has_v_proj { arch.head_dim_sliding } else { arch.head_dim_global },
+            mlp_intermediate: arch.intermediate_size,
+            hidden:           arch.hidden_size,
+        };
+        let awq_layer = crate::compressed_tensors::upload_gemma4_awq_layer(
+            arena, &layer_prefix, &geom, &awq.scheme, &byte_lookup,
+        ).map_err(|e| RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!("layer {l} AWQ upload: {e}"),
+            },
+            ctx: LoaderCtx {
+                path: model_dir.to_path_buf(),
+                tensor: Some(format!("{layer_prefix}.self_attn.*")),
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })?;
+
+        if l == 0 || l == load_max_layers - 1 {
             eprintln!(
-                "[awq-loader] layer {l} norms uploaded ({} F16 tensors); AWQ projection upload pending (cycle 49 step 8c)",
-                7
+                "[awq-loader] layer {l} ({:?}) AWQ uploaded: q_packed=0x{:x} (group_size={})",
+                arch.layer_types[l], awq_layer.q_proj.packed_offset_bytes, awq_layer.q_proj.group_size,
             );
         }
-        let _ = layers; // suppress unused-mut warning until 8c push
-        return Err(RvllmError::Loader {
-            err: LoaderError::UnsupportedQuantization {
-                detail: format!(
-                    "AWQ preludes + layer-{l} norms uploaded; AWQ projection upload pending (cycle 49 step 8c). Run with an FP8 checkpoint for now."
-                ),
-            },
-            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
-            bt: std::backtrace::Backtrace::capture(),
+
+        layers.push(crate::gemma4_weights::Gemma4LayerWeights {
+            qkv:       None,  // AWQ replaces FP8 fused QKV
+            o_proj:    None,
+            gate_up:   None,
+            down_proj: None,
+            qkv_f16:        None,
+            o_proj_f16:     None,
+            gate_up_f16:    None,
+            down_proj_f16:  None,
+            input_layernorm,
+            post_attention_layernorm,
+            pre_feedforward_layernorm,
+            post_feedforward_layernorm,
+            q_norm,
+            k_norm,
+            layer_scalar,
+            awq: Some(awq_layer),
         });
     }
-    let _ = (embedding, final_norm, lm_head_fp8, lm_head_f16,
-             rope_cos_sliding, rope_sin_sliding, rope_cos_global, rope_sin_global);
-    let _ = layers;
-    unreachable!("cycle 49 step 8c will replace this with the Gemma4LoadedModel build");
+
+    eprintln!(
+        "[awq-loader] all {} layers uploaded; building Gemma4LoadedModel",
+        layers.len()
+    );
+
+    Ok(Gemma4LoadedModel {
+        embedding,
+        lm_head_fp8,
+        lm_head_f16,
+        final_norm,
+        rope_cos_sliding,
+        rope_sin_sliding,
+        rope_cos_global,
+        rope_sin_global,
+        layers,
+    })
 }
 
 /// Cycle 48 step 7c: per-layer AWQ geometry derived from

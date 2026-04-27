@@ -531,7 +531,6 @@ pub struct AwqLayerShapes {
 /// per-launch overhead is non-trivial; the call sites here would then
 /// pre-concatenate `weight_packed` / `weight_scale` and update the
 /// `weight_zero_point` packing.
-#[cfg(feature = "cuda")]
 pub fn upload_gemma4_awq_layer<'a>(
     arena: &'a rvllm_mem::HbmArena<'a>,
     prefix: &str,
