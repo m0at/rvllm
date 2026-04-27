@@ -228,52 +228,86 @@ fn execute_decode_artifacts(
     args: &Args,
 ) -> Result<Vec<M2RustDecodeExecutedTiming>, Box<dyn std::error::Error>> {
     let client = PjrtClientHandle::new()?;
+    let num_devices = client.num_devices();
     let mut out = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let mlir = fs::read_to_string(&artifact.mlir_path)?;
         let exe = client.compile(&mlir)?;
-        let token_buf = client.buffer_from_host(
-            &vec![0u8; artifact.shape.batch * 4],
-            &[artifact.shape.batch as i64],
-            PjrtElementType::S32,
-            0,
-        )?;
-        let pos_buf = client.buffer_from_host(
-            &vec![0u8; artifact.shape.batch * 4],
-            &[artifact.shape.batch as i64],
-            PjrtElementType::S32,
-            0,
-        )?;
-        let mut kv_buf = client.buffer_from_host(
-            &vec![0u8; artifact.shape.kv_cache_bytes()],
-            &[artifact.shape.kv_cache_bytes() as i64],
-            PjrtElementType::S8,
-            0,
-        )?;
-        let weight_arena = client.buffer_from_host(
-            &vec![0u8; artifact.weight_arena_bytes],
-            &[artifact.weight_arena_bytes as i64],
-            PjrtElementType::S8,
-            0,
-        )?;
+        let token_zero = vec![0u8; artifact.shape.batch * 4];
+        let pos_zero = vec![0u8; artifact.shape.batch * 4];
+        let kv_zero = vec![0u8; artifact.shape.kv_cache_bytes()];
+        let weight_zero = vec![0u8; artifact.weight_arena_bytes];
+        let token_bufs = (0..num_devices)
+            .map(|device| {
+                client.buffer_from_host(
+                    &token_zero,
+                    &[artifact.shape.batch as i64],
+                    PjrtElementType::S32,
+                    device,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let pos_bufs = (0..num_devices)
+            .map(|device| {
+                client.buffer_from_host(
+                    &pos_zero,
+                    &[artifact.shape.batch as i64],
+                    PjrtElementType::S32,
+                    device,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut kv_bufs = (0..num_devices)
+            .map(|device| {
+                client.buffer_from_host(
+                    &kv_zero,
+                    &[artifact.shape.kv_cache_bytes() as i64],
+                    PjrtElementType::S8,
+                    device,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let weight_arenas = (0..num_devices)
+            .map(|device| {
+                client.buffer_from_host(
+                    &weight_zero,
+                    &[artifact.weight_arena_bytes as i64],
+                    PjrtElementType::S8,
+                    device,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut samples = Vec::with_capacity(args.iters);
         for step in 0..(args.warmup + args.iters) {
             let start = Instant::now();
-            let inputs = [&token_buf, &pos_buf, &kv_buf, &weight_arena];
-            let mut outputs = client.execute(&exe, &inputs)?;
-            if outputs.len() != 3 {
-                return Err(
-                    format!("decode returned {} outputs, expected 3", outputs.len()).into(),
-                );
+            let per_device_inputs = (0..num_devices)
+                .map(|device| {
+                    vec![
+                        &token_bufs[device],
+                        &pos_bufs[device],
+                        &kv_bufs[device],
+                        &weight_arenas[device],
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let outputs_by_device = client.execute_partitioned(&exe, &per_device_inputs)?;
+            let mut next_kv_bufs = Vec::with_capacity(num_devices);
+            for mut outputs in outputs_by_device {
+                if outputs.len() != 3 {
+                    return Err(
+                        format!("decode returned {} outputs, expected 3", outputs.len()).into(),
+                    );
+                }
+                let next_token = outputs.remove(1);
+                let new_kv = outputs.remove(1);
+                let mut next_bytes = vec![0u8; artifact.shape.batch * 4];
+                client.buffer_to_host(&next_token, &mut next_bytes)?;
+                next_kv_bufs.push(new_kv);
             }
-            let next_token = outputs.remove(1);
-            let new_kv = outputs.remove(1);
-            let mut next_bytes = vec![0u8; artifact.shape.batch * 4];
-            client.buffer_to_host(&next_token, &mut next_bytes)?;
             if step >= args.warmup {
                 samples.push(start.elapsed().as_secs_f64() * 1000.0);
             }
-            kv_buf = new_kv;
+            kv_bufs = next_kv_bufs;
         }
         samples.sort_by(|a, b| a.total_cmp(b));
         let ms_min = *samples.first().ok_or("no timing samples")?;

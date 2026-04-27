@@ -318,6 +318,14 @@ impl PjrtClientHandle {
         }
     }
 
+    pub fn execute_partitioned(
+        &self,
+        exe: &CompiledExecutable,
+        per_device_inputs: &[Vec<&PjrtBufferHandle>],
+    ) -> Result<Vec<Vec<PjrtBufferHandle>>> {
+        self.execute_partitioned_raw(exe, per_device_inputs, None)
+    }
+
     pub fn execute_with_buffers(
         &self,
         exe: &CompiledExecutable,
@@ -413,6 +421,118 @@ impl PjrtClientHandle {
                 device_idx: inputs.first().and_then(|input| input.device_idx),
             })
             .collect())
+    }
+
+    fn execute_partitioned_raw(
+        &self,
+        exe: &CompiledExecutable,
+        per_device_inputs: &[Vec<&PjrtBufferHandle>],
+        output_specs: Option<&[PjrtTensorSpec]>,
+    ) -> Result<Vec<Vec<PjrtBufferHandle>>> {
+        self.validate_executable_client(exe)?;
+        if per_device_inputs.is_empty() {
+            return Err(xla_err("partitioned execute needs at least one device"));
+        }
+        let num_args = per_device_inputs[0].len();
+        if num_args == 0 {
+            return Err(xla_err("partitioned execute needs at least one argument"));
+        }
+        if per_device_inputs.len() > self.inner.devices.len() {
+            return Err(xla_err(format!(
+                "partitioned execute got {} devices, client has {}",
+                per_device_inputs.len(),
+                self.inner.devices.len()
+            )));
+        }
+        for (device_idx, inputs) in per_device_inputs.iter().enumerate() {
+            if inputs.len() != num_args {
+                return Err(xla_err(format!(
+                    "device {device_idx} has {} args, expected {num_args}",
+                    inputs.len()
+                )));
+            }
+            self.validate_input_clients(inputs)?;
+        }
+
+        let input_ptrs: Vec<Vec<*mut PjrtBuffer>> = per_device_inputs
+            .iter()
+            .map(|inputs| inputs.iter().map(|b| b.raw).collect())
+            .collect();
+        let input_lists: Vec<*const *mut PjrtBuffer> =
+            input_ptrs.iter().map(|ptrs| ptrs.as_ptr()).collect();
+        let output_slots = output_specs.map_or(256, |specs| specs.len());
+        let mut output_ptrs: Vec<Vec<*mut PjrtBuffer>> =
+            vec![vec![ptr::null_mut(); output_slots]; per_device_inputs.len()];
+        let mut output_lists: Vec<*mut *mut PjrtBuffer> = output_ptrs
+            .iter_mut()
+            .map(|ptrs| ptrs.as_mut_ptr())
+            .collect();
+        let exec_options = PJRT_ExecuteOptions {
+            struct_size: std::mem::size_of::<PJRT_ExecuteOptions>(),
+            extension_start: ptr::null_mut(),
+            send_callbacks: ptr::null(),
+            recv_callbacks: ptr::null(),
+            num_send_ops: 0,
+            num_recv_ops: 0,
+            launch_id: 0,
+            non_donatable_input_indices: ptr::null(),
+            num_non_donatable_input_indices: 0,
+            context: ptr::null(),
+            call_location: ptr::null(),
+            num_tasks: 0,
+            task_ids: ptr::null(),
+            incarnation_ids: ptr::null(),
+        };
+
+        unsafe {
+            let mut args = PJRT_LoadedExecutable_Execute_Args {
+                struct_size: std::mem::size_of::<PJRT_LoadedExecutable_Execute_Args>(),
+                extension_start: ptr::null_mut(),
+                executable: exe.raw,
+                options: &exec_options,
+                argument_lists: input_lists.as_ptr(),
+                num_devices: per_device_inputs.len(),
+                num_args,
+                output_lists: output_lists.as_mut_ptr(),
+                device_complete_events: ptr::null_mut(),
+                execute_device: ptr::null_mut(),
+            };
+            let err = (self.inner.fns.loaded_executable_execute)(&mut args);
+            if !err.is_null() {
+                return Err(xla_err(format!(
+                    "PJRT_LoadedExecutable_Execute failed: {}",
+                    extract_error_message(&self.inner.fns, err)
+                )));
+            }
+        }
+
+        let mut out = Vec::with_capacity(output_ptrs.len());
+        for (device_idx, ptrs) in output_ptrs.into_iter().enumerate() {
+            let num_outputs = if let Some(specs) = output_specs {
+                if let Some((idx, _)) = ptrs.iter().enumerate().find(|(_, p)| p.is_null()) {
+                    self.destroy_raw_buffers(&ptrs);
+                    return Err(xla_err(format!(
+                        "PJRT_LoadedExecutable_Execute returned null output {idx} on device {device_idx}"
+                    )));
+                }
+                specs.len()
+            } else {
+                ptrs.iter().take_while(|p| !p.is_null()).count()
+            };
+            out.push(
+                ptrs[..num_outputs]
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &raw)| PjrtBufferHandle {
+                        client: self.clone(),
+                        raw,
+                        spec: output_specs.map(|specs| specs[idx].clone()),
+                        device_idx: Some(device_idx),
+                    })
+                    .collect(),
+            );
+        }
+        Ok(out)
     }
 
     pub fn buffer_to_host(&self, buf: &PjrtBufferHandle, dst: &mut [u8]) -> Result<()> {
