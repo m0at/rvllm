@@ -233,6 +233,106 @@ pub struct Gemma4LayerDims {
     pub kv_dtype: KvDtype,
 }
 
+impl Gemma4LayerDims {
+    /// Cycle 53 hardening: catch plumbing misconfigurations before they
+    /// reach the kernel layer. The attention launchers already validate
+    /// their own params, but several invariants live at the *layer*
+    /// level — across attn + RoPE + cache layout — and previously had
+    /// to be caught either by visual review of the call sites or by
+    /// kernel-side OOB reads (silent garbage on long context). This
+    /// runs once per `gemma4_forward_phase` call; cost is negligible
+    /// vs the kernel launches that follow.
+    ///
+    /// Failure converts to `AttentionError::FeatureNotAvailable` with
+    /// a descriptive `op` so the source of the misconfiguration is
+    /// obvious in logs.
+    pub fn validate(&self) -> Result<()> {
+        let mk_err = |op: &'static str| -> rvllm_core::RvllmError {
+            rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "Gemma4LayerDims",
+                    op,
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "gemma4_forward_phase.validate",
+                    stream: 0,
+                    num_seqs: self.num_tokens,
+                    head_dim: self.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        };
+        if self.num_tokens == 0 {
+            return Err(mk_err("Gemma4LayerDims: num_tokens == 0"));
+        }
+        if self.hidden == 0 || self.num_heads == 0 || self.num_kv_heads == 0 {
+            return Err(mk_err(
+                "Gemma4LayerDims: hidden/num_heads/num_kv_heads must be > 0",
+            ));
+        }
+        if self.num_heads % self.num_kv_heads != 0 {
+            return Err(mk_err(
+                "Gemma4LayerDims: num_heads not divisible by num_kv_heads",
+            ));
+        }
+        if self.head_dim == 0 || self.head_dim > 1024 {
+            // 1024 is well above any real Gemma 4 head_dim (256 / 512);
+            // catches u32 underflow / wild values.
+            return Err(mk_err("Gemma4LayerDims: head_dim out of range"));
+        }
+        if self.rotary_dim > self.head_dim {
+            return Err(mk_err("Gemma4LayerDims: rotary_dim > head_dim"));
+        }
+        if self.rotary_dim % 2 != 0 {
+            // RoPE pairs (cos, sin) over even/odd channel pairs.
+            return Err(mk_err("Gemma4LayerDims: rotary_dim must be even"));
+        }
+        if self.block_size == 0 || (self.block_size & (self.block_size - 1)) != 0 {
+            // Power-of-two block_size is what the page-table arithmetic
+            // assumes; non-PoT silently mis-indexes pages on long ctx.
+            return Err(mk_err(
+                "Gemma4LayerDims: block_size must be a non-zero power of two",
+            ));
+        }
+        if self.max_blocks_per_seq == 0 || self.num_blocks_total == 0 {
+            return Err(mk_err(
+                "Gemma4LayerDims: max_blocks_per_seq / num_blocks_total must be > 0",
+            ));
+        }
+        if let Some(cur) = self.current_max_context_len {
+            let bucket_max = (self.max_blocks_per_seq as u64)
+                .saturating_mul(self.block_size as u64);
+            if (cur as u64) > bucket_max {
+                // Decode reads block_tables[seq * max_blocks_per_seq +
+                // (cur-1)/block_size]. If cur exceeds the bucket,
+                // that's an OOB read on the page-table that would
+                // silently feed garbage block IDs to the kernel.
+                return Err(mk_err(
+                    "Gemma4LayerDims: current_max_context_len exceeds max_blocks_per_seq*block_size",
+                ));
+            }
+        }
+        if self.intermediate == 0 {
+            return Err(mk_err("Gemma4LayerDims: intermediate (MLP dim) == 0"));
+        }
+        if !self.attn_scale.is_finite() || self.attn_scale <= 0.0 {
+            return Err(mk_err("Gemma4LayerDims: attn_scale must be finite and > 0"));
+        }
+        if !self.rms_eps.is_finite() || self.rms_eps <= 0.0 {
+            return Err(mk_err("Gemma4LayerDims: rms_eps must be finite and > 0"));
+        }
+        // f16_kv must agree with kv_dtype — drift between these two
+        // routes the wrong RoPE kernel (rope_f16kv vs rope_fp8kv vs
+        // rope_nvfp4kv) and KV cache writes go to the wrong layout.
+        if self.f16_kv != self.kv_dtype.is_f16() {
+            return Err(mk_err(
+                "Gemma4LayerDims: f16_kv flag disagrees with kv_dtype.is_f16()",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Gemma4LayerWeightPtrs {
     pub attn_norm_gamma: u64,
@@ -605,6 +705,13 @@ pub unsafe fn gemma4_forward_phase(
     // takes the GEMV fast path instead of the lossy fallback.
     // CUTLASS SM120 continues to cover M>=128.
     const FAST_PATH_M_MAX: u32 = 127;
+    // Cycle 53 hardening: cross-cutting layer-dims invariants. Catches
+    // plumbing misuse (mis-sized buckets, dtype/flag drift, non-PoT
+    // block_size, OOB current_max_context_len) before any kernel
+    // launches consume the values. Errors out cleanly with a typed
+    // attention error pointing at the failing invariant. Called once
+    // per phase; cost is negligible.
+    dims.validate()?;
     let q_dim = dims.num_heads * dims.head_dim;
     let _kv_dim = dims.num_kv_heads * dims.head_dim;
     let qkv_rows = (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim;
@@ -2861,4 +2968,120 @@ pub unsafe fn logit_softcap(
         cap,
     }
     .launch(kernel, logits_ptr, stream)
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn good() -> Gemma4LayerDims {
+        Gemma4LayerDims {
+            num_tokens: 1,
+            hidden: 5376,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 256,
+            rotary_dim: 256,
+            intermediate: 14336,
+            block_size: 16,
+            max_blocks_per_seq: 1024,
+            num_blocks_total: 1024,
+            current_max_context_len: Some(1024),
+            attn_scale: 0.0625,
+            rms_eps: 1e-6,
+            layer_type: Gemma4LayerType::SlidingAttention,
+            sliding_window: 1024,
+            f16_kv: false,
+            kv_dtype: KvDtype::Fp8,
+        }
+    }
+
+    #[test]
+    fn good_dims_pass() {
+        good().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_num_tokens() {
+        let mut d = good(); d.num_tokens = 0;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_gqa_ratio_not_divisible() {
+        let mut d = good(); d.num_kv_heads = 5;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_rotary_dim_exceeds_head_dim() {
+        let mut d = good(); d.rotary_dim = 512;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_odd_rotary_dim() {
+        let mut d = good(); d.rotary_dim = 255;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_power_of_two_block_size() {
+        let mut d = good(); d.block_size = 12;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_block_size() {
+        let mut d = good(); d.block_size = 0;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_current_ctx_exceeding_bucket() {
+        let mut d = good();
+        // bucket_max = 1024 * 16 = 16384; one past = 16385
+        d.current_max_context_len = Some(16385);
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_current_ctx_at_bucket_boundary() {
+        let mut d = good();
+        d.current_max_context_len = Some(16384);
+        d.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_nonfinite_attn_scale() {
+        let mut d = good(); d.attn_scale = f32::NAN;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_attn_scale() {
+        let mut d = good(); d.attn_scale = 0.0;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_f16_flag_disagreeing_with_dtype() {
+        // Fp8 dtype but f16_kv=true → mismatch
+        let mut d = good(); d.f16_kv = true;
+        assert!(d.validate().is_err());
+        // Conversely: F16 dtype but f16_kv=false
+        let mut d = good();
+        d.kv_dtype = KvDtype::F16;
+        d.f16_kv = false;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_global_head_dim_512() {
+        let mut d = good();
+        d.head_dim = 512;
+        d.rotary_dim = 512;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        d.validate().unwrap();
+    }
 }
