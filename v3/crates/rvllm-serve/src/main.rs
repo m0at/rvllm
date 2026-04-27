@@ -23,35 +23,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         block_size: args.block_size,
         kv_dtype: M2PrefillKvDType::Int8,
     })?;
-    let runtime = match M2Runtime::from_plan(
-        args.model_dir.clone(),
-        plan.clone(),
-        args.max_weight_arena_bytes,
-        args.device_idx,
-    ) {
-        Ok(runtime) => {
-            eprintln!(
-                "rvllm-server m2: runtime ready tpu_feature={} weight_arena_bytes={}",
-                cfg!(feature = "tpu"),
-                plan.weight_arena_bytes
-            );
-            Some(runtime)
-        }
-        Err(err) => {
-            eprintln!("rvllm-server m2: runtime unavailable: {err}");
-            None
-        }
-    };
+    let (runtime, runtime_mode, runtime_error) = init_m2_runtime(&args, &plan);
+    eprintln!(
+        "rvllm-server m2: startup runtime_mode={} native_execution={} tpu_feature={} decode_graph_bytes={} weight_arena_bytes={}",
+        runtime_mode.as_str(),
+        runtime_mode.is_execute_capable(),
+        cfg!(feature = "tpu"),
+        plan.decode_mlir.len(),
+        plan.weight_arena_bytes
+    );
+    if let Some(err) = runtime_error.as_deref() {
+        eprintln!("rvllm-server m2: runtime unavailable: {err}");
+    }
     let listener = TcpListener::bind((args.host.as_str(), args.port))?;
     eprintln!(
-        "rvllm-server m2: listening on {}:{} model={} batch={} ctx={} decode_steps={}",
-        args.host, args.port, args.model_name, args.batch, args.max_ctx, args.decode_steps
+        "rvllm-server m2: listening on {}:{} model={} batch={} ctx={} decode_steps={} runtime_mode={}",
+        args.host,
+        args.port,
+        args.model_name,
+        args.batch,
+        args.max_ctx,
+        args.decode_steps,
+        runtime_mode.as_str()
     );
     let state = ServerState {
         model_name: args.model_name,
         max_ctx: args.max_ctx,
         plan,
         runtime,
+        runtime_mode,
+        runtime_error,
     };
     for stream in listener.incoming() {
         match stream {
@@ -71,6 +72,58 @@ struct ServerState {
     max_ctx: usize,
     plan: M2RustPrefillDecodePlan,
     runtime: Option<M2Runtime>,
+    runtime_mode: M2ExecutionMode,
+    runtime_error: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum M2ExecutionMode {
+    PlanningOnly,
+    CompileOnly,
+    ExecuteCapable,
+}
+
+impl M2ExecutionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PlanningOnly => "planning-only",
+            Self::CompileOnly => "compile-only",
+            Self::ExecuteCapable => "execute-capable",
+        }
+    }
+
+    fn is_execute_capable(self) -> bool {
+        self == Self::ExecuteCapable
+    }
+
+    fn unavailable_status(self) -> u16 {
+        match self {
+            Self::PlanningOnly => 501,
+            Self::CompileOnly | Self::ExecuteCapable => 503,
+        }
+    }
+
+    fn unavailable_message(self) -> &'static str {
+        match self {
+            Self::PlanningOnly => {
+                "Native Rust M2 execution is unavailable: rvllm-server was built without the tpu feature, so it can only plan Rust/XLA graphs. Rebuild with --features tpu on a TPU PJRT host. No Python runtime fallback is configured."
+            }
+            Self::CompileOnly => {
+                "Native Rust M2 execution is unavailable: the Rust M2 runtime failed to initialize, so this server is compile-only and cannot execute completions. No Python runtime fallback is configured."
+            }
+            Self::ExecuteCapable => {
+                "Native Rust M2 execution is temporarily unavailable. No Python runtime fallback is configured."
+            }
+        }
+    }
+
+    fn unavailable_type(self) -> &'static str {
+        match self {
+            Self::PlanningOnly => "not_implemented",
+            Self::CompileOnly | Self::ExecuteCapable => "backend_unavailable",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -183,6 +236,35 @@ impl Args {
     }
 }
 
+#[cfg(feature = "tpu")]
+fn init_m2_runtime(
+    args: &Args,
+    plan: &M2RustPrefillDecodePlan,
+) -> (Option<M2Runtime>, M2ExecutionMode, Option<String>) {
+    match M2Runtime::from_plan(
+        args.model_dir.clone(),
+        plan.clone(),
+        args.max_weight_arena_bytes,
+        args.device_idx,
+    ) {
+        Ok(runtime) => (Some(runtime), M2ExecutionMode::ExecuteCapable, None),
+        Err(err) => (None, M2ExecutionMode::CompileOnly, Some(err.to_string())),
+    }
+}
+
+#[cfg(not(feature = "tpu"))]
+fn init_m2_runtime(
+    args: &Args,
+    plan: &M2RustPrefillDecodePlan,
+) -> (Option<M2Runtime>, M2ExecutionMode, Option<String>) {
+    let _ = (args, plan);
+    (
+        None,
+        M2ExecutionMode::PlanningOnly,
+        Some("rvllm-server was built without the tpu feature".to_string()),
+    )
+}
+
 fn handle_stream(
     mut stream: TcpStream,
     state: &ServerState,
@@ -195,9 +277,13 @@ fn handle_stream(
             json!({
                 "status": "ok",
                 "model": state.model_name,
-                "runtime": "rust-m2-pjrt",
+                "runtime": "rust-m2-xla",
+                "runtime_mode": state.runtime_mode.as_str(),
                 "runtime_loaded": state.runtime.is_some(),
+                "native_execution_available": state.runtime_mode.is_execute_capable(),
                 "tpu_feature": cfg!(feature = "tpu"),
+                "python_runtime_fallback": false,
+                "runtime_error": state.runtime_error.as_deref(),
                 "decode_graph_bytes": state.plan.decode_mlir.len(),
                 "weight_arena_bytes": state.plan.weight_arena_bytes,
             }),
@@ -241,6 +327,21 @@ fn handle_chat(body: &[u8], state: &ServerState) -> (u16, serde_json::Value) {
             ),
         );
     }
+    let model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| state.model_name.clone());
+    let runtime = match &state.runtime {
+        Some(runtime) if state.runtime_mode.is_execute_capable() => runtime,
+        _ => {
+            return runtime_unavailable_response(
+                state,
+                &model,
+                req.prompt_token_ids.as_ref().map(Vec::len),
+                req.max_tokens,
+            )
+        }
+    };
     let prompt_ids = match req.prompt_token_ids {
         Some(ids) if !ids.is_empty() => ids,
         Some(_) => return (400, error_json(400, "prompt_token_ids must not be empty")),
@@ -291,30 +392,6 @@ fn handle_chat(body: &[u8], state: &ServerState) -> (u16, serde_json::Value) {
             error_json(400, "prompt_token_ids contains id outside M2 vocab"),
         );
     }
-    let model = req.model.unwrap_or_else(|| state.model_name.clone());
-    let runtime = match &state.runtime {
-        Some(runtime) => runtime,
-        None => {
-            return (
-                503,
-                json!({
-                    "error": {
-                        "message": "Rust M2 runtime is not loaded; build with --features tpu on the TPU VM and ensure decode custom calls compile",
-                        "type": "backend_unavailable",
-                        "code": 503
-                    },
-                    "rvllm": {
-                        "model": model,
-                        "prompt_tokens": prompt_ids.len(),
-                        "max_tokens": max_tokens,
-                        "batch": state.plan.decode_shape.batch,
-                        "weight_arena_bytes": state.plan.weight_arena_bytes,
-                        "tpu_feature": cfg!(feature = "tpu")
-                    }
-                }),
-            );
-        }
-    };
     match runtime.generate_token_ids(&M2GenerateRequest {
         prompt_token_ids: prompt_ids,
         max_tokens,
@@ -333,13 +410,49 @@ fn handle_chat(body: &[u8], state: &ServerState) -> (u16, serde_json::Value) {
                 },
                 "rvllm": {
                     "model": model,
+                    "runtime": "rust-m2-xla",
+                    "runtime_mode": state.runtime_mode.as_str(),
+                    "native_execution_available": state.runtime_mode.is_execute_capable(),
                     "batch": state.plan.decode_shape.batch,
                     "weight_arena_bytes": state.plan.weight_arena_bytes,
-                    "tpu_feature": cfg!(feature = "tpu")
+                    "tpu_feature": cfg!(feature = "tpu"),
+                    "python_runtime_fallback": false
                 }
             }),
         ),
     }
+}
+
+fn runtime_unavailable_response(
+    state: &ServerState,
+    model: &str,
+    prompt_tokens: Option<usize>,
+    max_tokens: Option<usize>,
+) -> (u16, serde_json::Value) {
+    let status = state.runtime_mode.unavailable_status();
+    (
+        status,
+        json!({
+            "error": {
+                "message": state.runtime_mode.unavailable_message(),
+                "type": state.runtime_mode.unavailable_type(),
+                "code": status
+            },
+            "rvllm": {
+                "model": model,
+                "runtime": "rust-m2-xla",
+                "runtime_mode": state.runtime_mode.as_str(),
+                "native_execution_available": false,
+                "prompt_tokens": prompt_tokens,
+                "max_tokens": max_tokens,
+                "batch": state.plan.decode_shape.batch,
+                "weight_arena_bytes": state.plan.weight_arena_bytes,
+                "tpu_feature": cfg!(feature = "tpu"),
+                "python_runtime_fallback": false,
+                "runtime_error": state.runtime_error.as_deref()
+            }
+        }),
+    )
 }
 
 fn chat_response(
@@ -445,6 +558,7 @@ fn write_response(
         204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
+        501 => "Not Implemented",
         503 => "Service Unavailable",
         _ => "Error",
     };
@@ -487,4 +601,29 @@ where
 
 fn usage() -> String {
     "usage: rvllm-server --model-dir DIR [--host HOST] [--port PORT] [--model-name NAME] [--batch-size N] [--prompt-len N] [--decode-steps N] [--max-ctx N] [--block-size N] [--max-weight-arena-bytes N] [--device-idx N]".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_modes_report_openai_status_codes() {
+        assert_eq!(M2ExecutionMode::PlanningOnly.unavailable_status(), 501);
+        assert_eq!(M2ExecutionMode::CompileOnly.unavailable_status(), 503);
+        assert_eq!(M2ExecutionMode::ExecuteCapable.unavailable_status(), 503);
+    }
+
+    #[test]
+    fn unavailable_messages_disable_python_fallback() {
+        for mode in [
+            M2ExecutionMode::PlanningOnly,
+            M2ExecutionMode::CompileOnly,
+            M2ExecutionMode::ExecuteCapable,
+        ] {
+            let msg = mode.unavailable_message();
+            assert!(msg.contains("No Python runtime fallback"));
+            assert!(!msg.contains("Python M2 API server"));
+        }
+    }
 }
