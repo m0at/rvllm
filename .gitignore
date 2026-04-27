@@ -32,3 +32,10 @@ build/
 zig/.zig-cache/
 .wrangler/
 .blackboxcli/
+
+# M2 TPU run artifacts (timestamped, large, not commit-worthy)
+tpu/out/m2/rust_xla/run_*/
+tpu/out/m2/rust_xla/metrics_*/
+tpu/out/m2/rust_xla/typed_globals_*_probe/
+tpu/out/m2/rust_xla/last_failed_real_execute_*.mlir
+tpu/out/m2/rust_xla/rust_xla_b*_zero_body_*.json

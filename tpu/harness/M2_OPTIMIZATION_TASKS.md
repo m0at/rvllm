@@ -62,10 +62,38 @@ gate and a saved result JSON.
   runtime hook. No silent fallback.
 - [x] Add `RVLLM_M2_MOE_INT8=w1` projection selection. Unselected W2/W3
   projections stay NVFP4 in mixed arenas.
-- [ ] Run B=8 TPU real-model Rust/XLA int8-weight bench and compare against the
-  current JAX real-model B=8 result. Current saved attempt
-  (`tpu/out/m2/m2_int8_weight_b8.json`) is blocked before timing/PPL because
-  decode MLIR still uses zero embed/final-logit placeholders.
+- [x] Wire observable W1 body through the full-graph PJRT compile on v6e-8.
+  4 unrolled K=32 tiles lowered to `tpu.matmul`, `vector.store` of the bf16
+  W1 result to `hidden_out[:, 0:128]`. Full 62-layer graph compiles; recorded
+  at `tpu/out/m2/rust_xla/m2_int8_w1_unroll4_compile.json`. The previously
+  reported "blocked before timing/PPL because decode MLIR still uses zero
+  embed/final-logit placeholders" was superseded: typed BF16 globals plus
+  host-side embed gather are wired, the placeholder claim no longer
+  describes the failure.
+- [x] Add the logits-change sanity gate (`RVLLM_M2_BODY_PROBE=1`):
+  `analyze_logits_observability` checks variance, dynamic range, nonzero
+  fraction, and finite-ness, and aborts the bench when degenerate.
+- [ ] Expand W1 K coverage from 4 tiles (4.17%) to 96 tiles (full K=3072) via
+  mosaic-serde bytecode pre-generation; the lowered text body at full unroll
+  exceeds the StableHLO parser ceiling, so the lowered linker is the wrong
+  target for full coverage. Mark `m2_int8_weight_b8.json` as superseded by
+  whatever the next bytecode-backed run writes.
+- [ ] After full K coverage, run the real-model B=8 bench with all three
+  gates (`RVLLM_M2_BODY_PROBE`, `RVLLM_M2_PARITY`, `RVLLM_M2_GATE`) and
+  compare against the JAX real-model B=8 result.
+
+### HBM ceiling on v6e-8 (2026-04-27 audit)
+
+- W1 only int8 weights: ~74 GB packed expert weights, fits within the per-device
+  arena budget on v6e-8 (8x32 GB HBM, current `MAX_WEIGHT_ARENA_BYTES=260e9`).
+- W1 + W2 + W3 int8 weights: ~224 GB total expert weights -> 28 GB/device,
+  plus ~0.4 GB row scales, ~2 GB int8 KV at B=8 ctx 2048, ~7 GB BF16 dense
+  weights, ~1.2 GB lm_head, ~40 MB Mosaic working set per layer. Per-device
+  share crosses the 32 GB HBM ceiling and leaves no headroom for activation
+  spill. Treat full int8 W1+W2+W3 as **out of budget on v6e-8** until dynamic
+  expert paging (load top-K active experts only per step) is added; ship W1
+  only as the int8-weight ceiling and remove the "default for B>=16" plan
+  for the joint W1+W2+W3 path.
 
 Recorded int8-KV results:
 
