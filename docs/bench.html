@@ -197,7 +197,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   </div>
 
   <div class="note-box" style="border-left-color:#84E6B7">
-    <strong>Rust-native status:</strong> Rust + PJRT now compiles and executes the B=8, ctx 2048, int8-KV 8-partition decode graph on v6e-8 with no Python/JAX. The runtime probe uses a zero Mosaic layer body and measures <strong>1.016 ms/step</strong> (<strong>7873 tok/s</strong>) as plumbing validation only. Real model speed still depends on replacing that zero body with the fused NVFP4→MXU Mosaic custom call.
+    <strong>Rust-native status:</strong> Rust + PJRT now compiles and launches the B=8, ctx 2048, int8-KV 8-partition decode graph on v6e-8 with no Python/JAX. The probe used a zero/no-op Mosaic layer body, so it is <strong>not a model benchmark</strong> and must not be compared to the real M2 tok/s numbers above. Real model speed still depends on replacing that zero body with the fused NVFP4→MXU Mosaic custom call.
   </div>
 </section>
 
