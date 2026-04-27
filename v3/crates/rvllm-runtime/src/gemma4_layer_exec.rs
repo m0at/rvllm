@@ -1282,6 +1282,7 @@ pub unsafe fn gemma4_forward_phase(
     // 14 QKV F16-in fast path with full_chain ON), gamma stays f16.
     let qkv_rmsnorm_kernel = if dims.bf16_residual
         && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
+        && !crate::gemma4_bring_up::bf16_disable_qkv_rmsnorm()
     {
         kernels.fused_qkv_rmsnorm_bf16
     } else {
@@ -2885,6 +2886,7 @@ unsafe fn rope_fp8kv(
     // is enabled. Same launch ABI; Q/K/V inputs flip f16 → bf16.
     let rope_kernel = if dims.bf16_residual
         && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
+        && !crate::gemma4_bring_up::bf16_disable_rope()
     {
         kernels.fused_rope_partial_fp8kv_bf16in
     } else {
@@ -2939,6 +2941,7 @@ unsafe fn rope_nvfp4kv(
     // chain is enabled. Same launch ABI; Q/K/V inputs flip f16 → bf16.
     let kernel_opt = if dims.bf16_residual
         && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
+        && !crate::gemma4_bring_up::bf16_disable_rope()
     {
         kernels.fused_rope_partial_nvfp4kv_bf16in
             .or(kernels.fused_rope_partial_nvfp4kv)

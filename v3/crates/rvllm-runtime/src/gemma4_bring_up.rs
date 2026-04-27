@@ -480,6 +480,18 @@ pub fn bf16_native_full_chain_enabled() -> bool {
     parse_truthy_env("RVLLM_BF16_NATIVE_FULL_CHAIN").unwrap_or(false)
 }
 
+/// Cycle 55 step 15 bisect overrides. When `RVLLM_BF16_NATIVE_FULL_CHAIN=1`
+/// is on, individual sub-dispatches default to bf16. Setting any of
+/// these env vars to 1 disables that one site (forces f16) while
+/// keeping the rest bf16. Use to localize which bf16 kernel introduces
+/// the empirical regression.
+pub fn bf16_disable_qkv_rmsnorm() -> bool {
+    parse_truthy_env("RVLLM_BF16_DISABLE_QKV_RMSNORM").unwrap_or(false)
+}
+pub fn bf16_disable_rope() -> bool {
+    parse_truthy_env("RVLLM_BF16_DISABLE_ROPE").unwrap_or(false)
+}
+
 /// Cycle 55 step 13 experimental: enable bf16-native dispatch on the
 /// M=1 decode QKV F16-in fast path (the production decode hot path).
 /// When ON, the residual is consumed as bf16 directly by
