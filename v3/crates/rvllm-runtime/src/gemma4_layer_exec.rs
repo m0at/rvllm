@@ -637,6 +637,13 @@ pub struct Gemma4LayerKernels {
     /// activation FP8-quant step and runs this kernel directly on the
     /// f16 rmsnorm output.
     pub fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    /// Cycle 55 step 3 (Phase B): bf16-input sibling of the f16in
+    /// kernel above (`fp8_gemv_blockwise_wpr_native_bf16in_kernel`).
+    /// `None` on non-Blackwell targets. Used under bf16-native
+    /// dispatch (`dims.bf16_residual = true`, default since cycle 55
+    /// step 1) so QKV / gate_up M=1 fast paths consume bf16 input
+    /// directly instead of narrowing bf16→f16-sat at branch entry.
+    pub fp8_gemv_wpr_native_bf16in: Option<KernelFn>,
     /// Cycle 45 step 4.5c: AWQ INT4 W4A16 GEMV kernel handle. `None`
     /// when the PTX wasn't built into `$KERNELS_DIR`; the AWQ
     /// dispatch path checks this and rejects load if an AwqConfig

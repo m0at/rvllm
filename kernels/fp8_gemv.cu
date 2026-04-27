@@ -17,6 +17,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_bf16.h>
 
 // Convert FP8 E4M3 byte to float via branchless bit manipulation.
 // FP8 E4M3: 1 sign | 4 exponent (bias=7) | 3 mantissa
@@ -934,6 +935,104 @@ __global__ void fp8_gemv_blockwise_wpr_native_f16in_kernel(
 
     if (lane == 0) {
         output[(long long)m * N + n] = __float2half(acc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused FP8 GEMV with block-wise f32 scale, BF16-input fast path.
+//
+// Cycle 55 step 3 (Phase B): bf16-input sibling of
+// `fp8_gemv_blockwise_wpr_native_f16in_kernel`. Identical math (f32
+// internal accumulator, FP8 weight dequant, blockwise scale) — only
+// the input + output dtypes flip f16 → bf16. Eliminates the cycle-54
+// runtime bf16→f16-sat narrow at QKV/gate_up entry on the M=1 decode
+// hot path.
+//
+// Launch config: identical to wpr_native_f16in — grid (ceil(N/8), M),
+// block 256.
+// ---------------------------------------------------------------------------
+extern "C"
+__global__ void fp8_gemv_blockwise_wpr_native_bf16in_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const unsigned char* __restrict__ weight,
+    const float* __restrict__ scale,
+    const __nv_bfloat16* __restrict__ input,
+    int M, int N, int K,
+    int num_col_blocks
+) {
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int n = blockIdx.x * 8 + warp;
+    int m = blockIdx.y;
+    if (n >= N || m >= M) return;
+
+    int scale_row = n >> 7;
+    const unsigned char* w_row = weight + (long long)n * K;
+    const __nv_bfloat16* x_row = input + (long long)m * K;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (int k = lane * 8; k + 7 < K; k += 256) {
+        unsigned long long w8 = __ldg(reinterpret_cast<const unsigned long long*>(w_row + k));
+
+        // 8 bf16 values = 16 bytes = 2 × u64
+        unsigned long long x_lo = __ldg(reinterpret_cast<const unsigned long long*>(x_row + k));
+        unsigned long long x_hi = __ldg(reinterpret_cast<const unsigned long long*>(x_row + k + 4));
+
+        int sc0 = k >> 7;
+        float s0 = __ldg(&scale[scale_row * num_col_blocks + sc0]);
+        int sc4 = (k + 4) >> 7;
+        float s4 = (sc4 != sc0) ? __ldg(&scale[scale_row * num_col_blocks + sc4]) : s0;
+
+        float w0, w1, w2, w3, w4, w5, w6, w7;
+        fp8x2_to_f32((unsigned short)(w8),       w0, w1);
+        fp8x2_to_f32((unsigned short)(w8 >> 16), w2, w3);
+        fp8x2_to_f32((unsigned short)(w8 >> 32), w4, w5);
+        fp8x2_to_f32((unsigned short)(w8 >> 48), w6, w7);
+
+        // bf16 → f32 is a simple left-shift-16 since bf16 is the
+        // upper half of f32. Compiler emits a single mov.b32 in PTX.
+        float x0, x1, x2, x3, x4, x5, x6, x7;
+        x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x_lo));
+        x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_lo) + 2));
+        x2 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_lo) + 4));
+        x3 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_lo) + 6));
+        x4 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x_hi));
+        x5 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_hi) + 2));
+        x6 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_hi) + 4));
+        x7 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_hi) + 6));
+
+        acc0 += w0 * s0 * x0;
+        acc0 += w1 * s0 * x1;
+        acc0 += w2 * s0 * x2;
+        acc0 += w3 * s0 * x3;
+        acc1 += w4 * s4 * x4;
+        acc1 += w5 * s4 * x5;
+        acc1 += w6 * s4 * x6;
+        acc1 += w7 * s4 * x7;
+    }
+
+    float acc = acc0 + acc1;
+
+    // Remainder
+    {
+        int aligned_k = (K / 8) * 8;
+        for (int kr = aligned_k + lane; kr < K; kr += 32) {
+            int sc = kr >> 7;
+            float s = __ldg(&scale[scale_row * num_col_blocks + sc]);
+            acc += fp8e4m3_to_float(__ldg(w_row + kr)) * s
+                   * __bfloat162float(__ldg(x_row + kr));
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+
+    if (lane == 0) {
+        output[(long long)m * N + n] = __float2bfloat16(acc);
     }
 }
 

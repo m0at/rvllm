@@ -169,6 +169,13 @@ pub struct Gemma4FusedModules {
     /// directly off f16 activations, skipping the FP8 activation-
     /// quant step that cuBLASLt requires.
     pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    /// Cycle 55 step 3 (Phase B): bf16-input sibling of the f16in fast
+    /// path above. Same kernel ABI (`Fp8GemvF16InLaunch` reuses), only
+    /// the dtype interpretation of input/output buffers differs. Used
+    /// when `dims.bf16_residual = true` (the default since cycle 55
+    /// step 1) so the M=1 decode QKV + gate_up fast paths don't narrow
+    /// bf16→f16-sat at projection entry.
+    pub fn_fp8_gemv_wpr_native_bf16in: Option<KernelFn>,
     /// Companion to the V-rotation arm of the NVFP4 RoPE kernel: when
     /// V is stored rotated (V_cache = V·R), attn_out = P·V·R, and we
     /// need to right-multiply attn_out by R^T per (token, head) before
@@ -3902,6 +3909,7 @@ impl Gemma4Bringup {
             fused_qkv_rmsnorm: self.fused.fn_fused_qkv_rmsnorm,
             scale_cols_f16: self.fused.fn_scale_cols_f16,
             fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,
+            fp8_gemv_wpr_native_bf16in: self.fused.fn_fp8_gemv_wpr_native_bf16in,
             hadamard_unrotate_f16: self.fused.fn_hadamard_unrotate_f16,
             awq_int4_gemv_f16: self.fused.fn_awq_int4_gemv_f16,
             awq_int4_gemm_sm120_wmma: self.fused.fn_awq_int4_gemm_sm120_wmma,
@@ -3991,6 +3999,13 @@ fn load_gemma4_fused(
         Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t) => Some(
             fp8_gemv_mod
                 .get_function(rvllm_kernels::Fp8GemvVariant::WprNativeF16In.entry_point())?,
+        ),
+        _ => None,
+    };
+    let fn_fp8_gemv_wpr_native_bf16in = match target {
+        Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeBf16In.available_for(t) => Some(
+            fp8_gemv_mod
+                .get_function(rvllm_kernels::Fp8GemvVariant::WprNativeBf16In.entry_point())?,
         ),
         _ => None,
     };
@@ -4097,6 +4112,7 @@ fn load_gemma4_fused(
         scale_cols_f16_mod,
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_native_f16in,
+        fn_fp8_gemv_wpr_native_bf16in,
         hadamard_unrotate_f16_mod,
         fn_hadamard_unrotate_f16,
         awq_int4_gemv_f16_mod,
