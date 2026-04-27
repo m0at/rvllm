@@ -197,7 +197,15 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   </div>
 
   <div class="note-box" style="border-left-color:#84E6B7">
-    <strong>Rust-native status:</strong> Rust + PJRT compiles and launches the B=8, ctx 2048, int8-KV 8-partition decode graph on v6e-8 with no Python/JAX. The int8-weight path has a passing TPU parity probe for <code>s8 -> f32 -> bf16</code> (8x16x64, zero mismatches), a W1-only projection flag (<code>RVLLM_M2_MOE_INT8=w1</code>), and an observable W1 body that does real <code>vector.contract</code> (lowered to <code>tpu.matmul</code>) over 4 unrolled K=32 tiles and stores the bf16 W1 result into <code>hidden_out[:, 0:128]</code>. The full 62-layer decode graph compiles through PJRT/Mosaic on v6e-8; result at <code>tpu/out/m2/rust_xla/m2_int8_w1_unroll4_compile.json</code> (pass=true). K coverage is <strong>128/3072 = 4.17%</strong>, so the W1 math is structurally correct but partial &mdash; expanding to full K=96 unroll requires <code>mosaic-serde</code> bytecode pre-generation to fit the StableHLO parser. Do not compare to the real M2 tok/s numbers above until full K plus the <code>RVLLM_M2_BODY_PROBE</code>, <code>RVLLM_M2_PARITY</code>, and <code>RVLLM_M2_GATE</code> gates are wired and the bench writes a <code>passed=true</code> result.
+    <strong>Rust-native status:</strong> Rust + PJRT compiles, links a real <code>vector.contract</code>-based int8 W1 body across all 62 decode layers, executes it on v6e-8, and produces real logits with the body-probe gate passing. Result: <code>tpu/out/m2/rust_xla/m2_int8_weight_w1_k96_b8_with_ppl.json</code>. K coverage is full (3072/3072) under the static-unroll lowered path; the StableHLO parser accepts the 8.1 MB graph at K=96.
+    <table style="margin-top:0.75rem">
+      <thead><tr><th>Bench</th><th class="r">ms/step</th><th class="r">tok/s</th><th class="r">PPL</th><th class="r">top1</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>JAX baseline (m2_int8_b8.json)</td><td class="r">145.21</td><td class="r">55.10</td><td class="r">5.60*</td><td class="r">-</td><td>Full M2 NVFP4, MoE all-experts</td></tr>
+        <tr class="highlight"><td><strong>rvLLM int8 W1 (k96, N=128)</strong></td><td class="r"><strong>11.19</strong></td><td class="r"><strong>714.91</strong></td><td class="r">197221</td><td class="r">0.000</td><td>Body covers 1 of 12 N-tiles (8.3%), no W2/W3, no silu</td></tr>
+      </tbody>
+    </table>
+    <p>The 13&times; ms/step reduction is real but <strong>not</strong> apples-to-apples &mdash; rvLLM&apos;s body executes a single 128-col tile of W1 with the rest of the residual stream passing through, so PPL is huge by design. The number that matters for &quot;we ran a real model&quot; is the <code>body_probe</code> result: var=2.3e-3, range=&plusmn;0.33, distinct top-1=7, all finite, gate passed. Next milestone is full N=1536 W1 + W2/W3/silu in the body, which needs a multi-dim memref refactor (W1 as <code>memref&lt;3072x12x128xi8&gt;</code>, scales as <code>memref&lt;12x128xf32&gt;</code>) so Mosaic accepts <code>scf.for</code> over %n inside the body. *PPL 5.60 is the JAX-side scoring slice from <code>tpu/out/m2/m2_int8_correct.json</code>; the JAX ms/tok-s row above does not include PPL because it was a separate run.</p>
   </div>
 </section>
 
