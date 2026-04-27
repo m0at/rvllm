@@ -12,8 +12,8 @@
 pub mod compressed_tensors;
 pub use compressed_tensors::{
     AwqConfig, AwqExpectedShapes, AwqLayerShapes, AwqLinearLayout, AwqLinearStaged,
-    AwqLinearWeight, AwqPackFormat, AwqTensorNames, AwqWeightScheme, stage_awq_linear,
-    validate_awq_linear,
+    AwqLinearWeight, AwqPackFormat, AwqTensorNames, AwqWeightScheme, read_awq_config_from_dir,
+    stage_awq_linear, validate_awq_linear,
 };
 #[cfg(feature = "cuda")]
 pub use compressed_tensors::{upload_awq_linear, upload_gemma4_awq_layer};

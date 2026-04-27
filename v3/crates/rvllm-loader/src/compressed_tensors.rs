@@ -461,6 +461,32 @@ pub fn upload_awq_linear<'a>(
     })
 }
 
+/// Read `config.json` from `model_dir` and parse `quantization_config`.
+///
+/// Returns `Ok(None)` when the field is absent (unquantized model — the
+/// FP8 path stays). Returns an `Err` only on filesystem / JSON-syntax
+/// failure; a malformed `quantization_config` block is wrapped into the
+/// returned `Err(String)` so callers can decide whether to abort load
+/// or fall back to FP8.
+///
+/// Cycle 45 step 4.5d: this is the entrypoint a Gemma 4 load path
+/// calls before deciding which weight upload code path to take. The
+/// AwqConfig itself does NOT carry shapes — only the scheme + ignore
+/// list. Caller pairs it with [`AwqLayerShapes`] derived from arch.
+pub fn read_awq_config_from_dir(model_dir: &std::path::Path) -> std::io::Result<Option<AwqConfig>> {
+    let cfg_path = model_dir.join("config.json");
+    let bytes = std::fs::read(&cfg_path)?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("config.json: {e}")))?;
+    // compressed-tensors AWQ stores quantization_config at the top
+    // level; some HF formats nest it inside text_config. Check both.
+    let qc = v.get("quantization_config")
+        .or_else(|| v.get("text_config").and_then(|tc| tc.get("quantization_config")));
+    AwqConfig::from_json(qc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Geometry of one Gemma 4 transformer layer needed to drive the AWQ
 /// load path: dense `[N, K]` for each of the seven linears that
 /// compressed-tensors AWQ stores un-fused. K is `hidden_size` for QKV
@@ -906,6 +932,84 @@ mod tests {
         let err = stage_awq_linear(prefix, [8192, 5376], &scheme, &lookup)
             .expect_err("must reject");
         assert!(err.contains("weight_shape contents"), "got: {err}");
+    }
+
+    // === Cycle 45 step 4.5d read_awq_config_from_dir tests ===
+
+    fn write_config_json(dir: &std::path::Path, body: &str) {
+        std::fs::write(dir.join("config.json"), body).unwrap();
+    }
+
+    #[test]
+    fn read_awq_config_returns_none_on_unquantized() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rvllm-awq-test-unquant-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_config_json(&tmp, r#"{"hidden_size": 5376}"#);
+        let r = read_awq_config_from_dir(&tmp).expect("ok");
+        assert!(r.is_none());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn read_awq_config_parses_real_layout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rvllm-awq-test-real-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_config_json(&tmp, r#"{
+            "hidden_size": 5376,
+            "quantization_config": {
+                "config_groups": {
+                    "group_0": {
+                        "format": "pack-quantized",
+                        "targets": ["Linear"],
+                        "weights": {
+                            "num_bits": 4, "group_size": 128,
+                            "strategy": "group", "symmetric": false,
+                            "type": "int", "zp_dtype": "torch.int8"
+                        }
+                    }
+                },
+                "format": "pack-quantized",
+                "ignore": ["lm_head", "re:model.vision_tower.*"]
+            }
+        }"#);
+        let cfg = read_awq_config_from_dir(&tmp).expect("ok").expect("Some");
+        assert_eq!(cfg.scheme.num_bits, 4);
+        assert_eq!(cfg.scheme.group_size, 128);
+        assert!(!cfg.scheme.symmetric);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn read_awq_config_handles_text_config_nesting() {
+        // Some HF model layouts put quantization_config under text_config.
+        let tmp = std::env::temp_dir().join(format!(
+            "rvllm-awq-test-nested-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_config_json(&tmp, r#"{
+            "text_config": {
+                "hidden_size": 5376,
+                "quantization_config": {
+                    "config_groups": {
+                        "g": {"targets": ["Linear"], "weights": {
+                            "num_bits": 4, "group_size": 128,
+                            "strategy": "group", "type": "int", "symmetric": true
+                        }}
+                    },
+                    "format": "pack-quantized"
+                }
+            }
+        }"#);
+        let cfg = read_awq_config_from_dir(&tmp).expect("ok").expect("Some");
+        assert!(cfg.scheme.symmetric);
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
