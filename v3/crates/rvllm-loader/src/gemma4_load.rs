@@ -51,40 +51,20 @@ pub fn load_gemma4_model(
     arena: &HbmArena,
     arch: &Gemma4Arch,
 ) -> Result<Gemma4LoadedModel> {
-    // Cycle 47 step 6a: detect AWQ checkpoints at entry. If
-    // quantization_config is present, fail loud rather than silently
-    // re-quantizing the AWQ INT4 weights as FP8 (which is wrong: the
-    // file holds [N, K/8] int32-packed nibbles, not raw f16/bf16, and
-    // tensor_to_f16_bytes would treat the bytes as if they were).
-    //
-    // The actual AWQ load wiring (call upload_gemma4_awq_layer per
-    // layer + populate layer.awq + skip FP8 upload for AWQ-targeted
-    // linears) needs Gemma4LayerWeights' FP8 fields to be Optional —
-    // a deeper data-shape change deferred to cycle 48.
-    if let Some(awq) = crate::compressed_tensors::read_awq_config_from_dir(model_dir)
+    // Cycle 47 step 6a + cycle 48 step 7b: detect AWQ checkpoints at
+    // entry. parse_awq_config malformed → Corrupt. Valid AWQ →
+    // (cycle 48 step 7b) walk the per-layer tensor shapes against the
+    // shard index using `validate_awq_linear`, then fail with a
+    // detailed "validated, upload pending" message. Cycle 48 step 7c
+    // replaces this with the actual upload + layer.awq population.
+    let awq_config = crate::compressed_tensors::read_awq_config_from_dir(model_dir)
         .map_err(|e| RvllmError::Loader {
             err: LoaderError::Corrupt {
                 detail: format!("quantization_config: {e}"),
             },
             ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
             bt: std::backtrace::Backtrace::capture(),
-        })?
-    {
-        eprintln!(
-            "[loader] AWQ-quantized checkpoint detected (format={:?}, num_bits={}, group_size={}, ignore={:?})",
-            awq.format, awq.scheme.num_bits, awq.scheme.group_size, awq.ignore
-        );
-        return Err(RvllmError::Loader {
-            err: LoaderError::UnsupportedQuantization {
-                detail: format!(
-                    "AWQ {:?} W{} detected; load_gemma4_model AWQ wiring deferred to cycle 48 (needs Optional FP8 fields + upload_gemma4_awq_layer). Run with an FP8 checkpoint instead.",
-                    awq.format, awq.scheme.num_bits
-                ),
-            },
-            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
-            bt: std::backtrace::Backtrace::capture(),
-        });
-    }
+        })?;
 
     let idx = ShardIndex::resolve(model_dir)?;
     let mut shards = Vec::with_capacity(idx.shards.len());
@@ -96,6 +76,31 @@ pub fn load_gemma4_model(
         for (name, entry) in &sm.header.tensors {
             tensors.insert(name.clone(), (si, entry.clone()));
         }
+    }
+
+    if let Some(awq) = &awq_config {
+        eprintln!(
+            "[loader] AWQ-quantized checkpoint detected (format={:?}, num_bits={}, group_size={}, ignore={:?})",
+            awq.format, awq.scheme.num_bits, awq.scheme.group_size, awq.ignore
+        );
+        validate_gemma4_awq_layout(arch, awq, &tensors).map_err(|e| RvllmError::Loader {
+            err: LoaderError::UnsupportedQuantization {
+                detail: format!("AWQ layout validation failed: {e}"),
+            },
+            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        })?;
+        eprintln!(
+            "[loader] AWQ layout validated: {} layers × 7 linears × 4 tensors = {} entries OK",
+            arch.num_hidden_layers, arch.num_hidden_layers * 28
+        );
+        return Err(RvllmError::Loader {
+            err: LoaderError::UnsupportedQuantization {
+                detail: "AWQ layout validated; upload + Gemma4LoadedModel build pending (cycle 48 step 7c). Run with an FP8 checkpoint for now.".into(),
+            },
+            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        });
     }
 
     let bytes_of = |si: usize, e: &TensorEntry| -> &[u8] {
@@ -1112,6 +1117,61 @@ fn fp8_e4m3_to_f32(b: u8) -> f32 {
         f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
     };
     if s != 0 { -val } else { val }
+}
+
+/// Cycle 48 step 7b: walk every Gemma 4 layer's expected AWQ tensor
+/// names against the shard index, validate dtype + shape per linear
+/// via `validate_awq_linear`. Sliding layers (`head_dim=256, kv=16`)
+/// have different N for q/k/v/o vs global layers
+/// (`head_dim=512, kv=4`); per-layer geometry is derived from
+/// `arch.layer_types[i]` so heterogeneous Gemma 4 attention is handled
+/// the same way the bring-up reads it.
+///
+/// Returns `Ok(())` when every linear in every non-ignored layer
+/// validates cleanly. Returns a descriptive `Err(String)` on the
+/// first failure so the caller can attribute the abort to one
+/// specific tensor.
+fn validate_gemma4_awq_layout(
+    arch: &crate::gemma4_arch::Gemma4Arch,
+    awq: &crate::compressed_tensors::AwqConfig,
+    tensors: &BTreeMap<String, (usize, TensorEntry)>,
+) -> std::result::Result<(), String> {
+    let lookup = |key: &str| -> Option<(rvllm_core::DType, Vec<usize>)> {
+        tensors.get(key).map(|(_, e)| (e.dtype, e.shape.clone()))
+    };
+    let prefix = &arch.weight_prefix;
+    for (i, lt) in arch.layer_types.iter().enumerate() {
+        let (q_out, kv_out, o_in) = match lt {
+            crate::gemma4_arch::Gemma4LayerType::SlidingAttention => {
+                let q = arch.num_attention_heads * arch.head_dim_sliding;
+                let kv = arch.num_kv_heads_sliding * arch.head_dim_sliding;
+                (q, kv, q)
+            }
+            crate::gemma4_arch::Gemma4LayerType::GlobalAttention => {
+                let q = arch.num_attention_heads * arch.head_dim_global;
+                let kv = arch.num_kv_heads_global * arch.head_dim_global;
+                (q, kv, q)
+            }
+        };
+        let layer_prefix = format!("{prefix}.layers.{i}");
+        let lin = |name: &str, dense: [usize; 2]| -> std::result::Result<(), String> {
+            let full = format!("{layer_prefix}.{name}");
+            if awq.is_ignored(&full) {
+                return Ok(()); // not AWQ-quantized; FP8 path will load it
+            }
+            crate::compressed_tensors::validate_awq_linear(
+                &full, dense, &awq.scheme, &lookup,
+            ).map(|_| ()).map_err(|e| format!("layer {i} ({lt:?}) {name}: {e}"))
+        };
+        lin("self_attn.q_proj",  [q_out, arch.hidden_size])?;
+        lin("self_attn.k_proj",  [kv_out, arch.hidden_size])?;
+        lin("self_attn.v_proj",  [kv_out, arch.hidden_size])?;
+        lin("self_attn.o_proj",  [arch.hidden_size, o_in])?;
+        lin("mlp.gate_proj",     [arch.intermediate_size, arch.hidden_size])?;
+        lin("mlp.up_proj",       [arch.intermediate_size, arch.hidden_size])?;
+        lin("mlp.down_proj",     [arch.hidden_size, arch.intermediate_size])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
