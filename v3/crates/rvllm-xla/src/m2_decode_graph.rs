@@ -37,6 +37,45 @@ pub struct M2ExpertPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct M2ExpertDirectoryEntry {
+    pub expert: usize,
+    pub w1_packed_offset: i64,
+    pub w1_scale_offset: i64,
+    pub w1_global_scale_offset: i64,
+    pub w1_input_scale_offset: i64,
+    pub w2_packed_offset: i64,
+    pub w2_scale_offset: i64,
+    pub w2_global_scale_offset: i64,
+    pub w2_input_scale_offset: i64,
+    pub w3_packed_offset: i64,
+    pub w3_scale_offset: i64,
+    pub w3_global_scale_offset: i64,
+    pub w3_input_scale_offset: i64,
+}
+
+impl M2ExpertDirectoryEntry {
+    pub const COLS: usize = 13;
+
+    pub fn as_i64_row(&self) -> [i64; Self::COLS] {
+        [
+            self.expert as i64,
+            self.w1_packed_offset,
+            self.w1_scale_offset,
+            self.w1_global_scale_offset,
+            self.w1_input_scale_offset,
+            self.w2_packed_offset,
+            self.w2_scale_offset,
+            self.w2_global_scale_offset,
+            self.w2_input_scale_offset,
+            self.w3_packed_offset,
+            self.w3_scale_offset,
+            self.w3_global_scale_offset,
+            self.w3_input_scale_offset,
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct M2DecodeLayerPlan {
     pub layer: usize,
     pub input_norm: M2ArenaTensor,
@@ -111,6 +150,13 @@ impl M2DecodeLayerPlan {
             })
             .sum()
     }
+
+    pub fn expert_directory(&self) -> Vec<M2ExpertDirectoryEntry> {
+        self.experts
+            .iter()
+            .map(M2ExpertPlan::directory_entry)
+            .collect()
+    }
 }
 
 impl M2ExpertPlan {
@@ -121,6 +167,24 @@ impl M2ExpertPlan {
             w2: nvfp4_projection(lookup, layer, expert, M2Projection::W2)?,
             w3: nvfp4_projection(lookup, layer, expert, M2Projection::W3)?,
         })
+    }
+
+    fn directory_entry(&self) -> M2ExpertDirectoryEntry {
+        M2ExpertDirectoryEntry {
+            expert: self.expert,
+            w1_packed_offset: self.w1.packed.offset as i64,
+            w1_scale_offset: self.w1.scale.offset as i64,
+            w1_global_scale_offset: self.w1.global_scale.offset as i64,
+            w1_input_scale_offset: input_scale_offset(&self.w1),
+            w2_packed_offset: self.w2.packed.offset as i64,
+            w2_scale_offset: self.w2.scale.offset as i64,
+            w2_global_scale_offset: self.w2.global_scale.offset as i64,
+            w2_input_scale_offset: input_scale_offset(&self.w2),
+            w3_packed_offset: self.w3.packed.offset as i64,
+            w3_scale_offset: self.w3.scale.offset as i64,
+            w3_global_scale_offset: self.w3.global_scale.offset as i64,
+            w3_input_scale_offset: input_scale_offset(&self.w3),
+        }
     }
 }
 
@@ -243,6 +307,7 @@ fn emit_layer_call(
 ) -> String {
     let first = &layer.experts[0];
     let last = layer.experts.last().expect("M2 layer has experts");
+    let expert_directory = expert_directory_attr(layer);
     format!(
         r#"    "rvllm.m2.decode_layer"({src}, %positions, %kv_cache, %weight_arena, {dst}) {{
       rvllm.layer = {layer_idx} : i64,
@@ -267,7 +332,9 @@ fn emit_layer_call(
       rvllm.w3_first_packed_offset = {w3_first_packed} : i64,
       rvllm.w3_last_packed_offset = {w3_last_packed} : i64,
       rvllm.input_scales_missing = {missing_input_scales} : i64,
-      rvllm.expert_directory = "M2DecodeGraphPlan.layers[{layer_idx}].experts"
+      rvllm.expert_directory = "packed_i64_offsets",
+      rvllm.expert_directory_cols = {expert_directory_cols} : i64,
+      rvllm.expert_directory_i64 = {expert_directory}
     }} : ({hidden_ty}, {token_ty}, {kv_ty}, {arena_ty}, {hidden_ty}) -> ()
 "#,
         src = src,
@@ -294,7 +361,34 @@ fn emit_layer_call(
         w3_first_packed = first.w3.packed.offset,
         w3_last_packed = last.w3.packed.offset,
         missing_input_scales = layer.input_scale_missing_count(),
+        expert_directory_cols = M2ExpertDirectoryEntry::COLS,
+        expert_directory = expert_directory,
     )
+}
+
+fn expert_directory_attr(layer: &M2DecodeLayerPlan) -> String {
+    let rows = layer.expert_directory();
+    let mut out = String::new();
+    out.push_str("dense<[");
+    for (row_idx, row) in rows.iter().enumerate() {
+        if row_idx > 0 {
+            out.push_str(", ");
+        }
+        out.push('[');
+        for (col_idx, value) in row.as_i64_row().iter().enumerate() {
+            if col_idx > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&value.to_string());
+        }
+        out.push(']');
+    }
+    out.push_str(&format!(
+        "]> : tensor<{}x{}xi64>",
+        rows.len(),
+        M2ExpertDirectoryEntry::COLS
+    ));
+    out
 }
 
 fn dense(lookup: &ArenaLookup<'_>, layer: usize, suffix: &str) -> Result<M2ArenaTensor> {
@@ -433,6 +527,43 @@ mod tests {
     }
 
     #[test]
+    fn expert_directory_pins_all_nvfp4_offsets_for_fused_moe() {
+        let arena = arena();
+        let plan = M2DecodeGraphPlan::from_arena(&arena).unwrap();
+        let layer0 = &plan.layers[0];
+        let dir = layer0.expert_directory();
+        assert_eq!(dir.len(), M2_NUM_EXPERTS);
+        assert_eq!(M2ExpertDirectoryEntry::COLS, 13);
+        assert_eq!(dir[0].expert, 0);
+        assert_eq!(
+            dir[0].w1_packed_offset,
+            layer0.experts[0].w1.packed.offset as i64
+        );
+        assert_eq!(
+            dir[0].w1_scale_offset,
+            layer0.experts[0].w1.scale.offset as i64
+        );
+        assert_eq!(
+            dir[0].w1_global_scale_offset,
+            layer0.experts[0].w1.global_scale.offset as i64
+        );
+        assert_eq!(
+            dir[0].w2_packed_offset,
+            layer0.experts[0].w2.packed.offset as i64
+        );
+        assert_eq!(
+            dir[0].w3_packed_offset,
+            layer0.experts[0].w3.packed.offset as i64
+        );
+        assert_eq!(dir[255].expert, 255);
+        assert_eq!(
+            dir[255].w3_global_scale_offset,
+            layer0.experts[255].w3.global_scale.offset as i64
+        );
+        assert_eq!(dir[0].as_i64_row().len(), M2ExpertDirectoryEntry::COLS);
+    }
+
+    #[test]
     fn emits_decode_graph_contract_over_flat_weight_arena() {
         let shape = M2GraphShape::decode(8, 2048, 1);
         let arena = arena();
@@ -447,6 +578,10 @@ mod tests {
         assert!(mlir.contains("\"rvllm.m2.decode_layer\""));
         assert!(mlir.contains("rvllm.q_proj_offset = "));
         assert!(mlir.contains("rvllm.w1_first_packed_offset = "));
+        assert!(mlir.contains("rvllm.expert_directory = \"packed_i64_offsets\""));
+        assert!(mlir.contains("rvllm.expert_directory_cols = 13 : i64"));
+        assert!(mlir.contains("rvllm.expert_directory_i64 = dense<[[0, "));
+        assert!(mlir.contains("]> : tensor<256x13xi64>"));
         assert!(!mlir.contains("Contract body placeholder"));
     }
 

@@ -21,8 +21,8 @@ pub use m2_decode_bench::{
     M2RustDecodeRuntimeReport, M2RustDecodeSweepItem,
 };
 pub use m2_decode_graph::{
-    m2_decode_graph_mlir, M2ArenaTensor, M2DecodeGraphPlan, M2DecodeLayerPlan, M2ExpertPlan,
-    M2Nvfp4ProjectionPlan,
+    m2_decode_graph_mlir, M2ArenaTensor, M2DecodeGraphPlan, M2DecodeLayerPlan,
+    M2ExpertDirectoryEntry, M2ExpertPlan, M2Nvfp4ProjectionPlan,
 };
 pub use m2_graph_abi::{
     M2GraphAbi, M2GraphPhase, M2GraphShape, M2GraphTensorSpec, M2LayerWeightAbi,

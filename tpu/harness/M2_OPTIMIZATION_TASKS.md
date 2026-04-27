@@ -51,6 +51,11 @@ Recorded int8-KV results:
   deterministic small tensors.
 - [x] Pin the custom-call ABI target and byte contract:
   `rvllm.m2.nvfp4_decode_bf16_matmul` with packed/scales/output byte metadata.
+- [x] Add fused-MoE expert-directory metadata to the Rust decode graph:
+  every `rvllm.m2.decode_layer` now carries a dense `256x13xi64` directory of
+  W1/W2/W3 packed, scale, global-scale, and optional input-scale offsets. This
+  removes contiguous-weight assumptions from the future Mosaic body and lets
+  router-selected expert ids jump directly to flat-arena NVFP4 tensors.
 - [ ] Decode FP4/FP8 in VMEM/registers and feed bf16 RHS tiles to TPU matmul
   without high-level Pallas layout inference.
 - [ ] Match TPU/JAX `nvfp4_matmul` exactly on small random tensors.
