@@ -764,8 +764,15 @@ pub unsafe fn gemma4_forward_phase(
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
-        let fn_awq = kernels.awq_int4_gemv_f16.ok_or_else(|| {
-            rvllm_core::RvllmError::Attention {
+        // GEMV kernel handle — only required for M=1 decode or the
+        // M>1 loop fallback. Pure-GEMM-prefill builds can ship without
+        // the GEMV PTX (codex review of cycle 51d.4c flagged the
+        // earlier unconditional ok_or_else as forcing GEMV-presence).
+        let fn_awq_opt = kernels.awq_int4_gemv_f16;
+        let need_gemv = dims.num_tokens == 1
+            || (dims.num_tokens > 1 && (!gemm_available || prefill_loop_enabled));
+        if need_gemv && fn_awq_opt.is_none() {
+            return Err(rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     backend: "AwqInt4GemvF16",
                     op: "awq_int4_gemv_f16 PTX missing from $KERNELS_DIR",
@@ -775,8 +782,11 @@ pub unsafe fn gemma4_forward_phase(
                     num_seqs: dims.num_tokens, head_dim: dims.head_dim,
                 },
                 bt: std::backtrace::Backtrace::capture(),
-            }
-        })?;
+            });
+        }
+        // fn_awq is only consumed by GEMV branches (M=1 or loop fallback);
+        // need_gemv guarantees fn_awq_opt.is_some() in those branches.
+        let fn_awq = fn_awq_opt;
 
         // Same prelude as the qkv_f16 branch: copy residual to delta
         // scratch then in-place rmsnorm.
@@ -820,17 +830,17 @@ pub unsafe fn gemma4_forward_phase(
             if dims.num_tokens == 1 {
                 gemma4_launcher::AwqInt4GemvF16Launch {
                     n: q_dim_u, k, group_size: g,
-                }.launch(fn_awq, scratch.delta_f16,
+                }.launch(fn_awq.unwrap(), scratch.delta_f16,
                     weights.awq.q_packed, weights.awq.q_scale, weights.awq.q_zero,
                     scratch.q_out, stream)?;
                 gemma4_launcher::AwqInt4GemvF16Launch {
                     n: kv_dim, k, group_size: g,
-                }.launch(fn_awq, scratch.delta_f16,
+                }.launch(fn_awq.unwrap(), scratch.delta_f16,
                     weights.awq.k_packed, weights.awq.k_scale, weights.awq.k_zero,
                     scratch.q_out + (q_dim_u as u64) * 2, stream)?;
                 gemma4_launcher::AwqInt4GemvF16Launch {
                     n: kv_dim, k, group_size: g,
-                }.launch(fn_awq, scratch.delta_f16,
+                }.launch(fn_awq.unwrap(), scratch.delta_f16,
                     weights.awq.v_packed, weights.awq.v_scale, weights.awq.v_zero,
                     scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2, stream)?;
             } else if use_gemm {
@@ -859,13 +869,14 @@ pub unsafe fn gemma4_forward_phase(
                     in_stride_elems:  k,
                     out_stride_elems: qkv_rows_u,
                 };
-                mk_loop(q_dim_u).launch(fn_awq, scratch.delta_f16,
+                let f = fn_awq.unwrap();
+                mk_loop(q_dim_u).launch(f, scratch.delta_f16,
                     weights.awq.q_packed, weights.awq.q_scale, weights.awq.q_zero,
                     scratch.q_out, stream)?;
-                mk_loop(kv_dim).launch(fn_awq, scratch.delta_f16,
+                mk_loop(kv_dim).launch(f, scratch.delta_f16,
                     weights.awq.k_packed, weights.awq.k_scale, weights.awq.k_zero,
                     scratch.q_out + (q_dim_u as u64) * 2, stream)?;
-                mk_loop(kv_dim).launch(fn_awq, scratch.delta_f16,
+                mk_loop(kv_dim).launch(f, scratch.delta_f16,
                     weights.awq.v_packed, weights.awq.v_scale, weights.awq.v_zero,
                     scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2, stream)?;
             }
@@ -1576,16 +1587,20 @@ pub unsafe fn gemma4_forward_phase(
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
-        let fn_awq = kernels.awq_int4_gemv_f16.ok_or_else(|| {
-            rvllm_core::RvllmError::Attention {
+        // O proj: GEMV needed only for decode or loop-fallback path.
+        let need_gemv = dims.num_tokens == 1
+            || (dims.num_tokens > 1 && (!gemm_available || prefill_loop_enabled));
+        if need_gemv && kernels.awq_int4_gemv_f16.is_none() {
+            return Err(rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     backend: "AwqInt4GemvF16", op: "awq_int4_gemv_f16 PTX missing",
                 },
                 ctx: rvllm_core::AttnCtx { op: "awq_o", stream,
                     num_seqs: dims.num_tokens, head_dim: dims.head_dim },
                 bt: std::backtrace::Backtrace::capture(),
-            }
-        })?;
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16;
         let o_out_f16 = scratch.gemm_f32_tmp;
         let use_gemm = dims.num_tokens > 1 && !prefill_loop_enabled && gemm_available;
         unsafe {
@@ -1594,7 +1609,7 @@ pub unsafe fn gemma4_forward_phase(
                     n: dims.hidden as u32,
                     k: q_dim as u32,
                     group_size: weights.awq.group_size,
-                }.launch(fn_awq, scratch.attn_out,
+                }.launch(fn_awq.unwrap(), scratch.attn_out,
                     weights.awq.o_packed, weights.awq.o_scale, weights.awq.o_zero,
                     o_out_f16, stream)?;
             } else if use_gemm {
@@ -1619,7 +1634,7 @@ pub unsafe fn gemma4_forward_phase(
                     group_size: weights.awq.group_size,
                     in_stride_elems:  q_dim as u32,
                     out_stride_elems: dims.hidden as u32,
-                }.launch(fn_awq, scratch.attn_out,
+                }.launch(fn_awq.unwrap(), scratch.attn_out,
                     weights.awq.o_packed, weights.awq.o_scale, weights.awq.o_zero,
                     o_out_f16, stream)?;
             }
@@ -1776,16 +1791,19 @@ pub unsafe fn gemma4_forward_phase(
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
-        let fn_awq = kernels.awq_int4_gemv_f16.ok_or_else(|| {
-            rvllm_core::RvllmError::Attention {
+        let need_gemv = dims.num_tokens == 1
+            || (dims.num_tokens > 1 && (!gemm_available || prefill_loop_enabled));
+        if need_gemv && kernels.awq_int4_gemv_f16.is_none() {
+            return Err(rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     backend: "AwqInt4GemvF16", op: "awq_int4_gemv_f16 PTX missing",
                 },
                 ctx: rvllm_core::AttnCtx { op: "awq_gate_up", stream,
                     num_seqs: dims.num_tokens, head_dim: dims.head_dim },
                 bt: std::backtrace::Backtrace::capture(),
-            }
-        })?;
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16;
         // Same prelude as gate_up FP8 fast path: residual → delta_f16 +
         // pre-FF rmsnorm in place.
         cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
@@ -1805,14 +1823,15 @@ pub unsafe fn gemma4_forward_phase(
         let use_gemm = dims.num_tokens > 1 && !prefill_loop_enabled && gemm_available;
         unsafe {
             if dims.num_tokens == 1 {
+                let f = fn_awq.unwrap();
                 // gate -> scratch.gate_up_out + 0
                 gemma4_launcher::AwqInt4GemvF16Launch { n: inter, k, group_size: g }
-                    .launch(fn_awq, scratch.delta_f16,
+                    .launch(f, scratch.delta_f16,
                         weights.awq.gate_packed, weights.awq.gate_scale, weights.awq.gate_zero,
                         scratch.gate_up_out, stream)?;
                 // up -> scratch.gate_up_out + intermediate*2 (f16 = 2B)
                 gemma4_launcher::AwqInt4GemvF16Launch { n: inter, k, group_size: g }
-                    .launch(fn_awq, scratch.delta_f16,
+                    .launch(f, scratch.delta_f16,
                         weights.awq.up_packed, weights.awq.up_scale, weights.awq.up_zero,
                         scratch.gate_up_out + (inter as u64) * 2, stream)?;
             } else if use_gemm {
@@ -1840,10 +1859,11 @@ pub unsafe fn gemma4_forward_phase(
                     in_stride_elems: k,
                     out_stride_elems: 2 * inter,
                 };
-                mk_loop(inter).launch(fn_awq, scratch.delta_f16,
+                let f = fn_awq.unwrap();
+                mk_loop(inter).launch(f, scratch.delta_f16,
                     weights.awq.gate_packed, weights.awq.gate_scale, weights.awq.gate_zero,
                     scratch.gate_up_out, stream)?;
-                mk_loop(inter).launch(fn_awq, scratch.delta_f16,
+                mk_loop(inter).launch(f, scratch.delta_f16,
                     weights.awq.up_packed, weights.awq.up_scale, weights.awq.up_zero,
                     scratch.gate_up_out + (inter as u64) * 2, stream)?;
             }
@@ -1966,16 +1986,19 @@ pub unsafe fn gemma4_forward_phase(
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
-        let fn_awq = kernels.awq_int4_gemv_f16.ok_or_else(|| {
-            rvllm_core::RvllmError::Attention {
+        let need_gemv = dims.num_tokens == 1
+            || (dims.num_tokens > 1 && (!gemm_available || prefill_loop_enabled));
+        if need_gemv && kernels.awq_int4_gemv_f16.is_none() {
+            return Err(rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     backend: "AwqInt4GemvF16", op: "awq_int4_gemv_f16 PTX missing",
                 },
                 ctx: rvllm_core::AttnCtx { op: "awq_down", stream,
                     num_seqs: dims.num_tokens, head_dim: dims.head_dim },
                 bt: std::backtrace::Backtrace::capture(),
-            }
-        })?;
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16;
         // f16 GELU(gate)*up into gate_up_fp8 alias.
         {
             let mut out = scratch.gate_up_fp8;
@@ -1997,7 +2020,7 @@ pub unsafe fn gemma4_forward_phase(
                     n: dims.hidden as u32,
                     k: dims.intermediate as u32,
                     group_size: weights.awq.group_size,
-                }.launch(fn_awq, scratch.gate_up_fp8,
+                }.launch(fn_awq.unwrap(), scratch.gate_up_fp8,
                     weights.awq.down_packed, weights.awq.down_scale, weights.awq.down_zero,
                     scratch.gemm_f32_tmp, stream)?;
             } else if use_gemm {
@@ -2025,7 +2048,7 @@ pub unsafe fn gemma4_forward_phase(
                     group_size: weights.awq.group_size,
                     in_stride_elems:  dims.intermediate as u32,
                     out_stride_elems: dims.hidden as u32,
-                }.launch(fn_awq, scratch.gate_up_fp8,
+                }.launch(fn_awq.unwrap(), scratch.gate_up_fp8,
                     weights.awq.down_packed, weights.awq.down_scale, weights.awq.down_zero,
                     scratch.gemm_f32_tmp, stream)?;
             }
