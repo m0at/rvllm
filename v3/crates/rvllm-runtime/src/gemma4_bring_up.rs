@@ -3319,6 +3319,44 @@ impl Gemma4Bringup {
             self.stream.fence()?;
             cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
         }
+        // Cycle 53 step 5: top-K logit dump at first decode step. Gated by
+        // RVLLM_DUMP_TOPK_LOGITS=1. Cost: 1 MiB DtoH + partial-sort vocab
+        // entries (host-side). Compares logit distribution shape across
+        // prompts: a sharp top-1 (margin >> 1.0 over top-2) means the
+        // model is decisive; a flat top-K (margin < 0.5) means
+        // cumulative quantization noise has overwhelmed signal — the
+        // canonical long-ctx failure mode documented above
+        // (RVLLM_TOOL_CALL_OPEN_BIAS rationale).
+        if std::env::var("RVLLM_DUMP_TOPK_LOGITS").is_ok() {
+            self.stream.fence()?;
+            let mut logits_host = vec![0.0f32; vocab as usize];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                logits_host.as_mut_ptr() as *mut _,
+                logits_f32.device_ptr(),
+                (vocab as usize * 4) as _,
+            );
+            let mut idx: Vec<usize> = (0..vocab as usize).collect();
+            // Partial sort: select top-10 by logit
+            idx.sort_by(|&a, &b| logits_host[b].partial_cmp(&logits_host[a]).unwrap_or(std::cmp::Ordering::Equal));
+            let top: Vec<(usize, f32)> = idx.iter().take(10)
+                .map(|&i| (i, logits_host[i])).collect();
+            let mean = logits_host.iter().sum::<f32>() / vocab as f32;
+            let mut sum_sq = 0.0f64;
+            let mut amax = f32::NEG_INFINITY;
+            let mut amin = f32::INFINITY;
+            for &v in &logits_host {
+                let d = (v - mean) as f64;
+                sum_sq += d * d;
+                if v > amax { amax = v; }
+                if v < amin { amin = v; }
+            }
+            let std = (sum_sq / vocab as f64).sqrt();
+            let margin_1_2 = top[0].1 - top[1].1;
+            eprintln!(
+                "[topk-logits] mean={:.3} std={:.3} amax={:.3} amin={:.3} margin(1-2)={:.3} top10={:?}",
+                mean, std, amax, amin, margin_1_2, top,
+            );
+        }
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[prefill] {} tokens in {:.1}ms (TTFT={:.1}ms)",
             prompt_ids.len(), prefill_ms, prefill_ms);
