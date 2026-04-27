@@ -65,6 +65,8 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
     %h_mat_{tile_idx} = arith.extf %h_bf16_{tile_idx} : vector<{batch}x{k_tile}xbf16> to vector<{batch}x{k_tile}xf32>
     %w_i8_{tile_idx} = vector.load %w1_block_t[{k_idx}, %c0] : memref<{hidden}x128xi8>, vector<{k_tile}x128xi8>
     %w_f32_{tile_idx} = arith.sitofp %w_i8_{tile_idx} : vector<{k_tile}x128xi8> to vector<{k_tile}x128xf32>
+    %scale_b_{tile_idx} = vector.broadcast %scale_v : vector<128xf32> to vector<{k_tile}x128xf32>
+    %w_scaled_{tile_idx} = arith.mulf %w_f32_{tile_idx}, %scale_b_{tile_idx} : vector<{k_tile}x128xf32>
     {acc_next} = vector.contract {{
       indexing_maps = [
         affine_map<(m, n, k) -> (m, k)>,
@@ -73,7 +75,7 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
       ],
       iterator_types = ["parallel", "parallel", "reduction"],
       kind = #vector.kind<add>
-    }} %h_mat_{tile_idx}, %w_f32_{tile_idx}, {acc_prev} : vector<{batch}x{k_tile}xf32>, vector<{k_tile}x128xf32> into vector<{batch}x128xf32>
+    }} %h_mat_{tile_idx}, %w_scaled_{tile_idx}, {acc_prev} : vector<{batch}x{k_tile}xf32>, vector<{k_tile}x128xf32> into vector<{batch}x128xf32>
 "#,
             batch = shape.batch,
             hidden = M2_HIDDEN,
@@ -96,11 +98,9 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
     %c0 = arith.constant 0 : index
 {k_constants}
     %zero = arith.constant dense<0.000000e+00> : vector<{batch}x128xf32>
-{k_tiles}
     %scale_v = vector.load %w1_row_scales[%c0] : memref<128xf32>, vector<128xf32>
-    %scale_b = vector.broadcast %scale_v : vector<128xf32> to vector<{batch}x128xf32>
-    %scaled = arith.mulf {acc_prev}, %scale_b : vector<{batch}x128xf32>
-    %out_bf16 = arith.truncf %scaled : vector<{batch}x128xf32> to vector<{batch}x128xbf16>
+{k_tiles}
+    %out_bf16 = arith.truncf {acc_prev} : vector<{batch}x128xf32> to vector<{batch}x128xbf16>
     vector.store %out_bf16, %hidden_out[%c0, %c0] : memref<{batch}x128xbf16>, vector<{batch}x128xbf16>
     return
   }}

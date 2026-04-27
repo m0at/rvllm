@@ -5,17 +5,19 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 #[cfg(feature = "tpu")]
+use rvllm_fused::{int8_matmul_ref, M2Nvfp4MatmulShape};
+#[cfg(feature = "tpu")]
 use rvllm_xla::{
-    m2_decode_layer_int8_lowered_body_mlir, tpu_custom_call_backend_config_for_body, M2GraphShape,
-    PjrtClientHandle, PjrtElementType, TpuMosaicSerializedBody, TPU_CUSTOM_CALL_TARGET,
+    tpu_custom_call_backend_config_for_body, PjrtClientHandle, PjrtElementType,
+    TpuMosaicSerializedBody, TPU_CUSTOM_CALL_TARGET,
 };
 
 #[cfg(feature = "tpu")]
 const B: usize = 8;
 #[cfg(feature = "tpu")]
-const K: usize = 3072;
+const K: usize = 64;
 #[cfg(feature = "tpu")]
-const N: usize = 128;
+const N: usize = 16;
 
 #[derive(Serialize)]
 struct ParityReport {
@@ -67,35 +69,62 @@ fn parse_out_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 #[cfg(feature = "tpu")]
 fn run() -> Result<ParityReport, Box<dyn std::error::Error>> {
-    let shape = M2GraphShape::decode(B, 2048, 1);
-    let body_mlir = m2_decode_layer_int8_lowered_body_mlir(&shape, 0)?;
+    let body_mlir = parity_body_mlir();
     let body = TpuMosaicSerializedBody::from_lowered_mlir(body_mlir.as_bytes())?;
     let mlir = parity_mlir(&tpu_custom_call_backend_config_for_body(&body));
 
     let hidden_bits = make_hidden_bf16();
-    let weights = make_weights_kx_n();
+    let weights_nx_k = make_weights_nx_k();
+    let weights_kx_n = transpose_nx_k_to_kx_n(&weights_nx_k);
     let scales = make_scales();
-    let expected = reference_bf16(&hidden_bits, &weights, &scales);
+    let expected = reference_bf16(&hidden_bits, &weights_nx_k, &scales)?;
 
     let hidden_bytes = u16_bytes(&hidden_bits);
     let scale_bytes = f32_bytes(&scales);
 
     let client = PjrtClientHandle::new()?;
+    let num_devices = client.num_devices();
     let exe = client.compile(&mlir)?;
-    let hidden = client.buffer_from_host(
-        &hidden_bytes,
-        &[B as i64, K as i64],
-        PjrtElementType::BF16,
-        0,
-    )?;
-    let weight = client.buffer_from_host(
-        &i8_bytes(&weights),
-        &[K as i64, N as i64],
-        PjrtElementType::S8,
-        0,
-    )?;
-    let scale = client.buffer_from_host(&scale_bytes, &[N as i64], PjrtElementType::F32, 0)?;
-    let mut outputs = client.execute(&exe, &[&hidden, &weight, &scale])?;
+    let weight_bytes = i8_bytes(&weights_kx_n);
+    let hidden_bufs = (0..num_devices)
+        .map(|device| {
+            client.buffer_from_host(
+                &hidden_bytes,
+                &[B as i64, K as i64],
+                PjrtElementType::BF16,
+                device,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let weight_bufs = (0..num_devices)
+        .map(|device| {
+            client.buffer_from_host(
+                &weight_bytes,
+                &[K as i64, N as i64],
+                PjrtElementType::S8,
+                device,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let scale_bufs = (0..num_devices)
+        .map(|device| {
+            client.buffer_from_host(&scale_bytes, &[N as i64], PjrtElementType::F32, device)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let per_device_inputs = (0..num_devices)
+        .map(|device| {
+            vec![
+                &hidden_bufs[device],
+                &weight_bufs[device],
+                &scale_bufs[device],
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut outputs_by_device = client.execute_partitioned(&exe, &per_device_inputs)?;
+    if outputs_by_device.is_empty() {
+        return Err("partitioned execute returned no device outputs".into());
+    }
+    let mut outputs = outputs_by_device.remove(0);
     if outputs.len() != 1 {
         return Err(format!("expected one output, got {}", outputs.len()).into());
     }
@@ -139,6 +168,127 @@ fn parity_mlir(backend_config: &str) -> String {
 }
 
 #[cfg(feature = "tpu")]
+fn parity_body_mlir() -> String {
+    let mut constants = String::new();
+    for i in 1..K {
+        constants.push_str(&format!("    %c{i} = arith.constant {i} : index\n"));
+    }
+    let mut acc_init = String::new();
+    let mut acc = Vec::with_capacity(B);
+    for b in 0..B {
+        let name = format!("%acc_{b}_0");
+        acc_init.push_str(&format!(
+            "    {name} = arith.constant dense<0.000000e+00> : vector<{n}xf32>\n",
+            n = N
+        ));
+        acc.push(name);
+    }
+    let mut hidden_rows = String::new();
+    for b in 0..B {
+        let b_idx = idx(b);
+        hidden_rows.push_str(&format!(
+            r#"    %h_row_2d_{b} = vector.load %hidden[{b_idx}, %c0] : memref<{batch}x{k_total}xbf16>, vector<1x{k_total}xbf16>
+    %h_row_{b} = vector.shape_cast %h_row_2d_{b} : vector<1x{k_total}xbf16> to vector<{k_total}xbf16>
+    %h_row_f32_{b} = arith.extf %h_row_{b} : vector<{k_total}xbf16> to vector<{k_total}xf32>
+"#,
+            b = b,
+            b_idx = b_idx,
+            batch = B,
+            k_total = K
+        ));
+    }
+    let mut body = String::new();
+    for k in 0..K {
+        let k_idx = idx(k);
+        body.push_str(&format!(
+            r#"    %w_i8_2d_{k} = vector.load %w1_block_t[{k_idx}, %c0] : memref<{k_total}x{n}xi8>, vector<1x{n}xi8>
+    %w_i8_{k} = vector.shape_cast %w_i8_2d_{k} : vector<1x{n}xi8> to vector<{n}xi8>
+    %w_f32_{k} = arith.sitofp %w_i8_{k} : vector<{n}xi8> to vector<{n}xf32>
+    %w_scaled_{k} = arith.mulf %w_f32_{k}, %scale_v : vector<{n}xf32>
+"#,
+            k = k,
+            k_idx = k_idx,
+            k_total = K,
+            n = N
+        ));
+        for b in 0..B {
+            let next = format!("%acc_{b}_{}", k + 1);
+            body.push_str(&format!(
+                r#"    %h_f32_{b}_{k} = vector.extract %h_row_f32_{b}[{k}] : f32 from vector<{k_total}xf32>
+    %h_vec_{b}_{k} = vector.broadcast %h_f32_{b}_{k} : f32 to vector<{n}xf32>
+    %prod_{b}_{k} = arith.mulf %h_vec_{b}_{k}, %w_scaled_{k} : vector<{n}xf32>
+    {next} = arith.addf {prev}, %prod_{b}_{k} : vector<{n}xf32>
+"#,
+                b = b,
+                k = k,
+                k_total = K,
+                n = N,
+                next = next,
+                prev = acc[b]
+            ));
+            acc[b] = next;
+        }
+    }
+    let mut stores = String::new();
+    for (b, acc_name) in acc.iter().enumerate() {
+        let b_idx = idx(b);
+        stores.push_str(&format!(
+            r#"    %out_{b} = arith.truncf {acc_name} : vector<{n}xf32> to vector<{n}xbf16>
+    %out_2d_{b} = vector.shape_cast %out_{b} : vector<{n}xbf16> to vector<1x{n}xbf16>
+    vector.store %out_2d_{b}, %hidden_out[{b_idx}, %c0] : memref<{batch}x{n}xbf16>, vector<1x{n}xbf16>
+"#,
+            b = b,
+            acc_name = acc_name,
+            n = N,
+            b_idx = b_idx,
+            batch = B
+        ));
+    }
+
+    format!(
+        r#"module attributes {{"stable_mosaic.version" = "1"}} {{
+  func.func @main(
+      %hidden: memref<{b}x{k}xbf16>,
+      %w1_block_t: memref<{k}x{n}xi8>,
+      %w1_row_scales: memref<{n}xf32>,
+      %hidden_out: memref<{b}x{n}xbf16>) attributes {{
+        dimension_semantics = [],
+        scalar_prefetch = 0 : i64,
+        scratch_operands = 0 : i64,
+        rvllm.int8_probe = "fixed_8x16x64"
+      }} {{
+    %c0 = arith.constant 0 : index
+{constants}
+    %scale_v = vector.load %w1_row_scales[%c0] : memref<{n}xf32>, vector<{n}xf32>
+{acc_init}
+{hidden_rows}
+{body}
+{stores}
+    return
+  }}
+}}
+"#,
+        b = B,
+        k = K,
+        n = N,
+        constants = constants,
+        acc_init = acc_init,
+        hidden_rows = hidden_rows,
+        body = body,
+        stores = stores
+    )
+}
+
+#[cfg(feature = "tpu")]
+fn idx(i: usize) -> String {
+    if i == 0 {
+        "%c0".to_string()
+    } else {
+        format!("%c{i}")
+    }
+}
+
+#[cfg(feature = "tpu")]
 fn make_hidden_bf16() -> Vec<u16> {
     (0..B * K)
         .map(|idx| {
@@ -149,14 +299,25 @@ fn make_hidden_bf16() -> Vec<u16> {
 }
 
 #[cfg(feature = "tpu")]
-fn make_weights_kx_n() -> Vec<i8> {
-    (0..K * N)
+fn make_weights_nx_k() -> Vec<i8> {
+    (0..N * K)
         .map(|idx| {
-            let k = idx / N;
-            let n = idx % N;
+            let n = idx / K;
+            let k = idx % K;
             (((k * 31 + n * 17 + 13) % 255) as i32 - 127) as i8
         })
         .collect()
+}
+
+#[cfg(feature = "tpu")]
+fn transpose_nx_k_to_kx_n(weights: &[i8]) -> Vec<i8> {
+    let mut out = vec![0i8; K * N];
+    for n in 0..N {
+        for k in 0..K {
+            out[k * N + n] = weights[n * K + k];
+        }
+    }
+    out
 }
 
 #[cfg(feature = "tpu")]
@@ -170,18 +331,20 @@ fn make_scales() -> Vec<f32> {
 }
 
 #[cfg(feature = "tpu")]
-fn reference_bf16(hidden: &[u16], weights: &[i8], scales: &[f32]) -> Vec<u16> {
-    let mut out = vec![0u16; B * N];
-    for b in 0..B {
-        for n in 0..N {
-            let mut acc = 0.0f32;
-            for k in 0..K {
-                acc += bf16_bits_to_f32(hidden[b * K + k]) * weights[k * N + n] as f32;
-            }
-            out[b * N + n] = f32_to_bf16_bits(acc * scales[n]);
-        }
-    }
-    out
+fn reference_bf16(
+    hidden: &[u16],
+    weights: &[i8],
+    scales: &[f32],
+) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
+    let x = hidden
+        .iter()
+        .copied()
+        .map(bf16_bits_to_f32)
+        .collect::<Vec<_>>();
+    let shape = M2Nvfp4MatmulShape { m: B, n: N, k: K };
+    let mut out = vec![0.0f32; B * N];
+    int8_matmul_ref(&x, weights, scales, shape, &mut out)?;
+    Ok(out.into_iter().map(f32_to_bf16_bits).collect())
 }
 
 #[cfg(feature = "tpu")]

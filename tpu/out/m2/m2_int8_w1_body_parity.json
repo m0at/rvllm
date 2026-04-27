@@ -1,0 +1,9 @@
+{
+  "schema": "rvllm.m2.int8_w1_body_parity.v1",
+  "batch": 8,
+  "k": 64,
+  "n": 16,
+  "pass": true,
+  "mismatches": 0,
+  "first_mismatch": null
+}
