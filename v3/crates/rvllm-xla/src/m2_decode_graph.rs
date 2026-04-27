@@ -10,7 +10,8 @@ use crate::m2_tpu_custom_call::{
 };
 use crate::{
     M2GraphPhase, M2GraphShape, M2Nvfp4ProjectionAbi, M2WeightArenaEntry, M2WeightArenaPlan,
-    M2WeightRole, PjrtElementType, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_LAYERS, M2_VOCAB,
+    M2WeightRole, PjrtElementType, M2_HIDDEN, M2_MOE_INTER, M2_NUM_EXPERTS, M2_NUM_LAYERS,
+    M2_VOCAB,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -380,6 +381,10 @@ fn emit_decode_body(
 
     let mut hidden = "%input_hidden".to_string();
     let mut kv = "%kv_cache".to_string();
+    // W1 N tile per layer custom_call. 128 is the proven path on v6e-8;
+    // M2_MOE_INTER (1536, full N) requires multi-dim memrefs to satisfy
+    // Mosaic's 1024-aligned sublane access for vector<128xf32> scale loads
+    // inside an scf.for over %n. Tracked as separate work.
     let w1_block_cols = 128usize;
     let int8_tile_elems = M2_HIDDEN * w1_block_cols;
     for layer in &plan.layers {
@@ -528,7 +533,7 @@ fn emit_layer_call(
       kernel_name = "{target}",
       operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>],
       result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>]
-    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x128xi8>, tensor<128xf32>) -> ({hidden_ty}, {kv_ty})
+    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x{w1_block_cols}xi8>, tensor<{w1_block_cols}xf32>) -> ({hidden_ty}, {kv_ty})
 "#,
             tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
             backend_config = backend_config,
@@ -540,6 +545,7 @@ fn emit_layer_call(
             int8_tile = int8_tile,
             int8_row_scales = int8_row_scales,
             hidden_size = M2_HIDDEN,
+            w1_block_cols = 128usize,
             hidden_ty = hidden_ty,
             token_ty = token_ty,
             kv_ty = kv_ty,
