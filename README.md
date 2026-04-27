@@ -175,7 +175,8 @@ What we found while compiling the Rust MLIR directly on the TPU:
 - The `body` is not our semicolon metadata string. It is serialized Mosaic MLIR bytecode produced by the Mosaic serde pass.
 - Commit `8d92d99f8` emits the real `tpu_custom_call` target and JSON backend config from Rust. The TPU compile probe now gets past the custom-emitter lookup and fails at body deserialization: `Failed to deserialize the Mosaic module: Missing or invalid version attribute`. That is expected for the current empty placeholder body.
 - Commit `d24a77eef` proves the native StableHLO path: a Rust-emitted B=8, ctx=2048, int8-KV smoke graph compiles through PJRT on `rvllm-m2` with no Python/JAX. The report marks `sweep[0].status = "compiled"` and covers the real M2 runtime signature (`191,069` weight tensors, `134.4 GB` planned arena, `2.08 GB` int8 KV buffer).
-- Therefore the remaining blocker is not Python, tokenization, serving, or PJRT. It is linking a real serialized Mosaic body for embed/final/decode-layer kernels, or decomposing embed/final into native StableHLO and reserving Mosaic only for the fused NVFP4 MoE matmul.
+- Commit `a2148a9c3` removes the fake embed/final custom calls from the real graph. The full graph now emits native StableHLO placeholders for embed/final and exactly 62 `tpu_custom_call` layer calls. TPU compile now fails only on the fused decode-layer Mosaic body placeholder, which is the intended remaining blocker.
+- Therefore the remaining blocker is not Python, tokenization, serving, or PJRT. It is linking a real serialized Mosaic body for the fused NVFP4 decode-layer kernel, then replacing the current native embed/final placeholders with real native StableHLO math.
 - The HF repo `and-y/rvllm-m2-build` is a private dataset containing legacy JAX cache artifacts only. It is useful for reproduction, not for the Rust-native runtime.
 
 ### Known issues blocking production
