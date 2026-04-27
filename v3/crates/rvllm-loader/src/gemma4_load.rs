@@ -90,10 +90,7 @@ pub fn load_gemma4_model(
             ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
             bt: std::backtrace::Backtrace::capture(),
         })?;
-        eprintln!(
-            "[loader] AWQ layout validated: {} layers × 7 linears × 4 tensors = {} entries OK",
-            arch.num_hidden_layers, arch.num_hidden_layers * 28
-        );
+        // (validate_gemma4_awq_layout already logs the per-linear total)
         return Err(RvllmError::Loader {
             err: LoaderError::UnsupportedQuantization {
                 detail: "AWQ layout validated; upload + Gemma4LoadedModel build pending (cycle 48 step 7c). Run with an FP8 checkpoint for now.".into(),
@@ -1140,37 +1137,53 @@ fn validate_gemma4_awq_layout(
         tensors.get(key).map(|(_, e)| (e.dtype, e.shape.clone()))
     };
     let prefix = &arch.weight_prefix;
+    let mut total_validated = 0usize;
     for (i, lt) in arch.layer_types.iter().enumerate() {
-        let (q_out, kv_out, o_in) = match lt {
+        // Per-layer geometry. Note: global layers have
+        // `attention_k_eq_v=true` — V projection is absent in the
+        // checkpoint, K is reused as V. Sliding layers carry all 7
+        // linears; global layers carry 6 (no v_proj). Codex review of
+        // 918d642 caught this — without the skip the validator falsely
+        // rejected real AWQ checkpoints.
+        let (q_out, kv_out, o_in, has_v_proj) = match lt {
             crate::gemma4_arch::Gemma4LayerType::SlidingAttention => {
                 let q = arch.num_attention_heads * arch.head_dim_sliding;
                 let kv = arch.num_kv_heads_sliding * arch.head_dim_sliding;
-                (q, kv, q)
+                (q, kv, q, true)
             }
             crate::gemma4_arch::Gemma4LayerType::GlobalAttention => {
                 let q = arch.num_attention_heads * arch.head_dim_global;
                 let kv = arch.num_kv_heads_global * arch.head_dim_global;
-                (q, kv, q)
+                (q, kv, q, false) // attention_k_eq_v=true — K reused as V
             }
         };
         let layer_prefix = format!("{prefix}.layers.{i}");
-        let lin = |name: &str, dense: [usize; 2]| -> std::result::Result<(), String> {
+        let mut layer_validated = 0usize;
+        let mut lin = |name: &str, dense: [usize; 2]| -> std::result::Result<(), String> {
             let full = format!("{layer_prefix}.{name}");
             if awq.is_ignored(&full) {
                 return Ok(()); // not AWQ-quantized; FP8 path will load it
             }
             crate::compressed_tensors::validate_awq_linear(
                 &full, dense, &awq.scheme, &lookup,
-            ).map(|_| ()).map_err(|e| format!("layer {i} ({lt:?}) {name}: {e}"))
+            ).map(|_| { layer_validated += 1; })
+              .map_err(|e| format!("layer {i} ({lt:?}) {name}: {e}"))
         };
         lin("self_attn.q_proj",  [q_out, arch.hidden_size])?;
         lin("self_attn.k_proj",  [kv_out, arch.hidden_size])?;
-        lin("self_attn.v_proj",  [kv_out, arch.hidden_size])?;
+        if has_v_proj {
+            lin("self_attn.v_proj",  [kv_out, arch.hidden_size])?;
+        }
         lin("self_attn.o_proj",  [arch.hidden_size, o_in])?;
         lin("mlp.gate_proj",     [arch.intermediate_size, arch.hidden_size])?;
         lin("mlp.up_proj",       [arch.intermediate_size, arch.hidden_size])?;
         lin("mlp.down_proj",     [arch.hidden_size, arch.intermediate_size])?;
+        total_validated += layer_validated;
     }
+    eprintln!(
+        "[loader] AWQ layout validated: {} layer-linear entries across {} layers",
+        total_validated, arch.num_hidden_layers
+    );
     Ok(())
 }
 
