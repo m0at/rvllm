@@ -347,6 +347,11 @@ pub struct Fa2PtxKernels {
     /// Cycle 55 step 8 (Phase B): bf16-input sibling of
     /// `fused_rope_nvfp4kv_mod`. None if PTX absent on this build.
     pub fused_rope_nvfp4kv_bf16in_mod: Option<rvllm_kernels::LoadedModule>,
+    /// Cycle 55 step 9 (Phase F): bf16-OUTPUT siblings of the 6
+    /// NVFP4 attention kernels. Loaded as a single PTX module sharing
+    /// the same source-of-truth math; only the output dtype flips
+    /// f16 → bf16 across all 6 kernel entries.
+    pub flash_attention_nvfp4kv_bf16out_mod: Option<rvllm_kernels::LoadedModule>,
     /// `flash_attention_2_decode_nvfp4kv_kernel` — NVFP4 KV decode,
     /// BC=32 variant for head_dim ≤ 256.
     #[cfg(feature = "cuda")]
@@ -392,6 +397,19 @@ pub struct Fa2PtxKernels {
     /// launch ABI; Q/K/V activation inputs flip f16 → bf16. cos/sin
     /// tables stay f16 (Phase D revisits).
     pub fn_rope_nvfp4kv_bf16in: Option<rvllm_kernels::KernelFn>,
+    /// Cycle 55 step 9 (Phase F): bf16-output siblings of the NVFP4
+    /// attention decode + prefill kernels. Six entries cover the
+    /// canonical decode (BC=32 + BC=16 variants), GQA (BC=32 + BC=16),
+    /// and unified prefill (BC=32 + BC=16). Same launch ABI as their
+    /// f16-output counterparts; only the output dtype is bf16 so the
+    /// downstream O-projection can consume it without a runtime
+    /// f16↔bf16 conversion.
+    pub fn_decode_nvfp4kv_bf16out: Option<rvllm_kernels::KernelFn>,
+    pub fn_decode_nvfp4kv_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
+    pub fn_decode_nvfp4kv_gqa_bf16out: Option<rvllm_kernels::KernelFn>,
+    pub fn_decode_nvfp4kv_gqa_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
+    pub fn_prefill_nvfp4kv_bf16out: Option<rvllm_kernels::KernelFn>,
+    pub fn_prefill_nvfp4kv_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
 
     // ---- Split-KV decode path (paged_attention_v2-style) ----
     //
@@ -514,6 +532,32 @@ impl Fa2PtxKernels {
                     }
                     Err(_) => (None, None),
                 };
+            // Cycle 55 step 9 (Phase F): bf16-OUTPUT NVFP4 attention
+            // kernels. All 6 entries (decode + decode_bc16 + decode_gqa
+            // + decode_gqa_bc16 + prefill + prefill_bc16) live in
+            // `flash_attention_nvfp4kv_bf16out`. Selected when the
+            // downstream O-projection consumes bf16 (eventually the
+            // only path once Phase B/F complete).
+            let (
+                flash_attention_nvfp4kv_bf16out_mod,
+                fn_decode_nvfp4kv_bf16out,
+                fn_decode_nvfp4kv_bc16_bf16out,
+                fn_prefill_nvfp4kv_bf16out,
+                fn_prefill_nvfp4kv_bc16_bf16out,
+                fn_decode_nvfp4kv_gqa_bf16out,
+                fn_decode_nvfp4kv_gqa_bc16_bf16out,
+            ) = match loader.load_ptx("flash_attention_nvfp4kv_bf16out") {
+                Ok(m) => {
+                    let d    = m.get_function("flash_attention_2_decode_nvfp4kv_bf16out_kernel").ok();
+                    let d16  = m.get_function("flash_attention_2_decode_nvfp4kv_bc16_bf16out_kernel").ok();
+                    let p    = m.get_function("flash_attention_2_prefill_nvfp4kv_bf16out_kernel").ok();
+                    let p16  = m.get_function("flash_attention_2_prefill_nvfp4kv_bc16_bf16out_kernel").ok();
+                    let dg   = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_bf16out_kernel").ok();
+                    let dg16 = m.get_function("flash_attention_2_decode_nvfp4kv_gqa_bc16_bf16out_kernel").ok();
+                    (Some(m), d, d16, p, p16, dg, dg16)
+                }
+                Err(_) => (None, None, None, None, None, None, None),
+            };
 
             // Unified NVFP4 prefill — Phase 2b follow-up. Separate PTX
             // so old kernel trees can still bring up (runtime gates
@@ -565,6 +609,7 @@ impl Fa2PtxKernels {
                 flash_attention_nvfp4kv_mod,
                 fused_rope_nvfp4kv_mod,
                 fused_rope_nvfp4kv_bf16in_mod,
+                flash_attention_nvfp4kv_bf16out_mod,
                 fn_decode_nvfp4kv,
                 fn_decode_nvfp4kv_bc16,
                 fn_decode_nvfp4kv_gqa,
@@ -575,6 +620,12 @@ impl Fa2PtxKernels {
                 unified_prefill_nvfp4kv_mod,
                 fn_rope_nvfp4kv,
                 fn_rope_nvfp4kv_bf16in,
+                fn_decode_nvfp4kv_bf16out,
+                fn_decode_nvfp4kv_bc16_bf16out,
+                fn_decode_nvfp4kv_gqa_bf16out,
+                fn_decode_nvfp4kv_gqa_bc16_bf16out,
+                fn_prefill_nvfp4kv_bf16out,
+                fn_prefill_nvfp4kv_bc16_bf16out,
                 split_decode_nvfp4kv_mod,
                 fn_decode_nvfp4kv_split,
                 fn_decode_nvfp4kv_split_bc16,
