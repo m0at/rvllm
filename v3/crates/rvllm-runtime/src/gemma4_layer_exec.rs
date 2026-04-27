@@ -231,6 +231,15 @@ pub struct Gemma4LayerDims {
     /// (rope_f16kv vs rope_fp8kv). Equivalent to `kv_dtype.is_f16()`.
     pub f16_kv: bool,
     pub kv_dtype: KvDtype,
+    /// Cycle 54 Stage 1: when true, the residual buffer is interpreted
+    /// as bf16 (still 2 bytes per element, same allocation). Set by
+    /// the engine when `RVLLM_RESIDUAL_BF16=1`. The math inside each
+    /// rmsnorm + residual-add is unchanged (f32 internally); only the
+    /// inter-layer storage dtype differs. f16 vs bf16 trade 3 mantissa
+    /// bits for 3 exponent bits — bf16 keeps long-context cumulative
+    /// residual values from saturating/underflowing across 60 layers.
+    /// Matches vLLM's bf16-activation production setup.
+    pub bf16_residual: bool,
 }
 
 impl Gemma4LayerDims {
@@ -612,6 +621,13 @@ pub struct Gemma4LayerKernels {
     /// fp8_gemv has already baked the per-channel weight scale into
     /// its output.
     pub fused_norm_add_residual_f16in: KernelFn,
+    // Cycle 54 Stage 1: BF16 residual chain. Mirror the f16 set; only
+    // the residual storage dtype differs (math stays f32 internally).
+    // Used when `dims.bf16_residual = true` (RVLLM_RESIDUAL_BF16=1).
+    pub f16_to_bf16: KernelFn,
+    pub fused_norm_add_residual_bf16: KernelFn,
+    pub fused_norm_add_residual_bf16_f16in: KernelFn,
+    pub fused_rmsnorm_fp8_quant_bf16in: KernelFn,
     pub fused_qkv_rmsnorm: KernelFn,
     pub scale_cols_f16: KernelFn,
     /// F16-input fp8_gemv kernel (`fp8_gemv_blockwise_wpr_native_f16in_kernel`).
@@ -712,6 +728,26 @@ pub unsafe fn gemma4_forward_phase(
     // attention error pointing at the failing invariant. Called once
     // per phase; cost is negligible.
     dims.validate()?;
+    // Cycle 54 Stage 1: BF16 residual chain dispatch. When the engine
+    // sets `dims.bf16_residual = true` (RVLLM_RESIDUAL_BF16=1), every
+    // residual touchpoint reads/writes bf16 instead of f16. The bf16
+    // sibling kernels share the same launch ABI as their f16
+    // counterparts; only the storage dtype changes. Math stays f32.
+    let rmsnorm_quant_kernel = if dims.bf16_residual {
+        kernels.fused_rmsnorm_fp8_quant_bf16in
+    } else {
+        kernels.fused_rmsnorm_fp8_quant
+    };
+    let norm_add_residual_kernel = if dims.bf16_residual {
+        kernels.fused_norm_add_residual_bf16
+    } else {
+        kernels.fused_norm_add_residual
+    };
+    let norm_add_residual_f16in_kernel = if dims.bf16_residual {
+        kernels.fused_norm_add_residual_bf16_f16in
+    } else {
+        kernels.fused_norm_add_residual_f16in
+    };
     let q_dim = dims.num_heads * dims.head_dim;
     let _kv_dim = dims.num_kv_heads * dims.head_dim;
     let qkv_rows = (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim;
@@ -780,7 +816,7 @@ pub unsafe fn gemma4_forward_phase(
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_rmsnorm_fp8_quant,
+            rmsnorm_quant_kernel,
             scratch.hidden_fp8,
             scratch.hidden_scale,
             residual,
@@ -897,12 +933,24 @@ pub unsafe fn gemma4_forward_phase(
 
         // Same prelude as the qkv_f16 branch: copy residual to delta
         // scratch then in-place rmsnorm.
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.delta_f16,
-            residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
-        );
+        // Cycle 54 Stage 2.1: when the residual chain runs in bf16
+        // (RVLLM_RESIDUAL_BF16=1), narrow bf16→f16-sat into the scratch
+        // the f16-typed rmsnorm + downstream f16-input AWQ GEMV/GEMM
+        // expect; otherwise keep the byte-identical memcpy. Both leave
+        // f16 in `scratch.delta_f16`.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            );
+        }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -990,12 +1038,20 @@ pub unsafe fn gemma4_forward_phase(
         }
     } else if weights.qkv_f16 != 0 {
         // F16 path: copy residual to delta_f16 scratch, apply rmsnorm in-place, use as GEMM input
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.delta_f16,
-            residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
-        );
+        // Cycle 54 Stage 2.1: bf16-residual narrow at branch entry.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            );
+        }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -1050,12 +1106,23 @@ pub unsafe fn gemma4_forward_phase(
         // already done by `fused_rmsnorm_fp8_quant` in step 1 — at M=1
         // that's ~5 KiB of rmsnorm work against a >30 MiB weight GEMV,
         // well below the noise floor.
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.delta_f16,
-            residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
-        );
+        // Cycle 54 Stage 2.1: this is the M=1 decode QKV hot path.
+        // Narrow bf16→f16-sat at branch entry when the residual chain
+        // is bf16 so the f16-typed rmsnorm + Fp8GemvF16InLaunch consume
+        // valid f16 (was a silent dtype mismatch in Stage 2.0).
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            );
+        }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -1749,7 +1816,7 @@ pub unsafe fn gemma4_forward_phase(
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
         }.launch(
-            kernels.fused_norm_add_residual_f16in, o_out_f16,
+            norm_add_residual_f16in_kernel, o_out_f16,
             weights.post_attn_norm_gamma, residual, 0, stream,
         )?;
     } else if weights.o_f16 != 0 {
@@ -1759,7 +1826,7 @@ pub unsafe fn gemma4_forward_phase(
         )?;
         gemma4_launcher::FusedNormAddResidualLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
+        }.launch(norm_add_residual_kernel, scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
     } else if let (true, Some(fn_gemv)) = (
         weights.o_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
@@ -1790,7 +1857,7 @@ pub unsafe fn gemma4_forward_phase(
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_norm_add_residual_f16in,
+            norm_add_residual_f16in_kernel,
             scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma,
             residual,
@@ -1826,7 +1893,7 @@ pub unsafe fn gemma4_forward_phase(
         )?;
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual_f16in, o_out_f16,
+        }.launch(norm_add_residual_f16in_kernel, o_out_f16,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
     } else {
         cublaslt.fp8_gemm_f32(
@@ -1836,7 +1903,7 @@ pub unsafe fn gemma4_forward_phase(
         )?;
         gemma4_launcher::FusedNormAddResidualLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
+        }.launch(norm_add_residual_kernel, scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
     }
 
@@ -1862,7 +1929,7 @@ pub unsafe fn gemma4_forward_phase(
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_rmsnorm_fp8_quant,
+            rmsnorm_quant_kernel,
             scratch.hidden_fp8,
             scratch.hidden_scale,
             residual,
@@ -1913,11 +1980,19 @@ pub unsafe fn gemma4_forward_phase(
         let fn_awq = kernels.awq_int4_gemv_f16;
         // Same prelude as gate_up FP8 fast path: residual → delta_f16 +
         // pre-FF rmsnorm in place.
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.delta_f16, residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
-        );
+        // Cycle 54 Stage 2.1: bf16-residual narrow at branch entry.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16, residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            );
+        }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
         }.launch(
@@ -1977,12 +2052,22 @@ pub unsafe fn gemma4_forward_phase(
         }
     } else if weights.gate_up_f16 != 0 {
         // F16 path: norm residual into gate_up_out scratch, then F16 GEMM
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.gate_up_out,
-            residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
-        );
+        // Cycle 54 Stage 2.1: bf16-residual narrow at branch entry. Note
+        // the scratch here is `scratch.gate_up_out` (re-used as the
+        // pre-norm staging buffer for this branch), not `delta_f16`.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.gate_up_out, residual, stream)?;
+        } else {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.gate_up_out,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            );
+        }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -2021,12 +2106,20 @@ pub unsafe fn gemma4_forward_phase(
         // gamma this time), then f16-input fp8_gemv direct to
         // gate_up_out. Downstream `fused_gelu_mul` reads gate_up_out
         // as f16 so no epilogue change is needed.
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.delta_f16,
-            residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
-        );
+        // Cycle 54 Stage 2.1: bf16-residual narrow at branch entry.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            );
+        }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -2163,7 +2256,7 @@ pub unsafe fn gemma4_forward_phase(
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
         }.launch(
-            kernels.fused_norm_add_residual_f16in, scratch.gemm_f32_tmp,
+            norm_add_residual_f16in_kernel, scratch.gemm_f32_tmp,
             weights.post_ff_norm_gamma, residual,
             weights.layer_scalar_ptr, stream,
         )?;
@@ -2235,7 +2328,7 @@ pub unsafe fn gemma4_forward_phase(
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_norm_add_residual_f16in,
+            norm_add_residual_f16in_kernel,
             scratch.gemm_f32_tmp,
             weights.post_ff_norm_gamma,
             residual,
@@ -2272,7 +2365,7 @@ pub unsafe fn gemma4_forward_phase(
             )?;
             gemma4_launcher::FusedNormAddResidualF16InLaunch {
                 num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-            }.launch(kernels.fused_norm_add_residual_f16in, down_out_f16,
+            }.launch(norm_add_residual_f16in_kernel, down_out_f16,
                 weights.post_ff_norm_gamma, residual,
                 weights.layer_scalar_ptr, stream)?;
         } else {
@@ -2283,7 +2376,7 @@ pub unsafe fn gemma4_forward_phase(
             )?;
             gemma4_launcher::FusedNormAddResidualLaunch {
                 num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-            }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
+            }.launch(norm_add_residual_kernel, scratch.gemm_f32_tmp,
                 weights.post_ff_norm_gamma, residual,
                 weights.layer_scalar_ptr, stream)?;
         }
@@ -2993,6 +3086,7 @@ mod validate_tests {
             sliding_window: 1024,
             f16_kv: false,
             kv_dtype: KvDtype::Fp8,
+            bf16_residual: false,
         }
     }
 

@@ -718,6 +718,35 @@ impl Bf16ToF16SatLaunch {
     }
 }
 
+// Cycle 54 Stage 1: f16 -> bf16 conversion (residual chain entry).
+// Mirrors Bf16ToF16SatLaunch — same ABI, opposite direction. Safe for
+// in-place use (dst == src) thanks to the no-restrict kernel signature.
+pub struct F16ToBf16Launch {
+    pub n: u32,
+}
+
+impl F16ToBf16Launch {
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        dst: u64,
+        src: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut dst = dst;
+        let mut src = src;
+        let mut n = self.n as i32;
+        let args = [
+            (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+            (&mut src) as *mut u64 as *mut core::ffi::c_void,
+            (&mut n) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block = (256u32, 1, 1);
+        let grid = ((self.n + 255) / 256, 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // logit_softcap
 // ---------------------------------------------------------------------------

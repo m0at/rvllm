@@ -417,6 +417,18 @@ pub fn nvfp4_hadamard_enabled() -> bool {
     parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(false)
 }
 
+/// Cycle 54 Stage 1: BF16 residual chain gate. Default OFF — when
+/// unset the residual chain stays on f16 (byte-identical to pre-stage-1
+/// behaviour). When `RVLLM_RESIDUAL_BF16=1`, the inter-layer residual
+/// buffer is interpreted as bf16 (still 2 bytes/elem, same allocation),
+/// the rmsnorm + add-residual ops route to bf16 sibling kernels, and
+/// embedding gather entry + LM head input convert at the boundaries.
+/// See `fused_norm_add_residual_bf16.cu` and Cycle 53 brain task for
+/// the long-context-margin rationale.
+pub fn bf16_residual_enabled() -> bool {
+    parse_truthy_env("RVLLM_RESIDUAL_BF16").unwrap_or(false)
+}
+
 /// Per-token Q scale gate.
 /// * For the FP8-KV path the scratch allocation defaults ON because
 ///   per-token Q materially helps PPL on prose (memory aa010018 in the
@@ -1158,6 +1170,7 @@ impl Gemma4Bringup {
                     sliding_window: arch.sliding_window_size as u32,
                     f16_kv: kv_dtype.is_f16(),
                     kv_dtype,
+                    bf16_residual: bf16_residual_enabled(),
                     current_max_context_len: None,
                 };
 
@@ -1647,6 +1660,7 @@ impl Gemma4Bringup {
                     sliding_window: arch.sliding_window_size as u32,
                     f16_kv: kv_dtype.is_f16(),
                     kv_dtype,
+                    bf16_residual: bf16_residual_enabled(),
                     current_max_context_len: None,
                 };
 
@@ -2601,6 +2615,13 @@ impl Gemma4Bringup {
             rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
                 .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
                     token_ids_region.device_ptr(), stream)?;
+            // Cycle 54 Stage 1: BF16 residual chain entry. Embedding
+            // gather writes f16; widen to bf16 in-place so subsequent
+            // layers operate on bf16 storage.
+            if bf16_residual_enabled() {
+                rvllm_fused::gemma4_launcher::F16ToBf16Launch { n: hidden }
+                    .launch(kernels.f16_to_bf16, residual_ptr, residual_ptr, stream)?;
+            }
 
             let pos = [step as i32];
             let slot = [step as i32];
@@ -2647,6 +2668,7 @@ impl Gemma4Bringup {
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
                     f16_kv: kv_dtype.is_f16(),
                     kv_dtype,
+                    bf16_residual: bf16_residual_enabled(),
                     // Decode step knows its own ctx CPU-side — `ctx = [step + 1]`
                     // was computed at line ~1843. Pass it so the split-KV
                     // dispatch gates on the current ctx length instead of
@@ -2965,6 +2987,14 @@ impl Gemma4Bringup {
                 rvllm_fused::EmbeddingGatherLaunch { num_tokens: chunk_q, hidden, vocab }
                     .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
                         token_ids_region.device_ptr(), stream)?;
+                // Cycle 54 Stage 1: widen embedding-gather output (f16)
+                // to bf16 in-place so the chunked-prefill residual chain
+                // operates on bf16 between layers.
+                if bf16_residual_enabled() {
+                    rvllm_fused::gemma4_launcher::F16ToBf16Launch {
+                        n: chunk_q * hidden,
+                    }.launch(kernels.f16_to_bf16, residual_ptr, residual_ptr, stream)?;
+                }
                 if chunk_idx == 0 {
                     self.stream.fence()?;
                     let mut r0 = vec![0u16; 4];
@@ -3041,6 +3071,7 @@ impl Gemma4Bringup {
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
                     f16_kv: false, // prefill uses FP8 KV (no F16 prefill kernel)
                     kv_dtype: prefill_kv_dtype,
+                    bf16_residual: bf16_residual_enabled(),
                     current_max_context_len: None,  // prefill path — not used by split-KV decode
                 };
                 let w = crate::gemma4_layer_exec::Gemma4LayerWeightPtrs {
@@ -3278,10 +3309,24 @@ impl Gemma4Bringup {
             }
         }
 
-        // LM head on last prompt token
+        // LM head on last prompt token.
+        // Cycle 54 Stage 1: when bf16 residual is active, run the bf16
+        // rmsnorm sibling (math is identical, both use f32 accumulator
+        // internally) and then narrow bf16→f16 in-place before the
+        // existing f16 LM head GEMM consumes it.
+        let lm_head_bf16 = bf16_residual_enabled();
+        let lm_head_norm_kernel = if lm_head_bf16 {
+            kernels.rmsnorm_inplace_bf16
+        } else {
+            kernels.fused_rmsnorm
+        };
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: 1, hidden, eps: arch.rms_norm_eps,
-        }.launch(kernels.fused_rmsnorm, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
+        }.launch(lm_head_norm_kernel, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
+        if lm_head_bf16 {
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }
+                .launch(kernels.bf16_to_f16_sat, residual_ptr, residual_ptr, stream)?;
+        }
         self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
             logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
         // === TOOL-CALL OPEN-TAG BIAS (cycle 14 pragmatic fix) ===
@@ -3576,9 +3621,20 @@ impl Gemma4Bringup {
             }
             // === END NVFP4 SHADOW DIAGNOSTIC ===
 
+            // Cycle 54 Stage 1: same bf16 LM-head dispatch as the post-prefill site.
+            let lm_head_bf16 = bf16_residual_enabled();
+            let lm_head_norm_kernel = if lm_head_bf16 {
+                kernels.rmsnorm_inplace_bf16
+            } else {
+                kernels.fused_rmsnorm
+            };
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: 1, hidden, eps: arch.rms_norm_eps,
-            }.launch(kernels.fused_rmsnorm, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
+            }.launch(lm_head_norm_kernel, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
+            if lm_head_bf16 {
+                rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }
+                    .launch(kernels.bf16_to_f16_sat, residual_ptr, residual_ptr, stream)?;
+            }
             self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
                 logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
             // === REPETITION PENALTY (decode-loop site) ===
@@ -3823,6 +3879,11 @@ impl Gemma4Bringup {
             fused_norm_add_residual: self.fused.fn_fused_norm_add_residual,
             fused_norm_add_residual_f16: self.fused.fn_fused_norm_add_residual_f16,
             fused_norm_add_residual_f16in: self.fused.fn_fused_norm_add_residual_f16in,
+            // Cycle 54 Stage 1: BF16 residual chain handles.
+            f16_to_bf16: self.fused.fn_f16_to_bf16,
+            fused_norm_add_residual_bf16: self.fused.fn_fused_norm_add_residual_bf16,
+            fused_norm_add_residual_bf16_f16in: self.fused.fn_fused_norm_add_residual_bf16_f16in,
+            fused_rmsnorm_fp8_quant_bf16in: self.fused.fn_fused_rmsnorm_fp8_quant_bf16in,
             fused_qkv_rmsnorm: self.fused.fn_fused_qkv_rmsnorm,
             scale_cols_f16: self.fused.fn_scale_cols_f16,
             fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,

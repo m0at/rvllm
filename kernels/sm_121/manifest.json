@@ -22,9 +22,9 @@
       "sha256": "187ce594ccb771210b9baff836c46574be2f3b816dc3a23c4c2fcf925df59136"
     },
     "bf16_to_f16_sat": {
-      "bytes": 1314,
+      "bytes": 1311,
       "path": "bf16_to_f16_sat.ptx",
-      "sha256": "dd9e943cbadbc1394f55ee6368aaf2bf5b7f41d9894643b91078e75da30bdf1f"
+      "sha256": "6c83578939cd4ec78682944db314c6d80bbffbe4164d47812a0d2daef4419d9a"
     },
     "cast_fp": {
       "bytes": 2185,
@@ -47,9 +47,9 @@
       "sha256": "5e4e97c1e8b388017e767f21810d2319d0babee1db0432d55c4e6f360d783ec7"
     },
     "f16_to_bf16": {
-      "bytes": 1219,
+      "bytes": 1216,
       "path": "f16_to_bf16.ptx",
-      "sha256": "f6f454b0c24eb0dac53715cc520232310cf983dc1f6837b071340685fe830d94"
+      "sha256": "01eada933b78fff18045565832a104e0b55bc3f3913b5a1d6c08460e620cbbe9"
     },
     "f32_to_bf16": {
       "bytes": 1178,
@@ -277,5 +277,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "4b85a25"
+  "revision": "b493ac1"
 }

@@ -11,10 +11,14 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+// NB: no __restrict__ on dst/src so the kernel is safe to call with
+// dst == src (in-place dtype reinterpretation of the residual buffer
+// at chain entry). Each thread reads its own index then writes the
+// same index, so there is no cross-thread aliasing hazard.
 extern "C" __global__ void __launch_bounds__(1024)
 f16_to_bf16_kernel(
-    __nv_bfloat16* __restrict__ dst,
-    const __half*  __restrict__ src,
+    __nv_bfloat16* dst,
+    const __half*  src,
     int n
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
