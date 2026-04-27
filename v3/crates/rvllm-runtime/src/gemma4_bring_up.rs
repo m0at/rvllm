@@ -33,6 +33,15 @@ fn awq_layer_ptrs(
     // one Linear config group). Pick from q_proj — any of them is
     // identical by construction.
     let group_size = a.q_proj.group_size;
+    debug_assert!(
+        a.k_proj.group_size    == group_size
+            && a.v_proj.group_size    == group_size
+            && a.o_proj.group_size    == group_size
+            && a.gate_proj.group_size == group_size
+            && a.up_proj.group_size   == group_size
+            && a.down_proj.group_size == group_size,
+        "AwqLayerWeights group_size must be uniform across linears"
+    );
     crate::gemma4_layer_exec::Gemma4AwqLayerPtrs {
         q_packed:    a.q_proj.packed_offset_bytes,
         q_scale:     a.q_proj.scale_offset_bytes,
