@@ -80,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct DecodeArtifact {
     mlir: String,
+    mlir_path: PathBuf,
 }
 
 fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn std::error::Error>> {
@@ -100,7 +101,8 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
         };
         let mlir_name = format!("m2_decode_b{batch}.mlir");
         let json_name = format!("m2_decode_b{batch}.json");
-        fs::write(args.artifact_dir.join(&mlir_name), mlir.as_bytes())?;
+        let mlir_path = args.artifact_dir.join(&mlir_name);
+        fs::write(&mlir_path, mlir.as_bytes())?;
         let artifact = decode_artifact_manifest(&mlir_name, &shape, weight_arena_bytes);
         fs::write(
             args.artifact_dir.join(&json_name),
@@ -111,7 +113,7 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
             args.artifact_dir.join(&mlir_name).display(),
             args.artifact_dir.join(&json_name).display()
         );
-        out.push(DecodeArtifact { mlir });
+        out.push(DecodeArtifact { mlir, mlir_path });
     }
     Ok(out)
 }
@@ -153,7 +155,8 @@ fn compile_decode_artifacts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = PjrtClientHandle::new()?;
     for artifact in artifacts {
-        let _exe = client.compile(&artifact.mlir)?;
+        let mlir = fs::read_to_string(&artifact.mlir_path)?;
+        let _exe = client.compile(&mlir)?;
         eprintln!("compiled decode MLIR through PJRT");
     }
     Ok(())
