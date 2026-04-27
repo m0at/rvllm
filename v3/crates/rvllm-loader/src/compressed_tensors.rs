@@ -286,6 +286,100 @@ pub struct AwqLinearLayout {
     pub dense:    [usize; 2],
 }
 
+/// CPU-side bytes for one AWQ-quantized linear, ready to ship to GPU.
+/// The four byte buffers correspond to the four safetensors entries.
+///
+/// Cycle 43 step 3d: kept CPU-only on purpose — GPU buffer allocation +
+/// memcpy is a thin wrapper in cycle 44 that takes one of these and a
+/// device pool. Splitting like this makes the staging path unit-testable
+/// without a CUDA dep.
+#[derive(Clone, Debug)]
+pub struct AwqLinearStaged {
+    pub layout: AwqLinearLayout,
+    /// Raw bytes of `weight_packed` (I32 LE, [N, K/8]).
+    pub packed: Vec<u8>,
+    /// Raw bytes of `weight_scale` (BF16 LE, [N, K/g]).
+    pub scale: Vec<u8>,
+    /// Raw bytes of `weight_zero_point` (I32 LE, [N/8, K/g]).
+    pub zero_point: Vec<u8>,
+    /// Raw bytes of `weight_shape` (I64 LE, [2]).
+    pub shape: Vec<u8>,
+}
+
+impl AwqLinearStaged {
+    /// Total bytes pulled into host memory for this one linear.
+    pub fn host_bytes(&self) -> usize {
+        self.packed.len() + self.scale.len() + self.zero_point.len() + self.shape.len()
+    }
+}
+
+/// Pull the four AWQ tensor byte slices for `linear_name` from a
+/// generic `byte_lookup` that resolves an entry name to its raw bytes
+/// (e.g. an mmap'd safetensors slice). Validates dtype + shape, then
+/// stages the bytes into `AwqLinearStaged`.
+///
+/// The lookup signature matches what an `mmap` view of the safetensors
+/// header naturally supports: given an entry name, return its dtype,
+/// dense shape, and byte slice. Caller is responsible for keeping the
+/// slice alive long enough; we copy into owned `Vec<u8>` so the staged
+/// struct outlives the mmap.
+pub fn stage_awq_linear(
+    linear_name: &str,
+    dense_shape: [usize; 2],
+    scheme: &AwqWeightScheme,
+    byte_lookup: &dyn Fn(&str) -> Option<(rvllm_core::DType, Vec<usize>, Vec<u8>)>,
+) -> Result<AwqLinearStaged, String> {
+    // First validate the layout — uses the dtype/shape pair, ignores bytes.
+    let dtype_shape_lookup = |k: &str| -> Option<(rvllm_core::DType, Vec<usize>)> {
+        byte_lookup(k).map(|(d, s, _)| (d, s))
+    };
+    let layout = validate_awq_linear(linear_name, dense_shape, scheme, &dtype_shape_lookup)?;
+
+    // Then pull bytes for each (validation already ensured the entries exist).
+    let need_bytes = |key: &str| -> Result<Vec<u8>, String> {
+        byte_lookup(key)
+            .map(|(_, _, bytes)| bytes)
+            .ok_or_else(|| format!("AWQ entry vanished between validate and stage: {key}"))
+    };
+
+    let packed     = need_bytes(&layout.names.packed)?;
+    let scale      = need_bytes(&layout.names.scale)?;
+    let zero_point = need_bytes(&layout.names.zero_point)?;
+    let shape      = need_bytes(&layout.names.shape)?;
+
+    // Sanity-check byte sizes against expected shapes to catch
+    // truncated/over-long mmap slices.
+    let n = dense_shape[0];
+    let k = dense_shape[1];
+    let g = scheme.group_size as usize;
+    let expected_packed = n * (k / 8) * 4;       // I32
+    let expected_scale  = n * (k / g) * 2;       // BF16
+    let expected_zero   = (n / 8) * (k / g) * 4; // I32
+    let expected_shape  = 2 * 8;                  // I64 [2]
+    if packed.len() != expected_packed {
+        return Err(format!(
+            "weight_packed bytes = {} != expected {}", packed.len(), expected_packed
+        ));
+    }
+    if scale.len() != expected_scale {
+        return Err(format!(
+            "weight_scale bytes = {} != expected {}", scale.len(), expected_scale
+        ));
+    }
+    if zero_point.len() != expected_zero {
+        return Err(format!(
+            "weight_zero_point bytes = {} != expected {}", zero_point.len(), expected_zero
+        ));
+    }
+    if shape.len() != expected_shape {
+        return Err(format!(
+            "weight_shape bytes = {} != expected {}", shape.len(), expected_shape
+        ));
+    }
+
+    Ok(AwqLinearStaged { layout, packed, scale, zero_point, shape })
+}
+
 /// Result of validating one AWQ linear against the safetensors entries
 /// the shard index resolved.
 pub fn validate_awq_linear(
@@ -547,6 +641,76 @@ mod tests {
             "l.q", [8192, 5376], &scheme, &lookup
         ).expect_err("must fail");
         assert!(err.contains("shape"), "got: {err}");
+    }
+
+    // === Cycle 43 step 3d stage_awq_linear tests ===
+
+    /// Helper: builds a byte-lookup that returns dtype/shape/bytes of
+    /// the expected size for the given dense [N, K] + group_size,
+    /// optionally overriding one entry's byte length.
+    fn mock_byte_lookup(
+        prefix: &str,
+        n: usize,
+        k: usize,
+        g: usize,
+        override_packed_len: Option<usize>,
+    ) -> std::collections::HashMap<String, (rvllm_core::DType, Vec<usize>, Vec<u8>)> {
+        let names = AwqTensorNames::for_linear(prefix);
+        let packed_bytes = override_packed_len.unwrap_or(n * (k / 8) * 4);
+        let scale_bytes  = n * (k / g) * 2;
+        let zero_bytes   = (n / 8) * (k / g) * 4;
+        let shape_bytes  = 2 * 8;
+        [
+            (names.packed,     (rvllm_core::DType::I32,  vec![n, k / 8],     vec![0u8; packed_bytes])),
+            (names.scale,      (rvllm_core::DType::Bf16, vec![n, k / g],     vec![0u8; scale_bytes])),
+            (names.zero_point, (rvllm_core::DType::I32,  vec![n / 8, k / g], vec![0u8; zero_bytes])),
+            (names.shape,      (rvllm_core::DType::I64,  vec![2],            vec![0u8; shape_bytes])),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn stage_awq_linear_happy_path() {
+        let scheme = AwqWeightScheme { num_bits: 4, group_size: 128, symmetric: false };
+        let prefix = "model.language_model.layers.0.self_attn.q_proj";
+        let map = mock_byte_lookup(prefix, 8192, 5376, 128, None);
+        let lookup = |k: &str| map.get(k).cloned();
+
+        let staged = stage_awq_linear(prefix, [8192, 5376], &scheme, &lookup)
+            .expect("stages");
+        assert_eq!(staged.layout.dense, [8192, 5376]);
+        assert_eq!(staged.packed.len(),     8192 * (5376 / 8) * 4);
+        assert_eq!(staged.scale.len(),      8192 * (5376 / 128) * 2);
+        assert_eq!(staged.zero_point.len(), (8192 / 8) * (5376 / 128) * 4);
+        assert_eq!(staged.shape.len(),      16);
+        assert_eq!(staged.host_bytes(),
+            staged.packed.len() + staged.scale.len()
+            + staged.zero_point.len() + staged.shape.len());
+    }
+
+    #[test]
+    fn stage_awq_linear_missing_entry_errors() {
+        let scheme = AwqWeightScheme { num_bits: 4, group_size: 128, symmetric: false };
+        // No entries at all → validate fails first.
+        let lookup = |_k: &str| None;
+        let err = stage_awq_linear("l.q", [8192, 5376], &scheme, &lookup)
+            .expect_err("must fail");
+        assert!(err.contains("missing") || err.contains("AWQ entry"), "got: {err}");
+    }
+
+    #[test]
+    fn stage_awq_linear_byte_size_mismatch_errors() {
+        let scheme = AwqWeightScheme { num_bits: 4, group_size: 128, symmetric: false };
+        // Truncate weight_packed bytes by 1 — validate passes (dtype + shape OK)
+        // but stage's byte-size sanity check rejects.
+        let prefix = "l.q";
+        let correct = 8192 * (5376 / 8) * 4;
+        let map = mock_byte_lookup(prefix, 8192, 5376, 128, Some(correct - 1));
+        let lookup = |k: &str| map.get(k).cloned();
+        let err = stage_awq_linear(prefix, [8192, 5376], &scheme, &lookup)
+            .expect_err("must fail");
+        assert!(err.contains("weight_packed bytes"), "got: {err}");
     }
 
     #[test]
