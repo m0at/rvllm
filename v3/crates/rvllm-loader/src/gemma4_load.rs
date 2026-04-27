@@ -51,6 +51,38 @@ pub fn load_gemma4_model(
     arena: &HbmArena,
     arch: &Gemma4Arch,
 ) -> Result<Gemma4LoadedModel> {
+    // Cycle 47 step 6a: detect AWQ checkpoints at entry. If
+    // quantization_config is present, fail loud rather than silently
+    // re-quantizing the AWQ INT4 weights as FP8 (which is wrong: the
+    // file holds [N, K/8] int32-packed nibbles, not raw f16/bf16, and
+    // tensor_to_f16_bytes would treat the bytes as if they were).
+    //
+    // The actual AWQ load wiring (call upload_gemma4_awq_layer per
+    // layer + populate layer.awq + skip FP8 upload for AWQ-targeted
+    // linears) needs Gemma4LayerWeights' FP8 fields to be Optional —
+    // a deeper data-shape change deferred to cycle 48.
+    if let Some(awq) = crate::compressed_tensors::read_awq_config_from_dir(model_dir)
+        .map_err(|e| RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!("quantization_config: {e}"),
+            },
+            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        })?
+    {
+        eprintln!(
+            "[loader] AWQ-quantized checkpoint detected (format={:?}, num_bits={}, group_size={}, ignore={:?})",
+            awq.format, awq.scheme.num_bits, awq.scheme.group_size, awq.ignore
+        );
+        return Err(RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: "AWQ load path not yet wired; cycle 48 needs to make Gemma4LayerWeights FP8 fields Optional and call upload_gemma4_awq_layer per layer. Run with the FP8 checkpoint instead.".into(),
+            },
+            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+
     let idx = ShardIndex::resolve(model_dir)?;
     let mut shards = Vec::with_capacity(idx.shards.len());
     for p in &idx.shards {
