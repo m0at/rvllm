@@ -205,6 +205,126 @@ impl AwqConfig {
     }
 }
 
+/// Names of the four safetensors entries that compose one AWQ-quantized
+/// linear under the `pack-quantized` format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AwqTensorNames {
+    /// `<linear>.weight_packed`  — I32 [N, K/8]
+    pub packed: String,
+    /// `<linear>.weight_scale`   — BF16 [N, K/group_size]
+    pub scale: String,
+    /// `<linear>.weight_zero_point` — I32 [N/8, K/group_size]
+    pub zero_point: String,
+    /// `<linear>.weight_shape`   — I64 [2] metadata
+    pub shape: String,
+}
+
+impl AwqTensorNames {
+    /// Compose the four expected entry names from a `<linear>` prefix
+    /// (e.g. `model.language_model.layers.0.self_attn.q_proj`).
+    pub fn for_linear(linear: &str) -> Self {
+        Self {
+            packed:     format!("{linear}.weight_packed"),
+            scale:      format!("{linear}.weight_scale"),
+            zero_point: format!("{linear}.weight_zero_point"),
+            shape:      format!("{linear}.weight_shape"),
+        }
+    }
+}
+
+/// Per-linear AWQ shape header. Captures what the safetensors entries
+/// MUST be for the `pack-quantized` format given a dense `[N, K]` linear
+/// shape and the global group_size from [`AwqConfig`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AwqExpectedShapes {
+    /// `[N, K/8]`
+    pub packed_shape: [usize; 2],
+    /// `[N, K/group_size]`
+    pub scale_shape: [usize; 2],
+    /// `[N/8, K/group_size]`
+    pub zero_point_shape: [usize; 2],
+    /// Always `[2]` (stores `[N, K]` as i64 metadata).
+    pub shape_shape: [usize; 1],
+}
+
+impl AwqExpectedShapes {
+    /// Compute expected entry shapes from the dense linear shape `[N, K]`
+    /// and the AWQ group size. Returns Err if N or K are not divisible
+    /// by the required factors (N % 8, K % 8, K % group_size, K %
+    /// (2*group_size) for the per-group quantities).
+    pub fn from_dense(n: usize, k: usize, group_size: u32) -> Result<Self, String> {
+        let g = group_size as usize;
+        if g == 0 {
+            return Err("group_size must be > 0".into());
+        }
+        if k % 8 != 0 {
+            return Err(format!("K={k} must be divisible by 8 (8 INT4 per int32 along K)"));
+        }
+        if k % g != 0 {
+            return Err(format!("K={k} must be divisible by group_size={g}"));
+        }
+        if n % 8 != 0 {
+            return Err(format!("N={n} must be divisible by 8 (8 INT4 per int32 along N for zero_point)"));
+        }
+        Ok(Self {
+            packed_shape:     [n,     k / 8],
+            scale_shape:      [n,     k / g],
+            zero_point_shape: [n / 8, k / g],
+            shape_shape:      [2],
+        })
+    }
+}
+
+/// One linear's AWQ tensor metadata, validated against expected shapes
+/// and dtypes. Created via [`validate_awq_linear`].
+#[derive(Clone, Debug)]
+pub struct AwqLinearLayout {
+    pub names:    AwqTensorNames,
+    pub expected: AwqExpectedShapes,
+    /// Dense `[N, K]` of the linear; reproduced here for callers that
+    /// do not already track it.
+    pub dense:    [usize; 2],
+}
+
+/// Result of validating one AWQ linear against the safetensors entries
+/// the shard index resolved.
+pub fn validate_awq_linear(
+    linear_name: &str,
+    dense_shape: [usize; 2],
+    scheme: &AwqWeightScheme,
+    lookup: &dyn Fn(&str) -> Option<(rvllm_core::DType, Vec<usize>)>,
+) -> Result<AwqLinearLayout, String> {
+    let names    = AwqTensorNames::for_linear(linear_name);
+    let expected = AwqExpectedShapes::from_dense(
+        dense_shape[0], dense_shape[1], scheme.group_size,
+    )?;
+
+    // Helper: lookup, error path bakes in the linear name + entry kind.
+    let need = |key: &str, expected_dtype: rvllm_core::DType, expected_shape: &[usize]| -> Result<(), String> {
+        let (dtype, shape) = lookup(key)
+            .ok_or_else(|| format!("AWQ entry missing: {key}"))?;
+        if dtype != expected_dtype {
+            return Err(format!(
+                "AWQ entry {key} dtype = {dtype:?}, expected {expected_dtype:?}"
+            ));
+        }
+        if shape != expected_shape {
+            return Err(format!(
+                "AWQ entry {key} shape = {shape:?}, expected {expected_shape:?}"
+            ));
+        }
+        Ok(())
+    };
+
+    need(&names.packed,     rvllm_core::DType::I32,  &expected.packed_shape)?;
+    need(&names.scale,      rvllm_core::DType::Bf16, &expected.scale_shape)?;
+    need(&names.zero_point, rvllm_core::DType::I32,  &expected.zero_point_shape)?;
+    need(&names.shape,      rvllm_core::DType::I64,  &expected.shape_shape)?;
+    let _ = scheme.num_bits; // suppress unused warning if num_bits != 4 lands later
+
+    Ok(AwqLinearLayout { names, expected, dense: dense_shape })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +398,155 @@ mod tests {
         });
         let err = AwqConfig::from_json(Some(&bad)).expect_err("must reject");
         assert!(err.contains("marlin") || err.contains("unsupported"));
+    }
+
+    // === Cycle 42 step 3c tensor classifier + shape validator tests ===
+
+    #[test]
+    fn tensor_names_compose_correctly() {
+        let names = AwqTensorNames::for_linear(
+            "model.language_model.layers.0.self_attn.q_proj"
+        );
+        assert_eq!(names.packed,
+            "model.language_model.layers.0.self_attn.q_proj.weight_packed");
+        assert_eq!(names.scale,
+            "model.language_model.layers.0.self_attn.q_proj.weight_scale");
+        assert_eq!(names.zero_point,
+            "model.language_model.layers.0.self_attn.q_proj.weight_zero_point");
+        assert_eq!(names.shape,
+            "model.language_model.layers.0.self_attn.q_proj.weight_shape");
+    }
+
+    #[test]
+    fn expected_shapes_match_real_gemma4_q_proj() {
+        // Real ebircak/gemma-4-31B-it-4bit-W4A16-AWQ q_proj header:
+        //   weight_packed:    I32 [8192, 672]
+        //   weight_scale:     BF16 [8192, 42]
+        //   weight_zero_point: I32 [1024, 42]
+        //   weight_shape:     I64 [2]
+        // dense shape [N=8192, K=5376], group_size=128
+        let exp = AwqExpectedShapes::from_dense(8192, 5376, 128).expect("ok");
+        assert_eq!(exp.packed_shape,     [8192, 672]);   // K/8
+        assert_eq!(exp.scale_shape,      [8192, 42]);    // K/g
+        assert_eq!(exp.zero_point_shape, [1024, 42]);    // N/8, K/g
+        assert_eq!(exp.shape_shape,      [2]);
+    }
+
+    #[test]
+    fn expected_shapes_match_real_gemma4_down_proj() {
+        // down_proj: dense [N=5376, K=21504], group_size=128
+        //   weight_packed:    I32 [5376, 2688]   K/8
+        //   weight_scale:     BF16 [5376, 168]   K/g
+        //   weight_zero_point: I32 [672, 168]    N/8, K/g
+        let exp = AwqExpectedShapes::from_dense(5376, 21504, 128).expect("ok");
+        assert_eq!(exp.packed_shape,     [5376, 2688]);
+        assert_eq!(exp.scale_shape,      [5376, 168]);
+        assert_eq!(exp.zero_point_shape, [672, 168]);
+    }
+
+    #[test]
+    fn expected_shapes_reject_unaligned_n() {
+        // N=5377 not divisible by 8 → INT4-along-N zero_point can't be
+        // packed cleanly → reject.
+        assert!(AwqExpectedShapes::from_dense(5377, 5376, 128).is_err());
+    }
+
+    #[test]
+    fn expected_shapes_reject_unaligned_k() {
+        // K=5377 not divisible by 8 → INT4-along-K weight_packed can't.
+        assert!(AwqExpectedShapes::from_dense(5376, 5377, 128).is_err());
+    }
+
+    #[test]
+    fn expected_shapes_reject_k_not_multiple_of_group() {
+        // K=128 OK with g=128 but K=200 with g=128 is not → reject.
+        assert!(AwqExpectedShapes::from_dense(8, 200, 128).is_err());
+    }
+
+    #[test]
+    fn validate_awq_linear_happy_path() {
+        let scheme = AwqWeightScheme {
+            num_bits: 4, group_size: 128, symmetric: false,
+        };
+        // Mock the safetensors lookup: returns the dtypes/shapes the
+        // real ebircak Gemma 4 31B q_proj would have.
+        let entries: std::collections::HashMap<&str, (rvllm_core::DType, Vec<usize>)> = [
+            ("model.language_model.layers.0.self_attn.q_proj.weight_packed",
+              (rvllm_core::DType::I32,  vec![8192, 672])),
+            ("model.language_model.layers.0.self_attn.q_proj.weight_scale",
+              (rvllm_core::DType::Bf16, vec![8192, 42])),
+            ("model.language_model.layers.0.self_attn.q_proj.weight_zero_point",
+              (rvllm_core::DType::I32,  vec![1024, 42])),
+            ("model.language_model.layers.0.self_attn.q_proj.weight_shape",
+              (rvllm_core::DType::I64,  vec![2])),
+        ].into_iter().collect();
+        let lookup = |k: &str| entries.get(k).cloned();
+
+        let layout = validate_awq_linear(
+            "model.language_model.layers.0.self_attn.q_proj",
+            [8192, 5376],
+            &scheme,
+            &lookup,
+        ).expect("validates");
+        assert_eq!(layout.dense, [8192, 5376]);
+        assert_eq!(layout.expected.packed_shape, [8192, 672]);
+    }
+
+    #[test]
+    fn validate_awq_linear_missing_entry_errors() {
+        let scheme = AwqWeightScheme {
+            num_bits: 4, group_size: 128, symmetric: false,
+        };
+        // Provide only 3 of 4 entries (missing weight_zero_point).
+        let entries: std::collections::HashMap<&str, (rvllm_core::DType, Vec<usize>)> = [
+            ("layer.q_proj.weight_packed", (rvllm_core::DType::I32,  vec![8192, 672])),
+            ("layer.q_proj.weight_scale",  (rvllm_core::DType::Bf16, vec![8192, 42])),
+            ("layer.q_proj.weight_shape",  (rvllm_core::DType::I64,  vec![2])),
+        ].into_iter().collect();
+        let lookup = |k: &str| entries.get(k).cloned();
+        let err = validate_awq_linear(
+            "layer.q_proj", [8192, 5376], &scheme, &lookup
+        ).expect_err("must fail");
+        assert!(err.contains("weight_zero_point"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_awq_linear_wrong_dtype_errors() {
+        let scheme = AwqWeightScheme {
+            num_bits: 4, group_size: 128, symmetric: false,
+        };
+        // Pass U8 instead of expected I32 for weight_packed (wrong format).
+        let entries: std::collections::HashMap<&str, (rvllm_core::DType, Vec<usize>)> = [
+            ("l.q.weight_packed",     (rvllm_core::DType::U8,   vec![8192, 672])),
+            ("l.q.weight_scale",      (rvllm_core::DType::Bf16, vec![8192, 42])),
+            ("l.q.weight_zero_point", (rvllm_core::DType::I32,  vec![1024, 42])),
+            ("l.q.weight_shape",      (rvllm_core::DType::I64,  vec![2])),
+        ].into_iter().collect();
+        let lookup = |k: &str| entries.get(k).cloned();
+        let err = validate_awq_linear(
+            "l.q", [8192, 5376], &scheme, &lookup
+        ).expect_err("must fail");
+        assert!(err.contains("dtype"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_awq_linear_wrong_shape_errors() {
+        let scheme = AwqWeightScheme {
+            num_bits: 4, group_size: 128, symmetric: false,
+        };
+        // Provide weight_packed with N=4096 but dense [8192, 5376] →
+        // expected [8192, 672], got [4096, 672] — should reject.
+        let entries: std::collections::HashMap<&str, (rvllm_core::DType, Vec<usize>)> = [
+            ("l.q.weight_packed",     (rvllm_core::DType::I32,  vec![4096, 672])),
+            ("l.q.weight_scale",      (rvllm_core::DType::Bf16, vec![8192, 42])),
+            ("l.q.weight_zero_point", (rvllm_core::DType::I32,  vec![1024, 42])),
+            ("l.q.weight_shape",      (rvllm_core::DType::I64,  vec![2])),
+        ].into_iter().collect();
+        let lookup = |k: &str| entries.get(k).cloned();
+        let err = validate_awq_linear(
+            "l.q", [8192, 5376], &scheme, &lookup
+        ).expect_err("must fail");
+        assert!(err.contains("shape"), "got: {err}");
     }
 
     #[test]
