@@ -847,9 +847,9 @@ mod tests {
         assert_eq!(plan.seed_decode_positions, vec![4; 8]);
         assert_eq!(plan.decode_input_specs[3].name, "weight_arena");
         assert_eq!(plan.decode_input_specs[3].nbytes, plan.weight_arena_bytes);
-        assert!(plan.decode_mlir.contains(
-            "rvllm.custom_call_target = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\""
-        ));
+        assert!(plan
+            .decode_mlir
+            .contains("target=rvllm.m2.decode_layer.fused_attention_nvfp4_moe"));
     }
 
     #[test]
