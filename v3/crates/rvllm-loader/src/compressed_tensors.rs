@@ -468,10 +468,13 @@ pub fn upload_awq_linear<'a>(
 /// down_proj.
 ///
 /// Caller derives this from `gemma4_arch::ModelArch` + the per-layer
-/// attention type (sliding heads at half-width, full heads at full).
-/// We keep it as plain data here so the loader doesn't reach into the
-/// arch crate for layer geometry — that mirrors how `validate_awq_linear`
-/// already takes `dense_shape` rather than an arch handle.
+/// attention type. Gemma 4 31B is heterogeneous: sliding layers run
+/// `head_dim=256, num_kv_heads=16` (kv_out=4096), global layers run
+/// `head_dim=512, num_kv_heads=4` (kv_out=2048). q_out follows
+/// `num_attention_heads * head_dim` per type. One `AwqLayerShapes`
+/// per layer; we keep it as plain data here so the loader doesn't reach
+/// into the arch crate, matching how `validate_awq_linear` takes
+/// `dense_shape` rather than an arch handle.
 #[derive(Clone, Debug)]
 pub struct AwqLayerShapes {
     /// Output dim of `q_proj` weight (= num_heads * head_dim). Hidden
