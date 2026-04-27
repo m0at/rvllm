@@ -607,20 +607,21 @@ fn execute_decode_artifacts(
                     }
                 }
                 if let (Some(tokens), Some(logits)) = (&teacher, logits.as_ref()) {
-                    let targets = tokens.target_at(step)?;
-                    let argmax = m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
-                    top1_hits += argmax
-                        .iter()
-                        .zip(targets.iter())
-                        .filter(|(got, want)| got == want)
-                        .count();
-                    top1_total += targets.len();
-                    nll.extend(m2_bf16_logits_nll(
-                        logits,
-                        &targets,
-                        artifact.shape.batch,
-                        M2_VOCAB,
-                    )?);
+                    if let Ok(targets) = tokens.target_at(step) {
+                        let argmax = m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
+                        top1_hits += argmax
+                            .iter()
+                            .zip(targets.iter())
+                            .filter(|(got, want)| got == want)
+                            .count();
+                        top1_total += targets.len();
+                        nll.extend(m2_bf16_logits_nll(
+                            logits,
+                            &targets,
+                            artifact.shape.batch,
+                            M2_VOCAB,
+                        )?);
+                    }
                 }
             }
             if let Some(logits) = logits.as_ref() {
