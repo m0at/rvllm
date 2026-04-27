@@ -250,12 +250,12 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
     let plan = M2DecodeGraphPlan::from_arena(arena)?;
     let body = emit_decode_body(shape, arena, &plan, decode_layer_body)?;
     Ok(format!(
-        r#"module attributes {{rvllm.kind = "m2_decode_graph"}} {{
+        r###"module attributes {{mhlo.frontend_attributes = {{xla.sdy.meshes = "{{mesh = #sdy.mesh<[\22expert\22=8]>}}"}}, mhlo.num_partitions = 8 : i32, mhlo.num_replicas = 1 : i32, rvllm.kind = "m2_decode_graph"}} {{
   func.func @{kernel_name}(
       %token_ids: tensor<{batch}xi32>,
       %positions: tensor<{batch}xi32>,
       %kv_cache: tensor<{kv_bytes}xi8>,
-      %weight_arena: tensor<{weight_bytes}xi8>)
+      %weight_arena: tensor<{weight_bytes}xi8> {{mhlo.frontend_attributes = {{xla.sdy.sharding = "#sdy.sharding<@mesh, [{{\22expert\22}}]>"}}, mhlo.sharding = "{{devices=[8]<=[8]}}"}})
       -> (tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>)
       attributes {{
         rvllm.signature = "token_ids,positions,kv_cache,weight_arena -> logits,next_token,kv_cache",
@@ -277,7 +277,7 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
 {body}
   }}
 }}
-"#,
+"###,
         kernel_name = kernel_name,
         batch = shape.batch,
         ctx = shape.ctx,
@@ -336,15 +336,21 @@ fn emit_decode_body(
 ) -> Result<String> {
     let hidden_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_HIDDEN);
     let kv_ty = format!("tensor<{}xi8>", shape.kv_cache_bytes());
-    let arena_ty = format!("tensor<{}xi8>", arena.total_bytes);
+    let arena_local_bytes = arena.total_bytes.div_ceil(8);
+    let arena_ty = format!("tensor<{}xi8>", arena_local_bytes);
     let token_ty = format!("tensor<{}xi32>", shape.batch);
     let logits_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_VOCAB);
     let mut out = String::new();
 
     out.push_str(&format!(
-        r#"    %embed_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
+        r###"    %embed_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
     %h_embed = stablehlo.broadcast_in_dim %embed_zero, dims = [] : (tensor<bf16>) -> {hidden_ty}
-"#
+    %weight_arena_local = stablehlo.custom_call @xla.sdy.GlobalToLocalShape(%weight_arena) {{
+      has_side_effect = true,
+      mhlo.frontend_attributes = {{xla.sdy.in_shardings = "#sdy.sharding_per_value<[<@mesh, [{{\22expert\22}}]>]>", xla.sdy.manual_axes = "#sdy<manual_axes{{\22expert\22}}>"}}
+    }} : (tensor<{weight_bytes}xi8>) -> {arena_ty}
+"###,
+        weight_bytes = arena.total_bytes,
     ));
 
     let mut hidden = "%h_embed".to_string();
@@ -402,7 +408,7 @@ fn emit_layer_call(
         None => tpu_custom_call_backend_config(""),
     };
     Ok(format!(
-        r#"    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, %weight_arena) {{
+        r#"    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, {arena}) {{
       call_target_name = "{tpu_custom_call}",
       backend_config = "{backend_config}",
       called_computations = [],
@@ -418,6 +424,7 @@ fn emit_layer_call(
         target = target,
         src = src,
         kv_src = kv_src,
+        arena = "%weight_arena_local",
         dst = dst,
         kv_dst = kv_dst,
     ))
