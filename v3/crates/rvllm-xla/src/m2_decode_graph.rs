@@ -260,7 +260,7 @@ pub fn m2_decode_graph_mlir(
         rvllm.weight_input_scales_missing = {missing_input_scales} : i64,
         rvllm.weight_metadata = "compile_time_offsets_from_M2WeightArenaPlan",
         rvllm.lowering = "rust_xla_custom_call",
-        rvllm.lowering_plan = "embed -> 62 fused decode-layer custom calls -> flat-arena dense loads -> fused attention -> top-k router -> flat-arena NVFP4 experts -> final norm -> lm_head -> argmax"
+        rvllm.lowering_plan = "native StableHLO embed/final placeholders -> 62 fused decode-layer custom calls -> flat-arena dense loads -> fused attention -> top-k router -> flat-arena NVFP4 experts"
       }} {{
 {body}
   }}
@@ -330,19 +330,9 @@ fn emit_decode_body(
     let empty_mosaic_body = "";
 
     out.push_str(&format!(
-        r#"    %h_embed = "stablehlo.custom_call"(%token_ids, %weight_arena) {{
-      call_target_name = "{tpu_custom_call}",
-      backend_config = "{backend_config}",
-      called_computations = [],
-      has_side_effect = false,
-      api_version = 1 : i32,
-      kernel_name = "rvllm.m2.embed",
-      operand_layouts = [dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>],
-      result_layouts = [dense<[1, 0]> : tensor<2xindex>]
-    }} : ({token_ty}, {arena_ty}) -> {hidden_ty}
-"#,
-        tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
-        backend_config = tpu_custom_call_backend_config(empty_mosaic_body),
+        r#"    %embed_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
+    %h_embed = stablehlo.broadcast_in_dim %embed_zero, dims = [] : (tensor<bf16>) -> {hidden_ty}
+"#
     ));
 
     let mut hidden = "%h_embed".to_string();
@@ -368,22 +358,15 @@ fn emit_decode_body(
     }
 
     out.push_str(&format!(
-        r#"    %logits, %next_token = "stablehlo.custom_call"({final_hidden}, %weight_arena) {{
-      call_target_name = "{tpu_custom_call}",
-      backend_config = "{backend_config}",
-      called_computations = [],
-      has_side_effect = false,
-      api_version = 1 : i32,
-      kernel_name = "rvllm.m2.final_logits",
-      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>],
-      result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>]
-    }} : ({hidden_ty}, {arena_ty}) -> ({logits_ty}, {token_ty})
+        r#"    %logits_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
+    %logits = stablehlo.broadcast_in_dim %logits_zero, dims = [] : (tensor<bf16>) -> {logits_ty}
+    %token_zero = stablehlo.constant dense<0> : tensor<i32>
+    %token_zero_vec = stablehlo.broadcast_in_dim %token_zero, dims = [] : (tensor<i32>) -> {token_ty}
+    %position_zero = stablehlo.multiply %positions, %token_zero_vec : {token_ty}
+    %next_token = stablehlo.add %token_ids, %position_zero : {token_ty}
     return %logits, %next_token, {final_kv} : {logits_ty}, {token_ty}, {kv_ty}
 "#,
-        final_hidden = hidden,
         final_kv = kv,
-        tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
-        backend_config = tpu_custom_call_backend_config(empty_mosaic_body),
     ));
     Ok(out)
 }
@@ -612,15 +595,18 @@ mod tests {
         assert_eq!(
             mlir.matches("call_target_name = \"tpu_custom_call\"")
                 .count(),
-            M2_NUM_LAYERS + 2
+            M2_NUM_LAYERS
         );
         assert_eq!(
             mlir.matches("kernel_name = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\"")
                 .count(),
             M2_NUM_LAYERS
         );
-        assert!(mlir.contains("kernel_name = \"rvllm.m2.embed\""));
-        assert!(mlir.contains("kernel_name = \"rvllm.m2.final_logits\""));
+        assert!(!mlir.contains("kernel_name = \"rvllm.m2.embed\""));
+        assert!(!mlir.contains("kernel_name = \"rvllm.m2.final_logits\""));
+        assert!(mlir.contains("native StableHLO embed/final placeholders"));
+        assert!(mlir.contains("%h_embed = stablehlo.broadcast_in_dim"));
+        assert!(mlir.contains("%logits = stablehlo.broadcast_in_dim"));
         assert!(mlir.contains("\\22custom_call_config\\22"));
         assert!(mlir.contains("\\22serialization_format\\22: 1"));
         assert!(mlir.contains("\\22needs_layout_passes\\22: true"));
