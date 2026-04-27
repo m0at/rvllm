@@ -521,6 +521,12 @@ pub struct Gemma4LayerKernels {
     /// activation FP8-quant step and runs this kernel directly on the
     /// f16 rmsnorm output.
     pub fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    /// Cycle 45 step 4.5c: AWQ INT4 W4A16 GEMV kernel handle. `None`
+    /// when the PTX wasn't built into `$KERNELS_DIR`; the AWQ
+    /// dispatch path checks this and rejects load if an AwqConfig
+    /// is present without the kernel available. Companion to
+    /// `Gemma4AwqLayerPtrs` on `Gemma4LayerWeightPtrs`.
+    pub awq_int4_gemv_f16: Option<KernelFn>,
     /// Companion to the V-rotation arm of the NVFP4 RoPE kernel.
     /// When `RVLLM_NVFP4_HADAMARD_V=1` and the rope kernel rotated V
     /// before NVFP4-packing it, this kernel right-multiplies the

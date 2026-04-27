@@ -119,6 +119,13 @@ pub struct Gemma4FusedModules {
     /// in that case.
     pub hadamard_unrotate_f16_mod: Option<LoadedModule>,
     pub fn_hadamard_unrotate_f16: Option<KernelFn>,
+    /// AWQ INT4 W4A16 GEMV kernel (cycle 45 step 4.5c). PTX may be
+    /// absent on older kernel trees / non-Blackwell branches; fall
+    /// through to `None` and the dispatch site treats AWQ as
+    /// unavailable for any layer (load_gemma4_model rejects an
+    /// AwqConfig-bearing checkpoint when this is `None`).
+    pub awq_int4_gemv_f16_mod: Option<LoadedModule>,
+    pub fn_awq_int4_gemv_f16: Option<KernelFn>,
 }
 
 /// Session-level prefix cache state. Populated on first `run_generate`
@@ -3673,6 +3680,7 @@ impl Gemma4Bringup {
             scale_cols_f16: self.fused.fn_scale_cols_f16,
             fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,
             hadamard_unrotate_f16: self.fused.fn_hadamard_unrotate_f16,
+            awq_int4_gemv_f16: self.fused.fn_awq_int4_gemv_f16,
         }
     }
 }
@@ -3774,6 +3782,14 @@ fn load_gemma4_fused(
         .as_ref()
         .and_then(|m| m.get_function("hadamard_unrotate_f16_kernel").ok());
 
+    // Cycle 45 step 4.5c: AWQ INT4 W4A16 GEMV. Optional — `None` is fine
+    // and silently disables the AWQ load path. load_gemma4_model rejects
+    // an AwqConfig-bearing checkpoint when this is `None`.
+    let awq_int4_gemv_f16_mod = loader.load_ptx("awq_int4_gemv_f16").ok();
+    let fn_awq_int4_gemv_f16 = awq_int4_gemv_f16_mod
+        .as_ref()
+        .and_then(|m| m.get_function("awq_int4_gemv_f16_kernel").ok());
+
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
         rmsnorm_inplace_mod,
@@ -3829,5 +3845,7 @@ fn load_gemma4_fused(
         fn_fp8_gemv_wpr_native_f16in,
         hadamard_unrotate_f16_mod,
         fn_hadamard_unrotate_f16,
+        awq_int4_gemv_f16_mod,
+        fn_awq_int4_gemv_f16,
     })
 }
