@@ -7,9 +7,9 @@ use rvllm_xla::m2_decode_bench::{
 };
 use rvllm_xla::m2_runtime::{m2_decode_mlir_execution_blocker, M2RuntimeMode};
 use rvllm_xla::{
-    m2_decode_graph_mlir, plan_m2_rust_decode_bench, M2GraphAbi, M2GraphShape,
-    M2RustDecodeBenchConfig, M2WeightUploadPlan, PjrtElementType, XlaArtifact, XlaTensorSpec,
-    M2_VOCAB,
+    m2_decode_graph_mlir, m2_decode_smoke_mlir, plan_m2_rust_decode_bench, M2GraphAbi,
+    M2GraphShape, M2RustDecodeBenchConfig, M2WeightUploadPlan, PjrtElementType, XlaArtifact,
+    XlaTensorSpec, M2_VOCAB,
 };
 
 #[cfg(feature = "tpu")]
@@ -87,14 +87,21 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
     let mut out = Vec::with_capacity(args.batches.len());
     for &batch in &args.batches {
         let shape = M2GraphShape::decode(batch, args.ctx, kv_bytes_per_elem(&args.kv_cache)?);
-        let abi = M2GraphAbi::new(shape.clone())?;
-        let weights = M2WeightUploadPlan::from_index_dir(&args.model_dir, &abi)?;
-        let arena = weights.flat_arena(128)?;
-        let mlir = m2_decode_graph_mlir("main", &shape, &arena)?;
+        let weight_arena_bytes;
+        let mlir = if args.native_smoke {
+            weight_arena_bytes = 1;
+            m2_decode_smoke_mlir("main", &shape)?
+        } else {
+            let abi = M2GraphAbi::new(shape.clone())?;
+            let weights = M2WeightUploadPlan::from_index_dir(&args.model_dir, &abi)?;
+            let arena = weights.flat_arena(128)?;
+            weight_arena_bytes = arena.total_bytes;
+            m2_decode_graph_mlir("main", &shape, &arena)?
+        };
         let mlir_name = format!("m2_decode_b{batch}.mlir");
         let json_name = format!("m2_decode_b{batch}.json");
         fs::write(args.artifact_dir.join(&mlir_name), mlir.as_bytes())?;
-        let artifact = decode_artifact_manifest(&mlir_name, &shape, arena.total_bytes);
+        let artifact = decode_artifact_manifest(&mlir_name, &shape, weight_arena_bytes);
         fs::write(
             args.artifact_dir.join(&json_name),
             serde_json::to_vec_pretty(&artifact)?,
@@ -165,6 +172,7 @@ struct Args {
     out: Option<PathBuf>,
     check: Option<PathBuf>,
     emit_decode_artifacts: bool,
+    native_smoke: bool,
     runtime_mode: M2RuntimeMode,
     batches: Vec<usize>,
     ctx: usize,
@@ -185,6 +193,7 @@ impl Args {
             out: None,
             check: None,
             emit_decode_artifacts: false,
+            native_smoke: false,
             runtime_mode: M2RuntimeMode::PlanningOnly,
             batches: M2_DEFAULT_DECODE_BENCH_BATCHES.to_vec(),
             ctx: 2048,
@@ -216,6 +225,10 @@ impl Args {
                     out.check = Some(PathBuf::from(value(&args, i, "--check")?));
                 }
                 "--emit-decode-artifacts" => out.emit_decode_artifacts = true,
+                "--native-smoke" => {
+                    out.native_smoke = true;
+                    out.emit_decode_artifacts = true;
+                }
                 "--runtime-mode" => {
                     i += 1;
                     out.runtime_mode = value(&args, i, "--runtime-mode")?

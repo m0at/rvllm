@@ -281,6 +281,49 @@ pub fn m2_decode_graph_mlir(
     ))
 }
 
+pub fn m2_decode_smoke_mlir(kernel_name: &str, shape: &M2GraphShape) -> Result<String> {
+    shape.validate()?;
+    if shape.phase != M2GraphPhase::Decode {
+        return Err(invalid("phase", "expected decode graph shape"));
+    }
+    if !is_mlir_symbol(kernel_name) {
+        return Err(invalid("kernel_name", "must be an MLIR symbol"));
+    }
+    Ok(format!(
+        r#"module attributes {{rvllm.kind = "m2_decode_smoke"}} {{
+  func.func @{kernel_name}(
+      %token_ids: tensor<{batch}xi32>,
+      %positions: tensor<{batch}xi32>,
+      %kv_cache: tensor<{kv_bytes}xi8>,
+      %weight_arena: tensor<1xi8>)
+      -> (tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>)
+      attributes {{
+        rvllm.signature = "token_ids,positions,kv_cache,weight_arena -> logits,next_token,kv_cache",
+        rvllm.phase = "decode-smoke",
+        rvllm.batch = {batch} : i64,
+        rvllm.ctx = {ctx} : i64,
+        rvllm.layers = {layers} : i64,
+        rvllm.hidden = {hidden} : i64,
+        rvllm.vocab = {vocab} : i64,
+        rvllm.kv_cache_bytes = {kv_bytes} : i64,
+        rvllm.lowering = "native_stablehlo_smoke"
+      }} {{
+    %logits = stablehlo.constant dense<0.000000e+00> : tensor<{batch}x{vocab}xbf16>
+    %next_token = stablehlo.constant dense<0> : tensor<{batch}xi32>
+    return %logits, %next_token, %kv_cache : tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>
+  }}
+}}
+"#,
+        kernel_name = kernel_name,
+        batch = shape.batch,
+        ctx = shape.ctx,
+        layers = M2_NUM_LAYERS,
+        hidden = M2_HIDDEN,
+        vocab = M2_VOCAB,
+        kv_bytes = shape.kv_cache_bytes(),
+    ))
+}
+
 fn emit_decode_body(
     shape: &M2GraphShape,
     arena: &M2WeightArenaPlan,
@@ -594,6 +637,18 @@ mod tests {
         assert!(mlir.contains("rvllm.ctx = 2048 : i64"));
         assert!(!mlir.contains("target=rvllm.m2.decode_layer.fused_attention_nvfp4_moe"));
         assert!(!mlir.contains("Contract body placeholder"));
+    }
+
+    #[test]
+    fn emits_native_stablehlo_smoke_without_custom_calls() {
+        let shape = M2GraphShape::decode(8, 2048, 1);
+        let mlir = m2_decode_smoke_mlir("main", &shape).unwrap();
+        assert!(mlir.contains("rvllm.kind = \"m2_decode_smoke\""));
+        assert!(mlir.contains("rvllm.lowering = \"native_stablehlo_smoke\""));
+        assert!(mlir.contains("tensor<8x200064xbf16>"));
+        assert!(mlir.contains("tensor<2080374784xi8>"));
+        assert!(!mlir.contains("stablehlo.custom_call"));
+        assert!(!mlir.contains("tpu_custom_call"));
     }
 
     #[test]
