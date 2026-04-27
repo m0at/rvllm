@@ -8,6 +8,57 @@ use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 
 const SUPPORTED_HEAD_DIMS: &[u32] = &[128, 256, 512];
 
+/// Cycle 52 step 11c (codex audit finding #3): assert backend
+/// head_dim matches params. See decode.rs for rationale.
+fn assert_head_dim_matches_backend(
+    backend: &super::AttentionBackend,
+    params_head_dim: u32,
+    op: &'static str,
+    stream: u64,
+    num_seqs: u32,
+) -> Result<()> {
+    let backend_hd = backend.head_dim();
+    if backend_hd != 0 && backend_hd != params_head_dim {
+        eprintln!(
+            "[attn] head_dim mismatch at {op}: params={params_head_dim}, backend={backend_hd}"
+        );
+        return Err(RvllmError::Attention {
+            err: AttentionError::FeatureNotAvailable {
+                backend: "head_dim-cross-check",
+                op,
+            },
+            ctx: AttnCtx { op, stream, num_seqs, head_dim: params_head_dim },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    Ok(())
+}
+
+/// Cycle 52 step 11b (codex audit finding #1): pre-launch null-pointer
+/// guard. See decode.rs::require_nonnull for rationale; same shape.
+fn require_nonnull(
+    ptrs: &[(&'static str, u64)],
+    op: &'static str,
+    stream: u64,
+    num_seqs: u32,
+    head_dim: u32,
+) -> Result<()> {
+    for (name, p) in ptrs {
+        if *p == 0 {
+            eprintln!("[attn] required device ptr {name:?} == 0 at {op}");
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op,
+                },
+                ctx: AttnCtx { op, stream, num_seqs, head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct PagedPrefillParams {
     pub num_tokens: u32,
@@ -180,6 +231,26 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        require_nonnull(
+            &[
+                ("o_f16",              o_f16),
+                ("q_fp8",              q_fp8),
+                ("k_cache_fp8",        k_cache_fp8),
+                ("v_cache_fp8",        v_cache_fp8),
+                ("k_descale_fallback", k_descale_fallback),
+                ("v_descale_fallback", v_descale_fallback),
+                ("block_tables",       block_tables),
+                ("cu_seqlens_q",       cu_seqlens_q),
+                ("context_lens",       context_lens),
+                ("q_descale_fallback", q_descale_fallback),
+            ],
+            "paged_prefill_fp8_unified",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_prefill_fp8_unified", stream, params.num_seqs,
+        )?;
         #[cfg(feature = "cuda")]
         {
             let fa2 = match self.backend {
@@ -397,6 +468,27 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        require_nonnull(
+            &[
+                ("o_f16",         o_f16),
+                ("q_fp8",         q_fp8),
+                ("k_cache_fp8",   k_cache_fp8),
+                ("v_cache_fp8",   v_cache_fp8),
+                ("block_tables",  block_tables),
+                ("context_lens",  context_lens),
+                ("cu_seqlens_q",  cu_seqlens_q),
+                ("workspace",     workspace),
+                ("q_descale_ptr", q_descale_ptr),
+                ("k_descale_ptr", k_descale_ptr),
+                ("v_descale_ptr", v_descale_ptr),
+            ],
+            "paged_prefill (Fa3 FP8)",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_prefill (Fa3 FP8)", stream, params.num_seqs,
+        )?;
         #[cfg(feature = "cuda")]
         {
             let fa3 = match self.backend {
@@ -535,6 +627,26 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        require_nonnull(
+            &[
+                ("o_f16",          o_f16),
+                ("q_fp8",          q_fp8),
+                ("k_cache_packed", k_cache_packed),
+                ("v_cache_packed", v_cache_packed),
+                ("k_cache_scale",  k_cache_scale),
+                ("v_cache_scale",  v_cache_scale),
+                ("block_tables",   block_tables),
+                ("context_lens",   context_lens),
+                ("cu_seqlens_q",   cu_seqlens_q),
+                ("q_descale_ptr",  q_descale_ptr),
+            ],
+            "paged_prefill (NVFP4 KV)",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_prefill (NVFP4 KV)", stream, params.num_seqs,
+        )?;
         #[cfg(feature = "cuda")]
         {
             let fa2 = match self.backend {
@@ -710,6 +822,26 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        require_nonnull(
+            &[
+                ("o_f16",              o_f16),
+                ("q_fp8",              q_fp8),
+                ("k_cache_packed",     k_cache_packed),
+                ("v_cache_packed",     v_cache_packed),
+                ("k_cache_scale",      k_cache_scale),
+                ("v_cache_scale",      v_cache_scale),
+                ("block_tables",       block_tables),
+                ("cu_seqlens_q",       cu_seqlens_q),
+                ("context_lens",       context_lens),
+                ("q_descale_fallback", q_descale_fallback),
+            ],
+            "paged_prefill_nvfp4_unified",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_prefill_nvfp4_unified", stream, params.num_seqs,
+        )?;
         #[cfg(feature = "cuda")]
         {
             let fa2 = match self.backend {

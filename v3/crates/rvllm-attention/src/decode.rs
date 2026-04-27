@@ -9,6 +9,79 @@ use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 
 const SUPPORTED_HEAD_DIMS: &[u32] = &[128, 256, 512];
 
+/// Cycle 52 step 11c (codex audit finding #3): assert that the launch
+/// `params.head_dim` matches the backend's load-time head_dim. Gemma 4
+/// 31B has heterogeneous attention (sliding head_dim=256, global=512)
+/// with separate Fa2PtxKernels instances loaded for each. A wrong
+/// route — e.g. dispatching a global-layer launch through the
+/// sliding backend — silently picks the wrong BC variant + mismatched
+/// smem layout. Fa3 returns head_dim=0 (validated at load time);
+/// skip the assert in that case.
+fn assert_head_dim_matches_backend(
+    backend: &super::AttentionBackend,
+    params_head_dim: u32,
+    op: &'static str,
+    stream: u64,
+    num_seqs: u32,
+) -> Result<()> {
+    let backend_hd = backend.head_dim();
+    if backend_hd != 0 && backend_hd != params_head_dim {
+        eprintln!(
+            "[attn] head_dim mismatch at {op}: params={params_head_dim}, backend={backend_hd}"
+        );
+        return Err(RvllmError::Attention {
+            err: AttentionError::FeatureNotAvailable {
+                backend: "head_dim-cross-check",
+                op,
+            },
+            ctx: AttnCtx { op, stream, num_seqs, head_dim: params_head_dim },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    Ok(())
+}
+
+/// Cycle 52 step 11b (codex audit finding #1): host-side null-pointer
+/// guard. Pre-launch, every required device pointer must be non-zero;
+/// silent zero pointers manifest as kernel-side invalid reads or
+/// silent garbage (e.g. a zero `context_lens` causes the kernel to
+/// read seq lens from device address 0 → SIGSEGV on first attention
+/// dispatch).
+///
+/// `op` and `head_dim`/`num_seqs` go into the AttnCtx so the error
+/// message points at the right launch site. Nullable pointers
+/// (e.g. some scale caches that are documented Option) MUST NOT be
+/// passed here — only required ones.
+fn require_nonnull(
+    ptrs: &[(&'static str, u64)],
+    op: &'static str,
+    stream: u64,
+    num_seqs: u32,
+    head_dim: u32,
+) -> Result<()> {
+    for (name, p) in ptrs {
+        if *p == 0 {
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op,
+                },
+                ctx: AttnCtx {
+                    op,
+                    stream,
+                    num_seqs,
+                    head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            }).map_err(|e| {
+                eprintln!("[attn] required device ptr {name:?} == 0 at {op}");
+                e
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Parameters for one paged decode launch.
 #[derive(Copy, Clone, Debug)]
 pub struct PagedDecodeParams {
@@ -115,6 +188,23 @@ impl<'a> PagedDecodeLauncher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        require_nonnull(
+            &[
+                ("out_ptr",          out_ptr),
+                ("q_ptr",            q_ptr),
+                ("k_cache_ptr",      k_cache_ptr),
+                ("v_cache_ptr",      v_cache_ptr),
+                ("block_tables_ptr", block_tables_ptr),
+                ("context_lens_ptr", context_lens_ptr),
+                ("workspace_ptr",    workspace_ptr),
+            ],
+            "paged_decode (Fa3/SM90)",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_decode (Fa3/SM90)", stream, params.num_seqs,
+        )?;
         #[cfg(feature = "cuda")]
         {
             let fa3 = match self.backend {
@@ -310,6 +400,23 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        require_nonnull(
+            &[
+                ("o_f16",         o_f16),
+                ("q_fp8",         q_fp8),
+                ("k_cache_fp8",   k_cache_fp8),
+                ("v_cache_fp8",   v_cache_fp8),
+                ("block_tables",  block_tables),
+                ("context_lens",  context_lens),
+                ("q_descale_ptr", q_descale_ptr),
+            ],
+            "paged_decode (FP8 KV)",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_decode (FP8 KV)", stream, params.num_seqs,
+        )?;
         #[cfg(feature = "cuda")]
         {
             let fa3 = match self.backend {
@@ -566,6 +673,25 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        require_nonnull(
+            &[
+                ("o_f16",          o_f16),
+                ("q_fp8",          q_fp8),
+                ("k_cache_packed", k_cache_packed),
+                ("v_cache_packed", v_cache_packed),
+                ("k_cache_scale",  k_cache_scale),
+                ("v_cache_scale",  v_cache_scale),
+                ("block_tables",   block_tables),
+                ("context_lens",   context_lens),
+                ("q_descale_ptr",  q_descale_ptr),
+            ],
+            "paged_decode (NVFP4 KV)",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_decode (NVFP4 KV)", stream, params.num_seqs,
+        )?;
         #[cfg(feature = "cuda")]
         {
             let fa2 = match self.backend {
@@ -791,6 +917,26 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        require_nonnull(
+            &[
+                ("o_f16",          o_f16),
+                ("q_fp8",          q_fp8),
+                ("k_cache_packed", k_cache_packed),
+                ("v_cache_packed", v_cache_packed),
+                ("k_cache_scale",  k_cache_scale),
+                ("v_cache_scale",  v_cache_scale),
+                ("block_tables",   block_tables),
+                ("context_lens",   context_lens),
+                ("q_descale_ptr",  q_descale_ptr),
+                ("workspace_ptr",  workspace_ptr),
+            ],
+            "paged_decode_nvfp4_split",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_decode_nvfp4_split", stream, params.num_seqs,
+        )?;
         #[cfg(feature = "cuda")]
         {
             let fa2 = match self.backend {
