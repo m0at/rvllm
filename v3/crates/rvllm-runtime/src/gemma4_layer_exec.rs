@@ -1510,7 +1510,52 @@ pub unsafe fn gemma4_forward_phase(
 
     // 7-8. O proj + channelscale + post_attn norm + residual add
     #[cfg(feature = "cuda")]
-    if weights.o_f16 != 0 {
+    if weights.awq.linear_active(AwqLinearKind::O) {
+        // Cycle 46 step 5b: AWQ O-proj. Reads f16 attn_out directly,
+        // writes f16 staging in gemm_f32_tmp, then the standard f16-in
+        // post-attn-norm + residual epilogue rolls it into `residual`.
+        if dims.num_tokens != 1 {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq o_proj prefill (M>1) not yet implemented",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "awq_o", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16.ok_or_else(|| {
+            rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16", op: "awq_int4_gemv_f16 PTX missing",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_o", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        })?;
+        let o_out_f16 = scratch.gemm_f32_tmp;
+        unsafe {
+            gemma4_launcher::AwqInt4GemvF16Launch {
+                n: dims.hidden as u32,
+                k: q_dim as u32,
+                group_size: weights.awq.group_size,
+            }.launch(
+                fn_awq, scratch.attn_out,
+                weights.awq.o_packed, weights.awq.o_scale, weights.awq.o_zero,
+                o_out_f16, stream,
+            )?;
+        }
+        gemma4_launcher::FusedNormAddResidualF16InLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(
+            kernels.fused_norm_add_residual_f16in, o_out_f16,
+            weights.post_attn_norm_gamma, residual, 0, stream,
+        )?;
+    } else if weights.o_f16 != 0 {
         cublaslt.f16_gemm_f32(
             scratch.attn_out, weights.o_f16, scratch.gemm_f32_tmp,
             dims.num_tokens as i32, dims.hidden as i32, q_dim as i32, stream,
@@ -1636,7 +1681,67 @@ pub unsafe fn gemma4_forward_phase(
 
     // 10. gate||up projection
     #[cfg(feature = "cuda")]
-    if weights.gate_up_f16 != 0 {
+    if weights.awq.linear_active(AwqLinearKind::Gate) {
+        // Cycle 46 step 5b: AWQ gate||up. Two sequential launches into
+        // scratch.gate_up_out at offsets 0 and `intermediate * 2`,
+        // composing the same fused [gate || up] layout downstream
+        // GELU-mul expects.
+        debug_assert!(weights.awq.linear_active(AwqLinearKind::Up),
+            "AWQ gate/up must be all-or-nothing");
+        if dims.num_tokens != 1 {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq gate_up prefill (M>1) not yet implemented",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_gate_up", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16.ok_or_else(|| {
+            rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16", op: "awq_int4_gemv_f16 PTX missing",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_gate_up", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        })?;
+        // Same prelude as gate_up FP8 fast path: residual → delta_f16 +
+        // pre-FF rmsnorm in place.
+        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            scratch.delta_f16, residual,
+            (dims.num_tokens * dims.hidden * 2) as _,
+            stream as _,
+        );
+        gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(
+            kernels.fused_rmsnorm, scratch.delta_f16,
+            weights.pre_ff_norm_gamma, stream,
+        )?;
+        let inter = dims.intermediate as u32;
+        let k = dims.hidden as u32;
+        let g = weights.awq.group_size;
+        unsafe {
+            // gate -> scratch.gate_up_out + 0
+            gemma4_launcher::AwqInt4GemvF16Launch { n: inter, k, group_size: g }
+                .launch(
+                    fn_awq, scratch.delta_f16,
+                    weights.awq.gate_packed, weights.awq.gate_scale, weights.awq.gate_zero,
+                    scratch.gate_up_out, stream,
+                )?;
+            // up -> scratch.gate_up_out + intermediate*2 (f16 = 2B)
+            gemma4_launcher::AwqInt4GemvF16Launch { n: inter, k, group_size: g }
+                .launch(
+                    fn_awq, scratch.delta_f16,
+                    weights.awq.up_packed, weights.awq.up_scale, weights.awq.up_zero,
+                    scratch.gate_up_out + (inter as u64) * 2, stream,
+                )?;
+        }
+    } else if weights.gate_up_f16 != 0 {
         // F16 path: norm residual into gate_up_out scratch, then F16 GEMM
         cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
             scratch.gate_up_out,
@@ -1735,7 +1840,66 @@ pub unsafe fn gemma4_forward_phase(
 
     // 11-12. GELU*up + down_proj
     #[cfg(feature = "cuda")]
-    if weights.down_f16 != 0 {
+    if weights.awq.linear_active(AwqLinearKind::Down) {
+        // Cycle 46 step 5b: AWQ down. F16 GELU output staged into
+        // gate_up_fp8 (alias trick — same as the f16-weights and
+        // f16-gemv-fast-path branches), then 1 AWQ launch into
+        // gemm_f32_tmp (used as f16 staging), then the standard
+        // f16-in post-FF-norm + residual epilogue.
+        if dims.num_tokens != 1 {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq down_proj prefill (M>1) not yet implemented",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_down", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16.ok_or_else(|| {
+            rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16", op: "awq_int4_gemv_f16 PTX missing",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_down", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        })?;
+        // f16 GELU(gate)*up into gate_up_fp8 alias.
+        {
+            let mut out = scratch.gate_up_fp8;
+            let mut inp = scratch.gate_up_out;
+            let mut inter = dims.intermediate as i32;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inter) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block = (dims.intermediate.min(1024), 1, 1);
+            let grid = (dims.num_tokens, 1, 1);
+            rvllm_fused::launch_raw(kernels.fused_gelu_mul_f16, grid, block, 0, stream, &args)?;
+        }
+        unsafe {
+            gemma4_launcher::AwqInt4GemvF16Launch {
+                n: dims.hidden as u32,
+                k: dims.intermediate as u32,
+                group_size: weights.awq.group_size,
+            }.launch(
+                fn_awq, scratch.gate_up_fp8,
+                weights.awq.down_packed, weights.awq.down_scale, weights.awq.down_zero,
+                scratch.gemm_f32_tmp, stream,
+            )?;
+        }
+        gemma4_launcher::FusedNormAddResidualF16InLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(
+            kernels.fused_norm_add_residual_f16in, scratch.gemm_f32_tmp,
+            weights.post_ff_norm_gamma, residual,
+            weights.layer_scalar_ptr, stream,
+        )?;
+    } else if weights.down_f16 != 0 {
         // F16 path: GELU output to separate buffer (can't alias gate_up_out)
         {
             let mut out = scratch.gate_up_fp8; // use gate_up_fp8 scratch as f16 gelu output
