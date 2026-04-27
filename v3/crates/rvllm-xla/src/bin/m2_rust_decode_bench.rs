@@ -391,22 +391,37 @@ fn execute_decode_artifacts(
                 )
                 .into());
             }
-            let host = match args.weight_format.as_str() {
-                "nvfp4" => arena.materialize_host_buffer(reader, args.max_weight_arena_bytes)?,
-                "int8" => {
-                    arena.materialize_int8_host_buffer(reader, args.max_weight_arena_bytes)?
-                }
-                _ => return Err("--weight-format: expected nvfp4|int8".into()),
-            };
-            let row_scale_bytes = if args.weight_format == "int8" {
+            let w1_probe_only = args.weight_format == "int8"
+                && env::var("RVLLM_M2_MOE_INT8").as_deref() == Ok("w1");
+            let row_scale_bytes = if w1_probe_only {
+                arena.materialize_decode_w1_probe_row_scales(reader)?
+            } else if args.weight_format == "int8" {
+                let host =
+                    arena.materialize_int8_host_buffer(reader, args.max_weight_arena_bytes)?;
                 arena.materialize_decode_w1_row_scale_probe_bytes(&host)?
             } else {
                 row_scale_zero.clone()
             };
             let uploaded = (0..num_devices)
                 .map(|device| {
-                    let local =
-                        local_weight_arena_shard(&host.bytes, artifact.weight_arena_bytes, device);
+                    let local = if w1_probe_only {
+                        arena.materialize_decode_w1_probe_shard(
+                            reader,
+                            artifact.weight_arena_bytes,
+                            device,
+                        )?
+                    } else {
+                        let host = match args.weight_format.as_str() {
+                            "nvfp4" => arena
+                                .materialize_host_buffer(reader, args.max_weight_arena_bytes)?,
+                            "int8" => arena.materialize_int8_host_buffer(
+                                reader,
+                                args.max_weight_arena_bytes,
+                            )?,
+                            _ => unreachable!("weight_format is validated during arg parsing"),
+                        };
+                        local_weight_arena_shard(&host.bytes, artifact.weight_arena_bytes, device)
+                    };
                     client.buffer_from_host(
                         &local,
                         &[artifact.weight_arena_bytes as i64],
@@ -429,7 +444,7 @@ fn execute_decode_artifacts(
                 "uploaded real {} weight arena B={} total={:.3} GB local={:.3} GB devices={} in {:.2}s",
                 args.weight_format,
                 artifact.batch,
-                host.total_bytes as f64 / 1.0e9,
+                arena.total_bytes as f64 / 1.0e9,
                 artifact.weight_arena_bytes as f64 / 1.0e9,
                 num_devices,
                 upload_start.elapsed().as_secs_f64()

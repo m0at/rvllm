@@ -470,6 +470,70 @@ impl M2WeightArenaPlan {
         Ok(out)
     }
 
+    pub fn materialize_decode_w1_probe_row_scales(
+        &self,
+        reader: &M2SafetensorsReader,
+    ) -> Result<Vec<u8>> {
+        let rows_per_layer = 128usize;
+        let mut out = vec![0u8; M2_NUM_LAYERS * rows_per_layer * 4];
+        for layer in 0..M2_NUM_LAYERS {
+            let group = M2Nvfp4ProjectionAbi::new(layer, 0, M2Projection::W1);
+            let entry = self.entry(&group.weight.name)?;
+            if entry.role != M2WeightRole::Int8Weight {
+                return Err(invalid_owned(
+                    "w1_probe",
+                    format!("{}: expected int8 W1 weight entry", entry.name),
+                ));
+            }
+            let converted = convert_int8_weight(entry, self, reader)?;
+            for (row, scale) in converted.row_scales.iter().take(rows_per_layer).enumerate() {
+                let start = (layer * rows_per_layer + row) * 4;
+                out[start..start + 4].copy_from_slice(&scale.to_le_bytes());
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn materialize_decode_w1_probe_shard(
+        &self,
+        reader: &M2SafetensorsReader,
+        local_bytes: usize,
+        device: usize,
+    ) -> Result<Vec<u8>> {
+        let rows_per_layer = 128usize;
+        let mut out = vec![0u8; local_bytes];
+        let shard_start = local_bytes
+            .checked_mul(device)
+            .ok_or_else(|| invalid("shard", "device shard offset overflow"))?;
+        let shard_end = shard_start
+            .checked_add(local_bytes)
+            .ok_or_else(|| invalid("shard", "device shard end overflow"))?;
+        for layer in 0..M2_NUM_LAYERS {
+            let group = M2Nvfp4ProjectionAbi::new(layer, 0, M2Projection::W1);
+            let entry = self.entry(&group.weight.name)?;
+            if entry.role != M2WeightRole::Int8Weight || entry.shape.len() != 2 {
+                return Err(invalid_owned(
+                    "w1_probe",
+                    format!("{}: expected 2D int8 W1 weight entry", entry.name),
+                ));
+            }
+            let cols = entry.shape[1] as usize;
+            let tile_bytes = rows_per_layer * cols;
+            let entry_start = entry.offset;
+            let entry_end = entry_start + tile_bytes;
+            if entry_end <= shard_start || entry_start >= shard_end {
+                continue;
+            }
+            let converted = convert_int8_weight(entry, self, reader)?;
+            let tile = converted.weights[..tile_bytes]
+                .iter()
+                .map(|&x| x as u8)
+                .collect::<Vec<_>>();
+            copy_overlap_to_shard(&mut out, shard_start, entry_start, &tile);
+        }
+        Ok(out)
+    }
+
     fn materialize_int8_host_buffer_inner(
         &self,
         reader: &M2SafetensorsReader,
@@ -571,6 +635,25 @@ struct ConvertedInt8Weight {
 
 fn align_up(x: usize, alignment: usize) -> usize {
     (x + alignment - 1) & !(alignment - 1)
+}
+
+fn copy_overlap_to_shard<T: Copy>(
+    shard: &mut [T],
+    shard_start: usize,
+    global_start: usize,
+    data: &[T],
+) {
+    let global_end = global_start + data.len();
+    let shard_end = shard_start + shard.len();
+    let copy_start = global_start.max(shard_start);
+    let copy_end = global_end.min(shard_end);
+    if copy_start >= copy_end {
+        return;
+    }
+    let src_start = copy_start - global_start;
+    let dst_start = copy_start - shard_start;
+    let len = copy_end - copy_start;
+    shard[dst_start..dst_start + len].copy_from_slice(&data[src_start..src_start + len]);
 }
 
 fn packed_shape(shape: &[i64]) -> Result<(usize, usize)> {
@@ -716,14 +799,16 @@ fn validate_upload_tensor(spec: &M2WeightUploadSpec, view: &M2TensorView<'_>) ->
 
 fn validate_arena_tensor(entry: &M2WeightArenaEntry, view: &M2TensorView<'_>) -> Result<()> {
     let expected_dtype = pjrt_to_loader_dtype(entry.dtype)?;
-    if view.entry.dtype != expected_dtype {
+    let dtype_matches = view.entry.dtype == expected_dtype
+        || (expected_dtype == DType::U8 && is_byte_dtype(view.entry.dtype));
+    if !dtype_matches {
         return Err(invalid_owned(
             "dtype",
             format!("{}: arena tensor dtype mismatch", entry.name),
         ));
     }
     let expected_shape = entry.shape.iter().map(|&x| x as usize).collect::<Vec<_>>();
-    if view.entry.shape != expected_shape {
+    if !arena_shape_matches(&expected_shape, view.entry.shape.as_slice(), entry.dtype) {
         return Err(invalid_owned(
             "shape",
             format!("{}: arena tensor shape mismatch", entry.name),
@@ -736,6 +821,19 @@ fn validate_arena_tensor(entry: &M2WeightArenaEntry, view: &M2TensorView<'_>) ->
         ));
     }
     Ok(())
+}
+
+fn arena_shape_matches(
+    expected: &[usize],
+    actual: &[usize],
+    dtype: crate::PjrtElementType,
+) -> bool {
+    expected == actual
+        || (dtype == crate::PjrtElementType::F32 && expected == [1] && actual.is_empty())
+}
+
+fn is_byte_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::U8 | DType::Fp8E4M3 | DType::Fp8E5M2)
 }
 
 fn validate_packed_source(entry: &M2WeightArenaEntry, view: &M2TensorView<'_>) -> Result<()> {
