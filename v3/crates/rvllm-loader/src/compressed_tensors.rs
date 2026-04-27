@@ -82,21 +82,41 @@ pub struct AwqConfig {
 }
 
 impl AwqConfig {
-    /// Parse `quantization_config` JSON value. Returns `Ok(None)` when
-    /// the model is unquantized (no `quantization_config` field), an
-    /// `Err` when the field is present but malformed.
+    /// Parse `quantization_config` JSON value. Returns `Ok(None)` when:
+    ///   - the model is unquantized (no `quantization_config` field), OR
+    ///   - the quantization_config is present but for a non-AWQ format
+    ///     (e.g. `"float-quantized"` for FP8 / `"int-quantized"` for
+    ///     GPTQ). The caller treats `None` as "not an AWQ model — fall
+    ///     through to the existing FP8/F16 path".
+    /// Returns `Err` only when the field is present, claims to be
+    /// `"pack-quantized"` (AWQ), and is structurally malformed.
+    ///
+    /// Cycle 52 step 12 (production hotfix): cycle 47 step 6a's strict
+    /// reject of unknown formats broke loading the FP8-block production
+    /// model — its config.json has `quantization_config.format =
+    /// "float-quantized"` (per-tensor FP8 metadata) and rvllm-serve's
+    /// FP8 path was correctly handling it. The gate now narrows: only
+    /// `"pack-quantized"` is treated as AWQ; everything else is None
+    /// and the FP8 path takes over.
     pub fn from_json(qc: Option<&serde_json::Value>) -> Result<Option<Self>, String> {
         let Some(qc) = qc else { return Ok(None) };
 
         let format = match qc.get("format").and_then(|v| v.as_str()) {
             Some("pack-quantized") => AwqPackFormat::PackQuantized,
-            Some(other) => {
-                return Err(format!(
-                    "quantization_config.format = {other:?} unsupported; \
-                     only \"pack-quantized\" recognized"
-                ));
+            Some(_other) => {
+                // Non-AWQ quantization_config (FP8 "float-quantized",
+                // GPTQ "int-quantized", etc.). The FP8 path consumes it
+                // directly via the loader's existing fp8_prequant probe.
+                return Ok(None);
             }
-            None => return Err("quantization_config.format missing".into()),
+            None => {
+                // Field present but no format string — unusual, but
+                // safer to fall through to the FP8 path than to abort
+                // the entire load. Existing FP8 / F16 detection code
+                // will raise its own typed error if the checkpoint
+                // is genuinely broken.
+                return Ok(None);
+            }
         };
 
         let groups = qc
@@ -683,15 +703,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_format() {
-        let bad = json!({
+    fn non_awq_format_returns_none() {
+        // Cycle 52 step 12: non-"pack-quantized" formats (marlin, GPTQ,
+        // FP8 float-quantized, etc.) are NOT errors — they're "not
+        // AWQ, fall through to FP8/F16 path". Production FP8-block
+        // model has format="float-quantized" and must boot via the
+        // existing FP8 path, not crash on this gate.
+        let fp8 = json!({
+            "config_groups": {
+                "g": {"targets": ["Linear"], "weights": {"num_bits": 8, "group_size": 128, "strategy": "tensor", "type": "float"}}
+            },
+            "format": "float-quantized"
+        });
+        assert!(AwqConfig::from_json(Some(&fp8)).expect("ok").is_none());
+
+        let marlin = json!({
             "config_groups": {
                 "g": {"targets": ["Linear"], "weights": {"num_bits": 4, "group_size": 128, "strategy": "group", "type": "int"}}
             },
             "format": "marlin"
         });
-        let err = AwqConfig::from_json(Some(&bad)).expect_err("must reject");
-        assert!(err.contains("marlin") || err.contains("unsupported"));
+        assert!(AwqConfig::from_json(Some(&marlin)).expect("ok").is_none());
     }
 
     // === Cycle 42 step 3c tensor classifier + shape validator tests ===
