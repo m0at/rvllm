@@ -91,13 +91,9 @@ pub fn load_gemma4_model(
             bt: std::backtrace::Backtrace::capture(),
         })?;
         // (validate_gemma4_awq_layout already logs the per-linear total)
-        return Err(RvllmError::Loader {
-            err: LoaderError::UnsupportedQuantization {
-                detail: "AWQ layout validated; upload + Gemma4LoadedModel build pending (cycle 48 step 7c). Run with an FP8 checkpoint for now.".into(),
-            },
-            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
-            bt: std::backtrace::Backtrace::capture(),
-        });
+        return load_gemma4_awq_model_inner(
+            model_dir, arena, arch, awq, &shards, &tensors,
+        );
     }
 
     let bytes_of = |si: usize, e: &TensorEntry| -> &[u8] {
@@ -1114,6 +1110,138 @@ fn fp8_e4m3_to_f32(b: u8) -> f32 {
         f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
     };
     if s != 0 { -val } else { val }
+}
+
+/// Cycle 49 step 8a: AWQ-only Gemma 4 load path. Implements the
+/// non-quantized preludes (embedding sqrt(H) pre-scale, final_norm,
+/// lm_head, RoPE tables) and stubs the per-layer body so cycle 49
+/// step 8b can land per-layer norms, 8c can land the AWQ upload, and
+/// 8d can land debug-probe guards + smoke.
+///
+/// This is structurally a near-twin of `load_gemma4_model`'s FP8 path
+/// (lines ~140-250 above) but tailored for AWQ checkpoints:
+/// - lm_head + embedding stay BF16-source per AwqConfig.ignore (no
+///   FP8E4M3 weight tensor exists in AWQ checkpoints).
+/// - per-layer FP8 fields all populate as `None`; AWQ tensors land
+///   in `layer.awq` instead.
+fn load_gemma4_awq_model_inner(
+    model_dir: &Path,
+    arena: &HbmArena,
+    arch: &crate::gemma4_arch::Gemma4Arch,
+    _awq: &crate::compressed_tensors::AwqConfig,
+    shards: &[ShardMap],
+    tensors: &BTreeMap<String, (usize, TensorEntry)>,
+) -> Result<Gemma4LoadedModel> {
+    let prefix = &arch.weight_prefix;
+
+    let bytes_of = |si: usize, e: &TensorEntry| -> &[u8] {
+        let s = shards[si].bytes();
+        let start = e.file_offset as usize;
+        &s[start..start + e.nbytes as usize]
+    };
+    let must_get = |name: &str| -> Result<(usize, TensorEntry)> {
+        tensors.get(name).cloned().ok_or_else(|| RvllmError::Loader {
+            err: LoaderError::MissingTensor { name: name.to_string() },
+            ctx: LoaderCtx {
+                path: model_dir.to_path_buf(),
+                tensor: Some(name.to_string()),
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })
+    };
+    let get_tensor = |name: &str| tensors.get(name).cloned();
+
+    // ----- embedding (sqrt(H) pre-scale, identical to FP8 path) -----
+    let embed_name = format!("{prefix}.embed_tokens.weight");
+    let embedding = {
+        let (si, e) = must_get(&embed_name)?;
+        let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let scale = (arch.hidden_size as f32).sqrt();
+        eprintln!("[awq-loader] embedding sqrt({}) = {:.2}", arch.hidden_size, scale);
+        let n = buf.len() / 2;
+        for i in 0..n {
+            let bits = u16::from_le_bytes([buf[2*i], buf[2*i+1]]);
+            let v = f16::from_bits(bits);
+            let scaled = f16::from_f32(v.to_f32() * scale);
+            let out = scaled.to_le_bytes();
+            buf[2*i] = out[0];
+            buf[2*i+1] = out[1];
+        }
+        let region = arena.region("embedding", buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        F16Weight { offset_bytes: region.device_ptr(), shape: e.shape.clone() }
+    };
+
+    // ----- final_norm (F16) -----
+    let final_norm = {
+        let nm = format!("{prefix}.norm.weight");
+        let (si, e) = must_get(&nm)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let region = arena.region("final_norm", buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        F16Weight { offset_bytes: region.device_ptr(), shape: e.shape.clone() }
+    };
+
+    // ----- lm_head (typically in AwqConfig.ignore → BF16 source) -----
+    // AwqConfig.ignore lists "lm_head" → it's stored as BF16 in the
+    // safetensors. Same code paths as the FP8-from-BF16 branch in
+    // load_gemma4_model. fp8 form for the existing decode path; f16
+    // form for the f16 logit projection.
+    let lm_head_fp8 = if let Some((si, e)) = get_tensor("lm_head.weight") {
+        if e.dtype == DType::Fp8E4M3 {
+            let scale_entry = get_tensor("lm_head.weight_scale");
+            upload_fp8_direct_channelscale(arena, "lm_head", &(si, e), scale_entry.as_ref(), shards)?
+        } else {
+            upload_fp8(arena, "lm_head",
+                &tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?,
+                &e.shape, "lm_head.weight", model_dir)?
+        }
+    } else {
+        let (si, e) = must_get(&embed_name)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        upload_fp8(arena, "lm_head", &buf, &e.shape, "lm_head(tied_embed)", model_dir)?
+    };
+    let lm_head_f16 = {
+        let (si, e) = if let Some(t) = get_tensor("lm_head.weight") { t } else { must_get(&embed_name)? };
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let region = arena.region("lm_head_f16", buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        F16Weight { offset_bytes: region.device_ptr(), shape: e.shape.clone() }
+    };
+
+    // ----- RoPE tables (sliding + global, identical to FP8 path) -----
+    let sliding_rotary_dim = arch.head_dim_sliding;
+    let (cos_s, sin_s) = rope_cos_sin_bytes(
+        arch.head_dim_sliding, arch.max_position_embeddings,
+        arch.rope_theta_sliding, sliding_rotary_dim,
+    );
+    let global_rotary_dim = arch.rotary_dim_for_layer(
+        arch.layer_types.iter().position(|t| *t == crate::gemma4_arch::Gemma4LayerType::GlobalAttention).unwrap_or(0)
+    );
+    let (cos_g, sin_g) = rope_cos_sin_bytes(
+        arch.head_dim_global, arch.max_position_embeddings,
+        arch.rope_theta_global, global_rotary_dim,
+    );
+    let rope_cos_sliding = upload_rope(arena, "rope_cos_sliding", &cos_s)?;
+    let rope_sin_sliding = upload_rope(arena, "rope_sin_sliding", &sin_s)?;
+    let rope_cos_global  = upload_rope(arena, "rope_cos_global",  &cos_g)?;
+    let rope_sin_global  = upload_rope(arena, "rope_sin_global",  &sin_g)?;
+
+    // ----- per-layer (cycle 49 step 8b/8c stub) -----
+    eprintln!(
+        "[awq-loader] preludes uploaded (embedding + final_norm + lm_head + RoPE); per-layer body deferred to cycle 49 step 8b/8c"
+    );
+    let _ = (embedding.offset_bytes, final_norm.offset_bytes,
+             lm_head_fp8.offset_bytes, lm_head_f16.offset_bytes,
+             rope_cos_sliding.offset_bytes, rope_sin_sliding.offset_bytes,
+             rope_cos_global.offset_bytes, rope_sin_global.offset_bytes);
+    Err(RvllmError::Loader {
+        err: LoaderError::UnsupportedQuantization {
+            detail: "AWQ preludes uploaded; per-layer norms + AWQ tensor upload pending (cycle 49 step 8b/8c). Run with an FP8 checkpoint for now.".into(),
+        },
+        ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+        bt: std::backtrace::Backtrace::capture(),
+    })
 }
 
 /// Cycle 48 step 7c: per-layer AWQ geometry derived from
