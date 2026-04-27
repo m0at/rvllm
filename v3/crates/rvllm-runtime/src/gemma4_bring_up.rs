@@ -417,16 +417,20 @@ pub fn nvfp4_hadamard_enabled() -> bool {
     parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(false)
 }
 
-/// Cycle 54 Stage 1: BF16 residual chain gate. Default OFF — when
-/// unset the residual chain stays on f16 (byte-identical to pre-stage-1
-/// behaviour). When `RVLLM_RESIDUAL_BF16=1`, the inter-layer residual
-/// buffer is interpreted as bf16 (still 2 bytes/elem, same allocation),
-/// the rmsnorm + add-residual ops route to bf16 sibling kernels, and
-/// embedding gather entry + LM head input convert at the boundaries.
-/// See `fused_norm_add_residual_bf16.cu` and Cycle 53 brain task for
-/// the long-context-margin rationale.
+/// BF16 residual chain. Cycle 54 Stage 1 introduced this as an
+/// opt-in gate (RVLLM_RESIDUAL_BF16=1). Cycle 55 step 1 flips the
+/// **default to ON** because Gemma 4 was trained in bf16 and every
+/// modern foundation model trains in bf16; f16 storage is a
+/// distribution shift relative to training. The env still overrides
+/// to false for diagnostics / regression bisects.
+///
+/// This is Phase A of the cycle-55 "fully native bf16" effort. Phases
+/// B-G will progressively eliminate the f16↔bf16 conversions still
+/// happening at projection entry (the F16-in narrowing) and at
+/// embedding-gather / LM-head boundaries by building bf16-input
+/// kernel siblings, ultimately deleting the dead f16 kernels.
 pub fn bf16_residual_enabled() -> bool {
-    parse_truthy_env("RVLLM_RESIDUAL_BF16").unwrap_or(false)
+    parse_truthy_env("RVLLM_RESIDUAL_BF16").unwrap_or(true)
 }
 
 /// Per-token Q scale gate.

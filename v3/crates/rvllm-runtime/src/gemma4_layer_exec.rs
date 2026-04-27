@@ -3086,7 +3086,9 @@ mod validate_tests {
             sliding_window: 1024,
             f16_kv: false,
             kv_dtype: KvDtype::Fp8,
-            bf16_residual: false,
+            // Cycle 55 step 1: bf16 is the production default; f16
+            // remains as an env-overridable diagnostic path.
+            bf16_residual: true,
         }
     }
 
@@ -3095,24 +3097,22 @@ mod validate_tests {
         good().validate().unwrap();
     }
 
-    /// Cycle 54 step 6: bf16-residual is purely a storage-dtype gate;
-    /// validate() must accept it identically to the f16 default path.
-    /// Guards against future plumbing regressions where someone adds a
-    /// validate() rule that accidentally rejects bf16_residual=true.
+    /// Cycle 55 step 1: f16 residual is now the OPT-OUT path (env
+    /// override). Validate it still accepts so diagnostic bisects work.
     #[test]
-    fn bf16_residual_dims_pass() {
+    fn f16_residual_diagnostic_path_passes() {
         let mut d = good();
-        d.bf16_residual = true;
+        d.bf16_residual = false;
         d.validate().unwrap();
     }
 
-    /// And a heterogeneous-head sibling — Gemma 4 31B has 256/512 head
-    /// arity; a bf16 dispatch under the global-attn 512-head shape must
-    /// also validate.
+    /// Heterogeneous-head sibling — Gemma 4 31B has 256/512 head arity;
+    /// the bf16 default dispatch under the global-attn 512-head shape
+    /// must also validate.
     #[test]
     fn bf16_residual_global_attn_dims_pass() {
         let mut d = good();
-        d.bf16_residual = true;
+        // bf16_residual already true by default (cycle 55 step 1)
         d.head_dim = 512;
         d.rotary_dim = 512;
         d.attn_scale = 1.0 / (512f32).sqrt();
