@@ -1151,6 +1151,17 @@ fn load_gemma4_awq_model_inner(
     };
     let get_tensor = |name: &str| tensors.get(name).cloned();
 
+    let upload_f16 = |name: &'static str, hf_name: &str| -> Result<F16Weight> {
+        let (si, e) = must_get(hf_name)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let region = arena.region(name, buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        Ok(F16Weight {
+            offset_bytes: region.device_ptr(),
+            shape: e.shape.clone(),
+        })
+    };
+
     // ----- embedding (sqrt(H) pre-scale, identical to FP8 path) -----
     let embed_name = format!("{prefix}.embed_tokens.weight");
     let embedding = {
@@ -1227,21 +1238,64 @@ fn load_gemma4_awq_model_inner(
     let rope_cos_global  = upload_rope(arena, "rope_cos_global",  &cos_g)?;
     let rope_sin_global  = upload_rope(arena, "rope_sin_global",  &sin_g)?;
 
-    // ----- per-layer (cycle 49 step 8b/8c stub) -----
-    eprintln!(
-        "[awq-loader] preludes uploaded (embedding + final_norm + lm_head + RoPE); per-layer body deferred to cycle 49 step 8b/8c"
-    );
-    let _ = (embedding.offset_bytes, final_norm.offset_bytes,
-             lm_head_fp8.offset_bytes, lm_head_f16.offset_bytes,
-             rope_cos_sliding.offset_bytes, rope_sin_sliding.offset_bytes,
-             rope_cos_global.offset_bytes, rope_sin_global.offset_bytes);
-    Err(RvllmError::Loader {
-        err: LoaderError::UnsupportedQuantization {
-            detail: "AWQ preludes uploaded; per-layer norms + AWQ tensor upload pending (cycle 49 step 8b/8c). Run with an FP8 checkpoint for now.".into(),
-        },
-        ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
-        bt: std::backtrace::Backtrace::capture(),
-    })
+    // ----- per-layer (cycle 49 step 8b: norms uploaded; 8c stubs AWQ) -----
+    let load_max_layers = std::env::var("RVLLM_MAX_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.min(arch.num_hidden_layers))
+        .unwrap_or(arch.num_hidden_layers);
+    if load_max_layers < arch.num_hidden_layers {
+        eprintln!(
+            "[awq-loader] RVLLM_MAX_LAYERS={load_max_layers}: loading only first {load_max_layers} of {} layers",
+            arch.num_hidden_layers
+        );
+    }
+
+    let mut layers: Vec<crate::gemma4_weights::Gemma4LayerWeights> = Vec::with_capacity(load_max_layers);
+    for l in 0..load_max_layers {
+        let ln = |s: &str| format!("{prefix}.layers.{l}.{s}");
+
+        // F16 norms (identical names + shapes to FP8 path).
+        let input_layernorm =
+            upload_f16("input_ln", &ln("input_layernorm.weight"))?;
+        let post_attention_layernorm =
+            upload_f16("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
+        let pre_feedforward_layernorm =
+            upload_f16("pre_ff_ln", &ln("pre_feedforward_layernorm.weight"))?;
+        let post_feedforward_layernorm =
+            upload_f16("post_ff_ln", &ln("post_feedforward_layernorm.weight"))?;
+        let q_norm = upload_f16("q_norm", &ln("self_attn.q_norm.weight"))?;
+        let k_norm = upload_f16("k_norm", &ln("self_attn.k_norm.weight"))?;
+        let layer_scalar = upload_f16("layer_scalar", &ln("layer_scalar"))?;
+
+        // Cycle 49 step 8c stub: AWQ tensor upload + Gemma4LayerWeights
+        // construction is the next sub-step. Bail out cleanly so the
+        // already-uploaded norms aren't silently dropped (the arena
+        // bump will reset on the caller's `?` short-circuit).
+        let _ = (input_layernorm.offset_bytes, post_attention_layernorm.offset_bytes,
+                 pre_feedforward_layernorm.offset_bytes, post_feedforward_layernorm.offset_bytes,
+                 q_norm.offset_bytes, k_norm.offset_bytes, layer_scalar.offset_bytes);
+        if l == 0 {
+            eprintln!(
+                "[awq-loader] layer {l} norms uploaded ({} F16 tensors); AWQ projection upload pending (cycle 49 step 8c)",
+                7
+            );
+        }
+        let _ = layers; // suppress unused-mut warning until 8c push
+        return Err(RvllmError::Loader {
+            err: LoaderError::UnsupportedQuantization {
+                detail: format!(
+                    "AWQ preludes + layer-{l} norms uploaded; AWQ projection upload pending (cycle 49 step 8c). Run with an FP8 checkpoint for now."
+                ),
+            },
+            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    let _ = (embedding, final_norm, lm_head_fp8, lm_head_f16,
+             rope_cos_sliding, rope_sin_sliding, rope_cos_global, rope_sin_global);
+    let _ = layers;
+    unreachable!("cycle 49 step 8c will replace this with the Gemma4LoadedModel build");
 }
 
 /// Cycle 48 step 7c: per-layer AWQ geometry derived from
