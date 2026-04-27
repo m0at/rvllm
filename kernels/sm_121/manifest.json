@@ -127,9 +127,9 @@
       "sha256": "37ea92b755cd5f4e7a2001d7ab020edad12e30b35ee868762dfb031588d7751a"
     },
     "fp8_gemv": {
-      "bytes": 207639,
+      "bytes": 206837,
       "path": "fp8_gemv.ptx",
-      "sha256": "f4fe809e3d0747201944b24ff8202a05a776845628c952a9951cf9cada1ea76f"
+      "sha256": "05e0c5489a2da251b72c14ec3d86f083dcfdf934189b44c4a27057205bbebe13"
     },
     "fp8_mma_smem_probe": {
       "bytes": 2967,
@@ -282,9 +282,9 @@
       "sha256": "d0026e181356cc0d3c746a03454488912eeee7fe94ff79161d53452225124098"
     },
     "rmsnorm_inplace_bf16": {
-      "bytes": 8611,
+      "bytes": 9342,
       "path": "rmsnorm_inplace_bf16.ptx",
-      "sha256": "b29295f913a125b179f827fed3f4ef5b2423e1b6743123bc3c20f1e5bd1a8b18"
+      "sha256": "5ded64589326ba8e929cbee0f1cc3443dd33d2e71c325e26931a3d2f3e39e95a"
     },
     "rmsnorm_inplace_f16": {
       "bytes": 8590,
@@ -322,5 +322,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "b7d5f95"
+  "revision": "afb7243"
 }

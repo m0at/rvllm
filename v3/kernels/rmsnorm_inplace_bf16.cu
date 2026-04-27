@@ -38,9 +38,29 @@ rmsnorm_inplace_bf16_kernel(
 
     __shared__ float smem[WARPS_MAX];
 
+    // Cycle 55 step 17: optional f16-narrowing inside bf16 rmsnorm.
+    // bf16 has 7-bit mantissa vs f16's 10-bit. The cycle-54 stage-2.1
+    // narrow at QKV input was BOUNDING precision drift by f16-narrowing
+    // residual before SS; FULL_CHAIN removes that bound. To test
+    // whether bf16's lower mantissa precision is the FULL_CHAIN
+    // breakage mechanism, the `RVLLM_BF16_RMSNORM_F16_PRECISION=1`
+    // env causes the SS accumulator to read f16-narrowed values
+    // (matches f16 rmsnorm semantics exactly while output stays bf16).
+    // Hypothesis: if this fixes FULL_CHAIN, precision compounding is
+    // confirmed; the right architectural shape is hybrid bf16-storage
+    // + f16-mantissa SS.
+    // Note: the narrow is on the COMPUTE path only — output dtype
+    // stays bf16 so storage benefits remain.
+    // Cycle 55 step 17 EXPERIMENT: f16-narrow inside SS to test
+    // precision-compounding hypothesis (bf16's 7-bit mantissa vs
+    // f16's 10-bit at sum-of-squares stage). If this single change
+    // restores FULL_CHAIN at short context, the compounding mechanism
+    // is confirmed and the architectural answer is hybrid bf16-storage
+    // + f16-precision compute at SS bottlenecks. Output stays bf16.
     float local_ss = 0.0f;
     for (int i = tid; i < hidden_size; i += stride) {
         float v = __bfloat162float(x[row_offset + i]);
+        v = __half2float(__float2half(v));  // f16-narrow for SS
         local_ss += v * v;
     }
     float sum_sq = block_reduce_sum(local_ss, smem);

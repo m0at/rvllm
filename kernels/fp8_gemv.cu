@@ -994,14 +994,24 @@ __global__ void fp8_gemv_blockwise_wpr_native_bf16in_kernel(
         // bf16 → f32 is a simple left-shift-16 since bf16 is the
         // upper half of f32. Compiler emits a single mov.b32 in PTX.
         float x0, x1, x2, x3, x4, x5, x6, x7;
-        x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x_lo));
-        x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_lo) + 2));
-        x2 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_lo) + 4));
-        x3 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_lo) + 6));
-        x4 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x_hi));
-        x5 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_hi) + 2));
-        x6 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_hi) + 4));
-        x7 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(reinterpret_cast<const unsigned char*>(&x_hi) + 6));
+        // Cycle 55 step 16: bf16 → f32 via explicit shift, no pointer
+        // reinterpret_cast (avoids any alignment/aliasing UB the
+        // earlier `*reinterpret_cast<const __nv_bfloat16*>(&x_lo)`
+        // pattern might have hit). bf16 IS the upper 16 bits of f32,
+        // so the conversion is a single `mov.b32` in PTX.
+        // x_lo / x_hi each hold 4 bf16 values packed little-endian
+        // (bytes 0-1 = bf16[0], 2-3 = bf16[1], etc).
+        auto bf16_bits_to_f32 = [] (unsigned int bits16) -> float {
+            return __uint_as_float(bits16 << 16);
+        };
+        x0 = bf16_bits_to_f32((unsigned int)((unsigned short)(x_lo)));
+        x1 = bf16_bits_to_f32((unsigned int)((unsigned short)(x_lo >> 16)));
+        x2 = bf16_bits_to_f32((unsigned int)((unsigned short)(x_lo >> 32)));
+        x3 = bf16_bits_to_f32((unsigned int)((unsigned short)(x_lo >> 48)));
+        x4 = bf16_bits_to_f32((unsigned int)((unsigned short)(x_hi)));
+        x5 = bf16_bits_to_f32((unsigned int)((unsigned short)(x_hi >> 16)));
+        x6 = bf16_bits_to_f32((unsigned int)((unsigned short)(x_hi >> 32)));
+        x7 = bf16_bits_to_f32((unsigned int)((unsigned short)(x_hi >> 48)));
 
         acc0 += w0 * s0 * x0;
         acc0 += w1 * s0 * x1;
