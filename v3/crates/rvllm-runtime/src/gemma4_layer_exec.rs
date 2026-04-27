@@ -359,13 +359,39 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if weights.qkv_chscale != 0 {
-        cutlass.launch_fp8_gemm_channelscale(
-            scratch.q_out, scratch.hidden_fp8, weights.qkv_fp8,
-            scratch.hidden_scale, weights.qkv_chscale,
-            dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
-            scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
-            stream,
-        )?;
+        if cutlass.fp8_gemm_channelscale.is_some() {
+            cutlass.launch_fp8_gemm_channelscale(
+                scratch.q_out, scratch.hidden_fp8, weights.qkv_fp8,
+                scratch.hidden_scale, weights.qkv_chscale,
+                dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
+                scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+                stream,
+            )?;
+        } else {
+            cublaslt.fp8_gemm_f32(
+                scratch.hidden_fp8, weights.qkv_fp8, scratch.gemm_f32_tmp,
+                dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
+                scratch.hidden_scale, weights.qkv_scale,
+                stream,
+            )?;
+            launch_scale_cols_f32(
+                kernels.scale_cols_f32,
+                scratch.gemm_f32_tmp,
+                weights.qkv_chscale,
+                dims.num_tokens,
+                qkv_rows,
+                stream,
+            )?;
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * qkv_rows,
+            }
+            .launch(
+                kernels.f32_to_f16_sat,
+                scratch.q_out,
+                scratch.gemm_f32_tmp,
+                stream,
+            )?;
+        }
     } else {
         cublaslt.fp8_gemm(
             scratch.hidden_fp8, weights.qkv_fp8, scratch.q_out,
@@ -638,13 +664,39 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
     } else if weights.gate_up_chscale != 0 {
-        cutlass.launch_fp8_gemm_channelscale(
-            scratch.gate_up_out, scratch.hidden_fp8, weights.gate_up_fp8,
-            scratch.hidden_scale, weights.gate_up_chscale,
-            dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
-            scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
-            stream,
-        )?;
+        if cutlass.fp8_gemm_channelscale.is_some() {
+            cutlass.launch_fp8_gemm_channelscale(
+                scratch.gate_up_out, scratch.hidden_fp8, weights.gate_up_fp8,
+                scratch.hidden_scale, weights.gate_up_chscale,
+                dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
+                scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+                stream,
+            )?;
+        } else {
+            cublaslt.fp8_gemm_f32(
+                scratch.hidden_fp8, weights.gate_up_fp8, scratch.gemm_f32_tmp,
+                dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
+                scratch.hidden_scale, weights.gate_up_scale,
+                stream,
+            )?;
+            launch_scale_cols_f32(
+                kernels.scale_cols_f32,
+                scratch.gemm_f32_tmp,
+                weights.gate_up_chscale,
+                dims.num_tokens,
+                2 * dims.intermediate,
+                stream,
+            )?;
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * 2 * dims.intermediate,
+            }
+            .launch(
+                kernels.f32_to_f16_sat,
+                scratch.gate_up_out,
+                scratch.gemm_f32_tmp,
+                stream,
+            )?;
+        }
     } else {
         cublaslt.fp8_gemm(
             scratch.hidden_fp8, weights.gate_up_fp8, scratch.gate_up_out,
