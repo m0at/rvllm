@@ -36,10 +36,19 @@ use crate::weights::{AwqLayerWeights, F16Weight, Fp8Weight};
 
 #[derive(Debug)]
 pub struct Gemma4LayerWeights {
-    pub qkv: Fp8Weight,
-    pub o_proj: Fp8Weight,
-    pub gate_up: Fp8Weight,
-    pub down_proj: Fp8Weight,
+    /// FP8 attention QKV weights. `None` when this layer is AWQ-quantized
+    /// (the `awq` field below carries Q/K/V instead). At least one of
+    /// `qkv` / `qkv_f16` / `awq.q_proj` must be `Some` for the layer
+    /// to execute; bring-up reflects that as a non-zero pointer in
+    /// the corresponding `Gemma4LayerWeightPtrs` slot.
+    ///
+    /// Cycle 48 step 7a: made Optional to support AWQ-only layers
+    /// without forcing dummy FP8 weights to occupy ~half the GPU
+    /// arena.
+    pub qkv: Option<Fp8Weight>,
+    pub o_proj: Option<Fp8Weight>,
+    pub gate_up: Option<Fp8Weight>,
+    pub down_proj: Option<Fp8Weight>,
     pub qkv_f16: Option<F16Weight>,
     pub o_proj_f16: Option<F16Weight>,
     pub gate_up_f16: Option<F16Weight>,

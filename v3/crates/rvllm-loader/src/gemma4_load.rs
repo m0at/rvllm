@@ -539,10 +539,10 @@ pub fn load_gemma4_model(
         }
 
         layers.push(Gemma4LayerWeights {
-            qkv,
-            o_proj,
-            gate_up,
-            down_proj,
+            qkv: Some(qkv),
+            o_proj: Some(o_proj),
+            gate_up: Some(gate_up),
+            down_proj: Some(down_proj),
             qkv_f16: qkv_f16_w,
             o_proj_f16: o_proj_f16_w,
             gate_up_f16: gate_up_f16_w,
