@@ -1275,7 +1275,7 @@ fn load_gemma4_awq_model_inner(
         // self_attn.k_proj.* — runtime sees v_packed/scale/zero
         // pointers identical to k_packed/scale/zero, the AWQ kernel
         // happily produces the V output by re-running on K's weights.
-        let (_q_out, _kv_out, _o_in, has_v_proj) = awq_layer_shape_for(arch, l);
+        let (q_out, kv_out, o_in, has_v_proj) = awq_layer_shape_for(arch, l);
         let layer_prefix = format!("{prefix}.layers.{l}");
         let v_alias_prefix = format!("{layer_prefix}.self_attn.v_proj.");
         let k_alias_prefix = format!("{layer_prefix}.self_attn.k_proj.");
@@ -1294,16 +1294,17 @@ fn load_gemma4_awq_model_inner(
             let raw = bytes_of(si, &e).to_vec();
             Some((e.dtype, e.shape.clone(), raw))
         };
+        // Reuse awq_layer_shape_for outputs (codex review of 92cd9e0)
+        // — keeps the validator and the upload path in lock-step on
+        // global v_proj / heterogeneous head-dim handling.
         let geom = crate::compressed_tensors::AwqLayerShapes {
-            q_out:            arch.num_attention_heads * if has_v_proj { arch.head_dim_sliding } else { arch.head_dim_global },
-            kv_out:           if has_v_proj { arch.num_kv_heads_sliding * arch.head_dim_sliding }
-                              else          { arch.num_kv_heads_global  * arch.head_dim_global  },
+            q_out, kv_out,
             o_out:            arch.hidden_size,
-            o_in:             arch.num_attention_heads * if has_v_proj { arch.head_dim_sliding } else { arch.head_dim_global },
+            o_in,
             mlp_intermediate: arch.intermediate_size,
             hidden:           arch.hidden_size,
         };
-        let awq_layer = crate::compressed_tensors::upload_gemma4_awq_layer(
+        let mut awq_layer = crate::compressed_tensors::upload_gemma4_awq_layer(
             arena, &layer_prefix, &geom, &awq.scheme, &byte_lookup,
         ).map_err(|e| RvllmError::Loader {
             err: LoaderError::Corrupt {
@@ -1316,10 +1317,24 @@ fn load_gemma4_awq_model_inner(
             bt: std::backtrace::Backtrace::capture(),
         })?;
 
+        // Codex review of 92cd9e0: the v_proj→k_proj alias was at the
+        // byte_lookup level only — the arena still allocated a
+        // separate V region with K's bytes copied into it, so v_proj's
+        // device pointer was distinct from k_proj's. Fix the comment
+        // contract by aliasing at the AwqLinearWeight level too: for
+        // global layers the runtime sees identical v_packed/scale/zero
+        // pointers as k_*, matching the FP8 K-as-V trick. The wasted
+        // V region in the arena is a known footnote (worth ~3 GB on
+        // Gemma 4 31B for 10 global layers; cycle 50 cleanup task).
+        if !has_v_proj {
+            awq_layer.v_proj = awq_layer.k_proj.clone();
+        }
+
         if l == 0 || l == load_max_layers - 1 {
             eprintln!(
-                "[awq-loader] layer {l} ({:?}) AWQ uploaded: q_packed=0x{:x} (group_size={})",
+                "[awq-loader] layer {l} ({:?}) AWQ uploaded: q_packed=0x{:x} (group_size={}{})",
                 arch.layer_types[l], awq_layer.q_proj.packed_offset_bytes, awq_layer.q_proj.group_size,
+                if has_v_proj { "" } else { ", v=k alias" },
             );
         }
 
