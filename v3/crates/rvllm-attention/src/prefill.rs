@@ -50,6 +50,32 @@ impl PagedPrefillParams {
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
+        // Cycle 52 attention hardening (codex finding #2): prefill had
+        // NO num_tokens/num_seqs/scale/block_size guards. A zero in any
+        // of these causes the unified-prefill grid sizer to either
+        // panic on div_ceil(0) or launch a 0-grid kernel that
+        // silently writes garbage.
+        if self.num_tokens == 0 || self.num_seqs == 0 || self.num_heads == 0 {
+            return Err(RvllmError::Attention {
+                err: AttentionError::ContextExceedsBucket { context: 0, max: 0 },
+                ctx: ctx(),
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if self.block_size == 0 || self.num_blocks_total == 0 || self.max_blocks_per_seq == 0 {
+            return Err(RvllmError::Attention {
+                err: AttentionError::ContextExceedsBucket { context: 0, max: 0 },
+                ctx: ctx(),
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if !self.scale.is_finite() || self.scale <= 0.0 {
+            return Err(RvllmError::Attention {
+                err: AttentionError::ContextExceedsBucket { context: 0, max: 0 },
+                ctx: ctx(),
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
         Ok(())
     }
 }
