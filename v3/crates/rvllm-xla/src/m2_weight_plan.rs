@@ -627,13 +627,15 @@ fn validate_scale_source(
 ) -> Result<()> {
     let expected_shape = vec![rows, cols / 16];
     let expected_bytes = rows * (cols / 16);
-    if view.entry.dtype != DType::U8 || view.bytes.len() != expected_bytes {
+    let is_scale_dtype = matches!(view.entry.dtype, DType::U8 | DType::Fp8E4M3);
+    if !is_scale_dtype || view.bytes.len() != expected_bytes {
         return Err(invalid_owned(
             "scale",
             format!(
-                "{name}: source must be FP8 scale U8 shape {expected_shape:?} or {} bytes, got {:?} / {} bytes",
+                "{name}: source must be FP8 scale U8/Fp8E4M3 shape {expected_shape:?} or {} bytes, got {:?} {:?} / {} bytes",
                 expected_bytes,
                 view.entry.shape,
+                view.entry.dtype,
                 view.bytes.len()
             ),
         ));
