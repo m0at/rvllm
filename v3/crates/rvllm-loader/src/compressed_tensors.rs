@@ -940,13 +940,25 @@ mod tests {
         std::fs::write(dir.join("config.json"), body).unwrap();
     }
 
+    /// Test-local temp dir keyed by pid + thread + test-unique suffix.
+    /// Avoids collisions on cargo test's multi-threaded runner and on
+    /// re-runs that use the same process id (notable on Linux PID
+    /// reuse). Codex review of cycle 4.5d flagged the prior plain
+    /// `pid`-only suffix as bug-prone.
+    fn unique_tmp(name: &str) -> std::path::PathBuf {
+        let tid = format!("{:?}", std::thread::current().id());
+        let tid = tid.replace([':', '(', ')', ' '], "_");
+        let dir = std::env::temp_dir().join(format!(
+            "rvllm-awq-test-{name}-{}-{tid}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn read_awq_config_returns_none_on_unquantized() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rvllm-awq-test-unquant-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_tmp("unquant");
         write_config_json(&tmp, r#"{"hidden_size": 5376}"#);
         let r = read_awq_config_from_dir(&tmp).expect("ok");
         assert!(r.is_none());
@@ -955,11 +967,7 @@ mod tests {
 
     #[test]
     fn read_awq_config_parses_real_layout() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rvllm-awq-test-real-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_tmp("real");
         write_config_json(&tmp, r#"{
             "hidden_size": 5376,
             "quantization_config": {
@@ -988,11 +996,7 @@ mod tests {
     #[test]
     fn read_awq_config_handles_text_config_nesting() {
         // Some HF model layouts put quantization_config under text_config.
-        let tmp = std::env::temp_dir().join(format!(
-            "rvllm-awq-test-nested-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_tmp("nested");
         write_config_json(&tmp, r#"{
             "text_config": {
                 "hidden_size": 5376,
