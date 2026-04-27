@@ -461,6 +461,75 @@ pub fn upload_awq_linear<'a>(
     })
 }
 
+/// Geometry of one Gemma 4 transformer layer needed to drive the AWQ
+/// load path: dense `[N, K]` for each of the seven linears that
+/// compressed-tensors AWQ stores un-fused. K is `hidden_size` for QKV
+/// and gate/up, the head-multiple for O, and `intermediate_size` for
+/// down_proj.
+///
+/// Caller derives this from `gemma4_arch::ModelArch` + the per-layer
+/// attention type (sliding heads at half-width, full heads at full).
+/// We keep it as plain data here so the loader doesn't reach into the
+/// arch crate for layer geometry — that mirrors how `validate_awq_linear`
+/// already takes `dense_shape` rather than an arch handle.
+#[derive(Clone, Debug)]
+pub struct AwqLayerShapes {
+    /// Output dim of `q_proj` weight (= num_heads * head_dim). Hidden
+    /// is shared via `hidden`.
+    pub q_out:            usize,
+    /// Output dim of `k_proj` and `v_proj` weight (= num_kv_heads * head_dim).
+    pub kv_out:           usize,
+    /// Output dim of `o_proj` weight (= hidden_size).
+    pub o_out:            usize,
+    /// Input dim of `o_proj` weight (= num_heads * head_dim).
+    pub o_in:             usize,
+    /// Output dim of `gate_proj` and `up_proj` weight (= intermediate_size).
+    pub mlp_intermediate: usize,
+    /// Hidden size — the K of QKV / gate-up, also the N of down_proj.
+    pub hidden:           usize,
+}
+
+/// Stage + upload all 7 AWQ linears of one Gemma 4 transformer layer.
+///
+/// `byte_lookup` is the mmap-resolving callback that
+/// [`stage_awq_linear`] documents — same shape, same caller contract.
+/// `prefix` is the layer's HF weight prefix, e.g.
+/// `model.language_model.layers.0` (without trailing dot).
+///
+/// Cycle 44 step 4: leaves QKV un-fused on purpose. AWQ checkpoints
+/// store Q/K/V separately and the GEMV kernel handles M=1 well per
+/// linear. A future cycle can fuse along N if profiling shows the
+/// per-launch overhead is non-trivial; the call sites here would then
+/// pre-concatenate `weight_packed` / `weight_scale` and update the
+/// `weight_zero_point` packing.
+#[cfg(feature = "cuda")]
+pub fn upload_gemma4_awq_layer<'a>(
+    arena: &'a rvllm_mem::HbmArena<'a>,
+    prefix: &str,
+    geom: &AwqLayerShapes,
+    scheme: &AwqWeightScheme,
+    byte_lookup: &dyn Fn(&str) -> Option<(rvllm_core::DType, Vec<usize>, Vec<u8>)>,
+) -> Result<crate::weights::AwqLayerWeights, String> {
+    let stage_and_upload = |linear: &str, dense: [usize; 2]|
+        -> Result<AwqLinearWeight, String>
+    {
+        let full = format!("{prefix}.{linear}");
+        let staged = stage_awq_linear(&full, dense, scheme, byte_lookup)?;
+        upload_awq_linear(arena, &staged)
+            .map_err(|e| format!("upload {full}: {e:?}"))
+    };
+
+    Ok(crate::weights::AwqLayerWeights {
+        q_proj:    stage_and_upload("self_attn.q_proj",  [geom.q_out,            geom.hidden])?,
+        k_proj:    stage_and_upload("self_attn.k_proj",  [geom.kv_out,           geom.hidden])?,
+        v_proj:    stage_and_upload("self_attn.v_proj",  [geom.kv_out,           geom.hidden])?,
+        o_proj:    stage_and_upload("self_attn.o_proj",  [geom.o_out,            geom.o_in])?,
+        gate_proj: stage_and_upload("mlp.gate_proj",     [geom.mlp_intermediate, geom.hidden])?,
+        up_proj:   stage_and_upload("mlp.up_proj",       [geom.mlp_intermediate, geom.hidden])?,
+        down_proj: stage_and_upload("mlp.down_proj",     [geom.hidden,           geom.mlp_intermediate])?,
+    })
+}
+
 /// Result of validating one AWQ linear against the safetensors entries
 /// the shard index resolved.
 pub fn validate_awq_linear(
