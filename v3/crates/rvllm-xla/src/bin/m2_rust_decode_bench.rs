@@ -318,7 +318,7 @@ fn execute_decode_artifacts(
             M2RustDecodeTimingSource {
                 runtime: "rust_xla",
                 executed: true,
-                device: "tpu:0".to_string(),
+                device: format!("tpu:0-{}", num_devices.saturating_sub(1)),
                 executable: "pjrt_mlir_decode".to_string(),
             },
             artifact.batch,

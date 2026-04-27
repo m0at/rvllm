@@ -195,6 +195,10 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   <div class="footnote">
     Run: <code>bb800cc21</code>, v6e-8, ctx 2048, <code>RVLLM_M2_KV=int8</code>, <code>RVLLM_M2_MOE_IMPL=auto</code>. Artifact path: <code>tpu/out/m2/full_equiv_bb800cc21/final.json</code>. Caveat: measured path is the legacy JAX reproduction harness; Rust PJRT graph/server scaffolding exists, but executable Mosaic NVFP4 custom-call matmul is still the blocker for a fully native runtime.
   </div>
+
+  <div class="note-box" style="border-left-color:#84E6B7">
+    <strong>Rust-native status:</strong> Rust + PJRT now compiles and executes the B=8, ctx 2048, int8-KV 8-partition decode graph on v6e-8 with no Python/JAX. The runtime probe uses a zero Mosaic layer body and measures <strong>1.016 ms/step</strong> (<strong>7873 tok/s</strong>) as plumbing validation only. Real model speed still depends on replacing that zero body with the fused NVFP4→MXU Mosaic custom call.
+  </div>
 </section>
 
 <h3 id="b200-tpu-comparison">B200 vs TPU v6e equivalent</h3>

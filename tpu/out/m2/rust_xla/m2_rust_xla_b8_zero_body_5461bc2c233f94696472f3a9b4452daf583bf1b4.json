@@ -1,0 +1,74 @@
+{
+  "schema": "rvllm.m2.rust_xla_bench_plan.v1",
+  "bench_kind": "m2_full_equivalent_decode_plan",
+  "runtime": "rust+xla",
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "kv_cache": "int8",
+  "moe_impl": "raw-mosaic-sharded-weight",
+  "load_seconds": null,
+  "batches": [
+    8
+  ],
+  "artifacts": {
+    "model_dir": "../tpu/harness/m2_checkpoint_schema",
+    "artifact_dir": "/tmp/m2_rust_xla_exec_b8_5461bc2c233f94696472f3a9b4452daf583bf1b4",
+    "report_json": "/tmp/m2_rust_xla_exec_b8_5461bc2c233f94696472f3a9b4452daf583bf1b4/report.json",
+    "sweep_json": "/tmp/m2_rust_xla_exec_b8_5461bc2c233f94696472f3a9b4452daf583bf1b4/m2_decode_sweep.json",
+    "ppl_json": "/tmp/m2_rust_xla_exec_b8_5461bc2c233f94696472f3a9b4452daf583bf1b4/m2_ppl.json",
+    "generation_json": "/tmp/m2_rust_xla_exec_b8_5461bc2c233f94696472f3a9b4452daf583bf1b4/m2_generation.json"
+  },
+  "sweep": [
+    {
+      "batch": 8,
+      "ctx": 2048,
+      "iters": 10,
+      "warmup": 3,
+      "status": "executed",
+      "error": null,
+      "artifact_json": "/tmp/m2_rust_xla_exec_b8_5461bc2c233f94696472f3a9b4452daf583bf1b4/m2_decode_b8.json",
+      "decode_mlir": "/tmp/m2_rust_xla_exec_b8_5461bc2c233f94696472f3a9b4452daf583bf1b4/m2_decode_b8.mlir",
+      "timing": {
+        "timing_source": {
+          "runtime": "rust_xla",
+          "executed": true,
+          "device": "tpu:0-7",
+          "executable": "pjrt_mlir_decode"
+        },
+        "ms_min": 0.96296,
+        "ms_mean": 1.0160698,
+        "ms_max": 1.0868,
+        "ms_p50": 1.01444,
+        "tok_per_s": 7873.474834110807
+      }
+    }
+  ],
+  "ppl": {
+    "status": "planned",
+    "input_text_path": null,
+    "artifact_json": "/tmp/m2_rust_xla_exec_b8_5461bc2c233f94696472f3a9b4452daf583bf1b4/m2_ppl.json",
+    "result": null
+  },
+  "generation": {
+    "status": "planned",
+    "prompt": "Explain angular momentum.",
+    "gen_tokens": 256,
+    "artifact_json": "/tmp/m2_rust_xla_exec_b8_5461bc2c233f94696472f3a9b4452daf583bf1b4/m2_generation.json",
+    "result": null
+  },
+  "rust_runtime": {
+    "graph_phase": "decode",
+    "weight_tensors": 191069,
+    "weight_upload_bytes": 134400868280,
+    "batch_shapes": [
+      {
+        "batch": 8,
+        "runtime_inputs": 3,
+        "runtime_outputs": 3,
+        "kv_cache_bytes": 2080374784
+      }
+    ]
+  }
+}

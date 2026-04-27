@@ -140,7 +140,7 @@ Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/Mini
 | Full PPL gate (2047 scored tokens) | **6.73** |
 | Correctness gate | **pass** (`0.0` PPL delta, 736-char generation prefix match) |
 | Gen sample (256 tok) | Starts coherent, then repeats `\\vec{p}`; decode loop works, long-form coherence still needs attention/spec-decode work |
-| Rust PJRT native StableHLO smoke | **compile pass** at B=8, ctx 2048, int8 KV; proves Rust->PJRT->TPU works without Python/JAX, but it is a zero-logits smoke graph, not the real model |
+| Rust PJRT B=8 zero-body execute | **1.016 ms/step, 7873 tok/s**; proves Rust->PJRT->TPU 8-partition execution works, but this is a zero Mosaic body, not model throughput |
 
 ### What this demonstrates
 
@@ -158,7 +158,9 @@ Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/Mini
 
 ### Rust + XLA status (no JAX runtime)
 
-The Rust path is real but not executable yet. It currently owns:
+The Rust path now compiles and executes an 8-partition B=8 decode graph through PJRT/libtpu without Python or JAX. The measured Rust artifact is a zero Mosaic decode-layer body, so it validates runtime plumbing only. It is **not** a model-quality or real matmul throughput number.
+
+It currently owns:
 
 - MiniMax M2 checkpoint indexing and safetensors schema validation
 - Flat `i8` weight-arena planning for the 134 GB NVFP4 checkpoint
@@ -176,13 +178,14 @@ What we found while compiling the Rust MLIR directly on the TPU:
 - Commit `8d92d99f8` emits the real `tpu_custom_call` target and JSON backend config from Rust. The TPU compile probe now gets past the custom-emitter lookup and fails at body deserialization: `Failed to deserialize the Mosaic module: Missing or invalid version attribute`. That is expected for the current empty placeholder body.
 - Commit `d24a77eef` proves the native StableHLO path: a Rust-emitted B=8, ctx=2048, int8-KV smoke graph compiles through PJRT on `rvllm-m2` with no Python/JAX. The report marks `sweep[0].status = "compiled"` and covers the real M2 runtime signature (`191,069` weight tensors, `134.4 GB` planned arena, `2.08 GB` int8 KV buffer).
 - Commit `a2148a9c3` removes the fake embed/final custom calls from the real graph. The full graph now emits native StableHLO placeholders for embed/final and exactly 62 `tpu_custom_call` layer calls. TPU compile now fails only on the fused decode-layer Mosaic body placeholder, which is the intended remaining blocker.
-- Therefore the remaining blocker is not Python, tokenization, serving, or PJRT. It is linking a real serialized Mosaic body for the fused NVFP4 decode-layer kernel, then replacing the current native embed/final placeholders with real native StableHLO math.
+- Commit `5461bc2c2` adds 8-device PJRT argument-list execution. The zero-body B=8 graph executes at **1.016 ms/step** on v6e-8 and writes `tpu/out/m2/rust_xla/m2_rust_xla_b8_zero_body_5461bc2c233f94696472f3a9b4452daf583bf1b4.json`.
+- Therefore the remaining blocker is not Python, tokenization, serving, PJRT, or multi-device execution. It is linking a real serialized Mosaic body for the fused NVFP4 decode-layer kernel, then replacing the current native embed/final placeholders with real native StableHLO math.
 - The HF repo `and-y/rvllm-m2-build` is a private dataset containing legacy JAX cache artifacts only. It is useful for reproduction, not for the Rust-native runtime.
 
 ### Known issues blocking production
 
 1. **MoE dispatch overhead dominates at B=1** — 726 ms/step is far off the HBM-bandwidth ceiling. `shard_map` + per-expert `nvfp4_matmul` calls fail to fuse into a single MXU-tiled kernel. B=8/B=16/B=32 avoid padded token all-to-all now; B=1 still needs a better small-batch kernel.
-2. **Executable Rust decode still needs TPU custom-call bodies**. `rvllm-server` now calls `rvllm_xla::M2Runtime` from `/v1/chat/completions`, but TPU XLA only lowers `tpu_custom_call` with a serialized Mosaic body. The Rust emitter must stop using fake `rvllm.m2.*` targets and either emit native StableHLO for simple ops or attach real Mosaic bytecode for fused kernels.
+2. **Real Rust decode still needs the fused NVFP4 Mosaic body**. `rvllm-server` now calls `rvllm_xla::M2Runtime` from `/v1/chat/completions`, and Rust PJRT can execute the 8-partition graph. The current executable artifact uses a zero layer body; production needs the fused NVFP4 decode-layer body serialized into TPU Mosaic custom-call format.
 3. **Long-form generation degenerates**. The full gate scores PPL 6.73 and passes prefix matching, but the 256-token angular-momentum sample falls into repetitive math text after the coherent opening.
 
 ### Build list (ranked, from 16-agent perf advisor spec)
@@ -206,7 +209,7 @@ SPOT=1 ZONE=europe-west4-a HF_TOKEN=$(cat ~/.cache/huggingface/token) \
   bash tpu/harness/deploy_m2_tpu.sh
 ```
 
-Rust-only compile probe on the VM. This path does not run Python or JAX:
+Rust-only compile/execute probe on the VM. This path does not run Python or JAX. The body below is a zero-body runtime probe, not the real NVFP4 matmul:
 
 ```bash
 cd $HOME/runs/$SHA/v3
@@ -214,13 +217,14 @@ cargo run --release -p rvllm-xla --features tpu --bin m2_rust_decode_bench -- \
   --model-dir ../tpu/harness/m2_checkpoint_schema \
   --artifact-dir /tmp/m2_rust_xla \
   --out /tmp/m2_rust_xla/final.json \
-  --compile-decode \
-  --native-smoke \
-  --batches 8 \
+  --decode-layer-body /tmp/m2_raw_layer_body/body_hidden_any_local_weight_b8.mlir \
+  --decode-layer-body-format lowered \
+  --execute-decode \
+  --batch 8 \
   --ctx 2048 \
   --iters 10 --warmup 3 \
   --kv-cache int8 \
-  --moe-impl auto
+  --moe-impl raw-mosaic-sharded-weight
 ```
 
 The legacy reproduction command remains documented in
