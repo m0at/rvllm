@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rvllm_core::DType;
@@ -63,6 +64,16 @@ pub struct M2FlatArenaHostBuffer {
     pub bytes: Vec<u8>,
     pub total_bytes: usize,
     pub entries: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct M2Int8ArenaStreamStats {
+    pub total_bytes: usize,
+    pub streamed_bytes: usize,
+    pub chunks: usize,
+    pub entries: usize,
+    pub converted_weights: usize,
+    pub zero_bytes: usize,
 }
 
 #[cfg(feature = "tpu")]
@@ -347,6 +358,143 @@ impl M2WeightArenaPlan {
         self.materialize_int8_host_buffer_inner(reader, max_bytes, false)
     }
 
+    pub fn stream_int8_host_buffer<F>(
+        &self,
+        reader: &M2SafetensorsReader,
+        max_bytes: usize,
+        copy_dense: bool,
+        mut sink: F,
+    ) -> Result<M2Int8ArenaStreamStats>
+    where
+        F: FnMut(usize, &[u8]) -> Result<()>,
+    {
+        if self.total_bytes > max_bytes {
+            return Err(invalid_owned(
+                "max_bytes",
+                format!(
+                    "flat int8 arena is {} bytes, above configured max {}",
+                    self.total_bytes, max_bytes
+                ),
+            ));
+        }
+
+        let zero_buf = vec![0u8; 1024 * 1024];
+        let mut cursor = 0usize;
+        let mut chunks = 0usize;
+        let mut streamed_bytes = 0usize;
+        let mut zero_bytes = 0usize;
+        let mut converted_weights = 0usize;
+        let mut pending_scales: HashMap<String, Vec<f32>> = HashMap::new();
+
+        for entry in &self.entries {
+            if entry.offset > cursor {
+                let stats = stream_zeros(&mut sink, &zero_buf, cursor, entry.offset - cursor)?;
+                chunks += stats.0;
+                streamed_bytes += stats.1;
+                zero_bytes += stats.1;
+            }
+
+            match entry.role {
+                M2WeightRole::Global | M2WeightRole::LayerDense | M2WeightRole::Int8InputScale => {
+                    if copy_dense {
+                        let view = reader.tensor(&entry.name)?;
+                        validate_arena_tensor(entry, &view)?;
+                        sink(entry.offset, view.bytes)?;
+                        chunks += 1;
+                        streamed_bytes += view.bytes.len();
+                    } else {
+                        let stats = stream_zeros(&mut sink, &zero_buf, entry.offset, entry.nbytes)?;
+                        chunks += stats.0;
+                        streamed_bytes += stats.1;
+                        zero_bytes += stats.1;
+                    }
+                }
+                M2WeightRole::Int8Weight => {
+                    let converted = convert_int8_weight(entry, self, reader)?;
+                    let i8_bytes = converted
+                        .weights
+                        .iter()
+                        .map(|&x| x as u8)
+                        .collect::<Vec<_>>();
+                    sink(entry.offset, &i8_bytes)?;
+                    chunks += 1;
+                    streamed_bytes += i8_bytes.len();
+                    pending_scales.insert(converted.row_scale_name, converted.row_scales);
+                    converted_weights += 1;
+                }
+                M2WeightRole::Int8RowScale => {
+                    let row_scales = pending_scales.remove(&entry.name).ok_or_else(|| {
+                        invalid_owned(
+                            "row_scale",
+                            format!("{}: missing pending row scales", entry.name),
+                        )
+                    })?;
+                    let mut scale_bytes = Vec::with_capacity(entry.nbytes);
+                    for scale in row_scales {
+                        scale_bytes.extend_from_slice(&scale.to_le_bytes());
+                    }
+                    if scale_bytes.len() != entry.nbytes {
+                        return Err(invalid_owned(
+                            "row_scale",
+                            format!("{}: row scale byte length mismatch", entry.name),
+                        ));
+                    }
+                    sink(entry.offset, &scale_bytes)?;
+                    chunks += 1;
+                    streamed_bytes += scale_bytes.len();
+                }
+                M2WeightRole::Int8UnitScale => {
+                    let bytes = 1.0f32.to_le_bytes();
+                    sink(entry.offset, &bytes)?;
+                    chunks += 1;
+                    streamed_bytes += bytes.len();
+                }
+                M2WeightRole::Nvfp4Packed
+                | M2WeightRole::Nvfp4Scale
+                | M2WeightRole::Nvfp4GlobalScale
+                | M2WeightRole::Nvfp4InputScale => {
+                    return Err(invalid(
+                        "role",
+                        "use materialize_host_buffer for NVFP4 arenas",
+                    ));
+                }
+            }
+            cursor = entry.offset + entry.nbytes;
+        }
+
+        if self.total_bytes > cursor {
+            let stats = stream_zeros(&mut sink, &zero_buf, cursor, self.total_bytes - cursor)?;
+            chunks += stats.0;
+            streamed_bytes += stats.1;
+            zero_bytes += stats.1;
+        }
+
+        if streamed_bytes != self.total_bytes {
+            return Err(invalid_owned(
+                "stream",
+                format!(
+                    "streamed {} bytes, expected {}",
+                    streamed_bytes, self.total_bytes
+                ),
+            ));
+        }
+        if !pending_scales.is_empty() {
+            return Err(invalid_owned(
+                "row_scale",
+                format!("{} pending row-scale tensors left", pending_scales.len()),
+            ));
+        }
+
+        Ok(M2Int8ArenaStreamStats {
+            total_bytes: self.total_bytes,
+            streamed_bytes,
+            chunks,
+            entries: self.entries.len(),
+            converted_weights,
+            zero_bytes,
+        })
+    }
+
     fn materialize_int8_host_buffer_inner(
         &self,
         reader: &M2SafetensorsReader,
@@ -436,6 +584,34 @@ impl M2WeightArenaPlan {
     }
 }
 
+fn stream_zeros<F>(
+    sink: &mut F,
+    zero_buf: &[u8],
+    mut offset: usize,
+    mut len: usize,
+) -> Result<(usize, usize)>
+where
+    F: FnMut(usize, &[u8]) -> Result<()>,
+{
+    let mut chunks = 0usize;
+    let mut bytes = 0usize;
+    while len > 0 {
+        let n = len.min(zero_buf.len());
+        sink(offset, &zero_buf[..n])?;
+        offset += n;
+        len -= n;
+        chunks += 1;
+        bytes += n;
+    }
+    Ok((chunks, bytes))
+}
+
+struct ConvertedInt8Weight {
+    weights: Vec<i8>,
+    row_scales: Vec<f32>,
+    row_scale_name: String,
+}
+
 fn align_up(x: usize, alignment: usize) -> usize {
     (x + alignment - 1) & !(alignment - 1)
 }
@@ -453,6 +629,27 @@ fn materialize_int8_weight(
     reader: &M2SafetensorsReader,
     bytes: &mut [u8],
 ) -> Result<()> {
+    let converted = convert_int8_weight(entry, arena, reader)?;
+    let weight_start = entry.offset;
+    for (dst, src) in bytes[weight_start..weight_start + entry.nbytes]
+        .iter_mut()
+        .zip(converted.weights.iter())
+    {
+        *dst = *src as u8;
+    }
+    let scale_start = arena.entry(&converted.row_scale_name)?.offset;
+    for (row, scale) in converted.row_scales.iter().enumerate() {
+        let start = scale_start + row * 4;
+        bytes[start..start + 4].copy_from_slice(&scale.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn convert_int8_weight(
+    entry: &M2WeightArenaEntry,
+    arena: &M2WeightArenaPlan,
+    reader: &M2SafetensorsReader,
+) -> Result<ConvertedInt8Weight> {
     let packed = reader.tensor(&entry.name)?;
     validate_packed_source(entry, &packed)?;
     let scale_name = int8_row_scale_name(&entry.name)?;
@@ -500,19 +697,11 @@ fn materialize_int8_weight(
         &mut row_scales,
     )?;
 
-    let weight_start = entry.offset;
-    for (dst, src) in bytes[weight_start..weight_start + entry.nbytes]
-        .iter_mut()
-        .zip(i8_weights.iter())
-    {
-        *dst = *src as u8;
-    }
-    let scale_start = row_scale_entry.offset;
-    for (row, scale) in row_scales.iter().enumerate() {
-        let start = scale_start + row * 4;
-        bytes[start..start + 4].copy_from_slice(&scale.to_le_bytes());
-    }
-    Ok(())
+    Ok(ConvertedInt8Weight {
+        weights: i8_weights,
+        row_scales,
+        row_scale_name: scale_name,
+    })
 }
 
 fn int8_row_scale_name(weight_name: &str) -> Result<String> {
