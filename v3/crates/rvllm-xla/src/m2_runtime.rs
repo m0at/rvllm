@@ -669,6 +669,9 @@ pub fn m2_ppl_from_nll(nll: &[f64]) -> Result<M2PplResult> {
     if nll.is_empty() {
         return Err(invalid("nll", "must not be empty"));
     }
+    if nll.iter().any(|v| !v.is_finite()) {
+        return Err(invalid("nll", "must contain only finite values"));
+    }
     let avg_nll = nll.iter().sum::<f64>() / nll.len() as f64;
     Ok(M2PplResult {
         n_tokens_scored: nll.len(),

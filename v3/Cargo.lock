@@ -817,6 +817,7 @@ dependencies = [
  "rvllm-loader",
  "serde",
  "serde_json",
+ "tokenizers",
 ]
 
 [[package]]

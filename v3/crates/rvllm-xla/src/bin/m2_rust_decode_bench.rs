@@ -1,14 +1,17 @@
 use std::env;
 use std::fs;
+#[cfg(feature = "tpu")]
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "tpu")]
 use std::time::Instant;
 
 use rvllm_xla::m2_decode_bench::{
-    check_m2_rust_decode_bench_json, M2RustDecodeExecutedTiming, M2_DEFAULT_DECODE_BENCH_BATCHES,
+    check_m2_rust_decode_bench_json, M2RustDecodeExecutedTiming, M2RustDecodePplResult,
+    M2_DEFAULT_DECODE_BENCH_BATCHES,
 };
 #[cfg(feature = "tpu")]
-use rvllm_xla::m2_decode_bench::{m2_rust_decode_timing, M2RustDecodeTimingSource};
+use rvllm_xla::m2_decode_bench::{m2_rust_decode_timing_with_metrics, M2RustDecodeTimingSource};
 use rvllm_xla::m2_runtime::{m2_decode_mlir_execution_blocker, M2RuntimeMode};
 use rvllm_xla::{
     m2_decode_graph_mlir_with_mosaic_body, m2_decode_smoke_mlir, plan_m2_rust_decode_bench,
@@ -19,7 +22,10 @@ use rvllm_xla::{
 #[cfg(feature = "tpu")]
 use rvllm_loader::M2SafetensorsReader;
 #[cfg(feature = "tpu")]
-use rvllm_xla::{m2_gather_embed_bf16, PjrtClientHandle};
+use rvllm_xla::{
+    m2_bf16_argmax_tokens, m2_bf16_logits_nll, m2_gather_embed_bf16, m2_ppl_from_nll,
+    PjrtClientHandle,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(env::args().skip(1).collect())?;
@@ -45,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Vec::new()
     };
     let mut compiled = false;
-    let timings = match args.runtime_mode {
+    let executed = match args.runtime_mode {
         M2RuntimeMode::PlanningOnly => Vec::new(),
         M2RuntimeMode::CompileOnly => {
             compile_decode_artifacts(&artifacts)?;
@@ -84,11 +90,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             item.error = None;
         }
     }
-    if !timings.is_empty() {
-        for (item, timing) in report.sweep.iter_mut().zip(timings) {
+    if !executed.is_empty() {
+        let mut nll = Vec::new();
+        let mut top1_hits = 0usize;
+        let mut top1_total = 0usize;
+        for (item, executed) in report.sweep.iter_mut().zip(executed) {
             item.status = "executed";
             item.error = None;
-            item.timing = Some(timing);
+            if let Some(ppl) = executed.ppl.clone() {
+                nll.push(ppl);
+            }
+            top1_hits += executed.top1_hits;
+            top1_total += executed.top1_total;
+            item.timing = Some(executed.timing);
+        }
+        if let Some(ppl) = nll.last() {
+            report.ppl.status = "executed";
+            report.ppl.result = Some(serde_json::json!({
+                "n_tokens_scored": ppl.n_tokens_scored,
+                "avg_nll": ppl.avg_nll,
+                "ppl": ppl.ppl,
+            }));
+        }
+        if top1_total > 0 {
+            report.generation.status = "executed";
+            report.generation.result = Some(serde_json::json!({
+                "top1_match_rate": top1_hits as f64 / top1_total as f64,
+                "matched": top1_hits,
+                "total": top1_total,
+                "note": "teacher-forced decode argmax vs next-token target; no sampling",
+            }));
         }
     }
 
@@ -113,6 +144,14 @@ struct DecodeArtifact {
     batch: usize,
     shape: M2GraphShape,
     weight_arena_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ExecutedDecodeArtifact {
+    timing: M2RustDecodeExecutedTiming,
+    ppl: Option<M2RustDecodePplResult>,
+    top1_hits: usize,
+    top1_total: usize,
 }
 
 fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn std::error::Error>> {
@@ -299,7 +338,7 @@ fn compile_decode_artifacts(
 fn execute_decode_artifacts(
     artifacts: &[DecodeArtifact],
     args: &Args,
-) -> Result<Vec<M2RustDecodeExecutedTiming>, Box<dyn std::error::Error>> {
+) -> Result<Vec<ExecutedDecodeArtifact>, Box<dyn std::error::Error>> {
     let client = PjrtClientHandle::new()?;
     let num_devices = client.num_devices();
     if args.max_weight_arena_bytes == 0 && !args.native_smoke {
@@ -316,29 +355,7 @@ fn execute_decode_artifacts(
         } else {
             Some(M2SafetensorsReader::open(&args.model_dir)?)
         };
-        let token_zero = vec![0u8; artifact.shape.batch * 4];
-        let pos_zero = vec![0u8; artifact.shape.batch * 4];
         let kv_zero = vec![0u8; artifact.shape.kv_cache_bytes()];
-        let token_bufs = (0..num_devices)
-            .map(|device| {
-                client.buffer_from_host(
-                    &token_zero,
-                    &[artifact.shape.batch as i64],
-                    PjrtElementType::S32,
-                    device,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let pos_bufs = (0..num_devices)
-            .map(|device| {
-                client.buffer_from_host(
-                    &pos_zero,
-                    &[artifact.shape.batch as i64],
-                    PjrtElementType::S32,
-                    device,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut kv_bufs = (0..num_devices)
             .map(|device| {
                 client.buffer_from_host(
@@ -455,16 +472,67 @@ fn execute_decode_artifacts(
             None
         } else {
             let reader = reader.as_ref().expect("reader is present for real execute");
-            let token_ids = vec![0; artifact.shape.batch];
-            Some(upload_global_tensors(
-                &client,
+            Some(upload_static_global_tensors(&client, reader, num_devices)?)
+        };
+        let teacher = if args.native_smoke {
+            None
+        } else {
+            let reader = reader.as_ref().expect("reader is present for real execute");
+            Some(prepare_decode_tokens(
+                args,
                 reader,
-                num_devices,
-                &token_ids,
+                artifact.shape.batch,
+                args.warmup + args.iters,
             )?)
         };
+        let mut token_ids = teacher
+            .as_ref()
+            .map(|tokens| tokens.input_at(0))
+            .unwrap_or_else(|| vec![0; artifact.shape.batch]);
+        let mut positions = vec![0i32; artifact.shape.batch];
         let mut samples = Vec::with_capacity(args.iters);
+        let mut ttft_ms = None;
+        let mut nll = Vec::new();
+        let mut top1_hits = 0usize;
+        let mut top1_total = 0usize;
         for step in 0..(args.warmup + args.iters) {
+            if let Some(tokens) = &teacher {
+                token_ids = tokens.input_at(step);
+            }
+            let token_bytes = i32_bytes(&token_ids);
+            let pos_bytes = i32_bytes(&positions);
+            let token_bufs = (0..num_devices)
+                .map(|device| {
+                    client.buffer_from_host(
+                        &token_bytes,
+                        &[artifact.shape.batch as i64],
+                        PjrtElementType::S32,
+                        device,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let pos_bufs = (0..num_devices)
+                .map(|device| {
+                    client.buffer_from_host(
+                        &pos_bytes,
+                        &[artifact.shape.batch as i64],
+                        PjrtElementType::S32,
+                        device,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let input_hidden = if args.native_smoke {
+                None
+            } else {
+                let reader = reader.as_ref().expect("reader is present for real execute");
+                Some(upload_input_hidden(
+                    &client,
+                    reader,
+                    num_devices,
+                    &token_ids,
+                    artifact.shape.batch,
+                )?)
+            };
             let start = Instant::now();
             let per_device_inputs = (0..num_devices)
                 .map(|device| {
@@ -475,7 +543,9 @@ fn execute_decode_artifacts(
                         &weight_arenas[device],
                         &row_scale_arenas[device],
                     ];
-                    if let Some((input_hidden, final_norms, lm_heads)) = &global_tensors {
+                    if let (Some(input_hidden), Some((final_norms, lm_heads))) =
+                        (&input_hidden, &global_tensors)
+                    {
                         inputs.push(&input_hidden[device]);
                         inputs.push(&final_norms[device]);
                         inputs.push(&lm_heads[device]);
@@ -485,20 +555,51 @@ fn execute_decode_artifacts(
                 .collect::<Vec<_>>();
             let outputs_by_device = client.execute_partitioned(&exe, &per_device_inputs)?;
             let mut next_kv_bufs = Vec::with_capacity(num_devices);
-            for mut outputs in outputs_by_device {
+            let mut logits = None;
+            for (device, mut outputs) in outputs_by_device.into_iter().enumerate() {
                 if outputs.len() != 3 {
                     return Err(
                         format!("decode returned {} outputs, expected 3", outputs.len()).into(),
                     );
                 }
-                let next_token = outputs.remove(1);
-                let new_kv = outputs.remove(1);
-                let mut next_bytes = vec![0u8; artifact.shape.batch * 4];
-                client.buffer_to_host(&next_token, &mut next_bytes)?;
+                let logits_buf = outputs.remove(0);
+                let _next_token = outputs.remove(0);
+                let new_kv = outputs.remove(0);
+                if device == 0 {
+                    let mut logits_bytes = vec![0u8; artifact.shape.batch * M2_VOCAB * 2];
+                    client.buffer_to_host(&logits_buf, &mut logits_bytes)?;
+                    logits = Some(logits_bytes);
+                }
                 next_kv_bufs.push(new_kv);
             }
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            if step == 0 {
+                ttft_ms = Some(elapsed_ms);
+            }
             if step >= args.warmup {
-                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                samples.push(elapsed_ms);
+                if let (Some(tokens), Some(logits)) = (&teacher, logits.as_ref()) {
+                    let targets = tokens.target_at(step)?;
+                    let argmax = m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
+                    top1_hits += argmax
+                        .iter()
+                        .zip(targets.iter())
+                        .filter(|(got, want)| got == want)
+                        .count();
+                    top1_total += targets.len();
+                    nll.extend(m2_bf16_logits_nll(
+                        logits,
+                        &targets,
+                        artifact.shape.batch,
+                        M2_VOCAB,
+                    )?);
+                }
+            }
+            if let Some(logits) = logits.as_ref() {
+                token_ids = m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
+            }
+            for pos in &mut positions {
+                *pos += 1;
             }
             kv_bufs = next_kv_bufs;
         }
@@ -507,7 +608,22 @@ fn execute_decode_artifacts(
         let ms_max = *samples.last().ok_or("no timing samples")?;
         let ms_mean = samples.iter().sum::<f64>() / samples.len() as f64;
         let ms_p50 = samples[samples.len() / 2];
-        let timing = m2_rust_decode_timing(
+        let ppl = if nll.is_empty() {
+            None
+        } else {
+            let ppl = m2_ppl_from_nll(&nll)?;
+            Some(M2RustDecodePplResult {
+                n_tokens_scored: ppl.n_tokens_scored,
+                avg_nll: ppl.avg_nll,
+                ppl: ppl.ppl,
+            })
+        };
+        let top1_match_rate = if top1_total == 0 {
+            None
+        } else {
+            Some(top1_hits as f64 / top1_total as f64)
+        };
+        let timing = m2_rust_decode_timing_with_metrics(
             M2RustDecodeTimingSource {
                 runtime: "rust_xla",
                 executed: true,
@@ -519,14 +635,29 @@ fn execute_decode_artifacts(
             ms_mean,
             ms_max,
             ms_p50,
+            ttft_ms,
+            ppl.clone(),
+            top1_match_rate,
         )?;
         eprintln!(
-            "executed B={} mean={:.3} ms tok/s={:.2}",
+            "executed B={} ttft={:.3} ms mean={:.3} ms tok/s={:.2} ppl={} top1={}",
             artifact.batch,
+            ttft_ms.unwrap_or(0.0),
             ms_mean,
-            1000.0 * artifact.batch as f64 / ms_mean
+            1000.0 * artifact.batch as f64 / ms_mean,
+            ppl.as_ref()
+                .map(|p| format!("{:.4}", p.ppl))
+                .unwrap_or_else(|| "-".to_string()),
+            top1_match_rate
+                .map(|v| format!("{:.3}", v))
+                .unwrap_or_else(|| "-".to_string())
         );
-        out.push(timing);
+        out.push(ExecutedDecodeArtifact {
+            timing,
+            ppl,
+            top1_hits,
+            top1_total,
+        });
     }
     Ok(out)
 }
@@ -546,26 +677,17 @@ fn local_weight_arena_shard(bytes: &[u8], local_bytes: usize, device: usize) -> 
 type GlobalTensorBuffers = (
     Vec<rvllm_xla::PjrtBufferHandle>,
     Vec<rvllm_xla::PjrtBufferHandle>,
-    Vec<rvllm_xla::PjrtBufferHandle>,
 );
 
 #[cfg(feature = "tpu")]
-fn upload_global_tensors(
+fn upload_static_global_tensors(
     client: &PjrtClientHandle,
     reader: &M2SafetensorsReader,
     num_devices: usize,
-    token_ids: &[i32],
 ) -> Result<GlobalTensorBuffers, Box<dyn std::error::Error>> {
-    let input_hidden = m2_gather_embed_bf16(reader, token_ids)?;
     let final_norm = reader.tensor("model.norm.weight")?;
     let lm_head = reader.tensor("lm_head.weight")?;
     Ok((
-        upload_replicated(
-            client,
-            num_devices,
-            &input_hidden,
-            &[token_ids.len() as i64, M2_HIDDEN as i64],
-        )?,
         upload_replicated(client, num_devices, final_norm.bytes, &[M2_HIDDEN as i64])?,
         upload_replicated(
             client,
@@ -574,6 +696,26 @@ fn upload_global_tensors(
             &[M2_VOCAB as i64, M2_HIDDEN as i64],
         )?,
     ))
+}
+
+#[cfg(feature = "tpu")]
+fn upload_input_hidden(
+    client: &PjrtClientHandle,
+    reader: &M2SafetensorsReader,
+    num_devices: usize,
+    token_ids: &[i32],
+    batch: usize,
+) -> Result<Vec<rvllm_xla::PjrtBufferHandle>, Box<dyn std::error::Error>> {
+    if token_ids.len() != batch {
+        return Err(format!("expected {batch} token ids, got {}", token_ids.len()).into());
+    }
+    let input_hidden = m2_gather_embed_bf16(reader, token_ids)?;
+    upload_replicated(
+        client,
+        num_devices,
+        &input_hidden,
+        &[token_ids.len() as i64, M2_HIDDEN as i64],
+    )
 }
 
 #[cfg(feature = "tpu")]
@@ -589,11 +731,113 @@ fn upload_replicated(
     Ok(out)
 }
 
+#[cfg(feature = "tpu")]
+#[derive(Clone, Debug)]
+struct DecodeTokenPlan {
+    lanes: Vec<Vec<i32>>,
+}
+
+#[cfg(feature = "tpu")]
+impl DecodeTokenPlan {
+    fn input_at(&self, step: usize) -> Vec<i32> {
+        self.lanes.iter().map(|lane| lane[step]).collect()
+    }
+
+    fn target_at(&self, step: usize) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+        if self.lanes.iter().any(|lane| step + 1 >= lane.len()) {
+            return Err(format!("not enough target token ids for step {step}").into());
+        }
+        Ok(self.lanes.iter().map(|lane| lane[step + 1]).collect())
+    }
+}
+
+#[cfg(feature = "tpu")]
+fn prepare_decode_tokens(
+    args: &Args,
+    _reader: &M2SafetensorsReader,
+    batch: usize,
+    total_steps: usize,
+) -> Result<DecodeTokenPlan, Box<dyn std::error::Error>> {
+    let ids = if let Some(path) = &args.ppl_token_ids {
+        read_token_ids(path)?
+    } else if let Some(path) = &args.ppl_text {
+        tokenize_text_file(&args.model_dir, path)?
+    } else {
+        tokenize_text(&args.model_dir, &args.prompt)?
+    };
+    if ids.is_empty() {
+        return Err("tokenizer produced zero token ids".into());
+    }
+    let stride = if args.ppl_text.is_some() || args.ppl_token_ids.is_some() {
+        total_steps + 1
+    } else {
+        1
+    };
+    let need = batch * stride;
+    let mut lanes = Vec::with_capacity(batch);
+    if ids.len() >= need {
+        for row in 0..batch {
+            let start = row * stride;
+            lanes.push(ids[start..start + stride].to_vec());
+        }
+    } else if stride == 1 {
+        for row in 0..batch {
+            lanes.push(vec![ids[row.min(ids.len() - 1)]]);
+        }
+    } else {
+        return Err(format!(
+            "need at least {need} token ids for B={batch}, steps={total_steps}; got {}",
+            ids.len()
+        )
+        .into());
+    }
+    Ok(DecodeTokenPlan { lanes })
+}
+
+#[cfg(feature = "tpu")]
+fn tokenize_text_file(
+    model_dir: &Path,
+    path: &Path,
+) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+    let text = fs::read_to_string(path)?;
+    tokenize_text(model_dir, &text)
+}
+
+#[cfg(feature = "tpu")]
+fn tokenize_text(model_dir: &Path, text: &str) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| format!("load tokenizer {}: {e}", tokenizer_path.display()))?;
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|e| format!("tokenize text: {e}"))?;
+    Ok(encoding.get_ids().iter().map(|id| *id as i32).collect())
+}
+
+#[cfg(feature = "tpu")]
+fn read_token_ids(path: &Path) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+    let text = fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for word in text.split_whitespace() {
+        out.push(word.parse::<i32>()?);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "tpu")]
+fn i32_bytes(vals: &[i32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 4);
+    for val in vals {
+        out.extend_from_slice(&val.to_le_bytes());
+    }
+    out
+}
+
 #[cfg(not(feature = "tpu"))]
 fn execute_decode_artifacts(
     _artifacts: &[DecodeArtifact],
     _args: &Args,
-) -> Result<Vec<M2RustDecodeExecutedTiming>, Box<dyn std::error::Error>> {
+) -> Result<Vec<ExecutedDecodeArtifact>, Box<dyn std::error::Error>> {
     Err("m2_rust_decode_bench execute mode requires --features tpu".into())
 }
 
@@ -622,6 +866,7 @@ struct Args {
     weight_format: String,
     moe_impl: String,
     ppl_text: Option<PathBuf>,
+    ppl_token_ids: Option<PathBuf>,
     prompt: String,
     gen_tokens: usize,
     max_weight_arena_bytes: usize,
@@ -648,6 +893,7 @@ impl Args {
             weight_format: "int8".to_string(),
             moe_impl: "auto".to_string(),
             ppl_text: None,
+            ppl_token_ids: None,
             prompt: "Explain angular momentum.".to_string(),
             gen_tokens: 256,
             max_weight_arena_bytes: 0,
@@ -735,6 +981,10 @@ impl Args {
                     i += 1;
                     out.ppl_text = Some(PathBuf::from(value(&args, i, "--ppl-text")?));
                 }
+                "--ppl-token-ids" => {
+                    i += 1;
+                    out.ppl_token_ids = Some(PathBuf::from(value(&args, i, "--ppl-token-ids")?));
+                }
                 "--prompt" => {
                     i += 1;
                     out.prompt = value(&args, i, "--prompt")?.to_string();
@@ -797,7 +1047,7 @@ fn kv_bytes_per_elem(kv_cache: &str) -> Result<usize, String> {
 }
 
 fn usage() -> String {
-    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--decode-layer-body FILE] [--decode-layer-body-format serde|lowered] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--use-existing-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--weight-format int8|nvfp4] [--moe-impl NAME] [--ppl-text FILE] [--prompt TEXT] [--gen-tokens N] [--max-weight-arena-bytes N]".to_string()
+    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--decode-layer-body FILE] [--decode-layer-body-format serde|lowered] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--use-existing-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--weight-format int8|nvfp4] [--moe-impl NAME] [--ppl-text FILE|--ppl-token-ids FILE] [--prompt TEXT] [--gen-tokens N] [--max-weight-arena-bytes N]".to_string()
 }
 
 #[cfg(test)]

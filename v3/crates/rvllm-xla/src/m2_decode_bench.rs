@@ -78,6 +78,12 @@ pub struct M2RustDecodeExecutedTiming {
     ms_max: f64,
     ms_p50: f64,
     tok_per_s: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttft_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ppl: Option<M2RustDecodePplResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top1_match_rate: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -94,6 +100,13 @@ pub struct M2RustDecodePplPlan {
     pub input_text_path: Option<String>,
     pub artifact_json: String,
     pub result: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct M2RustDecodePplResult {
+    pub n_tokens_scored: usize,
+    pub avg_nll: f64,
+    pub ppl: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -240,7 +253,38 @@ pub fn m2_rust_decode_timing(
         ms_max,
         ms_p50,
         tok_per_s: 1000.0 * batch as f64 / ms_mean,
+        ttft_ms: None,
+        ppl: None,
+        top1_match_rate: None,
     })
+}
+
+pub fn m2_rust_decode_timing_with_metrics(
+    timing_source: M2RustDecodeTimingSource,
+    batch: usize,
+    ms_min: f64,
+    ms_mean: f64,
+    ms_max: f64,
+    ms_p50: f64,
+    ttft_ms: Option<f64>,
+    ppl: Option<M2RustDecodePplResult>,
+    top1_match_rate: Option<f64>,
+) -> Result<M2RustDecodeExecutedTiming> {
+    let mut out = m2_rust_decode_timing(timing_source, batch, ms_min, ms_mean, ms_max, ms_p50)?;
+    if let Some(value) = ttft_ms {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(invalid("ttft_ms", "must be finite and > 0"));
+        }
+        out.ttft_ms = Some(value);
+    }
+    if let Some(value) = top1_match_rate {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(invalid("top1_match_rate", "must be in [0, 1]"));
+        }
+        out.top1_match_rate = Some(value);
+    }
+    out.ppl = ppl;
+    Ok(out)
 }
 
 impl M2RustDecodeBenchConfig {
