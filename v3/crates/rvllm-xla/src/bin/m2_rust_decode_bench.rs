@@ -514,7 +514,9 @@ fn execute_decode_artifacts(
         let mut observability: Option<M2LogitsObservabilityReport> = None;
         for step in 0..(args.warmup + args.iters) {
             if let Some(tokens) = &teacher {
-                token_ids = tokens.input_at(step);
+                if tokens.has_input(step) {
+                    token_ids = tokens.input_at(step);
+                }
             }
             let token_bytes = i32_bytes(&token_ids);
             let pos_bytes = i32_bytes(&positions);
@@ -780,6 +782,10 @@ struct DecodeTokenPlan {
 
 #[cfg(feature = "tpu")]
 impl DecodeTokenPlan {
+    fn has_input(&self, step: usize) -> bool {
+        self.lanes.iter().all(|lane| step < lane.len())
+    }
+
     fn input_at(&self, step: usize) -> Vec<i32> {
         self.lanes.iter().map(|lane| lane[step]).collect()
     }
