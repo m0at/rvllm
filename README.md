@@ -140,6 +140,7 @@ Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/Mini
 | Full PPL gate (2047 scored tokens) | **6.73** |
 | Correctness gate | **pass** (`0.0` PPL delta, 736-char generation prefix match) |
 | Gen sample (256 tok) | Starts coherent, then repeats `\\vec{p}`; decode loop works, long-form coherence still needs attention/spec-decode work |
+| Rust PJRT native StableHLO smoke | **compile pass** at B=8, ctx 2048, int8 KV; proves Rust->PJRT->TPU works without Python/JAX, but it is a zero-logits smoke graph, not the real model |
 
 ### What this demonstrates
 
@@ -173,6 +174,7 @@ What we found while compiling the Rust MLIR directly on the TPU:
 - `tpu_custom_call` requires JSON `backend_config` shaped like `{"custom_call_config":{"body":"<base64 Mosaic bytecode>","serialization_format":1,"needs_layout_passes":true},"implicit_sharding":{"type":"MANUAL"}}`.
 - The `body` is not our semicolon metadata string. It is serialized Mosaic MLIR bytecode produced by the Mosaic serde pass.
 - Commit `8d92d99f8` emits the real `tpu_custom_call` target and JSON backend config from Rust. The TPU compile probe now gets past the custom-emitter lookup and fails at body deserialization: `Failed to deserialize the Mosaic module: Missing or invalid version attribute`. That is expected for the current empty placeholder body.
+- Commit `d24a77eef` proves the native StableHLO path: a Rust-emitted B=8, ctx=2048, int8-KV smoke graph compiles through PJRT on `rvllm-m2` with no Python/JAX. The report marks `sweep[0].status = "compiled"` and covers the real M2 runtime signature (`191,069` weight tensors, `134.4 GB` planned arena, `2.08 GB` int8 KV buffer).
 - Therefore the remaining blocker is not Python, tokenization, serving, or PJRT. It is linking a real serialized Mosaic body for embed/final/decode-layer kernels, or decomposing embed/final into native StableHLO and reserving Mosaic only for the fused NVFP4 MoE matmul.
 - The HF repo `and-y/rvllm-m2-build` is a private dataset containing legacy JAX cache artifacts only. It is useful for reproduction, not for the Rust-native runtime.
 
@@ -212,6 +214,7 @@ cargo run --release -p rvllm-xla --features tpu --bin m2_rust_decode_bench -- \
   --artifact-dir /tmp/m2_rust_xla \
   --out /tmp/m2_rust_xla/final.json \
   --compile-decode \
+  --native-smoke \
   --batches 8 \
   --ctx 2048 \
   --iters 10 --warmup 3 \
