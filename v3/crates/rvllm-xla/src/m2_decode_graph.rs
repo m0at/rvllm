@@ -250,12 +250,12 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
     let plan = M2DecodeGraphPlan::from_arena(arena)?;
     let body = emit_decode_body(shape, arena, &plan, decode_layer_body)?;
     Ok(format!(
-        r###"module attributes {{mhlo.frontend_attributes = {{xla.sdy.meshes = "{{mesh = #sdy.mesh<[\22expert\22=8]>}}"}}, mhlo.num_partitions = 8 : i32, mhlo.num_replicas = 1 : i32, rvllm.kind = "m2_decode_graph"}} {{
+        r#"module attributes {{mhlo.num_partitions = 8 : i32, mhlo.num_replicas = 1 : i32, rvllm.kind = "m2_decode_graph"}} {{
   func.func @{kernel_name}(
       %token_ids: tensor<{batch}xi32>,
       %positions: tensor<{batch}xi32>,
       %kv_cache: tensor<{kv_bytes}xi8>,
-      %weight_arena: tensor<{weight_bytes}xi8> {{mhlo.frontend_attributes = {{xla.sdy.sharding = "#sdy.sharding<@mesh, [{{\22expert\22}}]>"}}, mhlo.sharding = "{{devices=[8]<=[8]}}"}})
+      %weight_arena: tensor<{weight_bytes}xi8> {{mhlo.sharding = "{{devices=[8]0,1,2,3,4,5,6,7}}"}}
       -> (tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>)
       attributes {{
         rvllm.signature = "token_ids,positions,kv_cache,weight_arena -> logits,next_token,kv_cache",
@@ -277,7 +277,7 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
 {body}
   }}
 }}
-"###,
+"#,
         kernel_name = kernel_name,
         batch = shape.batch,
         ctx = shape.ctx,
@@ -343,13 +343,11 @@ fn emit_decode_body(
     let mut out = String::new();
 
     out.push_str(&format!(
-        r###"    %embed_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
+        r#"    %embed_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
     %h_embed = stablehlo.broadcast_in_dim %embed_zero, dims = [] : (tensor<bf16>) -> {hidden_ty}
-    %weight_arena_local = stablehlo.custom_call @xla.sdy.GlobalToLocalShape(%weight_arena) {{
-      has_side_effect = true,
-      mhlo.frontend_attributes = {{xla.sdy.in_shardings = "#sdy.sharding_per_value<[<@mesh, [{{\22expert\22}}]>]>", xla.sdy.manual_axes = "#sdy<manual_axes{{\22expert\22}}>"}}
-    }} : (tensor<{weight_bytes}xi8>) -> {arena_ty}
-"###,
+    %weight_arena_sharded = stablehlo.custom_call @Sharding(%weight_arena) {{mhlo.sharding = "{{devices=[8]0,1,2,3,4,5,6,7}}"}} : (tensor<{weight_bytes}xi8>) -> tensor<{weight_bytes}xi8>
+    %weight_arena_local = stablehlo.custom_call @SPMDFullToShardShape(%weight_arena_sharded) {{mhlo.sharding = "{{manual}}"}} : (tensor<{weight_bytes}xi8>) -> {arena_ty}
+"#,
         weight_bytes = arena.total_bytes,
     ));
 
