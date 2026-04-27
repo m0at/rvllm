@@ -96,6 +96,11 @@
       "path": "flash_attention_split_decode_nvfp4kv.ptx",
       "sha256": "059829bf10d59a368c7c3cf54d259454a1c848c004b08e5bc0aa4c7fc9f36450"
     },
+    "flash_attention_split_decode_nvfp4kv_bf16out": {
+      "bytes": 244895,
+      "path": "flash_attention_split_decode_nvfp4kv_bf16out.ptx",
+      "sha256": "e0dbd5da5d3d64f05661b05f1797ebba691c37e971dcaee2a300832df4bd0e49"
+    },
     "flash_attention_unified_prefill": {
       "bytes": 72311,
       "path": "flash_attention_unified_prefill.ptx",
@@ -105,6 +110,11 @@
       "bytes": 48574,
       "path": "flash_attention_unified_prefill_nvfp4kv.ptx",
       "sha256": "5fad7473d60439cba54300054aa2815fcd65854fd0b6bdee35e792da2eec2d12"
+    },
+    "flash_attention_unified_prefill_nvfp4kv_bf16out": {
+      "bytes": 48947,
+      "path": "flash_attention_unified_prefill_nvfp4kv_bf16out.ptx",
+      "sha256": "cdac0c5650ae39830dba290702e0f22751438c92a0ac711c71006e53554c5fa3"
     },
     "fp8_e4m3_mma_probe": {
       "bytes": 1570,
@@ -302,5 +312,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "d4f9d25"
+  "revision": "ffc69dc"
 }

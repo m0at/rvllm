@@ -352,6 +352,10 @@ pub struct Fa2PtxKernels {
     /// the same source-of-truth math; only the output dtype flips
     /// f16 → bf16 across all 6 kernel entries.
     pub flash_attention_nvfp4kv_bf16out_mod: Option<rvllm_kernels::LoadedModule>,
+    /// Cycle 55 step 10: bf16-output unified prefill module.
+    pub unified_prefill_nvfp4kv_bf16out_mod: Option<rvllm_kernels::LoadedModule>,
+    /// Cycle 55 step 10: bf16-output split-decode + reducer module.
+    pub split_decode_nvfp4kv_bf16out_mod: Option<rvllm_kernels::LoadedModule>,
     /// `flash_attention_2_decode_nvfp4kv_kernel` — NVFP4 KV decode,
     /// BC=32 variant for head_dim ≤ 256.
     #[cfg(feature = "cuda")]
@@ -410,6 +414,12 @@ pub struct Fa2PtxKernels {
     pub fn_decode_nvfp4kv_gqa_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
     pub fn_prefill_nvfp4kv_bf16out: Option<rvllm_kernels::KernelFn>,
     pub fn_prefill_nvfp4kv_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
+    /// Cycle 55 step 10: bf16-output unified-prefill kernel handle.
+    pub fn_prefill_nvfp4kv_unified_bf16out: Option<rvllm_kernels::KernelFn>,
+    /// Cycle 55 step 10: bf16-output split-decode + reducer handles.
+    pub fn_decode_nvfp4kv_split_bf16out: Option<rvllm_kernels::KernelFn>,
+    pub fn_decode_nvfp4kv_split_bc16_bf16out: Option<rvllm_kernels::KernelFn>,
+    pub fn_paged_attn_reduce_bf16: Option<rvllm_kernels::KernelFn>,
 
     // ---- Split-KV decode path (paged_attention_v2-style) ----
     //
@@ -558,6 +568,34 @@ impl Fa2PtxKernels {
                 }
                 Err(_) => (None, None, None, None, None, None, None),
             };
+            // Cycle 55 step 10: split-decode + unified-prefill
+            // bf16-output siblings. Phase-1 split kernels write f32
+            // tmp_out (cycle-21 fix) and are dtype-agnostic; only their
+            // symbols are renamed. The Phase-2 reducer flips f16→bf16.
+            let (
+                unified_prefill_nvfp4kv_bf16out_mod,
+                fn_prefill_nvfp4kv_unified_bf16out,
+            ) = match loader.load_ptx("flash_attention_unified_prefill_nvfp4kv_bf16out") {
+                Ok(m) => {
+                    let f = m.get_function("flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel").ok();
+                    (Some(m), f)
+                }
+                Err(_) => (None, None),
+            };
+            let (
+                split_decode_nvfp4kv_bf16out_mod,
+                fn_decode_nvfp4kv_split_bf16out,
+                fn_decode_nvfp4kv_split_bc16_bf16out,
+                fn_paged_attn_reduce_bf16,
+            ) = match loader.load_ptx("flash_attention_split_decode_nvfp4kv_bf16out") {
+                Ok(m) => {
+                    let s32 = m.get_function("flash_attention_2_decode_nvfp4kv_split_bf16out_kernel").ok();
+                    let s16 = m.get_function("flash_attention_2_decode_nvfp4kv_split_bc16_bf16out_kernel").ok();
+                    let r   = m.get_function("paged_attention_reduce_bf16_kernel").ok();
+                    (Some(m), s32, s16, r)
+                }
+                Err(_) => (None, None, None, None),
+            };
 
             // Unified NVFP4 prefill — Phase 2b follow-up. Separate PTX
             // so old kernel trees can still bring up (runtime gates
@@ -610,6 +648,8 @@ impl Fa2PtxKernels {
                 fused_rope_nvfp4kv_mod,
                 fused_rope_nvfp4kv_bf16in_mod,
                 flash_attention_nvfp4kv_bf16out_mod,
+                unified_prefill_nvfp4kv_bf16out_mod,
+                split_decode_nvfp4kv_bf16out_mod,
                 fn_decode_nvfp4kv,
                 fn_decode_nvfp4kv_bc16,
                 fn_decode_nvfp4kv_gqa,
@@ -626,6 +666,10 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_gqa_bc16_bf16out,
                 fn_prefill_nvfp4kv_bf16out,
                 fn_prefill_nvfp4kv_bc16_bf16out,
+                fn_prefill_nvfp4kv_unified_bf16out,
+                fn_decode_nvfp4kv_split_bf16out,
+                fn_decode_nvfp4kv_split_bc16_bf16out,
+                fn_paged_attn_reduce_bf16,
                 split_decode_nvfp4kv_mod,
                 fn_decode_nvfp4kv_split,
                 fn_decode_nvfp4kv_split_bc16,
