@@ -94,7 +94,10 @@ impl ShardHeader {
             let start = offsets[0].as_u64().unwrap_or(0);
             let end = offsets[1].as_u64().unwrap_or(0);
             let nbytes = end - start;
-            let expected = dtype_bytes(dtype) as u64 * shape.iter().product::<usize>() as u64;
+            // Cycle 39: dtype_storage_bytes handles sub-byte packed
+            // dtypes (U4Packed/I4Packed) which dtype_bytes returns 0 for.
+            let n_elements = shape.iter().product::<usize>() as u64;
+            let expected = dtype_storage_bytes(dtype, n_elements);
             if expected != nbytes {
                 return Err(loader_err(format!(
                     "{name}: offset range {nbytes} != dtype*shape {expected}"
@@ -126,16 +129,45 @@ fn map_dtype(s: &str) -> Option<DType> {
         "F16" => DType::F16,
         "BF16" => DType::Bf16,
         "F8_E4M3" | "F8E4M3" => DType::Fp8E4M3,
+        // Cycle 39: AWQ / compressed-tensors INT4 weight formats. HF
+        // safetensors stores packed INT4 with these dtype strings or
+        // (more commonly) as "U8"/"I32" with a separate compressed-
+        // tensors metadata block — those need a different loader path.
+        // The packed-as-named entries are kept for future-proofing.
+        "U4" => DType::U4Packed,
+        "I4" => DType::I4Packed,
         _ => return None,
     })
 }
 
 fn dtype_bytes(d: DType) -> usize {
+    // Cycle 39: sub-byte dtypes return 0 from DType::bytes(); the
+    // safetensors header still gives byte-precise offsets, so we
+    // compute storage as bits per element. Two INT4 elements pack
+    // into one byte → div by 2.
+    if d.is_sub_byte() {
+        // Caller multiplies by element count; defer to per-tensor
+        // storage calc using DType::bits().
+        return 0;
+    }
     match d {
         DType::F32 => 4,
         DType::F16 | DType::Bf16 => 2,
         DType::Fp8E4M3 => 1,
         _ => 0,
+    }
+}
+
+/// Cycle 39: storage bytes for a tensor with `n_elements`. Handles
+/// sub-byte packed dtypes (U4/I4) by computing bits-then-rounding-up.
+/// Use this anywhere the safetensors header validates that a tensor's
+/// `data_offsets` range matches its declared shape × dtype.
+pub fn dtype_storage_bytes(d: DType, n_elements: u64) -> u64 {
+    if d.is_sub_byte() {
+        let bits = n_elements * d.bits() as u64;
+        (bits + 7) / 8
+    } else {
+        n_elements * d.bytes() as u64
     }
 }
 
