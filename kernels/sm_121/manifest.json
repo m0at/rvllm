@@ -174,7 +174,7 @@
     "fused_qk_rmsnorm_bf16": {
       "bytes": 5371,
       "path": "fused_qk_rmsnorm_bf16.ptx",
-      "sha256": "453296a0f90c914092ff21eb6b9109faf01a2fd16e255d3f32fc8daa15a950c6"
+      "sha256": "1ff237a560e8e8f8d8e8e7f2253fe5fe5f5064e58c3f6f22fb35a39b226f7f83"
     },
     "fused_qkv_rmsnorm": {
       "bytes": 6049,
@@ -184,7 +184,7 @@
     "fused_qkv_rmsnorm_bf16": {
       "bytes": 6195,
       "path": "fused_qkv_rmsnorm_bf16.ptx",
-      "sha256": "7e225368c88ac1f1a3adcf4e5db56066051a705fa322f7f7145a9f213928f3aa"
+      "sha256": "135186db2a8c88b6c4f80c091ab0e7c40d800a9a372b38f814ee9a4eacf8dfac"
     },
     "fused_rmsnorm_fp8_quant": {
       "bytes": 39669,
@@ -322,5 +322,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "b872160"
+  "revision": "b7d5f95"
 }

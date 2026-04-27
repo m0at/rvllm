@@ -15,6 +15,7 @@
 //   blockIdx.y >= num_heads + num_kv_heads               -> V head (no gamma)
 // Block: (min(head_dim, 1024), 1, 1)
 
+#include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
 extern "C"
@@ -25,8 +26,8 @@ __global__ void fused_qkv_rmsnorm_bf16_kernel(
     __nv_bfloat16* __restrict__ q_out,
     __nv_bfloat16* __restrict__ k_out,
     __nv_bfloat16* __restrict__ v_out,
-    const __nv_bfloat16* __restrict__ q_gamma,
-    const __nv_bfloat16* __restrict__ k_gamma,
+    const __half* __restrict__ q_gamma,
+    const __half* __restrict__ k_gamma,
     int num_tokens,
     int num_heads,
     int num_kv_heads,
@@ -42,7 +43,7 @@ __global__ void fused_qkv_rmsnorm_bf16_kernel(
 
     const __nv_bfloat16* src;
     __nv_bfloat16* dst;
-    const __nv_bfloat16* gamma;
+    const __half* gamma;
     int n_heads_this;
     int head_local;
     bool use_gamma;
@@ -105,7 +106,7 @@ __global__ void fused_qkv_rmsnorm_bf16_kernel(
 
     for (int i = tid; i < head_dim; i += blockDim.x) {
         float v = __bfloat162float(src[src_offset + i]) * rms_inv;
-        if (use_gamma) v *= __bfloat162float(gamma[i]);
+        if (use_gamma) v *= __half2float(gamma[i]);
         dst[dst_offset + i] = __float2bfloat16(v);
     }
 }

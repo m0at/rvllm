@@ -633,6 +633,81 @@ fn tensor_to_f16_bytes(e: &TensorEntry, raw: &[u8], model_dir: &Path) -> Result<
     }
 }
 
+/// Cycle 55 step 12 (Phase D): bf16 sibling of `tensor_to_f16_bytes`.
+/// The Gemma 4 checkpoint stores weights natively as bf16 — this
+/// helper passes them through verbatim instead of narrowing to f16.
+/// Used by callers that want to load weight slots (norm gammas,
+/// layer_scalar, embedding, lm_head) directly into bf16 device
+/// memory so the bf16-native kernels added in cycle 55 steps 5-11
+/// can consume them without a runtime f16↔bf16 conversion.
+///
+/// f16 inputs are widened to bf16 (loses 3 mantissa bits but gains
+/// 3 exponent bits — matches training distribution), f32 narrows to
+/// bf16 round-to-nearest, fp8 dequants to bf16 via f32 intermediate.
+#[allow(dead_code)] // Phase D wiring lands in cycle 55 step 13+
+fn tensor_to_bf16_bytes(e: &TensorEntry, raw: &[u8], model_dir: &Path) -> Result<Vec<u8>> {
+    match e.dtype {
+        DType::Bf16 => Ok(raw.to_vec()),
+        DType::F16 => Ok(f16_to_bf16(raw)),
+        DType::F32 => Ok(f32_to_bf16(raw)),
+        DType::Fp8E4M3 => Ok(fp8e4m3_to_bf16(raw)),
+        _ => Err(RvllmError::Loader {
+            err: LoaderError::DtypeMismatch {
+                tensor: e.name.clone(),
+                expected: DType::Bf16,
+                got: e.dtype,
+            },
+            ctx: LoaderCtx {
+                path: model_dir.to_path_buf(),
+                tensor: Some(e.name.clone()),
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        }),
+    }
+}
+
+#[allow(dead_code)] // Phase D wiring lands in cycle 55 step 13+
+fn f16_to_bf16(raw: &[u8]) -> Vec<u8> {
+    let n = raw.len() / 2;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let bits = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+        let v = f16::from_bits(bits).to_f32();
+        // bf16 = upper 16 bits of f32 with round-to-nearest-even.
+        let f32_bits = v.to_bits();
+        let rounding_bias = 0x7FFF + ((f32_bits >> 16) & 1);
+        let bf16_bits = ((f32_bits + rounding_bias) >> 16) as u16;
+        out.extend_from_slice(&bf16_bits.to_le_bytes());
+    }
+    out
+}
+
+#[allow(dead_code)] // Phase D wiring lands in cycle 55 step 13+
+fn f32_to_bf16(raw: &[u8]) -> Vec<u8> {
+    let n = raw.len() / 4;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let f32_bits = u32::from_le_bytes(raw[4 * i..4 * i + 4].try_into().unwrap());
+        // Round-to-nearest-even narrowing
+        let rounding_bias = 0x7FFF + ((f32_bits >> 16) & 1);
+        let bf16_bits = ((f32_bits + rounding_bias) >> 16) as u16;
+        out.extend_from_slice(&bf16_bits.to_le_bytes());
+    }
+    out
+}
+
+#[allow(dead_code)] // Phase D wiring lands in cycle 55 step 13+
+fn fp8e4m3_to_bf16(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() * 2);
+    for &b in raw {
+        let f32_bits = fp8_e4m3_to_f32(b).to_bits();
+        let rounding_bias = 0x7FFF + ((f32_bits >> 16) & 1);
+        let bf16_bits = ((f32_bits + rounding_bias) >> 16) as u16;
+        out.extend_from_slice(&bf16_bits.to_le_bytes());
+    }
+    out
+}
+
 fn fp8e4m3_to_f16(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len() * 2);
     for &b in raw {

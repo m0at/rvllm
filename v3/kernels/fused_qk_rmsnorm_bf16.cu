@@ -22,6 +22,7 @@
 // K output: [num_tokens, num_kv_heads, head_dim]  (can alias input)
 // q_gamma, k_gamma: [head_dim]
 
+#include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
 extern "C"
@@ -30,8 +31,8 @@ __global__ void fused_qk_rmsnorm_bf16_kernel(
     const __nv_bfloat16* __restrict__ k_in,
     __nv_bfloat16* __restrict__ q_out,
     __nv_bfloat16* __restrict__ k_out,
-    const __nv_bfloat16* __restrict__ q_gamma,
-    const __nv_bfloat16* __restrict__ k_gamma,
+    const __half* __restrict__ q_gamma,
+    const __half* __restrict__ k_gamma,
     int num_tokens,
     int num_heads,
     int num_kv_heads,
@@ -50,7 +51,7 @@ __global__ void fused_qk_rmsnorm_bf16_kernel(
 
     const __nv_bfloat16* src = is_q ? q_in : k_in;
     __nv_bfloat16* dst = is_q ? q_out : k_out;
-    const __nv_bfloat16* gamma = is_q ? q_gamma : k_gamma;
+    const __half* gamma = is_q ? q_gamma : k_gamma;
 
     const int offset = (token * n_heads_this + head_local) * head_dim;
 
@@ -88,7 +89,7 @@ __global__ void fused_qk_rmsnorm_bf16_kernel(
     // Apply: out[i] = gamma[i] * x[i] * rms_inv
     for (int i = tid; i < head_dim; i += blockDim.x) {
         float v = __bfloat162float(src[offset + i]);
-        float g = __bfloat162float(gamma[i]);
+        float g = __half2float(gamma[i]);
         dst[offset + i] = __float2bfloat16(v * rms_inv * g);
     }
 }
