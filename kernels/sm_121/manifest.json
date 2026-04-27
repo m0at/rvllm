@@ -186,6 +186,11 @@
       "path": "fused_rope_partial_fp8kv.ptx",
       "sha256": "8f9200f4742875d0e75b4e1480cab280e6a1a09cc7a82c968c1b0680457f903c"
     },
+    "fused_rope_partial_fp8kv_bf16in": {
+      "bytes": 15544,
+      "path": "fused_rope_partial_fp8kv_bf16in.ptx",
+      "sha256": "6f3339dbc211158da51f5c4fd51011cc96acff18cde6dba54e7f2211ba4e9802"
+    },
     "fused_rope_partial_nvfp4kv": {
       "bytes": 41855,
       "path": "fused_rope_partial_nvfp4kv.ptx",
@@ -287,5 +292,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "43eb889"
+  "revision": "77e1d1c"
 }

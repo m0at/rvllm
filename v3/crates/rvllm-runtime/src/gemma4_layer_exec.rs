@@ -590,6 +590,10 @@ pub struct Gemma4LayerKernels {
     /// the QKV chain is bf16-native (eventually the only path).
     pub fused_qk_rmsnorm_bf16: KernelFn,
     pub fused_rope_partial_fp8kv: KernelFn,
+    /// Cycle 55 step 7 (Phase B): bf16-input sibling of
+    /// `fused_rope_partial_fp8kv`. Same launch ABI; Q/K/V inputs flip
+    /// f16 → bf16. cos/sin tables stay f16 (Phase D revisits).
+    pub fused_rope_partial_fp8kv_bf16in: KernelFn,
     /// RoPE + NVFP4-packed KV write. `None` when the NVFP4 PTX
     /// module isn't built into `$KERNELS_DIR` (pre-NVFP4 branches
     /// or TPU-focused kernel trees). Populated iff

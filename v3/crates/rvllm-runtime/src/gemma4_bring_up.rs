@@ -93,6 +93,9 @@ pub struct Gemma4FusedModules {
     pub rmsnorm_mod: LoadedModule,
     pub rmsnorm_inplace_mod: LoadedModule,
     pub rope_mod: LoadedModule,
+    /// Cycle 55 step 7 (Phase B): bf16-input sibling of rope_mod
+    /// (`fused_rope_partial_fp8kv_bf16in`).
+    pub rope_partial_fp8kv_bf16in_mod: LoadedModule,
     pub gelu_mod: LoadedModule,
     pub argmax_mod: LoadedModule,
     pub qk_norm_mod: LoadedModule,
@@ -123,6 +126,10 @@ pub struct Gemma4FusedModules {
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
     pub fn_rope_partial_fp8kv: KernelFn,
+    /// Cycle 55 step 7: bf16-input sibling of fn_rope_partial_fp8kv.
+    /// Same launch ABI; Q/K/V activation inputs flip f16 → bf16 while
+    /// FP8 KV cache write side stays unchanged (FP8 by design).
+    pub fn_rope_partial_fp8kv_bf16in: KernelFn,
     pub fn_gelu_mul: KernelFn,
     pub fn_argmax: KernelFn,
     pub fn_qk_rmsnorm: KernelFn,
@@ -3893,6 +3900,7 @@ impl Gemma4Bringup {
             fused_qk_rmsnorm: self.fused.fn_qk_rmsnorm,
             fused_qk_rmsnorm_bf16: self.fused.fn_qk_rmsnorm_bf16,
             fused_rope_partial_fp8kv: self.fused.fn_rope_partial_fp8kv,
+            fused_rope_partial_fp8kv_bf16in: self.fused.fn_rope_partial_fp8kv_bf16in,
             fused_rope_partial_nvfp4kv,
             fused_gelu_mul: self.fused.fn_gelu_mul,
             quantize_fp8_per_token: self.fused.fn_quantize,
@@ -3939,6 +3947,7 @@ fn load_gemma4_fused(
 ) -> Result<Gemma4FusedModules> {
     let rmsnorm_mod = loader.load_ptx("fused_rmsnorm_fp8_quant")?;
     let rope_mod = loader.load_ptx("fused_rope_partial_fp8kv")?;
+    let rope_partial_fp8kv_bf16in_mod = loader.load_ptx("fused_rope_partial_fp8kv_bf16in")?;
     let gelu_mod = loader.load_ptx("fused_gelu_mul_fp8_quant")?;
     let argmax_mod = loader.load_ptx("argmax")?;
     let qk_norm_mod = loader.load_ptx("fused_qk_rmsnorm")?;
@@ -3964,6 +3973,8 @@ fn load_gemma4_fused(
     let fn_rmsnorm_fp8_quant = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_quantize = rmsnorm_mod.get_function("quantize_fp8_per_token_kernel")?;
     let fn_rope_partial_fp8kv = rope_mod.get_function("fused_rope_partial_fp8kv_kernel")?;
+    let fn_rope_partial_fp8kv_bf16in = rope_partial_fp8kv_bf16in_mod
+        .get_function("fused_rope_partial_fp8kv_bf16in_kernel")?;
     let fn_gelu_mul = gelu_mod.get_function("fused_gelu_mul_fp8_quant_kernel")?;
     let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
     let fn_qk_rmsnorm = qk_norm_mod.get_function("fused_qk_rmsnorm_kernel")?;
@@ -4070,6 +4081,7 @@ fn load_gemma4_fused(
         rmsnorm_mod,
         rmsnorm_inplace_mod,
         rope_mod,
+        rope_partial_fp8kv_bf16in_mod,
         gelu_mod,
         argmax_mod,
         qk_norm_mod,
@@ -4098,6 +4110,7 @@ fn load_gemma4_fused(
         fn_rmsnorm_fp8_quant,
         fn_quantize,
         fn_rope_partial_fp8kv,
+        fn_rope_partial_fp8kv_bf16in,
         fn_gelu_mul,
         fn_argmax,
         fn_qk_rmsnorm,
