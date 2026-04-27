@@ -3213,13 +3213,24 @@ impl Gemma4Bringup {
                         residual_ptr + row0 * bytes_per_row,
                         ((n_rows as u64) * bytes_per_row) as usize,
                     );
+                    // Cycle 54 step 4: bf16-aware decode. When the residual
+                    // chain is bf16 (RVLLM_RESIDUAL_BF16=1), reinterpret
+                    // the same u16 buffer through the bf16 unpacker so the
+                    // dump shows real magnitudes. Single env probe per dump
+                    // batch — cheap.
+                    let to_f32: fn(u16) -> f32 = if bf16_residual_enabled() {
+                        crate::bring_up::bf16_to_f32
+                    } else {
+                        crate::bring_up::f16_to_f32
+                    };
+                    let dt_tag = if bf16_residual_enabled() { "bf16" } else { "f16" };
                     let mut norms = String::new();
                     let mut nan_or_inf = false;
                     for r in 0..n_rows as usize {
                         let mut sum_sq = 0.0f64;
                         let mut amax = 0.0f32;
                         for c in 0..hidden as usize {
-                            let f = crate::bring_up::f16_to_f32(buf[r * hidden as usize + c]);
+                            let f = to_f32(buf[r * hidden as usize + c]);
                             if !f.is_finite() { nan_or_inf = true; }
                             sum_sq += (f as f64) * (f as f64);
                             if f.abs() > amax { amax = f.abs(); }
@@ -3229,10 +3240,10 @@ impl Gemma4Bringup {
                     }
                     let last_row_off = (n_rows as usize - 1) * hidden as usize;
                     let last4: Vec<f32> = (hidden as usize - 4..hidden as usize)
-                        .map(|i| crate::bring_up::f16_to_f32(buf[last_row_off + i])).collect();
+                        .map(|i| to_f32(buf[last_row_off + i])).collect();
                     eprintln!(
-                        "[res-norm] L{} chunk{}{}{} last4={:?}",
-                        layer_idx, chunk_idx,
+                        "[res-norm/{}] L{} chunk{}{}{} last4={:?}",
+                        dt_tag, layer_idx, chunk_idx,
                         if nan_or_inf { " NAN/INF" } else { "" },
                         norms, last4,
                     );

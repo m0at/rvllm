@@ -1506,6 +1506,12 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits((sign << 31) | (f32_exp << 23) | (mant << 13))
 }
 
+#[cfg(feature = "cuda")]
+#[inline(always)]
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let rmsnorm_mod = loader.load_ptx("fused_rmsnorm_fp8_quant")?;
     let rope_mod = loader.load_ptx("fused_rope_cache_fp8kv")?;
