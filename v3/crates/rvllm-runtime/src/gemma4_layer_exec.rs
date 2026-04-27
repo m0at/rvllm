@@ -648,6 +648,8 @@ pub struct Gemma4LayerKernels {
     pub fused_norm_add_residual_bf16_f16in: KernelFn,
     pub fused_rmsnorm_fp8_quant_bf16in: KernelFn,
     pub fused_qkv_rmsnorm: KernelFn,
+    /// Cycle 55 step 11 (Phase B): bf16 sibling of `fused_qkv_rmsnorm`.
+    pub fused_qkv_rmsnorm_bf16: KernelFn,
     pub scale_cols_f16: KernelFn,
     /// F16-input fp8_gemv kernel (`fp8_gemv_blockwise_wpr_native_f16in_kernel`).
     /// `None` on non-Blackwell targets — the kernel is gated on

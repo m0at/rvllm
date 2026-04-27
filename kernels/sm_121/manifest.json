@@ -36,6 +36,11 @@
       "path": "compute_qkv_scales.ptx",
       "sha256": "2cdb98d40896b958fda55ecd6dac7bc32eb6921bf321d3ee25a37c3cf2d43e15"
     },
+    "embedding_gather_bf16": {
+      "bytes": 4561,
+      "path": "embedding_gather_bf16.ptx",
+      "sha256": "a2bc6bde4cb5802688d590bab3a7ed56ec088721f0b7933590573d466069d392"
+    },
     "embedding_gather_f16": {
       "bytes": 4548,
       "path": "embedding_gather_f16.ptx",
@@ -176,6 +181,11 @@
       "path": "fused_qkv_rmsnorm.ptx",
       "sha256": "dc542fd5ebb6809a2ea15c185d804a55ba5986ff3640a40e22c4978cc2ea34e9"
     },
+    "fused_qkv_rmsnorm_bf16": {
+      "bytes": 6195,
+      "path": "fused_qkv_rmsnorm_bf16.ptx",
+      "sha256": "7e225368c88ac1f1a3adcf4e5db56066051a705fa322f7f7145a9f213928f3aa"
+    },
     "fused_rmsnorm_fp8_quant": {
       "bytes": 39669,
       "path": "fused_rmsnorm_fp8_quant.ptx",
@@ -312,5 +322,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "ffc69dc"
+  "revision": "b872160"
 }

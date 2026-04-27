@@ -166,7 +166,12 @@ pub struct Gemma4FusedModules {
     pub fn_fused_norm_add_residual_f16in: KernelFn,
     pub fused_norm_add_residual_f16_mod: LoadedModule,
     pub fn_fused_qkv_rmsnorm: KernelFn,
+    /// Cycle 55 step 11 (Phase B): bf16 sibling of fn_fused_qkv_rmsnorm.
+    /// Same launch ABI; Q/K/V/gamma all flip f16 → bf16.
+    pub fn_fused_qkv_rmsnorm_bf16: KernelFn,
     pub fused_qkv_rmsnorm_mod: LoadedModule,
+    /// Cycle 55 step 11 (Phase B): bf16-typed sibling of fused_qkv_rmsnorm_mod.
+    pub fused_qkv_rmsnorm_bf16_mod: LoadedModule,
     pub fn_scale_cols_f16: KernelFn,
     pub scale_cols_f16_mod: LoadedModule,
 
@@ -3936,6 +3941,7 @@ impl Gemma4Bringup {
             fused_norm_add_residual_bf16_f16in: self.fused.fn_fused_norm_add_residual_bf16_f16in,
             fused_rmsnorm_fp8_quant_bf16in: self.fused.fn_fused_rmsnorm_fp8_quant_bf16in,
             fused_qkv_rmsnorm: self.fused.fn_fused_qkv_rmsnorm,
+            fused_qkv_rmsnorm_bf16: self.fused.fn_fused_qkv_rmsnorm_bf16,
             scale_cols_f16: self.fused.fn_scale_cols_f16,
             fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,
             fp8_gemv_wpr_native_bf16in: self.fused.fn_fp8_gemv_wpr_native_bf16in,
@@ -4059,6 +4065,9 @@ fn load_gemma4_fused(
     let fused_qkv_rmsnorm_mod = loader.load_ptx("fused_qkv_rmsnorm")?;
     let fn_fused_qkv_rmsnorm =
         fused_qkv_rmsnorm_mod.get_function("fused_qkv_rmsnorm_kernel")?;
+    let fused_qkv_rmsnorm_bf16_mod = loader.load_ptx("fused_qkv_rmsnorm_bf16")?;
+    let fn_fused_qkv_rmsnorm_bf16 =
+        fused_qkv_rmsnorm_bf16_mod.get_function("fused_qkv_rmsnorm_bf16_kernel")?;
 
     let scale_cols_f16_mod = loader.load_ptx("scale_cols_f16")?;
     let fn_scale_cols_f16 = scale_cols_f16_mod.get_function("scale_cols_f16_kernel")?;
@@ -4149,7 +4158,9 @@ fn load_gemma4_fused(
         fn_fused_norm_add_residual_f16in,
         fused_norm_add_residual_f16_mod,
         fn_fused_qkv_rmsnorm,
+        fn_fused_qkv_rmsnorm_bf16,
         fused_qkv_rmsnorm_mod,
+        fused_qkv_rmsnorm_bf16_mod,
         fn_scale_cols_f16,
         scale_cols_f16_mod,
         fp8_gemv_mod,
