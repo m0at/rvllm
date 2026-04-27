@@ -765,6 +765,83 @@ impl LogitSoftcapLaunch {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cycle 45 step 4.5a: AWQ INT4 W4A16 GEMV (compressed-tensors layout).
+//
+// Kernel: `awq_int4_gemv_f16_kernel` (kernels/awq_int4_gemv_f16.cu).
+// One block per output row, 32 threads (one warp), warp-shuffle reduce.
+//
+// Q|K|V scratch composition: caller can pass an offset device pointer
+// in `output_f16` so three sequential launches (Q, K, V) write into one
+// contiguous Q|K|V scratch buffer at the right offsets — this preserves
+// the fused QKV RMSNorm/attention path that consumes that buffer
+// (gemma4_layer_exec.rs:789). The kernel itself writes `output[n]` for
+// `n ∈ [0, N)`; pointer arithmetic at the call site does the rest.
+// No kernel modification needed.
+// ---------------------------------------------------------------------------
+
+pub struct AwqInt4GemvF16Launch {
+    pub n: u32,
+    pub k: u32,
+    pub group_size: u32,
+}
+
+impl AwqInt4GemvF16Launch {
+    /// # Safety
+    /// All device pointers must be valid for the kernel's duration.
+    /// `weight_packed` is `[N, K/8]` int32; `weight_scale` is
+    /// `[N, K/group_size]` bf16; `weight_zero_point` is
+    /// `[N/8, K/group_size]` int32; `activation` is `[K]` f16;
+    /// `output_f16` writes `[N]` f16 — caller may pass a non-zero
+    /// offset into a larger Q|K|V scratch.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        activation: u64,
+        weight_packed: u64,
+        weight_scale: u64,
+        weight_zero_point: u64,
+        output_f16: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut act = activation;
+        let mut w   = weight_packed;
+        let mut s   = weight_scale;
+        let mut z   = weight_zero_point;
+        let mut out = output_f16;
+        let mut n_i = self.n as i32;
+        let mut k_i = self.k as i32;
+        let mut g_i = self.group_size as i32;
+        let args = [
+            (&mut act) as *mut u64 as *mut core::ffi::c_void,
+            (&mut w)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut s)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut z)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut out) as *mut u64 as *mut core::ffi::c_void,
+            (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut g_i) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        // gridDim.x = N (one block per row), blockDim.x = 32 (single warp).
+        let grid = (self.n, 1u32, 1u32);
+        let block = (32u32, 1u32, 1u32);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+
+    /// Validate launch geometry. K must be divisible by 8 (INT4 packing
+    /// along K) and by group_size. All dims > 0.
+    pub fn validate(&self) -> Result<()> {
+        if self.n == 0 { return Err(invalid("n", "must be > 0")); }
+        if self.k == 0 { return Err(invalid("k", "must be > 0")); }
+        if self.group_size == 0 { return Err(invalid("group_size", "must be > 0")); }
+        if self.k % 8 != 0 { return Err(invalid("k", "must be multiple of 8 (INT4 packing)")); }
+        if self.k % self.group_size != 0 {
+            return Err(invalid("k", "must be multiple of group_size"));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +925,33 @@ mod tests {
             head_dim: 256,
             eps: 1e-6,
         };
+        assert!(l.validate().is_err());
+    }
+
+    // === Cycle 45 step 4.5a AWQ launcher tests ===
+
+    #[test]
+    fn awq_int4_gemv_accepts_canonical_gemma4_q_proj() {
+        // Real Gemma 4 31B q_proj: N=8192, K=5376, group_size=128.
+        let l = AwqInt4GemvF16Launch { n: 8192, k: 5376, group_size: 128 };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn awq_int4_gemv_rejects_k_not_multiple_of_8() {
+        let l = AwqInt4GemvF16Launch { n: 1024, k: 5377, group_size: 128 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_int4_gemv_rejects_k_not_multiple_of_group() {
+        let l = AwqInt4GemvF16Launch { n: 1024, k: 200, group_size: 128 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_int4_gemv_rejects_zero_dim() {
+        let l = AwqInt4GemvF16Launch { n: 0, k: 5376, group_size: 128 };
         assert!(l.validate().is_err());
     }
 }
