@@ -417,8 +417,9 @@ pub fn m2_decode_execution_blocker(plan: &M2RustPrefillDecodePlan) -> Option<&'s
 pub fn m2_decode_mlir_execution_blocker(mlir: &str) -> Option<&'static str> {
     if mlir.contains("rvllm.kind = \"m2_decode_graph\"")
         && mlir.contains("rvllm.lowering = \"rust_xla_custom_call\"")
+        && mlir.contains("\\22body\\22: \\22\\22")
     {
-        Some("decode MLIR is a Rust+XLA artifact, but M2 fused decode executable custom-call bodies are not linked yet; execution has no Python/JAX fallback")
+        Some("decode MLIR is a Rust+XLA artifact, but M2 fused decode executable custom-call bodies are not linked yet; pass serialized Mosaic bytecode with --decode-layer-body; no Python/JAX fallback")
     } else {
         None
     }

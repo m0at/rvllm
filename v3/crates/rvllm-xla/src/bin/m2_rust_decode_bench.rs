@@ -7,9 +7,9 @@ use rvllm_xla::m2_decode_bench::{
 };
 use rvllm_xla::m2_runtime::{m2_decode_mlir_execution_blocker, M2RuntimeMode};
 use rvllm_xla::{
-    m2_decode_graph_mlir, m2_decode_smoke_mlir, plan_m2_rust_decode_bench, M2GraphAbi,
-    M2GraphShape, M2RustDecodeBenchConfig, M2WeightUploadPlan, PjrtElementType, XlaArtifact,
-    XlaTensorSpec, M2_VOCAB,
+    m2_decode_graph_mlir_with_mosaic_body, m2_decode_smoke_mlir, plan_m2_rust_decode_bench,
+    M2GraphAbi, M2GraphShape, M2RustDecodeBenchConfig, M2WeightUploadPlan, PjrtElementType,
+    TpuMosaicSerializedBody, XlaArtifact, XlaTensorSpec, M2_VOCAB,
 };
 
 #[cfg(feature = "tpu")]
@@ -23,6 +23,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         check_m2_rust_decode_bench_json(&json)?;
         eprintln!("checked {}", path.display());
         return Ok(());
+    }
+    if args.runtime_mode != M2RuntimeMode::PlanningOnly
+        && !args.native_smoke
+        && args.decode_layer_body.is_none()
+    {
+        return Err("real Rust M2 compile/execute needs --decode-layer-body FILE containing serialized Mosaic bytecode; use --native-smoke for the zero-logits PJRT smoke".into());
     }
     let artifacts =
         if args.emit_decode_artifacts || args.runtime_mode != M2RuntimeMode::PlanningOnly {
@@ -84,11 +90,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct DecodeArtifact {
     mlir: String,
+    #[cfg_attr(not(feature = "tpu"), allow(dead_code))]
     mlir_path: PathBuf,
 }
 
 fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn std::error::Error>> {
     fs::create_dir_all(&args.artifact_dir)?;
+    let decode_layer_body = match &args.decode_layer_body {
+        Some(path) => {
+            let bytes = fs::read(path)?;
+            let body = TpuMosaicSerializedBody::from_serialized_bytecode(&bytes)?;
+            eprintln!(
+                "linked serialized Mosaic decode-layer body {} ({} bytes)",
+                path.display(),
+                body.byte_len()
+            );
+            Some(body)
+        }
+        None => None,
+    };
     let mut out = Vec::with_capacity(args.batches.len());
     for &batch in &args.batches {
         let shape = M2GraphShape::decode(batch, args.ctx, kv_bytes_per_elem(&args.kv_cache)?);
@@ -101,7 +121,12 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
             let weights = M2WeightUploadPlan::from_index_dir(&args.model_dir, &abi)?;
             let arena = weights.flat_arena(128)?;
             weight_arena_bytes = arena.total_bytes;
-            m2_decode_graph_mlir("main", &shape, &arena)?
+            m2_decode_graph_mlir_with_mosaic_body(
+                "main",
+                &shape,
+                &arena,
+                decode_layer_body.as_ref(),
+            )?
         };
         let mlir_name = format!("m2_decode_b{batch}.mlir");
         let json_name = format!("m2_decode_b{batch}.json");
@@ -178,6 +203,7 @@ struct Args {
     artifact_dir: PathBuf,
     out: Option<PathBuf>,
     check: Option<PathBuf>,
+    decode_layer_body: Option<PathBuf>,
     emit_decode_artifacts: bool,
     native_smoke: bool,
     runtime_mode: M2RuntimeMode,
@@ -199,6 +225,7 @@ impl Args {
             artifact_dir: PathBuf::from("tpu/out/m2/rust_xla_plan"),
             out: None,
             check: None,
+            decode_layer_body: None,
             emit_decode_artifacts: false,
             native_smoke: false,
             runtime_mode: M2RuntimeMode::PlanningOnly,
@@ -230,6 +257,14 @@ impl Args {
                 "--check" => {
                     i += 1;
                     out.check = Some(PathBuf::from(value(&args, i, "--check")?));
+                }
+                "--decode-layer-body" => {
+                    i += 1;
+                    out.decode_layer_body = Some(PathBuf::from(value(
+                        &args,
+                        i,
+                        "--decode-layer-body",
+                    )?));
                 }
                 "--emit-decode-artifacts" => out.emit_decode_artifacts = true,
                 "--native-smoke" => {
@@ -331,7 +366,7 @@ fn kv_bytes_per_elem(kv_cache: &str) -> Result<usize, String> {
 }
 
 fn usage() -> String {
-    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--moe-impl NAME] [--ppl-text FILE] [--prompt TEXT] [--gen-tokens N]".to_string()
+    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--decode-layer-body FILE] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--moe-impl NAME] [--ppl-text FILE] [--prompt TEXT] [--gen-tokens N]".to_string()
 }
 
 #[cfg(test)]
@@ -350,6 +385,16 @@ mod tests {
         assert!(args.emit_decode_artifacts);
         assert_eq!(args.runtime_mode, M2RuntimeMode::CompileOnly);
         assert_eq!(args.batches, vec![1, 8]);
+    }
+
+    #[test]
+    fn parses_decode_layer_body_path() {
+        let args = Args::parse(vec![
+            "--decode-layer-body".to_string(),
+            "/tmp/layer.mlirbc".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(args.decode_layer_body, Some(PathBuf::from("/tmp/layer.mlirbc")));
     }
 
     #[test]

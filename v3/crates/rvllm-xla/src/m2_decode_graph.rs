@@ -4,7 +4,10 @@ use rvllm_core::{ConfigError, Result, RvllmError};
 use rvllm_loader::M2Projection;
 
 use crate::m2_graph_abi::{M2DecodeLayerArenaOffsets, M2DecodeLayerCustomCallAbi};
-use crate::m2_tpu_custom_call::{tpu_custom_call_backend_config, TPU_CUSTOM_CALL_TARGET};
+use crate::m2_tpu_custom_call::{
+    tpu_custom_call_backend_config, tpu_custom_call_backend_config_for_body,
+    TpuMosaicSerializedBody, TPU_CUSTOM_CALL_TARGET,
+};
 use crate::{
     M2GraphPhase, M2GraphShape, M2Nvfp4ProjectionAbi, M2WeightArenaEntry, M2WeightArenaPlan,
     PjrtElementType, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_LAYERS, M2_VOCAB,
@@ -228,6 +231,15 @@ pub fn m2_decode_graph_mlir(
     shape: &M2GraphShape,
     arena: &M2WeightArenaPlan,
 ) -> Result<String> {
+    m2_decode_graph_mlir_with_mosaic_body(kernel_name, shape, arena, None)
+}
+
+pub fn m2_decode_graph_mlir_with_mosaic_body(
+    kernel_name: &str,
+    shape: &M2GraphShape,
+    arena: &M2WeightArenaPlan,
+    decode_layer_body: Option<&TpuMosaicSerializedBody>,
+) -> Result<String> {
     shape.validate()?;
     if shape.phase != M2GraphPhase::Decode {
         return Err(invalid("phase", "expected decode graph shape"));
@@ -236,7 +248,7 @@ pub fn m2_decode_graph_mlir(
         return Err(invalid("kernel_name", "must be an MLIR symbol"));
     }
     let plan = M2DecodeGraphPlan::from_arena(arena)?;
-    let body = emit_decode_body(shape, arena, &plan)?;
+    let body = emit_decode_body(shape, arena, &plan, decode_layer_body)?;
     Ok(format!(
         r#"module attributes {{rvllm.kind = "m2_decode_graph"}} {{
   func.func @{kernel_name}(
@@ -320,6 +332,7 @@ fn emit_decode_body(
     shape: &M2GraphShape,
     arena: &M2WeightArenaPlan,
     plan: &M2DecodeGraphPlan,
+    decode_layer_body: Option<&TpuMosaicSerializedBody>,
 ) -> Result<String> {
     let hidden_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_HIDDEN);
     let kv_ty = format!("tensor<{}xi8>", shape.kv_cache_bytes());
@@ -327,7 +340,6 @@ fn emit_decode_body(
     let token_ty = format!("tensor<{}xi32>", shape.batch);
     let logits_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_VOCAB);
     let mut out = String::new();
-    let empty_mosaic_body = "";
 
     out.push_str(&format!(
         r#"    %embed_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
@@ -351,7 +363,7 @@ fn emit_decode_body(
             &token_ty,
             &kv_ty,
             &arena_ty,
-            empty_mosaic_body,
+            decode_layer_body,
         )?);
         hidden = next_hidden;
         kv = next_kv;
@@ -382,9 +394,13 @@ fn emit_layer_call(
     token_ty: &str,
     kv_ty: &str,
     arena_ty: &str,
-    mosaic_body_b64: &str,
+    decode_layer_body: Option<&TpuMosaicSerializedBody>,
 ) -> Result<String> {
     let target = layer.custom_call_abi(shape)?.call.target();
+    let backend_config = match decode_layer_body {
+        Some(body) => tpu_custom_call_backend_config_for_body(body),
+        None => tpu_custom_call_backend_config(""),
+    };
     Ok(format!(
         r#"    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, %weight_arena) {{
       call_target_name = "{tpu_custom_call}",
@@ -398,7 +414,7 @@ fn emit_layer_call(
     }} : ({hidden_ty}, {token_ty}, {kv_ty}, {arena_ty}) -> ({hidden_ty}, {kv_ty})
 "#,
         tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
-        backend_config = tpu_custom_call_backend_config(mosaic_body_b64),
+        backend_config = backend_config,
         target = target,
         src = src,
         kv_src = kv_src,
@@ -615,6 +631,20 @@ mod tests {
         assert!(mlir.contains("rvllm.ctx = 2048 : i64"));
         assert!(!mlir.contains("target=rvllm.m2.decode_layer.fused_attention_nvfp4_moe"));
         assert!(!mlir.contains("Contract body placeholder"));
+    }
+
+    #[test]
+    fn can_link_serialized_decode_layer_body_into_all_layer_calls() {
+        let shape = M2GraphShape::decode(8, 2048, 1);
+        let arena = arena();
+        let body =
+            TpuMosaicSerializedBody::from_serialized_bytecode(&[0x4d, 0x4c, 0xef, 0x52])
+                .unwrap();
+        let mlir =
+            m2_decode_graph_mlir_with_mosaic_body("rvllm_m2_decode", &shape, &arena, Some(&body))
+                .unwrap();
+        assert_eq!(mlir.matches("\\22body\\22: \\22TUzvUg==\\22").count(), M2_NUM_LAYERS);
+        assert!(!mlir.contains("\\22body\\22: \\22\\22"));
     }
 
     #[test]

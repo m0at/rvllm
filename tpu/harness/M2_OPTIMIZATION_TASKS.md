@@ -59,6 +59,11 @@ Recorded int8-KV results:
   `needs_layout_passes` when no explicit device type is present. Plain textual
   MLIR or descriptor strings fail at PJRT compile with `Missing or invalid
   version attribute`, which is exactly the current Rust placeholder failure.
+- [x] Add the Rust-side serialized body linker: `TpuMosaicSerializedBody`
+  validates that the input is non-text bytecode, base64-encodes it without a
+  Python dependency, links it into all 62 decode-layer `tpu_custom_call`s, and
+  makes real compile/execute require `--decode-layer-body FILE` instead of
+  feeding empty placeholder bodies to TPU PJRT.
 - [x] Add fused-MoE expert-directory metadata to the Rust decode graph:
   every `rvllm.m2.decode_layer` now carries a dense `256x13xi64` directory of
   W1/W2/W3 packed, scale, global-scale, and optional input-scale offsets. This
