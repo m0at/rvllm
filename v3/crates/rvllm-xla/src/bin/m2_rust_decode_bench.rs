@@ -24,6 +24,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("checked {}", path.display());
         return Ok(());
     }
+    let artifacts =
+        if args.emit_decode_artifacts || args.runtime_mode != M2RuntimeMode::PlanningOnly {
+            write_decode_artifacts(&args)?
+        } else {
+            Vec::new()
+        };
+    let mut compiled = false;
+    match args.runtime_mode {
+        M2RuntimeMode::PlanningOnly => {}
+        M2RuntimeMode::CompileOnly => {
+            compile_decode_artifacts(&artifacts)?;
+            compiled = true;
+        }
+        M2RuntimeMode::Execute => {
+            if let Some(reason) = artifacts
+                .iter()
+                .find_map(|artifact| m2_decode_mlir_execution_blocker(&artifact.mlir))
+            {
+                return Err(reason.into());
+            }
+            return Err("m2_rust_decode_bench execute mode is not wired until decode custom-call bodies are linked".into());
+        }
+    }
+
     let mut report = plan_m2_rust_decode_bench(&M2RustDecodeBenchConfig {
         model_dir: args.model_dir.clone(),
         batches: args.batches.clone(),
@@ -38,30 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prompt: args.prompt.clone(),
         gen_tokens: args.gen_tokens,
     })?;
-
-    let artifacts =
-        if args.emit_decode_artifacts || args.runtime_mode != M2RuntimeMode::PlanningOnly {
-            write_decode_artifacts(&args)?
-        } else {
-            Vec::new()
-        };
-    match args.runtime_mode {
-        M2RuntimeMode::PlanningOnly => {}
-        M2RuntimeMode::CompileOnly => {
-            compile_decode_artifacts(&artifacts)?;
-            for item in &mut report.sweep {
-                item.status = "compiled";
-                item.error = None;
-            }
-        }
-        M2RuntimeMode::Execute => {
-            if let Some(reason) = artifacts
-                .iter()
-                .find_map(|artifact| m2_decode_mlir_execution_blocker(&artifact.mlir))
-            {
-                return Err(reason.into());
-            }
-            return Err("m2_rust_decode_bench execute mode is not wired until decode custom-call bodies are linked".into());
+    if compiled {
+        for item in &mut report.sweep {
+            item.status = "compiled";
+            item.error = None;
         }
     }
 
