@@ -528,13 +528,14 @@ pub fn compile_options_proto(num_replicas: usize, num_partitions: usize) -> Resu
     for partition in 0..num_partitions {
         let mut device_ids = Vec::new();
         for replica in 0..num_replicas {
-            push_varint_field(
+            push_varint(
                 &mut device_ids,
-                1,
                 (replica * num_partitions + partition) as u64,
             );
         }
-        push_bytes_field(&mut comp_devices, 3, &device_ids);
+        let mut comp_device = Vec::new();
+        push_bytes_field(&mut comp_device, 1, &device_ids);
+        push_bytes_field(&mut comp_devices, 3, &comp_device);
     }
 
     let mut device_assignment = Vec::new();
@@ -543,13 +544,13 @@ pub fn compile_options_proto(num_replicas: usize, num_partitions: usize) -> Resu
     device_assignment.extend_from_slice(&comp_devices);
 
     let mut exec_build_options = Vec::new();
-    push_varint_field(&mut exec_build_options, 1, num_replicas as u64);
-    push_varint_field(&mut exec_build_options, 2, num_partitions as u64);
-    push_varint_field(&mut exec_build_options, 3, 1);
-    push_bytes_field(&mut exec_build_options, 6, &device_assignment);
+    push_varint_field(&mut exec_build_options, 4, num_replicas as u64);
+    push_varint_field(&mut exec_build_options, 5, num_partitions as u64);
+    push_varint_field(&mut exec_build_options, 6, 1);
+    push_bytes_field(&mut exec_build_options, 9, &device_assignment);
 
     let mut compile_options = Vec::new();
-    push_bytes_field(&mut compile_options, 4, &exec_build_options);
+    push_bytes_field(&mut compile_options, 3, &exec_build_options);
     Ok(compile_options)
 }
 
@@ -582,15 +583,15 @@ mod tests {
         assert_eq!(
             one,
             vec![
-                0x22, 0x10, 0x08, 0x01, 0x10, 0x01, 0x18, 0x01, 0x32, 0x08, 0x08, 0x01, 0x10, 0x01,
-                0x1a, 0x02, 0x08, 0x00
+                0x1a, 0x11, 0x20, 0x01, 0x28, 0x01, 0x30, 0x01, 0x4a, 0x09, 0x08, 0x01, 0x10, 0x01,
+                0x1a, 0x03, 0x0a, 0x01, 0x00
             ]
         );
 
         let eight = compile_options_proto(1, 8).unwrap();
-        assert_eq!(eight[0], 0x22);
-        assert_eq!(eight[1], 0x2c);
-        assert!(eight.windows(2).any(|w| w == [0x10, 0x08]));
+        assert_eq!(eight[0], 0x1a);
+        assert_eq!(eight[1], 0x34);
+        assert!(eight.windows(2).any(|w| w == [0x28, 0x08]));
         assert!(compile_options_proto(0, 8).is_err());
         assert!(compile_options_proto(1, 0).is_err());
     }
