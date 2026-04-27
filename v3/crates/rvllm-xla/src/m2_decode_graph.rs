@@ -441,12 +441,17 @@ fn emit_decode_body(
             (None, None)
         };
         let int8_call = int8_tile_name.is_some();
+        let call_dst = if int8_call {
+            format!("%h_l{}_w1_head", layer.layer)
+        } else {
+            next_hidden.clone()
+        };
         out.push_str(&emit_layer_call(
             shape,
             layer,
             &hidden,
             &layer_kv,
-            &next_hidden,
+            &call_dst,
             &next_layer_kv,
             &hidden_ty,
             &token_ty,
@@ -456,6 +461,21 @@ fn emit_decode_body(
             int8_row_scale_name.as_deref(),
         )?);
         if int8_call {
+            let start_batch = format!("%h_l{}_w1_start_batch", layer.layer);
+            let start_col = format!("%h_l{}_w1_start_col", layer.layer);
+            out.push_str(&format!(
+                r#"    {start_batch} = stablehlo.constant dense<0> : tensor<i32>
+    {start_col} = stablehlo.constant dense<0> : tensor<i32>
+    {next_hidden} = "stablehlo.dynamic_update_slice"({hidden}, {call_dst}, {start_batch}, {start_col}) : ({hidden_ty}, tensor<{batch}x128xbf16>, tensor<i32>, tensor<i32>) -> {hidden_ty}
+"#,
+                start_batch = start_batch,
+                start_col = start_col,
+                next_hidden = next_hidden,
+                hidden = hidden,
+                call_dst = call_dst,
+                hidden_ty = hidden_ty,
+                batch = shape.batch,
+            ));
             hidden = next_hidden;
             continue;
         }
@@ -531,10 +551,9 @@ fn emit_layer_call(
       has_side_effect = false,
       api_version = 1 : i32,
       kernel_name = "{target}",
-      output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [0], operand_index = 0, operand_tuple_indices = []>],
       operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>],
       result_layouts = [dense<[1, 0]> : tensor<2xindex>]
-    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x128xi8>, tensor<128xf32>) -> {hidden_ty}
+    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x128xi8>, tensor<128xf32>) -> tensor<{batch}x128xbf16>
 "#,
             tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
             backend_config = backend_config,
@@ -552,6 +571,7 @@ fn emit_layer_call(
             expert_count = M2_NUM_EXPERTS,
             expert_cols = M2ExpertDirectoryEntry::I32_COLS,
             hidden_size = M2_HIDDEN,
+            batch = shape.batch,
         ));
     }
 
@@ -864,11 +884,11 @@ mod tests {
                 .count(),
             M2_NUM_LAYERS
         );
-        assert!(mlir.contains("%h_l0 = \"stablehlo.custom_call\""));
-        assert!(mlir.contains("output_operand_aliases = [#stablehlo.output_operand_alias"));
-        assert!(mlir.contains(") -> tensor<8x3072xbf16>"));
+        assert!(mlir.contains("%h_l0_w1_head = \"stablehlo.custom_call\""));
+        assert!(!mlir.contains("output_operand_aliases = [#stablehlo.output_operand_alias"));
+        assert!(mlir.contains(") -> tensor<8x128xbf16>"));
+        assert!(mlir.contains("%h_l0 = \"stablehlo.dynamic_update_slice\""));
         assert!(!mlir.contains("%kv_after_l0"));
-        assert!(!mlir.contains("%h_l0_w1_head"));
         assert!(!mlir.contains("\\22serialization_format\\22"));
     }
 
