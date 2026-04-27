@@ -1116,7 +1116,86 @@ fn fp8_e4m3_to_f32(b: u8) -> f32 {
     if s != 0 { -val } else { val }
 }
 
-/// Cycle 48 step 7b: walk every Gemma 4 layer's expected AWQ tensor
+/// Cycle 48 step 7c: per-layer AWQ geometry derived from
+/// `Gemma4Arch.layer_types[i]`. Shared between the validator
+/// (`validate_gemma4_awq_layout`) and the future upload path so they
+/// can't drift.
+///
+/// Returns `(q_out, kv_out, o_in, has_v_proj)`:
+///   Sliding: q = num_attention_heads * head_dim_sliding, kv similar;
+///            has_v_proj = true (all 7 linears in the checkpoint).
+///   Global:  q = num_attention_heads * head_dim_global,  kv similar;
+///            has_v_proj = false (`attention_k_eq_v=true`, K reused as V).
+pub(crate) fn awq_layer_shape_for(
+    arch: &crate::gemma4_arch::Gemma4Arch,
+    layer_idx: usize,
+) -> (usize, usize, usize, bool) {
+    match arch.layer_types[layer_idx] {
+        crate::gemma4_arch::Gemma4LayerType::SlidingAttention => {
+            let q = arch.num_attention_heads * arch.head_dim_sliding;
+            let kv = arch.num_kv_heads_sliding * arch.head_dim_sliding;
+            (q, kv, q, true)
+        }
+        crate::gemma4_arch::Gemma4LayerType::GlobalAttention => {
+            let q = arch.num_attention_heads * arch.head_dim_global;
+            let kv = arch.num_kv_heads_global * arch.head_dim_global;
+            (q, kv, q, false)
+        }
+    }
+}
+
+/// Cycle 48 step 7c roadmap (documented here so cycle 49 can pick up
+/// without re-deriving the plan from scratch):
+///
+/// 1. Drop the `UnsupportedQuantization` early-return at the
+///    validator-pass site in `load_gemma4_model`.
+///
+/// 2. Branch into a separate `load_gemma4_awq_model_inner` function
+///    that is structurally a near-twin of the FP8 path:
+///      a. embedding (sqrt(H) pre-scale, F16 upload)
+///      b. final_norm (F16 upload)
+///      c. lm_head: AwqConfig.ignore typically lists "lm_head" → loaded
+///         as-is via the existing CPU-quantize-to-FP8 fallback (the
+///         BF16 source matches the FP8 path's existing input shape)
+///      d. RoPE tables (sliding + global, identical to FP8 path)
+///      e. per-layer:
+///         * f16 norms (input/post_attn/pre_ff/post_ff_layernorm,
+///           q_norm, k_norm, layer_scalar) — identical to FP8 path
+///         * Build a byte_lookup closure over &shards + &tensors that
+///           returns (DType, Vec<usize>, Vec<u8>) per entry name. The
+///           bytes Vec is owned (memcpy from mmap) so the closure
+///           doesn't borrow shards across `upload_gemma4_awq_layer`'s
+///           internal allocations.
+///         * Derive per-layer geometry via `awq_layer_shape_for(arch, l)`.
+///           Build `AwqLayerShapes { q_out, kv_out, o_in, o_out: hidden,
+///           mlp_intermediate: arch.intermediate_size, hidden:
+///           arch.hidden_size }`.
+///         * Call `upload_gemma4_awq_layer(arena, &layer_prefix, &geom,
+///           &awq.scheme, &byte_lookup)` — gets back AwqLayerWeights.
+///         * For global layers, splice K's AwqLinearWeight into V's slot
+///           in the returned struct (mirrors the FP8 path's K-as-V
+///           reuse). Or: have a `upload_gemma4_awq_layer_global` that
+///           skips v_proj and copies q_proj-style — TBD in cycle 49.
+///         * Push `Gemma4LayerWeights { qkv: None, o_proj: None,
+///           gate_up: None, down_proj: None, qkv_f16: None,
+///           o_proj_f16: None, gate_up_f16: None, down_proj_f16: None,
+///           input_layernorm, ..., awq: Some(awq_layer_weights) }`.
+///      f. Build `Gemma4LoadedModel { embedding, lm_head_fp8,
+///         lm_head_f16, final_norm, rope_*, layers }`.
+///
+/// 3. Codex finding from cycle 48 step 7a: guard CUDA debug probes in
+///    `gemma4_layer_exec.rs` that unconditionally read `weights.qkv_scale`
+///    + `weights.qkv_fp8`. Add `if weights.qkv_fp8 != 0` around them
+///    so AWQ-only layers (qkv_fp8 = 0) don't trigger SIGSEGV in
+///    debug mode.
+///
+/// 4. Smoke test: load `ebircak/gemma-4-31B-it-4bit-W4A16-AWQ`, fire
+///    the same prompts the FP8 production path serves
+///    (`v3/scripts/bench_sm121.sh 1 1` + ZeroClaw weather query),
+///    confirm decoding works, measure tok/s. Target: 6-10 tok/s vs
+///    FP8 production 3.3-4.0.
+///
+/// Walk every Gemma 4 layer's expected AWQ tensor
 /// names against the shard index, validate dtype + shape per linear
 /// via `validate_awq_linear`. Sliding layers (`head_dim=256, kv=16`)
 /// have different N for q/k/v/o vs global layers
@@ -1139,24 +1218,10 @@ fn validate_gemma4_awq_layout(
     let prefix = &arch.weight_prefix;
     let mut total_validated = 0usize;
     for (i, lt) in arch.layer_types.iter().enumerate() {
-        // Per-layer geometry. Note: global layers have
-        // `attention_k_eq_v=true` — V projection is absent in the
-        // checkpoint, K is reused as V. Sliding layers carry all 7
-        // linears; global layers carry 6 (no v_proj). Codex review of
-        // 918d642 caught this — without the skip the validator falsely
-        // rejected real AWQ checkpoints.
-        let (q_out, kv_out, o_in, has_v_proj) = match lt {
-            crate::gemma4_arch::Gemma4LayerType::SlidingAttention => {
-                let q = arch.num_attention_heads * arch.head_dim_sliding;
-                let kv = arch.num_kv_heads_sliding * arch.head_dim_sliding;
-                (q, kv, q, true)
-            }
-            crate::gemma4_arch::Gemma4LayerType::GlobalAttention => {
-                let q = arch.num_attention_heads * arch.head_dim_global;
-                let kv = arch.num_kv_heads_global * arch.head_dim_global;
-                (q, kv, q, false) // attention_k_eq_v=true — K reused as V
-            }
-        };
+        // Per-layer geometry via the shared helper so the validator
+        // and the cycle-49 upload path can't drift on global v_proj
+        // handling.
+        let (q_out, kv_out, o_in, has_v_proj) = awq_layer_shape_for(arch, i);
         let layer_prefix = format!("{prefix}.layers.{i}");
         let mut layer_validated = 0usize;
         let mut lin = |name: &str, dense: [usize; 2]| -> std::result::Result<(), String> {
