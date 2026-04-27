@@ -272,6 +272,7 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
     let plan = M2DecodeGraphPlan::from_arena(arena)?;
     let body = emit_decode_body(shape, arena, &plan, decode_layer_body)?;
     let weight_arena_local_bytes = arena.total_bytes.div_ceil(8);
+    let int8_row_scale_arena_len = M2_NUM_LAYERS * 128;
     Ok(format!(
         r###"module attributes {{mhlo.frontend_attributes = {{xla.sdy.meshes = "{{mesh = #sdy.mesh<[\22expert\22=8]>}}"}}, mhlo.num_partitions = 8 : i32, mhlo.num_replicas = 1 : i32, rvllm.kind = "m2_decode_graph"}} {{
   func.func @{kernel_name}(
@@ -279,12 +280,13 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
       %positions: tensor<{batch}xi32>,
       %kv_cache: tensor<{kv_bytes}xi8>,
       %weight_arena: tensor<{weight_arena_local_bytes}xi8>,
+      %int8_row_scales: tensor<{int8_row_scale_arena_len}xf32>,
       %input_hidden: tensor<{batch}x{hidden}xbf16>,
       %final_norm: tensor<{hidden}xbf16>,
       %lm_head: tensor<{vocab}x{hidden}xbf16>)
       -> (tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>)
       attributes {{
-        rvllm.signature = "token_ids,positions,kv_cache,weight_arena,input_hidden,final_norm,lm_head -> logits,next_token,kv_cache",
+        rvllm.signature = "token_ids,positions,kv_cache,weight_arena,int8_row_scales,input_hidden,final_norm,lm_head -> logits,next_token,kv_cache",
         rvllm.phase = "decode",
         rvllm.batch = {batch} : i64,
         rvllm.ctx = {ctx} : i64,
@@ -294,6 +296,7 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
         rvllm.kv_cache_bytes = {kv_bytes} : i64,
         rvllm.weight_arena_bytes = {weight_arena_local_bytes} : i64,
         rvllm.weight_arena_total_bytes = {weight_bytes} : i64,
+        rvllm.int8_row_scale_arena_len = {int8_row_scale_arena_len} : i64,
         rvllm.weight_entries = {weight_entries} : i64,
         rvllm.weight_alignment = {weight_alignment} : i64,
         rvllm.weight_input_scales_missing = {missing_input_scales} : i64,
@@ -314,6 +317,7 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
         kv_bytes = shape.kv_cache_bytes(),
         weight_bytes = arena.total_bytes,
         weight_arena_local_bytes = weight_arena_local_bytes,
+        int8_row_scale_arena_len = int8_row_scale_arena_len,
         weight_entries = arena.entries.len(),
         weight_alignment = arena.alignment,
         missing_input_scales = plan.input_scale_missing_count(),
@@ -399,11 +403,13 @@ fn emit_decode_body(
             kv_ty = kv_ty,
             layer_kv_ty = layer_kv_ty,
         ));
-        let int8_tile_name = if uses_int8_tile_probe {
+        let (int8_tile_name, int8_row_scale_name) = if uses_int8_tile_probe {
             let w1_tile_start = format!("%w1_int8_tile_start_{}", layer.layer);
             let w1_tile_flat = format!("%w1_int8_tile_flat_{}", layer.layer);
             let w1_tile_rows = format!("%w1_int8_tile_rows_{}", layer.layer);
             let w1_tile = format!("%w1_int8_tile_t_{}", layer.layer);
+            let w1_scale_start = format!("%w1_int8_row_scale_start_{}", layer.layer);
+            let w1_scales = format!("%w1_int8_row_scales_{}", layer.layer);
             out.push_str(&format!(
                 r#"    {w1_tile_start} = stablehlo.constant dense<{w1_offset}> : tensor<i64>
     {w1_tile_flat} = "stablehlo.dynamic_slice"(%weight_arena, {w1_tile_start}) {{
@@ -411,20 +417,28 @@ fn emit_decode_body(
     }} : (tensor<{weight_arena_local_bytes}xi8>, tensor<i64>) -> tensor<{int8_tile_elems}xi8>
     {w1_tile_rows} = stablehlo.reshape {w1_tile_flat} : (tensor<{int8_tile_elems}xi8>) -> tensor<{w1_block_cols}x{hidden_size}xi8>
     {w1_tile} = stablehlo.transpose {w1_tile_rows}, dims = [1, 0] : (tensor<{w1_block_cols}x{hidden_size}xi8>) -> tensor<{hidden_size}x{w1_block_cols}xi8>
+    {w1_scale_start} = stablehlo.constant dense<{w1_scale_offset}> : tensor<i64>
+    {w1_scales} = "stablehlo.dynamic_slice"(%int8_row_scales, {w1_scale_start}) {{
+      slice_sizes = array<i64: {w1_block_cols}>
+    }} : (tensor<{int8_row_scale_arena_len}xf32>, tensor<i64>) -> tensor<{w1_block_cols}xf32>
 "#,
                 w1_tile_start = w1_tile_start,
                 w1_tile_flat = w1_tile_flat,
                 w1_tile_rows = w1_tile_rows,
                 w1_tile = w1_tile,
+                w1_scale_start = w1_scale_start,
+                w1_scales = w1_scales,
                 w1_offset = layer.arena_offsets().w1_first_packed,
+                w1_scale_offset = layer.layer * w1_block_cols,
                 int8_tile_elems = int8_tile_elems,
+                int8_row_scale_arena_len = M2_NUM_LAYERS * w1_block_cols,
                 weight_arena_local_bytes = arena.total_bytes.div_ceil(8),
                 hidden_size = M2_HIDDEN,
                 w1_block_cols = w1_block_cols,
             ));
-            Some(w1_tile)
+            (Some(w1_tile), Some(w1_scales))
         } else {
-            None
+            (None, None)
         };
         out.push_str(&emit_layer_call(
             shape,
@@ -438,6 +452,7 @@ fn emit_decode_body(
             &layer_kv_ty,
             decode_layer_body,
             int8_tile_name.as_deref(),
+            int8_row_scale_name.as_deref(),
         )?);
         out.push_str(&format!(
             r#"    {next_kv} = "stablehlo.dynamic_update_slice"({kv}, {next_layer_kv}, {layer_kv_start}) : ({kv_ty}, {layer_kv_ty}, tensor<i32>) -> {kv_ty}
@@ -483,6 +498,7 @@ fn emit_layer_call(
     kv_ty: &str,
     decode_layer_body: Option<&TpuMosaicSerializedBody>,
     int8_tile: Option<&str>,
+    int8_row_scales: Option<&str>,
 ) -> Result<String> {
     let target = layer.custom_call_abi(shape)?.call.target();
     let backend_config = match decode_layer_body {
@@ -499,20 +515,20 @@ fn emit_layer_call(
             .map(M2ExpertDirectoryEntry::as_i32_split_row)
             .collect::<Vec<_>>(),
     );
-    if let Some(int8_tile) = int8_tile {
+    if let (Some(int8_tile), Some(int8_row_scales)) = (int8_tile, int8_row_scales) {
         return Ok(format!(
             r#"    {layer_offsets_name} = stablehlo.constant dense<{layer_offsets}> : tensor<{offset_cols}xi32>
     {expert_directory_name} = stablehlo.constant dense<{expert_directory}> : tensor<{expert_count}x{expert_cols}xi32>
-    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, {layer_offsets_name}, {expert_directory_name}, {int8_tile}) {{
+    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, {layer_offsets_name}, {expert_directory_name}, {int8_tile}, {int8_row_scales}) {{
       call_target_name = "{tpu_custom_call}",
       backend_config = "{backend_config}",
       called_computations = [],
       has_side_effect = false,
       api_version = 1 : i32,
       kernel_name = "{target}",
-      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>],
+      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>],
       result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>]
-    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x128xi8>) -> ({hidden_ty}, {kv_ty})
+    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x128xi8>, tensor<128xf32>) -> ({hidden_ty}, {kv_ty})
 "#,
             tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
             backend_config = backend_config,
@@ -522,6 +538,7 @@ fn emit_layer_call(
             dst = dst,
             kv_dst = kv_dst,
             int8_tile = int8_tile,
+            int8_row_scales = int8_row_scales,
             layer_offsets_name = layer_offsets_name,
             expert_directory_name = expert_directory_name,
             layer_offsets = layer_offsets,

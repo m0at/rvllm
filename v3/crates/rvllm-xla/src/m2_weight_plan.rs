@@ -442,6 +442,34 @@ impl M2WeightArenaPlan {
         self.materialize_int8_host_buffer_inner(reader, max_bytes, false)
     }
 
+    pub fn materialize_decode_w1_row_scale_probe_bytes(
+        &self,
+        flat: &M2FlatArenaHostBuffer,
+    ) -> Result<Vec<u8>> {
+        if flat.total_bytes != self.total_bytes || flat.bytes.len() != self.total_bytes {
+            return Err(invalid("flat", "flat arena does not match arena plan"));
+        }
+        let rows_per_layer = 128usize;
+        let mut out = vec![0u8; M2_NUM_LAYERS * rows_per_layer * 4];
+        for layer in 0..M2_NUM_LAYERS {
+            let group = M2Nvfp4ProjectionAbi::new(layer, 0, M2Projection::W1);
+            let entry = self.entry(&group.weight_scale.name)?;
+            if entry.role != M2WeightRole::Int8RowScale
+                || entry.dtype != crate::PjrtElementType::F32
+                || entry.nbytes < rows_per_layer * 4
+            {
+                return Err(invalid_owned(
+                    "row_scale",
+                    format!("{}: expected int8 f32 row-scale entry", entry.name),
+                ));
+            }
+            let src = entry.offset..entry.offset + rows_per_layer * 4;
+            let dst = layer * rows_per_layer * 4..(layer + 1) * rows_per_layer * 4;
+            out[dst].copy_from_slice(&flat.bytes[src]);
+        }
+        Ok(out)
+    }
+
     fn materialize_int8_host_buffer_inner(
         &self,
         reader: &M2SafetensorsReader,
@@ -460,7 +488,7 @@ impl M2WeightArenaPlan {
         let mut bytes = vec![0u8; self.total_bytes];
         for entry in &self.entries {
             match entry.role {
-                M2WeightRole::Global | M2WeightRole::LayerDense | M2WeightRole::Int8InputScale => {
+                M2WeightRole::Global | M2WeightRole::LayerDense => {
                     if copy_dense {
                         let view = reader.tensor(&entry.name)?;
                         validate_arena_tensor(entry, &view)?;
@@ -469,6 +497,7 @@ impl M2WeightArenaPlan {
                         bytes[start..end].copy_from_slice(view.bytes);
                     }
                 }
+                M2WeightRole::Int8InputScale => {}
                 M2WeightRole::Int8Weight => {
                     materialize_int8_weight(entry, self, reader, &mut bytes)?;
                 }

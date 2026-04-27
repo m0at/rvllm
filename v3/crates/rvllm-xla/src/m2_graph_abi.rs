@@ -462,12 +462,12 @@ fn layer_weight_abi(layer: usize) -> M2LayerWeightAbi {
             ),
             tensor(
                 format!("{p}.self_attn.q_norm.weight"),
-                &[M2_HEAD_DIM],
+                &[M2_NUM_Q_HEADS * M2_HEAD_DIM],
                 PjrtElementType::BF16,
             ),
             tensor(
                 format!("{p}.self_attn.k_norm.weight"),
-                &[M2_HEAD_DIM],
+                &[M2_NUM_KV_HEADS * M2_HEAD_DIM],
                 PjrtElementType::BF16,
             ),
             tensor(
@@ -598,6 +598,8 @@ mod tests {
         assert_eq!(layer.dense[2].shape, vec![6144, 3072]);
         assert_eq!(layer.dense[3].shape, vec![1024, 3072]);
         assert_eq!(layer.dense[5].shape, vec![3072, 6144]);
+        assert_eq!(layer.dense[6].shape, vec![6144]);
+        assert_eq!(layer.dense[7].shape, vec![1024]);
         assert_eq!(layer.dense[8].shape, vec![256, 3072]);
         assert_eq!(
             layer.dense[9].name,

@@ -121,6 +121,7 @@ else
 fi
 export RVLLM_M2_MOE_INT8='$REMOTE_M2_MOE_INT8'
 export RVLLM_M2_PARITY='$REMOTE_M2_PARITY'
+export RAYON_NUM_THREADS=\"\${RAYON_NUM_THREADS:-180}\"
 cd '$REMOTE_RUN_ROOT/rvllm-xla-min'
 tar -xzf rvllm-xla-min.tgz
 cd v3
@@ -147,6 +148,18 @@ if [[ -n '$REMOTE_DECODE_LAYER_BODY' ]]; then
     --out \"\$RUN/real_execute_b8.json\" \
     --decode-layer-body '$REMOTE_DECODE_LAYER_BODY' \
     --decode-layer-body-format '$REMOTE_DECODE_LAYER_BODY_FORMAT' \
+    --emit-decode-artifacts \
+    --batch 8 \
+    --ctx 2048 \
+    --kv-cache int8 \
+    --weight-format int8 \
+    --prompt 'explain angular momentum' \
+    --gen-tokens 64 2>&1 | tee \"\$RUN/real_execute_b8_emit.log\"
+  target/release/m2_rust_decode_bench \
+    --model-dir '$REMOTE_MODEL_DIR' \
+    --artifact-dir \"\$RUN/real_execute_b8\" \
+    --out \"\$RUN/real_execute_b8.json\" \
+    --use-existing-artifacts \
     --execute-decode \
     --batch 8 \
     --ctx 2048 \

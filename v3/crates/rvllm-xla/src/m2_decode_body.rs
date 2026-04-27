@@ -49,6 +49,37 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
         return Err(invalid("phase", "expected decode graph shape"));
     }
     let kv_bytes = shape.layer_kv_cache_bytes();
+    let mut k_constants = String::new();
+    let mut k_tiles = String::new();
+    let mut acc_prev = "%zero".to_string();
+    for (tile_idx, k) in (0..M2_HIDDEN).step_by(128).enumerate() {
+        let k_idx = if k == 0 {
+            "%c0".to_string()
+        } else {
+            k_constants.push_str(&format!("    %c{k} = arith.constant {k} : index\n"));
+            format!("%c{k}")
+        };
+        let acc_next = format!("%acc_{tile_idx}");
+        k_tiles.push_str(&format!(
+            r#"    %h_bf16_{tile_idx} = vector.load %hidden[%c0, {k_idx}] : memref<{batch}x{hidden}xbf16>, vector<{batch}x128xbf16>
+    %h_mat_{tile_idx} = arith.extf %h_bf16_{tile_idx} : vector<{batch}x128xbf16> to vector<{batch}x128xf32>
+    %w_i8_{tile_idx} = vector.load %w1_block_t[{k_idx}, %c0] : memref<{hidden}x128xi8>, vector<128x128xi8>
+    %w_f32_{tile_idx} = arith.sitofp %w_i8_{tile_idx} : vector<128x128xi8> to vector<128x128xf32>
+    {acc_next} = vector.contract {{
+      indexing_maps = [
+        affine_map<(m, n, k) -> (m, k)>,
+        affine_map<(m, n, k) -> (k, n)>,
+        affine_map<(m, n, k) -> (m, n)>
+      ],
+      iterator_types = ["parallel", "parallel", "reduction"],
+      kind = #vector.kind<add>
+    }} %h_mat_{tile_idx}, %w_f32_{tile_idx}, {acc_prev} : vector<{batch}x128xf32>, vector<128x128xf32> into vector<{batch}x128xf32>
+"#,
+            batch = shape.batch,
+            hidden = M2_HIDDEN,
+        ));
+        acc_prev = acc_next;
+    }
     Ok(format!(
         r#"module attributes {{"stable_mosaic.version" = "1"}} {{
   func.func @main(
@@ -58,6 +89,7 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
       %layer_offsets: memref<34xi32>,
       %expert_directory: memref<256x25xi32>,
       %w1_block_t: memref<{hidden}x128xi8>,
+      %w1_row_scales: memref<128xf32>,
       %hidden_out: memref<{batch}x{hidden}xbf16>,
       %kv_out: memref<{kv_bytes}xi8>) attributes {{
         dimension_semantics = [],
@@ -66,36 +98,18 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
         rvllm.int8_probe = "w1_i8_full_k_128_cols"
       }} {{
     %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c32 = arith.constant 32 : index
-    %c_batch = arith.constant {batch} : index
-    %c_hidden = arith.constant {hidden} : index
+{k_constants}
     %hidden_v = vector.load %hidden[%c0, %c0] : memref<{batch}x{hidden}xbf16>, vector<1x128xbf16>
     vector.store %hidden_v, %hidden_out[%c0, %c0] : memref<{batch}x{hidden}xbf16>, vector<1x128xbf16>
     %kv_v = vector.load %kv_in[%c0] : memref<{kv_bytes}xi8>, vector<512xi8>
     vector.store %kv_v, %kv_out[%c0] : memref<{kv_bytes}xi8>, vector<512xi8>
-    %zero = arith.constant dense<0.000000e+00> : vector<1x128xf32>
-    scf.for %m = %c0 to %c_batch step %c1 {{
-      %acc = scf.for %k = %c0 to %c_hidden step %c32 iter_args(%acc_iter = %zero) -> (vector<1x128xf32>) {{
-        %h_bf16 = vector.load %hidden[%m, %k] : memref<{batch}x{hidden}xbf16>, vector<32xbf16>
-        %h_f32 = arith.extf %h_bf16 : vector<32xbf16> to vector<32xf32>
-        %h_mat = vector.broadcast %h_f32 : vector<32xf32> to vector<1x32xf32>
-        %w_i8 = vector.load %w1_block_t[%k, %c0] : memref<{hidden}x128xi8>, vector<32x128xi8>
-        %w_f32 = arith.sitofp %w_i8 : vector<32x128xi8> to vector<32x128xf32>
-        %next = vector.contract {{
-          indexing_maps = [
-            affine_map<(m, n, k) -> (m, k)>,
-            affine_map<(m, n, k) -> (k, n)>,
-            affine_map<(m, n, k) -> (m, n)>
-          ],
-          iterator_types = ["parallel", "parallel", "reduction"],
-          kind = #vector.kind<add>
-        }} %h_mat, %w_f32, %acc_iter : vector<1x32xf32>, vector<32x128xf32> into vector<1x128xf32>
-        scf.yield %next : vector<1x128xf32>
-      }}
-      %out_bf16 = arith.truncf %acc : vector<1x128xf32> to vector<1x128xbf16>
-      vector.store %out_bf16, %hidden_out[%m, %c0] : memref<{batch}x{hidden}xbf16>, vector<1x128xbf16>
-    }}
+    %zero = arith.constant dense<0.000000e+00> : vector<{batch}x128xf32>
+{k_tiles}
+    %scale_v = vector.load %w1_row_scales[%c0] : memref<128xf32>, vector<128xf32>
+    %scale_b = vector.broadcast %scale_v : vector<128xf32> to vector<{batch}x128xf32>
+    %scaled = arith.mulf {acc_prev}, %scale_b : vector<{batch}x128xf32>
+    %out_bf16 = arith.truncf %scaled : vector<{batch}x128xf32> to vector<{batch}x128xbf16>
+    vector.store %out_bf16, %hidden_out[%c0, %c0] : memref<{batch}x{hidden}xbf16>, vector<{batch}x128xbf16>
     return
   }}
 }}
@@ -103,6 +117,9 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
         batch = shape.batch,
         hidden = M2_HIDDEN,
         kv_bytes = kv_bytes,
+        k_constants = k_constants,
+        k_tiles = k_tiles,
+        acc_prev = acc_prev,
     ))
 }
 
@@ -142,11 +159,16 @@ mod tests {
         let mlir = m2_decode_layer_int8_lowered_body_mlir(&shape, 4_294_967_296).unwrap();
         assert!(mlir.contains("rvllm.int8_probe = \"w1_i8_full_k_128_cols\""));
         assert!(mlir.contains("memref<3072x128xi8>"));
-        assert!(mlir.contains("vector<32x128xi8>"));
-        assert!(mlir.contains("vector<1x32xf32>"));
+        assert!(mlir.contains("memref<128xf32>"));
+        assert!(mlir.contains("vector<8x128xbf16>"));
+        assert!(mlir.contains("vector<128x128xi8>"));
+        assert!(mlir.contains("vector<8x128xf32>"));
+        assert!(mlir.contains("vector<128xf32>"));
         assert!(mlir.contains("vector.contract"));
         assert!(mlir.contains("arith.sitofp"));
-        assert!(mlir.contains("scf.for"));
-        assert!(mlir.contains("vector<1x128xbf16>"));
+        assert!(mlir.contains("arith.mulf"));
+        assert!(!mlir.contains("scf.for"));
+        assert!(mlir.contains("%c2944 = arith.constant 2944 : index"));
+        assert!(mlir.contains("vector<8x128xbf16>"));
     }
 }

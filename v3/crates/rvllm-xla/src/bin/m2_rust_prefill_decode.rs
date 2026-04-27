@@ -13,7 +13,7 @@ use rvllm_loader::M2SafetensorsReader;
 use rvllm_xla::{
     load_artifact, m2_bf16_argmax_tokens, m2_bf16_logits_nll, m2_gather_embed_bf16,
     m2_ppl_from_nll, make_m2_prefill_inputs, M2GraphAbi, M2WeightUploadPlan, PjrtClientHandle,
-    PjrtElementType, M2_HIDDEN, M2_VOCAB,
+    PjrtElementType, M2_HIDDEN, M2_NUM_LAYERS, M2_VOCAB,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -219,13 +219,43 @@ fn execute_decode(
         PjrtElementType::S8,
         0,
     )?;
-    let weight_arena = match plan.weight_format.as_str() {
-        "nvfp4" => arena.upload_flat_arena_to_pjrt(&reader, &client, 0, max_weight_arena_bytes)?,
+    let row_scale_zero = vec![0u8; M2_NUM_LAYERS * 128 * 4];
+    let (weight_arena, row_scale_bytes) = match plan.weight_format.as_str() {
+        "nvfp4" => {
+            let host = arena.materialize_host_buffer(&reader, max_weight_arena_bytes)?;
+            let local = local_weight_arena_shard(&host.bytes, plan.weight_arena_bytes, 0);
+            (
+                client.buffer_from_host(
+                    &local,
+                    &[plan.weight_arena_bytes as i64],
+                    PjrtElementType::S8,
+                    0,
+                )?,
+                row_scale_zero,
+            )
+        }
         "int8" => {
-            arena.upload_int8_flat_arena_to_pjrt(&reader, &client, 0, max_weight_arena_bytes)?
+            let host = arena.materialize_int8_host_buffer(&reader, max_weight_arena_bytes)?;
+            let row_scales = arena.materialize_decode_w1_row_scale_probe_bytes(&host)?;
+            let local = local_weight_arena_shard(&host.bytes, plan.weight_arena_bytes, 0);
+            (
+                client.buffer_from_host(
+                    &local,
+                    &[plan.weight_arena_bytes as i64],
+                    PjrtElementType::S8,
+                    0,
+                )?,
+                row_scales,
+            )
         }
         _ => return Err("--weight-format: expected nvfp4|int8".into()),
     };
+    let int8_row_scales = client.buffer_from_host(
+        &row_scale_bytes,
+        &[(M2_NUM_LAYERS * 128) as i64],
+        PjrtElementType::F32,
+        0,
+    )?;
     let final_norm = upload_global_tensor(&reader, &client, "model.norm.weight", &[M2_HIDDEN])?;
     let lm_head = upload_global_tensor(&reader, &client, "lm_head.weight", &[M2_VOCAB, M2_HIDDEN])?;
 
@@ -254,6 +284,7 @@ fn execute_decode(
             &pos_buf,
             &kv_buf,
             &weight_arena,
+            &int8_row_scales,
             &input_hidden_buf,
             &final_norm,
             &lm_head,
@@ -303,6 +334,17 @@ fn execute_decode(
     Ok(M2DecodeExecutionReport {
         generated_token_ids,
     })
+}
+
+#[cfg(feature = "tpu")]
+fn local_weight_arena_shard(bytes: &[u8], local_bytes: usize, device: usize) -> Vec<u8> {
+    let start = device.saturating_mul(local_bytes);
+    let end = bytes.len().min(start.saturating_add(local_bytes));
+    let mut out = vec![0u8; local_bytes];
+    if start < end {
+        out[..end - start].copy_from_slice(&bytes[start..end]);
+    }
+    out
 }
 
 #[cfg(feature = "tpu")]

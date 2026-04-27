@@ -13,7 +13,7 @@ use rvllm_xla::m2_runtime::{m2_decode_mlir_execution_blocker, M2RuntimeMode};
 use rvllm_xla::{
     m2_decode_graph_mlir_with_mosaic_body, m2_decode_smoke_mlir, plan_m2_rust_decode_bench,
     M2GraphAbi, M2GraphShape, M2RustDecodeBenchConfig, M2WeightUploadPlan, PjrtElementType,
-    TpuMosaicSerializedBody, XlaArtifact, XlaTensorSpec, M2_HIDDEN, M2_VOCAB,
+    TpuMosaicSerializedBody, XlaArtifact, XlaTensorSpec, M2_HIDDEN, M2_NUM_LAYERS, M2_VOCAB,
 };
 
 #[cfg(feature = "tpu")]
@@ -33,15 +33,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.runtime_mode != M2RuntimeMode::PlanningOnly
         && !args.native_smoke
         && args.decode_layer_body.is_none()
+        && !args.use_existing_artifacts
     {
         return Err("real Rust M2 compile/execute needs --decode-layer-body FILE containing serde bytecode or lowered MLIR; use --native-smoke for the zero-logits PJRT smoke".into());
     }
-    let artifacts =
-        if args.emit_decode_artifacts || args.runtime_mode != M2RuntimeMode::PlanningOnly {
-            write_decode_artifacts(&args)?
-        } else {
-            Vec::new()
-        };
+    let artifacts = if args.use_existing_artifacts {
+        load_decode_artifacts(&args)?
+    } else if args.emit_decode_artifacts || args.runtime_mode != M2RuntimeMode::PlanningOnly {
+        write_decode_artifacts(&args)?
+    } else {
+        Vec::new()
+    };
     let mut compiled = false;
     let timings = match args.runtime_mode {
         M2RuntimeMode::PlanningOnly => Vec::new(),
@@ -189,6 +191,48 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
     Ok(out)
 }
 
+fn load_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn std::error::Error>> {
+    let mut out = Vec::with_capacity(args.batches.len());
+    for &batch in &args.batches {
+        let json_name = format!("m2_decode_b{batch}.json");
+        let mlir_name = format!("m2_decode_b{batch}.mlir");
+        let json_path = args.artifact_dir.join(&json_name);
+        let artifact: XlaArtifact = serde_json::from_slice(&fs::read(&json_path)?)?;
+        if artifact.mlir_file != mlir_name {
+            return Err(format!(
+                "{} points at {}, expected {}",
+                json_path.display(),
+                artifact.mlir_file,
+                mlir_name
+            )
+            .into());
+        }
+        let mlir_path = args.artifact_dir.join(&artifact.mlir_file);
+        let mlir = fs::read_to_string(&mlir_path)?;
+        let shape = M2GraphShape::decode(batch, args.ctx, kv_bytes_per_elem(&args.kv_cache)?);
+        let weight_arena_bytes = artifact
+            .inputs
+            .iter()
+            .find(|input| input.name == "weight_arena")
+            .and_then(|input| input.shape.first().copied())
+            .ok_or_else(|| format!("{} missing weight_arena input", json_path.display()))?
+            as usize;
+        eprintln!(
+            "loaded existing decode artifact {} and {}",
+            mlir_path.display(),
+            json_path.display()
+        );
+        out.push(DecodeArtifact {
+            mlir,
+            mlir_path,
+            batch,
+            shape,
+            weight_arena_bytes,
+        });
+    }
+    Ok(out)
+}
+
 fn decode_artifact_manifest(
     mlir_file: &str,
     shape: &M2GraphShape,
@@ -200,6 +244,11 @@ fn decode_artifact_manifest(
         tensor("positions", &[shape.batch], PjrtElementType::S32),
         tensor("kv_cache", &[shape.kv_cache_bytes()], PjrtElementType::S8),
         tensor("weight_arena", &[weight_arena_bytes], PjrtElementType::S8),
+        tensor(
+            "int8_row_scales",
+            &[M2_NUM_LAYERS * 128],
+            PjrtElementType::F32,
+        ),
     ];
     if include_globals {
         inputs.extend([
@@ -258,15 +307,15 @@ fn execute_decode_artifacts(
             "--execute-decode requires --max-weight-arena-bytes for real weight upload".into(),
         );
     }
-    let reader = if args.native_smoke {
-        None
-    } else {
-        Some(M2SafetensorsReader::open(&args.model_dir)?)
-    };
     let mut out = Vec::with_capacity(artifacts.len());
     for artifact in artifacts {
         let mlir = fs::read_to_string(&artifact.mlir_path)?;
         let exe = client.compile(&mlir)?;
+        let reader = if args.native_smoke {
+            None
+        } else {
+            Some(M2SafetensorsReader::open(&args.model_dir)?)
+        };
         let token_zero = vec![0u8; artifact.shape.batch * 4];
         let pos_zero = vec![0u8; artifact.shape.batch * 4];
         let kv_zero = vec![0u8; artifact.shape.kv_cache_bytes()];
@@ -300,9 +349,10 @@ fn execute_decode_artifacts(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let weight_arenas = if args.native_smoke {
+        let row_scale_zero = vec![0u8; M2_NUM_LAYERS * 128 * 4];
+        let (weight_arenas, row_scale_arenas) = if args.native_smoke {
             let weight_zero = vec![0u8; artifact.weight_arena_bytes];
-            (0..num_devices)
+            let weights = (0..num_devices)
                 .map(|device| {
                     client.buffer_from_host(
                         &weight_zero,
@@ -311,10 +361,21 @@ fn execute_decode_artifacts(
                         device,
                     )
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let scales = (0..num_devices)
+                .map(|device| {
+                    client.buffer_from_host(
+                        &row_scale_zero,
+                        &[(M2_NUM_LAYERS * 128) as i64],
+                        PjrtElementType::F32,
+                        device,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (weights, scales)
         } else {
-            let reader = reader.as_ref().expect("reader is present for real execute");
             let upload_start = Instant::now();
+            let reader = reader.as_ref().expect("reader is present for real execute");
             let abi = M2GraphAbi::new(artifact.shape.clone())?;
             let weights = M2WeightUploadPlan::from_index_dir(&args.model_dir, &abi)?;
             let arena = match args.weight_format.as_str() {
@@ -337,6 +398,11 @@ fn execute_decode_artifacts(
                 }
                 _ => return Err("--weight-format: expected nvfp4|int8".into()),
             };
+            let row_scale_bytes = if args.weight_format == "int8" {
+                arena.materialize_decode_w1_row_scale_probe_bytes(&host)?
+            } else {
+                row_scale_zero.clone()
+            };
             let uploaded = (0..num_devices)
                 .map(|device| {
                     let local =
@@ -345,6 +411,16 @@ fn execute_decode_artifacts(
                         &local,
                         &[artifact.weight_arena_bytes as i64],
                         PjrtElementType::S8,
+                        device,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let row_scales = (0..num_devices)
+                .map(|device| {
+                    client.buffer_from_host(
+                        &row_scale_bytes,
+                        &[(M2_NUM_LAYERS * 128) as i64],
+                        PjrtElementType::F32,
                         device,
                     )
                 })
@@ -358,7 +434,7 @@ fn execute_decode_artifacts(
                 num_devices,
                 upload_start.elapsed().as_secs_f64()
             );
-            uploaded
+            (uploaded, row_scales)
         };
         let global_tensors = if args.native_smoke {
             None
@@ -382,6 +458,7 @@ fn execute_decode_artifacts(
                         &pos_bufs[device],
                         &kv_bufs[device],
                         &weight_arenas[device],
+                        &row_scale_arenas[device],
                     ];
                     if let Some((input_hidden, final_norms, lm_heads)) = &global_tensors {
                         inputs.push(&input_hidden[device]);
@@ -533,6 +610,7 @@ struct Args {
     prompt: String,
     gen_tokens: usize,
     max_weight_arena_bytes: usize,
+    use_existing_artifacts: bool,
 }
 
 impl Args {
@@ -558,6 +636,7 @@ impl Args {
             prompt: "Explain angular momentum.".to_string(),
             gen_tokens: 256,
             max_weight_arena_bytes: 0,
+            use_existing_artifacts: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -589,6 +668,7 @@ impl Args {
                         value(&args, i, "--decode-layer-body-format")?.to_string();
                 }
                 "--emit-decode-artifacts" => out.emit_decode_artifacts = true,
+                "--use-existing-artifacts" => out.use_existing_artifacts = true,
                 "--native-smoke" => {
                     out.native_smoke = true;
                     out.emit_decode_artifacts = true;
@@ -702,7 +782,7 @@ fn kv_bytes_per_elem(kv_cache: &str) -> Result<usize, String> {
 }
 
 fn usage() -> String {
-    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--decode-layer-body FILE] [--decode-layer-body-format serde|lowered] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--weight-format int8|nvfp4] [--moe-impl NAME] [--ppl-text FILE] [--prompt TEXT] [--gen-tokens N] [--max-weight-arena-bytes N]".to_string()
+    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--decode-layer-body FILE] [--decode-layer-body-format serde|lowered] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--use-existing-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--weight-format int8|nvfp4] [--moe-impl NAME] [--ppl-text FILE] [--prompt TEXT] [--gen-tokens N] [--max-weight-arena-bytes N]".to_string()
 }
 
 #[cfg(test)]

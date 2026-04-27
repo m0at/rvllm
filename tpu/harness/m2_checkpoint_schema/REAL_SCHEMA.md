@@ -17,8 +17,8 @@ Ground truth extracted from `lukealonso/MiniMax-M2.7-NVFP4` on HuggingFace hub.
 - `model.layers.L.self_attn.k_proj.weight` — (NKV * HEAD_DIM) x hidden (8*128=1024 x 3072)
 - `model.layers.L.self_attn.v_proj.weight` — (NKV * HEAD_DIM) x hidden (8*128=1024 x 3072)
 - `model.layers.L.self_attn.o_proj.weight` — hidden x (NH * HEAD_DIM)  (3072 x 6144)
-- `model.layers.L.self_attn.q_norm.weight` — HEAD_DIM (per-layer, 128)
-- `model.layers.L.self_attn.k_norm.weight` — HEAD_DIM (per-layer, 128)
+- `model.layers.L.self_attn.q_norm.weight` — NH * HEAD_DIM (per-layer, 6144)
+- `model.layers.L.self_attn.k_norm.weight` — NKV * HEAD_DIM (per-layer, 1024)
 
 ### MoE router (bf16)
 - `model.layers.L.block_sparse_moe.gate.weight` — NUM_EXPERTS x hidden (256 x 3072)

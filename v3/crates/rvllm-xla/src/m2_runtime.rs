@@ -9,7 +9,8 @@ use rvllm_loader::{M2CheckpointIndex, M2CheckpointSummary, M2SafetensorsReader};
 
 use crate::{
     m2_decode_graph_mlir, make_m2_prefill_input_specs, M2GraphAbi, M2GraphShape,
-    M2PrefillHostInputSpec, M2WeightUploadPlan, PjrtElementType, M2_HIDDEN, M2_VOCAB,
+    M2PrefillHostInputSpec, M2WeightUploadPlan, PjrtElementType, M2_HIDDEN, M2_NUM_LAYERS,
+    M2_VOCAB,
 };
 #[cfg(feature = "tpu")]
 use crate::{CompiledExecutable, PjrtBufferHandle, PjrtClientHandle};
@@ -163,6 +164,7 @@ pub struct M2Runtime {
     client: Option<PjrtClientHandle>,
     exe: Option<CompiledExecutable>,
     weight_arena: Option<PjrtBufferHandle>,
+    int8_row_scales: Option<PjrtBufferHandle>,
     globals: Option<M2GlobalWeightBuffers>,
     reader: Option<M2SafetensorsReader>,
     device_idx: usize,
@@ -257,6 +259,7 @@ impl M2Runtime {
                     client: None,
                     exe: None,
                     weight_arena: None,
+                    int8_row_scales: None,
                     globals: None,
                     reader: None,
                     device_idx,
@@ -271,6 +274,7 @@ impl M2Runtime {
                     client: Some(client),
                     exe: Some(exe),
                     weight_arena: None,
+                    int8_row_scales: None,
                     globals: None,
                     reader: None,
                     device_idx,
@@ -295,21 +299,44 @@ impl M2Runtime {
         };
         let client = PjrtClientHandle::new()?;
         let exe = client.compile(&plan.decode_mlir)?;
-        let weight_arena = match plan.weight_format.as_str() {
-            "nvfp4" => arena.upload_flat_arena_to_pjrt(
-                &reader,
-                &client,
-                device_idx,
-                max_weight_arena_bytes,
-            )?,
-            "int8" => arena.upload_int8_flat_arena_to_pjrt(
-                &reader,
-                &client,
-                device_idx,
-                max_weight_arena_bytes,
-            )?,
+        let (weight_arena, row_scale_bytes) = match plan.weight_format.as_str() {
+            "nvfp4" => {
+                let host = arena.materialize_host_buffer(&reader, max_weight_arena_bytes)?;
+                let local =
+                    local_weight_arena_shard(&host.bytes, plan.weight_arena_bytes, device_idx);
+                (
+                    client.buffer_from_host(
+                        &local,
+                        &[plan.weight_arena_bytes as i64],
+                        PjrtElementType::S8,
+                        device_idx,
+                    )?,
+                    zero_int8_row_scale_bytes(),
+                )
+            }
+            "int8" => {
+                let host = arena.materialize_int8_host_buffer(&reader, max_weight_arena_bytes)?;
+                let row_scales = arena.materialize_decode_w1_row_scale_probe_bytes(&host)?;
+                let local =
+                    local_weight_arena_shard(&host.bytes, plan.weight_arena_bytes, device_idx);
+                (
+                    client.buffer_from_host(
+                        &local,
+                        &[plan.weight_arena_bytes as i64],
+                        PjrtElementType::S8,
+                        device_idx,
+                    )?,
+                    row_scales,
+                )
+            }
             _ => return Err(invalid("weight_format", "must be nvfp4 or int8")),
         };
+        let int8_row_scales = client.buffer_from_host(
+            &row_scale_bytes,
+            &[(M2_NUM_LAYERS * 128) as i64],
+            PjrtElementType::F32,
+            device_idx,
+        )?;
         let globals = upload_m2_global_weights(&reader, &client, device_idx)?;
         Ok(Self {
             plan,
@@ -317,6 +344,7 @@ impl M2Runtime {
             client: Some(client),
             exe: Some(exe),
             weight_arena: Some(weight_arena),
+            int8_row_scales: Some(int8_row_scales),
             globals: Some(globals),
             reader: Some(reader),
             device_idx,
@@ -380,6 +408,10 @@ impl M2Runtime {
             .weight_arena
             .as_ref()
             .ok_or_else(|| runtime_not_executable(&self.state))?;
+        let int8_row_scales = self
+            .int8_row_scales
+            .as_ref()
+            .ok_or_else(|| runtime_not_executable(&self.state))?;
         let globals = self
             .globals
             .as_ref()
@@ -422,6 +454,7 @@ impl M2Runtime {
                 &pos_buf,
                 &kv_buf,
                 weight_arena,
+                int8_row_scales,
                 &input_hidden_buf,
                 &globals.final_norm,
                 &globals.lm_head,
@@ -465,6 +498,22 @@ impl M2Runtime {
         );
         Err(runtime_not_executable(&self.state))
     }
+}
+
+#[cfg(feature = "tpu")]
+fn zero_int8_row_scale_bytes() -> Vec<u8> {
+    vec![0u8; M2_NUM_LAYERS * 128 * 4]
+}
+
+#[cfg(feature = "tpu")]
+fn local_weight_arena_shard(bytes: &[u8], local_bytes: usize, device: usize) -> Vec<u8> {
+    let start = device.saturating_mul(local_bytes);
+    let end = bytes.len().min(start.saturating_add(local_bytes));
+    let mut out = vec![0u8; local_bytes];
+    if start < end {
+        out[..end - start].copy_from_slice(&bytes[start..end]);
+    }
+    out
 }
 
 pub fn m2_decode_execution_blocker(plan: &M2RustPrefillDecodePlan) -> Option<&'static str> {
@@ -809,6 +858,11 @@ fn decode_input_specs(
             nbytes: weight_arena_bytes,
         },
         decode_spec(
+            "int8_row_scales",
+            &[M2_NUM_LAYERS * 128],
+            PjrtElementType::F32,
+        ),
+        decode_spec(
             "input_hidden",
             &[shape.batch, M2_HIDDEN],
             PjrtElementType::BF16,
@@ -1036,9 +1090,10 @@ mod tests {
         assert_eq!(plan.seed_decode_positions, vec![4; 8]);
         assert_eq!(plan.decode_input_specs[3].name, "weight_arena");
         assert_eq!(plan.decode_input_specs[3].nbytes, plan.weight_arena_bytes);
-        assert_eq!(plan.decode_input_specs[4].name, "input_hidden");
-        assert_eq!(plan.decode_input_specs[5].name, "final_norm");
-        assert_eq!(plan.decode_input_specs[6].name, "lm_head");
+        assert_eq!(plan.decode_input_specs[4].name, "int8_row_scales");
+        assert_eq!(plan.decode_input_specs[5].name, "input_hidden");
+        assert_eq!(plan.decode_input_specs[6].name, "final_norm");
+        assert_eq!(plan.decode_input_specs[7].name, "lm_head");
         assert!(plan
             .decode_mlir
             .contains("kernel_name = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\""));
