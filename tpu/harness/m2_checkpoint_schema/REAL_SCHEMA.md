@@ -55,32 +55,13 @@ Shapes for layer L, expert N:
 - No shared expert. Matches config `shared_intermediate_size=0`.
 - No sliding window. Matches config `sliding_window=null`.
 
-## Impact on rvllm code
+## Impact on rvllm Rust code
 
-`tpu/harness/nvfp4_loader.py` needs:
-1. Recognize modelopt-style NVFP4: four tensors (`weight`, `weight_scale`, `weight_scale_2`, `input_scale`) instead of assumed (`weight_packed`, `weight_scale`).
-2. Add a FP32 `global_scale` field to `NvFp4Tensor`.
-3. `dequant_nvfp4_to_bf16_cpu` and `..._int8_cpu` must multiply by both block scale AND global scale.
+`rvllm-loader` and `rvllm-xla` must recognize the ModelOpt-style NVFP4 layout:
+four tensors per expert projection (`weight`, `weight_scale`, `weight_scale_2`,
+and optional `input_scale`). The graph ABI must pass `w1`, `w2`, and `w3`
+separately and apply both the FP8 block scale and FP32 global scale.
 
-`tpu/harness/nvfp4_jax_ops.py` needs:
-1. `nvfp4_to_bf16_jax` and `nvfp4_matmul` accept `global_scale: jnp.ndarray (scalar)` as an extra arg.
-2. Fold the global scale into the dequant multiply.
-
-`tpu/harness/m2_tpu_infer.py` needs:
-1. Fix all tensor names to match above. Notably: router bias = `block_sparse_moe.e_score_correction_bias` (no `.gate.`).
-2. Expert loader should read `w1`, `w2`, `w3` as separate NVFP4 tensors; skip `input_scale` for now (only needed for static activation quant — path A uses bf16 activations).
-3. Set `USE_MTP=False` unconditionally, regardless of config (real checkpoint has no MTP).
-
-`tpu/harness/m2_moe.py` needs:
-1. `moe_block_nvfp4` signature should take three pytrees: `(w1_packed, w1_scale, w1_scale2)`, `(w2_*)`, `(w3_*)` rather than fused `gate_up`.
-2. Expert FFN becomes:
-     gate = nvfp4_matmul(x, w1_packed, w1_scale, w1_scale2, MOE_INTER, hidden)
-     up   = nvfp4_matmul(x, w3_packed, w3_scale, w3_scale2, MOE_INTER, hidden)
-     h    = silu(gate) * up
-     out  = nvfp4_matmul(h, w2_packed, w2_scale, w2_scale2, hidden, MOE_INTER)
-
-## Non-changes
-- Attention backbone (`m2_attention.py`): tensor names match. No change.
-- Mesh (`m2_mesh.py`), KV cache (`m2_kv_cache.py`): no change.
-- Chat template (`m2_chat.py`): no change.
-- Deploy script: no change.
+The old MiniMax Python/JAX harnesses were removed. M2 runtime work now lives in
+Rust under `v3/crates/rvllm-loader`, `rvllm-fused`, `rvllm-xla`, and
+`rvllm-serve`.

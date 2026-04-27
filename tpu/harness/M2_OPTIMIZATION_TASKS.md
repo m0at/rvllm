@@ -201,10 +201,10 @@ Rust verification:
   191,069 tensor specs, real shard filenames, dense BF16 weights, packed
   NVFP4/FP8/global-scale/input-scale expert tensors, and total flat upload byte
   budget without Python.
-- [x] Add Rust decode bench harness shell: emits the `m2_full_bench.py`
-  top-level JSON contract from Rust (`arch`, `slice`, `nl`, `ctx`, `kv_cache`,
-  `moe_impl`, `load_seconds`, `sweep`, `ppl`, `generation`) plus ABI runtime
-  facts. Current status is explicit `planned` until graph execution is wired.
+- [x] Add Rust decode bench harness shell: emits the M2 bench JSON contract from
+  Rust (`arch`, `slice`, `nl`, `ctx`, `kv_cache`, `moe_impl`, `load_seconds`,
+  `sweep`, `ppl`, `generation`) plus ABI runtime facts. Current status is
+  explicit `planned` until graph execution is wired.
 - [x] Wire the weight upload plan into live PJRT device buffers behind
   `rvllm-xla/tpu`: every safetensors view is validated for dtype/shape/bytes
   against the ABI before `PJRT_Client_BufferFromHostBuffer`.
@@ -223,10 +223,10 @@ Rust verification:
 - [x] Wire PJRT decode execution loop over the Rust decode graph: compile
   decode MLIR, upload token/position/KV/weight-arena buffers, execute repeated
   steps, read `next_token`, and carry returned KV forward.
-- [x] Replace `m2_full_bench.py` serial prefill/PPL/gen with Rust batched
-  prefill + decode harness: generated token-id dump and optional BF16-logit
-  PPL scoring run inside `m2_rust_prefill_decode`.
-- [x] Replace `m2_api_server.py` with Rust serving over the same PJRT runtime:
+- [x] Replace the old serial prefill/PPL/gen path with Rust batched prefill +
+  decode harness: generated token-id dump and optional BF16-logit PPL scoring
+  run inside `m2_rust_prefill_decode`.
+- [x] Replace the old M2 API surface with Rust serving over the same PJRT runtime:
   `rvllm-server` now owns `/health`, `/v1/models`, and
   `/v1/chat/completions` over `rvllm_xla::M2Runtime`. Chat accepts
   `prompt_token_ids`, calls the Rust PJRT decode loop, and returns a guarded
@@ -234,9 +234,8 @@ Rust verification:
   executable Mosaic custom-call bodies are missing.
 - [x] Delete stale top-level Python packaging metadata once no Python package
   target remains.
-- [x] Quarantine remaining M2 Python/JAX harnesses as legacy reproduction only:
-  `PYTHON_LEGACY.md`, `M2_SETUP_GUIDE.md`, and `README.md` point new work at
-  Rust `rvllm-xla`, `rvllm-loader`, `rvllm-fused`, and `rvllm-server`.
+- [x] Delete remaining M2 Python/JAX harnesses. New M2 work points at Rust
+  `rvllm-xla`, `rvllm-loader`, `rvllm-fused`, and `rvllm-server`.
 - [x] Add explicit Rust runtime modes:
   `planning-only`, `compile-only`, and `execute`, with execution blocked until
   fused M2 decode custom-call bodies are linked.

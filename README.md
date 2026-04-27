@@ -191,9 +191,7 @@ What we found while compiling the Rust MLIR directly on the TPU:
 2. **Real Rust decode still needs the fused NVFP4 Mosaic body**. `rvllm-server` now calls `rvllm_xla::M2Runtime` from `/v1/chat/completions`, and Rust PJRT can execute the 8-partition graph. The current executable artifact uses a zero layer body; production needs the fused NVFP4 decode-layer body serialized into TPU Mosaic custom-call format.
 3. **Long-form generation degenerates**. The full gate scores PPL 6.73 and passes prefix matching, but the 256-token angular-momentum sample falls into repetitive math text after the coherent opening.
 
-### Build list (ranked, from 16-agent perf advisor spec)
-
-See [`tpu/harness/M2_PERF_ADVISOR_SPEC.md`](tpu/harness/M2_PERF_ADVISOR_SPEC.md) for the full analysis.
+### Build list
 
 1. Rust emitter: use TPU's real `tpu_custom_call` target and JSON backend-config contract
 2. Native StableHLO fallback for embed/final logits so only the hard NVFP4 layer needs Mosaic
@@ -230,12 +228,6 @@ cargo run --release -p rvllm-xla --features tpu --bin m2_rust_decode_bench -- \
   --moe-impl raw-mosaic-sharded-weight
 ```
 
-The legacy reproduction command remains documented in
-[`tpu/harness/M2_SETUP_GUIDE.md`](tpu/harness/M2_SETUP_GUIDE.md), but new M2
-runtime work should not add Python paths.
-
-Full walkthrough in [`tpu/harness/M2_SETUP_GUIDE.md`](tpu/harness/M2_SETUP_GUIDE.md).
-Python/JAX M2 files are quarantined in [`tpu/harness/PYTHON_LEGACY.md`](tpu/harness/PYTHON_LEGACY.md).
 Full v6e-4-equivalent M2 run artifacts are in [`tpu/out/m2/full_equiv_bb800cc21/`](tpu/out/m2/full_equiv_bb800cc21/).
 
 
