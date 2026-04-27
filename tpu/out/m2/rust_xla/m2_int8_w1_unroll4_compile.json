@@ -1,0 +1,33 @@
+{
+  "schema": "rvllm.m2.int8_weight_compile_probe.v1",
+  "variant": "w1_observable_unrolled_bk32x4",
+  "k_coverage": {
+    "k_step": 32,
+    "k_tiles": 4,
+    "k_covered": 128,
+    "k_total": 3072,
+    "fraction": 0.0417
+  },
+  "observable": true,
+  "body_bytes": 3977,
+  "graph_bytes": 3613502,
+  "n_layers": 62,
+  "tpu_pjrt_compile": "passed",
+  "remote_artifact": "/workspace/models/runs/mlir_probe/m2_decode_b8_int8_w1_unroll4_135230.mlir",
+  "next_blocker": "expanding K to 96 tiles (full coverage) needs mosaic-serde bytecode pre-gen to fit parser",
+  "math_ops_per_tile": [
+    "vector.load %w1_block_t -> vector<32x128xi8>",
+    "arith.sitofp -> vector<32x128xf32>",
+    "arith.mulf w_scaled by row scales",
+    "vector.load %hidden -> vector<8x32xbf16>",
+    "arith.extf -> vector<8x32xf32>",
+    "vector.contract (lowered to tpu.matmul) -> vector<8x128xf32>"
+  ],
+  "body_format": "lowered",
+  "decode_layer_body_path": "tpu/out/m2/rust_xla/m2_decode_layer_body_int8_b8.mlir",
+  "store": {
+    "full_hidden_passthrough": "vector.store %hidden_v, %hidden_out[%c0, %c0]",
+    "w1_overlay": "vector.store %out_bf16, %hidden_out[%c0, %c0] : vector<8x128xbf16>"
+  },
+  "pass": true
+}
