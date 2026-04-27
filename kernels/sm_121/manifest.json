@@ -11,10 +11,15 @@
       "path": "argmax.ptx",
       "sha256": "91336a9928546748a48bd5b4cfd6a68ef04d1187a2b613c174a1e40142885027"
     },
+    "awq_int4_gemm_sm120_wmma": {
+      "bytes": 17562,
+      "path": "awq_int4_gemm_sm120_wmma.ptx",
+      "sha256": "3ca1e103abd82c56885e3a939dce1fd493228601ce1d0648368ec8722da9cb85"
+    },
     "awq_int4_gemv_f16": {
-      "bytes": 10845,
+      "bytes": 6364,
       "path": "awq_int4_gemv_f16.ptx",
-      "sha256": "94365e4858022a8aa32fd5d8e4893c5d0066e1b18643047c212a89ee93adbd64"
+      "sha256": "187ce594ccb771210b9baff836c46574be2f3b816dc3a23c4c2fcf925df59136"
     },
     "bf16_to_f16_sat": {
       "bytes": 1314,
@@ -257,5 +262,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "52f4244"
+  "revision": "c8f7c49"
 }

@@ -850,6 +850,90 @@ impl AwqInt4GemvF16Launch {
 }
 
 // ---------------------------------------------------------------------------
+// Cycle 51 step 10d.3: AWQ INT4 W4A16 GEMM (M>1 prefill) launcher.
+//
+// Wraps `awq_int4_gemm_sm120_wmma_kernel` (kernels/awq_int4_gemm_sm120_wmma.cu).
+// 1-warp/16x16-tile WMMA kernel — un-tuned but ~6 TFLOPS sustained on
+// canonical Gemma 4 prefill shapes (M=2048 q_proj = 30 ms vs the
+// per-token-loop's ~100 seconds → ~3000x speedup). Cycle 51d.2b will
+// tune to multi-warp / cp.async-pipelined for ~30 TFLOPS.
+//
+// Validated end-to-end against fp64 reference at M ∈ {8, 16, 128, 2048}
+// in v3/tools/awq_int4_gemm_check.py (cycle 51d.1b).
+// ---------------------------------------------------------------------------
+
+pub struct AwqInt4GemmSm120WmmaLaunch {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub group_size: u32,
+}
+
+impl AwqInt4GemmSm120WmmaLaunch {
+    pub fn validate(&self) -> Result<()> {
+        if self.m == 0 { return Err(invalid("m", "must be > 0")); }
+        if self.n == 0 { return Err(invalid("n", "must be > 0")); }
+        if self.k == 0 { return Err(invalid("k", "must be > 0")); }
+        if self.group_size == 0 { return Err(invalid("group_size", "must be > 0")); }
+        if self.k % 16 != 0 {
+            return Err(invalid("k", "must be multiple of 16 (WMMA K-step)"));
+        }
+        if self.k % self.group_size != 0 {
+            return Err(invalid("k", "must be multiple of group_size"));
+        }
+        if self.n % 8 != 0 {
+            return Err(invalid("n", "must be multiple of 8 (zero_point INT4-along-N packing)"));
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// All device pointers must be valid for the kernel's duration.
+    /// Layout per the kernel header in awq_int4_gemm_sm120_wmma.cu:
+    ///   D:                  [M, N] f16 RowMajor
+    ///   A:                  [M, K] f16 RowMajor
+    ///   weight_packed:      [N, K/8] i32 RowMajor
+    ///   weight_scale:       [N, K/g] bf16 RowMajor
+    ///   weight_zero_point:  [N/8, K/g] i32 RowMajor
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        d_f16: u64,
+        a_f16: u64,
+        weight_packed: u64,
+        weight_scale: u64,
+        weight_zero_point: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut d   = d_f16;
+        let mut a   = a_f16;
+        let mut w   = weight_packed;
+        let mut s   = weight_scale;
+        let mut z   = weight_zero_point;
+        let mut m_i = self.m as i32;
+        let mut n_i = self.n as i32;
+        let mut k_i = self.k as i32;
+        let mut g_i = self.group_size as i32;
+        let args = [
+            (&mut d)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut a)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut w)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut s)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut z)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut g_i) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        // gridDim = (ceil(N/16), ceil(M/16), 1), blockDim = 32.
+        let grid = ((self.n + 15) / 16, (self.m + 15) / 16, 1u32);
+        let block = (32u32, 1u32, 1u32);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cycle 51 step 10b: AWQ INT4 W4A16 per-token prefill loop helper.
 //
 // The AWQ GEMV kernel is M=1 only. Until the CUTLASS SM120 AWQ GEMM
@@ -1055,6 +1139,27 @@ mod tests {
             in_stride_elems: 5376, out_stride_elems: 10240,
         };
         assert!(l.validate().is_ok());
+    }
+
+    // === Cycle 51 step 10d.3 GEMM launcher tests ===
+
+    #[test]
+    fn awq_gemm_accepts_canonical_q_proj() {
+        // Gemma 4 31B q_proj prefill (M=2048): N=8192, K=5376, g=128.
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 2048, n: 8192, k: 5376, group_size: 128 };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn awq_gemm_rejects_k_not_multiple_of_16() {
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 8192, k: 5384, group_size: 128 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_gemm_rejects_n_not_multiple_of_8() {
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 1023, k: 5376, group_size: 128 };
+        assert!(l.validate().is_err());
     }
 
     #[test]
