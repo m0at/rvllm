@@ -735,13 +735,17 @@ pub unsafe fn gemma4_forward_phase(
                 && weights.awq.linear_active(AwqLinearKind::V),
             "AWQ QKV must be all-or-nothing (Q/K/V flags inconsistent)"
         );
-        if dims.num_tokens != 1 {
-            // Decode-only for now. Prefill needs either a per-token
-            // loop (slow) or an AWQ GEMM kernel (cycle 47 work).
+        // Prefill (M>1) is opt-in via RVLLM_AWQ_PREFILL_LOOP=1. The
+        // loop re-reads the full weight matrix per token (~50ms/token);
+        // production prefill answer is the cycle 51c-d CUTLASS SM120
+        // AWQ GEMM. Default behavior fails loud rather than silently
+        // running pathologically slow prefill.
+        let prefill_loop_enabled = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
+        if dims.num_tokens != 1 && !prefill_loop_enabled {
             return Err(rvllm_core::RvllmError::Attention {
                 err: rvllm_core::AttentionError::FeatureNotAvailable {
                     backend: "AwqInt4GemvF16",
-                    op: "awq qkv prefill (M>1) not yet implemented",
+                    op: "awq qkv prefill (M>1) not yet implemented; set RVLLM_AWQ_PREFILL_LOOP=1 for slow per-token fallback",
                 },
                 ctx: rvllm_core::AttnCtx {
                     op: "awq_qkv",
@@ -790,44 +794,47 @@ pub unsafe fn gemma4_forward_phase(
         let q_dim_u = q_dim as u32;
         let g = weights.awq.group_size;
         let k = dims.hidden as u32;
+        let qkv_rows_u = qkv_rows as u32;
 
-        // Q: writes scratch.q_out + 0
+        // Composes Q/K/V into the contiguous Q|K|V scratch via offset
+        // pointers. For decode (M=1), three M=1 GEMV launches. For
+        // prefill (M>1), three per-token-loop launches with
+        // out_stride=qkv_rows so each token's output lands at the
+        // right row.
         unsafe {
-            gemma4_launcher::AwqInt4GemvF16Launch {
-                n: q_dim_u, k, group_size: g,
-            }.launch(
-                fn_awq,
-                scratch.delta_f16,
-                weights.awq.q_packed,
-                weights.awq.q_scale,
-                weights.awq.q_zero,
-                scratch.q_out,
-                stream,
-            )?;
-            // K: writes scratch.q_out + q_dim*2 (output is f16 → 2B)
-            gemma4_launcher::AwqInt4GemvF16Launch {
-                n: kv_dim, k, group_size: g,
-            }.launch(
-                fn_awq,
-                scratch.delta_f16,
-                weights.awq.k_packed,
-                weights.awq.k_scale,
-                weights.awq.k_zero,
-                scratch.q_out + (q_dim_u as u64) * 2,
-                stream,
-            )?;
-            // V: writes scratch.q_out + (q_dim + kv_dim)*2
-            gemma4_launcher::AwqInt4GemvF16Launch {
-                n: kv_dim, k, group_size: g,
-            }.launch(
-                fn_awq,
-                scratch.delta_f16,
-                weights.awq.v_packed,
-                weights.awq.v_scale,
-                weights.awq.v_zero,
-                scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2,
-                stream,
-            )?;
+            if dims.num_tokens == 1 {
+                gemma4_launcher::AwqInt4GemvF16Launch {
+                    n: q_dim_u, k, group_size: g,
+                }.launch(fn_awq, scratch.delta_f16,
+                    weights.awq.q_packed, weights.awq.q_scale, weights.awq.q_zero,
+                    scratch.q_out, stream)?;
+                gemma4_launcher::AwqInt4GemvF16Launch {
+                    n: kv_dim, k, group_size: g,
+                }.launch(fn_awq, scratch.delta_f16,
+                    weights.awq.k_packed, weights.awq.k_scale, weights.awq.k_zero,
+                    scratch.q_out + (q_dim_u as u64) * 2, stream)?;
+                gemma4_launcher::AwqInt4GemvF16Launch {
+                    n: kv_dim, k, group_size: g,
+                }.launch(fn_awq, scratch.delta_f16,
+                    weights.awq.v_packed, weights.awq.v_scale, weights.awq.v_zero,
+                    scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2, stream)?;
+            } else {
+                // Per-token prefill loop — debug fallback only.
+                let mk_loop = |n: u32| gemma4_launcher::AwqInt4GemvF16PrefillLoop {
+                    num_tokens: dims.num_tokens, n, k, group_size: g,
+                    in_stride_elems:  k,
+                    out_stride_elems: qkv_rows_u,
+                };
+                mk_loop(q_dim_u).launch(fn_awq, scratch.delta_f16,
+                    weights.awq.q_packed, weights.awq.q_scale, weights.awq.q_zero,
+                    scratch.q_out, stream)?;
+                mk_loop(kv_dim).launch(fn_awq, scratch.delta_f16,
+                    weights.awq.k_packed, weights.awq.k_scale, weights.awq.k_zero,
+                    scratch.q_out + (q_dim_u as u64) * 2, stream)?;
+                mk_loop(kv_dim).launch(fn_awq, scratch.delta_f16,
+                    weights.awq.v_packed, weights.awq.v_scale, weights.awq.v_zero,
+                    scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2, stream)?;
+            }
         }
     } else if weights.qkv_f16 != 0 {
         // F16 path: copy residual to delta_f16 scratch, apply rmsnorm in-place, use as GEMM input
