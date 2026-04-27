@@ -23,7 +23,8 @@ use rvllm_xla::{
 use rvllm_loader::M2SafetensorsReader;
 #[cfg(feature = "tpu")]
 use rvllm_xla::{
-    m2_bf16_argmax_tokens, m2_bf16_logits_nll, m2_gather_embed_bf16, m2_ppl_from_nll,
+    analyze_logits_observability, enforce_body_probe_if_enabled, m2_bf16_argmax_tokens,
+    m2_bf16_logits_nll, m2_gather_embed_bf16, m2_ppl_from_nll, M2LogitsObservabilityReport,
     PjrtClientHandle,
 };
 
@@ -94,6 +95,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut nll = Vec::new();
         let mut top1_hits = 0usize;
         let mut top1_total = 0usize;
+        #[cfg(feature = "tpu")]
+        let mut last_observability: Option<M2LogitsObservabilityReport> = None;
         for (item, executed) in report.sweep.iter_mut().zip(executed) {
             item.status = "executed";
             item.error = None;
@@ -103,6 +106,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             top1_hits += executed.top1_hits;
             top1_total += executed.top1_total;
             item.timing = Some(executed.timing);
+            #[cfg(feature = "tpu")]
+            {
+                if let Some(report) = executed.observability.clone() {
+                    last_observability = Some(report);
+                }
+            }
         }
         if let Some(ppl) = nll.last() {
             report.ppl.status = "executed";
@@ -120,6 +129,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "total": top1_total,
                 "note": "teacher-forced decode argmax vs next-token target; no sampling",
             }));
+        }
+        #[cfg(feature = "tpu")]
+        if let Some(obs) = last_observability {
+            report.body_probe = Some(serde_json::to_value(&obs)?);
         }
     }
 
@@ -147,11 +160,14 @@ struct DecodeArtifact {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "tpu"), allow(dead_code))]
 struct ExecutedDecodeArtifact {
     timing: M2RustDecodeExecutedTiming,
     ppl: Option<M2RustDecodePplResult>,
     top1_hits: usize,
     top1_total: usize,
+    #[cfg(feature = "tpu")]
+    observability: Option<M2LogitsObservabilityReport>,
 }
 
 fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn std::error::Error>> {
@@ -495,6 +511,7 @@ fn execute_decode_artifacts(
         let mut nll = Vec::new();
         let mut top1_hits = 0usize;
         let mut top1_total = 0usize;
+        let mut observability: Option<M2LogitsObservabilityReport> = None;
         for step in 0..(args.warmup + args.iters) {
             if let Some(tokens) = &teacher {
                 token_ids = tokens.input_at(step);
@@ -578,6 +595,15 @@ fn execute_decode_artifacts(
             }
             if step >= args.warmup {
                 samples.push(elapsed_ms);
+                if observability.is_none() {
+                    if let Some(logits) = logits.as_ref() {
+                        observability = Some(analyze_logits_observability(
+                            logits,
+                            artifact.shape.batch,
+                            M2_VOCAB,
+                        )?);
+                    }
+                }
                 if let (Some(tokens), Some(logits)) = (&teacher, logits.as_ref()) {
                     let targets = tokens.target_at(step)?;
                     let argmax = m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
@@ -652,11 +678,26 @@ fn execute_decode_artifacts(
                 .map(|v| format!("{:.3}", v))
                 .unwrap_or_else(|| "-".to_string())
         );
+        if let Some(report) = observability.as_ref() {
+            eprintln!(
+                "logits_observability B={} var={:.3e} range=[{:.3e},{:.3e}] nonzero_frac={:.3} distinct_top1={} passed={}",
+                artifact.batch,
+                report.var,
+                report.min,
+                report.max,
+                report.nonzero_frac,
+                report.distinct_top1,
+                report.passed,
+            );
+            enforce_body_probe_if_enabled(report)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        }
         out.push(ExecutedDecodeArtifact {
             timing,
             ppl,
             top1_hits,
             top1_total,
+            observability,
         });
     }
     Ok(out)

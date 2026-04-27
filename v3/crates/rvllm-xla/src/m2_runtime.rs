@@ -632,6 +632,118 @@ fn run_int8_parity_gate_if_enabled(weight_format: &str) -> Result<()> {
     })
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct M2LogitsObservabilityReport {
+    pub mean: f64,
+    pub var: f64,
+    pub min: f64,
+    pub max: f64,
+    pub nonzero_frac: f64,
+    pub all_finite: bool,
+    pub distinct_top1: usize,
+    pub passed: bool,
+    pub failures: Vec<String>,
+}
+
+pub fn analyze_logits_observability(
+    logits_bf16: &[u8],
+    batch: usize,
+    vocab: usize,
+) -> Result<M2LogitsObservabilityReport> {
+    if logits_bf16.len() != batch * vocab * 2 {
+        return Err(invalid("logits", "bf16 byte length must be batch*vocab*2"));
+    }
+    let n = (batch * vocab) as f64;
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut nonzero = 0usize;
+    let mut all_finite = true;
+    for row in 0..batch {
+        let row_bytes = &logits_bf16[row * vocab * 2..(row + 1) * vocab * 2];
+        for col in 0..vocab {
+            let v = read_bf16(row_bytes, col) as f64;
+            if !v.is_finite() {
+                all_finite = false;
+                continue;
+            }
+            sum += v;
+            sum_sq += v * v;
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
+            if v.abs() > 1e-6 {
+                nonzero += 1;
+            }
+        }
+    }
+    let mean = if n > 0.0 { sum / n } else { 0.0 };
+    let var = if n > 0.0 {
+        (sum_sq / n) - mean * mean
+    } else {
+        0.0
+    };
+    let nonzero_frac = if n > 0.0 { nonzero as f64 / n } else { 0.0 };
+    let argmax_ids = m2_bf16_argmax_tokens(logits_bf16, batch, vocab)?;
+    let mut distinct = std::collections::HashSet::new();
+    for id in &argmax_ids {
+        distinct.insert(*id);
+    }
+    let distinct_top1 = distinct.len();
+    let mut failures = Vec::new();
+    if !all_finite {
+        failures.push("logits contain non-finite values".into());
+    }
+    if var <= 1e-8 {
+        failures.push(format!("logit variance is degenerate ({var:.3e} <= 1e-8)"));
+    }
+    if nonzero_frac < 0.5 {
+        failures.push(format!(
+            "less than 50% of logits are non-zero (frac={nonzero_frac:.3})"
+        ));
+    }
+    if max - min < 1e-3 {
+        failures.push(format!(
+            "logit range is degenerate (max-min={:.3e} < 1e-3)",
+            max - min
+        ));
+    }
+    Ok(M2LogitsObservabilityReport {
+        mean,
+        var,
+        min,
+        max,
+        nonzero_frac,
+        all_finite,
+        distinct_top1,
+        passed: failures.is_empty(),
+        failures,
+    })
+}
+
+pub fn enforce_body_probe_if_enabled(report: &M2LogitsObservabilityReport) -> Result<()> {
+    if env::var("RVLLM_M2_BODY_PROBE").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+    if report.passed {
+        return Ok(());
+    }
+    Err(RvllmError::config(
+        ConfigError::InvalidField {
+            name: "RVLLM_M2_BODY_PROBE",
+            reason: format!(
+                "decode-layer body produced degenerate logits: {}; aborting without fallback",
+                report.failures.join("; ")
+            ),
+        },
+        "m2_runtime",
+    ))
+}
+
 pub fn m2_bf16_logits_nll(
     logits_bf16: &[u8],
     target_ids: &[i32],

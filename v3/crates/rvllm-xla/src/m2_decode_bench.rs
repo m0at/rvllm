@@ -44,6 +44,8 @@ pub struct M2RustDecodeBenchReport {
     pub ppl: M2RustDecodePplPlan,
     pub generation: M2RustDecodeGenerationPlan,
     pub rust_runtime: M2RustDecodeRuntimeReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_probe: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -212,6 +214,7 @@ pub fn plan_m2_rust_decode_bench(cfg: &M2RustDecodeBenchConfig) -> Result<M2Rust
             weight_upload_bytes,
             batch_shapes,
         },
+        body_probe: None,
     })
 }
 
