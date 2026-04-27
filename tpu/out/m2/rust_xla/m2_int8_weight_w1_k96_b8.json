@@ -1,0 +1,87 @@
+{
+  "schema": "rvllm.m2.rust_xla_bench_plan.v1",
+  "bench_kind": "m2_full_equivalent_decode_plan",
+  "runtime": "rust+xla",
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "kv_cache": "int8",
+  "weight_format": "int8",
+  "moe_impl": "auto",
+  "load_seconds": null,
+  "batches": [
+    8
+  ],
+  "artifacts": {
+    "model_dir": "/workspace/models/m2/MiniMax-M2.7-NVFP4",
+    "artifact_dir": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260427_213841/real_execute_b8",
+    "report_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260427_213841/real_execute_b8.json",
+    "sweep_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260427_213841/real_execute_b8/m2_decode_sweep.json",
+    "ppl_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260427_213841/real_execute_b8/m2_ppl.json",
+    "generation_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260427_213841/real_execute_b8/m2_generation.json"
+  },
+  "sweep": [
+    {
+      "batch": 8,
+      "ctx": 2048,
+      "iters": 8,
+      "warmup": 2,
+      "status": "executed",
+      "error": null,
+      "artifact_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260427_213841/real_execute_b8/m2_decode_b8.json",
+      "decode_mlir": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260427_213841/real_execute_b8/m2_decode_b8.mlir",
+      "timing": {
+        "timing_source": {
+          "runtime": "rust_xla",
+          "executed": true,
+          "device": "tpu:0-7",
+          "executable": "pjrt_mlir_decode"
+        },
+        "ms_min": 11.082978,
+        "ms_mean": 11.58238075,
+        "ms_max": 11.896968000000001,
+        "ms_p50": 11.815429,
+        "tok_per_s": 690.7042837458093,
+        "ttft_ms": 5710.6952360000005
+      }
+    }
+  ],
+  "ppl": {
+    "status": "planned",
+    "input_text_path": null,
+    "artifact_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260427_213841/real_execute_b8/m2_ppl.json",
+    "result": null
+  },
+  "generation": {
+    "status": "planned",
+    "prompt": "explain angular momentum",
+    "gen_tokens": 64,
+    "artifact_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260427_213841/real_execute_b8/m2_generation.json",
+    "result": null
+  },
+  "rust_runtime": {
+    "graph_phase": "decode",
+    "weight_tensors": 191069,
+    "weight_upload_bytes": 167276952320,
+    "batch_shapes": [
+      {
+        "batch": 8,
+        "runtime_inputs": 7,
+        "runtime_outputs": 3,
+        "kv_cache_bytes": 2080374784
+      }
+    ]
+  },
+  "body_probe": {
+    "all_finite": true,
+    "distinct_top1": 3,
+    "failures": [],
+    "max": 0.328125,
+    "mean": 0.012395643708402303,
+    "min": -0.322265625,
+    "nonzero_frac": 0.999997500799744,
+    "passed": true,
+    "var": 0.0046425542237992536
+  }
+}
