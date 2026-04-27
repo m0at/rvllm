@@ -22,6 +22,8 @@ MAX_WEIGHT_ARENA_BYTES="${MAX_WEIGHT_ARENA_BYTES:-0}"
 REMOTE_M2_MOE_INT8="${RVLLM_M2_MOE_INT8:-}"
 REMOTE_M2_PARITY="${RVLLM_M2_PARITY:-}"
 REMOTE_M2_BODY_PROBE="${RVLLM_M2_BODY_PROBE:-}"
+REMOTE_PPL_TEXT_LOCAL="${REMOTE_PPL_TEXT_LOCAL:-$ROOT/tpu/harness/m2_ppl_corpus.txt}"
+REMOTE_PPL_TEXT="${REMOTE_PPL_TEXT:-$REMOTE_RUN_ROOT/m2_ppl_corpus.txt}"
 
 case "$REMOTE_MODEL_DIR" in
   /tmp/*|/dev/shm/*)
@@ -102,6 +104,14 @@ gcloud compute tpus tpu-vm scp "$LOCAL_STAGE/rvllm-xla-min.tgz" \
   --zone "$ZONE" \
   --scp-flag='-o ConnectTimeout=10'
 
+if [[ -f "$REMOTE_PPL_TEXT_LOCAL" ]]; then
+  gcloud compute tpus tpu-vm scp "$REMOTE_PPL_TEXT_LOCAL" \
+    "$TPU_NAME:$REMOTE_PPL_TEXT" \
+    --project "$PROJECT" \
+    --zone "$ZONE" \
+    --scp-flag='-o ConnectTimeout=10'
+fi
+
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
   --project "$PROJECT" \
   --zone "$ZONE" \
@@ -157,6 +167,10 @@ if [[ -n '$REMOTE_DECODE_LAYER_BODY' ]]; then
     --weight-format int8 \
     --prompt 'explain angular momentum' \
     --gen-tokens 64 2>&1 | tee \"\$RUN/real_execute_b8_emit.log\"
+  PPL_FLAG=()
+  if [[ -f '$REMOTE_PPL_TEXT' ]]; then
+    PPL_FLAG=(--ppl-text '$REMOTE_PPL_TEXT')
+  fi
   target/release/m2_rust_decode_bench \
     --model-dir '$REMOTE_MODEL_DIR' \
     --artifact-dir \"\$RUN/real_execute_b8\" \
@@ -171,6 +185,7 @@ if [[ -n '$REMOTE_DECODE_LAYER_BODY' ]]; then
     --weight-format int8 \
     --max-weight-arena-bytes '$MAX_WEIGHT_ARENA_BYTES' \
     --prompt 'explain angular momentum' \
+    \"\${PPL_FLAG[@]}\" \
     --gen-tokens 64 2>&1 | tee \"\$RUN/real_execute_b8.log\"
 else
   echo SKIP_REAL_EXECUTE=no_REMOTE_DECODE_LAYER_BODY
