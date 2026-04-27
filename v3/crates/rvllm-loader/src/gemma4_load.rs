@@ -75,8 +75,11 @@ pub fn load_gemma4_model(
             awq.format, awq.scheme.num_bits, awq.scheme.group_size, awq.ignore
         );
         return Err(RvllmError::Loader {
-            err: LoaderError::Corrupt {
-                detail: "AWQ load path not yet wired; cycle 48 needs to make Gemma4LayerWeights FP8 fields Optional and call upload_gemma4_awq_layer per layer. Run with the FP8 checkpoint instead.".into(),
+            err: LoaderError::UnsupportedQuantization {
+                detail: format!(
+                    "AWQ {:?} W{} detected; load_gemma4_model AWQ wiring deferred to cycle 48 (needs Optional FP8 fields + upload_gemma4_awq_layer). Run with an FP8 checkpoint instead.",
+                    awq.format, awq.scheme.num_bits
+                ),
             },
             ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
             bt: std::backtrace::Backtrace::capture(),

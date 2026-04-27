@@ -177,6 +177,12 @@ pub enum LoaderError {
     DtypeMismatch { tensor: String, expected: DType, got: DType },
     Fp8MisScaled { tensor: String, clamp_ppm: f32 },
     Corrupt { detail: String },
+    /// Checkpoint quantization scheme is recognized but not yet wired
+    /// into this loader entrypoint (e.g. AWQ INT4 W4A16 detected by
+    /// `compressed_tensors::AwqConfig` but the `load_*_model` path
+    /// still only handles FP8). Distinct from `Corrupt` (malformed)
+    /// and `MissingTensor` (well-formed but absent).
+    UnsupportedQuantization { detail: String },
 }
 
 #[derive(Debug)]
