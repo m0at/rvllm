@@ -1,0 +1,75 @@
+{
+  "schema": "rvllm.m2.rust_xla_bench_plan.v1",
+  "bench_kind": "m2_full_equivalent_decode_plan",
+  "runtime": "rust+xla",
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "kv_cache": "int8",
+  "weight_format": "int8",
+  "moe_impl": "auto",
+  "load_seconds": null,
+  "batches": [
+    8
+  ],
+  "artifacts": {
+    "model_dir": "/workspace/runs/e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/tpu/harness/m2_checkpoint_schema",
+    "artifact_dir": "/tmp/m2_tpu_perf_e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/artifacts",
+    "report_json": "/tmp/m2_tpu_perf_e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/rust_xla_b8_tpu_perf.json",
+    "sweep_json": "/tmp/m2_tpu_perf_e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/artifacts/m2_decode_sweep.json",
+    "ppl_json": "/tmp/m2_tpu_perf_e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/artifacts/m2_ppl.json",
+    "generation_json": "/tmp/m2_tpu_perf_e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/artifacts/m2_generation.json"
+  },
+  "sweep": [
+    {
+      "batch": 8,
+      "ctx": 2048,
+      "iters": 200,
+      "warmup": 20,
+      "status": "executed",
+      "error": null,
+      "artifact_json": "/tmp/m2_tpu_perf_e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/artifacts/m2_decode_b8.json",
+      "decode_mlir": "/tmp/m2_tpu_perf_e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/artifacts/m2_decode_b8.mlir",
+      "timing": {
+        "timing_source": {
+          "runtime": "rust_xla",
+          "executed": true,
+          "device": "tpu:0-7",
+          "executable": "pjrt_mlir_decode"
+        },
+        "ms_min": 3.769789,
+        "ms_mean": 3.8459372300000014,
+        "ms_max": 4.009459,
+        "ms_p50": 3.847479,
+        "tok_per_s": 2080.117152614058
+      }
+    }
+  ],
+  "ppl": {
+    "status": "planned",
+    "input_text_path": null,
+    "artifact_json": "/tmp/m2_tpu_perf_e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/artifacts/m2_ppl.json",
+    "result": null
+  },
+  "generation": {
+    "status": "planned",
+    "prompt": "Explain angular momentum.",
+    "gen_tokens": 256,
+    "artifact_json": "/tmp/m2_tpu_perf_e9144f9ca17a9d1286cecd9ed10d3e04a3fc35b1/artifacts/m2_generation.json",
+    "result": null
+  },
+  "rust_runtime": {
+    "graph_phase": "decode",
+    "weight_tensors": 191069,
+    "weight_upload_bytes": 233100453632,
+    "batch_shapes": [
+      {
+        "batch": 8,
+        "runtime_inputs": 3,
+        "runtime_outputs": 3,
+        "kv_cache_bytes": 2080374784
+      }
+    ]
+  }
+}
