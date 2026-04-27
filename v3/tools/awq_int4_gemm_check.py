@@ -119,10 +119,10 @@ def run_one(M: int, N: int, K: int, group_size: int, seed: int, ld_d: int = None
              np.array([ld_d], dtype=np.int32)]
     arg_ptrs = np.array([a.ctypes.data for a in args], dtype=np.uint64)
 
-    # gridDim = (ceil(N/16), ceil(M/16), 1), blockDim = (32, 1, 1)
-    gx = (N + 15) // 16
-    gy = (M + 15) // 16
-    CK(drv.cuLaunchKernel(fn, gx, gy, 1, 32, 1, 1, 0, 0,
+    # Production v2: gridDim = (ceil(N/32), ceil(M/32), 1), blockDim = 128.
+    gx = (N + 31) // 32
+    gy = (M + 31) // 32
+    CK(drv.cuLaunchKernel(fn, gx, gy, 1, 128, 1, 1, 0, 0,
                           arg_ptrs.ctypes.data, 0), "launch")
     CK(drv.cuCtxSynchronize(), "sync")
 

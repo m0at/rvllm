@@ -12,9 +12,9 @@
       "sha256": "91336a9928546748a48bd5b4cfd6a68ef04d1187a2b613c174a1e40142885027"
     },
     "awq_int4_gemm_sm120_wmma": {
-      "bytes": 17682,
+      "bytes": 31915,
       "path": "awq_int4_gemm_sm120_wmma.ptx",
-      "sha256": "afe8fced442592003aea96bedca527a3d95df0ce184a8d2b8f61f3b932733d72"
+      "sha256": "77e62daca4f5c8f5ce44844c5ab3538882e4d2ae2e810e084ef8b9caba8c58c4"
     },
     "awq_int4_gemv_f16": {
       "bytes": 6364,
@@ -262,5 +262,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "06da319"
+  "revision": "1d58f39"
 }

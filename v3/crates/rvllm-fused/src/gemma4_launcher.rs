@@ -937,9 +937,10 @@ impl AwqInt4GemmSm120WmmaLaunch {
             (&mut g_i)  as *mut i32 as *mut core::ffi::c_void,
             (&mut ld_i) as *mut i32 as *mut core::ffi::c_void,
         ];
-        // gridDim = (ceil(N/16), ceil(M/16), 1), blockDim = 32.
-        let grid = ((self.n + 15) / 16, (self.m + 15) / 16, 1u32);
-        let block = (32u32, 1u32, 1u32);
+        // Grid/block matches v2 32x32-tile / 128-thread kernel
+        // (cycle 51d.2b promoted v2 to production after 2x speedup).
+        let grid = ((self.n + 31) / 32, (self.m + 31) / 32, 1u32);
+        let block = (128u32, 1u32, 1u32);
         launch_raw(kernel, grid, block, 0, stream, &args)
     }
 }

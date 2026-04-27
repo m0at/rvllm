@@ -90,17 +90,17 @@ for label, M, N, K in SHAPES:
              np.array([N], dtype=np.int32)]  # ld_d = N
     arg_ptrs = np.array([a.ctypes.data for a in args], dtype=np.uint64)
 
-    gx = (N + 15) // 16
-    gy = (M + 15) // 16
+    gx = (N + 31) // 32
+    gy = (M + 31) // 32
     # warm up
     for _ in range(3):
-        CK(drv.cuLaunchKernel(fn, gx, gy, 1, 32, 1, 1, 0, 0,
+        CK(drv.cuLaunchKernel(fn, gx, gy, 1, 128, 1, 1, 0, 0,
                               arg_ptrs.ctypes.data, 0), "")
     CK(drv.cuCtxSynchronize(), "")
 
     t0 = time.perf_counter_ns()
     for _ in range(ITERS):
-        CK(drv.cuLaunchKernel(fn, gx, gy, 1, 32, 1, 1, 0, 0,
+        CK(drv.cuLaunchKernel(fn, gx, gy, 1, 128, 1, 1, 0, 0,
                               arg_ptrs.ctypes.data, 0), "")
     CK(drv.cuCtxSynchronize(), "")
     t1 = time.perf_counter_ns()

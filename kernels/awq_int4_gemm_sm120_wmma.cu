@@ -113,9 +113,141 @@ __device__ __forceinline__ float bf16_to_f32(__nv_bfloat16 v) {
 }
 }  // anonymous namespace
 
+// ===========================================================================
+// V2 KERNEL — 4-warp 32x32 block tile (cycle 51d.2b experimental tuning).
+// Same ABI as v1; cycle 51d.2c will A/B-bench and decide which the
+// production launcher targets.
+// ===========================================================================
+// Production kernel — 4-warp 32x32 block tile, ~12 TFLOPS sustained.
+extern "C" __global__
+__launch_bounds__(128)
+void awq_int4_gemm_sm120_wmma_kernel(
+    __half*               __restrict__ D,
+    const __half*         __restrict__ A,
+    const int32_t*        __restrict__ B_packed,
+    const __nv_bfloat16*  __restrict__ B_scale,
+    const int32_t*        __restrict__ B_zero,
+    int M, int N, int K, int group_size, int ld_d
+) {
+    // 32x32 block tile = 2x2 grid of 16x16 WMMA fragments, one warp per
+    // fragment. K-step = 16. 128 threads / block.
+    const int n_block = blockIdx.x * 32;
+    const int m_block = blockIdx.y * 32;
+    if (n_block >= N || m_block >= M) return;
+
+    const int tid     = threadIdx.x;       // 0..127
+    const int warp_id = tid >> 5;          // 0..3
+    const int lane_id = tid & 31;          // 0..31
+    // 2x2 warp grid: (m_warp, n_warp) ∈ {(0,0), (0,1), (1,0), (1,1)}
+    const int m_warp  = warp_id >> 1;      // 0..1
+    const int n_warp  = warp_id & 1;       // 0..1
+
+    const int K_div_8 = K >> 3;
+    const int K_div_g = K / group_size;
+
+    __shared__ __align__(16) __half A_smem[32 * 16];   // 32 M × 16 K = 1 KB
+    __shared__ __align__(16) __half B_smem[32 * 16];   // 32 N × 16 K = 1 KB
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major>    a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major>    b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float>                   acc_frag;
+    wmma::fill_fragment(acc_frag, 0.0f);
+
+    // Cooperative dequant mapping: 128 threads × 4 (N, k_half) pairs each
+    // = 512 ≥ 32 N × 2 k_half = 64 pairs. Use tid -> (n_local=tid>>2,
+    // k_sub=tid&3) where k_sub picks 4 of 16 K-elements per int32 lane.
+    // Cleaner: 32 N × 16 K = 512 dequant ops / 128 threads = 4 ops/thread.
+    // Map: thread t handles 4 contiguous K-elements at (n_local=t>>2, k_off=4*(t&3))
+    const int n_local_dq = tid >> 2;       // 0..31
+    const int k_quartet  = tid & 3;        // 0..3, 4 K-elements each
+    const int n_global_dq = n_block + n_local_dq;
+    const int n_in_zero   = n_global_dq & 7;
+    const int n_zero_g    = n_global_dq >> 3;
+
+    for (int k_base = 0; k_base < K; k_base += 16) {
+        // ---- Stage A_smem (32 M × 16 K = 512 elements / 128 threads = 4 each) ----
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int idx = i * 128 + tid;
+            const int r   = idx >> 4;
+            const int c   = idx & 0xF;
+            const int gm  = m_block + r;
+            const int gk  = k_base  + c;
+            __half v = __float2half(0.0f);
+            if (gm < M && gk < K) {
+                v = A[(size_t)gm * K + gk];
+            }
+            A_smem[r * 16 + c] = v;
+        }
+
+        // ---- Dequant B_smem ----
+        const int g = k_base / group_size;
+        // Each thread handles 4 K-elements. The packed int32 covers 8
+        // K-elements; 4 K-elements span half an int32.
+        const int   k_int_lane = k_quartet >> 1;     // 0 or 1
+        const int   k_lane_off = (k_quartet & 1) * 4; // 0 or 4
+        float scale_f   = 0.0f;
+        int   zero_pack = 0;
+        int32_t w_pack  = 0;
+        if (n_global_dq < N) {
+            scale_f   = bf16_to_f32(B_scale[(size_t)n_global_dq * K_div_g + g]);
+            zero_pack = B_zero  [(size_t)n_zero_g * K_div_g + g];
+            w_pack    = B_packed[(size_t)n_global_dq * K_div_8 + (k_base >> 3) + k_int_lane];
+        }
+        const int   z_int = (zero_pack >> (4 * n_in_zero)) & 0xF;
+        const float z_f   = (float)z_int;
+
+        #pragma unroll
+        for (int lane = 0; lane < 4; ++lane) {
+            const int   w_int   = (w_pack >> (4 * (k_lane_off + lane))) & 0xF;
+            const float dq      = ((float)w_int - z_f) * scale_f;
+            const int   k_local = k_int_lane * 8 + k_lane_off + lane; // 0..15
+            const int   gk      = k_base + k_local;
+            __half v = __float2half(0.0f);
+            if (n_global_dq < N && gk < K) {
+                v = __float2half(dq);
+            }
+            // B_smem layout matches v1: col_major [N x K] with ldb=16,
+            // element (k, n) at smem[n*16 + k].
+            B_smem[n_local_dq * 16 + k_local] = v;
+        }
+
+        __syncthreads();
+
+        // ---- WMMA load + accumulate (per warp's 16x16 sub-tile) ----
+        wmma::load_matrix_sync(a_frag, A_smem + m_warp * 16 * 16, 16);
+        wmma::load_matrix_sync(b_frag, B_smem + n_warp * 16 * 16, 16);
+        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+
+        __syncthreads();
+    }
+
+    // ---- Store: each warp writes its 16x16 sub-tile via shared f32 round-trip ----
+    __shared__ __align__(16) float acc_smem[32 * 32];
+    wmma::store_matrix_sync(
+        acc_smem + (m_warp * 16) * 32 + (n_warp * 16),
+        acc_frag, 32, wmma::mem_row_major);
+    __syncthreads();
+
+    // 128 threads cover 32x32 = 1024 elements, 8 each.
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int idx = i * 128 + tid;
+        const int r   = idx >> 5;     // 0..31
+        const int c   = idx & 0x1F;   // 0..31
+        const int gm  = m_block + r;
+        const int gn  = n_block + c;
+        if (gm < M && gn < N) {
+            D[(size_t)gm * ld_d + gn] = __float2half(acc_smem[r * 32 + c]);
+        }
+    }
+    (void)lane_id; // unused — wmma::*_sync use threadIdx implicitly
+}
+
+// V1 kernel kept for reference / A/B fallback. 1-warp 16x16 tile, ~6 TFLOPS.
 extern "C" __global__
 __launch_bounds__(32)
-void awq_int4_gemm_sm120_wmma_kernel(
+void awq_int4_gemm_sm120_wmma_v1_kernel(
     __half*               __restrict__ D,
     const __half*         __restrict__ A,
     const int32_t*        __restrict__ B_packed,
