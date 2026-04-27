@@ -347,7 +347,7 @@ fn emit_decode_body(
     %h_embed = stablehlo.broadcast_in_dim %embed_zero, dims = [] : (tensor<bf16>) -> {hidden_ty}
     %weight_arena_local = stablehlo.custom_call @xla.sdy.GlobalToLocalShape(%weight_arena) {{
       has_side_effect = true,
-      mhlo.sharding = "{{replicated}}",
+      mhlo.sharding = "{{manual}}",
       mhlo.frontend_attributes = {{xla.sdy.in_shardings = "#sdy.sharding_per_value<[<@mesh, [{{\22expert\22}}]>]>", xla.sdy.manual_axes = "#sdy<manual_axes{{\22expert\22}}>"}}
     }} : (tensor<{weight_bytes}xi8>) -> {arena_ty}
 "###,
