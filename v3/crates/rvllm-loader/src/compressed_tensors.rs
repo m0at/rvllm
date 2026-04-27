@@ -335,17 +335,25 @@ pub fn stage_awq_linear(
     };
     let layout = validate_awq_linear(linear_name, dense_shape, scheme, &dtype_shape_lookup)?;
 
-    // Then pull bytes for each (validation already ensured the entries exist).
-    let need_bytes = |key: &str| -> Result<Vec<u8>, String> {
-        byte_lookup(key)
-            .map(|(_, _, bytes)| bytes)
-            .ok_or_else(|| format!("AWQ entry vanished between validate and stage: {key}"))
+    // Then pull bytes for each, re-asserting dtype against the expected
+    // value (closes a TOCTOU gap if `byte_lookup` is non-pure — e.g. a
+    // racy mmap source).
+    let need_bytes = |key: &str, want: rvllm_core::DType| -> Result<Vec<u8>, String> {
+        let (dtype, _, bytes) = byte_lookup(key).ok_or_else(|| {
+            format!("AWQ entry vanished between validate and stage: {key}")
+        })?;
+        if dtype != want {
+            return Err(format!(
+                "AWQ entry {key} dtype changed mid-stage: {dtype:?} != {want:?}"
+            ));
+        }
+        Ok(bytes)
     };
 
-    let packed     = need_bytes(&layout.names.packed)?;
-    let scale      = need_bytes(&layout.names.scale)?;
-    let zero_point = need_bytes(&layout.names.zero_point)?;
-    let shape      = need_bytes(&layout.names.shape)?;
+    let packed     = need_bytes(&layout.names.packed,     rvllm_core::DType::I32)?;
+    let scale      = need_bytes(&layout.names.scale,      rvllm_core::DType::Bf16)?;
+    let zero_point = need_bytes(&layout.names.zero_point, rvllm_core::DType::I32)?;
+    let shape      = need_bytes(&layout.names.shape,      rvllm_core::DType::I64)?;
 
     // Sanity-check byte sizes against expected shapes to catch
     // truncated/over-long mmap slices.
@@ -374,6 +382,16 @@ pub fn stage_awq_linear(
     if shape.len() != expected_shape {
         return Err(format!(
             "weight_shape bytes = {} != expected {}", shape.len(), expected_shape
+        ));
+    }
+    // Cross-check the I64 [2] payload against the dense shape we were
+    // told. Catches a checkpoint that drifted from its config.json
+    // (or a misclassified linear) before any GPU memcpy happens.
+    let n_meta = i64::from_le_bytes(shape[0..8].try_into().unwrap());
+    let k_meta = i64::from_le_bytes(shape[8..16].try_into().unwrap());
+    if n_meta as usize != n || k_meta as usize != k {
+        return Err(format!(
+            "weight_shape contents = [{n_meta}, {k_meta}] != dense [{n}, {k}]"
         ));
     }
 
@@ -410,11 +428,20 @@ pub fn validate_awq_linear(
         Ok(())
     };
 
+    // Cycle 43.1: only W4 AWQ is wired today. Reject other widths loudly
+    // so a future W8 / W2 checkpoint can't silently fall through with W4
+    // assumptions baked into the staging byte-size formulas + GEMV kernel.
+    if scheme.num_bits != 4 {
+        return Err(format!(
+            "AWQ scheme.num_bits = {} unsupported; only 4 wired",
+            scheme.num_bits
+        ));
+    }
+
     need(&names.packed,     rvllm_core::DType::I32,  &expected.packed_shape)?;
     need(&names.scale,      rvllm_core::DType::Bf16, &expected.scale_shape)?;
     need(&names.zero_point, rvllm_core::DType::I32,  &expected.zero_point_shape)?;
     need(&names.shape,      rvllm_core::DType::I64,  &expected.shape_shape)?;
-    let _ = scheme.num_bits; // suppress unused warning if num_bits != 4 lands later
 
     Ok(AwqLinearLayout { names, expected, dense: dense_shape })
 }
@@ -659,12 +686,14 @@ mod tests {
         let packed_bytes = override_packed_len.unwrap_or(n * (k / 8) * 4);
         let scale_bytes  = n * (k / g) * 2;
         let zero_bytes   = (n / 8) * (k / g) * 4;
-        let shape_bytes  = 2 * 8;
+        let mut shape_payload = Vec::with_capacity(16);
+        shape_payload.extend_from_slice(&(n as i64).to_le_bytes());
+        shape_payload.extend_from_slice(&(k as i64).to_le_bytes());
         [
             (names.packed,     (rvllm_core::DType::I32,  vec![n, k / 8],     vec![0u8; packed_bytes])),
             (names.scale,      (rvllm_core::DType::Bf16, vec![n, k / g],     vec![0u8; scale_bytes])),
             (names.zero_point, (rvllm_core::DType::I32,  vec![n / 8, k / g], vec![0u8; zero_bytes])),
-            (names.shape,      (rvllm_core::DType::I64,  vec![2],            vec![0u8; shape_bytes])),
+            (names.shape,      (rvllm_core::DType::I64,  vec![2],            shape_payload)),
         ]
         .into_iter()
         .collect()
@@ -711,6 +740,37 @@ mod tests {
         let err = stage_awq_linear(prefix, [8192, 5376], &scheme, &lookup)
             .expect_err("must fail");
         assert!(err.contains("weight_packed bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_awq_linear_rejects_non_w4() {
+        let scheme = AwqWeightScheme {
+            num_bits: 8, group_size: 128, symmetric: false,
+        };
+        let lookup = |_k: &str| None;
+        let err = validate_awq_linear("l.q", [8192, 5376], &scheme, &lookup)
+            .expect_err("must reject non-W4");
+        assert!(err.contains("num_bits"), "got: {err}");
+    }
+
+    #[test]
+    fn stage_awq_linear_rejects_shape_payload_mismatch() {
+        let scheme = AwqWeightScheme { num_bits: 4, group_size: 128, symmetric: false };
+        let prefix = "l.q";
+        let mut map = mock_byte_lookup(prefix, 8192, 5376, 128, None);
+        // Corrupt weight_shape payload: [N, K] = [9999, 5376] disagrees with dense.
+        let bad_shape = {
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&(9999_i64).to_le_bytes());
+            v.extend_from_slice(&(5376_i64).to_le_bytes());
+            v
+        };
+        let names = AwqTensorNames::for_linear(prefix);
+        map.insert(names.shape, (rvllm_core::DType::I64, vec![2], bad_shape));
+        let lookup = |k: &str| map.get(k).cloned();
+        let err = stage_awq_linear(prefix, [8192, 5376], &scheme, &lookup)
+            .expect_err("must reject");
+        assert!(err.contains("weight_shape contents"), "got: {err}");
     }
 
     #[test]
