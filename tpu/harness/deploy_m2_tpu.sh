@@ -251,7 +251,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "installing rustup/cargo"
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
-source "$HOME/.cargo/env"
+source "\$HOME/.cargo/env"
 rustc --version
 cargo --version
 EOS
