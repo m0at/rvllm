@@ -172,6 +172,7 @@ What we found while compiling the Rust MLIR directly on the TPU:
 - The TPU backend has a registered lowering emitter for exactly `call_target_name = "tpu_custom_call"`.
 - `tpu_custom_call` requires JSON `backend_config` shaped like `{"custom_call_config":{"body":"<base64 Mosaic bytecode>","serialization_format":1,"needs_layout_passes":true},"implicit_sharding":{"type":"MANUAL"}}`.
 - The `body` is not our semicolon metadata string. It is serialized Mosaic MLIR bytecode produced by the Mosaic serde pass.
+- Commit `8d92d99f8` emits the real `tpu_custom_call` target and JSON backend config from Rust. The TPU compile probe now gets past the custom-emitter lookup and fails at body deserialization: `Failed to deserialize the Mosaic module: Missing or invalid version attribute`. That is expected for the current empty placeholder body.
 - Therefore the remaining blocker is not Python, tokenization, serving, or PJRT. It is linking a real serialized Mosaic body for embed/final/decode-layer kernels, or decomposing embed/final into native StableHLO and reserving Mosaic only for the fused NVFP4 MoE matmul.
 - The HF repo `and-y/rvllm-m2-build` is a private dataset containing legacy JAX cache artifacts only. It is useful for reproduction, not for the Rust-native runtime.
 
