@@ -41,6 +41,10 @@ run() {
   fi
 }
 
+redact() {
+  sed -E 's/hf_[A-Za-z0-9_-]+/hf_***REDACTED***/g'
+}
+
 run_heredoc() {
   # run_heredoc <description> <command...> < stdin
   local desc="$1"; shift
@@ -206,12 +210,17 @@ UNPACK_CMD="${SSH_BASE} --command=\"set -euo pipefail; cd '${RUN_DIR}' && tar xz
 run "$UNPACK_CMD"
 
 echo ">> (6) install deps on remote (Rust + optional legacy JAX env)"
+HF_TOKEN_EXPORT=""
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  HF_TOKEN_EXPORT="export HF_TOKEN='${HF_TOKEN}'; export HUGGING_FACE_HUB_TOKEN='${HF_TOKEN}';"
+fi
 INSTALL_SCRIPT=$(cat <<EOS
 set -euo pipefail
 echo "host cores: \$(nproc)"
 python3 --version
 
 # Try to pull cached python env + JAX compile cache from HF.
+${HF_TOKEN_EXPORT}
 export SHA=${SHA}
 export ACCEL=${ACCELERATOR}
 export REPO=and-y/rvllm-m2-build
@@ -258,7 +267,10 @@ EOS
 )
 INSTALL_SCRIPT="${INSTALL_SCRIPT//\$/\\\$}"
 INSTALL_CMD="${SSH_BASE} --command=\"${INSTALL_SCRIPT//\"/\\\"}\""
-run "$INSTALL_CMD"
+echo ">> $(printf '%s' "$INSTALL_CMD" | redact)"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  eval "$INSTALL_CMD"
+fi
 
 echo ">> (7) build zig project in ${RUN_DIR}/zig (SKIPPED: path A does not need Zig)"
 # The current M2 path is Rust PJRT/XLA. Zig is only needed for older experiments
@@ -282,10 +294,6 @@ else
 fi
 
 echo ">> (8) download model ${MODEL_REPO} to /dev/shm/m2-nvfp4"
-HF_TOKEN_EXPORT=""
-if [[ -n "${HF_TOKEN:-}" ]]; then
-  HF_TOKEN_EXPORT="export HF_TOKEN='${HF_TOKEN}'; export HUGGING_FACE_HUB_TOKEN='${HF_TOKEN}';"
-fi
 HF_SCRIPT=$(cat <<EOS
 set -euo pipefail
 export PATH="\$HOME/.local/bin:\$PATH"
@@ -303,7 +311,10 @@ EOS
 )
 HF_SCRIPT="${HF_SCRIPT//\$/\\\$}"
 HF_CMD="${SSH_BASE} --command=\"${HF_SCRIPT//\"/\\\"}\""
-run "$HF_CMD"
+echo ">> $(printf '%s' "$HF_CMD" | redact)"
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  eval "$HF_CMD"
+fi
 
 echo ">> (9) smoke run: Rust m2_rust_prefill_decode dry-run"
 SMOKE_SCRIPT=$(cat <<EOS
