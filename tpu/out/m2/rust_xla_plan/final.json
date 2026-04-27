@@ -1,0 +1,112 @@
+{
+  "schema": "rvllm.m2.rust_xla_bench_plan.v1",
+  "bench_kind": "m2_full_equivalent_decode_plan",
+  "runtime": "rust+xla",
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "kv_cache": "int8",
+  "moe_impl": "auto",
+  "load_seconds": null,
+  "batches": [
+    1,
+    8,
+    16,
+    32
+  ],
+  "artifacts": {
+    "model_dir": "tpu/harness/m2_checkpoint_schema",
+    "artifact_dir": "tpu/out/m2/rust_xla_plan",
+    "report_json": "tpu/out/m2/rust_xla_plan/final.json",
+    "sweep_json": "tpu/out/m2/rust_xla_plan/m2_decode_sweep.json",
+    "ppl_json": "tpu/out/m2/rust_xla_plan/m2_ppl.json",
+    "generation_json": "tpu/out/m2/rust_xla_plan/m2_generation.json"
+  },
+  "sweep": [
+    {
+      "batch": 1,
+      "ctx": 2048,
+      "iters": 10,
+      "warmup": 3,
+      "status": "planned",
+      "error": "Rust XLA decode timing has not executed",
+      "artifact_json": "tpu/out/m2/rust_xla_plan/m2_decode_b1.json",
+      "decode_mlir": "tpu/out/m2/rust_xla_plan/m2_decode_b1.mlir"
+    },
+    {
+      "batch": 8,
+      "ctx": 2048,
+      "iters": 10,
+      "warmup": 3,
+      "status": "planned",
+      "error": "Rust XLA decode timing has not executed",
+      "artifact_json": "tpu/out/m2/rust_xla_plan/m2_decode_b8.json",
+      "decode_mlir": "tpu/out/m2/rust_xla_plan/m2_decode_b8.mlir"
+    },
+    {
+      "batch": 16,
+      "ctx": 2048,
+      "iters": 10,
+      "warmup": 3,
+      "status": "planned",
+      "error": "Rust XLA decode timing has not executed",
+      "artifact_json": "tpu/out/m2/rust_xla_plan/m2_decode_b16.json",
+      "decode_mlir": "tpu/out/m2/rust_xla_plan/m2_decode_b16.mlir"
+    },
+    {
+      "batch": 32,
+      "ctx": 2048,
+      "iters": 10,
+      "warmup": 3,
+      "status": "planned",
+      "error": "Rust XLA decode timing has not executed",
+      "artifact_json": "tpu/out/m2/rust_xla_plan/m2_decode_b32.json",
+      "decode_mlir": "tpu/out/m2/rust_xla_plan/m2_decode_b32.mlir"
+    }
+  ],
+  "ppl": {
+    "status": "planned",
+    "input_text_path": null,
+    "artifact_json": "tpu/out/m2/rust_xla_plan/m2_ppl.json",
+    "result": null
+  },
+  "generation": {
+    "status": "planned",
+    "prompt": "Explain angular momentum.",
+    "gen_tokens": 256,
+    "artifact_json": "tpu/out/m2/rust_xla_plan/m2_generation.json",
+    "result": null
+  },
+  "rust_runtime": {
+    "graph_phase": "decode",
+    "weight_tensors": 191069,
+    "weight_upload_bytes": 134400868280,
+    "batch_shapes": [
+      {
+        "batch": 1,
+        "runtime_inputs": 3,
+        "runtime_outputs": 3,
+        "kv_cache_bytes": 260046848
+      },
+      {
+        "batch": 8,
+        "runtime_inputs": 3,
+        "runtime_outputs": 3,
+        "kv_cache_bytes": 2080374784
+      },
+      {
+        "batch": 16,
+        "runtime_inputs": 3,
+        "runtime_outputs": 3,
+        "kv_cache_bytes": 4160749568
+      },
+      {
+        "batch": 32,
+        "runtime_inputs": 3,
+        "runtime_outputs": 3,
+        "kv_cache_bytes": 8321499136
+      }
+    ]
+  }
+}

@@ -28,6 +28,19 @@ pub enum PjrtElementType {
     F8E4M3FN,
 }
 
+impl PjrtElementType {
+    pub const fn byte_size(self) -> Option<usize> {
+        match self {
+            Self::PRED | Self::S8 | Self::U8 | Self::F8E5M2 | Self::F8E4M3FN => Some(1),
+            Self::S16 | Self::U16 | Self::F16 | Self::BF16 => Some(2),
+            Self::S32 | Self::U32 | Self::F32 => Some(4),
+            Self::S64 | Self::U64 | Self::F64 | Self::C64 => Some(8),
+            Self::C128 => Some(16),
+            Self::INVALID => None,
+        }
+    }
+}
+
 pub type PjrtClient = c_void;
 pub type PjrtBuffer = c_void;
 pub type PjrtLoadedExecutable = c_void;
@@ -78,6 +91,13 @@ pub struct PJRT_Client_Create_Args {
     pub client: *mut PjrtClient,
     pub kv_try_get_callback: *const c_void,
     pub kv_try_get_user_arg: *mut c_void,
+}
+
+#[repr(C)]
+pub struct PJRT_Client_Destroy_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut c_void,
+    pub client: *mut PjrtClient,
 }
 
 #[repr(C)]
@@ -144,6 +164,13 @@ pub struct PJRT_LoadedExecutable_Execute_Args {
 }
 
 #[repr(C)]
+pub struct PJRT_LoadedExecutable_Destroy_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut c_void,
+    pub executable: *mut PjrtLoadedExecutable,
+}
+
+#[repr(C)]
 pub struct PJRT_ExecuteOptions {
     pub struct_size: usize,
     pub extension_start: *mut c_void,
@@ -198,6 +225,8 @@ pub type PjrtPluginInitializeFn =
 pub type PjrtErrorDestroyFn = unsafe extern "C" fn(*mut PJRT_Error_Destroy_Args);
 pub type PjrtErrorMessageFn = unsafe extern "C" fn(*mut PJRT_Error_Message_Args);
 pub type PjrtClientCreateFn = unsafe extern "C" fn(*mut PJRT_Client_Create_Args) -> *mut PjrtError;
+pub type PjrtClientDestroyFn =
+    unsafe extern "C" fn(*mut PJRT_Client_Destroy_Args) -> *mut PjrtError;
 pub type PjrtClientDevicesFn =
     unsafe extern "C" fn(*mut PJRT_Client_Devices_Args) -> *mut PjrtError;
 pub type PjrtClientCompileFn =
@@ -206,6 +235,8 @@ pub type PjrtClientBufferFromHostBufferFn =
     unsafe extern "C" fn(*mut PJRT_Client_BufferFromHostBuffer_Args) -> *mut PjrtError;
 pub type PjrtLoadedExecutableExecuteFn =
     unsafe extern "C" fn(*mut PJRT_LoadedExecutable_Execute_Args) -> *mut PjrtError;
+pub type PjrtLoadedExecutableDestroyFn =
+    unsafe extern "C" fn(*mut PJRT_LoadedExecutable_Destroy_Args) -> *mut PjrtError;
 pub type PjrtBufferToHostBufferFn =
     unsafe extern "C" fn(*mut PJRT_Buffer_ToHostBuffer_Args) -> *mut PjrtError;
 pub type PjrtBufferDestroyFn =
@@ -237,9 +268,11 @@ pub const OFFSET_PLUGIN_INITIALIZE: usize = fn_offset(3);
 pub const OFFSET_EVENT_DESTROY: usize = fn_offset(5);
 pub const OFFSET_EVENT_AWAIT: usize = fn_offset(8);
 pub const OFFSET_CLIENT_CREATE: usize = fn_offset(10);
+pub const OFFSET_CLIENT_DESTROY: usize = fn_offset(11);
 pub const OFFSET_CLIENT_DEVICES: usize = fn_offset(15);
 pub const OFFSET_CLIENT_COMPILE: usize = fn_offset(20);
 pub const OFFSET_CLIENT_BUFFER_FROM_HOST: usize = fn_offset(22);
+pub const OFFSET_LOADED_EXECUTABLE_DESTROY: usize = fn_offset(50);
 pub const OFFSET_LOADED_EXECUTABLE_EXECUTE: usize = fn_offset(55);
 pub const OFFSET_BUFFER_DESTROY: usize = fn_offset(58);
 pub const OFFSET_BUFFER_TO_HOST: usize = fn_offset(70);
@@ -251,9 +284,11 @@ pub struct PjrtApiFns {
     pub event_destroy: PjrtEventDestroyFn,
     pub event_await: PjrtEventAwaitFn,
     pub client_create: PjrtClientCreateFn,
+    pub client_destroy: PjrtClientDestroyFn,
     pub client_devices: PjrtClientDevicesFn,
     pub client_compile: PjrtClientCompileFn,
     pub client_buffer_from_host: PjrtClientBufferFromHostBufferFn,
+    pub loaded_executable_destroy: PjrtLoadedExecutableDestroyFn,
     pub loaded_executable_execute: PjrtLoadedExecutableExecuteFn,
     pub buffer_to_host: PjrtBufferToHostBufferFn,
     pub buffer_destroy: PjrtBufferDestroyFn,
@@ -269,9 +304,11 @@ impl PjrtApiFns {
             event_destroy: read_fn_ptr(base, OFFSET_EVENT_DESTROY),
             event_await: read_fn_ptr(base, OFFSET_EVENT_AWAIT),
             client_create: read_fn_ptr(base, OFFSET_CLIENT_CREATE),
+            client_destroy: read_fn_ptr(base, OFFSET_CLIENT_DESTROY),
             client_devices: read_fn_ptr(base, OFFSET_CLIENT_DEVICES),
             client_compile: read_fn_ptr(base, OFFSET_CLIENT_COMPILE),
             client_buffer_from_host: read_fn_ptr(base, OFFSET_CLIENT_BUFFER_FROM_HOST),
+            loaded_executable_destroy: read_fn_ptr(base, OFFSET_LOADED_EXECUTABLE_DESTROY),
             loaded_executable_execute: read_fn_ptr(base, OFFSET_LOADED_EXECUTABLE_EXECUTE),
             buffer_to_host: read_fn_ptr(base, OFFSET_BUFFER_TO_HOST),
             buffer_destroy: read_fn_ptr(base, OFFSET_BUFFER_DESTROY),

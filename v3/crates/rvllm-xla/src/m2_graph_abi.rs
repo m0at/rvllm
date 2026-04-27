@@ -21,6 +21,17 @@ pub enum M2GraphPhase {
     Prefill,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum M2KvCacheDType {
+    Int8,
+    Bf16,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum M2DecodeLayerCustomCall {
+    FusedAttentionNvfp4Moe,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct M2GraphShape {
     pub phase: M2GraphPhase,
@@ -50,6 +61,41 @@ pub struct M2Nvfp4ProjectionAbi {
     pub input_scale: M2GraphTensorSpec,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct M2DecodeLayerArenaOffsets {
+    pub input_norm: i64,
+    pub post_attention_norm: i64,
+    pub q_proj: i64,
+    pub k_proj: i64,
+    pub v_proj: i64,
+    pub o_proj: i64,
+    pub q_norm: i64,
+    pub k_norm: i64,
+    pub router: i64,
+    pub router_bias: i64,
+    pub w1_first_packed: i64,
+    pub w1_first_scale: i64,
+    pub w1_first_global_scale: i64,
+    pub w1_first_input_scale: i64,
+    pub w2_first_packed: i64,
+    pub w3_first_packed: i64,
+    pub w3_last_packed: i64,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct M2DecodeLayerCustomCallAbi {
+    pub call: M2DecodeLayerCustomCall,
+    pub batch: usize,
+    pub ctx: usize,
+    pub kv_dtype: M2KvCacheDType,
+    pub kv_cache_bytes: usize,
+    pub hidden: usize,
+    pub top_k: usize,
+    pub expert_count: usize,
+    pub expert_directory_cols: usize,
+    pub weight_offsets: M2DecodeLayerArenaOffsets,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct M2LayerWeightAbi {
     pub layer: usize,
@@ -64,6 +110,75 @@ pub struct M2GraphAbi {
     pub runtime_outputs: Vec<M2GraphTensorSpec>,
     pub global_weights: Vec<M2GraphTensorSpec>,
     pub layer_weights: Vec<M2LayerWeightAbi>,
+}
+
+impl M2KvCacheDType {
+    pub fn from_bytes_per_elem(bytes: usize) -> Result<Self> {
+        match bytes {
+            1 => Ok(Self::Int8),
+            2 => Ok(Self::Bf16),
+            _ => Err(invalid("kv_bytes_per_elem", "must be 1 or 2")),
+        }
+    }
+
+    pub const fn as_mlir_dtype(self) -> &'static str {
+        match self {
+            Self::Int8 => "i8",
+            Self::Bf16 => "bf16",
+        }
+    }
+
+    pub const fn bytes_per_elem(self) -> usize {
+        match self {
+            Self::Int8 => 1,
+            Self::Bf16 => 2,
+        }
+    }
+}
+
+impl M2DecodeLayerCustomCall {
+    pub const fn target(self) -> &'static str {
+        match self {
+            Self::FusedAttentionNvfp4Moe => "rvllm.m2.decode_layer.fused_attention_nvfp4_moe",
+        }
+    }
+
+    pub const fn abi(self) -> &'static str {
+        match self {
+            Self::FusedAttentionNvfp4Moe => "m2_decode_layer_v1",
+        }
+    }
+}
+
+impl M2DecodeLayerArenaOffsets {
+    pub const DENSE_ATTRS: &'static str =
+        "input_norm,post_attention_norm,q_proj,k_proj,v_proj,o_proj,q_norm,k_norm,router,router_bias";
+}
+
+impl M2DecodeLayerCustomCallAbi {
+    pub fn new(
+        shape: &M2GraphShape,
+        expert_count: usize,
+        expert_directory_cols: usize,
+        weight_offsets: M2DecodeLayerArenaOffsets,
+    ) -> Result<Self> {
+        shape.validate()?;
+        if shape.phase != M2GraphPhase::Decode {
+            return Err(invalid("phase", "expected decode graph shape"));
+        }
+        Ok(Self {
+            call: M2DecodeLayerCustomCall::FusedAttentionNvfp4Moe,
+            batch: shape.batch,
+            ctx: shape.ctx,
+            kv_dtype: shape.kv_dtype()?,
+            kv_cache_bytes: shape.kv_cache_bytes(),
+            hidden: M2_HIDDEN,
+            top_k: M2_TOP_K,
+            expert_count,
+            expert_directory_cols,
+            weight_offsets,
+        })
+    }
 }
 
 impl M2GraphShape {
@@ -107,6 +222,10 @@ impl M2GraphShape {
             return Err(invalid("prompt_len", "decode prompt_len must be 1"));
         }
         Ok(())
+    }
+
+    pub fn kv_dtype(&self) -> Result<M2KvCacheDType> {
+        M2KvCacheDType::from_bytes_per_elem(self.kv_bytes_per_elem)
     }
 
     pub const fn total_tokens(&self) -> usize {
@@ -443,5 +562,42 @@ mod tests {
             layer.dense[9].name,
             "model.layers.17.block_sparse_moe.e_score_correction_bias"
         );
+    }
+
+    #[test]
+    fn decode_layer_custom_call_abi_tracks_runtime_dispatch_shape() {
+        let shape = M2GraphShape::decode(4, 1024, 2);
+        let offsets = M2DecodeLayerArenaOffsets {
+            input_norm: 1,
+            post_attention_norm: 2,
+            q_proj: 3,
+            k_proj: 4,
+            v_proj: 5,
+            o_proj: 6,
+            q_norm: 7,
+            k_norm: 8,
+            router: 9,
+            router_bias: 10,
+            w1_first_packed: 11,
+            w1_first_scale: 12,
+            w1_first_global_scale: 13,
+            w1_first_input_scale: -1,
+            w2_first_packed: 14,
+            w3_first_packed: 15,
+            w3_last_packed: 16,
+        };
+        let abi = M2DecodeLayerCustomCallAbi::new(&shape, M2_NUM_EXPERTS, 13, offsets).unwrap();
+        assert_eq!(
+            abi.call.target(),
+            "rvllm.m2.decode_layer.fused_attention_nvfp4_moe"
+        );
+        assert_eq!(abi.call.abi(), "m2_decode_layer_v1");
+        assert_eq!(abi.batch, 4);
+        assert_eq!(abi.ctx, 1024);
+        assert_eq!(abi.kv_dtype, M2KvCacheDType::Bf16);
+        assert_eq!(abi.kv_dtype.as_mlir_dtype(), "bf16");
+        assert_eq!(abi.kv_cache_bytes, shape.kv_cache_bytes());
+        assert_eq!(abi.expert_directory_cols, 13);
+        assert_eq!(abi.weight_offsets, offsets);
     }
 }

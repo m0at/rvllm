@@ -1,6 +1,7 @@
 pub mod artifact;
 #[cfg(feature = "tpu")]
 pub mod client;
+pub mod executable;
 pub mod ffi;
 pub mod m2_decode_bench;
 pub mod m2_decode_graph;
@@ -15,6 +16,10 @@ pub use artifact::{
 };
 #[cfg(feature = "tpu")]
 pub use client::{CompiledExecutable, PjrtBufferHandle, PjrtClientHandle};
+pub use executable::{
+    tensor_nbytes, validate_argument_specs, PjrtExecutableSignature, PjrtHostBuffer,
+    PjrtProgramFormat, PjrtTensorSpec,
+};
 pub use ffi::PjrtElementType;
 pub use m2_decode_bench::{
     plan_m2_rust_decode_bench, M2RustDecodeBenchConfig, M2RustDecodeBenchReport,

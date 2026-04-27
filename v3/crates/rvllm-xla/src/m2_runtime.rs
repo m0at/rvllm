@@ -84,6 +84,61 @@ pub struct M2RuntimeConfig {
     pub kv_dtype: M2PrefillKvDType,
     pub max_weight_arena_bytes: usize,
     pub device_idx: usize,
+    pub mode: M2RuntimeMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum M2RuntimeMode {
+    #[default]
+    PlanningOnly,
+    CompileOnly,
+    Execute,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum M2RuntimeState {
+    PlanningOnly,
+    CompiledOnly,
+    Executable,
+}
+
+impl M2RuntimeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlanningOnly => "planning-only",
+            Self::CompileOnly => "compile-only",
+            Self::Execute => "execute",
+        }
+    }
+}
+
+impl std::str::FromStr for M2RuntimeMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "planning-only" | "plan-only" | "plan" => Ok(Self::PlanningOnly),
+            "compile-only" | "compile" => Ok(Self::CompileOnly),
+            "execute" | "exec" => Ok(Self::Execute),
+            other => Err(format!(
+                "expected planning-only|compile-only|execute, got {other:?}"
+            )),
+        }
+    }
+}
+
+impl M2RuntimeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PlanningOnly => "planning-only",
+            Self::CompiledOnly => "compiled-only",
+            Self::Executable => "executable",
+        }
+    }
+
+    pub fn is_executable(&self) -> bool {
+        matches!(self, Self::Executable)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,15 +157,17 @@ pub struct M2GenerateOutput {
 #[cfg(feature = "tpu")]
 pub struct M2Runtime {
     plan: M2RustPrefillDecodePlan,
-    client: PjrtClientHandle,
-    exe: CompiledExecutable,
-    weight_arena: PjrtBufferHandle,
+    state: M2RuntimeState,
+    client: Option<PjrtClientHandle>,
+    exe: Option<CompiledExecutable>,
+    weight_arena: Option<PjrtBufferHandle>,
     device_idx: usize,
 }
 
 #[cfg(not(feature = "tpu"))]
 pub struct M2Runtime {
     plan: M2RustPrefillDecodePlan,
+    state: M2RuntimeState,
 }
 
 impl M2RustPrefillPlan {
@@ -136,16 +193,25 @@ impl M2Runtime {
             block_size: cfg.block_size,
             kv_dtype: cfg.kv_dtype,
         })?;
-        Self::from_plan(
+        Self::from_plan_with_mode(
             cfg.model_dir.clone(),
             plan,
             cfg.max_weight_arena_bytes,
             cfg.device_idx,
+            cfg.mode,
         )
     }
 
     pub fn plan(&self) -> &M2RustPrefillDecodePlan {
         &self.plan
+    }
+
+    pub fn state(&self) -> &M2RuntimeState {
+        &self.state
+    }
+
+    pub fn is_executable(&self) -> bool {
+        self.state.is_executable()
     }
 
     #[cfg(feature = "tpu")]
@@ -155,6 +221,49 @@ impl M2Runtime {
         max_weight_arena_bytes: usize,
         device_idx: usize,
     ) -> Result<Self> {
+        Self::from_plan_with_mode(
+            model_dir,
+            plan,
+            max_weight_arena_bytes,
+            device_idx,
+            M2RuntimeMode::Execute,
+        )
+    }
+
+    #[cfg(feature = "tpu")]
+    pub fn from_plan_with_mode(
+        model_dir: PathBuf,
+        plan: M2RustPrefillDecodePlan,
+        max_weight_arena_bytes: usize,
+        device_idx: usize,
+        mode: M2RuntimeMode,
+    ) -> Result<Self> {
+        match mode {
+            M2RuntimeMode::PlanningOnly => {
+                return Ok(Self {
+                    plan,
+                    state: M2RuntimeState::PlanningOnly,
+                    client: None,
+                    exe: None,
+                    weight_arena: None,
+                    device_idx,
+                });
+            }
+            M2RuntimeMode::CompileOnly => {
+                let client = PjrtClientHandle::new()?;
+                let exe = client.compile(&plan.decode_mlir)?;
+                return Ok(Self {
+                    plan,
+                    state: M2RuntimeState::CompiledOnly,
+                    client: Some(client),
+                    exe: Some(exe),
+                    weight_arena: None,
+                    device_idx,
+                });
+            }
+            M2RuntimeMode::Execute => {}
+        }
+        ensure_decode_executable(&plan)?;
         if max_weight_arena_bytes == 0 {
             return Err(invalid(
                 "max_weight_arena_bytes",
@@ -175,9 +284,10 @@ impl M2Runtime {
         )?;
         Ok(Self {
             plan,
-            client,
-            exe,
-            weight_arena,
+            state: M2RuntimeState::Executable,
+            client: Some(client),
+            exe: Some(exe),
+            weight_arena: Some(weight_arena),
             device_idx,
         })
     }
@@ -189,14 +299,59 @@ impl M2Runtime {
         _max_weight_arena_bytes: usize,
         _device_idx: usize,
     ) -> Result<Self> {
-        Ok(Self { plan })
+        Self::from_plan_with_mode(
+            _model_dir,
+            plan,
+            _max_weight_arena_bytes,
+            _device_idx,
+            M2RuntimeMode::Execute,
+        )
+    }
+
+    #[cfg(not(feature = "tpu"))]
+    pub fn from_plan_with_mode(
+        _model_dir: PathBuf,
+        plan: M2RustPrefillDecodePlan,
+        _max_weight_arena_bytes: usize,
+        _device_idx: usize,
+        mode: M2RuntimeMode,
+    ) -> Result<Self> {
+        match mode {
+            M2RuntimeMode::PlanningOnly => Ok(Self {
+                plan,
+                state: M2RuntimeState::PlanningOnly,
+            }),
+            M2RuntimeMode::CompileOnly => Err(invalid(
+                "runtime_mode",
+                "compile-only requires building rvllm-xla with feature tpu",
+            )),
+            M2RuntimeMode::Execute => Err(invalid(
+                "runtime_mode",
+                "execute requires Rust PJRT plus linked M2 custom-call bodies; no Python/JAX fallback is used",
+            )),
+        }
     }
 
     #[cfg(feature = "tpu")]
     pub fn generate_token_ids(&self, req: &M2GenerateRequest) -> Result<M2GenerateOutput> {
+        if !self.state.is_executable() {
+            return Err(runtime_not_executable(&self.state));
+        }
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| runtime_not_executable(&self.state))?;
+        let exe = self
+            .exe
+            .as_ref()
+            .ok_or_else(|| runtime_not_executable(&self.state))?;
+        let weight_arena = self
+            .weight_arena
+            .as_ref()
+            .ok_or_else(|| runtime_not_executable(&self.state))?;
         let mut prepared = prepare_generate_request(&self.plan, req)?;
         let mut generated_token_ids = Vec::with_capacity(prepared.max_tokens);
-        let mut kv_buf = self.client.buffer_from_host(
+        let mut kv_buf = client.buffer_from_host(
             &vec![0u8; self.plan.decode_shape.kv_cache_bytes()],
             &[self.plan.decode_shape.kv_cache_bytes() as i64],
             PjrtElementType::S8,
@@ -204,20 +359,20 @@ impl M2Runtime {
         )?;
 
         for _ in 0..prepared.max_tokens {
-            let token_buf = self.client.buffer_from_host(
+            let token_buf = client.buffer_from_host(
                 &i32_bytes(&prepared.token_ids),
                 &[self.plan.decode_shape.batch as i64],
                 PjrtElementType::S32,
                 self.device_idx,
             )?;
-            let pos_buf = self.client.buffer_from_host(
+            let pos_buf = client.buffer_from_host(
                 &i32_bytes(&prepared.positions),
                 &[self.plan.decode_shape.batch as i64],
                 PjrtElementType::S32,
                 self.device_idx,
             )?;
-            let inputs = [&token_buf, &pos_buf, &kv_buf, &self.weight_arena];
-            let mut outputs = self.client.execute(&self.exe, &inputs)?;
+            let inputs = [&token_buf, &pos_buf, &kv_buf, weight_arena];
+            let mut outputs = client.execute(exe, &inputs)?;
             if outputs.len() != 3 {
                 return Err(invalid_owned(
                     "decode_outputs",
@@ -227,7 +382,7 @@ impl M2Runtime {
             let next_token = outputs.remove(1);
             let new_kv = outputs.remove(1);
             let mut next_bytes = vec![0u8; self.plan.decode_shape.batch * 4];
-            self.client.buffer_to_host(&next_token, &mut next_bytes)?;
+            client.buffer_to_host(&next_token, &mut next_bytes)?;
             prepared.token_ids = read_i32s(&next_bytes);
             generated_token_ids.push(prepared.token_ids[0]);
             for pos in &mut prepared.positions {
@@ -251,10 +406,21 @@ impl M2Runtime {
             prepared.positions.len(),
             prepared.max_tokens,
         );
-        Err(invalid(
-            "tpu",
-            "M2Runtime generation requires building rvllm-xla with feature tpu",
-        ))
+        Err(runtime_not_executable(&self.state))
+    }
+}
+
+pub fn m2_decode_execution_blocker(plan: &M2RustPrefillDecodePlan) -> Option<&'static str> {
+    m2_decode_mlir_execution_blocker(&plan.decode_mlir)
+}
+
+pub fn m2_decode_mlir_execution_blocker(mlir: &str) -> Option<&'static str> {
+    if mlir.contains("rvllm.kind = \"m2_decode_graph\"")
+        && mlir.contains("rvllm.lowering = \"rust_xla_custom_call\"")
+    {
+        Some("decode MLIR is a Rust+XLA artifact, but M2 fused decode executable custom-call bodies are not linked yet; execution has no Python/JAX fallback")
+    } else {
+        None
     }
 }
 
@@ -578,17 +744,28 @@ fn read_i32s(bytes: &[u8]) -> Vec<i32> {
         .collect()
 }
 
-fn invalid(field: &'static str, reason: &'static str) -> RvllmError {
-    RvllmError::config(
-        ConfigError::InvalidField {
-            name: field,
-            reason: reason.to_string(),
-        },
-        "m2_rust_prefill",
+#[cfg(feature = "tpu")]
+fn ensure_decode_executable(plan: &M2RustPrefillDecodePlan) -> Result<()> {
+    if let Some(reason) = m2_decode_execution_blocker(plan) {
+        return Err(invalid_owned("runtime_mode", reason.to_string()));
+    }
+    Ok(())
+}
+
+fn runtime_not_executable(state: &M2RuntimeState) -> RvllmError {
+    invalid_owned(
+        "runtime_state",
+        format!(
+            "M2Runtime state is {}; generation requires executable Rust+XLA state and has no Python/JAX fallback",
+            state.as_str()
+        ),
     )
 }
 
-#[cfg(feature = "tpu")]
+fn invalid(field: &'static str, reason: &'static str) -> RvllmError {
+    invalid_owned(field, reason.to_string())
+}
+
 fn invalid_owned(field: &'static str, reason: String) -> RvllmError {
     RvllmError::config(
         ConfigError::InvalidField {
@@ -670,7 +847,65 @@ mod tests {
         assert_eq!(plan.seed_decode_positions, vec![4; 8]);
         assert_eq!(plan.decode_input_specs[3].name, "weight_arena");
         assert_eq!(plan.decode_input_specs[3].nbytes, plan.weight_arena_bytes);
-        assert!(plan.decode_mlir.contains("\"rvllm.m2.decode_layer\""));
+        assert!(plan.decode_mlir.contains(
+            "rvllm.custom_call_target = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\""
+        ));
+    }
+
+    #[test]
+    fn runtime_plan_only_state_is_explicitly_non_executable() {
+        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tpu/harness/m2_checkpoint_schema");
+        let plan = plan_m2_rust_prefill_decode(&M2RustPrefillDecodeConfig {
+            model_dir: model_dir.clone(),
+            batch: 8,
+            prompt_len: 4,
+            decode_steps: 32,
+            ctx: 2048,
+            block_size: 32,
+            kv_dtype: M2PrefillKvDType::Int8,
+        })
+        .unwrap();
+        let runtime =
+            M2Runtime::from_plan_with_mode(model_dir, plan, 0, 0, M2RuntimeMode::PlanningOnly)
+                .unwrap();
+        assert_eq!(runtime.state(), &M2RuntimeState::PlanningOnly);
+        assert!(!runtime.is_executable());
+    }
+
+    #[test]
+    fn decode_execution_blocker_reports_unlinked_custom_calls() {
+        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tpu/harness/m2_checkpoint_schema");
+        let plan = plan_m2_rust_prefill_decode(&M2RustPrefillDecodeConfig {
+            model_dir,
+            batch: 8,
+            prompt_len: 4,
+            decode_steps: 32,
+            ctx: 2048,
+            block_size: 32,
+            kv_dtype: M2PrefillKvDType::Int8,
+        })
+        .unwrap();
+        let reason = m2_decode_execution_blocker(&plan).unwrap();
+        assert!(reason.contains("custom-call bodies"));
+        assert!(reason.contains("no Python/JAX fallback"));
+    }
+
+    #[test]
+    fn parses_runtime_modes() {
+        assert_eq!(
+            "planning-only".parse::<M2RuntimeMode>().unwrap(),
+            M2RuntimeMode::PlanningOnly
+        );
+        assert_eq!(
+            "compile".parse::<M2RuntimeMode>().unwrap(),
+            M2RuntimeMode::CompileOnly
+        );
+        assert_eq!(
+            "execute".parse::<M2RuntimeMode>().unwrap(),
+            M2RuntimeMode::Execute
+        );
     }
 
     #[test]

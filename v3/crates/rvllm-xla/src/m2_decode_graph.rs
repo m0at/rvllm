@@ -3,9 +3,11 @@ use std::collections::BTreeMap;
 use rvllm_core::{ConfigError, Result, RvllmError};
 use rvllm_loader::M2Projection;
 
+use crate::m2_graph_abi::{M2DecodeLayerArenaOffsets, M2DecodeLayerCustomCallAbi};
 use crate::{
     M2GraphPhase, M2GraphShape, M2Nvfp4ProjectionAbi, M2WeightArenaEntry, M2WeightArenaPlan,
-    PjrtElementType, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_LAYERS, M2_TOP_K, M2_VOCAB,
+    PjrtElementType, M2_HEAD_DIM, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_KV_HEADS, M2_NUM_LAYERS,
+    M2_NUM_Q_HEADS, M2_NVFP4_GROUP, M2_ROTARY_DIM, M2_VOCAB,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +159,39 @@ impl M2DecodeLayerPlan {
             .map(M2ExpertPlan::directory_entry)
             .collect()
     }
+
+    pub fn arena_offsets(&self) -> M2DecodeLayerArenaOffsets {
+        let first = &self.experts[0];
+        let last = self.experts.last().expect("M2 layer has experts");
+        M2DecodeLayerArenaOffsets {
+            input_norm: self.input_norm.offset as i64,
+            post_attention_norm: self.post_attention_norm.offset as i64,
+            q_proj: self.q_proj.offset as i64,
+            k_proj: self.k_proj.offset as i64,
+            v_proj: self.v_proj.offset as i64,
+            o_proj: self.o_proj.offset as i64,
+            q_norm: self.q_norm.offset as i64,
+            k_norm: self.k_norm.offset as i64,
+            router: self.router.offset as i64,
+            router_bias: self.router_bias.offset as i64,
+            w1_first_packed: first.w1.packed.offset as i64,
+            w1_first_scale: first.w1.scale.offset as i64,
+            w1_first_global_scale: first.w1.global_scale.offset as i64,
+            w1_first_input_scale: input_scale_offset(&first.w1),
+            w2_first_packed: first.w2.packed.offset as i64,
+            w3_first_packed: first.w3.packed.offset as i64,
+            w3_last_packed: last.w3.packed.offset as i64,
+        }
+    }
+
+    pub fn custom_call_abi(&self, shape: &M2GraphShape) -> Result<M2DecodeLayerCustomCallAbi> {
+        M2DecodeLayerCustomCallAbi::new(
+            shape,
+            self.experts.len(),
+            M2ExpertDirectoryEntry::COLS,
+            self.arena_offsets(),
+        )
+    }
 }
 
 impl M2ExpertPlan {
@@ -201,7 +236,7 @@ pub fn m2_decode_graph_mlir(
         return Err(invalid("kernel_name", "must be an MLIR symbol"));
     }
     let plan = M2DecodeGraphPlan::from_arena(arena)?;
-    let body = emit_decode_body(shape, arena, &plan);
+    let body = emit_decode_body(shape, arena, &plan)?;
     Ok(format!(
         r#"module attributes {{rvllm.kind = "m2_decode_graph"}} {{
   func.func @{kernel_name}(
@@ -224,8 +259,8 @@ pub fn m2_decode_graph_mlir(
         rvllm.weight_alignment = {weight_alignment} : i64,
         rvllm.weight_input_scales_missing = {missing_input_scales} : i64,
         rvllm.weight_metadata = "compile_time_offsets_from_M2WeightArenaPlan",
-        rvllm.lowering = "rust_mlir_custom_call",
-        rvllm.lowering_plan = "embed -> 62 layer scan -> flat-arena dense loads -> flat-arena NVFP4 expert custom calls -> final norm -> lm_head -> argmax"
+        rvllm.lowering = "rust_xla_custom_call",
+        rvllm.lowering_plan = "embed -> 62 fused decode-layer custom calls -> flat-arena dense loads -> fused attention -> top-k router -> flat-arena NVFP4 experts -> final norm -> lm_head -> argmax"
       }} {{
 {body}
   }}
@@ -250,7 +285,7 @@ fn emit_decode_body(
     shape: &M2GraphShape,
     arena: &M2WeightArenaPlan,
     plan: &M2DecodeGraphPlan,
-) -> String {
+) -> Result<String> {
     let hidden_ty = format!("memref<{}x{}xbf16>", shape.batch, M2_HIDDEN);
     let kv_ty = format!("memref<{}xi8>", shape.kv_cache_bytes());
     let arena_ty = format!("memref<{}xi8>", arena.total_bytes);
@@ -276,8 +311,8 @@ fn emit_decode_body(
         let src = if layer.layer % 2 == 0 { "%h0" } else { "%h1" };
         let dst = if layer.layer % 2 == 0 { "%h1" } else { "%h0" };
         out.push_str(&emit_layer_call(
-            layer, src, dst, &hidden_ty, &token_ty, &kv_ty, &arena_ty,
-        ));
+            shape, arena, layer, src, dst, &hidden_ty, &token_ty, &kv_ty, &arena_ty,
+        )?);
     }
 
     let final_hidden = if M2_NUM_LAYERS % 2 == 0 { "%h0" } else { "%h1" };
@@ -293,10 +328,12 @@ fn emit_decode_body(
         lm_head_offset = plan.lm_head.offset,
         vocab = M2_VOCAB,
     ));
-    out
+    Ok(out)
 }
 
 fn emit_layer_call(
+    shape: &M2GraphShape,
+    arena: &M2WeightArenaPlan,
     layer: &M2DecodeLayerPlan,
     src: &str,
     dst: &str,
@@ -304,16 +341,32 @@ fn emit_layer_call(
     token_ty: &str,
     kv_ty: &str,
     arena_ty: &str,
-) -> String {
-    let first = &layer.experts[0];
-    let last = layer.experts.last().expect("M2 layer has experts");
+) -> Result<String> {
+    let abi = layer.custom_call_abi(shape)?;
+    let target = abi.call.target();
+    let offsets = abi.weight_offsets;
     let expert_directory = expert_directory_attr(layer);
-    format!(
-        r#"    "rvllm.m2.decode_layer"({src}, %positions, %kv_cache, %weight_arena, {dst}) {{
+    Ok(format!(
+        r#"    "{target}"({src}, %positions, %kv_cache, %weight_arena, {dst}) {{
+      rvllm.custom_call_target = "{target}",
+      rvllm.custom_call_abi = "{custom_call_abi}",
       rvllm.layer = {layer_idx} : i64,
+      rvllm.batch = {batch} : i64,
+      rvllm.ctx = {ctx} : i64,
+      rvllm.kv_dtype = "{kv_dtype}",
+      rvllm.kv_cache_bytes = {kv_cache_bytes} : i64,
       rvllm.hidden = {hidden} : i64,
+      rvllm.num_q_heads = {num_q_heads} : i64,
+      rvllm.num_kv_heads = {num_kv_heads} : i64,
+      rvllm.head_dim = {head_dim} : i64,
+      rvllm.rotary_dim = {rotary_dim} : i64,
       rvllm.top_k = {top_k} : i64,
       rvllm.expert_count = {expert_count} : i64,
+      rvllm.nvfp4_group = {nvfp4_group} : i64,
+      rvllm.weight_arena = "flat_i8_offsets",
+      rvllm.weight_arena_bytes = {weight_arena_bytes} : i64,
+      rvllm.weight_arena_alignment = {weight_arena_alignment} : i64,
+      rvllm.weight_arena_dense_offsets = "{dense_offsets}",
       rvllm.input_norm_offset = {input_norm} : i64,
       rvllm.post_attention_norm_offset = {post_attention_norm} : i64,
       rvllm.q_proj_offset = {q_proj} : i64,
@@ -334,36 +387,52 @@ fn emit_layer_call(
       rvllm.input_scales_missing = {missing_input_scales} : i64,
       rvllm.expert_directory = "packed_i64_offsets",
       rvllm.expert_directory_cols = {expert_directory_cols} : i64,
-      rvllm.expert_directory_i64 = {expert_directory}
+      rvllm.expert_directory_i64 = {expert_directory},
+      rvllm.dispatch = "fused_attention_topk_nvfp4_moe",
+      rvllm.lowering = "rust_xla_custom_call"
     }} : ({hidden_ty}, {token_ty}, {kv_ty}, {arena_ty}, {hidden_ty}) -> ()
 "#,
+        target = target,
+        custom_call_abi = abi.call.abi(),
         src = src,
         dst = dst,
         layer_idx = layer.layer,
-        hidden = M2_HIDDEN,
-        top_k = M2_TOP_K,
-        expert_count = layer.experts.len(),
-        input_norm = layer.input_norm.offset,
-        post_attention_norm = layer.post_attention_norm.offset,
-        q_proj = layer.q_proj.offset,
-        k_proj = layer.k_proj.offset,
-        v_proj = layer.v_proj.offset,
-        o_proj = layer.o_proj.offset,
-        q_norm = layer.q_norm.offset,
-        k_norm = layer.k_norm.offset,
-        router = layer.router.offset,
-        router_bias = layer.router_bias.offset,
-        w1_first_packed = first.w1.packed.offset,
-        w1_first_scale = first.w1.scale.offset,
-        w1_first_global = first.w1.global_scale.offset,
-        w1_first_input = input_scale_offset(&first.w1),
-        w2_first_packed = first.w2.packed.offset,
-        w3_first_packed = first.w3.packed.offset,
-        w3_last_packed = last.w3.packed.offset,
+        batch = abi.batch,
+        ctx = abi.ctx,
+        kv_dtype = abi.kv_dtype.as_mlir_dtype(),
+        kv_cache_bytes = abi.kv_cache_bytes,
+        hidden = abi.hidden,
+        num_q_heads = M2_NUM_Q_HEADS,
+        num_kv_heads = M2_NUM_KV_HEADS,
+        head_dim = M2_HEAD_DIM,
+        rotary_dim = M2_ROTARY_DIM,
+        top_k = abi.top_k,
+        expert_count = abi.expert_count,
+        nvfp4_group = M2_NVFP4_GROUP,
+        weight_arena_bytes = arena.total_bytes,
+        weight_arena_alignment = arena.alignment,
+        dense_offsets = M2DecodeLayerArenaOffsets::DENSE_ATTRS,
+        input_norm = offsets.input_norm,
+        post_attention_norm = offsets.post_attention_norm,
+        q_proj = offsets.q_proj,
+        k_proj = offsets.k_proj,
+        v_proj = offsets.v_proj,
+        o_proj = offsets.o_proj,
+        q_norm = offsets.q_norm,
+        k_norm = offsets.k_norm,
+        router = offsets.router,
+        router_bias = offsets.router_bias,
+        w1_first_packed = offsets.w1_first_packed,
+        w1_first_scale = offsets.w1_first_scale,
+        w1_first_global = offsets.w1_first_global_scale,
+        w1_first_input = offsets.w1_first_input_scale,
+        w2_first_packed = offsets.w2_first_packed,
+        w3_first_packed = offsets.w3_first_packed,
+        w3_last_packed = offsets.w3_last_packed,
         missing_input_scales = layer.input_scale_missing_count(),
-        expert_directory_cols = M2ExpertDirectoryEntry::COLS,
+        expert_directory_cols = abi.expert_directory_cols,
         expert_directory = expert_directory,
-    )
+    ))
 }
 
 fn expert_directory_attr(layer: &M2DecodeLayerPlan) -> String {
@@ -574,14 +643,43 @@ mod tests {
         assert!(mlir.contains("weight_arena"));
         assert!(mlir.contains("rvllm.weight_entries = 191069 : i64"));
         assert!(mlir.contains("rvllm.weight_input_scales_missing = 18 : i64"));
-        assert!(mlir.contains("rvllm.lowering = \"rust_mlir_custom_call\""));
-        assert!(mlir.contains("\"rvllm.m2.decode_layer\""));
+        assert!(mlir.contains("rvllm.lowering = \"rust_xla_custom_call\""));
+        assert_eq!(
+            mlir.matches("\"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\"(")
+                .count(),
+            M2_NUM_LAYERS
+        );
+        assert_eq!(
+            mlir.matches(
+                "rvllm.custom_call_target = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\""
+            )
+            .count(),
+            M2_NUM_LAYERS
+        );
+        assert!(mlir.contains("rvllm.custom_call_abi = \"m2_decode_layer_v1\""));
+        assert!(mlir.contains("rvllm.batch = 8 : i64"));
+        assert!(mlir.contains("rvllm.ctx = 2048 : i64"));
+        assert!(mlir.contains("rvllm.kv_dtype = \"i8\""));
+        assert!(mlir.contains("rvllm.kv_cache_bytes = 2080374784 : i64"));
+        assert!(mlir.contains("rvllm.num_q_heads = 48 : i64"));
+        assert!(mlir.contains("rvllm.num_kv_heads = 8 : i64"));
+        assert!(mlir.contains("rvllm.head_dim = 128 : i64"));
+        assert!(mlir.contains("rvllm.rotary_dim = 64 : i64"));
+        assert!(mlir.contains("rvllm.nvfp4_group = 16 : i64"));
+        assert!(mlir.contains("rvllm.weight_arena = \"flat_i8_offsets\""));
+        assert!(mlir.contains(&format!(
+            "rvllm.weight_arena_bytes = {} : i64",
+            arena.total_bytes
+        )));
+        assert!(mlir.contains("rvllm.weight_arena_alignment = 128 : i64"));
+        assert!(mlir.contains("rvllm.weight_arena_dense_offsets = \"input_norm,post_attention_norm,q_proj,k_proj,v_proj,o_proj,q_norm,k_norm,router,router_bias\""));
         assert!(mlir.contains("rvllm.q_proj_offset = "));
         assert!(mlir.contains("rvllm.w1_first_packed_offset = "));
         assert!(mlir.contains("rvllm.expert_directory = \"packed_i64_offsets\""));
         assert!(mlir.contains("rvllm.expert_directory_cols = 13 : i64"));
         assert!(mlir.contains("rvllm.expert_directory_i64 = dense<[[0, "));
         assert!(mlir.contains("]> : tensor<256x13xi64>"));
+        assert!(mlir.contains("rvllm.dispatch = \"fused_attention_topk_nvfp4_moe\""));
         assert!(!mlir.contains("Contract body placeholder"));
     }
 

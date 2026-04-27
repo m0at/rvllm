@@ -7,6 +7,9 @@ use std::sync::Arc;
 use libloading::{Library, Symbol};
 use rvllm_core::{ConfigError, Result, RvllmError};
 
+use crate::executable::{
+    PjrtExecutableSignature, PjrtHostBuffer, PjrtProgramFormat, PjrtTensorSpec,
+};
 use crate::ffi::*;
 
 pub struct PjrtClientInner {
@@ -19,6 +22,22 @@ pub struct PjrtClientInner {
 
 unsafe impl Send for PjrtClientInner {}
 unsafe impl Sync for PjrtClientInner {}
+
+impl Drop for PjrtClientInner {
+    fn drop(&mut self) {
+        if !self.client.is_null() {
+            unsafe {
+                let mut args = PJRT_Client_Destroy_Args {
+                    struct_size: std::mem::size_of::<PJRT_Client_Destroy_Args>(),
+                    extension_start: ptr::null_mut(),
+                    client: self.client,
+                };
+                let _ = (self.fns.client_destroy)(&mut args);
+            }
+            self.client = ptr::null_mut();
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct PjrtClientHandle {
@@ -127,18 +146,56 @@ impl PjrtClientHandle {
     }
 
     pub fn compile(&self, mlir_text: &str) -> Result<CompiledExecutable> {
-        self.compile_bytes(mlir_text.as_bytes())
+        self.compile_program_bytes(PjrtProgramFormat::Mlir, mlir_text.as_bytes(), None)
     }
 
     pub fn compile_bytes(&self, code: &[u8]) -> Result<CompiledExecutable> {
-        let format = b"mlir";
+        self.compile_program_bytes(PjrtProgramFormat::Mlir, code, None)
+    }
+
+    pub fn compile_mlir_module_text(
+        &self,
+        mlir_text: &str,
+        signature: PjrtExecutableSignature,
+    ) -> Result<CompiledExecutable> {
+        self.compile_module_text(mlir_text, PjrtProgramFormat::Mlir, signature)
+    }
+
+    pub fn compile_hlo_module_text(
+        &self,
+        hlo_text: &str,
+        signature: PjrtExecutableSignature,
+    ) -> Result<CompiledExecutable> {
+        self.compile_module_text(hlo_text, PjrtProgramFormat::Hlo, signature)
+    }
+
+    pub fn compile_module_text(
+        &self,
+        module_text: &str,
+        format: PjrtProgramFormat,
+        signature: PjrtExecutableSignature,
+    ) -> Result<CompiledExecutable> {
+        signature.validate()?;
+        self.compile_program_bytes(format, module_text.as_bytes(), Some(signature))
+    }
+
+    fn compile_program_bytes(
+        &self,
+        format: PjrtProgramFormat,
+        code: &[u8],
+        signature: Option<PjrtExecutableSignature>,
+    ) -> Result<CompiledExecutable> {
+        if code.is_empty() {
+            return Err(xla_err("module text must not be empty"));
+        }
+        let format_bytes = format.as_pjrt_format();
         let program = PJRT_Program {
             struct_size: std::mem::size_of::<PJRT_Program>(),
             extension_start: ptr::null_mut(),
             code: code.as_ptr(),
             code_size: code.len(),
-            format: format.as_ptr(),
-            format_size: format.len(),
+            format: format_bytes.as_ptr(),
+            format_size: format_bytes.len(),
         };
         let default_opts: [u8; 6] = [0x22, 0x04, 0x18, 0x01, 0x20, 0x01];
         let opts = self
@@ -171,6 +228,8 @@ impl PjrtClientHandle {
         Ok(CompiledExecutable {
             client: self.clone(),
             raw,
+            format,
+            signature,
         })
     }
 
@@ -181,6 +240,25 @@ impl PjrtClientHandle {
         dtype: PjrtElementType,
         device_idx: usize,
     ) -> Result<PjrtBufferHandle> {
+        let spec = PjrtTensorSpec::anonymous(shape.to_vec(), dtype)?;
+        self.buffer_from_host_spec(data, &spec, device_idx)
+    }
+
+    pub fn buffer_from_host_buffer(
+        &self,
+        host: &PjrtHostBuffer<'_>,
+        device_idx: usize,
+    ) -> Result<PjrtBufferHandle> {
+        self.buffer_from_host_spec(host.data, &host.spec, device_idx)
+    }
+
+    pub fn buffer_from_host_spec(
+        &self,
+        data: &[u8],
+        spec: &PjrtTensorSpec,
+        device_idx: usize,
+    ) -> Result<PjrtBufferHandle> {
+        spec.validate_byte_len(data.len())?;
         if device_idx >= self.inner.devices.len() {
             return Err(xla_err(format!(
                 "device index {device_idx} out of range, have {}",
@@ -193,9 +271,9 @@ impl PjrtClientHandle {
                 extension_start: ptr::null_mut(),
                 client: self.inner.client,
                 data: data.as_ptr() as *const c_void,
-                type_: dtype,
-                dims: shape.as_ptr(),
-                num_dims: shape.len(),
+                type_: spec.dtype,
+                dims: spec.shape.as_ptr(),
+                num_dims: spec.shape.len(),
                 byte_strides: ptr::null(),
                 num_byte_strides: 0,
                 host_buffer_semantics: PjrtHostBufferSemantics::ImmutableUntilTransferCompletes,
@@ -222,6 +300,8 @@ impl PjrtClientHandle {
         Ok(PjrtBufferHandle {
             client: self.clone(),
             raw,
+            spec: Some(spec.clone()),
+            device_idx: Some(device_idx),
         })
     }
 
@@ -230,9 +310,47 @@ impl PjrtClientHandle {
         exe: &CompiledExecutable,
         inputs: &[&PjrtBufferHandle],
     ) -> Result<Vec<PjrtBufferHandle>> {
+        if let Some(signature) = exe.signature() {
+            self.execute_with_signature(exe, inputs, signature)
+        } else {
+            self.execute_raw(exe, inputs, None)
+        }
+    }
+
+    pub fn execute_with_buffers(
+        &self,
+        exe: &CompiledExecutable,
+        inputs: &[&PjrtBufferHandle],
+    ) -> Result<Vec<PjrtBufferHandle>> {
+        let signature = exe
+            .signature()
+            .ok_or_else(|| xla_err("execute_with_buffers requires an executable signature"))?;
+        self.execute_with_signature(exe, inputs, signature)
+    }
+
+    pub fn execute_with_signature(
+        &self,
+        exe: &CompiledExecutable,
+        inputs: &[&PjrtBufferHandle],
+        signature: &PjrtExecutableSignature,
+    ) -> Result<Vec<PjrtBufferHandle>> {
+        signature.validate()?;
+        self.validate_input_specs(signature, inputs)?;
+        self.execute_raw(exe, inputs, Some(&signature.outputs))
+    }
+
+    fn execute_raw(
+        &self,
+        exe: &CompiledExecutable,
+        inputs: &[&PjrtBufferHandle],
+        output_specs: Option<&[PjrtTensorSpec]>,
+    ) -> Result<Vec<PjrtBufferHandle>> {
+        self.validate_executable_client(exe)?;
+        self.validate_input_clients(inputs)?;
         let input_ptrs: Vec<*mut PjrtBuffer> = inputs.iter().map(|b| b.raw).collect();
         let input_list: *const *mut PjrtBuffer = input_ptrs.as_ptr();
-        let mut output_ptrs: Vec<*mut PjrtBuffer> = vec![ptr::null_mut(); 256];
+        let output_slots = output_specs.map_or(256, |specs| specs.len());
+        let mut output_ptrs: Vec<*mut PjrtBuffer> = vec![ptr::null_mut(); output_slots];
         let mut output_list: *mut *mut PjrtBuffer = output_ptrs.as_mut_ptr();
         let exec_options = PJRT_ExecuteOptions {
             struct_size: std::mem::size_of::<PJRT_ExecuteOptions>(),
@@ -273,17 +391,33 @@ impl PjrtClientHandle {
             }
         }
 
-        let num_outputs = output_ptrs.iter().take_while(|p| !p.is_null()).count();
+        let num_outputs = if let Some(specs) = output_specs {
+            if let Some((idx, _)) = output_ptrs.iter().enumerate().find(|(_, p)| p.is_null()) {
+                self.destroy_raw_buffers(&output_ptrs);
+                return Err(xla_err(format!(
+                    "PJRT_LoadedExecutable_Execute returned null output {idx}"
+                )));
+            }
+            specs.len()
+        } else {
+            output_ptrs.iter().take_while(|p| !p.is_null()).count()
+        };
         Ok(output_ptrs[..num_outputs]
             .iter()
-            .map(|&raw| PjrtBufferHandle {
+            .enumerate()
+            .map(|(idx, &raw)| PjrtBufferHandle {
                 client: self.clone(),
                 raw,
+                spec: output_specs.map(|specs| specs[idx].clone()),
+                device_idx: inputs.first().and_then(|input| input.device_idx),
             })
             .collect())
     }
 
     pub fn buffer_to_host(&self, buf: &PjrtBufferHandle, dst: &mut [u8]) -> Result<()> {
+        if let Some(spec) = buf.spec() {
+            spec.validate_byte_len(dst.len())?;
+        }
         unsafe {
             let mut args = PJRT_Buffer_ToHostBuffer_Args {
                 struct_size: std::mem::size_of::<PJRT_Buffer_ToHostBuffer_Args>(),
@@ -306,6 +440,54 @@ impl PjrtClientHandle {
             }
         }
         Ok(())
+    }
+
+    fn validate_executable_client(&self, exe: &CompiledExecutable) -> Result<()> {
+        if !Arc::ptr_eq(&self.inner, &exe.client.inner) {
+            return Err(xla_err("executable belongs to a different PJRT client"));
+        }
+        Ok(())
+    }
+
+    fn validate_input_clients(&self, inputs: &[&PjrtBufferHandle]) -> Result<()> {
+        for (idx, input) in inputs.iter().enumerate() {
+            if !Arc::ptr_eq(&self.inner, &input.client.inner) {
+                return Err(xla_err(format!(
+                    "argument {idx} belongs to a different PJRT client"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_input_specs(
+        &self,
+        signature: &PjrtExecutableSignature,
+        inputs: &[&PjrtBufferHandle],
+    ) -> Result<()> {
+        let mut actual = Vec::with_capacity(inputs.len());
+        for (idx, input) in inputs.iter().enumerate() {
+            let spec = input
+                .spec()
+                .ok_or_else(|| xla_err(format!("argument {idx} has no tensor spec")))?;
+            actual.push(spec.clone());
+        }
+        signature.validate_arguments(&actual)
+    }
+
+    fn destroy_raw_buffers(&self, buffers: &[*mut PjrtBuffer]) {
+        for &buffer in buffers {
+            if !buffer.is_null() {
+                unsafe {
+                    let mut args = PJRT_Buffer_Destroy_Args {
+                        struct_size: std::mem::size_of::<PJRT_Buffer_Destroy_Args>(),
+                        extension_start: ptr::null_mut(),
+                        buffer,
+                    };
+                    let _ = (self.inner.fns.buffer_destroy)(&mut args);
+                }
+            }
+        }
     }
 
     fn await_event(&self, event: *mut PjrtEvent) -> Result<()> {
@@ -336,25 +518,61 @@ impl PjrtClientHandle {
 pub struct CompiledExecutable {
     client: PjrtClientHandle,
     pub(crate) raw: *mut PjrtLoadedExecutable,
+    format: PjrtProgramFormat,
+    signature: Option<PjrtExecutableSignature>,
 }
 
 impl CompiledExecutable {
     pub fn client(&self) -> &PjrtClientHandle {
         &self.client
     }
+
+    pub fn format(&self) -> PjrtProgramFormat {
+        self.format
+    }
+
+    pub fn signature(&self) -> Option<&PjrtExecutableSignature> {
+        self.signature.as_ref()
+    }
 }
 
 unsafe impl Send for CompiledExecutable {}
 unsafe impl Sync for CompiledExecutable {}
 
+impl Drop for CompiledExecutable {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                let mut args = PJRT_LoadedExecutable_Destroy_Args {
+                    struct_size: std::mem::size_of::<PJRT_LoadedExecutable_Destroy_Args>(),
+                    extension_start: ptr::null_mut(),
+                    executable: self.raw,
+                };
+                let _ = (self.client.inner.fns.loaded_executable_destroy)(&mut args);
+            }
+            self.raw = ptr::null_mut();
+        }
+    }
+}
+
 pub struct PjrtBufferHandle {
     client: PjrtClientHandle,
     pub(crate) raw: *mut PjrtBuffer,
+    spec: Option<PjrtTensorSpec>,
+    device_idx: Option<usize>,
 }
 
 impl PjrtBufferHandle {
     pub fn client(&self) -> &PjrtClientHandle {
         &self.client
+    }
+
+    pub fn spec(&self) -> Option<&PjrtTensorSpec> {
+        self.spec.as_ref()
+    }
+
+    pub fn device_idx(&self) -> Option<usize> {
+        self.device_idx
     }
 }
 
@@ -372,6 +590,7 @@ impl Drop for PjrtBufferHandle {
                 };
                 let _ = (self.client.inner.fns.buffer_destroy)(&mut args);
             }
+            self.raw = ptr::null_mut();
         }
     }
 }

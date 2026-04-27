@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rvllm_fused::M2PrefillKvDType;
+use rvllm_xla::m2_runtime::{m2_decode_execution_blocker, M2RuntimeMode};
 use rvllm_xla::{plan_m2_rust_prefill_decode, M2RustPrefillDecodeConfig, M2RustPrefillDecodePlan};
+use rvllm_xla::{XlaArtifact, XlaTensorSpec};
 
 #[cfg(feature = "tpu")]
 use rvllm_loader::M2SafetensorsReader;
@@ -37,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         plan.weight_entries,
         plan.decode_mlir.len()
     );
+    eprintln!("  runtime_mode={}", args.runtime_mode.as_str());
     eprintln!(
         "  seed decode token_ids={:?} positions={:?}",
         plan.seed_decode_token_ids, plan.seed_decode_positions
@@ -55,10 +58,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(&path, plan.decode_mlir.as_bytes())?;
         eprintln!("wrote {}", path.display());
     }
+    if let Some(path) = args.emit_decode_artifact.as_ref() {
+        write_decode_artifact(path, &plan, args.decode_num_partitions)?;
+        eprintln!("wrote decode artifact {}", path.display());
+    }
+    if args.runtime_mode == M2RuntimeMode::CompileOnly {
+        compile_decode(&plan)?;
+    }
     if args.execute_prefill {
         execute_prefill(args.artifact_dir, &plan)?;
     }
-    if args.execute_decode {
+    if args.runtime_mode == M2RuntimeMode::Execute {
         let target_ids = args
             .ppl_target_ids
             .as_ref()
@@ -79,6 +89,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn write_decode_artifact(
+    dir: &Path,
+    plan: &M2RustPrefillDecodePlan,
+    num_partitions: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if num_partitions == 0 {
+        return Err("--decode-num-partitions must be > 0".into());
+    }
+    fs::create_dir_all(dir)?;
+    let mlir_file = "rvllm_m2_decode.mlir";
+    fs::write(dir.join(mlir_file), plan.decode_mlir.as_bytes())?;
+    let artifact = XlaArtifact {
+        mlir_file: mlir_file.to_string(),
+        inputs: plan
+            .decode_input_specs
+            .iter()
+            .map(|spec| XlaTensorSpec {
+                name: spec.name.to_string(),
+                shape: spec.shape.clone(),
+                dtype: spec.dtype,
+            })
+            .collect(),
+        outputs: plan
+            .decode_output_specs
+            .iter()
+            .map(|spec| XlaTensorSpec {
+                name: spec.name.to_string(),
+                shape: spec.shape.clone(),
+                dtype: spec.dtype,
+            })
+            .collect(),
+        donate_indices: vec![2],
+        num_partitions,
+    };
+    fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&artifact)?,
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "tpu")]
+fn compile_decode(plan: &M2RustPrefillDecodePlan) -> Result<(), Box<dyn std::error::Error>> {
+    let client = PjrtClientHandle::new()?;
+    let _exe = client.compile(&plan.decode_mlir)?;
+    eprintln!(
+        "m2 rust decode compiled through PJRT: mlir_bytes={}",
+        plan.decode_mlir.len()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "tpu"))]
+fn compile_decode(_plan: &M2RustPrefillDecodePlan) -> Result<(), Box<dyn std::error::Error>> {
+    Err("m2_rust_prefill_decode compile-only requires --features tpu".into())
 }
 
 #[cfg(feature = "tpu")]
@@ -117,6 +184,9 @@ fn execute_decode(
     max_weight_arena_bytes: usize,
     ppl_target_ids: Option<&[i32]>,
 ) -> Result<M2DecodeExecutionReport, Box<dyn std::error::Error>> {
+    if let Some(reason) = m2_decode_execution_blocker(plan) {
+        return Err(reason.into());
+    }
     if max_weight_arena_bytes == 0 {
         return Err("--execute-decode requires --max-weight-arena-bytes".into());
     }
@@ -209,10 +279,13 @@ fn execute_decode(
 #[cfg(not(feature = "tpu"))]
 fn execute_decode(
     _model_dir: &Path,
-    _plan: &M2RustPrefillDecodePlan,
+    plan: &M2RustPrefillDecodePlan,
     _max_weight_arena_bytes: usize,
     _ppl_target_ids: Option<&[i32]>,
 ) -> Result<M2DecodeExecutionReport, Box<dyn std::error::Error>> {
+    if let Some(reason) = m2_decode_execution_blocker(plan) {
+        return Err(reason.into());
+    }
     Err("m2_rust_prefill_decode --execute-decode requires --features tpu".into())
 }
 
@@ -232,14 +305,16 @@ struct Args {
     model_dir: PathBuf,
     artifact_dir: Option<PathBuf>,
     emit_decode_mlir: Option<PathBuf>,
+    emit_decode_artifact: Option<PathBuf>,
+    decode_num_partitions: usize,
     batch: usize,
     prompt_len: usize,
     decode_steps: usize,
     ctx: usize,
     block_size: u32,
     kv_dtype: M2PrefillKvDType,
+    runtime_mode: M2RuntimeMode,
     execute_prefill: bool,
-    execute_decode: bool,
     max_weight_arena_bytes: usize,
     out_token_ids: Option<PathBuf>,
     ppl_target_ids: Option<PathBuf>,
@@ -251,14 +326,16 @@ impl Args {
             model_dir: PathBuf::from("/dev/shm/m2-nvfp4"),
             artifact_dir: None,
             emit_decode_mlir: None,
+            emit_decode_artifact: None,
+            decode_num_partitions: 8,
             batch: 8,
             prompt_len: 20,
             decode_steps: 256,
             ctx: 2048,
             block_size: 32,
             kv_dtype: M2PrefillKvDType::Int8,
+            runtime_mode: M2RuntimeMode::PlanningOnly,
             execute_prefill: false,
-            execute_decode: false,
             max_weight_arena_bytes: 0,
             out_token_ids: None,
             ppl_target_ids: None,
@@ -279,6 +356,25 @@ impl Args {
                     out.emit_decode_mlir =
                         Some(PathBuf::from(value(&args, i, "--emit-decode-mlir")?));
                 }
+                "--emit-decode-artifact" => {
+                    i += 1;
+                    out.emit_decode_artifact =
+                        Some(PathBuf::from(value(&args, i, "--emit-decode-artifact")?));
+                }
+                "--decode-num-partitions" => {
+                    i += 1;
+                    out.decode_num_partitions = parse(
+                        value(&args, i, "--decode-num-partitions")?,
+                        "--decode-num-partitions",
+                    )?;
+                }
+                "--runtime-mode" => {
+                    i += 1;
+                    out.runtime_mode = value(&args, i, "--runtime-mode")?
+                        .parse::<M2RuntimeMode>()
+                        .map_err(|e| format!("--runtime-mode: {e}"))?;
+                }
+                "--compile-decode" => out.runtime_mode = M2RuntimeMode::CompileOnly,
                 "--batch" => {
                     i += 1;
                     out.batch = parse(value(&args, i, "--batch")?, "--batch")?;
@@ -310,7 +406,7 @@ impl Args {
                     };
                 }
                 "--execute-prefill" => out.execute_prefill = true,
-                "--execute-decode" => out.execute_decode = true,
+                "--execute-decode" => out.runtime_mode = M2RuntimeMode::Execute,
                 "--out-token-ids" => {
                     i += 1;
                     out.out_token_ids = Some(PathBuf::from(value(&args, i, "--out-token-ids")?));
@@ -385,5 +481,32 @@ fn read_i32s(bytes: &[u8]) -> Vec<i32> {
 }
 
 fn usage() -> String {
-    "usage: m2_rust_prefill_decode [--model-dir DIR] [--batch N] [--prompt-len N] [--decode-steps N] [--ctx N] [--block-size N] [--kv-dtype int8|bf16] [--emit-decode-mlir FILE] [--artifact-dir DIR] [--execute-prefill] [--execute-decode --max-weight-arena-bytes N] [--out-token-ids FILE] [--ppl-target-ids FILE]".to_string()
+    "usage: m2_rust_prefill_decode [--model-dir DIR] [--batch N] [--prompt-len N] [--decode-steps N] [--ctx N] [--block-size N] [--kv-dtype int8|bf16] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-mlir FILE] [--emit-decode-artifact DIR] [--decode-num-partitions N] [--artifact-dir DIR] [--execute-prefill] [--compile-decode] [--execute-decode --max-weight-arena-bytes N] [--out-token-ids FILE] [--ppl-target-ids FILE]".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_compile_only_decode_artifact_flags() {
+        let args = Args::parse(vec![
+            "--runtime-mode".to_string(),
+            "compile-only".to_string(),
+            "--emit-decode-artifact".to_string(),
+            "out/decode".to_string(),
+            "--decode-num-partitions".to_string(),
+            "4".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(args.runtime_mode, M2RuntimeMode::CompileOnly);
+        assert_eq!(args.emit_decode_artifact, Some(PathBuf::from("out/decode")));
+        assert_eq!(args.decode_num_partitions, 4);
+    }
+
+    #[test]
+    fn execute_decode_alias_selects_execute_mode() {
+        let args = Args::parse(vec!["--execute-decode".to_string()]).unwrap();
+        assert_eq!(args.runtime_mode, M2RuntimeMode::Execute);
+    }
 }

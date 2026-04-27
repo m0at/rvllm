@@ -201,3 +201,24 @@ Rust verification:
 - [x] Quarantine remaining M2 Python/JAX harnesses as legacy reproduction only:
   `PYTHON_LEGACY.md`, `M2_SETUP_GUIDE.md`, and `README.md` point new work at
   Rust `rvllm-xla`, `rvllm-loader`, `rvllm-fused`, and `rvllm-server`.
+- [x] Add explicit Rust runtime modes:
+  `planning-only`, `compile-only`, and `execute`, with execution blocked until
+  fused M2 decode custom-call bodies are linked.
+- [x] Add safe PJRT executable signatures and host-buffer validation for
+  Rust-emitted MLIR/HLO modules.
+- [x] Add dispatchable M2 decode-layer custom-call ABI:
+  `rvllm.m2.decode_layer.fused_attention_nvfp4_moe` with exact batch, ctx,
+  KV dtype, arena offsets, and dense `256x13xi64` expert directory metadata.
+- [x] Add deterministic Rust NVFP4 custom-call descriptor text for
+  `rvllm.m2.nvfp4_decode_bf16_matmul`, pinning packed `u8`, FP8 scales,
+  global `f32`, block size 16, and bf16 input/output dimensions.
+- [x] Add Rust full-equivalent bench plan JSON for B=1/8/16/32 plus PPL/gen
+  placeholders. The checker rejects `tok_per_s` unless the timing source is
+  executed Rust/XLA.
+- [x] Harden `rvllm-server` so `/v1/chat/completions` reports Rust runtime mode
+  and returns 501/503 when native M2 execution is unavailable; no Python
+  fallback is advertised.
+- [ ] Link executable TPU custom-call bodies for
+  `rvllm.m2.decode_layer.fused_attention_nvfp4_moe`.
+- [ ] Run the Rust/XLA B=8/B=16/B=32 bench and only then replace the legacy JAX
+  reproduction numbers.
