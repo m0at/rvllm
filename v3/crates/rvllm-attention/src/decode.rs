@@ -413,6 +413,34 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
             "paged_decode (FP8 KV)",
             stream, params.num_seqs, params.head_dim,
         )?;
+        // Codex review of bc358cf: K/V need at least one scale source.
+        // For Fa2Ptx: k_scale_cache (per-slot) OR k_descale_fallback_ptr
+        // (scalar) must be non-zero. For Fa3: scale_cache is ignored,
+        // fallback ptr is required. Either way one path must be set.
+        if k_scale_cache == 0 && k_descale_fallback_ptr == 0 {
+            eprintln!("[attn] FP8 decode: both k_scale_cache and k_descale_fallback_ptr are 0");
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op: "paged_decode (FP8 KV) — K scale source missing",
+                },
+                ctx: AttnCtx { op: "paged_decode (FP8 KV)", stream,
+                    num_seqs: params.num_seqs, head_dim: params.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if v_scale_cache == 0 && v_descale_fallback_ptr == 0 {
+            eprintln!("[attn] FP8 decode: both v_scale_cache and v_descale_fallback_ptr are 0");
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op: "paged_decode (FP8 KV) — V scale source missing",
+                },
+                ctx: AttnCtx { op: "paged_decode (FP8 KV)", stream,
+                    num_seqs: params.num_seqs, head_dim: params.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
         assert_head_dim_matches_backend(
             self.backend, params.head_dim,
             "paged_decode (FP8 KV)", stream, params.num_seqs,
