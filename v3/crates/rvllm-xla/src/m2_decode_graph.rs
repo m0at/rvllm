@@ -550,34 +550,24 @@ fn emit_layer_call(
     );
     if let (Some(int8_tile), Some(int8_row_scales)) = (int8_tile, int8_row_scales) {
         return Ok(format!(
-            r#"    {layer_offsets_name} = stablehlo.constant dense<{layer_offsets}> : tensor<{offset_cols}xi32>
-    {expert_directory_name} = stablehlo.constant dense<{expert_directory}> : tensor<{expert_count}x{expert_cols}xi32>
-    {dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, {layer_offsets_name}, {expert_directory_name}, {int8_tile}, {int8_row_scales}) {{
+            r#"    {dst} = "stablehlo.custom_call"({src}, {int8_tile}, {int8_row_scales}) {{
       call_target_name = "{tpu_custom_call}",
       backend_config = "{backend_config}",
       called_computations = [],
       has_side_effect = false,
       api_version = 1 : i32,
       kernel_name = "{target}",
-      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>],
+      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>],
       result_layouts = [dense<[1, 0]> : tensor<2xindex>]
-    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x128xi8>, tensor<128xf32>) -> tensor<{batch}x128xbf16>
+    }} : ({hidden_ty}, tensor<{hidden_size}x128xi8>, tensor<128xf32>) -> tensor<{batch}x128xbf16>
 "#,
             tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
             backend_config = backend_config,
             target = target,
             src = src,
-            kv_src = kv_src,
             dst = dst,
             int8_tile = int8_tile,
             int8_row_scales = int8_row_scales,
-            layer_offsets_name = layer_offsets_name,
-            expert_directory_name = expert_directory_name,
-            layer_offsets = layer_offsets,
-            expert_directory = expert_directory,
-            offset_cols = M2DecodeLayerArenaOffsets::I32_COLS,
-            expert_count = M2_NUM_EXPERTS,
-            expert_cols = M2ExpertDirectoryEntry::I32_COLS,
             hidden_size = M2_HIDDEN,
             batch = shape.batch,
         ));

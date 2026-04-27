@@ -48,7 +48,6 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
     if shape.phase != M2GraphPhase::Decode {
         return Err(invalid("phase", "expected decode graph shape"));
     }
-    let kv_bytes = shape.layer_kv_cache_bytes();
     let mut k_constants = String::new();
     let mut k_tiles = String::new();
     let mut acc_prev = "%zero".to_string();
@@ -86,10 +85,6 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
         r#"module attributes {{"stable_mosaic.version" = "1"}} {{
   func.func @main(
       %hidden: memref<{batch}x{hidden}xbf16>,
-      %positions: memref<{batch}xi32>,
-      %kv_in: memref<{kv_bytes}xi8>,
-      %layer_offsets: memref<34xi32>,
-      %expert_directory: memref<256x25xi32>,
       %w1_block_t: memref<{hidden}x128xi8>,
       %w1_row_scales: memref<128xf32>,
       %hidden_out: memref<{batch}x128xbf16>) attributes {{
@@ -113,7 +108,6 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
 "#,
         batch = shape.batch,
         hidden = M2_HIDDEN,
-        kv_bytes = kv_bytes,
         k_constants = k_constants,
         k_tiles = k_tiles,
         acc_prev = acc_prev,
