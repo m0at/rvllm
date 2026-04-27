@@ -64,6 +64,11 @@ Recorded int8-KV results:
   Python dependency, links it into all 62 decode-layer `tpu_custom_call`s, and
   makes real compile/execute require `--decode-layer-body FILE` instead of
   feeding empty placeholder bodies to TPU PJRT.
+- [x] Add the raw lowered-body linker path and TPU probe result:
+  `--decode-layer-body-format lowered` omits `serialization_format: 1` and lets
+  PJRT accept a raw Mosaic module body. The minimal accepted VMEM pattern is
+  `vector.load` for reads plus `tpu.vector_store` for writes; `tpu.vector_load`
+  gets past body deserialization but fails in the TPU infer-vector-layout pass.
 - [x] Add fused-MoE expert-directory metadata to the Rust decode graph:
   every `rvllm.m2.decode_layer` now carries a dense `256x13xi64` directory of
   W1/W2/W3 packed, scale, global-scale, and optional input-scale offsets. This
