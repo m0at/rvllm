@@ -113,11 +113,37 @@ impl Gemma4Bringup {
         let sliding_attention =
             Fa3Kernels::load(paths.fa3_so.clone(), arch.head_dim_sliding as u32)?;
         // Global layers use the generic fallback paged attention path.
-        // Default location is next to the FA3 .so; an explicit override
-        // keeps bench/deploy flows flexible while avoiding a new required flag.
-        let global_attention_so = std::env::var_os("RVLLM_FA_FALLBACK_SO")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| paths.fa3_so.with_file_name("libfa_sm89_kernels.so"));
+        // Default is an arch-matched sibling of the FA3 .so (chosen from
+        // the sliding .so filename); RVLLM_FA_FALLBACK_SO overrides.
+        let global_attention_so = match std::env::var_os("RVLLM_FA_FALLBACK_SO") {
+            Some(s) => PathBuf::from(s),
+            None => {
+                let fa3_name = paths
+                    .fa3_so
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let default_name = if fa3_name.contains("sm86") {
+                    "libfa_sm86_kernels.so"
+                } else if fa3_name.contains("sm89") {
+                    "libfa_sm89_kernels.so"
+                } else if fa3_name.contains("fa3") || fa3_name.contains("sm90") {
+                    "libfa_sm89_kernels.so"
+                } else {
+                    return Err(rvllm_core::RvllmError::config(
+                        rvllm_core::ConfigError::Inconsistent {
+                            reasons: vec![format!(
+                                "cannot infer global-attention .so default from fa3_so filename {:?}; \
+                                 set RVLLM_FA_FALLBACK_SO explicitly",
+                                fa3_name
+                            )],
+                        },
+                        "RVLLM_FA_FALLBACK_SO",
+                    ));
+                };
+                paths.fa3_so.with_file_name(default_name)
+            }
+        };
         let global_attention = Fa3Kernels::load(global_attention_so, arch.head_dim_global as u32)?;
 
         let policy_bytes =
@@ -180,7 +206,7 @@ impl Gemma4Bringup {
         use crate::gemma4_layer_exec::*;
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
-        let f16_only = false; // bench path always FP8
+        let f16_only = std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1");
         let arch = &self.arch;
         let hidden = arch.hidden_size as u32;
         let max_hd = arch.max_head_dim() as u32;
@@ -329,6 +355,9 @@ impl Gemma4Bringup {
 
         let logits = arena
             .region("logits", (num_seqs * vocab * 2) as usize, 16)
+            .unwrap();
+        let logits_f32 = arena
+            .region("logits_f32", (num_seqs * vocab * 4) as usize, 16)
             .unwrap();
         let sampled_tokens = arena
             .region("sampled_tokens", (num_seqs * 4) as usize, 16)
@@ -507,31 +536,72 @@ impl Gemma4Bringup {
                 )?;
             }
 
-            // LM head: final norm + FP8 quant + GEMM + softcap + argmax
-            rvllm_fused::FusedRmsnormFp8QuantLaunch {
-                num_tokens: num_seqs,
-                hidden,
-                eps: arch.rms_norm_eps,
+            // LM head: final norm + GEMM + softcap + argmax.
+            // F16 path: copy residual to delta_f16 (preserve residual across warmup),
+            // in-place rmsnorm, F16 GEMM into f32 scratch, saturating cast to f16.
+            // FP8 path: fused rmsnorm+quant, FP8 GEMM direct to f16 logits.
+            if f16_only {
+                cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                    delta_f16.device_ptr(),
+                    residual_ptr,
+                    (num_seqs * hidden * 2) as _,
+                    stream as _,
+                );
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                    num_tokens: num_seqs,
+                    hidden,
+                    eps: arch.rms_norm_eps,
+                }
+                .launch(
+                    kernels.fused_rmsnorm,
+                    delta_f16.device_ptr(),
+                    self.model.final_norm.offset_bytes,
+                    stream,
+                )?;
+                self.cublaslt.f16_gemm_f32(
+                    delta_f16.device_ptr(),
+                    self.model.lm_head_f16.offset_bytes,
+                    logits_f32.device_ptr(),
+                    num_seqs as i32,
+                    vocab as i32,
+                    hidden as i32,
+                    stream,
+                )?;
+                rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch {
+                    n: num_seqs * vocab,
+                }
+                .launch(
+                    kernels.f32_to_f16_sat,
+                    logits.device_ptr(),
+                    logits_f32.device_ptr(),
+                    stream,
+                )?;
+            } else {
+                rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                    num_tokens: num_seqs,
+                    hidden,
+                    eps: arch.rms_norm_eps,
+                }
+                .launch(
+                    kernels.fused_rmsnorm_fp8_quant,
+                    hidden_fp8.device_ptr(),
+                    hidden_scale.device_ptr(),
+                    residual_ptr,
+                    self.model.final_norm.offset_bytes,
+                    stream,
+                )?;
+                self.cublaslt.fp8_gemm(
+                    hidden_fp8.device_ptr(),
+                    self.model.lm_head_fp8.offset_bytes,
+                    logits.device_ptr(),
+                    num_seqs as i32,
+                    vocab as i32,
+                    hidden as i32,
+                    hidden_scale.device_ptr(),
+                    self.model.lm_head_fp8.scale_ptr,
+                    stream,
+                )?;
             }
-            .launch(
-                kernels.fused_rmsnorm_fp8_quant,
-                hidden_fp8.device_ptr(),
-                hidden_scale.device_ptr(),
-                residual_ptr,
-                self.model.final_norm.offset_bytes,
-                stream,
-            )?;
-            self.cublaslt.fp8_gemm(
-                hidden_fp8.device_ptr(),
-                self.model.lm_head_fp8.offset_bytes,
-                logits.device_ptr(),
-                num_seqs as i32,
-                vocab as i32,
-                hidden as i32,
-                hidden_scale.device_ptr(),
-                self.model.lm_head_fp8.scale_ptr,
-                stream,
-            )?;
             logit_softcap(
                 self.fused.fn_softcap,
                 logits.device_ptr(),
