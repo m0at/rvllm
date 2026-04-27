@@ -440,6 +440,7 @@ fn emit_decode_body(
         } else {
             (None, None)
         };
+        let int8_call = int8_tile_name.is_some();
         out.push_str(&emit_layer_call(
             shape,
             layer,
@@ -454,6 +455,10 @@ fn emit_decode_body(
             int8_tile_name.as_deref(),
             int8_row_scale_name.as_deref(),
         )?);
+        if int8_call {
+            hidden = next_hidden;
+            continue;
+        }
         out.push_str(&format!(
             r#"    {next_kv} = "stablehlo.dynamic_update_slice"({kv}, {next_layer_kv}, {layer_kv_start}) : ({kv_ty}, {layer_kv_ty}, tensor<i32>) -> {kv_ty}
 "#,
@@ -519,16 +524,17 @@ fn emit_layer_call(
         return Ok(format!(
             r#"    {layer_offsets_name} = stablehlo.constant dense<{layer_offsets}> : tensor<{offset_cols}xi32>
     {expert_directory_name} = stablehlo.constant dense<{expert_directory}> : tensor<{expert_count}x{expert_cols}xi32>
-    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, {layer_offsets_name}, {expert_directory_name}, {int8_tile}, {int8_row_scales}) {{
+    {dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, {layer_offsets_name}, {expert_directory_name}, {int8_tile}, {int8_row_scales}) {{
       call_target_name = "{tpu_custom_call}",
       backend_config = "{backend_config}",
       called_computations = [],
       has_side_effect = false,
       api_version = 1 : i32,
       kernel_name = "{target}",
+      output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [0], operand_index = 0, operand_tuple_indices = []>],
       operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>],
-      result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>]
-    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x128xi8>, tensor<128xf32>) -> ({hidden_ty}, {kv_ty})
+      result_layouts = [dense<[1, 0]> : tensor<2xindex>]
+    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x128xi8>, tensor<128xf32>) -> {hidden_ty}
 "#,
             tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
             backend_config = backend_config,
@@ -536,7 +542,6 @@ fn emit_layer_call(
             src = src,
             kv_src = kv_src,
             dst = dst,
-            kv_dst = kv_dst,
             int8_tile = int8_tile,
             int8_row_scales = int8_row_scales,
             layer_offsets_name = layer_offsets_name,
@@ -704,19 +709,26 @@ fn is_mlir_symbol(s: &str) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::{M2GraphAbi, M2WeightUploadPlan};
+    use crate::{M2GraphAbi, M2Int8ProjectionSet, M2WeightUploadPlan};
 
     use super::*;
 
     fn arena() -> M2WeightArenaPlan {
+        weight_plan().flat_arena(128).unwrap()
+    }
+
+    fn int8_w1_arena() -> M2WeightArenaPlan {
+        weight_plan()
+            .int8_flat_arena_for(128, M2Int8ProjectionSet::w1())
+            .unwrap()
+    }
+
+    fn weight_plan() -> M2WeightUploadPlan {
         let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../tpu/harness/m2_checkpoint_schema");
         let shape = M2GraphShape::decode(8, 2048, 1);
         let abi = M2GraphAbi::new(shape).unwrap();
-        M2WeightUploadPlan::from_index_dir(model_dir, &abi)
-            .unwrap()
-            .flat_arena(128)
-            .unwrap()
+        M2WeightUploadPlan::from_index_dir(model_dir, &abi).unwrap()
     }
 
     #[test]
@@ -842,7 +854,7 @@ mod tests {
     #[test]
     fn can_link_lowered_decode_layer_body_without_serde_format() {
         let shape = M2GraphShape::decode(8, 2048, 1);
-        let arena = arena();
+        let arena = int8_w1_arena();
         let body = TpuMosaicSerializedBody::from_lowered_mlir(b"module { }").unwrap();
         let mlir =
             m2_decode_graph_mlir_with_mosaic_body("rvllm_m2_decode", &shape, &arena, Some(&body))
@@ -852,6 +864,11 @@ mod tests {
                 .count(),
             M2_NUM_LAYERS
         );
+        assert!(mlir.contains("%h_l0 = \"stablehlo.custom_call\""));
+        assert!(mlir.contains("output_operand_aliases = [#stablehlo.output_operand_alias"));
+        assert!(mlir.contains(") -> tensor<8x3072xbf16>"));
+        assert!(!mlir.contains("%kv_after_l0"));
+        assert!(!mlir.contains("%h_l0_w1_head"));
         assert!(!mlir.contains("\\22serialization_format\\22"));
     }
 

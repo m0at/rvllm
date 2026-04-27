@@ -90,8 +90,7 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
       %expert_directory: memref<256x25xi32>,
       %w1_block_t: memref<{hidden}x128xi8>,
       %w1_row_scales: memref<128xf32>,
-      %hidden_out: memref<{batch}x{hidden}xbf16>,
-      %kv_out: memref<{kv_bytes}xi8>) attributes {{
+      %hidden_out: memref<{batch}x{hidden}xbf16>) attributes {{
         dimension_semantics = [],
         scalar_prefetch = 0 : i64,
         scratch_operands = 0 : i64,
@@ -99,10 +98,8 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
       }} {{
     %c0 = arith.constant 0 : index
 {k_constants}
-    %hidden_v = vector.load %hidden[%c0, %c0] : memref<{batch}x{hidden}xbf16>, vector<{batch}x{hidden}xbf16>
-    vector.store %hidden_v, %hidden_out[%c0, %c0] : memref<{batch}x{hidden}xbf16>, vector<{batch}x{hidden}xbf16>
-    %kv_v = vector.load %kv_in[%c0] : memref<{kv_bytes}xi8>, vector<512xi8>
-    vector.store %kv_v, %kv_out[%c0] : memref<{kv_bytes}xi8>, vector<512xi8>
+    %hidden_v = vector.load %hidden[%c0, %c0] : memref<{batch}x{hidden}xbf16>, vector<1x128xbf16>
+    vector.store %hidden_v, %hidden_out[%c0, %c0] : memref<{batch}x{hidden}xbf16>, vector<1x128xbf16>
     %zero = arith.constant dense<0.000000e+00> : vector<{batch}x128xf32>
 {k_tiles}
     %scale_v = vector.load %w1_row_scales[%c0] : memref<128xf32>, vector<128xf32>
