@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ctx: args.max_ctx,
         block_size: args.block_size,
         kv_dtype: M2PrefillKvDType::Int8,
+        weight_format: "int8".to_string(),
     })?;
     let (runtime, runtime_mode, runtime_error) = init_m2_runtime(&args, &plan);
     eprintln!(

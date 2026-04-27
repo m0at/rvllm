@@ -26,15 +26,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ctx: args.ctx,
         block_size: args.block_size,
         kv_dtype: args.kv_dtype,
+        weight_format: args.weight_format.clone(),
     })?;
 
     eprintln!(
-        "m2 rust prefill+decode plan: batch={} prompt_len={} decode_steps={} ctx={} kv_bytes={} weight_arena_bytes={} weight_entries={} decode_mlir_bytes={}",
+        "m2 rust prefill+decode plan: batch={} prompt_len={} decode_steps={} ctx={} kv_bytes={} weight_format={} weight_arena_bytes={} weight_entries={} decode_mlir_bytes={}",
         plan.prefill.shape.batch,
         plan.prefill.shape.prompt_len,
         plan.decode_steps,
         plan.prefill.shape.ctx,
         plan.decode_shape.kv_cache_bytes(),
+        plan.weight_format,
         plan.weight_arena_bytes,
         plan.weight_entries,
         plan.decode_mlir.len()
@@ -199,7 +201,11 @@ fn execute_decode(
     let reader = M2SafetensorsReader::open(model_dir)?;
     let abi = M2GraphAbi::new(plan.decode_shape.clone())?;
     let weights = M2WeightUploadPlan::from_index_dir(model_dir, &abi)?;
-    let arena = weights.flat_arena(128)?;
+    let arena = match plan.weight_format.as_str() {
+        "nvfp4" => weights.flat_arena(128)?,
+        "int8" => weights.int8_flat_arena(128)?,
+        _ => return Err("--weight-format: expected nvfp4|int8".into()),
+    };
     let client = PjrtClientHandle::new()?;
     let exe = client.compile(&plan.decode_mlir)?;
     let mut token_ids = plan.seed_decode_token_ids.clone();
@@ -212,8 +218,13 @@ fn execute_decode(
         PjrtElementType::S8,
         0,
     )?;
-    let weight_arena =
-        arena.upload_flat_arena_to_pjrt(&reader, &client, 0, max_weight_arena_bytes)?;
+    let weight_arena = match plan.weight_format.as_str() {
+        "nvfp4" => arena.upload_flat_arena_to_pjrt(&reader, &client, 0, max_weight_arena_bytes)?,
+        "int8" => {
+            arena.upload_int8_flat_arena_to_pjrt(&reader, &client, 0, max_weight_arena_bytes)?
+        }
+        _ => return Err("--weight-format: expected nvfp4|int8".into()),
+    };
 
     for _step in 0..plan.decode_steps {
         let token_buf = client.buffer_from_host(
@@ -313,6 +324,7 @@ struct Args {
     ctx: usize,
     block_size: u32,
     kv_dtype: M2PrefillKvDType,
+    weight_format: String,
     runtime_mode: M2RuntimeMode,
     execute_prefill: bool,
     max_weight_arena_bytes: usize,
@@ -334,6 +346,7 @@ impl Args {
             ctx: 2048,
             block_size: 32,
             kv_dtype: M2PrefillKvDType::Int8,
+            weight_format: "int8".to_string(),
             runtime_mode: M2RuntimeMode::PlanningOnly,
             execute_prefill: false,
             max_weight_arena_bytes: 0,
@@ -404,6 +417,13 @@ impl Args {
                             return Err(format!("--kv-dtype: expected int8|bf16, got {other:?}"))
                         }
                     };
+                }
+                "--weight-format" => {
+                    i += 1;
+                    out.weight_format = value(&args, i, "--weight-format")?.to_string();
+                    if !matches!(out.weight_format.as_str(), "nvfp4" | "int8") {
+                        return Err("--weight-format: expected nvfp4|int8".to_string());
+                    }
                 }
                 "--execute-prefill" => out.execute_prefill = true,
                 "--execute-decode" => out.runtime_mode = M2RuntimeMode::Execute,
@@ -481,7 +501,7 @@ fn read_i32s(bytes: &[u8]) -> Vec<i32> {
 }
 
 fn usage() -> String {
-    "usage: m2_rust_prefill_decode [--model-dir DIR] [--batch N] [--prompt-len N] [--decode-steps N] [--ctx N] [--block-size N] [--kv-dtype int8|bf16] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-mlir FILE] [--emit-decode-artifact DIR] [--decode-num-partitions N] [--artifact-dir DIR] [--execute-prefill] [--compile-decode] [--execute-decode --max-weight-arena-bytes N] [--out-token-ids FILE] [--ppl-target-ids FILE]".to_string()
+    "usage: m2_rust_prefill_decode [--model-dir DIR] [--batch N] [--prompt-len N] [--decode-steps N] [--ctx N] [--block-size N] [--kv-dtype int8|bf16] [--weight-format int8|nvfp4] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-mlir FILE] [--emit-decode-artifact DIR] [--decode-num-partitions N] [--artifact-dir DIR] [--execute-prefill] [--compile-decode] [--execute-decode --max-weight-arena-bytes N] [--out-token-ids FILE] [--ppl-target-ids FILE]".to_string()
 }
 
 #[cfg(test)]

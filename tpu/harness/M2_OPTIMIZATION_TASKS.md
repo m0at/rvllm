@@ -29,8 +29,22 @@ gate and a saved result JSON.
   cache surface.
 - [x] Decide whether NVFP4-to-int8 weight upcast is worth keeping as an offline
   experiment only; do not make it default unless PPL/coherence survives.
-  Decision: offline experiment only. It bloats the 130 GB NVFP4 checkpoint and
-  is not on the default path.
+  Superseded: the Rust runtime now has a boot-time int8 flat-arena path so
+  inference can load S8 expert weights and F32 row scales without NVFP4 decode
+  in the runtime matmul path.
+- [x] Add global-scale-correct Rust NVFP4 -> int8 conversion for M2 expert
+  weights (`rvllm_fused::m2_int8`).
+- [x] Add Rust int8 flat-arena planning: `.weight` becomes S8 logical
+  `[rows, cols]`, `.weight_scale` becomes F32 per-row scale, and
+  `.weight_scale_2` is a unit F32 scalar because global scale is baked in.
+- [x] Add boot-time int8 arena materialization from original NVFP4 safetensors
+  using only Rust mmap reads and Rust conversion.
+- [x] Wire Rust decode bench, prefill+decode harness, and API runtime planning
+  to prefer `weight_format=int8`.
+- [ ] Emit/link the matching int8 TPU decode-layer body so the custom call
+  consumes S8 weights + F32 row scales instead of NVFP4 packed/scales.
+- [ ] Run B=8 TPU real-model Rust/XLA int8-weight bench and compare against the
+  current JAX real-model B=8 result.
 
 Recorded int8-KV results:
 

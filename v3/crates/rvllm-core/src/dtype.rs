@@ -10,6 +10,7 @@ pub enum DType {
     Bf16,
     F32,
     F64,
+    I8,
     I32,
     U32,
     U8,
@@ -27,7 +28,7 @@ impl DType {
             DType::F16 | DType::Bf16 => 2,
             DType::F32 | DType::I32 | DType::U32 => 4,
             DType::F64 => 8,
-            DType::U8 | DType::Fp8E4M3 | DType::Fp8E5M2 => 1,
+            DType::I8 | DType::U8 | DType::Fp8E4M3 | DType::Fp8E5M2 => 1,
         }
     }
 
@@ -44,6 +45,7 @@ mod tests {
     #[test]
     fn sizes() {
         assert_eq!(DType::F16.bytes(), 2);
+        assert_eq!(DType::I8.bytes(), 1);
         assert_eq!(DType::F32.bytes(), 4);
         assert_eq!(DType::Fp8E4M3.bytes(), 1);
     }

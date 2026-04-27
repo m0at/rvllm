@@ -16,6 +16,7 @@ pub struct M2RustDecodeBenchConfig {
     pub iters: usize,
     pub warmup: usize,
     pub kv_cache: String,
+    pub weight_format: String,
     pub moe_impl: String,
     pub artifact_dir: PathBuf,
     pub report_path: Option<PathBuf>,
@@ -34,6 +35,7 @@ pub struct M2RustDecodeBenchReport {
     pub nl: usize,
     pub ctx: usize,
     pub kv_cache: String,
+    pub weight_format: String,
     pub moe_impl: String,
     pub load_seconds: Option<f64>,
     pub batches: Vec<usize>,
@@ -129,6 +131,11 @@ pub fn plan_m2_rust_decode_bench(cfg: &M2RustDecodeBenchConfig) -> Result<M2Rust
     let batches = cfg.batches.clone();
     let abi = M2GraphAbi::new(M2GraphShape::decode(batches[0], cfg.ctx, kv_bytes_per_elem))?;
     let weights = M2WeightUploadPlan::from_index_dir(&cfg.model_dir, &abi)?;
+    let weight_upload_bytes = match cfg.weight_format.as_str() {
+        "nvfp4" => weights.flat_arena(128)?.total_bytes,
+        "int8" => weights.int8_flat_arena(128)?.total_bytes,
+        _ => return Err(invalid("weight_format", "must be nvfp4 or int8")),
+    };
     let mut sweep = Vec::with_capacity(batches.len());
     let mut batch_shapes = Vec::with_capacity(batches.len());
     for &batch in &batches {
@@ -160,6 +167,7 @@ pub fn plan_m2_rust_decode_bench(cfg: &M2RustDecodeBenchConfig) -> Result<M2Rust
         nl: M2_NUM_LAYERS,
         ctx: cfg.ctx,
         kv_cache: cfg.kv_cache.clone(),
+        weight_format: cfg.weight_format.clone(),
         moe_impl: cfg.moe_impl.clone(),
         load_seconds: None,
         batches,
@@ -188,7 +196,7 @@ pub fn plan_m2_rust_decode_bench(cfg: &M2RustDecodeBenchConfig) -> Result<M2Rust
         rust_runtime: M2RustDecodeRuntimeReport {
             graph_phase: "decode",
             weight_tensors: weights.specs.len(),
-            weight_upload_bytes: weights.total_device_bytes(),
+            weight_upload_bytes,
             batch_shapes,
         },
     })
@@ -253,6 +261,9 @@ impl M2RustDecodeBenchConfig {
         }
         if self.gen_tokens == 0 {
             return Err(invalid("gen_tokens", "must be > 0"));
+        }
+        if !matches!(self.weight_format.as_str(), "nvfp4" | "int8") {
+            return Err(invalid("weight_format", "must be nvfp4 or int8"));
         }
         Ok(())
     }
@@ -336,6 +347,7 @@ mod tests {
             iters: 10,
             warmup: 3,
             kv_cache: "int8".to_string(),
+            weight_format: "int8".to_string(),
             moe_impl: "auto".to_string(),
             artifact_dir: PathBuf::from("tpu/out/m2/rust_xla_plan"),
             report_path: Some(PathBuf::from("tpu/out/m2/rust_xla_plan/full.json")),
@@ -358,6 +370,7 @@ mod tests {
             "nl",
             "ctx",
             "kv_cache",
+            "weight_format",
             "moe_impl",
             "load_seconds",
             "batches",

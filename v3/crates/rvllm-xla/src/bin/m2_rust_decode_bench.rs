@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         iters: args.iters,
         warmup: args.warmup,
         kv_cache: args.kv_cache.clone(),
+        weight_format: args.weight_format.clone(),
         moe_impl: args.moe_impl.clone(),
         artifact_dir: args.artifact_dir.clone(),
         report_path: args.out.clone(),
@@ -144,7 +145,11 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
         } else {
             let abi = M2GraphAbi::new(shape.clone())?;
             let weights = M2WeightUploadPlan::from_index_dir(&args.model_dir, &abi)?;
-            let arena = weights.flat_arena(128)?;
+            let arena = match args.weight_format.as_str() {
+                "nvfp4" => weights.flat_arena(128)?,
+                "int8" => weights.int8_flat_arena(128)?,
+                _ => return Err("--weight-format: expected nvfp4|int8".into()),
+            };
             weight_arena_bytes = arena.total_bytes.div_ceil(8);
             m2_decode_graph_mlir_with_mosaic_body(
                 "main",
@@ -368,6 +373,7 @@ struct Args {
     iters: usize,
     warmup: usize,
     kv_cache: String,
+    weight_format: String,
     moe_impl: String,
     ppl_text: Option<PathBuf>,
     prompt: String,
@@ -391,6 +397,7 @@ impl Args {
             iters: 10,
             warmup: 3,
             kv_cache: "int8".to_string(),
+            weight_format: "int8".to_string(),
             moe_impl: "auto".to_string(),
             ppl_text: None,
             prompt: "Explain angular momentum.".to_string(),
@@ -462,6 +469,13 @@ impl Args {
                     i += 1;
                     out.kv_cache = value(&args, i, "--kv-cache")?.to_string();
                 }
+                "--weight-format" => {
+                    i += 1;
+                    out.weight_format = value(&args, i, "--weight-format")?.to_string();
+                    if !matches!(out.weight_format.as_str(), "nvfp4" | "int8") {
+                        return Err("--weight-format: expected nvfp4|int8".to_string());
+                    }
+                }
                 "--moe-impl" => {
                     i += 1;
                     out.moe_impl = value(&args, i, "--moe-impl")?.to_string();
@@ -525,7 +539,7 @@ fn kv_bytes_per_elem(kv_cache: &str) -> Result<usize, String> {
 }
 
 fn usage() -> String {
-    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--decode-layer-body FILE] [--decode-layer-body-format serde|lowered] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--moe-impl NAME] [--ppl-text FILE] [--prompt TEXT] [--gen-tokens N]".to_string()
+    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--decode-layer-body FILE] [--decode-layer-body-format serde|lowered] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--weight-format int8|nvfp4] [--moe-impl NAME] [--ppl-text FILE] [--prompt TEXT] [--gen-tokens N]".to_string()
 }
 
 #[cfg(test)]

@@ -126,6 +126,7 @@ fn map_dtype(s: &str) -> Option<DType> {
         "F32" => DType::F32,
         "F16" => DType::F16,
         "BF16" => DType::Bf16,
+        "I8" | "INT8" => DType::I8,
         "U8" | "UINT8" => DType::U8,
         "I32" => DType::I32,
         "U32" => DType::U32,
@@ -224,6 +225,7 @@ mod tests {
                 DType::F32 => "F32",
                 DType::F16 => "F16",
                 DType::Bf16 => "BF16",
+                DType::I8 => "I8",
                 DType::Fp8E4M3 => "F8_E4M3",
                 _ => "F32",
             };

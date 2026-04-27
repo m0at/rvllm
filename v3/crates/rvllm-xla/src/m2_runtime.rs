@@ -42,6 +42,7 @@ pub struct M2RustPrefillDecodeConfig {
     pub ctx: usize,
     pub block_size: u32,
     pub kv_dtype: M2PrefillKvDType,
+    pub weight_format: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +62,7 @@ pub struct M2RustPrefillDecodePlan {
     pub seed_decode_token_ids: Vec<i32>,
     pub seed_decode_positions: Vec<i32>,
     pub decode_steps: usize,
+    pub weight_format: String,
     pub weight_arena_bytes: usize,
     pub weight_entries: usize,
     pub decode_mlir: String,
@@ -82,6 +84,7 @@ pub struct M2RuntimeConfig {
     pub ctx: usize,
     pub block_size: u32,
     pub kv_dtype: M2PrefillKvDType,
+    pub weight_format: String,
     pub max_weight_arena_bytes: usize,
     pub device_idx: usize,
     pub mode: M2RuntimeMode,
@@ -192,6 +195,7 @@ impl M2Runtime {
             ctx: cfg.ctx,
             block_size: cfg.block_size,
             kv_dtype: cfg.kv_dtype,
+            weight_format: cfg.weight_format.clone(),
         })?;
         Self::from_plan_with_mode(
             cfg.model_dir.clone(),
@@ -273,15 +277,28 @@ impl M2Runtime {
         let reader = M2SafetensorsReader::open(&model_dir)?;
         let abi = M2GraphAbi::new(plan.decode_shape.clone())?;
         let weights = M2WeightUploadPlan::from_index_dir(&model_dir, &abi)?;
-        let arena = weights.flat_arena(128)?;
+        let arena = match plan.weight_format.as_str() {
+            "nvfp4" => weights.flat_arena(128)?,
+            "int8" => weights.int8_flat_arena(128)?,
+            _ => return Err(invalid("weight_format", "must be nvfp4 or int8")),
+        };
         let client = PjrtClientHandle::new()?;
         let exe = client.compile(&plan.decode_mlir)?;
-        let weight_arena = arena.upload_flat_arena_to_pjrt(
-            &reader,
-            &client,
-            device_idx,
-            max_weight_arena_bytes,
-        )?;
+        let weight_arena = match plan.weight_format.as_str() {
+            "nvfp4" => arena.upload_flat_arena_to_pjrt(
+                &reader,
+                &client,
+                device_idx,
+                max_weight_arena_bytes,
+            )?,
+            "int8" => arena.upload_int8_flat_arena_to_pjrt(
+                &reader,
+                &client,
+                device_idx,
+                max_weight_arena_bytes,
+            )?,
+            _ => return Err(invalid("weight_format", "must be nvfp4 or int8")),
+        };
         Ok(Self {
             plan,
             state: M2RuntimeState::Executable,
@@ -482,7 +499,11 @@ pub fn plan_m2_rust_prefill_decode(
     let decode_shape = M2GraphShape::decode(cfg.batch, cfg.ctx, kv_bytes_per_elem);
     let abi = M2GraphAbi::new(decode_shape.clone())?;
     let weights = M2WeightUploadPlan::from_index_dir(&cfg.model_dir, &abi)?;
-    let arena = weights.flat_arena(128)?;
+    let arena = match cfg.weight_format.as_str() {
+        "nvfp4" => weights.flat_arena(128)?,
+        "int8" => weights.int8_flat_arena(128)?,
+        _ => return Err(invalid("weight_format", "must be nvfp4 or int8")),
+    };
     let decode_mlir = m2_decode_graph_mlir("main", &decode_shape, &arena)?;
     let weight_arena_bytes = arena.total_bytes.div_ceil(8);
     let decode_input_specs = decode_input_specs(&decode_shape, weight_arena_bytes);
@@ -495,6 +516,7 @@ pub fn plan_m2_rust_prefill_decode(
         decode_input_specs,
         decode_output_specs,
         decode_steps: cfg.decode_steps,
+        weight_format: cfg.weight_format.clone(),
         weight_arena_bytes,
         weight_entries: arena.entries.len(),
         decode_mlir,
@@ -609,6 +631,9 @@ impl M2RustPrefillDecodeConfig {
     fn validate(&self) -> Result<()> {
         if self.decode_steps == 0 {
             return Err(invalid("decode_steps", "must be > 0"));
+        }
+        if !matches!(self.weight_format.as_str(), "nvfp4" | "int8") {
+            return Err(invalid("weight_format", "must be nvfp4 or int8"));
         }
         M2RustPrefillConfig {
             model_dir: self.model_dir.clone(),
@@ -835,12 +860,14 @@ mod tests {
             ctx: 2048,
             block_size: 32,
             kv_dtype: M2PrefillKvDType::Int8,
+            weight_format: "int8".to_string(),
         })
         .unwrap();
         assert_eq!(plan.prefill.shape.total_tokens(), 32);
         assert_eq!(plan.decode_shape.batch, 8);
         assert_eq!(plan.decode_shape.kv_cache_bytes(), 2_080_374_784);
         assert_eq!(plan.decode_steps, 32);
+        assert_eq!(plan.weight_format, "int8");
         assert_eq!(plan.weight_entries, 191_069);
         assert_eq!(
             plan.seed_decode_token_ids,
@@ -869,6 +896,7 @@ mod tests {
             ctx: 2048,
             block_size: 32,
             kv_dtype: M2PrefillKvDType::Int8,
+            weight_format: "int8".to_string(),
         })
         .unwrap();
         let runtime =
@@ -890,6 +918,7 @@ mod tests {
             ctx: 2048,
             block_size: 32,
             kv_dtype: M2PrefillKvDType::Int8,
+            weight_format: "int8".to_string(),
         })
         .unwrap();
         let reason = m2_decode_execution_blocker(&plan).unwrap();
@@ -945,6 +974,7 @@ mod tests {
             ctx: 2048,
             block_size: 32,
             kv_dtype: M2PrefillKvDType::Int8,
+            weight_format: "int8".to_string(),
         })
         .unwrap();
         let prepared = prepare_generate_request(

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use rvllm_core::DType;
 use rvllm_core::{ConfigError, Result, RvllmError};
+use rvllm_fused::{nvfp4_to_int8_matrix, M2Nvfp4MatmulShape};
 use rvllm_loader::M2TensorView;
 use rvllm_loader::{M2CheckpointIndex, M2Projection, M2SafetensorsReader};
 
@@ -17,6 +18,10 @@ pub enum M2WeightRole {
     Nvfp4Scale,
     Nvfp4GlobalScale,
     Nvfp4InputScale,
+    Int8Weight,
+    Int8RowScale,
+    Int8UnitScale,
+    Int8InputScale,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,6 +185,83 @@ impl M2WeightUploadPlan {
         })
     }
 
+    pub fn int8_flat_arena(&self, alignment: usize) -> Result<M2WeightArenaPlan> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(invalid("alignment", "must be a nonzero power of two"));
+        }
+        let mut offset = 0usize;
+        let mut entries = Vec::with_capacity(self.specs.len());
+        for spec in &self.specs {
+            let (role, shape, dtype, nbytes) = match spec.role {
+                M2WeightRole::Global | M2WeightRole::LayerDense => (
+                    spec.role,
+                    spec.tensor.shape.clone(),
+                    spec.tensor.dtype,
+                    spec.tensor.nbytes,
+                ),
+                M2WeightRole::Nvfp4Packed => {
+                    let packed_shape = packed_shape(&spec.tensor.shape)?;
+                    let logical_cols = packed_shape.1 * 2;
+                    (
+                        M2WeightRole::Int8Weight,
+                        vec![packed_shape.0 as i64, logical_cols as i64],
+                        crate::PjrtElementType::S8,
+                        packed_shape.0 * logical_cols,
+                    )
+                }
+                M2WeightRole::Nvfp4Scale => {
+                    let rows = *spec
+                        .tensor
+                        .shape
+                        .first()
+                        .ok_or_else(|| invalid("shape", "missing rows"))?
+                        as usize;
+                    (
+                        M2WeightRole::Int8RowScale,
+                        vec![rows as i64],
+                        crate::PjrtElementType::F32,
+                        rows * 4,
+                    )
+                }
+                M2WeightRole::Nvfp4GlobalScale => (
+                    M2WeightRole::Int8UnitScale,
+                    spec.tensor.shape.clone(),
+                    crate::PjrtElementType::F32,
+                    4,
+                ),
+                M2WeightRole::Nvfp4InputScale => (
+                    M2WeightRole::Int8InputScale,
+                    spec.tensor.shape.clone(),
+                    spec.tensor.dtype,
+                    spec.tensor.nbytes,
+                ),
+                M2WeightRole::Int8Weight
+                | M2WeightRole::Int8RowScale
+                | M2WeightRole::Int8UnitScale
+                | M2WeightRole::Int8InputScale => {
+                    return Err(invalid("role", "upload plan is already int8"))
+                }
+            };
+            offset = align_up(offset, alignment);
+            entries.push(M2WeightArenaEntry {
+                role,
+                name: spec.name.clone(),
+                offset,
+                nbytes,
+                shape,
+                dtype,
+            });
+            offset = offset
+                .checked_add(nbytes)
+                .ok_or_else(|| invalid("total_bytes", "weight arena overflow"))?;
+        }
+        Ok(M2WeightArenaPlan {
+            alignment,
+            total_bytes: align_up(offset, alignment),
+            entries,
+        })
+    }
+
     #[cfg(feature = "tpu")]
     pub fn upload_to_pjrt(
         &self,
@@ -249,6 +331,57 @@ impl M2WeightArenaPlan {
         })
     }
 
+    pub fn materialize_int8_host_buffer(
+        &self,
+        reader: &M2SafetensorsReader,
+        max_bytes: usize,
+    ) -> Result<M2FlatArenaHostBuffer> {
+        if self.total_bytes > max_bytes {
+            return Err(invalid_owned(
+                "max_bytes",
+                format!(
+                    "flat int8 arena is {} bytes, above configured max {}",
+                    self.total_bytes, max_bytes
+                ),
+            ));
+        }
+        let mut bytes = vec![0u8; self.total_bytes];
+        for entry in &self.entries {
+            match entry.role {
+                M2WeightRole::Global | M2WeightRole::LayerDense | M2WeightRole::Int8InputScale => {
+                    let view = reader.tensor(&entry.name)?;
+                    validate_arena_tensor(entry, &view)?;
+                    let start = entry.offset;
+                    let end = start + entry.nbytes;
+                    bytes[start..end].copy_from_slice(view.bytes);
+                }
+                M2WeightRole::Int8Weight => {
+                    materialize_int8_weight(entry, self, reader, &mut bytes)?;
+                }
+                M2WeightRole::Int8RowScale => {}
+                M2WeightRole::Int8UnitScale => {
+                    let start = entry.offset;
+                    let end = start + entry.nbytes;
+                    bytes[start..end].copy_from_slice(&1.0f32.to_le_bytes());
+                }
+                M2WeightRole::Nvfp4Packed
+                | M2WeightRole::Nvfp4Scale
+                | M2WeightRole::Nvfp4GlobalScale
+                | M2WeightRole::Nvfp4InputScale => {
+                    return Err(invalid(
+                        "role",
+                        "use materialize_host_buffer for NVFP4 arenas",
+                    ));
+                }
+            }
+        }
+        Ok(M2FlatArenaHostBuffer {
+            bytes,
+            total_bytes: self.total_bytes,
+            entries: self.entries.len(),
+        })
+    }
+
     #[cfg(feature = "tpu")]
     pub fn upload_flat_arena_to_pjrt(
         &self,
@@ -265,10 +398,116 @@ impl M2WeightArenaPlan {
             device_idx,
         )
     }
+
+    #[cfg(feature = "tpu")]
+    pub fn upload_int8_flat_arena_to_pjrt(
+        &self,
+        reader: &M2SafetensorsReader,
+        client: &PjrtClientHandle,
+        device_idx: usize,
+        max_host_bytes: usize,
+    ) -> Result<PjrtBufferHandle> {
+        let host = self.materialize_int8_host_buffer(reader, max_host_bytes)?;
+        client.buffer_from_host(
+            &host.bytes,
+            &[host.total_bytes as i64],
+            crate::PjrtElementType::S8,
+            device_idx,
+        )
+    }
 }
 
 fn align_up(x: usize, alignment: usize) -> usize {
     (x + alignment - 1) & !(alignment - 1)
+}
+
+fn packed_shape(shape: &[i64]) -> Result<(usize, usize)> {
+    if shape.len() != 2 || shape[0] <= 0 || shape[1] <= 0 {
+        return Err(invalid("shape", "NVFP4 packed tensor must be 2D"));
+    }
+    Ok((shape[0] as usize, shape[1] as usize))
+}
+
+fn materialize_int8_weight(
+    entry: &M2WeightArenaEntry,
+    arena: &M2WeightArenaPlan,
+    reader: &M2SafetensorsReader,
+    bytes: &mut [u8],
+) -> Result<()> {
+    let packed = reader.tensor(&entry.name)?;
+    validate_packed_source(entry, &packed)?;
+    let scale_name = int8_row_scale_name(&entry.name)?;
+    let global_scale_name = int8_unit_scale_name(&entry.name)?;
+    let scale = reader.tensor(&scale_name)?;
+    let global_scale = reader.tensor(&global_scale_name)?;
+    let rows = packed.entry.shape[0];
+    let cols = packed.entry.shape[1] * 2;
+    if entry.shape != vec![rows as i64, cols as i64] || entry.nbytes != rows * cols {
+        return Err(invalid_owned(
+            "shape",
+            format!(
+                "{}: int8 arena shape does not match NVFP4 source",
+                entry.name
+            ),
+        ));
+    }
+    validate_scale_source(&scale_name, &scale, rows, cols)?;
+    let global_scale = global_scale.f32_scalar()?;
+    let row_scale_entry = arena.entry(&scale_name)?;
+    if row_scale_entry.role != M2WeightRole::Int8RowScale
+        || row_scale_entry.dtype != crate::PjrtElementType::F32
+        || row_scale_entry.shape != vec![rows as i64]
+        || row_scale_entry.nbytes != rows * 4
+    {
+        return Err(invalid_owned(
+            "row_scale",
+            format!("{scale_name}: int8 row-scale arena entry mismatch"),
+        ));
+    }
+
+    let shape = M2Nvfp4MatmulShape {
+        m: 1,
+        n: rows,
+        k: cols,
+    };
+    let mut i8_weights = vec![0i8; rows * cols];
+    let mut row_scales = vec![0.0f32; rows];
+    nvfp4_to_int8_matrix(
+        packed.bytes,
+        scale.bytes,
+        global_scale,
+        shape,
+        &mut i8_weights,
+        &mut row_scales,
+    )?;
+
+    let weight_start = entry.offset;
+    for (dst, src) in bytes[weight_start..weight_start + entry.nbytes]
+        .iter_mut()
+        .zip(i8_weights.iter())
+    {
+        *dst = *src as u8;
+    }
+    let scale_start = row_scale_entry.offset;
+    for (row, scale) in row_scales.iter().enumerate() {
+        let start = scale_start + row * 4;
+        bytes[start..start + 4].copy_from_slice(&scale.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn int8_row_scale_name(weight_name: &str) -> Result<String> {
+    let base = weight_name
+        .strip_suffix(".weight")
+        .ok_or_else(|| invalid("weight", "expected .weight suffix"))?;
+    Ok(format!("{base}.weight_scale"))
+}
+
+fn int8_unit_scale_name(weight_name: &str) -> Result<String> {
+    let base = weight_name
+        .strip_suffix(".weight")
+        .ok_or_else(|| invalid("weight", "expected .weight suffix"))?;
+    Ok(format!("{base}.weight_scale_2"))
 }
 
 fn push_required(
@@ -334,10 +573,54 @@ fn validate_arena_tensor(entry: &M2WeightArenaEntry, view: &M2TensorView<'_>) ->
     Ok(())
 }
 
+fn validate_packed_source(entry: &M2WeightArenaEntry, view: &M2TensorView<'_>) -> Result<()> {
+    if view.entry.dtype != DType::U8 || view.entry.shape.len() != 2 {
+        return Err(invalid_owned(
+            "packed",
+            format!("{}: source must be packed NVFP4 U8", entry.name),
+        ));
+    }
+    let rows = view.entry.shape[0];
+    let cols = view.entry.shape[1] * 2;
+    if cols % 16 != 0 {
+        return Err(invalid_owned(
+            "packed",
+            format!("{}: logical cols must be multiple of 16", entry.name),
+        ));
+    }
+    if entry.dtype != crate::PjrtElementType::S8
+        || entry.shape != vec![rows as i64, cols as i64]
+        || entry.nbytes != rows * cols
+    {
+        return Err(invalid_owned(
+            "packed",
+            format!("{}: int8 arena entry does not match source", entry.name),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scale_source(
+    name: &str,
+    view: &M2TensorView<'_>,
+    rows: usize,
+    cols: usize,
+) -> Result<()> {
+    let expected_shape = vec![rows, cols / 16];
+    if view.entry.dtype != DType::U8 || view.entry.shape != expected_shape {
+        return Err(invalid_owned(
+            "scale",
+            format!("{name}: source must be FP8 scale U8 shape {expected_shape:?}"),
+        ));
+    }
+    Ok(())
+}
+
 fn pjrt_to_loader_dtype(dtype: crate::PjrtElementType) -> Result<DType> {
     Ok(match dtype {
         crate::PjrtElementType::BF16 => DType::Bf16,
         crate::PjrtElementType::F32 => DType::F32,
+        crate::PjrtElementType::S8 => DType::I8,
         crate::PjrtElementType::U8 => DType::U8,
         crate::PjrtElementType::S32 => DType::I32,
         _ => return Err(invalid("dtype", "unsupported upload dtype")),
@@ -450,6 +733,45 @@ mod tests {
     }
 
     #[test]
+    fn int8_flat_arena_replaces_nvfp4_experts_without_runtime_decode_tensors() {
+        let abi = M2GraphAbi::new(M2GraphShape::decode(8, 2048, 1)).unwrap();
+        let plan = M2WeightUploadPlan::from_index_dir(schema_dir(), &abi).unwrap();
+        let nvfp4 = plan.flat_arena(128).unwrap();
+        let int8 = plan.int8_flat_arena(128).unwrap();
+        assert_eq!(int8.alignment, 128);
+        assert_eq!(int8.entries.len(), nvfp4.entries.len());
+        assert!(int8.total_bytes > nvfp4.total_bytes);
+        assert_eq!(int8.total_bytes % 128, 0);
+        assert_eq!(
+            int8.entries
+                .iter()
+                .filter(|entry| entry.role == M2WeightRole::Int8Weight)
+                .count(),
+            47_616
+        );
+
+        let w1 = int8
+            .entry("model.layers.0.block_sparse_moe.experts.0.w1.weight")
+            .unwrap();
+        assert_eq!(w1.role, M2WeightRole::Int8Weight);
+        assert_eq!(w1.shape, vec![1_536, 3_072]);
+        assert_eq!(w1.dtype, PjrtElementType::S8);
+
+        let w1_scale = int8
+            .entry("model.layers.0.block_sparse_moe.experts.0.w1.weight_scale")
+            .unwrap();
+        assert_eq!(w1_scale.role, M2WeightRole::Int8RowScale);
+        assert_eq!(w1_scale.shape, vec![1_536]);
+        assert_eq!(w1_scale.dtype, PjrtElementType::F32);
+
+        let w1_global = int8
+            .entry("model.layers.0.block_sparse_moe.experts.0.w1.weight_scale_2")
+            .unwrap();
+        assert_eq!(w1_global.role, M2WeightRole::Int8UnitScale);
+        assert_eq!(w1_global.dtype, PjrtElementType::F32);
+    }
+
+    #[test]
     fn upload_tensor_validation_checks_dtype_shape_and_nbytes() {
         let spec = M2WeightUploadSpec {
             role: M2WeightRole::Global,
@@ -523,6 +845,58 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn materializes_boot_time_int8_arena_from_nvfp4_sources() {
+        let dir = tiny_nvfp4_model_dir();
+        let reader = M2SafetensorsReader::open(&dir).unwrap();
+        let arena = M2WeightArenaPlan {
+            alignment: 8,
+            total_bytes: 48,
+            entries: vec![
+                M2WeightArenaEntry {
+                    role: M2WeightRole::Int8Weight,
+                    name: "model.layers.0.block_sparse_moe.experts.0.w1.weight".to_string(),
+                    offset: 0,
+                    nbytes: 32,
+                    shape: vec![2, 16],
+                    dtype: PjrtElementType::S8,
+                },
+                M2WeightArenaEntry {
+                    role: M2WeightRole::Int8RowScale,
+                    name: "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale".to_string(),
+                    offset: 32,
+                    nbytes: 8,
+                    shape: vec![2],
+                    dtype: PjrtElementType::F32,
+                },
+                M2WeightArenaEntry {
+                    role: M2WeightRole::Int8UnitScale,
+                    name: "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale_2".to_string(),
+                    offset: 40,
+                    nbytes: 4,
+                    shape: vec![],
+                    dtype: PjrtElementType::F32,
+                },
+            ],
+        };
+        let host = arena.materialize_int8_host_buffer(&reader, 64).unwrap();
+        assert_eq!(host.total_bytes, 48);
+        assert!(host.bytes[0..32].iter().all(|&x| x == 127));
+        assert_eq!(
+            f32::from_le_bytes(host.bytes[32..36].try_into().unwrap()),
+            1.0 / 127.0
+        );
+        assert_eq!(
+            f32::from_le_bytes(host.bytes[36..40].try_into().unwrap()),
+            1.0 / 127.0
+        );
+        assert_eq!(
+            f32::from_le_bytes(host.bytes[40..44].try_into().unwrap()),
+            1.0
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn tiny_model_dir() -> PathBuf {
         let uniq = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -547,6 +921,54 @@ mod tests {
             "weight_map": {
                 "a": shard_name,
                 "b": shard_name
+            }
+        });
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn tiny_nvfp4_model_dir() -> PathBuf {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rvllm-xla-int8-arena-{uniq}"));
+        fs::create_dir_all(&dir).unwrap();
+        let shard_name = "model-00001-of-00001.safetensors";
+        let weight = [0x11u8; 16];
+        let scale = [0x38u8; 2];
+        let global = 2.0f32.to_le_bytes();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&weight);
+        payload.extend_from_slice(&scale);
+        payload.extend_from_slice(&global);
+        let header = json!({
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight": {
+                "dtype": "U8", "shape": [2, 8], "data_offsets": [0, 16]
+            },
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale": {
+                "dtype": "U8", "shape": [2, 1], "data_offsets": [16, 18]
+            },
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale_2": {
+                "dtype": "F32", "shape": [], "data_offsets": [18, 22]
+            }
+        });
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+        let mut shard = Vec::new();
+        shard.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        shard.extend_from_slice(&header_bytes);
+        shard.extend_from_slice(&payload);
+        fs::write(dir.join(shard_name), shard).unwrap();
+        let index = json!({
+            "metadata": {},
+            "weight_map": {
+                "model.layers.0.block_sparse_moe.experts.0.w1.weight": shard_name,
+                "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale": shard_name,
+                "model.layers.0.block_sparse_moe.experts.0.w1.weight_scale_2": shard_name
             }
         });
         fs::write(
