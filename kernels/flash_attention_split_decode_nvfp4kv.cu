@@ -393,7 +393,11 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_kernel(
 
 extern "C"
 __global__ void flash_attention_2_decode_nvfp4kv_split_bc16_kernel(
-    __half*              __restrict__ tmp_out,
+    // tmp_out is f32 [S,H,P,D] — matches the BC=32 split kernel and
+    // the f32 contract `paged_attention_reduce_f16_kernel` expects.
+    // Cycle 21 widened the main split kernel to f32 but missed this
+    // BC16 variant; cycle 52 step 11d fix.
+    float*               __restrict__ tmp_out,
     float*               __restrict__ max_logits,
     float*               __restrict__ exp_sums,
     const unsigned char* __restrict__ query,

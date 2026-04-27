@@ -91,7 +91,13 @@ compile_kernel() {
             sm_122) arch="sm_122a" ;;
         esac
     fi
-    $NVCC -ptx -arch="$arch" -O3 $extra_flags -o "$ptx" "$cu" 2>/dev/null
+    # Cycle 52 step 11d: stop swallowing nvcc errors. The cycle-21
+    # NVFP4 split-decode tmp_out f16->f32 fix updated the main kernel
+    # but not the BC16 variant; the resulting type mismatch was
+    # silently dropped here for ~30 cycles, leaving a stale PTX in
+    # the manifest with the wrong ABI. Print stderr so the next such
+    # bug surfaces immediately.
+    $NVCC -ptx -arch="$arch" -O3 $extra_flags -o "$ptx" "$cu"
 }
 
 # Revision pinned into the generated manifest.json. Precedence:
