@@ -1304,8 +1304,8 @@ fn load_gemma4_awq_model_inner(
             mlp_intermediate: arch.intermediate_size,
             hidden:           arch.hidden_size,
         };
-        let mut awq_layer = crate::compressed_tensors::upload_gemma4_awq_layer(
-            arena, &layer_prefix, &geom, &awq.scheme, &byte_lookup,
+        let awq_layer = crate::compressed_tensors::upload_gemma4_awq_layer(
+            arena, &layer_prefix, &geom, &awq.scheme, &byte_lookup, has_v_proj,
         ).map_err(|e| RvllmError::Loader {
             err: LoaderError::Corrupt {
                 detail: format!("layer {l} AWQ upload: {e}"),
@@ -1317,18 +1317,10 @@ fn load_gemma4_awq_model_inner(
             bt: std::backtrace::Backtrace::capture(),
         })?;
 
-        // Codex review of 92cd9e0: the v_proj→k_proj alias was at the
-        // byte_lookup level only — the arena still allocated a
-        // separate V region with K's bytes copied into it, so v_proj's
-        // device pointer was distinct from k_proj's. Fix the comment
-        // contract by aliasing at the AwqLinearWeight level too: for
-        // global layers the runtime sees identical v_packed/scale/zero
-        // pointers as k_*, matching the FP8 K-as-V trick. The wasted
-        // V region in the arena is a known footnote (worth ~3 GB on
-        // Gemma 4 31B for 10 global layers; cycle 50 cleanup task).
-        if !has_v_proj {
-            awq_layer.v_proj = awq_layer.k_proj.clone();
-        }
+        // Cycle 49 step 8e: upload_gemma4_awq_layer now handles the V/K
+        // alias internally (skips the v_proj arena region for globals
+        // and clones K's AwqLinearWeight into the v_proj slot), so no
+        // post-upload alias step is needed here.
 
         if l == 0 || l == load_max_layers - 1 {
             eprintln!(

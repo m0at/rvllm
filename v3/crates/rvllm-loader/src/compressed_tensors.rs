@@ -537,6 +537,7 @@ pub fn upload_gemma4_awq_layer<'a>(
     geom: &AwqLayerShapes,
     scheme: &AwqWeightScheme,
     byte_lookup: &dyn Fn(&str) -> Option<(rvllm_core::DType, Vec<usize>, Vec<u8>)>,
+    has_v_proj: bool,
 ) -> Result<crate::weights::AwqLayerWeights, String> {
     let stage_and_upload = |linear: &str, dense: [usize; 2]|
         -> Result<AwqLinearWeight, String>
@@ -547,14 +548,26 @@ pub fn upload_gemma4_awq_layer<'a>(
             .map_err(|e| format!("upload {full}: {e:?}"))
     };
 
+    let q_proj    = stage_and_upload("self_attn.q_proj",  [geom.q_out,            geom.hidden])?;
+    let k_proj    = stage_and_upload("self_attn.k_proj",  [geom.kv_out,           geom.hidden])?;
+    // Cycle 49 step 8e (codex review of 92cd9e0 cycle 50 cleanup):
+    // global Gemma 4 layers have `attention_k_eq_v=true` — V is reused
+    // from K. Don't allocate a separate V arena region; alias the K
+    // upload into v_proj. Saves ~50MB per global layer × ~10 globals
+    // ≈ 0.5GB on Gemma 4 31B (smaller than the cycle 50 estimate
+    // because per-linear is ~50MB INT4 packed not the full f16 weight).
+    let v_proj    = if has_v_proj {
+        stage_and_upload("self_attn.v_proj",  [geom.kv_out, geom.hidden])?
+    } else {
+        k_proj.clone()
+    };
+    let o_proj    = stage_and_upload("self_attn.o_proj",  [geom.o_out,            geom.o_in])?;
+    let gate_proj = stage_and_upload("mlp.gate_proj",     [geom.mlp_intermediate, geom.hidden])?;
+    let up_proj   = stage_and_upload("mlp.up_proj",       [geom.mlp_intermediate, geom.hidden])?;
+    let down_proj = stage_and_upload("mlp.down_proj",     [geom.hidden,           geom.mlp_intermediate])?;
+
     Ok(crate::weights::AwqLayerWeights {
-        q_proj:    stage_and_upload("self_attn.q_proj",  [geom.q_out,            geom.hidden])?,
-        k_proj:    stage_and_upload("self_attn.k_proj",  [geom.kv_out,           geom.hidden])?,
-        v_proj:    stage_and_upload("self_attn.v_proj",  [geom.kv_out,           geom.hidden])?,
-        o_proj:    stage_and_upload("self_attn.o_proj",  [geom.o_out,            geom.o_in])?,
-        gate_proj: stage_and_upload("mlp.gate_proj",     [geom.mlp_intermediate, geom.hidden])?,
-        up_proj:   stage_and_upload("mlp.up_proj",       [geom.mlp_intermediate, geom.hidden])?,
-        down_proj: stage_and_upload("mlp.down_proj",     [geom.hidden,           geom.mlp_intermediate])?,
+        q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj,
     })
 }
 
