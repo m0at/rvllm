@@ -719,7 +719,111 @@ pub unsafe fn gemma4_forward_phase(
 
     // 2. Q||K||V projection
     #[cfg(feature = "cuda")]
-    if weights.qkv_f16 != 0 {
+    if weights.awq.linear_active(AwqLinearKind::Q) {
+        // Cycle 46: AWQ INT4 W4A16 path. Three sequential GEMV launches
+        // (Q, K, V) compose into the existing Q|K|V scratch via offset
+        // pointer arithmetic — preserves the fused QKV RMSNorm /
+        // attention path that consumes that buffer downstream.
+        debug_assert!(
+            weights.awq.linear_active(AwqLinearKind::K)
+                && weights.awq.linear_active(AwqLinearKind::V),
+            "AWQ QKV must be all-or-nothing (Q/K/V flags inconsistent)"
+        );
+        if dims.num_tokens != 1 {
+            // Decode-only for now. Prefill needs either a per-token
+            // loop (slow) or an AWQ GEMM kernel (cycle 47 work).
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq qkv prefill (M>1) not yet implemented",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "awq_qkv",
+                    stream,
+                    num_seqs: dims.num_tokens,
+                    head_dim: dims.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16.ok_or_else(|| {
+            rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq_int4_gemv_f16 PTX missing from $KERNELS_DIR",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "awq_qkv", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        })?;
+
+        // Same prelude as the qkv_f16 branch: copy residual to delta
+        // scratch then in-place rmsnorm.
+        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            scratch.delta_f16,
+            residual,
+            (dims.num_tokens * dims.hidden * 2) as _,
+            stream as _,
+        );
+        gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: dims.num_tokens,
+            hidden: dims.hidden,
+            eps: dims.rms_eps,
+        }
+        .launch(
+            kernels.fused_rmsnorm,
+            scratch.delta_f16,
+            weights.attn_norm_gamma,
+            stream,
+        )?;
+
+        let kv_dim = (dims.num_kv_heads * dims.head_dim) as u32;
+        let q_dim_u = q_dim as u32;
+        let g = weights.awq.group_size;
+        let k = dims.hidden as u32;
+
+        // Q: writes scratch.q_out + 0
+        unsafe {
+            gemma4_launcher::AwqInt4GemvF16Launch {
+                n: q_dim_u, k, group_size: g,
+            }.launch(
+                fn_awq,
+                scratch.delta_f16,
+                weights.awq.q_packed,
+                weights.awq.q_scale,
+                weights.awq.q_zero,
+                scratch.q_out,
+                stream,
+            )?;
+            // K: writes scratch.q_out + q_dim*2 (output is f16 → 2B)
+            gemma4_launcher::AwqInt4GemvF16Launch {
+                n: kv_dim, k, group_size: g,
+            }.launch(
+                fn_awq,
+                scratch.delta_f16,
+                weights.awq.k_packed,
+                weights.awq.k_scale,
+                weights.awq.k_zero,
+                scratch.q_out + (q_dim_u as u64) * 2,
+                stream,
+            )?;
+            // V: writes scratch.q_out + (q_dim + kv_dim)*2
+            gemma4_launcher::AwqInt4GemvF16Launch {
+                n: kv_dim, k, group_size: g,
+            }.launch(
+                fn_awq,
+                scratch.delta_f16,
+                weights.awq.v_packed,
+                weights.awq.v_scale,
+                weights.awq.v_zero,
+                scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2,
+                stream,
+            )?;
+        }
+    } else if weights.qkv_f16 != 0 {
         // F16 path: copy residual to delta_f16 scratch, apply rmsnorm in-place, use as GEMM input
         cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
             scratch.delta_f16,
