@@ -51,6 +51,14 @@ Recorded int8-KV results:
   deterministic small tensors.
 - [x] Pin the custom-call ABI target and byte contract:
   `rvllm.m2.nvfp4_decode_bf16_matmul` with packed/scales/output byte metadata.
+- [x] Pin the TPU Mosaic body serialization contract from the installed TPU
+  stack, without running Python/JAX: JAX lowers `tpu_custom_call` by running
+  `mosaic-serde{serialize=true target-version=3?}` over a Mosaic MLIR module,
+  writing MLIR bytecode with `desired_version=0`, base64-encoding that bytecode
+  into `custom_call_config.body`, and setting `serialization_format: 1` plus
+  `needs_layout_passes` when no explicit device type is present. Plain textual
+  MLIR or descriptor strings fail at PJRT compile with `Missing or invalid
+  version attribute`, which is exactly the current Rust placeholder failure.
 - [x] Add fused-MoE expert-directory metadata to the Rust decode graph:
   every `rvllm.m2.decode_layer` now carries a dense `256x13xi64` directory of
   W1/W2/W3 packed, scale, global-scale, and optional input-scale offsets. This
