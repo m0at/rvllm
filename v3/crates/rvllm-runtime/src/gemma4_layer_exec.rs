@@ -584,6 +584,11 @@ pub struct Gemma4LayerKernels {
     pub fused_rmsnorm: KernelFn,
     pub fused_rmsnorm_fp8_quant: KernelFn,
     pub fused_qk_rmsnorm: KernelFn,
+    /// Cycle 55 step 5 (Phase B): bf16-typed sibling of
+    /// `fused_qk_rmsnorm`. Same launch ABI; only the dtype
+    /// interpretation of Q/K/gamma flips f16 → bf16. Selected when
+    /// the QKV chain is bf16-native (eventually the only path).
+    pub fused_qk_rmsnorm_bf16: KernelFn,
     pub fused_rope_partial_fp8kv: KernelFn,
     /// RoPE + NVFP4-packed KV write. `None` when the NVFP4 PTX
     /// module isn't built into `$KERNELS_DIR` (pre-NVFP4 branches

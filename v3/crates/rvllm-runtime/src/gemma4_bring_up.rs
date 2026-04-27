@@ -96,6 +96,8 @@ pub struct Gemma4FusedModules {
     pub gelu_mod: LoadedModule,
     pub argmax_mod: LoadedModule,
     pub qk_norm_mod: LoadedModule,
+    /// Cycle 55 step 5 (Phase B): bf16-typed sibling of qk_norm_mod.
+    pub qk_norm_bf16_mod: LoadedModule,
     pub softcap_mod: LoadedModule,
     pub residual_scale_mod: LoadedModule,
     pub vnorm_mod: LoadedModule,
@@ -122,6 +124,10 @@ pub struct Gemma4FusedModules {
     pub fn_gelu_mul: KernelFn,
     pub fn_argmax: KernelFn,
     pub fn_qk_rmsnorm: KernelFn,
+    /// Cycle 55 step 5: bf16 sibling of fn_qk_rmsnorm. Same launch
+    /// ABI; only the dtype interpretation of inputs/outputs/gamma
+    /// flips f16 → bf16.
+    pub fn_qk_rmsnorm_bf16: KernelFn,
     pub fn_softcap: KernelFn,
     pub fn_residual_scale: KernelFn,
     pub fn_vnorm: KernelFn,
@@ -3881,6 +3887,7 @@ impl Gemma4Bringup {
             fused_rmsnorm: self.fused.fn_rmsnorm,
             fused_rmsnorm_fp8_quant: self.fused.fn_rmsnorm_fp8_quant,
             fused_qk_rmsnorm: self.fused.fn_qk_rmsnorm,
+            fused_qk_rmsnorm_bf16: self.fused.fn_qk_rmsnorm_bf16,
             fused_rope_partial_fp8kv: self.fused.fn_rope_partial_fp8kv,
             fused_rope_partial_nvfp4kv,
             fused_gelu_mul: self.fused.fn_gelu_mul,
@@ -3930,6 +3937,7 @@ fn load_gemma4_fused(
     let gelu_mod = loader.load_ptx("fused_gelu_mul_fp8_quant")?;
     let argmax_mod = loader.load_ptx("argmax")?;
     let qk_norm_mod = loader.load_ptx("fused_qk_rmsnorm")?;
+    let qk_norm_bf16_mod = loader.load_ptx("fused_qk_rmsnorm_bf16")?;
     let softcap_mod = loader.load_ptx("logit_softcap")?;
     let residual_scale_mod = loader.load_ptx("residual_scale_f16")?;
     let vnorm_mod = loader.load_ptx("vnorm_f16")?;
@@ -3954,6 +3962,7 @@ fn load_gemma4_fused(
     let fn_gelu_mul = gelu_mod.get_function("fused_gelu_mul_fp8_quant_kernel")?;
     let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
     let fn_qk_rmsnorm = qk_norm_mod.get_function("fused_qk_rmsnorm_kernel")?;
+    let fn_qk_rmsnorm_bf16 = qk_norm_bf16_mod.get_function("fused_qk_rmsnorm_bf16_kernel")?;
     let fn_softcap = softcap_mod.get_function("logit_softcap_kernel")?;
     let fn_residual_scale = residual_scale_mod.get_function("residual_scale_f16_kernel")?;
     let fn_vnorm = vnorm_mod.get_function("vnorm_f16_kernel")?;
@@ -4057,6 +4066,7 @@ fn load_gemma4_fused(
         gelu_mod,
         argmax_mod,
         qk_norm_mod,
+        qk_norm_bf16_mod,
         softcap_mod,
         residual_scale_mod,
         vnorm_mod,
@@ -4083,6 +4093,7 @@ fn load_gemma4_fused(
         fn_gelu_mul,
         fn_argmax,
         fn_qk_rmsnorm,
+        fn_qk_rmsnorm_bf16,
         fn_softcap,
         fn_residual_scale,
         fn_vnorm,
