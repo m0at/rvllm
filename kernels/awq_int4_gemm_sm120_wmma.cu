@@ -42,6 +42,13 @@
 //
 // Launch: gridDim = (ceil(N/16), ceil(M/16)), blockDim = (32, 1, 1).
 //
+// Constraint: K must be a multiple of 16 (the WMMA K-step) AND a
+// multiple of group_size. Real Gemma 4 31B has K = 5376 (= 16 * 336
+// = 128 * 42), satisfies both. The kernel does NOT guard against
+// out-of-bounds B_packed reads at K not %16 — it only zeroes the
+// store. Caller should validate K dimension before launch.
+// (Cycle 51d.2 will add proper bounds checks if needed.)
+//
 // === TILE STRUCTURE ===
 //
 // One warp per block. Each block computes a 16x16 output sub-tile via
@@ -173,8 +180,12 @@ void awq_int4_gemm_sm120_wmma_kernel(
             if (n_global < N && gk < K) {
                 v = __float2half(dq);
             }
-            // col_major: smem[col * ldb + row] with ldb=16; here col=k_local, row=n_local.
-            B_smem[k_local * 16 + n_local] = v;
+            // WMMA matrix_b is logically [K, N]. col_major with ldb=16
+            // means: element at (k_local, n_local) lives at
+            // n_local * ldb + k_local — N is the column stride, K is
+            // contiguous within a column. Codex review of cycle 51d.1
+            // caught the reversed indexing in the first version.
+            B_smem[n_local * 16 + k_local] = v;
         }
 
         __syncthreads();
