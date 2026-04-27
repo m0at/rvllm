@@ -46,9 +46,9 @@ pub use m2_runtime::{
     M2RustPrefillPlan,
 };
 pub use m2_tpu_custom_call::{
-    tpu_custom_call_backend_config, tpu_custom_call_backend_config_for_body,
+    tpu_custom_call_backend_config, tpu_custom_call_backend_config_for_body, TpuMosaicBodyFormat,
     TpuMosaicSerializedBody, TPU_CUSTOM_CALL_TARGET, TPU_MOSAIC_BYTECODE_VERSION,
-    TPU_MOSAIC_SERIALIZATION_FORMAT, TPU_MOSAIC_SERDE_PASS,
+    TPU_MOSAIC_SERDE_PASS, TPU_MOSAIC_SERIALIZATION_FORMAT,
 };
 pub use m2_weight_plan::{
     M2FlatArenaHostBuffer, M2WeightArenaEntry, M2WeightArenaPlan, M2WeightRole, M2WeightUploadPlan,

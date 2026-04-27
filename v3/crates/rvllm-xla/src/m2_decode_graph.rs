@@ -638,13 +638,31 @@ mod tests {
         let shape = M2GraphShape::decode(8, 2048, 1);
         let arena = arena();
         let body =
-            TpuMosaicSerializedBody::from_serialized_bytecode(&[0x4d, 0x4c, 0xef, 0x52])
-                .unwrap();
+            TpuMosaicSerializedBody::from_serialized_bytecode(&[0x4d, 0x4c, 0xef, 0x52]).unwrap();
         let mlir =
             m2_decode_graph_mlir_with_mosaic_body("rvllm_m2_decode", &shape, &arena, Some(&body))
                 .unwrap();
-        assert_eq!(mlir.matches("\\22body\\22: \\22TUzvUg==\\22").count(), M2_NUM_LAYERS);
+        assert_eq!(
+            mlir.matches("\\22body\\22: \\22TUzvUg==\\22").count(),
+            M2_NUM_LAYERS
+        );
         assert!(!mlir.contains("\\22body\\22: \\22\\22"));
+    }
+
+    #[test]
+    fn can_link_lowered_decode_layer_body_without_serde_format() {
+        let shape = M2GraphShape::decode(8, 2048, 1);
+        let arena = arena();
+        let body = TpuMosaicSerializedBody::from_lowered_mlir(b"module { }").unwrap();
+        let mlir =
+            m2_decode_graph_mlir_with_mosaic_body("rvllm_m2_decode", &shape, &arena, Some(&body))
+                .unwrap();
+        assert_eq!(
+            mlir.matches("\\22body\\22: \\22bW9kdWxlIHsgfQ==\\22")
+                .count(),
+            M2_NUM_LAYERS
+        );
+        assert!(!mlir.contains("\\22serialization_format\\22"));
     }
 
     #[test]

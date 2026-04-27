@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && !args.native_smoke
         && args.decode_layer_body.is_none()
     {
-        return Err("real Rust M2 compile/execute needs --decode-layer-body FILE containing serialized Mosaic bytecode; use --native-smoke for the zero-logits PJRT smoke".into());
+        return Err("real Rust M2 compile/execute needs --decode-layer-body FILE containing serde bytecode or lowered MLIR; use --native-smoke for the zero-logits PJRT smoke".into());
     }
     let artifacts =
         if args.emit_decode_artifacts || args.runtime_mode != M2RuntimeMode::PlanningOnly {
@@ -99,9 +99,21 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
     let decode_layer_body = match &args.decode_layer_body {
         Some(path) => {
             let bytes = fs::read(path)?;
-            let body = TpuMosaicSerializedBody::from_serialized_bytecode(&bytes)?;
+            let body = match args.decode_layer_body_format.as_str() {
+                "serde" | "serialized" | "bytecode" => {
+                    TpuMosaicSerializedBody::from_serialized_bytecode(&bytes)?
+                }
+                "lowered" | "raw" | "mlir" => TpuMosaicSerializedBody::from_lowered_mlir(&bytes)?,
+                other => {
+                    return Err(format!(
+                        "--decode-layer-body-format: expected serde|lowered, got {other:?}"
+                    )
+                    .into());
+                }
+            };
             eprintln!(
-                "linked serialized Mosaic decode-layer body {} ({} bytes)",
+                "linked {} Mosaic decode-layer body {} ({} bytes)",
+                args.decode_layer_body_format,
                 path.display(),
                 body.byte_len()
             );
@@ -204,6 +216,7 @@ struct Args {
     out: Option<PathBuf>,
     check: Option<PathBuf>,
     decode_layer_body: Option<PathBuf>,
+    decode_layer_body_format: String,
     emit_decode_artifacts: bool,
     native_smoke: bool,
     runtime_mode: M2RuntimeMode,
@@ -226,6 +239,7 @@ impl Args {
             out: None,
             check: None,
             decode_layer_body: None,
+            decode_layer_body_format: "serde".to_string(),
             emit_decode_artifacts: false,
             native_smoke: false,
             runtime_mode: M2RuntimeMode::PlanningOnly,
@@ -260,11 +274,13 @@ impl Args {
                 }
                 "--decode-layer-body" => {
                     i += 1;
-                    out.decode_layer_body = Some(PathBuf::from(value(
-                        &args,
-                        i,
-                        "--decode-layer-body",
-                    )?));
+                    out.decode_layer_body =
+                        Some(PathBuf::from(value(&args, i, "--decode-layer-body")?));
+                }
+                "--decode-layer-body-format" => {
+                    i += 1;
+                    out.decode_layer_body_format =
+                        value(&args, i, "--decode-layer-body-format")?.to_string();
                 }
                 "--emit-decode-artifacts" => out.emit_decode_artifacts = true,
                 "--native-smoke" => {
@@ -366,7 +382,7 @@ fn kv_bytes_per_elem(kv_cache: &str) -> Result<usize, String> {
 }
 
 fn usage() -> String {
-    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--decode-layer-body FILE] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--moe-impl NAME] [--ppl-text FILE] [--prompt TEXT] [--gen-tokens N]".to_string()
+    "usage: m2_rust_decode_bench [--model-dir DIR] [--artifact-dir DIR] [--out JSON] [--check JSON] [--decode-layer-body FILE] [--decode-layer-body-format serde|lowered] [--runtime-mode planning-only|compile-only|execute] [--emit-decode-artifacts] [--compile-decode] [--execute-decode] [--batches 1,8,16,32|--batch N] [--ctx N] [--iters N] [--warmup N] [--kv-cache int8|bf16] [--moe-impl NAME] [--ppl-text FILE] [--prompt TEXT] [--gen-tokens N]".to_string()
 }
 
 #[cfg(test)]
@@ -392,9 +408,15 @@ mod tests {
         let args = Args::parse(vec![
             "--decode-layer-body".to_string(),
             "/tmp/layer.mlirbc".to_string(),
+            "--decode-layer-body-format".to_string(),
+            "lowered".to_string(),
         ])
         .unwrap();
-        assert_eq!(args.decode_layer_body, Some(PathBuf::from("/tmp/layer.mlirbc")));
+        assert_eq!(
+            args.decode_layer_body,
+            Some(PathBuf::from("/tmp/layer.mlirbc"))
+        );
+        assert_eq!(args.decode_layer_body_format, "lowered");
     }
 
     #[test]

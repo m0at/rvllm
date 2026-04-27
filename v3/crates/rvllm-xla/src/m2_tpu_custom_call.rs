@@ -6,9 +6,16 @@ pub const TPU_MOSAIC_BYTECODE_VERSION: u32 = 0;
 pub const TPU_MOSAIC_SERDE_PASS: &str = "mosaic-serde{serialize=true target-version=3?}";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TpuMosaicBodyFormat {
+    SerdeBytecode,
+    LoweredMlir,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TpuMosaicSerializedBody {
     body_b64: String,
     byte_len: usize,
+    format: TpuMosaicBodyFormat,
 }
 
 impl TpuMosaicSerializedBody {
@@ -31,6 +38,30 @@ impl TpuMosaicSerializedBody {
         Ok(Self {
             body_b64: base64_encode(bytes),
             byte_len: bytes.len(),
+            format: TpuMosaicBodyFormat::SerdeBytecode,
+        })
+    }
+
+    pub fn from_lowered_mlir(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(invalid("mosaic_body", "lowered MLIR body is empty"));
+        }
+        let trimmed = bytes
+            .iter()
+            .copied()
+            .skip_while(|b| b.is_ascii_whitespace())
+            .take(16)
+            .collect::<Vec<_>>();
+        if !(trimmed.starts_with(b"module") || trimmed.starts_with(b"builtin.module")) {
+            return Err(invalid(
+                "mosaic_body",
+                "lowered MLIR body must start with module",
+            ));
+        }
+        Ok(Self {
+            body_b64: base64_encode(bytes),
+            byte_len: bytes.len(),
+            format: TpuMosaicBodyFormat::LoweredMlir,
         })
     }
 
@@ -38,7 +69,11 @@ impl TpuMosaicSerializedBody {
         if body_b64.is_empty() {
             return Err(invalid("mosaic_body", "base64 body is empty"));
         }
-        Ok(Self { body_b64, byte_len })
+        Ok(Self {
+            body_b64,
+            byte_len,
+            format: TpuMosaicBodyFormat::SerdeBytecode,
+        })
     }
 
     pub fn body_b64(&self) -> &str {
@@ -47,6 +82,10 @@ impl TpuMosaicSerializedBody {
 
     pub fn byte_len(&self) -> usize {
         self.byte_len
+    }
+
+    pub fn format(&self) -> &TpuMosaicBodyFormat {
+        &self.format
     }
 }
 
@@ -58,7 +97,16 @@ pub fn tpu_custom_call_backend_config(body_b64: &str) -> String {
 }
 
 pub fn tpu_custom_call_backend_config_for_body(body: &TpuMosaicSerializedBody) -> String {
-    tpu_custom_call_backend_config(body.body_b64())
+    match body.format() {
+        TpuMosaicBodyFormat::SerdeBytecode => tpu_custom_call_backend_config(body.body_b64()),
+        TpuMosaicBodyFormat::LoweredMlir => {
+            let json = format!(
+                r#"{{"custom_call_config": {{"body": "{}", "needs_layout_passes": true}}, "implicit_sharding": {{"type": "MANUAL"}}}}"#,
+                body.body_b64()
+            );
+            mlir_string_escape(&json)
+        }
+    }
 }
 
 pub fn base64_encode(bytes: &[u8]) -> String {
@@ -150,9 +198,21 @@ mod tests {
     fn serialized_body_rejects_textual_mlir() {
         assert!(TpuMosaicSerializedBody::from_serialized_bytecode(b"").is_err());
         assert!(TpuMosaicSerializedBody::from_serialized_bytecode(b"module {}").is_err());
-        let body = TpuMosaicSerializedBody::from_serialized_bytecode(&[0x4d, 0x4c, 0xef, 0x52])
-            .unwrap();
+        let body =
+            TpuMosaicSerializedBody::from_serialized_bytecode(&[0x4d, 0x4c, 0xef, 0x52]).unwrap();
         assert_eq!(body.byte_len(), 4);
         assert_eq!(body.body_b64(), "TUzvUg==");
+        assert_eq!(body.format(), &TpuMosaicBodyFormat::SerdeBytecode);
+    }
+
+    #[test]
+    fn lowered_mlir_body_omits_serde_format() {
+        let body = TpuMosaicSerializedBody::from_lowered_mlir(b"module { }").unwrap();
+        let cfg = tpu_custom_call_backend_config_for_body(&body);
+        assert!(cfg.contains("\\22custom_call_config\\22"));
+        assert!(cfg.contains("\\22body\\22: \\22bW9kdWxlIHsgfQ==\\22"));
+        assert!(cfg.contains("\\22needs_layout_passes\\22: true"));
+        assert!(!cfg.contains("serialization_format"));
+        assert_eq!(body.format(), &TpuMosaicBodyFormat::LoweredMlir);
     }
 }
