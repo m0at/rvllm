@@ -1161,6 +1161,7 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    awq: Default::default(),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -1642,6 +1643,7 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    awq: Default::default(),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -2605,6 +2607,7 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    awq: Default::default(),
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;
@@ -2993,6 +2996,7 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    awq: Default::default(),
                 };
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
                 // point at row 0's K / V sub-slice. The rmsnorm kernel

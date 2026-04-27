@@ -271,6 +271,70 @@ pub struct Gemma4LayerWeightPtrs {
     pub o_blockscale: u64,
     pub gate_up_blockscale: u64,
     pub down_blockscale: u64,
+    /// Cycle 45 step 4.5b: per-layer AWQ INT4 W4A16 weights. All-zero
+    /// fields = AWQ inactive for this linear, fall back to the FP8 path
+    /// using the `*_fp8` / `*_scale` / `*_blockscale` fields above.
+    /// Non-zero `*_packed` = AWQ active for that linear; the dispatch
+    /// in `exec_layer` reads `awq` and routes to `AwqInt4GemvF16Launch`
+    /// instead of `Fp8GemvF16InLaunch`.
+    ///
+    /// Compressed-tensors AWQ stores Q/K/V un-fused, so QKV is split
+    /// into three (q/k/v) independent launches that write into the
+    /// existing Q|K|V scratch buffer at q_dim / kv_dim offsets;
+    /// gate/up are similarly split into (gate, up). The down + o
+    /// projections stay 1-launch.
+    pub awq: Gemma4AwqLayerPtrs,
+}
+
+/// Per-layer AWQ device pointer set. All-zero `*_packed` = AWQ
+/// inactive for that linear; each tuple of (packed, scale, zero) for
+/// one linear must be all-zero or all-non-zero — partial fills are a
+/// programming error caught by `exec_layer`'s dispatch gate.
+///
+/// Layout matches what `compressed_tensors::upload_gemma4_awq_layer`
+/// produces (one `AwqLinearWeight` per of the seven Gemma 4 linears).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Gemma4AwqLayerPtrs {
+    pub q_packed: u64,    pub q_scale: u64,    pub q_zero: u64,
+    pub k_packed: u64,    pub k_scale: u64,    pub k_zero: u64,
+    pub v_packed: u64,    pub v_scale: u64,    pub v_zero: u64,
+    pub o_packed: u64,    pub o_scale: u64,    pub o_zero: u64,
+    pub gate_packed: u64, pub gate_scale: u64, pub gate_zero: u64,
+    pub up_packed: u64,   pub up_scale: u64,   pub up_zero: u64,
+    pub down_packed: u64, pub down_scale: u64, pub down_zero: u64,
+    /// AWQ block-scale group size along K. Typical 128. Same value
+    /// shared across every linear in the layer.
+    pub group_size: u32,
+}
+
+impl Gemma4AwqLayerPtrs {
+    /// `true` if any linear in this layer has AWQ weights bound.
+    pub fn any_active(&self) -> bool {
+        self.q_packed != 0 || self.k_packed != 0 || self.v_packed != 0
+            || self.o_packed != 0
+            || self.gate_packed != 0 || self.up_packed != 0
+            || self.down_packed != 0
+    }
+
+    /// `true` if this specific linear is AWQ-active (only the packed
+    /// pointer is checked — scale/zero must be set in tandem).
+    pub fn linear_active(&self, kind: AwqLinearKind) -> bool {
+        match kind {
+            AwqLinearKind::Q    => self.q_packed != 0,
+            AwqLinearKind::K    => self.k_packed != 0,
+            AwqLinearKind::V    => self.v_packed != 0,
+            AwqLinearKind::O    => self.o_packed != 0,
+            AwqLinearKind::Gate => self.gate_packed != 0,
+            AwqLinearKind::Up   => self.up_packed != 0,
+            AwqLinearKind::Down => self.down_packed != 0,
+        }
+    }
+}
+
+/// Identifies one of the seven AWQ-quantizable Gemma 4 linears.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum AwqLinearKind {
+    Q, K, V, O, Gate, Up, Down,
 }
 
 #[derive(Copy, Clone, Debug)]
