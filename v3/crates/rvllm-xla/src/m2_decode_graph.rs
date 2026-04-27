@@ -336,8 +336,7 @@ fn emit_decode_body(
 ) -> Result<String> {
     let hidden_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_HIDDEN);
     let kv_ty = format!("tensor<{}xi8>", shape.kv_cache_bytes());
-    let arena_local_bytes = arena.total_bytes.div_ceil(8);
-    let arena_ty = format!("tensor<{}xi8>", arena_local_bytes);
+    let arena_ty = format!("tensor<{}xi8>", arena.total_bytes);
     let token_ty = format!("tensor<{}xi32>", shape.batch);
     let logits_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_VOCAB);
     let mut out = String::new();
@@ -346,7 +345,6 @@ fn emit_decode_body(
         r#"    %embed_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
     %h_embed = stablehlo.broadcast_in_dim %embed_zero, dims = [] : (tensor<bf16>) -> {hidden_ty}
     %weight_arena_sharded = stablehlo.custom_call @Sharding(%weight_arena) {{mhlo.sharding = "{{devices=[8]0,1,2,3,4,5,6,7}}"}} : (tensor<{weight_bytes}xi8>) -> tensor<{weight_bytes}xi8>
-    %weight_arena_local = stablehlo.custom_call @SPMDFullToShardShape(%weight_arena_sharded) {{mhlo.sharding = "{{manual}}"}} : (tensor<{weight_bytes}xi8>) -> {arena_ty}
 "#,
         weight_bytes = arena.total_bytes,
     ));
@@ -422,7 +420,7 @@ fn emit_layer_call(
         target = target,
         src = src,
         kv_src = kv_src,
-        arena = "%weight_arena_local",
+        arena = "%weight_arena_sharded",
         dst = dst,
         kv_dst = kv_dst,
     ))
