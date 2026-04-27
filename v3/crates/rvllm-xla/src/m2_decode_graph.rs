@@ -255,7 +255,7 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
       %token_ids: tensor<{batch}xi32>,
       %positions: tensor<{batch}xi32>,
       %kv_cache: tensor<{kv_bytes}xi8>,
-      %weight_arena: tensor<{weight_bytes}xi8> {{mhlo.sharding = "{{devices=[8]0,1,2,3,4,5,6,7}}"}}
+      %weight_arena: tensor<{weight_bytes}xi8> {{mhlo.sharding = "{{devices=[8]0,1,2,3,4,5,6,7}}"}})
       -> (tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>)
       attributes {{
         rvllm.signature = "token_ids,positions,kv_cache,weight_arena -> logits,next_token,kv_cache",
