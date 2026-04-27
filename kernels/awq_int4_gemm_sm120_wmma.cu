@@ -104,7 +104,12 @@ void awq_int4_gemm_sm120_wmma_kernel(
     int                   M,
     int                   N,
     int                   K,
-    int                   group_size
+    int                   group_size,
+    int                   ld_d           // f16 row stride of D; pass N for
+                                          // contiguous output, qkv_rows /
+                                          // 2*intermediate / hidden when
+                                          // composing into Q|K|V or
+                                          // gate||up scratch.
 ) {
     // Block tile: 16 rows of A × 16 cols of B → 16×16 output sub-tile.
     const int n_block = blockIdx.x * 16;     // first N column
@@ -214,7 +219,7 @@ void awq_int4_gemm_sm120_wmma_kernel(
         const int gm  = m_block + r;
         const int gn  = n_block + c;
         if (gm < M && gn < N) {
-            D[(size_t)gm * N + gn] = __float2half(acc_smem[r * 16 + c]);
+            D[(size_t)gm * ld_d + gn] = __float2half(acc_smem[r * 16 + c]);
         }
     }
 }

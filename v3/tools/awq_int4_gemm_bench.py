@@ -86,7 +86,8 @@ for label, M, N, K in SHAPES:
     args += [np.array([M], dtype=np.int32),
              np.array([N], dtype=np.int32),
              np.array([K], dtype=np.int32),
-             np.array([GROUP], dtype=np.int32)]
+             np.array([GROUP], dtype=np.int32),
+             np.array([N], dtype=np.int32)]  # ld_d = N
     arg_ptrs = np.array([a.ctypes.data for a in args], dtype=np.uint64)
 
     gx = (N + 15) // 16

@@ -867,6 +867,12 @@ pub struct AwqInt4GemmSm120WmmaLaunch {
     pub n: u32,
     pub k: u32,
     pub group_size: u32,
+    /// f16 row stride of the output buffer D, in elements. Pass `n`
+    /// for contiguous `[M, N]` output. Pass a larger value when
+    /// composing into a wider scratch row (e.g. `qkv_rows` for QKV
+    /// composition where Q/K/V land at column offsets `0`,
+    /// `q_dim`, `q_dim + kv_dim`).
+    pub ld_d: u32,
 }
 
 impl AwqInt4GemmSm120WmmaLaunch {
@@ -883,6 +889,9 @@ impl AwqInt4GemmSm120WmmaLaunch {
         }
         if self.n % 8 != 0 {
             return Err(invalid("n", "must be multiple of 8 (zero_point INT4-along-N packing)"));
+        }
+        if self.ld_d < self.n {
+            return Err(invalid("ld_d", "must be >= n (output row stride)"));
         }
         Ok(())
     }
@@ -915,16 +924,18 @@ impl AwqInt4GemmSm120WmmaLaunch {
         let mut n_i = self.n as i32;
         let mut k_i = self.k as i32;
         let mut g_i = self.group_size as i32;
+        let mut ld_i = self.ld_d as i32;
         let args = [
-            (&mut d)   as *mut u64 as *mut core::ffi::c_void,
-            (&mut a)   as *mut u64 as *mut core::ffi::c_void,
-            (&mut w)   as *mut u64 as *mut core::ffi::c_void,
-            (&mut s)   as *mut u64 as *mut core::ffi::c_void,
-            (&mut z)   as *mut u64 as *mut core::ffi::c_void,
-            (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
-            (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
-            (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
-            (&mut g_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut d)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut a)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut w)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut s)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut z)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut m_i)  as *mut i32 as *mut core::ffi::c_void,
+            (&mut n_i)  as *mut i32 as *mut core::ffi::c_void,
+            (&mut k_i)  as *mut i32 as *mut core::ffi::c_void,
+            (&mut g_i)  as *mut i32 as *mut core::ffi::c_void,
+            (&mut ld_i) as *mut i32 as *mut core::ffi::c_void,
         ];
         // gridDim = (ceil(N/16), ceil(M/16), 1), blockDim = 32.
         let grid = ((self.n + 15) / 16, (self.m + 15) / 16, 1u32);
@@ -1146,19 +1157,33 @@ mod tests {
     #[test]
     fn awq_gemm_accepts_canonical_q_proj() {
         // Gemma 4 31B q_proj prefill (M=2048): N=8192, K=5376, g=128.
-        let l = AwqInt4GemmSm120WmmaLaunch { m: 2048, n: 8192, k: 5376, group_size: 128 };
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 2048, n: 8192, k: 5376, group_size: 128, ld_d: 8192 };
         assert!(l.validate().is_ok());
     }
 
     #[test]
     fn awq_gemm_rejects_k_not_multiple_of_16() {
-        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 8192, k: 5384, group_size: 128 };
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 8192, k: 5384, group_size: 128, ld_d: 8192 };
         assert!(l.validate().is_err());
     }
 
     #[test]
     fn awq_gemm_rejects_n_not_multiple_of_8() {
-        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 1023, k: 5376, group_size: 128 };
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 1023, k: 5376, group_size: 128, ld_d: 1023 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_gemm_accepts_ld_d_greater_than_n() {
+        // QKV composition: Q has N=8192 but lands in qkv_rows=10240
+        // wide scratch.
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 8192, k: 5376, group_size: 128, ld_d: 10240 };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn awq_gemm_rejects_ld_d_smaller_than_n() {
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 8192, k: 5376, group_size: 128, ld_d: 4096 };
         assert!(l.validate().is_err());
     }
 

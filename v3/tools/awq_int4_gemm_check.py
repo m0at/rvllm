@@ -64,7 +64,9 @@ def pack_int4_into_i32_along_axis(vals: np.ndarray, axis: int) -> np.ndarray:
     return np.moveaxis(packed, -1, axis)
 
 
-def run_one(M: int, N: int, K: int, group_size: int, seed: int) -> bool:
+def run_one(M: int, N: int, K: int, group_size: int, seed: int, ld_d: int = None) -> bool:
+    if ld_d is None:
+        ld_d = N
     rng = np.random.default_rng(seed)
     # Random INT4 weights in [0..15]
     w_int4 = rng.integers(0, 16, size=(N, K), dtype=np.uint8)
@@ -99,20 +101,22 @@ def run_one(M: int, N: int, K: int, group_size: int, seed: int) -> bool:
     d_w   = CK(drv.cuMemAlloc(w_packed.nbytes), "alloc w")
     d_s   = CK(drv.cuMemAlloc(scales_bits.nbytes), "alloc s")
     d_z   = CK(drv.cuMemAlloc(z_packed.nbytes), "alloc z")
-    d_out = CK(drv.cuMemAlloc(M * N * 2), "alloc out")
+    # Allocate D as [M, ld_d] so column offsets within rows don't OOB.
+    d_out = CK(drv.cuMemAlloc(M * ld_d * 2), "alloc out")
     CK(drv.cuMemcpyHtoD(d_act, act.tobytes(), act.nbytes), "H2D act")
     CK(drv.cuMemcpyHtoD(d_w, w_packed.tobytes(), w_packed.nbytes), "H2D w")
     CK(drv.cuMemcpyHtoD(d_s, scales_bits.tobytes(), scales_bits.nbytes), "H2D s")
     CK(drv.cuMemcpyHtoD(d_z, z_packed.tobytes(), z_packed.nbytes), "H2D z")
-    CK(drv.cuMemsetD8(d_out, 0, M * N * 2), "memset out")
+    CK(drv.cuMemsetD8(d_out, 0, M * ld_d * 2), "memset out")
 
-    # Kernel ABI: (D, A, B_packed, B_scale, B_zero, M, N, K, group_size)
+    # Kernel ABI: (D, A, B_packed, B_scale, B_zero, M, N, K, group_size, ld_d)
     args = [np.array([int(p)], dtype=np.uint64)
             for p in (d_out, d_act, d_w, d_s, d_z)]
     args += [np.array([M], dtype=np.int32),
              np.array([N], dtype=np.int32),
              np.array([K], dtype=np.int32),
-             np.array([group_size], dtype=np.int32)]
+             np.array([group_size], dtype=np.int32),
+             np.array([ld_d], dtype=np.int32)]
     arg_ptrs = np.array([a.ctypes.data for a in args], dtype=np.uint64)
 
     # gridDim = (ceil(N/16), ceil(M/16), 1), blockDim = (32, 1, 1)
@@ -122,8 +126,10 @@ def run_one(M: int, N: int, K: int, group_size: int, seed: int) -> bool:
                           arg_ptrs.ctypes.data, 0), "launch")
     CK(drv.cuCtxSynchronize(), "sync")
 
-    out = np.empty((M, N), dtype=np.float16)
-    CK(drv.cuMemcpyDtoH(out.ctypes.data, d_out, M * N * 2), "D2H")
+    # Pull the full [M, ld_d] buffer; we'll slice [:, :N] for comparison.
+    out_full = np.empty((M, ld_d), dtype=np.float16)
+    CK(drv.cuMemcpyDtoH(out_full.ctypes.data, d_out, M * ld_d * 2), "D2H")
+    out = out_full[:, :N]
     for h in (d_act, d_w, d_s, d_z, d_out):
         CK(drv.cuMemFree(h), "free")
 
@@ -142,12 +148,15 @@ def run_one(M: int, N: int, K: int, group_size: int, seed: int) -> bool:
 
 print(f"AWQ INT4 GEMM check (compressed-tensors I32 packing) on {ARCH}")
 shapes = [
-    # (M, N, K, group_size, seed)
-    (8,    128,  128, 32, 1),     # tiny smoke
-    (16,   128,  256, 64, 7),     # multi-block in M and N
-    (128,  256, 1024, 128, 42),   # mid-size
-    (128, 8192, 5376, 128, 99),   # Gemma 4 q_proj prefill (small batch)
-    (2048, 8192, 5376, 128, 13),  # Gemma 4 q_proj prefill (max batch)
+    # (M, N, K, group_size, seed, ld_d?)
+    (8,    128,  128, 32, 1),     # tiny smoke (ld_d=N)
+    (16,   128,  256, 64, 7),     # multi-block in M and N (ld_d=N)
+    (128,  256, 1024, 128, 42),   # mid-size (ld_d=N)
+    (128, 8192, 5376, 128, 99),   # Gemma 4 q_proj prefill small batch (ld_d=N)
+    (2048, 8192, 5376, 128, 13),  # Gemma 4 q_proj prefill max batch (ld_d=N)
+    # ld_d > N — composes Q into wider QKV scratch (qkv_rows=10240
+    # for Gemma 4 sliding: 8192 + 2*1024).
+    (128, 8192, 5376, 128, 21, 10240),
 ]
 ok = all(run_one(*s) for s in shapes)
 print()
