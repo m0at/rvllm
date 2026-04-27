@@ -41,6 +41,8 @@ gate and a saved result JSON.
   using only Rust mmap reads and Rust conversion.
 - [x] Wire Rust decode bench, prefill+decode harness, and API runtime planning
   to prefer `weight_format=int8`.
+- [x] Add a Rust TPU-side boot bench (`m2_int8_arena_bench`) for full-checkpoint
+  NVFP4 -> int8 arena materialization and optional PJRT upload timing.
 - [ ] Emit/link the matching int8 TPU decode-layer body so the custom call
   consumes S8 weights + F32 row scales instead of NVFP4 packed/scales.
 - [ ] Run B=8 TPU real-model Rust/XLA int8-weight bench and compare against the
