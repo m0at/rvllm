@@ -9,6 +9,7 @@
 //!   to proceed.
 //! - Full weight set resident before first forward; no lazy loading.
 
+pub mod compressed_tensors;
 pub mod fp8_quant;
 pub mod gemma4_arch;
 pub mod gemma4_load;

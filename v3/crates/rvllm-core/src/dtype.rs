@@ -9,6 +9,10 @@ pub enum DType {
     F32,
     F64,
     I32,
+    /// 64-bit signed integer. Cycle 41 (AWQ): compressed-tensors AWQ
+    /// stores `weight_shape` metadata as I64 — purely host-side,
+    /// never reaches a CUDA kernel.
+    I64,
     U32,
     U8,
     /// FP8 E4M3. Paired with a per-row or per-tensor `F32` scale at the
@@ -39,7 +43,7 @@ impl DType {
         match self {
             DType::F16 | DType::Bf16 => 2,
             DType::F32 | DType::I32 | DType::U32 => 4,
-            DType::F64 => 8,
+            DType::F64 | DType::I64 => 8,
             DType::U8 | DType::Fp8E4M3 | DType::Fp8E5M2 => 1,
             DType::U4Packed | DType::I4Packed => 0,
         }

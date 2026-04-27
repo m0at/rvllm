@@ -136,6 +136,14 @@ fn map_dtype(s: &str) -> Option<DType> {
         // The packed-as-named entries are kept for future-proofing.
         "U4" => DType::U4Packed,
         "I4" => DType::I4Packed,
+        // Cycle 41 (AWQ step 3b): compressed-tensors AWQ Gemma 4 stores
+        // weight_packed as I32 (8 INT4 per int32) and weight_shape as
+        // I64 (original [N,K] dense shape, host metadata).
+        // weight_zero_point also I32 (8 INT4 per int32 along N).
+        "I32" => DType::I32,
+        "I64" => DType::I64,
+        "U32" => DType::U32,
+        "U8" => DType::U8,
         _ => return None,
     })
 }
@@ -151,9 +159,10 @@ fn dtype_bytes(d: DType) -> usize {
         return 0;
     }
     match d {
-        DType::F32 => 4,
+        DType::F32 | DType::I32 | DType::U32 => 4,
+        DType::F64 | DType::I64 => 8,
         DType::F16 | DType::Bf16 => 2,
-        DType::Fp8E4M3 => 1,
+        DType::Fp8E4M3 | DType::Fp8E5M2 | DType::U8 => 1,
         _ => 0,
     }
 }
