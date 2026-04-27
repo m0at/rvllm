@@ -849,6 +849,88 @@ impl AwqInt4GemvF16Launch {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cycle 51 step 10b: AWQ INT4 W4A16 per-token prefill loop helper.
+//
+// The AWQ GEMV kernel is M=1 only. Until the CUTLASS SM120 AWQ GEMM
+// (cycle 51 c-d) lands, prefill paths can either fail loud
+// (FeatureNotAvailable, the cycle 46 default) or run a per-token loop
+// over the GEMV — slow because each token re-reads the full weight
+// matrix from HBM, but correct.
+//
+// Codex review (cycle 51 design consult): "(a) is only useful as a
+// correctness/debug path". Wrap accordingly: caller decides whether
+// to invoke this loop (env-gated in exec_layer dispatch) or fail.
+// Default exec_layer behavior stays at FeatureNotAvailable so users
+// don't get pathologically slow prefill silently.
+// ---------------------------------------------------------------------------
+
+pub struct AwqInt4GemvF16PrefillLoop {
+    /// Number of activation tokens (rows of A). Loop iterates this
+    /// many times calling the M=1 GEMV.
+    pub num_tokens: u32,
+    /// Per-row dims passed to each GEMV launch.
+    pub n: u32,
+    pub k: u32,
+    pub group_size: u32,
+    /// Activation row stride in f16 elements (typically `k`).
+    pub in_stride_elems: u32,
+    /// Output row stride in f16 elements. May differ from `n` when
+    /// the caller is composing into a larger Q|K|V or gate||up
+    /// scratch buffer (offset_within_row = caller-managed).
+    pub out_stride_elems: u32,
+}
+
+impl AwqInt4GemvF16PrefillLoop {
+    pub fn validate(&self) -> Result<()> {
+        AwqInt4GemvF16Launch {
+            n: self.n, k: self.k, group_size: self.group_size,
+        }.validate()?;
+        if self.num_tokens == 0 {
+            return Err(invalid("num_tokens", "must be > 0"));
+        }
+        if self.in_stride_elems == 0 || self.out_stride_elems == 0 {
+            return Err(invalid("stride", "must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// Caller owns all four device pointers + the output base for the
+    /// loop's duration. `out_base_f16` is the row-0 start of the
+    /// destination region (caller adds any intra-row offset already).
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        activation_base: u64,
+        weight_packed: u64,
+        weight_scale: u64,
+        weight_zero_point: u64,
+        out_base_f16: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let inner = AwqInt4GemvF16Launch {
+            n: self.n, k: self.k, group_size: self.group_size,
+        };
+        // 2 bytes per f16 element.
+        let in_row_bytes  = (self.in_stride_elems  as u64) * 2;
+        let out_row_bytes = (self.out_stride_elems as u64) * 2;
+        for t in 0..self.num_tokens {
+            inner.launch(
+                kernel,
+                activation_base + (t as u64) * in_row_bytes,
+                weight_packed,
+                weight_scale,
+                weight_zero_point,
+                out_base_f16 + (t as u64) * out_row_bytes,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,6 +1041,37 @@ mod tests {
     #[test]
     fn awq_int4_gemv_rejects_zero_dim() {
         let l = AwqInt4GemvF16Launch { n: 0, k: 5376, group_size: 128 };
+        assert!(l.validate().is_err());
+    }
+
+    // === Cycle 51 step 10b prefill-loop tests ===
+
+    #[test]
+    fn awq_prefill_loop_accepts_canonical_q_proj() {
+        // 128-token prefill of Gemma 4 q_proj (N=8192, K=5376, g=128)
+        // with QKV scratch row stride = qkv_rows = 8192 + 2*1024 = 10240.
+        let l = AwqInt4GemvF16PrefillLoop {
+            num_tokens: 128, n: 8192, k: 5376, group_size: 128,
+            in_stride_elems: 5376, out_stride_elems: 10240,
+        };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn awq_prefill_loop_rejects_zero_tokens() {
+        let l = AwqInt4GemvF16PrefillLoop {
+            num_tokens: 0, n: 8192, k: 5376, group_size: 128,
+            in_stride_elems: 5376, out_stride_elems: 10240,
+        };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_prefill_loop_rejects_zero_stride() {
+        let l = AwqInt4GemvF16PrefillLoop {
+            num_tokens: 1, n: 8192, k: 5376, group_size: 128,
+            in_stride_elems: 5376, out_stride_elems: 0,
+        };
         assert!(l.validate().is_err());
     }
 
