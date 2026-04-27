@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use rvllm_core::{ConfigError, Result, RvllmError};
 
 use crate::m2_nvfp4::{decode_fp4_e2m1, decode_fp8_e4m3, nvfp4_weight_at, M2Nvfp4MatmulShape};
@@ -24,24 +25,28 @@ pub fn nvfp4_to_int8_matrix(
         return Err(invalid("row_scales", "length does not match n"));
     }
 
-    for row in 0..shape.n {
-        let mut max_abs = 0.0f32;
-        for col in 0..shape.k {
-            let v = nvfp4_weight_at(packed, scales, global_scale, shape, row, col);
-            if !v.is_finite() {
-                return Err(invalid("nvfp4", "decoded weight is not finite"));
+    out_i8
+        .par_chunks_mut(shape.k)
+        .zip(row_scales.par_iter_mut())
+        .enumerate()
+        .try_for_each(|(row, (out_row, row_scale_slot))| -> Result<()> {
+            let mut max_abs = 0.0f32;
+            for col in 0..shape.k {
+                let v = nvfp4_weight_at(packed, scales, global_scale, shape, row, col);
+                if !v.is_finite() {
+                    return Err(invalid("nvfp4", "decoded weight is not finite"));
+                }
+                max_abs = max_abs.max(v.abs());
             }
-            max_abs = max_abs.max(v.abs());
-        }
 
-        let row_scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
-        row_scales[row] = row_scale;
-        for col in 0..shape.k {
-            let v = nvfp4_weight_at(packed, scales, global_scale, shape, row, col);
-            let q = (v / row_scale).round().clamp(-127.0, 127.0) as i8;
-            out_i8[row * shape.k + col] = q;
-        }
-    }
+            let row_scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+            *row_scale_slot = row_scale;
+            for (col, out) in out_row.iter_mut().enumerate() {
+                let v = nvfp4_weight_at(packed, scales, global_scale, shape, row, col);
+                *out = (v / row_scale).round().clamp(-127.0, 127.0) as i8;
+            }
+            Ok(())
+        })?;
     Ok(())
 }
 

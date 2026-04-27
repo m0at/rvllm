@@ -698,6 +698,7 @@ version = "0.3.0"
 dependencies = [
  "cudarc",
  "half",
+ "rayon",
  "rvllm-core",
  "rvllm-kernels",
  "rvllm-mem",

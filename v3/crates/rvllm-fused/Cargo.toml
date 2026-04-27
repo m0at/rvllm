@@ -20,4 +20,5 @@ rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
 rvllm-kernels = { workspace = true }
 half = { workspace = true }
+rayon = "1.10"
 cudarc = { version = "0.19", features = ["driver", "cuda-version-from-build-system"], optional = true }
