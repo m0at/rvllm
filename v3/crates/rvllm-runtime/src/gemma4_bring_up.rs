@@ -462,6 +462,24 @@ pub fn bf16_residual_enabled() -> bool {
     parse_truthy_env("RVLLM_RESIDUAL_BF16").unwrap_or(true)
 }
 
+/// Cycle 55 step 14 master gate: enable end-to-end bf16-native chain
+/// on the M=1 decode path. Implies `bf16_native_qkv_fast_path_enabled`
+/// + bf16 dispatch at fused_qkv_rmsnorm + fused_rope_partial + GeLU
+/// + gate_up/down F16-in fast paths + post-attn/FF epilogues. The
+/// attention kernel's output stays f16 (its bf16-out siblings exist
+/// from cycle 55 step 9 but are not yet dispatched in this gate; the
+/// O-projection consumes f16 attn_out and writes bf16 via
+/// `fused_norm_add_residual_bf16_f16in`'s built-in narrow).
+///
+/// Default OFF — empirical regression on long context (iteration 12
+/// WHO@17k) is unresolved. Per user directive cycle 55 step 14: wire
+/// the chain end-to-end accepting it may break short-term so we have
+/// the substrate for further investigation; production override
+/// keeps the f16 chain via `RVLLM_BF16_NATIVE_FULL_CHAIN=0`.
+pub fn bf16_native_full_chain_enabled() -> bool {
+    parse_truthy_env("RVLLM_BF16_NATIVE_FULL_CHAIN").unwrap_or(false)
+}
+
 /// Cycle 55 step 13 experimental: enable bf16-native dispatch on the
 /// M=1 decode QKV F16-in fast path (the production decode hot path).
 /// When ON, the residual is consumed as bf16 directly by

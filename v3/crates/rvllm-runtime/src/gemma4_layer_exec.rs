@@ -1122,7 +1122,8 @@ pub unsafe fn gemma4_forward_phase(
         // regression (gibberish on WHO@17k while short prompts work).
         // Production stays on the cycle-54 stage-2.1 narrowing.
         let gate = dims.bf16_residual
-            && crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled();
+            && (crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled()
+                || crate::gemma4_bring_up::bf16_native_full_chain_enabled());
         if gate {
             kernels.fp8_gemv_wpr_native_bf16in
         } else {
@@ -1153,7 +1154,10 @@ pub unsafe fn gemma4_forward_phase(
         //   !bf16_residual (legacy f16 path)
         //     → memcpy f16 → fused_rmsnorm → Fp8GemvF16In
         let bf16_native = dims.bf16_residual
-            && crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled();
+            && (crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled()
+                || crate::gemma4_bring_up::bf16_native_full_chain_enabled());
+        let full_chain = dims.bf16_residual
+            && crate::gemma4_bring_up::bf16_native_full_chain_enabled();
         if bf16_native {
             // bf16 → bf16 memcpy (same byte layout, no conversion)
             cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
@@ -1211,7 +1215,11 @@ pub unsafe fn gemma4_forward_phase(
         // input). Empirically REGRESSES long-context (iteration 12
         // gibberish on WHO@17k) — env-gated default OFF until the
         // mechanism is understood and addressed.
-        if bf16_native {
+        // Cycle 55 step 14: when full_chain ON, skip the output
+        // narrow — downstream qkv_rmsnorm dispatch will be bf16 too.
+        // When step-13-only (qkv_fast_path without full_chain),
+        // narrow back to f16 for legacy f16 RoPE/qkv_rmsnorm.
+        if bf16_native && !full_chain {
             gemma4_launcher::Bf16ToF16SatLaunch {
                 n: dims.num_tokens * qkv_rows,
             }
@@ -1268,6 +1276,17 @@ pub unsafe fn gemma4_forward_phase(
     // scratch buffers so the downstream rope kernel sees a uniform
     // `[num_tokens, n_heads, head_dim]` layout across all three.
     let qkv_rows = q_dim + 2 * dims.num_kv_heads * dims.head_dim;
+    // Cycle 55 step 14 (Phase B dispatch): pick bf16 sibling when full
+    // chain is enabled. Same launch ABI; only dtype interpretation
+    // changes. Q/K/V inputs are bf16 if upstream produced bf16 (step
+    // 14 QKV F16-in fast path with full_chain ON), gamma stays f16.
+    let qkv_rmsnorm_kernel = if dims.bf16_residual
+        && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
+    {
+        kernels.fused_qkv_rmsnorm_bf16
+    } else {
+        kernels.fused_qkv_rmsnorm
+    };
     gemma4_launcher::FusedQkvRmsnormLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
@@ -1277,7 +1296,7 @@ pub unsafe fn gemma4_forward_phase(
         src_row_stride: qkv_rows,
     }
     .launch(
-        kernels.fused_qkv_rmsnorm,
+        qkv_rmsnorm_kernel,
         scratch.q_out,
         scratch.k_out,
         scratch.v_out,
@@ -2862,6 +2881,15 @@ unsafe fn rope_fp8kv(
     meta: &Gemma4MetadataPtrs,
     stream: u64,
 ) -> Result<()> {
+    // Cycle 55 step 14: pick bf16-input RoPE kernel when full chain
+    // is enabled. Same launch ABI; Q/K/V inputs flip f16 → bf16.
+    let rope_kernel = if dims.bf16_residual
+        && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
+    {
+        kernels.fused_rope_partial_fp8kv_bf16in
+    } else {
+        kernels.fused_rope_partial_fp8kv
+    };
     gemma4_launcher::FusedRopePartialFp8KvLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
@@ -2870,7 +2898,7 @@ unsafe fn rope_fp8kv(
         rotary_dim: dims.rotary_dim,
     }
     .launch(
-        kernels.fused_rope_partial_fp8kv,
+        rope_kernel,
         scratch.q_normed,
         scratch.k_normed,
         scratch.v_normed,
@@ -2907,7 +2935,17 @@ unsafe fn rope_nvfp4kv(
     // `RVLLM_NVFP4_KV=1` but their kernel tree predates the NVFP4
     // branch — fail clean with a typed attention error (closest
     // match in rvllm-core; we don't have a KernelError variant).
-    let kernel = kernels.fused_rope_partial_nvfp4kv.ok_or_else(|| {
+    // Cycle 55 step 14: pick bf16-input NVFP4 RoPE kernel when full
+    // chain is enabled. Same launch ABI; Q/K/V inputs flip f16 → bf16.
+    let kernel_opt = if dims.bf16_residual
+        && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
+    {
+        kernels.fused_rope_partial_nvfp4kv_bf16in
+            .or(kernels.fused_rope_partial_nvfp4kv)
+    } else {
+        kernels.fused_rope_partial_nvfp4kv
+    };
+    let kernel = kernel_opt.ok_or_else(|| {
         rvllm_core::RvllmError::Attention {
             err: rvllm_core::AttentionError::FeatureNotAvailable {
                 backend: "Fa2Ptx",
