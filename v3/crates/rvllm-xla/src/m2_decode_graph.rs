@@ -299,7 +299,8 @@ pub fn m2_decode_smoke_mlir(kernel_name: &str, shape: &M2GraphShape) -> Result<S
       -> (tensor<{batch}x{vocab}xbf16> {{jax.result_info = "logits"}},
           tensor<{batch}xi32> {{jax.result_info = "next_token"}},
           tensor<{kv_bytes}xi8> {{jax.result_info = "kv_cache"}}) {{
-    %logits = stablehlo.constant dense<0.000000e+00> : tensor<{batch}x{vocab}xbf16>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
+    %logits = stablehlo.broadcast_in_dim %zero, dims = [] : (tensor<bf16>) -> tensor<{batch}x{vocab}xbf16>
     %next_token = stablehlo.constant dense<0> : tensor<{batch}xi32>
     return %logits, %next_token, %kv_cache : tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>
   }}
