@@ -296,7 +296,9 @@ pub fn m2_decode_smoke_mlir(kernel_name: &str, shape: &M2GraphShape) -> Result<S
       %positions: tensor<{batch}xi32>,
       %kv_cache: tensor<{kv_bytes}xi8>,
       %weight_arena: tensor<1xi8>)
-      -> (tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>) {{
+      -> (tensor<{batch}x{vocab}xbf16> {{jax.result_info = "logits"}},
+          tensor<{batch}xi32> {{jax.result_info = "next_token"}},
+          tensor<{kv_bytes}xi8> {{jax.result_info = "kv_cache"}}) {{
     %logits = stablehlo.constant dense<0.000000e+00> : tensor<{batch}x{vocab}xbf16>
     %next_token = stablehlo.constant dense<0> : tensor<{batch}xi32>
     return %logits, %next_token, %kv_cache : tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>
@@ -632,6 +634,7 @@ mod tests {
         assert!(mlir.contains("rvllm.kind = \"m2_decode_smoke\""));
         assert!(mlir.contains("func.func public @main"));
         assert!(mlir.contains("mhlo.num_partitions = 1 : i32"));
+        assert!(mlir.contains("jax.result_info = \"logits\""));
         assert!(mlir.contains("tensor<8x200064xbf16>"));
         assert!(mlir.contains("tensor<2080374784xi8>"));
         assert!(!mlir.contains("stablehlo.custom_call"));
