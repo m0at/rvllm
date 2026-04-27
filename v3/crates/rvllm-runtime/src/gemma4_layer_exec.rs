@@ -527,6 +527,12 @@ pub struct Gemma4LayerKernels {
     /// is present without the kernel available. Companion to
     /// `Gemma4AwqLayerPtrs` on `Gemma4LayerWeightPtrs`.
     pub awq_int4_gemv_f16: Option<KernelFn>,
+    /// Cycle 51 step 10d.4: AWQ INT4 W4A16 GEMM kernel (M>1 prefill).
+    /// Companion to `awq_int4_gemv_f16` for prefill paths.
+    /// When `Some` and `dims.num_tokens > 1`, the AWQ dispatch sites
+    /// prefer this over the per-token GEMV loop. `None` falls back to
+    /// the loop (or `RVLLM_AWQ_PREFILL_LOOP=1` debug fallback).
+    pub awq_int4_gemm_sm120_wmma: Option<KernelFn>,
     /// Companion to the V-rotation arm of the NVFP4 RoPE kernel.
     /// When `RVLLM_NVFP4_HADAMARD_V=1` and the rope kernel rotated V
     /// before NVFP4-packing it, this kernel right-multiplies the

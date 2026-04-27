@@ -175,6 +175,12 @@ pub struct Gemma4FusedModules {
     /// AwqConfig-bearing checkpoint when this is `None`).
     pub awq_int4_gemv_f16_mod: Option<LoadedModule>,
     pub fn_awq_int4_gemv_f16: Option<KernelFn>,
+    /// Cycle 51 step 10d.4: AWQ INT4 W4A16 GEMM kernel (M>1 prefill).
+    /// PTX may be absent on older kernel trees; the AWQ prefill
+    /// dispatch falls through to the per-token GEMV loop when this is
+    /// `None`.
+    pub awq_int4_gemm_sm120_wmma_mod: Option<LoadedModule>,
+    pub fn_awq_int4_gemm_sm120_wmma: Option<KernelFn>,
 }
 
 /// Session-level prefix cache state. Populated on first `run_generate`
@@ -3730,6 +3736,7 @@ impl Gemma4Bringup {
             fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,
             hadamard_unrotate_f16: self.fused.fn_hadamard_unrotate_f16,
             awq_int4_gemv_f16: self.fused.fn_awq_int4_gemv_f16,
+            awq_int4_gemm_sm120_wmma: self.fused.fn_awq_int4_gemm_sm120_wmma,
         }
     }
 }
@@ -3839,6 +3846,13 @@ fn load_gemma4_fused(
         .as_ref()
         .and_then(|m| m.get_function("awq_int4_gemv_f16_kernel").ok());
 
+    // Cycle 51 step 10d.4: AWQ INT4 W4A16 GEMM (WMMA, M>1 prefill).
+    // Optional — None falls through to per-token GEMV loop fallback.
+    let awq_int4_gemm_sm120_wmma_mod = loader.load_ptx("awq_int4_gemm_sm120_wmma").ok();
+    let fn_awq_int4_gemm_sm120_wmma = awq_int4_gemm_sm120_wmma_mod
+        .as_ref()
+        .and_then(|m| m.get_function("awq_int4_gemm_sm120_wmma_kernel").ok());
+
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
         rmsnorm_inplace_mod,
@@ -3896,5 +3910,7 @@ fn load_gemma4_fused(
         fn_hadamard_unrotate_f16,
         awq_int4_gemv_f16_mod,
         fn_awq_int4_gemv_f16,
+        awq_int4_gemm_sm120_wmma_mod,
+        fn_awq_int4_gemm_sm120_wmma,
     })
 }
