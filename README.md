@@ -141,6 +141,7 @@ Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/Mini
 | Correctness gate | **pass** (`0.0` PPL delta, 736-char generation prefix match) |
 | Gen sample (256 tok) | Starts coherent, then repeats `\\vec{p}`; decode loop works, long-form coherence still needs attention/spec-decode work |
 | Rust PJRT smoke | Compiles and launches an 8-partition B=8 graph; **not a model benchmark** because the layer body is zero/no-op |
+| Rust int8 arena boot conversion | **233.1 GB materialized in 214.0 s** at B=8/ctx=2048 with Rayon (`180` worker threads, `181` LWPs, ~69-86 cores active); artifact: `tpu/out/m2/rust_xla/m2_int8_arena_b8_rayon.json` |
 
 ### What this demonstrates
 
@@ -155,6 +156,7 @@ Scaled the TPU stack up to a 230B-total / 10B-active MoE model (`lukealonso/Mini
 - Rust M2 runtime path now owns checkpoint indexing, safetensors reads, flat weight-arena planning/upload, decode MLIR generation, PPL/gen token loop, and the OpenAI-compatible server surface
 - B=8/B=16/B=32 now use exact replicate-token MoE by default: tokens stay replicated across expert shards, each shard skips inactive local experts with `lax.cond`, and outputs combine with `psum`. This avoids padded all-to-all buckets and empty expert matmuls.
 - `RVLLM_M2_KV=int8` adds Gemma-style per-vector int8 KV cache. It preserves the short PPL/coherence gate and keeps B=8/B=16 throughput flat while fitting B=32 at 171 tok/s.
+- The Rust int8 arena path now converts MiniMax's NVFP4 expert weights to a flat int8 arena at boot. The first implementation was accidentally single-threaded (`NLWP=1`, one core at ~100% CPU). The Rayon version uses all host cores (`RAYON_NUM_THREADS=180`) and completed the 233.1 GB arena materialization in 214.0 seconds. This is a boot/setup speedup; real decode tok/s still depends on wiring the int8 MXU layer body.
 
 ### Rust + XLA status (no JAX runtime)
 
@@ -179,6 +181,7 @@ What we found while compiling the Rust MLIR directly on the TPU:
 - Commit `d24a77eef` proves the native StableHLO path: a Rust-emitted B=8, ctx=2048, int8-KV smoke graph compiles through PJRT on `rvllm-m2` with no Python/JAX. The report marks `sweep[0].status = "compiled"` and covers the real M2 runtime signature (`191,069` weight tensors, `134.4 GB` planned arena, `2.08 GB` int8 KV buffer).
 - Commit `a2148a9c3` removes the fake embed/final custom calls from the real graph. The full graph now emits native StableHLO placeholders for embed/final and exactly 62 `tpu_custom_call` layer calls. TPU compile now fails only on the fused decode-layer Mosaic body placeholder, which is the intended remaining blocker.
 - Commit `5461bc2c2` adds 8-device PJRT argument-list execution. It ran a zero/no-op B=8 graph and writes `tpu/out/m2/rust_xla/m2_rust_xla_b8_zero_body_5461bc2c233f94696472f3a9b4452daf583bf1b4.json`; that artifact must not be compared to real model tok/s.
+- Commit `d76482f88` parallelizes the boot-time NVFP4->int8 arena conversion with Rayon. The TPU VM run used `180` Rayon worker threads (`181` LWPs observed) and wrote `tpu/out/m2/rust_xla/m2_int8_arena_b8_rayon.json`: 233.1 GB total arena, 191,069 weight entries, 214.0 s end-to-end. The dense slots were reserved/zero-filled for this bench (`copy_dense_tensors=false`); expert NVFP4 weights/scales were actually converted.
 - Therefore the remaining blocker is not Python, tokenization, serving, PJRT, or multi-device execution. It is linking a real serialized Mosaic body for the fused NVFP4 decode-layer kernel, then replacing the current native embed/final placeholders with real native StableHLO math.
 - The HF repo `and-y/rvllm-m2-build` is a private dataset containing legacy JAX cache artifacts only. It is useful for reproduction, not for the Rust-native runtime.
 
