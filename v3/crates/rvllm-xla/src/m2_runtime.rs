@@ -482,7 +482,7 @@ pub fn plan_m2_rust_prefill_decode(
     let abi = M2GraphAbi::new(decode_shape.clone())?;
     let weights = M2WeightUploadPlan::from_index_dir(&cfg.model_dir, &abi)?;
     let arena = weights.flat_arena(128)?;
-    let decode_mlir = m2_decode_graph_mlir("rvllm_m2_decode", &decode_shape, &arena)?;
+    let decode_mlir = m2_decode_graph_mlir("main", &decode_shape, &arena)?;
     let decode_input_specs = decode_input_specs(&decode_shape, arena.total_bytes);
     let decode_output_specs = decode_output_specs(&decode_shape);
     Ok(M2RustPrefillDecodePlan {

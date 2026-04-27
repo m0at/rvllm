@@ -90,7 +90,7 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
         let abi = M2GraphAbi::new(shape.clone())?;
         let weights = M2WeightUploadPlan::from_index_dir(&args.model_dir, &abi)?;
         let arena = weights.flat_arena(128)?;
-        let mlir = m2_decode_graph_mlir("rvllm_m2_decode", &shape, &arena)?;
+        let mlir = m2_decode_graph_mlir("main", &shape, &arena)?;
         let mlir_name = format!("m2_decode_b{batch}.mlir");
         let json_name = format!("m2_decode_b{batch}.json");
         fs::write(args.artifact_dir.join(&mlir_name), mlir.as_bytes())?;

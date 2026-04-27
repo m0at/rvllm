@@ -46,7 +46,7 @@ impl Args {
             ctx: 2048,
             kv_bytes_per_elem: 1,
             alignment: 128,
-            kernel_name: "rvllm_m2_decode".to_string(),
+            kernel_name: "main".to_string(),
         };
         let mut i = 0;
         while i < args.len() {

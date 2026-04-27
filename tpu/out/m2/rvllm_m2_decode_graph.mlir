@@ -1,5 +1,5 @@
 module attributes {rvllm.kind = "m2_decode_graph"} {
-  func.func @rvllm_m2_decode(
+  func.func @main(
       %token_ids: tensor<8xi32>,
       %positions: tensor<8xi32>,
       %kv_cache: tensor<2080374784xi8>,
