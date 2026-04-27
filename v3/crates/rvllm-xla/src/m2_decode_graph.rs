@@ -249,13 +249,14 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
     }
     let plan = M2DecodeGraphPlan::from_arena(arena)?;
     let body = emit_decode_body(shape, arena, &plan, decode_layer_body)?;
+    let weight_arena_local_bytes = arena.total_bytes.div_ceil(8);
     Ok(format!(
         r###"module attributes {{mhlo.frontend_attributes = {{xla.sdy.meshes = "{{mesh = #sdy.mesh<[\22expert\22=8]>}}"}}, mhlo.num_partitions = 8 : i32, mhlo.num_replicas = 1 : i32, rvllm.kind = "m2_decode_graph"}} {{
   func.func @{kernel_name}(
       %token_ids: tensor<{batch}xi32>,
       %positions: tensor<{batch}xi32>,
       %kv_cache: tensor<{kv_bytes}xi8>,
-      %weight_arena: tensor<{weight_bytes}xi8> {{mhlo.frontend_attributes = {{xla.sdy.sharding = "#sdy.sharding<@mesh, [{{\22expert\22}}]>"}}, mhlo.sharding = "{{devices=[8]<=[8]}}"}})
+      %weight_arena: tensor<{weight_arena_local_bytes}xi8>)
       -> (tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>)
       attributes {{
         rvllm.signature = "token_ids,positions,kv_cache,weight_arena -> logits,next_token,kv_cache",
@@ -266,7 +267,8 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
         rvllm.hidden = {hidden} : i64,
         rvllm.vocab = {vocab} : i64,
         rvllm.kv_cache_bytes = {kv_bytes} : i64,
-        rvllm.weight_arena_bytes = {weight_bytes} : i64,
+        rvllm.weight_arena_bytes = {weight_arena_local_bytes} : i64,
+        rvllm.weight_arena_total_bytes = {weight_bytes} : i64,
         rvllm.weight_entries = {weight_entries} : i64,
         rvllm.weight_alignment = {weight_alignment} : i64,
         rvllm.weight_input_scales_missing = {missing_input_scales} : i64,
@@ -286,6 +288,7 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
         vocab = M2_VOCAB,
         kv_bytes = shape.kv_cache_bytes(),
         weight_bytes = arena.total_bytes,
+        weight_arena_local_bytes = weight_arena_local_bytes,
         weight_entries = arena.entries.len(),
         weight_alignment = arena.alignment,
         missing_input_scales = plan.input_scale_missing_count(),
@@ -345,14 +348,7 @@ fn emit_decode_body(
     out.push_str(&format!(
         r###"    %embed_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
     %h_embed = stablehlo.broadcast_in_dim %embed_zero, dims = [] : (tensor<bf16>) -> {hidden_ty}
-    %weight_arena_local = stablehlo.custom_call @xla.sdy.GlobalToLocalShape(%weight_arena) {{
-      has_side_effect = true,
-      mhlo.sharding = "{{maximal device=0}}",
-      mhlo.frontend_attributes = {{xla.sdy.in_shardings = "#sdy.sharding_per_value<[<@mesh, [{{\22expert\22}}]>]>", xla.sdy.manual_axes = "#sdy<manual_axes{{\22expert\22}}>"}}
-    }} : (tensor<{weight_bytes}xi8>) -> {arena_ty}
 "###,
-        weight_bytes = arena.total_bytes,
-        arena_ty = arena_ty,
     ));
 
     let mut hidden = "%h_embed".to_string();
@@ -426,7 +422,7 @@ fn emit_layer_call(
         target = target,
         src = src,
         kv_src = kv_src,
-        arena = "%weight_arena_local",
+        arena = "%weight_arena",
         dst = dst,
         kv_dst = kv_dst,
     ))

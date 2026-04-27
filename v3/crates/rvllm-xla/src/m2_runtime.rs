@@ -484,7 +484,8 @@ pub fn plan_m2_rust_prefill_decode(
     let weights = M2WeightUploadPlan::from_index_dir(&cfg.model_dir, &abi)?;
     let arena = weights.flat_arena(128)?;
     let decode_mlir = m2_decode_graph_mlir("main", &decode_shape, &arena)?;
-    let decode_input_specs = decode_input_specs(&decode_shape, arena.total_bytes);
+    let weight_arena_bytes = arena.total_bytes.div_ceil(8);
+    let decode_input_specs = decode_input_specs(&decode_shape, weight_arena_bytes);
     let decode_output_specs = decode_output_specs(&decode_shape);
     Ok(M2RustPrefillDecodePlan {
         seed_decode_token_ids: seed_decode_token_ids(&prefill.plan, cfg.batch, cfg.prompt_len)?,
@@ -494,7 +495,7 @@ pub fn plan_m2_rust_prefill_decode(
         decode_input_specs,
         decode_output_specs,
         decode_steps: cfg.decode_steps,
-        weight_arena_bytes: arena.total_bytes,
+        weight_arena_bytes,
         weight_entries: arena.entries.len(),
         decode_mlir,
     })

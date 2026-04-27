@@ -132,7 +132,7 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
             let abi = M2GraphAbi::new(shape.clone())?;
             let weights = M2WeightUploadPlan::from_index_dir(&args.model_dir, &abi)?;
             let arena = weights.flat_arena(128)?;
-            weight_arena_bytes = arena.total_bytes;
+            weight_arena_bytes = arena.total_bytes.div_ceil(8);
             m2_decode_graph_mlir_with_mosaic_body(
                 "main",
                 &shape,
