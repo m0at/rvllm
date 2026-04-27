@@ -3095,6 +3095,31 @@ mod validate_tests {
         good().validate().unwrap();
     }
 
+    /// Cycle 54 step 6: bf16-residual is purely a storage-dtype gate;
+    /// validate() must accept it identically to the f16 default path.
+    /// Guards against future plumbing regressions where someone adds a
+    /// validate() rule that accidentally rejects bf16_residual=true.
+    #[test]
+    fn bf16_residual_dims_pass() {
+        let mut d = good();
+        d.bf16_residual = true;
+        d.validate().unwrap();
+    }
+
+    /// And a heterogeneous-head sibling — Gemma 4 31B has 256/512 head
+    /// arity; a bf16 dispatch under the global-attn 512-head shape must
+    /// also validate.
+    #[test]
+    fn bf16_residual_global_attn_dims_pass() {
+        let mut d = good();
+        d.bf16_residual = true;
+        d.head_dim = 512;
+        d.rotary_dim = 512;
+        d.attn_scale = 1.0 / (512f32).sqrt();
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        d.validate().unwrap();
+    }
+
     #[test]
     fn rejects_zero_num_tokens() {
         let mut d = good(); d.num_tokens = 0;
