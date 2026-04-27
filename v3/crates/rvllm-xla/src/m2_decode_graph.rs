@@ -462,19 +462,27 @@ fn emit_decode_body(
         )?);
         if int8_call {
             let start_batch = format!("%h_l{}_w1_start_batch", layer.layer);
-            let start_col = format!("%h_l{}_w1_start_col", layer.layer);
+            let tail_start_col = format!("%h_l{}_w1_tail_start_col", layer.layer);
+            let tail = format!("%h_l{}_w1_tail", layer.layer);
             out.push_str(&format!(
                 r#"    {start_batch} = stablehlo.constant dense<0> : tensor<i32>
-    {start_col} = stablehlo.constant dense<0> : tensor<i32>
-    {next_hidden} = "stablehlo.dynamic_update_slice"({hidden}, {call_dst}, {start_batch}, {start_col}) : ({hidden_ty}, tensor<{batch}x128xbf16>, tensor<i32>, tensor<i32>) -> {hidden_ty}
+    {tail_start_col} = stablehlo.constant dense<128> : tensor<i32>
+    {tail} = "stablehlo.dynamic_slice"({hidden}, {start_batch}, {tail_start_col}) {{
+      slice_sizes = array<i64: {batch}, {tail_cols}>
+    }} : ({hidden_ty}, tensor<i32>, tensor<i32>) -> tensor<{batch}x{tail_cols}xbf16>
+    {next_hidden} = "stablehlo.concatenate"({call_dst}, {tail}) {{
+      dimension = 1 : i64
+    }} : (tensor<{batch}x128xbf16>, tensor<{batch}x{tail_cols}xbf16>) -> {hidden_ty}
 "#,
                 start_batch = start_batch,
-                start_col = start_col,
+                tail_start_col = tail_start_col,
+                tail = tail,
                 next_hidden = next_hidden,
                 hidden = hidden,
                 call_dst = call_dst,
                 hidden_ty = hidden_ty,
                 batch = shape.batch,
+                tail_cols = M2_HIDDEN - 128,
             ));
             hidden = next_hidden;
             continue;
@@ -887,7 +895,8 @@ mod tests {
         assert!(mlir.contains("%h_l0_w1_head = \"stablehlo.custom_call\""));
         assert!(!mlir.contains("output_operand_aliases = [#stablehlo.output_operand_alias"));
         assert!(mlir.contains(") -> tensor<8x128xbf16>"));
-        assert!(mlir.contains("%h_l0 = \"stablehlo.dynamic_update_slice\""));
+        assert!(mlir.contains("%h_l0_w1_tail = \"stablehlo.dynamic_slice\""));
+        assert!(mlir.contains("%h_l0 = \"stablehlo.concatenate\""));
         assert!(!mlir.contains("%kv_after_l0"));
         assert!(!mlir.contains("\\22serialization_format\\22"));
     }
