@@ -111,6 +111,8 @@ pub struct Gemma4FusedModules {
     pub scale_rows_f32_ratio_mod: LoadedModule,
     pub compute_qkv_scales_mod: LoadedModule,
     pub fused_gelu_mul_f16_mod: LoadedModule,
+    /// Cycle 55 step 6 (Phase B): bf16 sibling of fused_gelu_mul_f16.
+    pub fused_gelu_mul_bf16_mod: LoadedModule,
     pub fused_rope_partial_f16kv_mod: LoadedModule,
     pub fused_norm_add_residual_mod: LoadedModule,
     // Cycle 53+ Stage 1: BF16 residual chain modules.
@@ -146,6 +148,8 @@ pub struct Gemma4FusedModules {
     pub fn_scale_rows_f32_ratio: KernelFn,
     pub fn_compute_qkv_scales: KernelFn,
     pub fn_fused_gelu_mul_f16: KernelFn,
+    /// Cycle 55 step 6: bf16 sibling of fn_fused_gelu_mul_f16.
+    pub fn_fused_gelu_mul_bf16: KernelFn,
     pub fn_fused_rope_partial_f16kv: KernelFn,
     pub fn_fused_norm_add_residual: KernelFn,
     pub fn_fused_norm_add_residual_f16: KernelFn,
@@ -3904,6 +3908,7 @@ impl Gemma4Bringup {
             scale_rows_f32_ratio: self.fused.fn_scale_rows_f32_ratio,
             compute_qkv_scales: self.fused.fn_compute_qkv_scales,
             fused_gelu_mul_f16: self.fused.fn_fused_gelu_mul_f16,
+            fused_gelu_mul_bf16: self.fused.fn_fused_gelu_mul_bf16,
             fused_rope_partial_f16kv: self.fused.fn_fused_rope_partial_f16kv,
             fused_norm_add_residual: self.fused.fn_fused_norm_add_residual,
             fused_norm_add_residual_f16: self.fused.fn_fused_norm_add_residual_f16,
@@ -3994,6 +3999,8 @@ fn load_gemma4_fused(
 
     let fused_gelu_mul_f16_mod = loader.load_ptx("fused_gelu_mul_f16")?;
     let fn_fused_gelu_mul_f16 = fused_gelu_mul_f16_mod.get_function("fused_gelu_mul_f16_kernel")?;
+    let fused_gelu_mul_bf16_mod = loader.load_ptx("fused_gelu_mul_bf16")?;
+    let fn_fused_gelu_mul_bf16 = fused_gelu_mul_bf16_mod.get_function("fused_gelu_mul_bf16_kernel")?;
 
     let fused_rope_partial_f16kv_mod = loader.load_ptx("fused_rope_partial_f16kv")?;
     let fn_fused_rope_partial_f16kv =
@@ -4080,6 +4087,7 @@ fn load_gemma4_fused(
         scale_rows_f32_ratio_mod,
         compute_qkv_scales_mod,
         fused_gelu_mul_f16_mod,
+        fused_gelu_mul_bf16_mod,
         fused_rope_partial_f16kv_mod,
         fused_norm_add_residual_mod,
         // Cycle 53+ Stage 1: BF16 residual chain.
@@ -4112,6 +4120,7 @@ fn load_gemma4_fused(
         fn_scale_rows_f32_ratio,
         fn_compute_qkv_scales,
         fn_fused_gelu_mul_f16,
+        fn_fused_gelu_mul_bf16,
         fn_fused_rope_partial_f16kv,
         fn_fused_norm_add_residual,
         fn_fused_norm_add_residual_f16,
