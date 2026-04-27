@@ -228,9 +228,15 @@ pub fn load_gemma4_model(
         sliding_rotary_dim,
     );
     // Global RoPE: theta=1M, partial rotation (0.25 * head_dim_global = 128 of 512)
-    let global_rotary_dim = arch.rotary_dim_for_layer(
-        arch.layer_types.iter().position(|t| *t == crate::gemma4_arch::Gemma4LayerType::GlobalAttention).unwrap_or(0)
-    );
+    // Cycle 50: derive directly from arch (head_dim_global *
+    // partial_rotary_factor_global, even-rounded). The previous
+    // `.position(...).unwrap_or(0)` fallback returned layer 0's
+    // rotary dim if no global layer was found — silently producing
+    // the sliding dim while the cos/sin tables below were built
+    // for head_dim_global. Codex review of cycle 49 step 8a flagged
+    // this; fix applies to both load_gemma4_model and
+    // load_gemma4_awq_model_inner.
+    let global_rotary_dim = arch.rotary_dim_global();
     let (cos_g, sin_g) = rope_cos_sin_bytes(
         arch.head_dim_global,
         arch.max_position_embeddings,
@@ -1226,9 +1232,15 @@ fn load_gemma4_awq_model_inner(
         arch.head_dim_sliding, arch.max_position_embeddings,
         arch.rope_theta_sliding, sliding_rotary_dim,
     );
-    let global_rotary_dim = arch.rotary_dim_for_layer(
-        arch.layer_types.iter().position(|t| *t == crate::gemma4_arch::Gemma4LayerType::GlobalAttention).unwrap_or(0)
-    );
+    // Cycle 50: derive directly from arch (head_dim_global *
+    // partial_rotary_factor_global, even-rounded). The previous
+    // `.position(...).unwrap_or(0)` fallback returned layer 0's
+    // rotary dim if no global layer was found — silently producing
+    // the sliding dim while the cos/sin tables below were built
+    // for head_dim_global. Codex review of cycle 49 step 8a flagged
+    // this; fix applies to both load_gemma4_model and
+    // load_gemma4_awq_model_inner.
+    let global_rotary_dim = arch.rotary_dim_global();
     let (cos_g, sin_g) = rope_cos_sin_bytes(
         arch.head_dim_global, arch.max_position_embeddings,
         arch.rope_theta_global, global_rotary_dim,
