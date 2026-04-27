@@ -363,11 +363,11 @@ fn emit_layer_call(
     let abi = layer.custom_call_abi(shape)?;
     let target = abi.call.target();
     let offsets = abi.weight_offsets;
-    let expert_directory = expert_directory_attr(layer);
+    let expert_directory = expert_directory_backend_config(layer);
     Ok(format!(
         r#"    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, %weight_arena) {{
       call_target_name = "rvllm.m2.decode_layer.fused_attention_nvfp4_moe",
-      backend_config = "target={target};custom_call_abi={custom_call_abi};layer={layer_idx};batch={batch};ctx={ctx};kv_dtype={kv_dtype};kv_cache_bytes={kv_cache_bytes};hidden={hidden};num_q_heads={num_q_heads};num_kv_heads={num_kv_heads};head_dim={head_dim};rotary_dim={rotary_dim};top_k={top_k};expert_count={expert_count};nvfp4_group={nvfp4_group};weight_arena=flat_i8_offsets;weight_arena_bytes={weight_arena_bytes};weight_arena_alignment={weight_arena_alignment};weight_arena_dense_offsets={dense_offsets};input_norm_offset={input_norm};post_attention_norm_offset={post_attention_norm};q_proj_offset={q_proj};k_proj_offset={k_proj};v_proj_offset={v_proj};o_proj_offset={o_proj};q_norm_offset={q_norm};k_norm_offset={k_norm};router_offset={router};router_bias_offset={router_bias};w1_first_packed_offset={w1_first_packed};w1_first_scale_offset={w1_first_scale};w1_first_global_scale_offset={w1_first_global};w1_first_input_scale_offset={w1_first_input};w2_first_packed_offset={w2_first_packed};w3_first_packed_offset={w3_first_packed};w3_last_packed_offset={w3_last_packed};input_scales_missing={missing_input_scales};expert_directory=packed_i64_offsets;expert_directory_cols={expert_directory_cols};expert_directory_i64={expert_directory_compact};dispatch=fused_attention_topk_nvfp4_moe;lowering=rust_xla_custom_call",
+      backend_config = "target={target};custom_call_abi={custom_call_abi};layer={layer_idx};batch={batch};ctx={ctx};kv_dtype={kv_dtype};kv_cache_bytes={kv_cache_bytes};hidden={hidden};num_q_heads={num_q_heads};num_kv_heads={num_kv_heads};head_dim={head_dim};rotary_dim={rotary_dim};top_k={top_k};expert_count={expert_count};nvfp4_group={nvfp4_group};weight_arena=flat_i8_offsets;weight_arena_bytes={weight_arena_bytes};weight_arena_alignment={weight_arena_alignment};weight_arena_dense_offsets={dense_offsets};input_norm_offset={input_norm};post_attention_norm_offset={post_attention_norm};q_proj_offset={q_proj};k_proj_offset={k_proj};v_proj_offset={v_proj};o_proj_offset={o_proj};q_norm_offset={q_norm};k_norm_offset={k_norm};router_offset={router};router_bias_offset={router_bias};w1_first_packed_offset={w1_first_packed};w1_first_scale_offset={w1_first_scale};w1_first_global_scale_offset={w1_first_global};w1_first_input_scale_offset={w1_first_input};w2_first_packed_offset={w2_first_packed};w3_first_packed_offset={w3_first_packed};w3_last_packed_offset={w3_last_packed};input_scales_missing={missing_input_scales};expert_directory=packed_i64_offsets;expert_directory_cols={expert_directory_cols};{expert_directory};dispatch=fused_attention_topk_nvfp4_moe;lowering=rust_xla_custom_call",
       called_computations = [],
       has_side_effect = false,
       api_version = 2 : i32
@@ -414,40 +414,30 @@ fn emit_layer_call(
         w3_last_packed = offsets.w3_last_packed,
         missing_input_scales = layer.input_scale_missing_count(),
         expert_directory_cols = abi.expert_directory_cols,
-        expert_directory_compact = compact_backend_config_value(&expert_directory),
+        expert_directory = expert_directory,
     ))
 }
 
-fn compact_backend_config_value(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join("")
-        .replace('"', "'")
+fn expert_directory_backend_config(layer: &M2DecodeLayerPlan) -> String {
+    let rows = layer.expert_directory();
+    let first = rows.first().expect("M2 layer has experts");
+    let last = rows.last().expect("M2 layer has experts");
+    format!(
+        "expert_directory_first={};expert_directory_last={}",
+        compact_i64_row(&first.as_i64_row()),
+        compact_i64_row(&last.as_i64_row())
+    )
 }
 
-fn expert_directory_attr(layer: &M2DecodeLayerPlan) -> String {
-    let rows = layer.expert_directory();
-    let mut out = String::new();
-    out.push_str("dense<[");
-    for (row_idx, row) in rows.iter().enumerate() {
-        if row_idx > 0 {
-            out.push_str(", ");
+fn compact_i64_row<const N: usize>(row: &[i64; N]) -> String {
+    let mut out = String::from("[");
+    for (idx, value) in row.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
         }
-        out.push('[');
-        for (col_idx, value) in row.as_i64_row().iter().enumerate() {
-            if col_idx > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(&value.to_string());
-        }
-        out.push(']');
+        out.push_str(&value.to_string());
     }
-    out.push_str(&format!(
-        "]> : tensor<{}x{}xi64>",
-        rows.len(),
-        M2ExpertDirectoryEntry::COLS
-    ));
+    out.push(']');
     out
 }
 
@@ -664,8 +654,8 @@ mod tests {
         assert!(mlir.contains("w1_first_packed_offset="));
         assert!(mlir.contains("expert_directory=packed_i64_offsets"));
         assert!(mlir.contains("expert_directory_cols=13"));
-        assert!(mlir.contains("expert_directory_i64=dense<[[0,"));
-        assert!(mlir.contains("]>:tensor<256x13xi64>"));
+        assert!(mlir.contains("expert_directory_first=[0,"));
+        assert!(mlir.contains("expert_directory_last=[255,"));
         assert!(mlir.contains("dispatch=fused_attention_topk_nvfp4_moe"));
         assert!(!mlir.contains("Contract body placeholder"));
     }
