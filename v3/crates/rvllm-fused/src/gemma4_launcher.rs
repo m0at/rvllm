@@ -835,6 +835,13 @@ impl AwqInt4GemvF16Launch {
         if self.k == 0 { return Err(invalid("k", "must be > 0")); }
         if self.group_size == 0 { return Err(invalid("group_size", "must be > 0")); }
         if self.k % 8 != 0 { return Err(invalid("k", "must be multiple of 8 (INT4 packing)")); }
+        if self.n % 8 != 0 {
+            // Defense-in-depth: AWQ zero_point is INT4-packed along N
+            // (`[N/8, K/g]` int32). The cycle 42 AwqExpectedShapes::from_dense
+            // already enforces this at load time, but assert it here too so
+            // the launcher itself never sees an invalid layout.
+            return Err(invalid("n", "must be multiple of 8 (INT4 zero_point packing along N)"));
+        }
         if self.k % self.group_size != 0 {
             return Err(invalid("k", "must be multiple of group_size"));
         }
@@ -952,6 +959,13 @@ mod tests {
     #[test]
     fn awq_int4_gemv_rejects_zero_dim() {
         let l = AwqInt4GemvF16Launch { n: 0, k: 5376, group_size: 128 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_int4_gemv_rejects_n_not_multiple_of_8() {
+        // INT4 zero_point packs 8-per-int32 along N; non-/8 N is invalid.
+        let l = AwqInt4GemvF16Launch { n: 1023, k: 5376, group_size: 128 };
         assert!(l.validate().is_err());
     }
 }
