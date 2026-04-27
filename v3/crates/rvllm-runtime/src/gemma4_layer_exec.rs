@@ -629,7 +629,10 @@ pub unsafe fn gemma4_forward_phase(
     #[cfg(feature = "cuda")]
     macro_rules! probe_f32 {
         ($label:expr, $ptr:expr) => {
-            if dbg_layer >= 0 {
+            // Cycle 49 step 8d: skip when ptr is null (AWQ-only layers
+            // have weights.qkv_scale / qkv_fp8 = 0 — copying from
+            // device address 0 is invalid).
+            if dbg_layer >= 0 && $ptr != 0 {
                 cudarc::driver::sys::cuStreamSynchronize(stream as _);
                 let mut v = [0.0f32; 1];
                 cudarc::driver::sys::cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut _, $ptr, 4);
@@ -681,7 +684,9 @@ pub unsafe fn gemma4_forward_phase(
     probe_f32!("step1_qkv_wscale", weights.qkv_scale);
     #[cfg(feature = "cuda")]
     {
-        if dbg_layer >= 0 {
+        // Cycle 49 step 8d: AWQ-only layers have weights.qkv_scale = 0
+        // (FP8 path absent). Copying from null device addr is invalid.
+        if dbg_layer >= 0 && weights.qkv_scale != 0 && scratch.hidden_scale != 0 {
             cudarc::driver::sys::cuStreamSynchronize(stream as _);
             let mut hs = [0.0f32; 1];
             let mut ws = [0.0f32; 1];
@@ -703,7 +708,8 @@ pub unsafe fn gemma4_forward_phase(
 
     #[cfg(feature = "cuda")]
     {
-        if dbg_layer >= 0 {
+        // Same null-guard for the qkv_fp8 / hidden_fp8 byte probe.
+        if dbg_layer >= 0 && weights.qkv_fp8 != 0 && scratch.hidden_fp8 != 0 {
             cudarc::driver::sys::cuStreamSynchronize(stream as _);
             let mut wb = [0u8; 8];
             cudarc::driver::sys::cuMemcpyDtoH_v2(wb.as_mut_ptr() as *mut _, weights.qkv_fp8, 8);
