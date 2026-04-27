@@ -3,14 +3,14 @@ use std::collections::BTreeMap;
 use rvllm_core::{ConfigError, Result, RvllmError};
 use rvllm_loader::M2Projection;
 
-use crate::m2_graph_abi::{M2DecodeLayerArenaOffsets, M2DecodeLayerCustomCallAbi};
+use crate::m2_graph_abi::{split_i64_row, M2DecodeLayerArenaOffsets, M2DecodeLayerCustomCallAbi};
 use crate::m2_tpu_custom_call::{
     tpu_custom_call_backend_config, tpu_custom_call_backend_config_for_body,
     TpuMosaicSerializedBody, TPU_CUSTOM_CALL_TARGET,
 };
 use crate::{
     M2GraphPhase, M2GraphShape, M2Nvfp4ProjectionAbi, M2WeightArenaEntry, M2WeightArenaPlan,
-    PjrtElementType, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_LAYERS, M2_VOCAB,
+    M2WeightRole, PjrtElementType, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_LAYERS, M2_VOCAB,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +60,7 @@ pub struct M2ExpertDirectoryEntry {
 
 impl M2ExpertDirectoryEntry {
     pub const COLS: usize = 13;
+    pub const I32_COLS: usize = 1 + (Self::COLS - 1) * 2;
 
     pub fn as_i64_row(&self) -> [i64; Self::COLS] {
         [
@@ -77,6 +78,27 @@ impl M2ExpertDirectoryEntry {
             self.w3_global_scale_offset,
             self.w3_input_scale_offset,
         ]
+    }
+
+    pub fn as_i32_split_row(&self) -> [i32; Self::I32_COLS] {
+        let offsets = split_i64_row::<12, 24>(&[
+            self.w1_packed_offset,
+            self.w1_scale_offset,
+            self.w1_global_scale_offset,
+            self.w1_input_scale_offset,
+            self.w2_packed_offset,
+            self.w2_scale_offset,
+            self.w2_global_scale_offset,
+            self.w2_input_scale_offset,
+            self.w3_packed_offset,
+            self.w3_scale_offset,
+            self.w3_global_scale_offset,
+            self.w3_input_scale_offset,
+        ]);
+        let mut row = [0; Self::I32_COLS];
+        row[0] = self.expert as i32;
+        row[1..].copy_from_slice(&offsets);
+        row
     }
 }
 
@@ -256,10 +278,13 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
       %token_ids: tensor<{batch}xi32>,
       %positions: tensor<{batch}xi32>,
       %kv_cache: tensor<{kv_bytes}xi8>,
-      %weight_arena: tensor<{weight_arena_local_bytes}xi8>)
+      %weight_arena: tensor<{weight_arena_local_bytes}xi8>,
+      %input_hidden: tensor<{batch}x{hidden}xbf16>,
+      %final_norm: tensor<{hidden}xbf16>,
+      %lm_head: tensor<{vocab}x{hidden}xbf16>)
       -> (tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>)
       attributes {{
-        rvllm.signature = "token_ids,positions,kv_cache,weight_arena -> logits,next_token,kv_cache",
+        rvllm.signature = "token_ids,positions,kv_cache,weight_arena,input_hidden,final_norm,lm_head -> logits,next_token,kv_cache",
         rvllm.phase = "decode",
         rvllm.batch = {batch} : i64,
         rvllm.ctx = {ctx} : i64,
@@ -274,7 +299,7 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
         rvllm.weight_input_scales_missing = {missing_input_scales} : i64,
         rvllm.weight_metadata = "compile_time_offsets_from_M2WeightArenaPlan",
         rvllm.lowering = "rust_xla_custom_call",
-        rvllm.lowering_plan = "native StableHLO embed/final placeholders -> 62 fused decode-layer custom calls -> flat-arena dense loads -> fused attention -> top-k router -> flat-arena NVFP4 experts"
+        rvllm.lowering_plan = "host BF16 embedding gather -> native StableHLO final logits -> 62 fused decode-layer custom calls -> flat-arena dense loads -> fused attention -> top-k router -> flat-arena NVFP4 experts"
       }} {{
 {body}
   }}
@@ -339,49 +364,108 @@ fn emit_decode_body(
 ) -> Result<String> {
     let hidden_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_HIDDEN);
     let kv_ty = format!("tensor<{}xi8>", shape.kv_cache_bytes());
-    let arena_local_bytes = arena.total_bytes.div_ceil(8);
-    let arena_ty = format!("tensor<{}xi8>", arena_local_bytes);
+    let layer_kv_ty = format!("tensor<{}xi8>", shape.layer_kv_cache_bytes());
     let token_ty = format!("tensor<{}xi32>", shape.batch);
     let logits_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_VOCAB);
     let mut out = String::new();
+    let uses_int8_tile_probe = decode_layer_body.is_some()
+        && arena
+            .entries
+            .iter()
+            .any(|entry| entry.role == M2WeightRole::Int8Weight);
 
-    out.push_str(&format!(
-        r###"    %embed_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
-    %h_embed = stablehlo.broadcast_in_dim %embed_zero, dims = [] : (tensor<bf16>) -> {hidden_ty}
-"###,
-    ));
-
-    let mut hidden = "%h_embed".to_string();
+    let mut hidden = "%input_hidden".to_string();
     let mut kv = "%kv_cache".to_string();
+    let w1_block_cols = 128usize;
+    let int8_tile_elems = M2_HIDDEN * w1_block_cols;
     for layer in &plan.layers {
         let next_hidden = format!("%h_l{}", layer.layer);
-        let next_kv = format!("%kv_l{}", layer.layer);
+        let layer_kv = format!("%kv_layer_{}", layer.layer);
+        let next_layer_kv = format!("%kv_layer_out_{}", layer.layer);
+        let next_kv = format!("%kv_after_l{}", layer.layer);
+        let layer_kv_offset = shape.layer_kv_cache_offset(layer.layer);
+        let layer_kv_start = format!("%kv_layer_start_{}", layer.layer);
+        out.push_str(&format!(
+            r#"    {layer_kv_start} = stablehlo.constant dense<{layer_kv_offset}> : tensor<i32>
+    {layer_kv} = "stablehlo.dynamic_slice"({kv}, {layer_kv_start}) {{
+      slice_sizes = array<i64: {layer_kv_bytes}>
+    }} : ({kv_ty}, tensor<i32>) -> {layer_kv_ty}
+"#,
+            layer_kv_start = layer_kv_start,
+            layer_kv_offset = layer_kv_offset,
+            layer_kv = layer_kv,
+            kv = kv,
+            layer_kv_bytes = shape.layer_kv_cache_bytes(),
+            kv_ty = kv_ty,
+            layer_kv_ty = layer_kv_ty,
+        ));
+        let int8_tile_name = if uses_int8_tile_probe {
+            let w1_tile_start = format!("%w1_int8_tile_start_{}", layer.layer);
+            let w1_tile_flat = format!("%w1_int8_tile_flat_{}", layer.layer);
+            let w1_tile_rows = format!("%w1_int8_tile_rows_{}", layer.layer);
+            let w1_tile = format!("%w1_int8_tile_t_{}", layer.layer);
+            out.push_str(&format!(
+                r#"    {w1_tile_start} = stablehlo.constant dense<{w1_offset}> : tensor<i64>
+    {w1_tile_flat} = "stablehlo.dynamic_slice"(%weight_arena, {w1_tile_start}) {{
+      slice_sizes = array<i64: {int8_tile_elems}>
+    }} : (tensor<{weight_arena_local_bytes}xi8>, tensor<i64>) -> tensor<{int8_tile_elems}xi8>
+    {w1_tile_rows} = stablehlo.reshape {w1_tile_flat} : (tensor<{int8_tile_elems}xi8>) -> tensor<{w1_block_cols}x{hidden_size}xi8>
+    {w1_tile} = stablehlo.transpose {w1_tile_rows}, dims = [1, 0] : (tensor<{w1_block_cols}x{hidden_size}xi8>) -> tensor<{hidden_size}x{w1_block_cols}xi8>
+"#,
+                w1_tile_start = w1_tile_start,
+                w1_tile_flat = w1_tile_flat,
+                w1_tile_rows = w1_tile_rows,
+                w1_tile = w1_tile,
+                w1_offset = layer.arena_offsets().w1_first_packed,
+                int8_tile_elems = int8_tile_elems,
+                weight_arena_local_bytes = arena.total_bytes.div_ceil(8),
+                hidden_size = M2_HIDDEN,
+                w1_block_cols = w1_block_cols,
+            ));
+            Some(w1_tile)
+        } else {
+            None
+        };
         out.push_str(&emit_layer_call(
             shape,
             layer,
             &hidden,
-            &kv,
+            &layer_kv,
             &next_hidden,
-            &next_kv,
+            &next_layer_kv,
             &hidden_ty,
             &token_ty,
-            &kv_ty,
-            &arena_ty,
+            &layer_kv_ty,
             decode_layer_body,
+            int8_tile_name.as_deref(),
         )?);
+        out.push_str(&format!(
+            r#"    {next_kv} = "stablehlo.dynamic_update_slice"({kv}, {next_layer_kv}, {layer_kv_start}) : ({kv_ty}, {layer_kv_ty}, tensor<i32>) -> {kv_ty}
+"#,
+            next_kv = next_kv,
+            kv = kv,
+            next_layer_kv = next_layer_kv,
+            layer_kv_start = layer_kv_start,
+            kv_ty = kv_ty,
+            layer_kv_ty = layer_kv_ty,
+        ));
         hidden = next_hidden;
         kv = next_kv;
     }
 
     out.push_str(&format!(
-        r#"    %logits_zero = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
-    %logits = stablehlo.broadcast_in_dim %logits_zero, dims = [] : (tensor<bf16>) -> {logits_ty}
-    %token_zero = stablehlo.constant dense<0> : tensor<i32>
-    %token_zero_vec = stablehlo.broadcast_in_dim %token_zero, dims = [] : (tensor<i32>) -> {token_ty}
-    %position_zero = stablehlo.multiply %positions, %token_zero_vec : {token_ty}
-    %next_token = stablehlo.add %token_ids, %position_zero : {token_ty}
-    return %logits, %next_token, {final_kv} : {logits_ty}, {token_ty}, {kv_ty}
+        r#"    %final_norm_b = stablehlo.broadcast_in_dim %final_norm, dims = [1] : (tensor<{hidden_size}xbf16>) -> {hidden_ty}
+    %h_final = stablehlo.multiply {hidden}, %final_norm_b : {hidden_ty}
+    %lm_head_t = stablehlo.transpose %lm_head, dims = [1, 0] : (tensor<{vocab}x{hidden_size}xbf16>) -> tensor<{hidden_size}x{vocab}xbf16>
+    %logits = "stablehlo.dot_general"(%h_final, %lm_head_t) {{
+      dot_dimension_numbers = #stablehlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>
+    }} : ({hidden_ty}, tensor<{hidden_size}x{vocab}xbf16>) -> {logits_ty}
+    %next_token = stablehlo.add %token_ids, %positions : {token_ty}
+    func.return %logits, %next_token, {final_kv} : {logits_ty}, {token_ty}, {kv_ty}
 "#,
+        hidden = hidden,
+        hidden_size = M2_HIDDEN,
+        vocab = M2_VOCAB,
         final_kv = kv,
     ));
     Ok(out)
@@ -397,35 +481,111 @@ fn emit_layer_call(
     hidden_ty: &str,
     token_ty: &str,
     kv_ty: &str,
-    arena_ty: &str,
     decode_layer_body: Option<&TpuMosaicSerializedBody>,
+    int8_tile: Option<&str>,
 ) -> Result<String> {
     let target = layer.custom_call_abi(shape)?.call.target();
     let backend_config = match decode_layer_body {
         Some(body) => tpu_custom_call_backend_config_for_body(body),
         None => tpu_custom_call_backend_config(""),
     };
-    Ok(format!(
-        r#"    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, {arena}) {{
+    let layer_offsets_name = format!("%layer_offsets_{}", layer.layer);
+    let expert_directory_name = format!("%expert_directory_{}", layer.layer);
+    let layer_offsets = compact_i32_row(&layer.arena_offsets().as_i32_split_row());
+    let expert_directory = dense_i32_matrix(
+        &layer
+            .expert_directory()
+            .iter()
+            .map(M2ExpertDirectoryEntry::as_i32_split_row)
+            .collect::<Vec<_>>(),
+    );
+    if let Some(int8_tile) = int8_tile {
+        return Ok(format!(
+            r#"    {layer_offsets_name} = stablehlo.constant dense<{layer_offsets}> : tensor<{offset_cols}xi32>
+    {expert_directory_name} = stablehlo.constant dense<{expert_directory}> : tensor<{expert_count}x{expert_cols}xi32>
+    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, {layer_offsets_name}, {expert_directory_name}, {int8_tile}) {{
       call_target_name = "{tpu_custom_call}",
       backend_config = "{backend_config}",
       called_computations = [],
       has_side_effect = false,
       api_version = 1 : i32,
       kernel_name = "{target}",
-      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>],
+      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>],
       result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>]
-    }} : ({hidden_ty}, {token_ty}, {kv_ty}, {arena_ty}) -> ({hidden_ty}, {kv_ty})
+    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>, tensor<{hidden_size}x128xi8>) -> ({hidden_ty}, {kv_ty})
+"#,
+            tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
+            backend_config = backend_config,
+            target = target,
+            src = src,
+            kv_src = kv_src,
+            dst = dst,
+            kv_dst = kv_dst,
+            int8_tile = int8_tile,
+            layer_offsets_name = layer_offsets_name,
+            expert_directory_name = expert_directory_name,
+            layer_offsets = layer_offsets,
+            expert_directory = expert_directory,
+            offset_cols = M2DecodeLayerArenaOffsets::I32_COLS,
+            expert_count = M2_NUM_EXPERTS,
+            expert_cols = M2ExpertDirectoryEntry::I32_COLS,
+            hidden_size = M2_HIDDEN,
+        ));
+    }
+
+    Ok(format!(
+        r#"    {layer_offsets_name} = stablehlo.constant dense<{layer_offsets}> : tensor<{offset_cols}xi32>
+    {expert_directory_name} = stablehlo.constant dense<{expert_directory}> : tensor<{expert_count}x{expert_cols}xi32>
+    {dst}, {kv_dst} = "stablehlo.custom_call"({src}, %positions, {kv_src}, {layer_offsets_name}, {expert_directory_name}) {{
+      call_target_name = "{tpu_custom_call}",
+      backend_config = "{backend_config}",
+      called_computations = [],
+      has_side_effect = false,
+      api_version = 1 : i32,
+      kernel_name = "{target}",
+      operand_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[0]> : tensor<1xindex>, dense<[1, 0]> : tensor<2xindex>],
+      result_layouts = [dense<[1, 0]> : tensor<2xindex>, dense<[0]> : tensor<1xindex>]
+    }} : ({hidden_ty}, {token_ty}, {kv_ty}, tensor<{offset_cols}xi32>, tensor<{expert_count}x{expert_cols}xi32>) -> ({hidden_ty}, {kv_ty})
 "#,
         tpu_custom_call = TPU_CUSTOM_CALL_TARGET,
         backend_config = backend_config,
         target = target,
         src = src,
         kv_src = kv_src,
-        arena = "%weight_arena",
         dst = dst,
         kv_dst = kv_dst,
+        layer_offsets_name = layer_offsets_name,
+        expert_directory_name = expert_directory_name,
+        layer_offsets = layer_offsets,
+        expert_directory = expert_directory,
+        offset_cols = M2DecodeLayerArenaOffsets::I32_COLS,
+        expert_count = M2_NUM_EXPERTS,
+        expert_cols = M2ExpertDirectoryEntry::I32_COLS,
     ))
+}
+
+fn compact_i32_row<const N: usize>(row: &[i32; N]) -> String {
+    let mut out = String::from("[");
+    for (idx, value) in row.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&value.to_string());
+    }
+    out.push(']');
+    out
+}
+
+fn dense_i32_matrix<const N: usize>(rows: &[[i32; N]]) -> String {
+    let mut out = String::from("[");
+    for (idx, row) in rows.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&compact_i32_row(row));
+    }
+    out.push(']');
+    out
 }
 
 fn dense(lookup: &ArenaLookup<'_>, layer: usize, suffix: &str) -> Result<M2ArenaTensor> {
@@ -608,6 +768,7 @@ mod tests {
         assert!(mlir.contains("rvllm.kind = \"m2_decode_graph\""));
         assert!(mlir.contains("tensor<8xi32>"));
         assert!(mlir.contains("tensor<2080374784xi8>"));
+        assert!(mlir.contains("tensor<33554432xi8>"));
         assert!(!mlir.contains("memref."));
         assert!(mlir.contains("weight_arena"));
         assert!(mlir.contains("rvllm.weight_entries = 191069 : i64"));
@@ -625,9 +786,16 @@ mod tests {
         );
         assert!(!mlir.contains("kernel_name = \"rvllm.m2.embed\""));
         assert!(!mlir.contains("kernel_name = \"rvllm.m2.final_logits\""));
-        assert!(mlir.contains("native StableHLO embed/final placeholders"));
-        assert!(mlir.contains("%h_embed = stablehlo.broadcast_in_dim"));
-        assert!(mlir.contains("%logits = stablehlo.broadcast_in_dim"));
+        assert!(mlir.contains("host BF16 embedding gather"));
+        assert!(mlir.contains("input_hidden"));
+        assert!(mlir.contains("final_norm"));
+        assert!(mlir.contains("lm_head"));
+        assert!(mlir.contains("\"stablehlo.dot_general\""));
+        assert!(!mlir.contains("native StableHLO embed/final placeholders"));
+        assert!(!mlir.contains("embed_tokens"));
+        assert!(!mlir.contains("\"stablehlo.gather\""));
+        assert!(!mlir.contains("%h_embed = stablehlo.broadcast_in_dim"));
+        assert!(!mlir.contains("%logits = stablehlo.broadcast_in_dim"));
         assert!(mlir.contains("\\22custom_call_config\\22"));
         assert!(mlir.contains("\\22serialization_format\\22: 1"));
         assert!(mlir.contains("\\22needs_layout_passes\\22: true"));

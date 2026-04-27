@@ -151,8 +151,46 @@ impl M2DecodeLayerCustomCall {
 }
 
 impl M2DecodeLayerArenaOffsets {
+    pub const COLS: usize = 17;
+    pub const I32_COLS: usize = Self::COLS * 2;
     pub const DENSE_ATTRS: &'static str =
         "input_norm,post_attention_norm,q_proj,k_proj,v_proj,o_proj,q_norm,k_norm,router,router_bias";
+
+    pub const fn as_i64_row(&self) -> [i64; Self::COLS] {
+        [
+            self.input_norm,
+            self.post_attention_norm,
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+            self.q_norm,
+            self.k_norm,
+            self.router,
+            self.router_bias,
+            self.w1_first_packed,
+            self.w1_first_scale,
+            self.w1_first_global_scale,
+            self.w1_first_input_scale,
+            self.w2_first_packed,
+            self.w3_first_packed,
+            self.w3_last_packed,
+        ]
+    }
+
+    pub fn as_i32_split_row(&self) -> [i32; Self::I32_COLS] {
+        split_i64_row(&self.as_i64_row())
+    }
+}
+
+pub fn split_i64_row<const N: usize, const OUT: usize>(row: &[i64; N]) -> [i32; OUT] {
+    assert_eq!(OUT, N * 2);
+    let mut out = [0; OUT];
+    for (idx, value) in row.iter().enumerate() {
+        out[idx * 2] = *value as i32;
+        out[idx * 2 + 1] = (*value >> 32) as i32;
+    }
+    out
 }
 
 impl M2DecodeLayerCustomCallAbi {
@@ -233,12 +271,15 @@ impl M2GraphShape {
     }
 
     pub const fn kv_cache_bytes(&self) -> usize {
-        2 * M2_NUM_LAYERS
-            * self.batch
-            * self.ctx
-            * M2_NUM_KV_HEADS
-            * M2_HEAD_DIM
-            * self.kv_bytes_per_elem
+        M2_NUM_LAYERS * self.layer_kv_cache_bytes()
+    }
+
+    pub const fn layer_kv_cache_bytes(&self) -> usize {
+        2 * self.batch * self.ctx * M2_NUM_KV_HEADS * M2_HEAD_DIM * self.kv_bytes_per_elem
+    }
+
+    pub const fn layer_kv_cache_offset(&self, layer: usize) -> usize {
+        layer * self.layer_kv_cache_bytes()
     }
 
     pub fn runtime_inputs(&self) -> Result<Vec<M2GraphTensorSpec>> {

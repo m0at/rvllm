@@ -11,8 +11,9 @@ use rvllm_xla::{XlaArtifact, XlaTensorSpec};
 use rvllm_loader::M2SafetensorsReader;
 #[cfg(feature = "tpu")]
 use rvllm_xla::{
-    load_artifact, m2_bf16_logits_nll, m2_ppl_from_nll, make_m2_prefill_inputs, M2GraphAbi,
-    M2WeightUploadPlan, PjrtClientHandle, PjrtElementType, M2_VOCAB,
+    load_artifact, m2_bf16_argmax_tokens, m2_bf16_logits_nll, m2_gather_embed_bf16,
+    m2_ppl_from_nll, make_m2_prefill_inputs, M2GraphAbi, M2WeightUploadPlan, PjrtClientHandle,
+    PjrtElementType, M2_HIDDEN, M2_VOCAB,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -225,6 +226,8 @@ fn execute_decode(
         }
         _ => return Err("--weight-format: expected nvfp4|int8".into()),
     };
+    let final_norm = upload_global_tensor(&reader, &client, "model.norm.weight", &[M2_HIDDEN])?;
+    let lm_head = upload_global_tensor(&reader, &client, "lm_head.weight", &[M2_VOCAB, M2_HIDDEN])?;
 
     for _step in 0..plan.decode_steps {
         let token_buf = client.buffer_from_host(
@@ -239,7 +242,22 @@ fn execute_decode(
             PjrtElementType::S32,
             0,
         )?;
-        let inputs = [&token_buf, &pos_buf, &kv_buf, &weight_arena];
+        let input_hidden = m2_gather_embed_bf16(&reader, &token_ids)?;
+        let input_hidden_buf = client.buffer_from_host(
+            &input_hidden,
+            &[plan.decode_shape.batch as i64, M2_HIDDEN as i64],
+            PjrtElementType::BF16,
+            0,
+        )?;
+        let inputs = [
+            &token_buf,
+            &pos_buf,
+            &kv_buf,
+            &weight_arena,
+            &input_hidden_buf,
+            &final_norm,
+            &lm_head,
+        ];
         let mut outputs = client.execute(&exe, &inputs)?;
         if outputs.len() != 3 {
             return Err(format!(
@@ -248,11 +266,14 @@ fn execute_decode(
             )
             .into());
         }
+        let logits_buf = outputs.remove(0);
+        let next_token = outputs.remove(0);
+        let new_kv = outputs.remove(0);
+        let mut logits = vec![0u8; plan.decode_shape.batch * M2_VOCAB * 2];
+        client.buffer_to_host(&logits_buf, &mut logits)?;
         if let Some(targets) = ppl_target_ids {
             let target_start = _step * plan.decode_shape.batch;
             let target_end = target_start + plan.decode_shape.batch;
-            let mut logits = vec![0u8; plan.decode_shape.batch * M2_VOCAB * 2];
-            client.buffer_to_host(&outputs[0], &mut logits)?;
             nll.extend(m2_bf16_logits_nll(
                 &logits,
                 &targets[target_start..target_end],
@@ -260,11 +281,8 @@ fn execute_decode(
                 M2_VOCAB,
             )?);
         }
-        let next_token = outputs.remove(1);
-        let new_kv = outputs.remove(1);
-        let mut next_bytes = vec![0u8; plan.decode_shape.batch * 4];
-        client.buffer_to_host(&next_token, &mut next_bytes)?;
-        token_ids = read_i32s(&next_bytes);
+        let _ = next_token;
+        token_ids = m2_bf16_argmax_tokens(&logits, plan.decode_shape.batch, M2_VOCAB)?;
         generated_token_ids.extend_from_slice(&token_ids);
         for pos in &mut positions {
             *pos += 1;
@@ -285,6 +303,26 @@ fn execute_decode(
     Ok(M2DecodeExecutionReport {
         generated_token_ids,
     })
+}
+
+#[cfg(feature = "tpu")]
+fn upload_global_tensor(
+    reader: &M2SafetensorsReader,
+    client: &PjrtClientHandle,
+    name: &'static str,
+    shape: &[usize],
+) -> Result<rvllm_xla::PjrtBufferHandle, Box<dyn std::error::Error>> {
+    let view = reader.tensor(name)?;
+    let expected = shape.iter().product::<usize>() * 2;
+    if view.bytes.len() != expected {
+        return Err(format!(
+            "{name}: expected {expected} bytes, got {}",
+            view.bytes.len()
+        )
+        .into());
+    }
+    let shape = shape.iter().map(|&x| x as i64).collect::<Vec<_>>();
+    Ok(client.buffer_from_host(view.bytes, &shape, PjrtElementType::BF16, 0)?)
 }
 
 #[cfg(not(feature = "tpu"))]

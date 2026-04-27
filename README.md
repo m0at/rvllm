@@ -6,6 +6,20 @@ Three Gemma 4 models on TPU v6e-4: **E4B** (16,794 tok/s peak, 78.3 tok/s B=1, P
 
 **[Full benchmarks](https://docs.solidsf.com/docs/bench.html)**
 
+## Environment
+
+Bench/deploy commands must load secrets from the repo-local `.env` first:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+`HF_TOKEN` is required for Hugging Face model downloads, especially MiniMax M2.
+Do not run M2 downloads unauthenticated, and do not stage M2 weights in `/tmp`
+or `/dev/shm`; use persistent model storage such as `/workspace/models`.
+
 ## At a glance
 
 | | E4B (4B) | 26B-A4B (MoE) | 31B TPU | 31B GPU | vLLM H100 |
@@ -206,19 +220,31 @@ What we found while compiling the Rust MLIR directly on the TPU:
 One-shot deploy (requires v6e-8 quota in `europe-west4-a`):
 
 ```bash
-SPOT=1 ZONE=europe-west4-a HF_TOKEN=$(cat ~/.cache/huggingface/token) \
-  bash tpu/harness/deploy_m2_tpu.sh
+set -a
+source .env
+set +a
+
+SPOT=1 ZONE=europe-west4-a bash tpu/harness/deploy_m2_tpu.sh
 ```
 
-Rust-only compile/execute probe on the VM. This path does not run Python or JAX. The body below is a zero-body runtime probe, not the real NVFP4 matmul:
+Rust/XLA-only TPU bench runner. This packages only the Rust crates needed for
+`rvllm-xla`, builds on the TPU VM, uses the persistent model path, and writes
+artifacts under `/workspace/models/runs`:
+
+```bash
+bash tpu/harness/run_m2_rust_xla.sh
+```
+
+Manual Rust-only compile/execute probe on the VM. This path does not run Python
+or JAX. The body below is a zero-body runtime probe, not the real NVFP4 matmul:
 
 ```bash
 cd $HOME/runs/$SHA/v3
 cargo run --release -p rvllm-xla --features tpu --bin m2_rust_decode_bench -- \
   --model-dir ../tpu/harness/m2_checkpoint_schema \
-  --artifact-dir /tmp/m2_rust_xla \
-  --out /tmp/m2_rust_xla/final.json \
-  --decode-layer-body /tmp/m2_raw_layer_body/body_hidden_any_local_weight_b8.mlir \
+  --artifact-dir /workspace/models/runs/m2_rust_xla \
+  --out /workspace/models/runs/m2_rust_xla/final.json \
+  --decode-layer-body /workspace/models/runs/m2_raw_layer_body/body_hidden_any_local_weight_b8.mlir \
   --decode-layer-body-format lowered \
   --execute-decode \
   --batch 8 \

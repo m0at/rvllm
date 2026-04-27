@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::env;
 use std::path::{Path, PathBuf};
 
 use rvllm_core::DType;
@@ -59,21 +59,18 @@ pub struct M2WeightArenaPlan {
     pub entries: Vec<M2WeightArenaEntry>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct M2Int8ProjectionSet {
+    pub w1: bool,
+    pub w2: bool,
+    pub w3: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct M2FlatArenaHostBuffer {
     pub bytes: Vec<u8>,
     pub total_bytes: usize,
     pub entries: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct M2Int8ArenaStreamStats {
-    pub total_bytes: usize,
-    pub streamed_bytes: usize,
-    pub chunks: usize,
-    pub entries: usize,
-    pub converted_weights: usize,
-    pub zero_bytes: usize,
 }
 
 #[cfg(feature = "tpu")]
@@ -197,12 +194,21 @@ impl M2WeightUploadPlan {
     }
 
     pub fn int8_flat_arena(&self, alignment: usize) -> Result<M2WeightArenaPlan> {
+        self.int8_flat_arena_for(alignment, M2Int8ProjectionSet::from_env()?)
+    }
+
+    pub fn int8_flat_arena_for(
+        &self,
+        alignment: usize,
+        projections: M2Int8ProjectionSet,
+    ) -> Result<M2WeightArenaPlan> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(invalid("alignment", "must be a nonzero power of two"));
         }
         let mut offset = 0usize;
         let mut entries = Vec::with_capacity(self.specs.len());
         for spec in &self.specs {
+            let selected = projections.selects_name(&spec.name);
             let (role, shape, dtype, nbytes) = match spec.role {
                 M2WeightRole::Global | M2WeightRole::LayerDense => (
                     spec.role,
@@ -210,7 +216,7 @@ impl M2WeightUploadPlan {
                     spec.tensor.dtype,
                     spec.tensor.nbytes,
                 ),
-                M2WeightRole::Nvfp4Packed => {
+                M2WeightRole::Nvfp4Packed if selected => {
                     let packed_shape = packed_shape(&spec.tensor.shape)?;
                     let logical_cols = packed_shape.1 * 2;
                     (
@@ -220,7 +226,13 @@ impl M2WeightUploadPlan {
                         packed_shape.0 * logical_cols,
                     )
                 }
-                M2WeightRole::Nvfp4Scale => {
+                M2WeightRole::Nvfp4Packed => (
+                    spec.role,
+                    spec.tensor.shape.clone(),
+                    spec.tensor.dtype,
+                    spec.tensor.nbytes,
+                ),
+                M2WeightRole::Nvfp4Scale if selected => {
                     let rows = *spec
                         .tensor
                         .shape
@@ -234,14 +246,32 @@ impl M2WeightUploadPlan {
                         rows * 4,
                     )
                 }
-                M2WeightRole::Nvfp4GlobalScale => (
+                M2WeightRole::Nvfp4Scale => (
+                    spec.role,
+                    spec.tensor.shape.clone(),
+                    spec.tensor.dtype,
+                    spec.tensor.nbytes,
+                ),
+                M2WeightRole::Nvfp4GlobalScale if selected => (
                     M2WeightRole::Int8UnitScale,
                     spec.tensor.shape.clone(),
                     crate::PjrtElementType::F32,
                     4,
                 ),
-                M2WeightRole::Nvfp4InputScale => (
+                M2WeightRole::Nvfp4GlobalScale => (
+                    spec.role,
+                    spec.tensor.shape.clone(),
+                    spec.tensor.dtype,
+                    spec.tensor.nbytes,
+                ),
+                M2WeightRole::Nvfp4InputScale if selected => (
                     M2WeightRole::Int8InputScale,
+                    spec.tensor.shape.clone(),
+                    spec.tensor.dtype,
+                    spec.tensor.nbytes,
+                ),
+                M2WeightRole::Nvfp4InputScale => (
+                    spec.role,
                     spec.tensor.shape.clone(),
                     spec.tensor.dtype,
                     spec.tensor.nbytes,
@@ -303,6 +333,60 @@ impl M2WeightUploadPlan {
     }
 }
 
+impl M2Int8ProjectionSet {
+    pub const fn all() -> Self {
+        Self {
+            w1: true,
+            w2: true,
+            w3: true,
+        }
+    }
+
+    pub const fn w1() -> Self {
+        Self {
+            w1: true,
+            w2: false,
+            w3: false,
+        }
+    }
+
+    pub const fn none() -> Self {
+        Self {
+            w1: false,
+            w2: false,
+            w3: false,
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        match env::var("RVLLM_M2_MOE_INT8") {
+            Ok(v) => Self::parse(&v),
+            Err(env::VarError::NotPresent) => Ok(Self::all()),
+            Err(env::VarError::NotUnicode(_)) => {
+                Err(invalid("RVLLM_M2_MOE_INT8", "must be valid UTF-8"))
+            }
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "" | "all" | "w1_w2_w3" => Ok(Self::all()),
+            "w1" => Ok(Self::w1()),
+            "none" | "off" | "0" => Ok(Self::none()),
+            _ => Err(invalid(
+                "RVLLM_M2_MOE_INT8",
+                "expected w1|w1_w2_w3|all|none",
+            )),
+        }
+    }
+
+    fn selects_name(self, name: &str) -> bool {
+        (self.w1 && name.contains(".w1."))
+            || (self.w2 && name.contains(".w2."))
+            || (self.w3 && name.contains(".w3."))
+    }
+}
+
 impl M2WeightArenaPlan {
     pub fn get(&self, name: &str) -> Option<&M2WeightArenaEntry> {
         self.entries.iter().find(|entry| entry.name == name)
@@ -358,143 +442,6 @@ impl M2WeightArenaPlan {
         self.materialize_int8_host_buffer_inner(reader, max_bytes, false)
     }
 
-    pub fn stream_int8_host_buffer<F>(
-        &self,
-        reader: &M2SafetensorsReader,
-        max_bytes: usize,
-        copy_dense: bool,
-        mut sink: F,
-    ) -> Result<M2Int8ArenaStreamStats>
-    where
-        F: FnMut(usize, &[u8]) -> Result<()>,
-    {
-        if self.total_bytes > max_bytes {
-            return Err(invalid_owned(
-                "max_bytes",
-                format!(
-                    "flat int8 arena is {} bytes, above configured max {}",
-                    self.total_bytes, max_bytes
-                ),
-            ));
-        }
-
-        let zero_buf = vec![0u8; 1024 * 1024];
-        let mut cursor = 0usize;
-        let mut chunks = 0usize;
-        let mut streamed_bytes = 0usize;
-        let mut zero_bytes = 0usize;
-        let mut converted_weights = 0usize;
-        let mut pending_scales: HashMap<String, Vec<f32>> = HashMap::new();
-
-        for entry in &self.entries {
-            if entry.offset > cursor {
-                let stats = stream_zeros(&mut sink, &zero_buf, cursor, entry.offset - cursor)?;
-                chunks += stats.0;
-                streamed_bytes += stats.1;
-                zero_bytes += stats.1;
-            }
-
-            match entry.role {
-                M2WeightRole::Global | M2WeightRole::LayerDense | M2WeightRole::Int8InputScale => {
-                    if copy_dense {
-                        let view = reader.tensor(&entry.name)?;
-                        validate_arena_tensor(entry, &view)?;
-                        sink(entry.offset, view.bytes)?;
-                        chunks += 1;
-                        streamed_bytes += view.bytes.len();
-                    } else {
-                        let stats = stream_zeros(&mut sink, &zero_buf, entry.offset, entry.nbytes)?;
-                        chunks += stats.0;
-                        streamed_bytes += stats.1;
-                        zero_bytes += stats.1;
-                    }
-                }
-                M2WeightRole::Int8Weight => {
-                    let converted = convert_int8_weight(entry, self, reader)?;
-                    let i8_bytes = converted
-                        .weights
-                        .iter()
-                        .map(|&x| x as u8)
-                        .collect::<Vec<_>>();
-                    sink(entry.offset, &i8_bytes)?;
-                    chunks += 1;
-                    streamed_bytes += i8_bytes.len();
-                    pending_scales.insert(converted.row_scale_name, converted.row_scales);
-                    converted_weights += 1;
-                }
-                M2WeightRole::Int8RowScale => {
-                    let row_scales = pending_scales.remove(&entry.name).ok_or_else(|| {
-                        invalid_owned(
-                            "row_scale",
-                            format!("{}: missing pending row scales", entry.name),
-                        )
-                    })?;
-                    let mut scale_bytes = Vec::with_capacity(entry.nbytes);
-                    for scale in row_scales {
-                        scale_bytes.extend_from_slice(&scale.to_le_bytes());
-                    }
-                    if scale_bytes.len() != entry.nbytes {
-                        return Err(invalid_owned(
-                            "row_scale",
-                            format!("{}: row scale byte length mismatch", entry.name),
-                        ));
-                    }
-                    sink(entry.offset, &scale_bytes)?;
-                    chunks += 1;
-                    streamed_bytes += scale_bytes.len();
-                }
-                M2WeightRole::Int8UnitScale => {
-                    let bytes = 1.0f32.to_le_bytes();
-                    sink(entry.offset, &bytes)?;
-                    chunks += 1;
-                    streamed_bytes += bytes.len();
-                }
-                M2WeightRole::Nvfp4Packed
-                | M2WeightRole::Nvfp4Scale
-                | M2WeightRole::Nvfp4GlobalScale
-                | M2WeightRole::Nvfp4InputScale => {
-                    return Err(invalid(
-                        "role",
-                        "use materialize_host_buffer for NVFP4 arenas",
-                    ));
-                }
-            }
-            cursor = entry.offset + entry.nbytes;
-        }
-
-        if self.total_bytes > cursor {
-            let stats = stream_zeros(&mut sink, &zero_buf, cursor, self.total_bytes - cursor)?;
-            chunks += stats.0;
-            streamed_bytes += stats.1;
-            zero_bytes += stats.1;
-        }
-
-        if streamed_bytes != self.total_bytes {
-            return Err(invalid_owned(
-                "stream",
-                format!(
-                    "streamed {} bytes, expected {}",
-                    streamed_bytes, self.total_bytes
-                ),
-            ));
-        }
-        if !pending_scales.is_empty() {
-            return Err(invalid_owned(
-                "row_scale",
-                format!("{} pending row-scale tensors left", pending_scales.len()),
-            ));
-        }
-
-        Ok(M2Int8ArenaStreamStats {
-            total_bytes: self.total_bytes,
-            streamed_bytes,
-            chunks,
-            entries: self.entries.len(),
-            converted_weights,
-            zero_bytes,
-        })
-    }
-
     fn materialize_int8_host_buffer_inner(
         &self,
         reader: &M2SafetensorsReader,
@@ -535,10 +482,13 @@ impl M2WeightArenaPlan {
                 | M2WeightRole::Nvfp4Scale
                 | M2WeightRole::Nvfp4GlobalScale
                 | M2WeightRole::Nvfp4InputScale => {
-                    return Err(invalid(
-                        "role",
-                        "use materialize_host_buffer for NVFP4 arenas",
-                    ));
+                    if copy_dense {
+                        let view = reader.tensor(&entry.name)?;
+                        validate_arena_tensor(entry, &view)?;
+                        let start = entry.offset;
+                        let end = start + entry.nbytes;
+                        bytes[start..end].copy_from_slice(view.bytes);
+                    }
                 }
             }
         }
@@ -582,28 +532,6 @@ impl M2WeightArenaPlan {
             device_idx,
         )
     }
-}
-
-fn stream_zeros<F>(
-    sink: &mut F,
-    zero_buf: &[u8],
-    mut offset: usize,
-    mut len: usize,
-) -> Result<(usize, usize)>
-where
-    F: FnMut(usize, &[u8]) -> Result<()>,
-{
-    let mut chunks = 0usize;
-    let mut bytes = 0usize;
-    while len > 0 {
-        let n = len.min(zero_buf.len());
-        sink(offset, &zero_buf[..n])?;
-        offset += n;
-        len -= n;
-        chunks += 1;
-        bytes += n;
-    }
-    Ok((chunks, bytes))
 }
 
 struct ConvertedInt8Weight {
@@ -985,6 +913,38 @@ mod tests {
             .unwrap();
         assert_eq!(w1_global.role, M2WeightRole::Int8UnitScale);
         assert_eq!(w1_global.dtype, PjrtElementType::F32);
+    }
+
+    #[test]
+    fn int8_projection_flag_can_select_w1_only() {
+        let abi = M2GraphAbi::new(M2GraphShape::decode(8, 2048, 1)).unwrap();
+        let plan = M2WeightUploadPlan::from_index_dir(schema_dir(), &abi).unwrap();
+        let int8 = plan
+            .int8_flat_arena_for(128, M2Int8ProjectionSet::w1())
+            .unwrap();
+        assert_eq!(
+            int8.entries
+                .iter()
+                .filter(|entry| entry.role == M2WeightRole::Int8Weight)
+                .count(),
+            M2_NUM_LAYERS * M2_NUM_EXPERTS
+        );
+        assert_eq!(
+            int8.entry("model.layers.0.block_sparse_moe.experts.0.w1.weight")
+                .unwrap()
+                .role,
+            M2WeightRole::Int8Weight
+        );
+        assert_eq!(
+            int8.entry("model.layers.0.block_sparse_moe.experts.0.w2.weight")
+                .unwrap()
+                .role,
+            M2WeightRole::Nvfp4Packed
+        );
+        assert_eq!(
+            M2Int8ProjectionSet::parse("w1_w2_w3").unwrap(),
+            M2Int8ProjectionSet::all()
+        );
     }
 
     #[test]

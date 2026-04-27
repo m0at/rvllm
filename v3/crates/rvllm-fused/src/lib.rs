@@ -26,7 +26,12 @@ pub use launcher::{
     FusedRopeKvWriteLaunch, FusedSiluMulFp8QuantLaunch, QuantizeFp8PerTokenLaunch,
     ResidualAddF16Launch,
 };
-pub use m2_int8::{int8_matmul_ref, int8_weight_at, nvfp4_scalar_weight, nvfp4_to_int8_matrix};
+pub use m2_int8::{
+    int8_matmul_ref, int8_weight_at, m2_int8_fixed_tile_parity_check, nvfp4_scalar_weight,
+    nvfp4_to_int8_matrix,
+    M2Int8KernelDescriptor, M2_INT8_CUSTOM_CALL_ABI_VERSION, M2_INT8_CUSTOM_CALL_TARGET,
+    M2_INT8_DESCRIPTOR_FORMAT,
+};
 pub use m2_nvfp4::{
     decode_fp4_e2m1, decode_fp8_e4m3, nvfp4_matmul_ref, nvfp4_weight_at, M2Nvfp4CustomCallAbi,
     M2Nvfp4IoDType, M2Nvfp4KernelDescriptor, M2Nvfp4MatmulShape, M2Nvfp4MosaicMemory,

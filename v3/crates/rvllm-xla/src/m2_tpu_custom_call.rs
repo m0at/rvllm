@@ -3,7 +3,7 @@ use rvllm_core::{ConfigError, Result, RvllmError};
 pub const TPU_CUSTOM_CALL_TARGET: &str = "tpu_custom_call";
 pub const TPU_MOSAIC_SERIALIZATION_FORMAT: u32 = 1;
 pub const TPU_MOSAIC_BYTECODE_VERSION: u32 = 0;
-pub const TPU_MOSAIC_SERDE_PASS: &str = "mosaic-serde{serialize=true target-version=3?}";
+pub const TPU_MOSAIC_SERDE_PASS: &str = "mosaic-serde{serialize=true target-version=4}";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TpuMosaicBodyFormat {
@@ -22,6 +22,12 @@ impl TpuMosaicSerializedBody {
     pub fn from_serialized_bytecode(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() {
             return Err(invalid("mosaic_body", "serialized bytecode is empty"));
+        }
+        if !bytes.starts_with(b"ML\xefR") {
+            return Err(invalid(
+                "mosaic_body",
+                "expected MLIR bytecode produced by mosaic-serde + write_bytecode",
+            ));
         }
         let trimmed = bytes
             .iter()
@@ -52,10 +58,13 @@ impl TpuMosaicSerializedBody {
             .skip_while(|b| b.is_ascii_whitespace())
             .take(16)
             .collect::<Vec<_>>();
-        if !(trimmed.starts_with(b"module") || trimmed.starts_with(b"builtin.module")) {
+        if !(trimmed.starts_with(b"module")
+            || trimmed.starts_with(b"builtin.module")
+            || trimmed.starts_with(b"#"))
+        {
             return Err(invalid(
                 "mosaic_body",
-                "lowered MLIR body must start with module",
+                "lowered MLIR body must start with module or MLIR aliases",
             ));
         }
         Ok(Self {
@@ -198,10 +207,11 @@ mod tests {
     fn serialized_body_rejects_textual_mlir() {
         assert!(TpuMosaicSerializedBody::from_serialized_bytecode(b"").is_err());
         assert!(TpuMosaicSerializedBody::from_serialized_bytecode(b"module {}").is_err());
-        let body =
-            TpuMosaicSerializedBody::from_serialized_bytecode(&[0x4d, 0x4c, 0xef, 0x52]).unwrap();
-        assert_eq!(body.byte_len(), 4);
-        assert_eq!(body.body_b64(), "TUzvUg==");
+        assert!(TpuMosaicSerializedBody::from_serialized_bytecode(b"#loc = loc(\"-\")").is_err());
+        let body = TpuMosaicSerializedBody::from_serialized_bytecode(&[0x4d, 0x4c, 0xef, 0x52, 1])
+            .unwrap();
+        assert_eq!(body.byte_len(), 5);
+        assert_eq!(body.body_b64(), "TUzvUgE=");
         assert_eq!(body.format(), &TpuMosaicBodyFormat::SerdeBytecode);
     }
 

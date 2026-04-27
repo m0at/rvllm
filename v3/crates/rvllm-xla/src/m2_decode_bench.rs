@@ -142,7 +142,7 @@ pub fn plan_m2_rust_decode_bench(cfg: &M2RustDecodeBenchConfig) -> Result<M2Rust
         let batch_abi = M2GraphAbi::new(M2GraphShape::decode(batch, cfg.ctx, kv_bytes_per_elem))?;
         batch_shapes.push(M2RustDecodeRuntimeShape {
             batch,
-            runtime_inputs: batch_abi.runtime_inputs.len(),
+            runtime_inputs: batch_abi.runtime_inputs.len() + 4,
             runtime_outputs: batch_abi.runtime_outputs.len(),
             kv_cache_bytes: batch_abi.shape.kv_cache_bytes(),
         });
@@ -413,7 +413,7 @@ mod tests {
             .iter()
             .find(|shape| shape.batch == 8)
             .unwrap();
-        assert_eq!(b8.runtime_inputs, 3);
+        assert_eq!(b8.runtime_inputs, 7);
         assert_eq!(b8.runtime_outputs, 3);
         assert_eq!(b8.kv_cache_bytes, 2_080_374_784);
     }

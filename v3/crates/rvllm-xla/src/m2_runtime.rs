@@ -1,16 +1,15 @@
+use std::env;
 use std::path::PathBuf;
 
 use rvllm_core::{
     BatchedPrefillPlan, ConfigError, PrefillRequest, ReqId, Result, RvllmError, TokenId,
 };
-use rvllm_fused::{M2PrefillKvDType, M2PrefillScanShape};
-#[cfg(feature = "tpu")]
-use rvllm_loader::M2SafetensorsReader;
-use rvllm_loader::{M2CheckpointIndex, M2CheckpointSummary};
+use rvllm_fused::{m2_int8_fixed_tile_parity_check, M2PrefillKvDType, M2PrefillScanShape};
+use rvllm_loader::{M2CheckpointIndex, M2CheckpointSummary, M2SafetensorsReader};
 
 use crate::{
     m2_decode_graph_mlir, make_m2_prefill_input_specs, M2GraphAbi, M2GraphShape,
-    M2PrefillHostInputSpec, M2WeightUploadPlan, PjrtElementType, M2_VOCAB,
+    M2PrefillHostInputSpec, M2WeightUploadPlan, PjrtElementType, M2_HIDDEN, M2_VOCAB,
 };
 #[cfg(feature = "tpu")]
 use crate::{CompiledExecutable, PjrtBufferHandle, PjrtClientHandle};
@@ -164,7 +163,15 @@ pub struct M2Runtime {
     client: Option<PjrtClientHandle>,
     exe: Option<CompiledExecutable>,
     weight_arena: Option<PjrtBufferHandle>,
+    globals: Option<M2GlobalWeightBuffers>,
+    reader: Option<M2SafetensorsReader>,
     device_idx: usize,
+}
+
+#[cfg(feature = "tpu")]
+pub struct M2GlobalWeightBuffers {
+    final_norm: PjrtBufferHandle,
+    lm_head: PjrtBufferHandle,
 }
 
 #[cfg(not(feature = "tpu"))]
@@ -250,6 +257,8 @@ impl M2Runtime {
                     client: None,
                     exe: None,
                     weight_arena: None,
+                    globals: None,
+                    reader: None,
                     device_idx,
                 });
             }
@@ -262,6 +271,8 @@ impl M2Runtime {
                     client: Some(client),
                     exe: Some(exe),
                     weight_arena: None,
+                    globals: None,
+                    reader: None,
                     device_idx,
                 });
             }
@@ -299,12 +310,15 @@ impl M2Runtime {
             )?,
             _ => return Err(invalid("weight_format", "must be nvfp4 or int8")),
         };
+        let globals = upload_m2_global_weights(&reader, &client, device_idx)?;
         Ok(Self {
             plan,
             state: M2RuntimeState::Executable,
             client: Some(client),
             exe: Some(exe),
             weight_arena: Some(weight_arena),
+            globals: Some(globals),
+            reader: Some(reader),
             device_idx,
         })
     }
@@ -366,6 +380,14 @@ impl M2Runtime {
             .weight_arena
             .as_ref()
             .ok_or_else(|| runtime_not_executable(&self.state))?;
+        let globals = self
+            .globals
+            .as_ref()
+            .ok_or_else(|| runtime_not_executable(&self.state))?;
+        let reader = self
+            .reader
+            .as_ref()
+            .ok_or_else(|| runtime_not_executable(&self.state))?;
         let mut prepared = prepare_generate_request(&self.plan, req)?;
         let mut generated_token_ids = Vec::with_capacity(prepared.max_tokens);
         let mut kv_buf = client.buffer_from_host(
@@ -388,7 +410,22 @@ impl M2Runtime {
                 PjrtElementType::S32,
                 self.device_idx,
             )?;
-            let inputs = [&token_buf, &pos_buf, &kv_buf, weight_arena];
+            let input_hidden = m2_gather_embed_bf16(reader, &prepared.token_ids)?;
+            let input_hidden_buf = client.buffer_from_host(
+                &input_hidden,
+                &[self.plan.decode_shape.batch as i64, M2_HIDDEN as i64],
+                PjrtElementType::BF16,
+                self.device_idx,
+            )?;
+            let inputs = [
+                &token_buf,
+                &pos_buf,
+                &kv_buf,
+                weight_arena,
+                &input_hidden_buf,
+                &globals.final_norm,
+                &globals.lm_head,
+            ];
             let mut outputs = client.execute(exe, &inputs)?;
             if outputs.len() != 3 {
                 return Err(invalid_owned(
@@ -396,11 +433,14 @@ impl M2Runtime {
                     format!("got {}, expected 3", outputs.len()),
                 ));
             }
-            let next_token = outputs.remove(1);
-            let new_kv = outputs.remove(1);
-            let mut next_bytes = vec![0u8; self.plan.decode_shape.batch * 4];
-            client.buffer_to_host(&next_token, &mut next_bytes)?;
-            prepared.token_ids = read_i32s(&next_bytes);
+            let logits = outputs.remove(0);
+            let next_token = outputs.remove(0);
+            let new_kv = outputs.remove(0);
+            let mut logits_bytes = vec![0u8; self.plan.decode_shape.batch * M2_VOCAB * 2];
+            client.buffer_to_host(&logits, &mut logits_bytes)?;
+            let _ = next_token;
+            prepared.token_ids =
+                m2_bf16_argmax_tokens(&logits_bytes, self.plan.decode_shape.batch, M2_VOCAB)?;
             generated_token_ids.push(prepared.token_ids[0]);
             for pos in &mut prepared.positions {
                 *pos += 1;
@@ -437,6 +477,10 @@ pub fn m2_decode_mlir_execution_blocker(mlir: &str) -> Option<&'static str> {
         && mlir.contains("\\22body\\22: \\22\\22")
     {
         Some("decode MLIR is a Rust+XLA artifact, but M2 fused decode executable custom-call bodies are not linked yet; pass serde bytecode or lowered MLIR with --decode-layer-body; no Python/JAX fallback")
+    } else if mlir.contains("rvllm.kind = \"m2_decode_graph\"")
+        && mlir.contains("native StableHLO embed/final placeholders")
+    {
+        Some("decode MLIR still has zero embed/final-logits placeholders, so it cannot produce real token/PPL/TTFT metrics yet")
     } else {
         None
     }
@@ -484,6 +528,7 @@ pub fn plan_m2_rust_prefill_decode(
     cfg: &M2RustPrefillDecodeConfig,
 ) -> Result<M2RustPrefillDecodePlan> {
     cfg.validate()?;
+    run_int8_parity_gate_if_enabled(&cfg.weight_format)?;
     let prefill = plan_m2_rust_prefill(&M2RustPrefillConfig {
         model_dir: cfg.model_dir.clone(),
         batch: cfg.batch,
@@ -520,6 +565,21 @@ pub fn plan_m2_rust_prefill_decode(
         weight_arena_bytes,
         weight_entries: arena.entries.len(),
         decode_mlir,
+    })
+}
+
+fn run_int8_parity_gate_if_enabled(weight_format: &str) -> Result<()> {
+    if weight_format != "int8" || env::var("RVLLM_M2_PARITY").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+    m2_int8_fixed_tile_parity_check().map_err(|e| {
+        RvllmError::config(
+            ConfigError::InvalidField {
+                name: "RVLLM_M2_PARITY",
+                reason: format!("fixed int8 tile parity failed; aborting without fallback: {e}"),
+            },
+            "m2_runtime",
+        )
     })
 }
 
@@ -566,6 +626,52 @@ pub fn m2_ppl_from_nll(nll: &[f64]) -> Result<M2PplResult> {
         avg_nll,
         ppl: avg_nll.exp(),
     })
+}
+
+pub fn m2_bf16_argmax_tokens(logits_bf16: &[u8], batch: usize, vocab: usize) -> Result<Vec<i32>> {
+    if logits_bf16.len() != batch * vocab * 2 {
+        return Err(invalid("logits", "bf16 byte length must be batch*vocab*2"));
+    }
+    let mut out = Vec::with_capacity(batch);
+    for row in 0..batch {
+        let row_bytes = &logits_bf16[row * vocab * 2..(row + 1) * vocab * 2];
+        let mut best_id = 0usize;
+        let mut best = f32::NEG_INFINITY;
+        for col in 0..vocab {
+            let val = read_bf16(row_bytes, col);
+            if val > best {
+                best = val;
+                best_id = col;
+            }
+        }
+        out.push(best_id as i32);
+    }
+    Ok(out)
+}
+
+pub fn m2_gather_embed_bf16(reader: &M2SafetensorsReader, token_ids: &[i32]) -> Result<Vec<u8>> {
+    let embed = reader.tensor("model.embed_tokens.weight")?;
+    let row_bytes = M2_HIDDEN * element_size(PjrtElementType::BF16);
+    if embed.bytes.len() != M2_VOCAB * row_bytes {
+        return Err(invalid_owned(
+            "model.embed_tokens.weight",
+            format!(
+                "expected {} bytes, got {}",
+                M2_VOCAB * row_bytes,
+                embed.bytes.len()
+            ),
+        ));
+    }
+    let mut out = vec![0u8; token_ids.len() * row_bytes];
+    for (row, token) in token_ids.iter().enumerate() {
+        if *token < 0 || *token as usize >= M2_VOCAB {
+            return Err(invalid("token_ids", "token id outside M2 vocab"));
+        }
+        let src = *token as usize * row_bytes;
+        let dst = row * row_bytes;
+        out[dst..dst + row_bytes].copy_from_slice(&embed.bytes[src..src + row_bytes]);
+    }
+    Ok(out)
 }
 
 struct M2PreparedGenerate {
@@ -702,6 +808,13 @@ fn decode_input_specs(
             dtype: PjrtElementType::S8,
             nbytes: weight_arena_bytes,
         },
+        decode_spec(
+            "input_hidden",
+            &[shape.batch, M2_HIDDEN],
+            PjrtElementType::BF16,
+        ),
+        decode_spec("final_norm", &[M2_HIDDEN], PjrtElementType::BF16),
+        decode_spec("lm_head", &[M2_VOCAB, M2_HIDDEN], PjrtElementType::BF16),
     ]
 }
 
@@ -769,6 +882,53 @@ fn read_i32s(bytes: &[u8]) -> Vec<i32> {
         .chunks_exact(4)
         .map(|x| i32::from_le_bytes([x[0], x[1], x[2], x[3]]))
         .collect()
+}
+
+#[cfg(feature = "tpu")]
+fn upload_m2_global_weights(
+    reader: &M2SafetensorsReader,
+    client: &PjrtClientHandle,
+    device_idx: usize,
+) -> Result<M2GlobalWeightBuffers> {
+    Ok(M2GlobalWeightBuffers {
+        final_norm: upload_m2_global_tensor(
+            reader,
+            client,
+            device_idx,
+            "model.norm.weight",
+            &[M2_HIDDEN],
+        )?,
+        lm_head: upload_m2_global_tensor(
+            reader,
+            client,
+            device_idx,
+            "lm_head.weight",
+            &[M2_VOCAB, M2_HIDDEN],
+        )?,
+    })
+}
+
+#[cfg(feature = "tpu")]
+fn upload_m2_global_tensor(
+    reader: &M2SafetensorsReader,
+    client: &PjrtClientHandle,
+    device_idx: usize,
+    name: &'static str,
+    shape: &[usize],
+) -> Result<PjrtBufferHandle> {
+    let view = reader.tensor(name)?;
+    let expected = shape.iter().product::<usize>() * element_size(PjrtElementType::BF16);
+    if view.bytes.len() != expected {
+        return Err(invalid_owned(
+            "global_weight",
+            format!(
+                "{name}: expected {expected} bytes, got {}",
+                view.bytes.len()
+            ),
+        ));
+    }
+    let shape = shape.iter().map(|&x| x as i64).collect::<Vec<_>>();
+    client.buffer_from_host(view.bytes, &shape, PjrtElementType::BF16, device_idx)
 }
 
 #[cfg(feature = "tpu")]
@@ -876,12 +1036,20 @@ mod tests {
         assert_eq!(plan.seed_decode_positions, vec![4; 8]);
         assert_eq!(plan.decode_input_specs[3].name, "weight_arena");
         assert_eq!(plan.decode_input_specs[3].nbytes, plan.weight_arena_bytes);
+        assert_eq!(plan.decode_input_specs[4].name, "input_hidden");
+        assert_eq!(plan.decode_input_specs[5].name, "final_norm");
+        assert_eq!(plan.decode_input_specs[6].name, "lm_head");
         assert!(plan
             .decode_mlir
             .contains("kernel_name = \"rvllm.m2.decode_layer.fused_attention_nvfp4_moe\""));
         assert!(plan
             .decode_mlir
             .contains("call_target_name = \"tpu_custom_call\""));
+        assert!(plan.decode_mlir.contains("\"stablehlo.dot_general\""));
+        assert!(!plan.decode_mlir.contains("\"stablehlo.gather\""));
+        assert!(!plan
+            .decode_mlir
+            .contains("native StableHLO embed/final placeholders"));
     }
 
     #[test]
@@ -924,6 +1092,19 @@ mod tests {
         let reason = m2_decode_execution_blocker(&plan).unwrap();
         assert!(reason.contains("custom-call bodies"));
         assert!(reason.contains("no Python/JAX fallback"));
+    }
+
+    #[test]
+    fn decode_execution_blocker_reports_zero_logits_placeholder() {
+        let mlir = r#"module attributes {rvllm.kind = "m2_decode_graph"} {
+  func.func @main() attributes {
+    rvllm.lowering = "rust_xla_custom_call",
+    rvllm.lowering_plan = "native StableHLO embed/final placeholders -> 62 fused decode-layer custom calls"
+  } { return }
+}"#;
+        let reason = m2_decode_mlir_execution_blocker(mlir).unwrap();
+        assert!(reason.contains("zero embed/final-logits placeholders"));
+        assert!(reason.contains("token/PPL/TTFT"));
     }
 
     #[test]

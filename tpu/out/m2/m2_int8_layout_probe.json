@@ -1,0 +1,44 @@
+{
+  "schema": "rvllm.m2.int8_layout_probe.v1",
+  "date_utc": "2026-04-27T14:41:00Z",
+  "host": "t1v-n-8f22bdcb-w-0",
+  "project": "finance-484520",
+  "zone": "europe-west4-a",
+  "snippet": "vector.load i8 -> arith.sitofp f32 -> arith.truncf bf16 -> tpu.vector_store bf16",
+  "body_format": "lowered_mlir",
+  "outer_format": "stablehlo_custom_call",
+  "pass": true,
+  "shape": {
+    "input": "tensor<8x128xi8>",
+    "output": "tensor<8x128xbf16>",
+    "load_vector": "vector<1x128xi8>",
+    "fp32_vector": "vector<1x128xf32>",
+    "store_vector": "vector<1x128xbf16>"
+  },
+  "diagnosis": "The failed probe used 1D tensor/vector shapes. Mosaic/PJRT accepts the cast path when the custom-call operand/result layout matches the existing decode-body tile contract: 2D tensor<8x128x*> with vector<1x128x*> row tiles.",
+  "error": null,
+  "compile_log_tail": "compiled /workspace/models/runs/m2_int8_layout_probe_swarm_local/2d_8x128_vec1x128_outer.mlir",
+  "failed_control_attempts": [
+    {
+      "shape": "tensor<128xi8> -> tensor<128xbf16>",
+      "load_vector": "vector<128xi8>",
+      "error": "Unsupported tiling change for 'vector<128xi8>': from \"8,{0,0},(1,512),-2\" to (8, 128) tiling"
+    },
+    {
+      "shape": "tensor<512xi8> -> tensor<512xbf16>",
+      "load_vector": "vector<512xi8>",
+      "error": "Unsupported tiling change for 'vector<512xi8>': from \"8,{0,0},(1,512),-2\" to (8, 128) tiling"
+    },
+    {
+      "shape": "tensor<1024xi8> -> tensor<1024xbf16>",
+      "load_vector": "vector<1024xi8>",
+      "error": "Unsupported tiling change for 'vector<1024xi8>': from \"8,{0,0},(1,512),-2\" to (8, 128) tiling"
+    }
+  ],
+  "artifacts": {
+    "remote_dir": "/workspace/models/runs/m2_int8_layout_probe_swarm_local",
+    "body_mlir": "/workspace/models/runs/m2_int8_layout_probe_swarm_local/2d_8x128_vec1x128_body.mlir",
+    "outer_mlir": "/workspace/models/runs/m2_int8_layout_probe_swarm_local/2d_8x128_vec1x128_outer.mlir",
+    "compile_log": "/workspace/models/runs/m2_int8_layout_probe_swarm_local/2d_8x128_vec1x128_compile.log"
+  }
+}

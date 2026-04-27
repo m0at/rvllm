@@ -4,6 +4,7 @@ pub mod client;
 pub mod executable;
 pub mod ffi;
 pub mod m2_decode_bench;
+pub mod m2_decode_body;
 pub mod m2_decode_graph;
 pub mod m2_graph_abi;
 pub mod m2_prefill;
@@ -26,6 +27,9 @@ pub use m2_decode_bench::{
     plan_m2_rust_decode_bench, M2RustDecodeBenchConfig, M2RustDecodeBenchReport,
     M2RustDecodeRuntimeReport, M2RustDecodeSweepItem,
 };
+pub use m2_decode_body::{
+    m2_decode_layer_int8_lowered_body_mlir, m2_decode_layer_lowered_body_mlir,
+};
 pub use m2_decode_graph::{
     m2_decode_graph_mlir, m2_decode_graph_mlir_with_mosaic_body, m2_decode_smoke_mlir,
     M2ArenaTensor, M2DecodeGraphPlan, M2DecodeLayerPlan, M2ExpertDirectoryEntry, M2ExpertPlan,
@@ -40,10 +44,10 @@ pub use m2_prefill::{
     make_m2_prefill_input_specs, make_m2_prefill_inputs, M2PrefillHostInput, M2PrefillHostInputSpec,
 };
 pub use m2_runtime::{
-    m2_bf16_logits_nll, m2_ppl_from_nll, plan_m2_rust_prefill, plan_m2_rust_prefill_decode,
-    M2DecodeRuntimeInputSpec, M2GenerateOutput, M2GenerateRequest, M2PplResult, M2Runtime,
-    M2RuntimeConfig, M2RustPrefillConfig, M2RustPrefillDecodeConfig, M2RustPrefillDecodePlan,
-    M2RustPrefillPlan,
+    m2_bf16_argmax_tokens, m2_bf16_logits_nll, m2_gather_embed_bf16, m2_ppl_from_nll,
+    plan_m2_rust_prefill, plan_m2_rust_prefill_decode, M2DecodeRuntimeInputSpec, M2GenerateOutput,
+    M2GenerateRequest, M2PplResult, M2Runtime, M2RuntimeConfig, M2RustPrefillConfig,
+    M2RustPrefillDecodeConfig, M2RustPrefillDecodePlan, M2RustPrefillPlan,
 };
 pub use m2_tpu_custom_call::{
     tpu_custom_call_backend_config, tpu_custom_call_backend_config_for_body, TpuMosaicBodyFormat,
@@ -51,8 +55,8 @@ pub use m2_tpu_custom_call::{
     TPU_MOSAIC_SERDE_PASS, TPU_MOSAIC_SERIALIZATION_FORMAT,
 };
 pub use m2_weight_plan::{
-    M2FlatArenaHostBuffer, M2WeightArenaEntry, M2WeightArenaPlan, M2WeightRole, M2WeightUploadPlan,
-    M2WeightUploadSpec,
+    M2FlatArenaHostBuffer, M2Int8ProjectionSet, M2WeightArenaEntry, M2WeightArenaPlan,
+    M2WeightRole, M2WeightUploadPlan, M2WeightUploadSpec,
 };
 #[cfg(feature = "tpu")]
 pub use m2_weight_plan::{M2UploadedWeightBuffer, M2UploadedWeights};

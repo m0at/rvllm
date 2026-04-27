@@ -45,10 +45,27 @@ gate and a saved result JSON.
   NVFP4 -> int8 arena materialization and optional PJRT upload timing. Default
   mode zero-fills dense tensors and times the MoE expert conversion only, since
   dense ABI shape drift is unrelated to the int8 expert path.
-- [ ] Emit/link the matching int8 TPU decode-layer body so the custom call
-  consumes S8 weights + F32 row scales instead of NVFP4 packed/scales.
+- [x] Prove the TPU layout-pass survival gate for `s8 -> f32 -> bf16` using
+  a lowered Mosaic body. Rank-1 vectors fail; the valid contract is
+  `tensor<8x128xi8>` with row-tile `vector<1x128xi8>` and 2D `[1,0]`
+  layouts (`tpu/out/m2/m2_int8_layout_probe.json`).
+- [x] Extend Rust int8 parity with `M=4`, `K=1040`, all-zero, one-hot, and
+  full-range FP8 scale cases. The edge cases are zero-ULP after bf16 output
+  rounding with f32 accumulators.
+- [x] Add the new int8 custom-call descriptor contract:
+  `rvllm.m2.int8_bf16_matmul`, format `rvllm.m2.int8.custom_call.v1`, operands
+  `(x_bf16, weights_s8, row_scales_f32, out_bf16)`.
+- [x] Emit/link an int8 lowered decode body via
+  `m2_emit_decode_layer_body --format int8`; it carries the proven row-tile
+  i8->bf16 cast path while preserving the existing decode-layer ABI.
+- [x] Add `RVLLM_M2_PARITY=1` host-side int8 parity gate and abort-on-fail
+  runtime hook. No silent fallback.
+- [x] Add `RVLLM_M2_MOE_INT8=w1` projection selection. Unselected W2/W3
+  projections stay NVFP4 in mixed arenas.
 - [ ] Run B=8 TPU real-model Rust/XLA int8-weight bench and compare against the
-  current JAX real-model B=8 result.
+  current JAX real-model B=8 result. Current saved attempt
+  (`tpu/out/m2/m2_int8_weight_b8.json`) is blocked before timing/PPL because
+  decode MLIR still uses zero embed/final-logit placeholders.
 
 Recorded int8-KV results:
 
@@ -70,13 +87,12 @@ Recorded int8-KV results:
 - [x] Pin the custom-call ABI target and byte contract:
   `rvllm.m2.nvfp4_decode_bf16_matmul` with packed/scales/output byte metadata.
 - [x] Pin the TPU Mosaic body serialization contract from the installed TPU
-  stack, without running Python/JAX: JAX lowers `tpu_custom_call` by running
-  `mosaic-serde{serialize=true target-version=3?}` over a Mosaic MLIR module,
-  writing MLIR bytecode with `desired_version=0`, base64-encoding that bytecode
-  into `custom_call_config.body`, and setting `serialization_format: 1` plus
-  `needs_layout_passes` when no explicit device type is present. Plain textual
-  MLIR or descriptor strings fail at PJRT compile with `Missing or invalid
-  version attribute`, which is exactly the current Rust placeholder failure.
+  stack: run `mosaic-serde{serialize=true target-version=4}` over the Mosaic
+  MLIR module, write MLIR bytecode with `desired_version=0`, base64-encode that
+  bytecode into `custom_call_config.body`, and set `serialization_format: 1`
+  plus `needs_layout_passes` when no explicit device type is present. The body
+  file must begin with MLIR bytecode magic `ML ef 52`; ASCII `#loc`/`module`
+  output from `get_asm` is not bytecode and fails StableHLO/PJRT parsing.
 - [x] Add the Rust-side serialized body linker: `TpuMosaicSerializedBody`
   validates that the input is non-text bytecode, base64-encodes it without a
   Python dependency, links it into all 62 decode-layer `tpu_custom_call`s, and
@@ -257,3 +273,23 @@ Rust verification:
   `rvllm.m2.decode_layer.fused_attention_nvfp4_moe`.
 - [ ] Run the Rust/XLA B=8/B=16/B=32 bench and only then replace the legacy JAX
   reproduction numbers.
+
+### 5.1 Mosaic body ABI notes from rvllm-m2
+
+- [x] Proven compile path: B=8 decode graph with serialized Mosaic bytecode
+  body, five custom-call operands
+  `(hidden, positions, per_layer_kv, layer_offsets, expert_directory)`.
+  The serialized body must be MLIR bytecode (`ML ef 52` prefix), emitted with
+  `mosaic-serde{serialize=true target-version=4}` and `write_bytecode`.
+- [x] Rejected full weight-arena operand: adding full local `weight_arena` as a
+  custom-call operand triggers PJRT vmem allocation of roughly 29.5 GB against
+  a 128 MB operand-span limit.
+- [x] Rejected tile operand attempt: adding a synthetic 64 MiB weight tile as a
+  sixth Mosaic operand compiles locally but fails inside the TPU StableHLO /
+  Mosaic plugin (`invalid SSA name`, `unknown custom op ht_scale`, or
+  `expected three consecutive dots for an ellipsis`, depending on 1D/2D body
+  shape). Do not repeat this as-is.
+- [ ] Next ABI direction: split real weights into projection-sized operands or
+  separate Mosaic calls, keeping each operand well below the TPU plugin's vmem
+  span limit and avoiding multidimensional Mosaic body shapes that trigger the
+  ellipsis parser failure.
