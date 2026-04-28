@@ -69,46 +69,14 @@ def main():
     print(f"mesh: {mesh}", file=sys.stderr)
 
     # Load weights + KV caches with the existing harness path.
-    model_state = m2_real_bench.load_model_stacked(
-        args.model_dir, mesh, args.ctx, B=args.batch, n_workers=args.workers,
+    # load_model_stacked returns: embed, final_norm, lm_head, stacked, k_cache,
+    # v_cache, cos, sin (per docstring on the TPU VM).
+    embed, final_norm, lm_head, stacked, k_cache, v_cache, cos, sin = (
+        m2_real_bench.load_model_stacked(
+            args.model_dir, mesh, args.ctx, B=args.batch, n_workers=args.workers,
+        )
     )
     print(">> model loaded", file=sys.stderr)
-
-    # Unpack (signature varies between rvLLM-vendored and upstream JAX paths).
-    # We expect (embed, final_norm, stacked, k_cache, v_cache, ...) -- handle
-    # whatever the harness returns.
-    if hasattr(model_state, "_asdict"):
-        st = model_state._asdict()
-    elif isinstance(model_state, dict):
-        st = model_state
-    else:
-        # Tuple / list -- positional unpack matching m2_real_bench convention
-        st = {
-            "embed": model_state[0],
-            "final_norm": model_state[1],
-            "stacked": model_state[2],
-            "k_cache": model_state[3],
-            "v_cache": model_state[4],
-            "lm_head": model_state[5] if len(model_state) > 5 else None,
-        }
-
-    embed = st.get("embed")
-    final_norm = st["final_norm"]
-    stacked = st["stacked"]
-    k_cache = st["k_cache"]
-    v_cache = st["v_cache"]
-    lm_head = st.get("lm_head")
-    if lm_head is None and embed is not None:
-        # M2 ties lm_head with embed in some configs; if separate weight does
-        # not exist in state, fall back to embed.
-        lm_head = embed
-
-    # Rotary tables -- forward_step expects (cos, sin) of size (max_ctx, head_dim_rot)
-    cos, sin = m2_synth_bench.precompute_rope(
-        m2_synth_bench.ROPE_THETA, m2_synth_bench.ROTARY_DIM, args.ctx
-    )
-    cos = jax.device_put(jnp.array(cos), NamedSharding(mesh, P(None, None)))
-    sin = jax.device_put(jnp.array(sin), NamedSharding(mesh, P(None, None)))
 
     # Single-step inputs:
     # x: hidden state at the current decode step, shape (B, H) bf16
