@@ -1,0 +1,42 @@
+{
+  "schema": "rvllm.m2.body_path_probe.v1",
+  "question": "Can JAX-emitted StableHLO bytecode (.mlirbc) slot into the rvLLM tpu_custom_call body?",
+  "hypothesis": "TpuMosaicSerializedBody validator only checks ML\\xefR magic, so PJRT might accept any MLIR bytecode at the body slot.",
+  "result": "REJECTED",
+  "error": "PJRT_Client_Compile failed: Failed to deserialize the Mosaic module: INTERNAL: Missing or invalid version attribute",
+  "error_source": "platforms/xla/mosaic/python/mosaic_emitter_base.cc:314",
+  "key_findings": [
+    "Validator (m2_tpu_custom_call.rs:26) accepts the bytecode -- magic ML\\xefR matches.",
+    "PJRT execution-time deserializer ENFORCES Mosaic dialect via the stable_mosaic.version attr that JAX-emitted StableHLO does not produce.",
+    "JAX dead-code-eliminates unused operands during lowering -- the probe's identity function returned only (hidden, kv_in), losing positions/layer_offsets/expert_directory/w1_block_t/w1_row_scales from the operand ABI."
+  ],
+  "implication": "The body slot strictly requires Mosaic-typed memref bodies with version attrs. JAX-extract-as-bytecode is not a valid shortcut to a real-MLP body.",
+  "remaining_paths_to_real_ppl": [
+    {
+      "name": "pure_stablehlo_inline_layer",
+      "approach": "Emit M2 layer math (RMSNorm + attention + MoE + MLP + residual) as inline StableHLO ops in m2_decode_graph.rs::emit_layer_call. Drop the tpu_custom_call entirely.",
+      "estimated_effort_hours": "12-16",
+      "perf": "2-4x slower than Mosaic (per Agent 6) but correct PPL",
+      "ppl_quality": "matches JAX 4.922"
+    },
+    {
+      "name": "pallas_kernel_lower_to_mosaic",
+      "approach": "Write M2 layer as pl.pallas_call kernel, lower via jax.jit, mosaic-serde produces valid Mosaic bytecode with version attrs.",
+      "estimated_effort_hours": "16-24",
+      "perf": "comparable to JAX baseline ~145 ms/step",
+      "ppl_quality": "matches JAX 4.922 once Pallas kernel parity verified"
+    },
+    {
+      "name": "hand_lowered_mosaic_with_split_calls",
+      "approach": "Split each layer into 3-4 smaller tpu_custom_call ops (RMS+attn / MoE+W1 / silu+W3+W2 / residual), each with hand-written lowered Mosaic body that fits the per-body size budget.",
+      "estimated_effort_hours": "24-40",
+      "perf": "potentially fastest, requires per-body tuning",
+      "ppl_quality": "matches JAX 4.922 once body math verified"
+    }
+  ],
+  "operational_artifacts": {
+    "probe_script": "tpu/harness/probe_jax_body_bytecode.py",
+    "probe_bytecode": "tpu/out/m2/rust_xla/m2_layer_probe_jax.mlirbc",
+    "remote_full_graph": "/workspace/models/runs/mlir_probe/m2_decode_b8_jax_body_*.mlir"
+  }
+}
