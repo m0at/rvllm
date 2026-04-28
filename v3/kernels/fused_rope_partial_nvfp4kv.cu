@@ -398,6 +398,9 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
                 // granularity in the {peak/6, peak/4} band where the
                 // 4-candidate set was coarsest. MSE-min is monotone in
                 // candidate set so adding can only help or be neutral.
+                // Tested 8 candidates with c6=peak/3, c7=second/3:
+                // WHO regressed to English (cycle-tied 8-way ties on
+                // typical blocks pick over-clipping scales). Stay at 6.
                 float c0 = round_scale_e4m3(peak * (1.0f / 6.0f));
                 float c1 = round_scale_e4m3(peak * (1.0f / 4.0f));
                 float c2 = round_scale_e4m3(second * (1.0f / 6.0f));
