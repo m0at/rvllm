@@ -81,6 +81,28 @@ pub use crate::bring_up::HbmArenaCheckpoint;
 const DEFAULT_Q_SCALE: f32 = 0.1;
 const DEFAULT_KV_SCALE: f32 = 0.08;
 
+/// Cycle 56 step 2: parse a `f32` env var with explicit logging on
+/// malformed values. The earlier `.parse().ok().unwrap_or(default)`
+/// idiom silently swallowed parse failures — operator setting
+/// `RVLLM_Q_SCALE=invalid` got the default with no signal. With this
+/// helper, malformed values emit a stderr warning and fall back; the
+/// operator at least sees the misconfig in journalctl.
+fn parse_f32_env_or_default(name: &'static str, default: f32) -> f32 {
+    match std::env::var(name) {
+        Err(_) => default, // env unset is the silent-OK case
+        Ok(v) => match v.parse::<f32>() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!(
+                    "[rvllm] WARN: {name}={v:?} failed to parse as f32 ({e}); \
+                     falling back to default {default}",
+                );
+                default
+            }
+        },
+    }
+}
+
 pub struct Gemma4EnginePaths {
     pub model_dir: PathBuf,
     pub kernels_dir: PathBuf,
@@ -1138,10 +1160,8 @@ impl Gemma4Bringup {
         let q_scale_region = arena.region("q_scale", 4, 4).unwrap();
         let kv_scale_region = arena.region("kv_scale", 4, 4).unwrap();
         {
-            let q_s: f32 = std::env::var("RVLLM_Q_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_Q_SCALE);
-            let kv_s: f32 = std::env::var("RVLLM_KV_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_KV_SCALE);
+            let q_s = parse_f32_env_or_default("RVLLM_Q_SCALE", DEFAULT_Q_SCALE);
+            let kv_s = parse_f32_env_or_default("RVLLM_KV_SCALE", DEFAULT_KV_SCALE);
             q_scale_region.copy_from_host(&q_s.to_le_bytes()).unwrap();
             kv_scale_region.copy_from_host(&kv_s.to_le_bytes()).unwrap();
         }
@@ -1665,10 +1685,8 @@ impl Gemma4Bringup {
         let q_scale_region = arena.region("q_scale", 4, 4)?;
         let kv_scale_region = arena.region("kv_scale", 4, 4)?;
         {
-            let q_s: f32 = std::env::var("RVLLM_Q_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_Q_SCALE);
-            let kv_s: f32 = std::env::var("RVLLM_KV_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_KV_SCALE);
+            let q_s = parse_f32_env_or_default("RVLLM_Q_SCALE", DEFAULT_Q_SCALE);
+            let kv_s = parse_f32_env_or_default("RVLLM_KV_SCALE", DEFAULT_KV_SCALE);
             q_scale_region.copy_from_host(&q_s.to_le_bytes())?;
             kv_scale_region.copy_from_host(&kv_s.to_le_bytes())?;
         }
@@ -2523,10 +2541,8 @@ impl Gemma4Bringup {
         let q_scale_region = arena.region("gen_q_scale", 4, 4)?;
         let kv_scale_region = arena.region("gen_kv_scale", 4, 4)?;
         {
-            let q_s: f32 = std::env::var("RVLLM_Q_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_Q_SCALE);
-            let kv_s: f32 = std::env::var("RVLLM_KV_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_KV_SCALE);
+            let q_s = parse_f32_env_or_default("RVLLM_Q_SCALE", DEFAULT_Q_SCALE);
+            let kv_s = parse_f32_env_or_default("RVLLM_KV_SCALE", DEFAULT_KV_SCALE);
             q_scale_region.copy_from_host(&q_s.to_le_bytes())?;
             kv_scale_region.copy_from_host(&kv_s.to_le_bytes())?;
         }
