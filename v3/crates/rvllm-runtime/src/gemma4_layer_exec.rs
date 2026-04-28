@@ -37,6 +37,42 @@ use rvllm_attention::{AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParam
 
 use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
+/// Cycle 56 step 3: check the CUresult of a hot-path cudarc driver
+/// call, converting non-success into a typed `RvllmError::Cuda` that
+/// gets propagated up the `Result<()>` chain. Without this, every
+/// `cuMemcpyDtoDAsync_v2(...)` etc in the forward path silently
+/// discards its return code — a CUDA OOM, ECC error, or stream
+/// fault corrupts the next kernel's input without any error signal,
+/// surfacing only as wrong-token output downstream.
+///
+/// Usage:
+///   cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(...),
+///               "qkv_input_memcpy", stream)?;
+///
+/// The bang form returns `Result<()>` so it composes with `?`. Stream
+/// is captured into `CudaCtx` for backtrace context. Caller passes a
+/// short static `op` label so the failure log says "qkv_input_memcpy"
+/// rather than just "MemcpyFailed".
+#[cfg(feature = "cuda")]
+macro_rules! cuda_check {
+    ($call:expr, $op:expr, $stream:expr) => {{
+        let r = $call;
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::Cuda {
+                kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                op: $op,
+                ctx: rvllm_core::CudaCtx {
+                    stream: $stream as u64,
+                    kernel: "",
+                    launch: None,
+                    device: 0,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+    }};
+}
+
 /// Storage dtype of the paged KV cache. Picked once at bring-up time
 /// per the `RVLLM_NVFP4_KV` / `RVLLM_F16_KV` env-flag priority and
 /// threaded through on every attention launch.
@@ -982,12 +1018,12 @@ pub unsafe fn gemma4_forward_phase(
             }
             .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
         } else {
-            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                 scratch.delta_f16,
                 residual,
                 (dims.num_tokens * dims.hidden * 2) as _,
                 stream as _,
-            );
+            ), "qkv_awq_input_memcpy", stream);
         }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
@@ -1083,12 +1119,12 @@ pub unsafe fn gemma4_forward_phase(
             }
             .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
         } else {
-            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                 scratch.delta_f16,
                 residual,
                 (dims.num_tokens * dims.hidden * 2) as _,
                 stream as _,
-            );
+            ), "qkv_f16_input_memcpy", stream);
         }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
@@ -1170,24 +1206,24 @@ pub unsafe fn gemma4_forward_phase(
             && crate::gemma4_bring_up::bf16_native_full_chain_enabled();
         if bf16_native {
             // bf16 → bf16 memcpy (same byte layout, no conversion)
-            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                 scratch.delta_f16,
                 residual,
                 (dims.num_tokens * dims.hidden * 2) as _,
                 stream as _,
-            );
+            ), "qkv_fast_path_input_memcpy_bf16", stream);
         } else if dims.bf16_residual {
             gemma4_launcher::Bf16ToF16SatLaunch {
                 n: dims.num_tokens * dims.hidden,
             }
             .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
         } else {
-            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                 scratch.delta_f16,
                 residual,
                 (dims.num_tokens * dims.hidden * 2) as _,
                 stream as _,
-            );
+            ), "qkv_fast_path_input_memcpy_f16", stream);
         }
         let rmsnorm_kernel = if bf16_native {
             kernels.rmsnorm_inplace_bf16
@@ -2090,11 +2126,11 @@ pub unsafe fn gemma4_forward_phase(
             }
             .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
         } else {
-            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                 scratch.delta_f16, residual,
                 (dims.num_tokens * dims.hidden * 2) as _,
                 stream as _,
-            );
+            ), "gate_up_awq_input_memcpy", stream);
         }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
@@ -2164,12 +2200,12 @@ pub unsafe fn gemma4_forward_phase(
             }
             .launch(kernels.bf16_to_f16_sat, scratch.gate_up_out, residual, stream)?;
         } else {
-            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                 scratch.gate_up_out,
                 residual,
                 (dims.num_tokens * dims.hidden * 2) as _,
                 stream as _,
-            );
+            ), "gate_up_f16_input_memcpy", stream);
         }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
@@ -2221,12 +2257,12 @@ pub unsafe fn gemma4_forward_phase(
             }
             .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
         } else {
-            cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                 scratch.delta_f16,
                 residual,
                 (dims.num_tokens * dims.hidden * 2) as _,
                 stream as _,
-            );
+            ), "gate_up_fastpath_input_memcpy", stream);
         }
         let rmsnorm_kernel = kernels.fused_rmsnorm;
         gemma4_launcher::RmsnormInplaceLaunch {
