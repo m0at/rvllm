@@ -1,0 +1,27 @@
+{
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "kv_cache": "bf16",
+  "moe_impl": "auto",
+  "load_seconds": 89.91667580604553,
+  "sweep": [
+    {
+      "batch": 8,
+      "ctx": 2048,
+      "iters": 8,
+      "ms_min": 142.92759200179717,
+      "ms_mean": 143.91409362451668,
+      "ms_max": 145.98179099994013,
+      "ms_p50": 143.75821100111352,
+      "tok_per_s": 55.58871823125702
+    }
+  ],
+  "ppl": {
+    "n_tokens_scored": 262,
+    "avg_nll": 1.5937532222512505,
+    "ppl": 4.922188369934368
+  },
+  "generation": null
+}
