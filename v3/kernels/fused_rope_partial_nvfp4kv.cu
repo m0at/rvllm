@@ -392,25 +392,35 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
             float scale_f32;
             if (policy == RVLLM_NVFP4_POLICY_MSE && peak > 0.0f) {
                 float second = block16_second_largest_abs(v, peak);
-                // 4 candidates (E4M3-rounded before scoring, to match
+                // 6 candidates (E4M3-rounded before scoring, to match
                 // what the production path would actually store).
+                // Cycle 56: added c4=peak/5, c5=second/5 — finer
+                // granularity in the {peak/6, peak/4} band where the
+                // 4-candidate set was coarsest. MSE-min is monotone in
+                // candidate set so adding can only help or be neutral.
                 float c0 = round_scale_e4m3(peak * (1.0f / 6.0f));
                 float c1 = round_scale_e4m3(peak * (1.0f / 4.0f));
                 float c2 = round_scale_e4m3(second * (1.0f / 6.0f));
                 float c3 = round_scale_e4m3(second * (1.0f / 4.0f));
+                float c4 = round_scale_e4m3(peak * (1.0f / 5.0f));
+                float c5 = round_scale_e4m3(second * (1.0f / 5.0f));
                 // Per-lane squared error at each candidate, then
                 // sum across the 16-lane group.
                 float e0 = block16_sum(lane_quant_sse(v, c0));
                 float e1 = block16_sum(lane_quant_sse(v, c1));
                 float e2 = block16_sum(lane_quant_sse(v, c2));
                 float e3 = block16_sum(lane_quant_sse(v, c3));
-                // Pick min across {c0..c3}. Prefer c0 (= current
+                float e4 = block16_sum(lane_quant_sse(v, c4));
+                float e5 = block16_sum(lane_quant_sse(v, c5));
+                // Pick min across {c0..c5}. Prefer c0 (= current
                 // baseline) on ties to stay range-preserving when MSE
                 // is indifferent.
                 float best_e = e0;    float best_s = c0;
                 if (e1 < best_e) { best_e = e1; best_s = c1; }
                 if (e2 < best_e) { best_e = e2; best_s = c2; }
                 if (e3 < best_e) { best_e = e3; best_s = c3; }
+                if (e4 < best_e) { best_e = e4; best_s = c4; }
+                if (e5 < best_e) { best_e = e5; best_s = c5; }
                 scale_f32 = best_s;
             } else {
                 // Baseline: peak / 6 (OCP NVFP4 default).
