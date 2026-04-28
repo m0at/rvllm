@@ -10,7 +10,8 @@ use crate::m2_tpu_custom_call::{
 };
 use crate::{
     M2GraphPhase, M2GraphShape, M2Nvfp4ProjectionAbi, M2WeightArenaEntry, M2WeightArenaPlan,
-    M2WeightRole, PjrtElementType, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_LAYERS, M2_VOCAB,
+    M2WeightRole, PjrtElementType, M2_HEAD_DIM, M2_HIDDEN, M2_NUM_EXPERTS, M2_NUM_KV_HEADS,
+    M2_NUM_LAYERS, M2_NUM_Q_HEADS, M2_ROTARY_DIM, M2_VOCAB,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,7 +271,10 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
         return Err(invalid("kernel_name", "must be an MLIR symbol"));
     }
     let plan = M2DecodeGraphPlan::from_arena(arena)?;
-    let body = emit_decode_body(shape, arena, &plan, decode_layer_body)?;
+    let dense_bytes_per_layer = dense_weight_bytes_per_layer();
+    let dense_arena_bytes = dense_bytes_per_layer * M2_NUM_LAYERS;
+    let dense_arena_bf16 = dense_arena_bytes / 2;
+    let body = emit_decode_body(shape, arena, &plan, decode_layer_body, dense_arena_bytes)?;
     let weight_arena_local_bytes = arena.total_bytes.div_ceil(8);
     let int8_row_scale_arena_len = M2_NUM_LAYERS * crate::m2_int8_w1_n_total();
     Ok(format!(
@@ -283,10 +287,13 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
       %int8_row_scales: tensor<{int8_row_scale_arena_len}xf32>,
       %input_hidden: tensor<{batch}x{hidden}xbf16>,
       %final_norm: tensor<{hidden}xbf16>,
-      %lm_head: tensor<{vocab}x{hidden}xbf16>)
+      %lm_head: tensor<{vocab}x{hidden}xbf16>,
+      %dense_weights: tensor<{dense_arena_bf16}xbf16>)
       -> (tensor<{batch}x{vocab}xbf16>, tensor<{batch}xi32>, tensor<{kv_bytes}xi8>)
       attributes {{
-        rvllm.signature = "token_ids,positions,kv_cache,weight_arena,int8_row_scales,input_hidden,final_norm,lm_head -> logits,next_token,kv_cache",
+        rvllm.signature = "token_ids,positions,kv_cache,weight_arena,int8_row_scales,input_hidden,final_norm,lm_head,dense_weights -> logits,next_token,kv_cache",
+        rvllm.dense_arena_bytes = {dense_arena_bytes} : i64,
+        rvllm.dense_arena_bf16 = {dense_arena_bf16} : i64,
         rvllm.phase = "decode",
         rvllm.batch = {batch} : i64,
         rvllm.ctx = {ctx} : i64,
@@ -365,6 +372,7 @@ fn emit_decode_body(
     arena: &M2WeightArenaPlan,
     plan: &M2DecodeGraphPlan,
     decode_layer_body: Option<&TpuMosaicSerializedBody>,
+    dense_arena_bytes: usize,
 ) -> Result<String> {
     let hidden_ty = format!("tensor<{}x{}xbf16>", shape.batch, M2_HIDDEN);
     let kv_ty = format!("tensor<{}xi8>", shape.kv_cache_bytes());
@@ -417,22 +425,16 @@ fn emit_decode_body(
         let layer_kv_start = format!("%kv_layer_start_{}", layer.layer);
 
         if stablehlo_mode {
-            // Pure StableHLO layer path (no tpu_custom_call). Phase 1: identity
-            // pass-through for hidden and kv. Subsequent phases will add
-            // RMSNorm, attention, MoE, MLP inline as stablehlo ops.
-            out.push_str(&format!(
-                r#"    {next_hidden} = stablehlo.optimization_barrier {hidden_in} : {hidden_ty}
-    {next_kv} = stablehlo.optimization_barrier {kv_in} : {kv_ty}
-"#,
-                next_hidden = next_hidden,
-                hidden_in = hidden,
-                hidden_ty = hidden_ty,
-                next_kv = next_kv,
-                kv_in = kv,
-                kv_ty = kv_ty,
-            ));
-            hidden = next_hidden;
-            kv = next_kv;
+            let (new_hidden, new_kv) = emit_stablehlo_layer(
+                &mut out,
+                shape,
+                layer,
+                dense_arena_bytes,
+                &hidden,
+                &kv,
+            )?;
+            hidden = new_hidden;
+            kv = new_kv;
             continue;
         }
         out.push_str(&format!(
@@ -577,6 +579,425 @@ fn emit_decode_body(
         final_kv = kv,
     ));
     Ok(out)
+}
+
+fn dense_weight_bytes_per_layer() -> usize {
+    let h = M2_HIDDEN;
+    let qd = M2_NUM_Q_HEADS * M2_HEAD_DIM;
+    let kvd = M2_NUM_KV_HEADS * M2_HEAD_DIM;
+    (h + h + qd * h + kvd * h + kvd * h + h * qd + qd + kvd + 256 * h + 256) * 2
+}
+
+fn dense_layer_field_offset(field_index: usize) -> usize {
+    let h = M2_HIDDEN;
+    let qd = M2_NUM_Q_HEADS * M2_HEAD_DIM;
+    let kvd = M2_NUM_KV_HEADS * M2_HEAD_DIM;
+    let sizes = [
+        h,         // 0: input_norm
+        h,         // 1: post_attention_norm
+        qd * h,    // 2: q_proj
+        kvd * h,   // 3: k_proj
+        kvd * h,   // 4: v_proj
+        h * qd,    // 5: o_proj
+        qd,        // 6: q_norm
+        kvd,       // 7: k_norm
+        256 * h,   // 8: router
+        256,       // 9: router_bias
+    ];
+    sizes[..field_index].iter().sum::<usize>() * 2
+}
+
+fn emit_dense_bf16(
+    out: &mut String,
+    dense_arena_bytes: usize,
+    layer: usize,
+    field_index: usize,
+    prefix: &str,
+    shape: &[usize],
+) -> String {
+    let per_layer = dense_weight_bytes_per_layer();
+    let byte_offset = layer * per_layer + dense_layer_field_offset(field_index);
+    let n_bf16: usize = shape.iter().product();
+    let bf16_offset = byte_offset / 2;
+    let bf16_end = bf16_offset + n_bf16;
+    let dense_bf16_total = dense_arena_bytes / 2;
+    let flat_name = format!("%{}_flat", prefix);
+    let result_name = format!("%{}", prefix);
+    // Dense weights are uploaded as bf16 -- just slice and reshape, no bitcast
+    out.push_str(&format!(
+        "    {flat_name} = stablehlo.slice %dense_weights [{bf16_offset}:{bf16_end}] : (tensor<{dense_bf16_total}xbf16>) -> tensor<{n_bf16}xbf16>\n",
+    ));
+    if shape.len() == 1 {
+        out.push_str(&format!(
+            "    {result_name} = stablehlo.optimization_barrier {flat_name} : tensor<{n_bf16}xbf16>\n",
+        ));
+    } else {
+        let shape_str = shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x");
+        out.push_str(&format!(
+            "    {result_name} = stablehlo.reshape {flat_name} : (tensor<{n_bf16}xbf16>) -> tensor<{shape_str}xbf16>\n",
+        ));
+    }
+    result_name
+}
+
+fn emit_arena_bf16(
+    out: &mut String,
+    arena_bytes: usize,
+    prefix: &str,
+    offset: i64,
+    shape: &[usize],
+) -> String {
+    let nbytes: usize = shape.iter().product::<usize>() * 2;
+    let n_bf16: usize = shape.iter().product();
+    let offset_name = format!("%{}_off", prefix);
+    let raw_name = format!("%{}_raw", prefix);
+    let raw2d_name = format!("%{}_raw2d", prefix);
+    let flat_name = format!("%{}_flat", prefix);
+    let result_name = format!("%{}", prefix);
+    // bitcast_convert requires src rank = dst rank + 1 when element sizes differ.
+    // Reshape i8 [nbytes] -> [n_bf16, 2] then bitcast to [n_bf16] bf16.
+    out.push_str(&format!(
+        "    {offset_name} = stablehlo.constant dense<{offset}> : tensor<i64>\n\
+         \x20\x20\x20\x20{raw_name} = \"stablehlo.dynamic_slice\"(%weight_arena, {offset_name}) {{\n\
+         \x20\x20\x20\x20\x20\x20slice_sizes = array<i64: {nbytes}>\n\
+         \x20\x20\x20\x20}} : (tensor<{arena_bytes}xi8>, tensor<i64>) -> tensor<{nbytes}xi8>\n\
+         \x20\x20\x20\x20{raw2d_name} = stablehlo.reshape {raw_name} : (tensor<{nbytes}xi8>) -> tensor<{n_bf16}x2xi8>\n\
+         \x20\x20\x20\x20{flat_name} = stablehlo.bitcast_convert {raw2d_name} : (tensor<{n_bf16}x2xi8>) -> tensor<{n_bf16}xbf16>\n",
+    ));
+    if shape.len() == 1 {
+        out.push_str(&format!(
+            "    {result_name} = stablehlo.optimization_barrier {flat_name} : tensor<{n_bf16}xbf16>\n",
+        ));
+    } else {
+        let shape_str = shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x");
+        out.push_str(&format!(
+            "    {result_name} = stablehlo.reshape {flat_name} : (tensor<{n_bf16}xbf16>) -> tensor<{shape_str}xbf16>\n",
+        ));
+    }
+    result_name
+}
+
+fn emit_rmsnorm(
+    out: &mut String,
+    input: &str,
+    weight: &str,
+    batch: usize,
+    hidden: usize,
+    prefix: &str,
+) -> String {
+    let h_ty = format!("tensor<{}x{}xbf16>", batch, hidden);
+    let sq = format!("%{}_sq", prefix);
+    let sum = format!("%{}_sum", prefix);
+    let mean = format!("%{}_mean", prefix);
+    let eps = format!("%{}_eps", prefix);
+    let me = format!("%{}_me", prefix);
+    let rs = format!("%{}_rs", prefix);
+    let rs_b = format!("%{}_rs_b", prefix);
+    let normed = format!("%{}_normed", prefix);
+    let w_b = format!("%{}_w_b", prefix);
+    let result = format!("%{}_out", prefix);
+    let h_f = hidden as f64;
+    let init = format!("%{}_init", prefix);
+    out.push_str(&format!(
+        "    {sq} = stablehlo.multiply {input}, {input} : {h_ty}\n\
+         \x20\x20\x20\x20{init} = stablehlo.constant dense<0.0> : tensor<bf16>\n\
+         \x20\x20\x20\x20{sum} = \"stablehlo.reduce\"({sq}, {init}) ({{\n\
+         \x20\x20\x20\x20    ^bb0(%a_{prefix}: tensor<bf16>, %b_{prefix}: tensor<bf16>):\n\
+         \x20\x20\x20\x20      %s_{prefix} = stablehlo.add %a_{prefix}, %b_{prefix} : tensor<bf16>\n\
+         \x20\x20\x20\x20      stablehlo.return %s_{prefix} : tensor<bf16>\n\
+         \x20\x20\x20\x20    }}) {{dimensions = array<i64: 1>}} : ({h_ty}, tensor<bf16>) -> tensor<{batch}xbf16>\n\
+         \x20\x20\x20\x20%eps_s_{prefix} = stablehlo.constant dense<{eps_val}> : tensor<bf16>\n\
+         \x20\x20\x20\x20{eps} = stablehlo.broadcast_in_dim %eps_s_{prefix}, dims = [] : (tensor<bf16>) -> tensor<{batch}xbf16>\n\
+         \x20\x20\x20\x20%h_inv_s_{prefix} = stablehlo.constant dense<{h_inv}> : tensor<bf16>\n\
+         \x20\x20\x20\x20%h_inv_{prefix} = stablehlo.broadcast_in_dim %h_inv_s_{prefix}, dims = [] : (tensor<bf16>) -> tensor<{batch}xbf16>\n\
+         \x20\x20\x20\x20{mean} = stablehlo.multiply {sum}, %h_inv_{prefix} : tensor<{batch}xbf16>\n\
+         \x20\x20\x20\x20{me} = stablehlo.add {mean}, {eps} : tensor<{batch}xbf16>\n\
+         \x20\x20\x20\x20{rs} = stablehlo.rsqrt {me} : tensor<{batch}xbf16>\n\
+         \x20\x20\x20\x20{rs_b} = stablehlo.broadcast_in_dim {rs}, dims = [0] : (tensor<{batch}xbf16>) -> {h_ty}\n\
+         \x20\x20\x20\x20{normed} = stablehlo.multiply {input}, {rs_b} : {h_ty}\n\
+         \x20\x20\x20\x20{w_b} = stablehlo.broadcast_in_dim {weight}, dims = [1] : (tensor<{hidden}xbf16>) -> {h_ty}\n\
+         \x20\x20\x20\x20{result} = stablehlo.multiply {normed}, {w_b} : {h_ty}\n",
+        eps_val = 1e-6_f64,
+        h_inv = 1.0 / h_f,
+    ));
+    result
+}
+
+fn emit_stablehlo_layer(
+    out: &mut String,
+    shape: &M2GraphShape,
+    layer: &M2DecodeLayerPlan,
+    dense_arena_bytes: usize,
+    hidden_in: &str,
+    kv_in: &str,
+) -> Result<(String, String)> {
+    let b = shape.batch;
+    let h = M2_HIDDEN;
+    let qh = M2_NUM_Q_HEADS;
+    let kvh = M2_NUM_KV_HEADS;
+    let hd = M2_HEAD_DIM;
+    let rd = M2_ROTARY_DIM;
+    let ctx = shape.ctx;
+    let qd = qh * hd;
+    let kvd = kvh * hd;
+    let gqa = qh / kvh;
+    let l = layer.layer;
+
+    let kv_bytes = shape.kv_cache_bytes();
+    let lkv_bytes = shape.layer_kv_cache_bytes();
+    let lkv_offset = shape.layer_kv_cache_offset(l);
+    let kv_bpe = shape.kv_bytes_per_elem;
+    let p = |s: &str| format!("%l{}_{}", l, s);
+    macro_rules! w {
+        ($($arg:tt)*) => { out.push_str("    "); out.push_str(&format!($($arg)*)); out.push('\n'); };
+    }
+
+    w!("// === Layer {} ===", l);
+
+    // --- Extract dense bf16 weights from dense_weights arena (< INT32_MAX bytes) ---
+    let da = dense_arena_bytes;
+    let norm1 = emit_dense_bf16(out, da, l, 0, &format!("l{}_norm1", l), &[h]);
+    let wq = emit_dense_bf16(out, da, l, 2, &format!("l{}_wq", l), &[qd, h]);
+    let wk = emit_dense_bf16(out, da, l, 3, &format!("l{}_wk", l), &[kvd, h]);
+    let wv = emit_dense_bf16(out, da, l, 4, &format!("l{}_wv", l), &[kvd, h]);
+    let wo = emit_dense_bf16(out, da, l, 5, &format!("l{}_wo", l), &[h, qd]);
+    let norm2 = emit_dense_bf16(out, da, l, 1, &format!("l{}_norm2", l), &[h]);
+
+    // --- RMSNorm (pre-attention) ---
+    let normed = emit_rmsnorm(out, hidden_in, &norm1, b, h, &format!("l{}_n1", l));
+
+    // --- QKV projections: hidden @ W.T ---
+    w!("{} = \"stablehlo.dot_general\"({}, {}) {{", p("qf"), normed, wq);
+    w!("  dot_dimension_numbers = #stablehlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [1]>");
+    w!("}} : (tensor<{}x{}xbf16>, tensor<{}x{}xbf16>) -> tensor<{}x{}xbf16>", b, h, qd, h, b, qd);
+    w!("{} = \"stablehlo.dot_general\"({}, {}) {{", p("kf"), normed, wk);
+    w!("  dot_dimension_numbers = #stablehlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [1]>");
+    w!("}} : (tensor<{}x{}xbf16>, tensor<{}x{}xbf16>) -> tensor<{}x{}xbf16>", b, h, kvd, h, b, kvd);
+    w!("{} = \"stablehlo.dot_general\"({}, {}) {{", p("vf"), normed, wv);
+    w!("  dot_dimension_numbers = #stablehlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [1]>");
+    w!("}} : (tensor<{}x{}xbf16>, tensor<{}x{}xbf16>) -> tensor<{}x{}xbf16>", b, h, kvd, h, b, kvd);
+
+    // --- Reshape to [B, heads, head_dim] ---
+    w!("{} = stablehlo.reshape {} : (tensor<{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>", p("q3"), p("qf"), b, qd, b, qh, hd);
+    w!("{} = stablehlo.reshape {} : (tensor<{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>", p("k3"), p("kf"), b, kvd, b, kvh, hd);
+    w!("{} = stablehlo.reshape {} : (tensor<{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>", p("v3"), p("vf"), b, kvd, b, kvh, hd);
+
+    // --- RoPE: rotate first rd dims of each head ---
+    // Split head_dim into [0:rd] (rotated) and [rd:hd] (passthrough)
+    let non_rot = hd - rd;
+    w!("{} = stablehlo.slice {} [0:{}, 0:{}, 0:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
+        p("q_rot_in"), p("q3"), b, qh, rd, b, qh, hd, b, qh, rd);
+    w!("{} = stablehlo.slice {} [0:{}, 0:{}, {}:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
+        p("q_pass"), p("q3"), b, qh, rd, hd, b, qh, hd, b, qh, non_rot);
+    w!("{} = stablehlo.slice {} [0:{}, 0:{}, 0:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
+        p("k_rot_in"), p("k3"), b, kvh, rd, b, kvh, hd, b, kvh, rd);
+    w!("{} = stablehlo.slice {} [0:{}, 0:{}, {}:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
+        p("k_pass"), p("k3"), b, kvh, rd, hd, b, kvh, hd, b, kvh, non_rot);
+
+    // RoPE: x_rot = x[:,:,0::2]*cos - x[:,:,1::2]*sin, x[:,:,1::2]*cos + x[:,:,0::2]*sin
+    // Simplified: split into even/odd pairs, apply rotation matrix
+    // For decode, cos/sin come from %positions (dynamic). We need cos[pos] and sin[pos].
+    // cos/sin are precomputed as [ctx, rd/2] tensors passed as graph inputs... but they
+    // aren't in the current graph signature. For now, skip RoPE and pass Q/K through.
+    // TODO: add cos/sin as graph inputs and apply rotation.
+    w!("{} = stablehlo.concatenate {}, {}, dim = 2 : (tensor<{}x{}x{}xbf16>, tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
+        p("q_roped"), p("q_rot_in"), p("q_pass"), b, qh, rd, b, qh, non_rot, b, qh, hd);
+    w!("{} = stablehlo.concatenate {}, {}, dim = 2 : (tensor<{}x{}x{}xbf16>, tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
+        p("k_roped"), p("k_rot_in"), p("k_pass"), b, kvh, rd, b, kvh, non_rot, b, kvh, hd);
+
+    // --- KV cache: extract layer slice, write new K/V, read full history ---
+    w!("{} = stablehlo.constant dense<{}> : tensor<i32>", p("lkv_off"), lkv_offset);
+    w!("{} = \"stablehlo.dynamic_slice\"({}, {}) {{", p("lkv"), kv_in, p("lkv_off"));
+    w!("  slice_sizes = array<i64: {}>", lkv_bytes);
+    w!("}} : (tensor<{}xi8>, tensor<i32>) -> tensor<{}xi8>", kv_bytes, lkv_bytes);
+
+    // Reshape layer KV to [2, B, ctx, kvh, hd] for bf16 or [2, B, ctx, kvh, hd] for i8
+    if kv_bpe == 2 {
+        w!("{} = stablehlo.reshape {} : (tensor<{}xi8>) -> tensor<{}x2xi8>",
+            p("lkv_2d"), p("lkv"), lkv_bytes, lkv_bytes / 2);
+        w!("{} = stablehlo.bitcast_convert {} : (tensor<{}x2xi8>) -> tensor<{}xbf16>",
+            p("lkv_bf16"), p("lkv_2d"), lkv_bytes / 2, lkv_bytes / 2);
+        w!("{} = stablehlo.reshape {} : (tensor<{}xbf16>) -> tensor<2x{}x{}x{}x{}xbf16>",
+            p("lkv5"), p("lkv_bf16"), lkv_bytes / 2, b, ctx, kvh, hd);
+    } else {
+        w!("{} = stablehlo.reshape {} : (tensor<{}xi8>) -> tensor<2x{}x{}x{}x{}xi8>",
+            p("lkv5"), p("lkv"), lkv_bytes, b, ctx, kvh, hd);
+    }
+
+    // Write new K at [0, :, pos, :, :] and V at [1, :, pos, :, :]
+    // For decode, pos is a scalar broadcast to batch. Use positions[0] as the write slot.
+    w!("{} = stablehlo.constant dense<0> : tensor<i32>", p("c0"));
+    w!("{} = stablehlo.constant dense<1> : tensor<i32>", p("c1"));
+    w!("{} = \"stablehlo.dynamic_slice\"(%positions, {}) {{", p("pos0"), p("c0"));
+    w!("  slice_sizes = array<i64: 1>");
+    w!("}} : (tensor<{}xi32>, tensor<i32>) -> tensor<1xi32>", b);
+    w!("{} = stablehlo.reshape {} : (tensor<1xi32>) -> tensor<i32>", p("pos_s"), p("pos0"));
+
+    if kv_bpe == 2 {
+        // K update: reshape k_roped [B,kvh,hd] -> [1,B,1,kvh,hd], write at [0,:,pos,:,:]
+        w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}xbf16>) -> tensor<1x{}x1x{}x{}xbf16>",
+            p("k_ins"), p("k_roped"), b, kvh, hd, b, kvh, hd);
+        w!("{} = \"stablehlo.dynamic_update_slice\"({}, {}, {}, {}, {}, {}, {}) : (tensor<2x{}x{}x{}x{}xbf16>, tensor<1x{}x1x{}x{}xbf16>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) -> tensor<2x{}x{}x{}x{}xbf16>",
+            p("lkv5_k"), p("lkv5"), p("k_ins"), p("c0"), p("c0"), p("pos_s"), p("c0"), p("c0"),
+            b, ctx, kvh, hd, b, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}xbf16>) -> tensor<1x{}x1x{}x{}xbf16>",
+            p("v_ins"), p("v3"), b, kvh, hd, b, kvh, hd);
+        w!("{} = \"stablehlo.dynamic_update_slice\"({}, {}, {}, {}, {}, {}, {}) : (tensor<2x{}x{}x{}x{}xbf16>, tensor<1x{}x1x{}x{}xbf16>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) -> tensor<2x{}x{}x{}x{}xbf16>",
+            p("lkv5_kv"), p("lkv5_k"), p("v_ins"), p("c1"), p("c0"), p("pos_s"), p("c0"), p("c0"),
+            b, ctx, kvh, hd, b, kvh, hd, b, ctx, kvh, hd);
+
+        // Read full K and V history
+        w!("{} = stablehlo.slice {} [0:1, 0:{}, 0:{}, 0:{}, 0:{}] : (tensor<2x{}x{}x{}x{}xbf16>) -> tensor<1x{}x{}x{}x{}xbf16>",
+            p("k_hist_5"), p("lkv5_kv"), b, ctx, kvh, hd, b, ctx, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.reshape {} : (tensor<1x{}x{}x{}x{}xbf16>) -> tensor<{}x{}x{}x{}xbf16>",
+            p("k_hist"), p("k_hist_5"), b, ctx, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.slice {} [1:2, 0:{}, 0:{}, 0:{}, 0:{}] : (tensor<2x{}x{}x{}x{}xbf16>) -> tensor<1x{}x{}x{}x{}xbf16>",
+            p("v_hist_5"), p("lkv5_kv"), b, ctx, kvh, hd, b, ctx, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.reshape {} : (tensor<1x{}x{}x{}x{}xbf16>) -> tensor<{}x{}x{}x{}xbf16>",
+            p("v_hist"), p("v_hist_5"), b, ctx, kvh, hd, b, ctx, kvh, hd);
+
+        // Flatten back to i8 for kv_out
+        w!("{} = stablehlo.reshape {} : (tensor<2x{}x{}x{}x{}xbf16>) -> tensor<{}xbf16>",
+            p("lkv_flat_bf16"), p("lkv5_kv"), b, ctx, kvh, hd, lkv_bytes / 2);
+        w!("{} = stablehlo.bitcast_convert {} : (tensor<{}xbf16>) -> tensor<{}x2xi8>",
+            p("lkv_out_2d"), p("lkv_flat_bf16"), lkv_bytes / 2, lkv_bytes / 2);
+        w!("{} = stablehlo.reshape {} : (tensor<{}x2xi8>) -> tensor<{}xi8>",
+            p("lkv_out"), p("lkv_out_2d"), lkv_bytes / 2, lkv_bytes);
+    } else {
+        // Int8 KV cache: convert bf16 K/V to i8 before write, i8 to bf16 on read
+        w!("{} = stablehlo.convert {} : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xi8>",
+            p("k_i8"), p("k_roped"), b, kvh, hd, b, kvh, hd);
+        w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}xi8>) -> tensor<1x{}x1x{}x{}xi8>",
+            p("k_ins"), p("k_i8"), b, kvh, hd, b, kvh, hd);
+        w!("{} = \"stablehlo.dynamic_update_slice\"({}, {}, {}, {}, {}, {}, {}) : (tensor<2x{}x{}x{}x{}xi8>, tensor<1x{}x1x{}x{}xi8>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) -> tensor<2x{}x{}x{}x{}xi8>",
+            p("lkv5_k"), p("lkv5"), p("k_ins"), p("c0"), p("c0"), p("pos_s"), p("c0"), p("c0"),
+            b, ctx, kvh, hd, b, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.convert {} : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xi8>",
+            p("v_i8"), p("v3"), b, kvh, hd, b, kvh, hd);
+        w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}xi8>) -> tensor<1x{}x1x{}x{}xi8>",
+            p("v_ins"), p("v_i8"), b, kvh, hd, b, kvh, hd);
+        w!("{} = \"stablehlo.dynamic_update_slice\"({}, {}, {}, {}, {}, {}, {}) : (tensor<2x{}x{}x{}x{}xi8>, tensor<1x{}x1x{}x{}xi8>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) -> tensor<2x{}x{}x{}x{}xi8>",
+            p("lkv5_kv"), p("lkv5_k"), p("v_ins"), p("c1"), p("c0"), p("pos_s"), p("c0"), p("c0"),
+            b, ctx, kvh, hd, b, kvh, hd, b, ctx, kvh, hd);
+
+        // Read K/V history as i8, convert to bf16
+        w!("{} = stablehlo.slice {} [0:1, 0:{}, 0:{}, 0:{}, 0:{}] : (tensor<2x{}x{}x{}x{}xi8>) -> tensor<1x{}x{}x{}x{}xi8>",
+            p("k_hist_i8_5"), p("lkv5_kv"), b, ctx, kvh, hd, b, ctx, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.reshape {} : (tensor<1x{}x{}x{}x{}xi8>) -> tensor<{}x{}x{}x{}xi8>",
+            p("k_hist_i8"), p("k_hist_i8_5"), b, ctx, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.convert {} : (tensor<{}x{}x{}x{}xi8>) -> tensor<{}x{}x{}x{}xbf16>",
+            p("k_hist"), p("k_hist_i8"), b, ctx, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.slice {} [1:2, 0:{}, 0:{}, 0:{}, 0:{}] : (tensor<2x{}x{}x{}x{}xi8>) -> tensor<1x{}x{}x{}x{}xi8>",
+            p("v_hist_i8_5"), p("lkv5_kv"), b, ctx, kvh, hd, b, ctx, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.reshape {} : (tensor<1x{}x{}x{}x{}xi8>) -> tensor<{}x{}x{}x{}xi8>",
+            p("v_hist_i8"), p("v_hist_i8_5"), b, ctx, kvh, hd, b, ctx, kvh, hd);
+        w!("{} = stablehlo.convert {} : (tensor<{}x{}x{}x{}xi8>) -> tensor<{}x{}x{}x{}xbf16>",
+            p("v_hist"), p("v_hist_i8"), b, ctx, kvh, hd, b, ctx, kvh, hd);
+
+        // Flatten updated KV back to i8
+        w!("{} = stablehlo.reshape {} : (tensor<2x{}x{}x{}x{}xi8>) -> tensor<{}xi8>",
+            p("lkv_out"), p("lkv5_kv"), b, ctx, kvh, hd, lkv_bytes);
+    }
+
+    // --- GQA: broadcast KV heads to match Q heads ---
+    // k_hist: [B, ctx, kvh, hd] -> transpose to [B, kvh, ctx, hd]
+    w!("{} = stablehlo.transpose {}, dims = [0, 2, 1, 3] : (tensor<{}x{}x{}x{}xbf16>) -> tensor<{}x{}x{}x{}xbf16>",
+        p("kt"), p("k_hist"), b, ctx, kvh, hd, b, kvh, ctx, hd);
+    w!("{} = stablehlo.transpose {}, dims = [0, 2, 1, 3] : (tensor<{}x{}x{}x{}xbf16>) -> tensor<{}x{}x{}x{}xbf16>",
+        p("vt"), p("v_hist"), b, ctx, kvh, hd, b, kvh, ctx, hd);
+    // Broadcast kvh -> qh by reshaping [B, kvh, ctx, hd] -> [B, kvh, 1, ctx, hd] -> broadcast -> [B, kvh, gqa, ctx, hd] -> reshape [B, qh, ctx, hd]
+    w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}x{}xbf16>) -> tensor<{}x{}x1x{}x{}xbf16>",
+        p("kt5"), p("kt"), b, kvh, ctx, hd, b, kvh, ctx, hd);
+    w!("{} = stablehlo.broadcast_in_dim {}, dims = [0, 1, 2, 3, 4] : (tensor<{}x{}x1x{}x{}xbf16>) -> tensor<{}x{}x{}x{}x{}xbf16>",
+        p("kt_bc"), p("kt5"), b, kvh, ctx, hd, b, kvh, gqa, ctx, hd);
+    w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}x{}x{}xbf16>) -> tensor<{}x{}x{}x{}xbf16>",
+        p("k_full"), p("kt_bc"), b, kvh, gqa, ctx, hd, b, qh, ctx, hd);
+    w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}x{}xbf16>) -> tensor<{}x{}x1x{}x{}xbf16>",
+        p("vt5"), p("vt"), b, kvh, ctx, hd, b, kvh, ctx, hd);
+    w!("{} = stablehlo.broadcast_in_dim {}, dims = [0, 1, 2, 3, 4] : (tensor<{}x{}x1x{}x{}xbf16>) -> tensor<{}x{}x{}x{}x{}xbf16>",
+        p("vt_bc"), p("vt5"), b, kvh, ctx, hd, b, kvh, gqa, ctx, hd);
+    w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}x{}x{}xbf16>) -> tensor<{}x{}x{}x{}xbf16>",
+        p("v_full"), p("vt_bc"), b, kvh, gqa, ctx, hd, b, qh, ctx, hd);
+
+    // --- Attention scores: Q @ K.T / sqrt(hd) ---
+    // q_roped: [B, qh, hd] -> add seq dim -> [B, qh, 1, hd]
+    w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x1x{}xbf16>",
+        p("q4"), p("q_roped"), b, qh, hd, b, qh, hd);
+    // k_full: [B, qh, ctx, hd] -> transpose last two -> [B, qh, hd, ctx]
+    w!("{} = stablehlo.transpose {}, dims = [0, 1, 3, 2] : (tensor<{}x{}x{}x{}xbf16>) -> tensor<{}x{}x{}x{}xbf16>",
+        p("k_t"), p("k_full"), b, qh, ctx, hd, b, qh, hd, ctx);
+    // scores = Q @ K.T -> [B, qh, 1, ctx]
+    w!("{} = \"stablehlo.dot_general\"({}, {}) {{", p("scores_raw"), p("q4"), p("k_t"));
+    w!("  dot_dimension_numbers = #stablehlo.dot<lhs_batching_dimensions = [0, 1], rhs_batching_dimensions = [0, 1], lhs_contracting_dimensions = [3], rhs_contracting_dimensions = [2]>");
+    w!("}} : (tensor<{}x{}x1x{}xbf16>, tensor<{}x{}x{}x{}xbf16>) -> tensor<{}x{}x1x{}xbf16>", b, qh, hd, b, qh, hd, ctx, b, qh, ctx);
+    // Scale by 1/sqrt(hd)
+    let scale = 1.0_f64 / (hd as f64).sqrt();
+    w!("{} = stablehlo.constant dense<{}> : tensor<bf16>", p("scale"), scale);
+    w!("{} = stablehlo.broadcast_in_dim {}, dims = [] : (tensor<bf16>) -> tensor<{}x{}x1x{}xbf16>",
+        p("scale_b"), p("scale"), b, qh, ctx);
+    w!("{} = stablehlo.multiply {}, {} : tensor<{}x{}x1x{}xbf16>",
+        p("scores"), p("scores_raw"), p("scale_b"), b, qh, ctx);
+
+    // --- Softmax (numerically stable) ---
+    w!("{} = stablehlo.constant dense<0xFF80> : tensor<bf16>", p("neg_inf"));
+    w!("{} = \"stablehlo.reduce\"({}, {}) ({{", p("s_max"), p("scores"), p("neg_inf"));
+    w!("    ^smbb{}(%sma_{}: tensor<bf16>, %smb_{}: tensor<bf16>):", l, l, l);
+    w!("      %smr_{} = stablehlo.maximum %sma_{}, %smb_{} : tensor<bf16>", l, l, l);
+    w!("      stablehlo.return %smr_{} : tensor<bf16>", l);
+    w!("    }}) {{dimensions = array<i64: 3>}} : (tensor<{}x{}x1x{}xbf16>, tensor<bf16>) -> tensor<{}x{}x1xbf16>",
+        b, qh, ctx, b, qh);
+    w!("{} = stablehlo.broadcast_in_dim {}, dims = [0, 1, 2] : (tensor<{}x{}x1xbf16>) -> tensor<{}x{}x1x{}xbf16>",
+        p("s_max_b"), p("s_max"), b, qh, b, qh, ctx);
+    w!("{} = stablehlo.subtract {}, {} : tensor<{}x{}x1x{}xbf16>",
+        p("s_shifted"), p("scores"), p("s_max_b"), b, qh, ctx);
+    w!("{} = stablehlo.exponential {} : tensor<{}x{}x1x{}xbf16>",
+        p("s_exp"), p("s_shifted"), b, qh, ctx);
+    w!("{} = stablehlo.constant dense<0.0> : tensor<bf16>", p("zero"));
+    w!("{} = \"stablehlo.reduce\"({}, {}) ({{", p("s_sum"), p("s_exp"), p("zero"));
+    w!("    ^ssbb{}(%ssa_{}: tensor<bf16>, %ssb_{}: tensor<bf16>):", l, l, l);
+    w!("      %ssr_{} = stablehlo.add %ssa_{}, %ssb_{} : tensor<bf16>", l, l, l);
+    w!("      stablehlo.return %ssr_{} : tensor<bf16>", l);
+    w!("    }}) {{dimensions = array<i64: 3>}} : (tensor<{}x{}x1x{}xbf16>, tensor<bf16>) -> tensor<{}x{}x1xbf16>",
+        b, qh, ctx, b, qh);
+    w!("{} = stablehlo.broadcast_in_dim {}, dims = [0, 1, 2] : (tensor<{}x{}x1xbf16>) -> tensor<{}x{}x1x{}xbf16>",
+        p("s_sum_b"), p("s_sum"), b, qh, b, qh, ctx);
+    w!("{} = stablehlo.divide {}, {} : tensor<{}x{}x1x{}xbf16>",
+        p("attn_w"), p("s_exp"), p("s_sum_b"), b, qh, ctx);
+
+    // --- Attention output: attn_weights @ V ---
+    // attn_w: [B, qh, 1, ctx], v_full: [B, qh, ctx, hd] -> [B, qh, 1, hd]
+    w!("{} = \"stablehlo.dot_general\"({}, {}) {{", p("attn_out4"), p("attn_w"), p("v_full"));
+    w!("  dot_dimension_numbers = #stablehlo.dot<lhs_batching_dimensions = [0, 1], rhs_batching_dimensions = [0, 1], lhs_contracting_dimensions = [3], rhs_contracting_dimensions = [2]>");
+    w!("}} : (tensor<{}x{}x1x{}xbf16>, tensor<{}x{}x{}x{}xbf16>) -> tensor<{}x{}x1x{}xbf16>", b, qh, ctx, b, qh, ctx, hd, b, qh, hd);
+    // Reshape to [B, qd] and project
+    w!("{} = stablehlo.reshape {} : (tensor<{}x{}x1x{}xbf16>) -> tensor<{}x{}xbf16>",
+        p("attn_flat"), p("attn_out4"), b, qh, hd, b, qd);
+    // O projection: [B, qd] @ [h, qd].T -> [B, h]
+    w!("{} = \"stablehlo.dot_general\"({}, {}) {{", p("attn_proj"), p("attn_flat"), wo);
+    w!("  dot_dimension_numbers = #stablehlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [1]>");
+    w!("}} : (tensor<{}x{}xbf16>, tensor<{}x{}xbf16>) -> tensor<{}x{}xbf16>", b, qd, h, qd, b, h);
+
+    // --- Residual add (attention) ---
+    w!("{} = stablehlo.add {}, {} : tensor<{}x{}xbf16>",
+        p("h_attn"), hidden_in, p("attn_proj"), b, h);
+
+    // --- RMSNorm (pre-MLP / pre-MoE) ---
+    let _normed2 = emit_rmsnorm(out, &p("h_attn"), &norm2, b, h, &format!("l{}_n2", l));
+
+    // --- MoE: for now, pass through (no expert MLP) ---
+    // TODO: implement MoE router + expert dispatch
+    // The hidden state after attention is the output for this layer until MoE is wired.
+    let next_hidden = format!("%h_l{}", l);
+    w!("{} = stablehlo.optimization_barrier {} : tensor<{}x{}xbf16>",
+        next_hidden, p("h_attn"), b, h);
+
+    // --- Write updated KV back to global cache ---
+    let next_kv = format!("%kv_after_l{}", l);
+    w!("{} = stablehlo.constant dense<{}> : tensor<i32>", p("lkv_off_out"), lkv_offset);
+    w!("{} = \"stablehlo.dynamic_update_slice\"({}, {}, {}) : (tensor<{}xi8>, tensor<{}xi8>, tensor<i32>) -> tensor<{}xi8>",
+        next_kv, kv_in, p("lkv_out"), p("lkv_off_out"), kv_bytes, lkv_bytes, kv_bytes);
+
+    Ok((next_hidden, next_kv))
 }
 
 fn emit_layer_call(

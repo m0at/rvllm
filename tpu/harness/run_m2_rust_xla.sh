@@ -155,7 +155,40 @@ target/release/m2_rust_decode_bench \
   --moe-impl auto \
   --prompt 'explain angular momentum' \
   --gen-tokens 64 2>&1 | tee \"\$RUN/decode_plan_int8.log\"
-if [[ -n '$REMOTE_DECODE_LAYER_BODY' ]]; then
+if [[ -n '$REMOTE_M2_LAYER_MODE' && '$REMOTE_M2_LAYER_MODE' != 'mosaic' ]]; then
+  echo STABLEHLO_LAYER_MODE='$REMOTE_M2_LAYER_MODE'
+  target/release/m2_rust_decode_bench \
+    --model-dir '$REMOTE_MODEL_DIR' \
+    --artifact-dir \"\$RUN/real_execute_b8\" \
+    --out \"\$RUN/real_execute_b8.json\" \
+    --emit-decode-artifacts \
+    --batch 8 \
+    --ctx 2048 \
+    --kv-cache int8 \
+    --weight-format int8 \
+    --prompt 'explain angular momentum' \
+    --gen-tokens 64 2>&1 | tee \"\$RUN/real_execute_b8_emit.log\"
+  PPL_FLAG=()
+  if [[ -f '$REMOTE_PPL_TEXT' ]]; then
+    PPL_FLAG=(--ppl-text '$REMOTE_PPL_TEXT')
+  fi
+  target/release/m2_rust_decode_bench \
+    --model-dir '$REMOTE_MODEL_DIR' \
+    --artifact-dir \"\$RUN/real_execute_b8\" \
+    --out \"\$RUN/real_execute_b8.json\" \
+    --use-existing-artifacts \
+    --execute-decode \
+    --batch 8 \
+    --ctx 2048 \
+    --iters 8 \
+    --warmup 2 \
+    --kv-cache int8 \
+    --weight-format int8 \
+    --max-weight-arena-bytes '$MAX_WEIGHT_ARENA_BYTES' \
+    --prompt 'explain angular momentum' \
+    \"\${PPL_FLAG[@]}\" \
+    --gen-tokens 64 2>&1 | tee \"\$RUN/real_execute_b8.log\"
+elif [[ -n '$REMOTE_DECODE_LAYER_BODY' ]]; then
   target/release/m2_rust_decode_bench \
     --model-dir '$REMOTE_MODEL_DIR' \
     --artifact-dir \"\$RUN/real_execute_b8\" \

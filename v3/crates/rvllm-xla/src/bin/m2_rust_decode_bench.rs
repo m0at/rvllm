@@ -37,12 +37,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("checked {}", path.display());
         return Ok(());
     }
+    let stablehlo_layer =
+        std::env::var("RVLLM_M2_LAYER_MODE").unwrap_or_default() != "mosaic"
+            && std::env::var("RVLLM_M2_LAYER_MODE").is_ok();
     if args.runtime_mode != M2RuntimeMode::PlanningOnly
         && !args.native_smoke
         && args.decode_layer_body.is_none()
         && !args.use_existing_artifacts
+        && !stablehlo_layer
     {
-        return Err("real Rust M2 compile/execute needs --decode-layer-body FILE containing serde bytecode or lowered MLIR; use --native-smoke for the zero-logits PJRT smoke".into());
+        return Err("real Rust M2 compile/execute needs --decode-layer-body FILE containing serde bytecode or lowered MLIR; use --native-smoke for the zero-logits PJRT smoke, or RVLLM_M2_LAYER_MODE=stablehlo for inline layer ops".into());
     }
     let artifacts = if args.use_existing_artifacts {
         load_decode_artifacts(&args)?
@@ -355,6 +359,9 @@ fn execute_decode_artifacts(
     artifacts: &[DecodeArtifact],
     args: &Args,
 ) -> Result<Vec<ExecutedDecodeArtifact>, Box<dyn std::error::Error>> {
+    let stablehlo_layer =
+        std::env::var("RVLLM_M2_LAYER_MODE").unwrap_or_default() != "mosaic"
+            && std::env::var("RVLLM_M2_LAYER_MODE").is_ok();
     let client = PjrtClientHandle::new()?;
     let num_devices = client.num_devices();
     if args.max_weight_arena_bytes == 0 && !args.native_smoke {
@@ -490,6 +497,12 @@ fn execute_decode_artifacts(
             let reader = reader.as_ref().expect("reader is present for real execute");
             Some(upload_static_global_tensors(&client, reader, num_devices)?)
         };
+        let dense_weight_bufs: Option<Vec<_>> = if stablehlo_layer && !args.native_smoke {
+            let reader = reader.as_ref().expect("reader is present for real execute");
+            Some(upload_dense_weight_arena(&client, reader, num_devices)?)
+        } else {
+            None
+        };
         let teacher = if args.native_smoke {
             None
         } else {
@@ -568,6 +581,9 @@ fn execute_decode_artifacts(
                         inputs.push(&input_hidden[device]);
                         inputs.push(&final_norms[device]);
                         inputs.push(&lm_heads[device]);
+                    }
+                    if let Some(dense) = &dense_weight_bufs {
+                        inputs.push(&dense[device]);
                     }
                     inputs
                 })
@@ -740,6 +756,42 @@ fn upload_static_global_tensors(
             &[M2_VOCAB as i64, M2_HIDDEN as i64],
         )?,
     ))
+}
+
+#[cfg(feature = "tpu")]
+fn upload_dense_weight_arena(
+    client: &PjrtClientHandle,
+    reader: &M2SafetensorsReader,
+    num_devices: usize,
+) -> Result<Vec<rvllm_xla::PjrtBufferHandle>, Box<dyn std::error::Error>> {
+    let dense_fields: &[&str] = &[
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+        "block_sparse_moe.gate.weight",
+        "block_sparse_moe.e_score_correction_bias",
+    ];
+    let mut buf = Vec::new();
+    for layer_idx in 0..M2_NUM_LAYERS {
+        for field in dense_fields {
+            let name = format!("model.layers.{layer_idx}.{field}");
+            let tensor = reader.tensor(&name)?;
+            buf.extend_from_slice(tensor.bytes);
+        }
+    }
+    eprintln!(
+        "dense_weight_arena: {} bytes ({:.2} MB) for {} layers",
+        buf.len(),
+        buf.len() as f64 / 1e6,
+        M2_NUM_LAYERS,
+    );
+    let n_bf16 = buf.len() / 2;
+    upload_replicated(client, num_devices, &buf, &[n_bf16 as i64])
 }
 
 #[cfg(feature = "tpu")]

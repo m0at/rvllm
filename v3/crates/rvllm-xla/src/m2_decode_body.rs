@@ -296,6 +296,9 @@ fn invalid(field: &'static str, reason: &'static str) -> RvllmError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn emits_lowered_mosaic_decode_layer_body_contract() {
@@ -315,9 +318,19 @@ mod tests {
 
     #[test]
     fn default_single_n_tile_skips_scf_for() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_n_cols = std::env::var("RVLLM_M2_W1_N_COLS").ok();
+        let old_k_step = std::env::var("RVLLM_M2_W1_K_STEP").ok();
+        let old_k_tiles = std::env::var("RVLLM_M2_W1_K_TILES").ok();
+        std::env::remove_var("RVLLM_M2_W1_N_COLS");
+        std::env::remove_var("RVLLM_M2_W1_K_STEP");
+        std::env::remove_var("RVLLM_M2_W1_K_TILES");
         let shape = M2GraphShape::decode(8, 2048, 1);
         // No env var = default 128 N cols, no loop, 2D operand contract.
         let mlir = m2_decode_layer_int8_lowered_body_mlir(&shape, 4_294_967_296).unwrap();
+        restore_env("RVLLM_M2_W1_N_COLS", old_n_cols);
+        restore_env("RVLLM_M2_W1_K_STEP", old_k_step);
+        restore_env("RVLLM_M2_W1_K_TILES", old_k_tiles);
         assert!(mlir.contains("rvllm.int8_probe = \"w1_observable_unrolled_bk32x4_n128\""));
         assert!(!mlir.contains("scf.for"));
         assert!(mlir.contains("memref<3072x128xi8>"));
@@ -332,10 +345,18 @@ mod tests {
 
     #[test]
     fn emits_int8_lowered_body_full_n_w1_with_n_loop() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let shape = M2GraphShape::decode(8, 2048, 1);
+        let old_n_cols = std::env::var("RVLLM_M2_W1_N_COLS").ok();
+        let old_k_step = std::env::var("RVLLM_M2_W1_K_STEP").ok();
+        let old_k_tiles = std::env::var("RVLLM_M2_W1_K_TILES").ok();
         std::env::set_var("RVLLM_M2_W1_N_COLS", "1536");
+        std::env::remove_var("RVLLM_M2_W1_K_STEP");
+        std::env::remove_var("RVLLM_M2_W1_K_TILES");
         let mlir = m2_decode_layer_int8_lowered_body_mlir(&shape, 4_294_967_296).unwrap();
-        std::env::remove_var("RVLLM_M2_W1_N_COLS");
+        restore_env("RVLLM_M2_W1_N_COLS", old_n_cols);
+        restore_env("RVLLM_M2_W1_K_STEP", old_k_step);
+        restore_env("RVLLM_M2_W1_K_TILES", old_k_tiles);
         assert!(mlir.contains("rvllm.int8_probe = \"w1_observable_n_loop_bk32x4_n1536_multidim\""));
         // multi-dim operand contract: 3D weight memref + 2D scale memref so
         // Mosaic can prove sublane alignment without per-element offset proofs.
@@ -377,5 +398,13 @@ mod tests {
             mlir.contains("vector.store %hidden_v, %hidden_out"),
             "must pass through full hidden before overlay"
         );
+    }
+
+    fn restore_env(key: &str, value: Option<String>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
     }
 }
