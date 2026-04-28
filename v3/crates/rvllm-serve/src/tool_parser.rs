@@ -33,7 +33,9 @@ const START: &str = "<|tool_call>";
 const END_A: &str = "<tool_call|>";
 const END_B: &str = "<turn|>";
 const ESCAPE: &str = "<|\"|>";
-const CHANNEL_OPEN: &str = "<|channel>";
+// Cycle 56 step 1: removed unused `CHANNEL_OPEN` — the literal
+// "<|channel>" lives in THOUGHT_BLOCK_OPENERS below; this private
+// constant was a stale duplicate.
 const CHANNEL_CLOSE: &str = "<channel|>";
 // Gemma 4 wraps its pre-answer reasoning in multiple block shapes:
 //   <|channel>thought\n...<channel|>

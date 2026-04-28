@@ -148,24 +148,10 @@ fn map_dtype(s: &str) -> Option<DType> {
     })
 }
 
-fn dtype_bytes(d: DType) -> usize {
-    // Cycle 39: sub-byte dtypes return 0 from DType::bytes(); the
-    // safetensors header still gives byte-precise offsets, so we
-    // compute storage as bits per element. Two INT4 elements pack
-    // into one byte → div by 2.
-    if d.is_sub_byte() {
-        // Caller multiplies by element count; defer to per-tensor
-        // storage calc using DType::bits().
-        return 0;
-    }
-    match d {
-        DType::F32 | DType::I32 | DType::U32 => 4,
-        DType::F64 | DType::I64 => 8,
-        DType::F16 | DType::Bf16 => 2,
-        DType::Fp8E4M3 | DType::Fp8E5M2 | DType::U8 => 1,
-        _ => 0,
-    }
-}
+// Cycle 56 step 1: removed the never-called `dtype_bytes` helper.
+// Sub-byte / standard byte-width logic now lives on `DType::bits()` /
+// `DType::bytes()` directly; this private safetensors helper was
+// stale infrastructure.
 
 /// Cycle 39: storage bytes for a tensor with `n_elements`. Handles
 /// sub-byte packed dtypes (U4/I4) by computing bits-then-rounding-up.

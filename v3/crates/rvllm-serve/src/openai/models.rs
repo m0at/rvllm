@@ -3,7 +3,6 @@
 use axum::{extract::State, Json};
 use serde::Serialize;
 
-use crate::openai::types::unix_now_secs;
 use crate::router::AppState;
 
 #[derive(Serialize)]

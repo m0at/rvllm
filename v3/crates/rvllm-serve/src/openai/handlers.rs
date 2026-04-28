@@ -179,7 +179,7 @@ use crate::worker::{GenerateEvent, GenerateRequest};
 /// on `req.stream`.
 pub async fn chat_completions(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> ApiResult<ChatCompletionsResponse> {
     let request_id = Uuid::new_v4();
@@ -346,6 +346,7 @@ impl IntoResponse for ChatCompletionsResponse {
     }
 }
 
+#[allow(unused_assignments)] // initial `let mut finish/usage = ...` overwritten before read in loop body
 async fn chat_collect(
     model_id: &str,
     tokenizer: &crate::tokenize::TokenizerHandle,
@@ -1063,7 +1064,7 @@ fn sse_json<T: serde::Serialize>(value: &T) -> Event {
 
 pub async fn completions(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    _headers: axum::http::HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> ApiResult<CompletionsResponse> {
     let request_id = Uuid::new_v4();
@@ -1184,6 +1185,7 @@ impl IntoResponse for CompletionsResponse {
     }
 }
 
+#[allow(unused_assignments)] // initial `let mut finish/usage = ...` overwritten before read in loop body
 async fn completion_collect(
     model_id: &str,
     tokenizer: &crate::tokenize::TokenizerHandle,

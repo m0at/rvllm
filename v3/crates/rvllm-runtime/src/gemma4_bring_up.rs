@@ -977,7 +977,7 @@ impl Gemma4Bringup {
         use crate::gemma4_layer_exec::*;
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
-        let f16_only = false; // bench path always FP8
+        let _f16_only = false; // bench path always FP8 (documentation only; unused)
         let arch = &self.arch;
         let hidden = arch.hidden_size as u32;
         let max_hd = arch.max_head_dim() as u32;
@@ -1120,7 +1120,11 @@ impl Gemma4Bringup {
         // Scale region only exists on the NVFP4 path; keep a 1-byte
         // placeholder region on F16/Fp8 so the Option branches in
         // scratch stay simple (0 pointer = don't touch).
-        let kv_cache_scale = if kv_dtype.is_nvfp4() {
+        // Cycle 56 step 1: rename to `_kv_cache_scale` to silence the
+        // unused-variable warning. The Region returned MUST be held to
+        // function end (RAII keeps the arena allocation live for the
+        // bench duration); the value itself is never read further.
+        let _kv_cache_scale = if kv_dtype.is_nvfp4() {
             let r = arena.region("kv_cache_scale", kv_scale_total_bytes as usize, 256).unwrap();
             #[cfg(feature = "cuda")]
             {
@@ -2427,9 +2431,13 @@ impl Gemma4Bringup {
         // Per-call fallback when cache wasn't initialised.
         let _kv_cache_region;
         let _kv_scale_region;
+        // Cycle 56 step 1: `_kv_scale_total_bytes` prefix silences
+        // the unused-variable warning — the value is computed in the
+        // else branch (and used there for the local memset), but the
+        // outer destructure binding is never read further.
         let (kv_cache_ptr, kv_scale_ptr,
              kv_layer_offsets, kv_scale_layer_offsets,
-             kv_total_bytes, kv_scale_total_bytes) = if use_prefix_cache {
+             kv_total_bytes, _kv_scale_total_bytes) = if use_prefix_cache {
             (kv_cache_ptr, kv_scale_ptr,
              kv_layer_offsets, kv_scale_layer_offsets,
              kv_total_bytes, kv_scale_total_bytes)
