@@ -380,6 +380,20 @@ fn emit_decode_body(
 
     let mut hidden = "%input_hidden".to_string();
     let mut kv = "%kv_cache".to_string();
+
+    // Layer body mode: "mosaic" (default, single tpu_custom_call per layer with
+    // a Mosaic-typed body) or "stablehlo" (no custom_call, pure StableHLO ops
+    // inline). The stablehlo path is the route to a real PPL because it sidesteps
+    // Mosaic body validation; cost is no Mosaic-specific perf optimization.
+    // Stages within stablehlo mode:
+    //   identity      -- pass through hidden + kv unchanged (Phase 1)
+    //   rmsnorm       -- + RMSNorm input + residual stub (Phase 2, future)
+    //   attention     -- + full attention (Phase 3, future)
+    //   moe           -- + MoE router and experts (Phase 4, future)
+    //   full          -- complete M2 layer (target)
+    let layer_mode = std::env::var("RVLLM_M2_LAYER_MODE").unwrap_or_else(|_| "mosaic".to_string());
+    let stablehlo_mode = layer_mode != "mosaic";
+
     // W1 N tile per layer custom_call. 128 is the proven single-tile path.
     // M2_MOE_INTER (1536, full N) requires multi-dim operand types so Mosaic
     // can prove sublane alignment of scale loads inside scf.for over %ti.
@@ -401,6 +415,26 @@ fn emit_decode_body(
         let next_kv = format!("%kv_after_l{}", layer.layer);
         let layer_kv_offset = shape.layer_kv_cache_offset(layer.layer);
         let layer_kv_start = format!("%kv_layer_start_{}", layer.layer);
+
+        if stablehlo_mode {
+            // Pure StableHLO layer path (no tpu_custom_call). Phase 1: identity
+            // pass-through for hidden and kv. Subsequent phases will add
+            // RMSNorm, attention, MoE, MLP inline as stablehlo ops.
+            out.push_str(&format!(
+                r#"    {next_hidden} = stablehlo.optimization_barrier {hidden_in} : {hidden_ty}
+    {next_kv} = stablehlo.optimization_barrier {kv_in} : {kv_ty}
+"#,
+                next_hidden = next_hidden,
+                hidden_in = hidden,
+                hidden_ty = hidden_ty,
+                next_kv = next_kv,
+                kv_in = kv,
+                kv_ty = kv_ty,
+            ));
+            hidden = next_hidden;
+            kv = next_kv;
+            continue;
+        }
         out.push_str(&format!(
             r#"    {layer_kv_start} = stablehlo.constant dense<{layer_kv_offset}> : tensor<i32>
     {layer_kv} = "stablehlo.dynamic_slice"({kv}, {layer_kv_start}) {{
