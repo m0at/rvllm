@@ -37,41 +37,9 @@ use rvllm_attention::{AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParam
 
 use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
-/// Cycle 56 step 3: check the CUresult of a hot-path cudarc driver
-/// call, converting non-success into a typed `RvllmError::Cuda` that
-/// gets propagated up the `Result<()>` chain. Without this, every
-/// `cuMemcpyDtoDAsync_v2(...)` etc in the forward path silently
-/// discards its return code — a CUDA OOM, ECC error, or stream
-/// fault corrupts the next kernel's input without any error signal,
-/// surfacing only as wrong-token output downstream.
-///
-/// Usage:
-///   cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(...),
-///               "qkv_input_memcpy", stream)?;
-///
-/// The bang form returns `Result<()>` so it composes with `?`. Stream
-/// is captured into `CudaCtx` for backtrace context. Caller passes a
-/// short static `op` label so the failure log says "qkv_input_memcpy"
-/// rather than just "MemcpyFailed".
-#[cfg(feature = "cuda")]
-macro_rules! cuda_check {
-    ($call:expr, $op:expr, $stream:expr) => {{
-        let r = $call;
-        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::Cuda {
-                kind: rvllm_core::CudaErrorKind::MemcpyFailed,
-                op: $op,
-                ctx: rvllm_core::CudaCtx {
-                    stream: $stream as u64,
-                    kernel: "",
-                    launch: None,
-                    device: 0,
-                },
-                bt: std::backtrace::Backtrace::capture(),
-            });
-        }
-    }};
-}
+// Cycle 56 step 7: cuda_check! macro hoisted to crate root in lib.rs.
+// Submodules pick it up via `#[macro_use] extern crate` semantics
+// (the macro is `#[macro_export]`-ed at crate root).
 
 /// Storage dtype of the paged KV cache. Picked once at bring-up time
 /// per the `RVLLM_NVFP4_KV` / `RVLLM_F16_KV` env-flag priority and

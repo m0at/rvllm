@@ -19,32 +19,7 @@ use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
 use crate::gemma4_layer_exec::Gemma4LayerKernels;
 
-/// Cycle 56 step 4: same shape as the `cuda_check!` macro in
-/// gemma4_layer_exec.rs — wraps a cudarc-driver call expression that
-/// returns CUresult, propagates non-success as `RvllmError::Cuda` from
-/// the enclosing `Result<...>` fn. Used at session-init / per-request
-/// paths where a silent cuMemset failure would corrupt scratch
-/// buffers and propagate as wrong-token output. Stream is `0` for
-/// the synchronous (non-async) memset variants where applicable.
-#[cfg(feature = "cuda")]
-macro_rules! cuda_check {
-    ($call:expr, $op:expr, $stream:expr) => {{
-        let r = $call;
-        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::Cuda {
-                kind: rvllm_core::CudaErrorKind::MemcpyFailed,
-                op: $op,
-                ctx: rvllm_core::CudaCtx {
-                    stream: $stream as u64,
-                    kernel: "",
-                    launch: None,
-                    device: 0,
-                },
-                bt: std::backtrace::Backtrace::capture(),
-            });
-        }
-    }};
-}
+// Cycle 56 step 7: cuda_check! macro hoisted to crate root in lib.rs.
 
 /// Cycle 46 step 5c: convert the loader's optional per-layer AWQ weight
 /// table into the runtime's flat-pointer struct. Returns the all-zero
