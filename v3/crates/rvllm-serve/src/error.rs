@@ -126,9 +126,8 @@ impl ApiError {
     }
 
     /// `Retry-After` seconds for 429 responses. `None` for other
-    /// statuses. The config-derived value is passed via the layer
-    /// that wraps handlers; this method supplies the *default* used
-    /// by raw `IntoResponse` calls that don't have config access.
+    /// statuses. Hardcoded to 1 — kept small so clients reconnect
+    /// quickly once the queue drains.
     fn retry_after_secs(&self) -> Option<u64> {
         match self {
             ApiError::Busy(_) => Some(1),

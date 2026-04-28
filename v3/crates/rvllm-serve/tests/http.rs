@@ -58,7 +58,6 @@ fn try_build_state() -> Option<(AppState, std::thread::JoinHandle<()>)> {
         request_timeout: Duration::from_secs(10),
         sse_keepalive: Duration::from_secs(15),
         shutdown_drain_timeout: Duration::from_secs(5),
-        retry_after_secs: 1,
     };
     config.validate().expect("test config valid");
 
