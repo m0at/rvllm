@@ -175,6 +175,9 @@ struct ExecutedDecodeArtifact {
 }
 
 fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn std::error::Error>> {
+    let stablehlo_layer =
+        std::env::var("RVLLM_M2_LAYER_MODE").unwrap_or_default() != "mosaic"
+            && std::env::var("RVLLM_M2_LAYER_MODE").is_ok();
     fs::create_dir_all(&args.artifact_dir)?;
     let decode_layer_body = match &args.decode_layer_body {
         Some(path) => {
@@ -216,7 +219,11 @@ fn write_decode_artifacts(args: &Args) -> Result<Vec<DecodeArtifact>, Box<dyn st
                 "int8" => weights.int8_flat_arena(128)?,
                 _ => return Err("--weight-format: expected nvfp4|int8".into()),
             };
-            weight_arena_bytes = arena.total_bytes.div_ceil(8);
+            weight_arena_bytes = if stablehlo_layer {
+                1
+            } else {
+                arena.total_bytes.div_ceil(8)
+            };
             m2_decode_graph_mlir_with_mosaic_body(
                 "main",
                 &shape,
@@ -364,7 +371,7 @@ fn execute_decode_artifacts(
             && std::env::var("RVLLM_M2_LAYER_MODE").is_ok();
     let client = PjrtClientHandle::new()?;
     let num_devices = client.num_devices();
-    if args.max_weight_arena_bytes == 0 && !args.native_smoke {
+    if args.max_weight_arena_bytes == 0 && !args.native_smoke && !stablehlo_layer {
         return Err(
             "--execute-decode requires --max-weight-arena-bytes for real weight upload".into(),
         );
@@ -390,7 +397,7 @@ fn execute_decode_artifacts(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let row_scale_zero = vec![0u8; M2_NUM_LAYERS * 128 * 4];
-        let (weight_arenas, row_scale_arenas) = if args.native_smoke {
+        let (weight_arenas, row_scale_arenas) = if args.native_smoke || stablehlo_layer {
             let weight_zero = vec![0u8; artifact.weight_arena_bytes];
             let weights = (0..num_devices)
                 .map(|device| {

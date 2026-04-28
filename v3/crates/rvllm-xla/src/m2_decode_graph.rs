@@ -275,7 +275,14 @@ pub fn m2_decode_graph_mlir_with_mosaic_body(
     let dense_arena_bytes = dense_bytes_per_layer * M2_NUM_LAYERS;
     let dense_arena_bf16 = dense_arena_bytes / 2;
     let body = emit_decode_body(shape, arena, &plan, decode_layer_body, dense_arena_bytes)?;
-    let weight_arena_local_bytes = arena.total_bytes.div_ceil(8);
+    let stablehlo_layer =
+        std::env::var("RVLLM_M2_LAYER_MODE").unwrap_or_default() != "mosaic"
+            && std::env::var("RVLLM_M2_LAYER_MODE").is_ok();
+    let weight_arena_local_bytes = if stablehlo_layer {
+        1
+    } else {
+        arena.total_bytes.div_ceil(8)
+    };
     let int8_row_scale_arena_len = M2_NUM_LAYERS * crate::m2_int8_w1_n_total();
     Ok(format!(
         r###"module attributes {{mhlo.frontend_attributes = {{xla.sdy.meshes = "{{mesh = #sdy.mesh<[\22expert\22=8]>}}"}}, mhlo.num_partitions = 8 : i32, mhlo.num_replicas = 1 : i32, rvllm.kind = "m2_decode_graph"}} {{
