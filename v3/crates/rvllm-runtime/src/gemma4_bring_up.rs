@@ -19,6 +19,33 @@ use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
 use crate::gemma4_layer_exec::Gemma4LayerKernels;
 
+/// Cycle 56 step 4: same shape as the `cuda_check!` macro in
+/// gemma4_layer_exec.rs — wraps a cudarc-driver call expression that
+/// returns CUresult, propagates non-success as `RvllmError::Cuda` from
+/// the enclosing `Result<...>` fn. Used at session-init / per-request
+/// paths where a silent cuMemset failure would corrupt scratch
+/// buffers and propagate as wrong-token output. Stream is `0` for
+/// the synchronous (non-async) memset variants where applicable.
+#[cfg(feature = "cuda")]
+macro_rules! cuda_check {
+    ($call:expr, $op:expr, $stream:expr) => {{
+        let r = $call;
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::Cuda {
+                kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                op: $op,
+                ctx: rvllm_core::CudaCtx {
+                    stream: $stream as u64,
+                    kernel: "",
+                    launch: None,
+                    device: 0,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+    }};
+}
+
 /// Cycle 46 step 5c: convert the loader's optional per-layer AWQ weight
 /// table into the runtime's flat-pointer struct. Returns the all-zero
 /// default when no AWQ tensors were uploaded for this layer (every
@@ -966,10 +993,20 @@ impl Gemma4Bringup {
         std::mem::forget(kv_region);
         std::mem::forget(kv_scale_region);
 
+        // Cycle 56 step 4 (bug-audit finding #2 — HIGH): check
+        // CUresult on prefix-cache init memset. Failure here corrupts
+        // ALL subsequent decode requests for this service lifetime;
+        // surfacing it as a typed RvllmError lets the operator see
+        // the OOM / ECC at startup instead of silent garbage decode
+        // hours later.
         #[cfg(feature = "cuda")]
         unsafe {
-            cudarc::driver::sys::cuMemsetD8_v2(kv_cache_ptr, 0, kv_total_bytes as usize);
-            cudarc::driver::sys::cuMemsetD8_v2(kv_scale_ptr, 0, kv_scale_bytes_alloc);
+            cuda_check!(
+                cudarc::driver::sys::cuMemsetD8_v2(kv_cache_ptr, 0, kv_total_bytes as usize),
+                "init_prefix_cache_kv_zero", 0u64);
+            cuda_check!(
+                cudarc::driver::sys::cuMemsetD8_v2(kv_scale_ptr, 0, kv_scale_bytes_alloc),
+                "init_prefix_cache_kv_scale_zero", 0u64);
         }
 
         *guard = Some(PrefixCacheState {
@@ -2490,11 +2527,19 @@ impl Gemma4Bringup {
                 };
             }
             let kvr = arena.region("gen_kv", kv_total_bytes as usize, 256)?;
-            cudarc::driver::sys::cuMemsetD8_v2(kvr.device_ptr(), 0, kv_total_bytes as usize);
+            // Cycle 56 step 4 (bug-audit #6): check CUresult on
+            // per-request scratch zeroing — failure here would leave
+            // KV cache + scale region with arbitrary bytes from the
+            // previous request and corrupt this request's decode.
+            cuda_check!(
+                cudarc::driver::sys::cuMemsetD8_v2(kvr.device_ptr(), 0, kv_total_bytes as usize),
+                "run_generate_kv_zero", 0u64);
             let kvs = arena.region(
                 "gen_kv_scale_cache", kv_scale_total_bytes.max(16) as usize, 16)?;
-            cudarc::driver::sys::cuMemsetD8_v2(
-                kvs.device_ptr(), 0, kv_scale_total_bytes as usize);
+            cuda_check!(
+                cudarc::driver::sys::cuMemsetD8_v2(
+                    kvs.device_ptr(), 0, kv_scale_total_bytes as usize),
+                "run_generate_kv_scale_zero", 0u64);
             let kc_ptr = kvr.device_ptr();
             let ks_ptr = kvs.device_ptr();
             _kv_cache_region = kvr;
@@ -2528,8 +2573,10 @@ impl Gemma4Bringup {
             (max_tokens as u64) * (arch.num_attention_heads as u64) * 4;
         let q_scale_scratch = arena.region(
             "gen_q_scale_scratch", q_scale_scratch_bytes as usize, 16)?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
+        cuda_check!(
+            cudarc::driver::sys::cuMemsetD8_v2(
+                q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize),
+            "run_generate_q_scale_scratch_zero", 0u64);
         // See run_bench: RVLLM_PER_TOKEN_Q_SCALE=0 opts out.
         let q_scale_cache_ptr: u64 =
             if per_token_q_scale_enabled(/*default_on=*/true) {
