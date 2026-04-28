@@ -101,10 +101,15 @@ impl Scheduler {
         let mut context_lens = Vec::with_capacity(active.len());
         for r in &active {
             req_ids.push(r.id);
+            // Lazy fallback: `unwrap_or` would eagerly index
+            // `prompt_tokens[len - 1]` and panic with `usize`
+            // underflow if both vecs are empty. `or_else` + `.last()`
+            // keeps the failure mode an explicit `expect`.
             last_tokens.push(
                 *r.output_tokens
                     .last()
-                    .unwrap_or(&r.prompt_tokens[r.prompt_tokens.len() - 1]),
+                    .or_else(|| r.prompt_tokens.last())
+                    .expect("scheduled request has neither prompt nor output tokens"),
             );
             positions.push(r.context_len() - 1);
             context_lens.push(r.context_len());
