@@ -1,4 +1,19 @@
 pub mod artifact;
+
+/// W1 N-tile column count per layer custom_call.
+///
+/// Default 128 = the proven single-tile path. Set RVLLM_M2_W1_N_COLS=1536 to
+/// opt into the multi-dim memref body that covers the full M2_MOE_INTER N
+/// dim under one custom_call. Read at runtime by the body emitter, the graph
+/// emitter, the bench, and the runtime so all four agree on the operand
+/// contract.
+pub fn m2_int8_w1_n_total() -> usize {
+    std::env::var("RVLLM_M2_W1_N_COLS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(128)
+}
+
 #[cfg(feature = "tpu")]
 pub mod client;
 pub mod executable;
