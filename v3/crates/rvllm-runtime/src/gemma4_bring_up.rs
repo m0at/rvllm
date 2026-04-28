@@ -597,9 +597,12 @@ fn sign_byte_for(layer_idx: u32, channel_idx: u32) -> i8 {
 /// Build the i8 sign-vector buffer host-side and upload to device.
 /// Returns `None` when `RVLLM_NVFP4_HADAMARD` is off.
 ///
-/// Uses the same arena.region(...) + std::mem::forget pattern that
-/// `nvfp4_shadow` uses — region lives until the arena is dropped,
-/// which is bring-up scope (the `Gemma4Bringup` arena is `'static`).
+/// `Region` is not `Drop`, so the bytes returned by `arena.region(...)`
+/// stay reserved as soon as the bump pointer has advanced — letting the
+/// `Region` handle fall out of scope here is enough; no `mem::forget`
+/// dance is required. This buffer must be allocated BEFORE the cuda
+/// worker takes its scratch checkpoint, so subsequent
+/// `arena.restore(scratch_ck)` calls don't rewind past it.
 #[cfg(feature = "cuda")]
 pub fn build_nvfp4_hadamard_signs(
     num_layers: u32,
@@ -625,7 +628,6 @@ pub fn build_nvfp4_hadamard_signs(
             bytes as usize,
         );
         if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            std::mem::forget(region);
             return Err(rvllm_core::RvllmError::Cuda {
                 kind: rvllm_core::CudaErrorKind::MemcpyFailed,
                 op: "cuMemcpyHtoD nvfp4_hadamard_signs",
@@ -639,7 +641,6 @@ pub fn build_nvfp4_hadamard_signs(
             });
         }
     }
-    std::mem::forget(region);
     eprintln!(
         "[hadamard] uploaded {} layers × {} signs ({} bytes) to {:#x}",
         num_layers, head_dim, bytes, base_ptr
@@ -959,14 +960,12 @@ impl Gemma4Bringup {
             self.arena.region("persistent_kv_scale", kv_scale_bytes_alloc, 16)?;
         let kv_scale_ptr = kv_scale_region.device_ptr();
 
-        // Leak the Region wrappers by forgetting them. The arena's
-        // bump pointer has already advanced past both regions, so
-        // their bytes stay reserved for the lifetime of `self.arena`.
-        // `arena.restore(scratch_ck)` run by the cuda worker only
-        // restores to a checkpoint taken AFTER this call, so these
-        // bytes are always above the worker's restore target.
-        std::mem::forget(kv_region);
-        std::mem::forget(kv_scale_region);
+        // `Region` isn't `Drop`, so dropping the wrappers here just
+        // discards the handles — the arena's bump pointer has already
+        // advanced past both regions, so their bytes stay reserved
+        // for the lifetime of `self.arena`. The cuda worker takes its
+        // `scratch_ck` checkpoint AFTER this call, so its later
+        // `arena.restore(scratch_ck)` cannot rewind past these bytes.
 
         // Cycle 56 step 4 (bug-audit finding #2 — HIGH): check
         // CUresult on prefix-cache init memset. Failure here corrupts
@@ -2688,17 +2687,18 @@ impl Gemma4Bringup {
             if let Some(ref existing) = *guard {
                 (existing.shadow_ptr, existing.shadow_q_ptr, existing.shadow_q_throwaway_ptr)
             } else {
+                // `Region` isn't `Drop`; the bump-pointer state held
+                // by `arena` is what keeps these allocations alive
+                // past the wrapper falling out of scope below.
                 let bytes = shadow_total_bytes.max(16) as usize;
                 let region = arena.region("nvfp4_shadow_kv", bytes, 256)?;
                 cudarc::driver::sys::cuMemsetD8_v2(region.device_ptr(), 0, bytes);
                 let ptr = region.device_ptr();
-                std::mem::forget(region);
                 // Per-layer Q snapshot region.
                 let q_bytes = shadow_q_total_bytes.max(16) as usize;
                 let q_region = arena.region("nvfp4_shadow_q", q_bytes, 256)?;
                 cudarc::driver::sys::cuMemsetD8_v2(q_region.device_ptr(), 0, q_bytes);
                 let q_ptr = q_region.device_ptr();
-                std::mem::forget(q_region);
                 // Q throwaway scratch: one slot. Shadow rope targets
                 // this when we're not capturing, so q_normed stays
                 // untouched and the subsequent primary nvfp4 rope
@@ -2710,7 +2710,6 @@ impl Gemma4Bringup {
                 cudarc::driver::sys::cuMemsetD8_v2(
                     throwaway_region.device_ptr(), 0, throwaway_bytes);
                 let throwaway_ptr = throwaway_region.device_ptr();
-                std::mem::forget(throwaway_region);
                 *guard = Some(NvFp4ShadowAlloc {
                     shadow_ptr: ptr,
                     shadow_bytes: shadow_total_bytes,
