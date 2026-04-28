@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rvLLM M2 TPU Bench</title>
+<style>
+  :root {
+    --bg: #000;
+    --surface: #0a0a0a;
+    --surface-2: #050505;
+    --border: #111;
+    --border-strong: #222;
+    --text: #e8e8e8;
+    --muted: #999;
+    --muted-2: #888;
+    --heading: #fff;
+    --accent: #0070f3;
+    --red: #e00;
+    --green: #22c55e;
+    --purple: #8b5cf6;
+    --amber: #f59e0b;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { font-size: 17px; scroll-behavior: smooth; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+  body { background: var(--bg); color: var(--text); font-family: Helvetica Neue, Helvetica, Arial, sans-serif; font-weight: 300; line-height: 1.6; letter-spacing: -0.01em; }
+  a { color: var(--text); text-decoration: underline; text-decoration-color: var(--border-strong); text-underline-offset: 3px; }
+  a:hover { color: var(--heading); }
+  code { color: var(--heading); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+  strong { color: var(--heading); font-weight: 600; }
+  ::selection { background: #333; color: var(--heading); }
+
+  .container { max-width: 1080px; margin: 0 auto; padding: 0 2rem 4rem; }
+  .memo-hero { padding: 5rem 0 2.8rem; }
+  .topline { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 4rem; }
+  .brand { color: #aaa; font-size: 0.8rem; font-weight: 500; letter-spacing: 0.08em; text-decoration: none; text-transform: uppercase; }
+  .memo-meta { color: #999; font-size: 0.78rem; text-align: right; }
+  .hero-grid { display: grid; grid-template-columns: minmax(0, 0.92fr) minmax(360px, 1.08fr); gap: 2rem; align-items: start; }
+  .hero-copy { padding-top: 0.35rem; }
+  .conf { color: #999; font-size: 0.78rem; font-weight: 500; letter-spacing: 0.08em; margin-bottom: 0.75rem; text-transform: uppercase; }
+  h1 { color: var(--heading); font-size: 3.2rem; font-weight: 700; letter-spacing: -0.04em; line-height: 1; margin-bottom: 0.75rem; text-shadow: 0 0 30px rgba(255,255,255,0.1), 0 0 60px rgba(255,255,255,0.03); }
+  .tag { color: #bbb; font-size: 1.05rem; font-weight: 300; max-width: 680px; margin-bottom: 0; }
+  .mobile-only { display: none; }
+  .nowrap { white-space: nowrap; }
+  .product-shot { background: var(--surface); border: 1px solid var(--border); overflow: hidden; }
+  .live-workspace { min-height: 280px; display: flex; flex-direction: column; justify-content: space-between; padding: 1rem; }
+  .live-workspace .k { color: #999; font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; }
+  .live-workspace .b { color: #fff; font-size: 1.65rem; font-weight: 700; letter-spacing: -0.04em; line-height: 1.05; max-width: 360px; }
+  .live-workspace .m { color: #bbb; font-size: 0.84rem; max-width: 400px; }
+  .live-workspace .status { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); }
+  .live-workspace .status span { background: #050505; color: #aaa; font-size: 0.7rem; padding: 0.55rem 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .shot-caption { display: flex; justify-content: space-between; gap: 1rem; border-top: 1px solid var(--border); padding: 0.55rem 0.75rem; color: #999; font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase; }
+
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); margin: 0 0 2rem; overflow: hidden; }
+  .stats.four { grid-template-columns: repeat(4, 1fr); }
+  .stats .s { background: var(--surface); min-height: 120px; padding: 1.2rem 1.4rem; text-align: left; transition: background 0.15s; }
+  .stats .s:hover, .kg .c:hover { background: #111; }
+  .stats .s .n { color: var(--heading); font-size: 1.65rem; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: -0.03em; line-height: 1.2; text-shadow: 0 0 20px rgba(255,255,255,0.15), 0 0 40px rgba(255,255,255,0.05); }
+  .stats .s .l { color: var(--muted); font-size: 0.78rem; margin-top: 0.25rem; }
+
+  h2 { border-top: 1px solid var(--border); color: var(--heading); font-size: 1.4rem; font-weight: 600; letter-spacing: -0.03em; line-height: 1.2; margin: 3.2rem 0 0.9rem; padding-top: 3rem; }
+  p { color: var(--text); margin-bottom: 0.8rem; max-width: 780px; }
+  .m { color: #aaa; }
+  .y { color: var(--accent); text-shadow: 0 0 10px rgba(0,112,243,0.3); }
+  .x { color: var(--red); text-shadow: 0 0 10px rgba(238,0,0,0.3); }
+  .g { color: var(--green); text-shadow: 0 0 10px rgba(34,197,94,0.3); }
+  .p { color: var(--purple); text-shadow: 0 0 10px rgba(139,92,246,0.3); }
+  .a { color: var(--amber); text-shadow: 0 0 10px rgba(245,158,11,0.3); }
+
+  .tt, .ct { width: 100%; border-collapse: collapse; font-size: 0.82rem; margin: 1rem 0 2rem; }
+  .tt th, .ct th { border-bottom: 1px solid var(--border); color: #999; font-size: 0.7rem; font-weight: 500; letter-spacing: 0.06em; padding: 0.5rem 0.8rem; text-align: left; text-transform: uppercase; }
+  .tt td, .ct td { border-bottom: 1px solid var(--border); color: var(--text); padding: 0.6rem 0.8rem; vertical-align: top; }
+  .tt th.r, .tt td.r { text-align: right; }
+  .tt tr.total td { border-top: 2px solid var(--border-strong); border-bottom: none; color: var(--heading); font-weight: 700; }
+  .ct tr.us td { color: var(--accent); font-weight: 600; }
+
+  .kg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; background: var(--border); margin: 1rem 0 1.5rem; overflow: hidden; }
+  .kg .c { background: var(--surface); min-height: 96px; padding: 1rem 1.2rem; transition: background 0.15s; }
+  .kg .c .n { color: var(--heading); font-size: 1.35rem; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: -0.03em; line-height: 1.25; text-shadow: 0 0 20px rgba(255,255,255,0.15), 0 0 40px rgba(255,255,255,0.05); }
+  .kg .c .l { color: var(--muted); font-size: 0.78rem; margin-top: 0.2rem; }
+
+  ul { color: var(--text); max-width: 780px; padding-left: 1.2rem; margin: 0.75rem 0 1rem; }
+  li { margin-bottom: 0.35rem; }
+  .div { border: none; border-top: 1px solid var(--border); margin: 3.2rem 0; }
+  .foot { color: #999; font-size: 0.75rem; margin-top: 3rem; text-align: center; max-width: none; }
+
+  .chart-wrap { position: relative; margin: 1.5rem 0 2rem; background: var(--surface); border: 1px solid var(--border); padding: 1.5rem; }
+  .chart-wrap canvas { width: 100% !important; height: 420px !important; }
+  .chart-title { color: #999; font-size: 0.7rem; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 1rem; }
+
+  .badge { display: inline-block; font-size: 0.65rem; font-weight: 600; letter-spacing: 0.04em; padding: 0.15rem 0.45rem; text-transform: uppercase; vertical-align: middle; margin-left: 0.4rem; }
+  .badge-green { background: rgba(34,197,94,0.15); color: var(--green); text-shadow: 0 0 8px rgba(34,197,94,0.4); }
+  .badge-amber { background: rgba(245,158,11,0.15); color: var(--amber); text-shadow: 0 0 8px rgba(245,158,11,0.4); }
+  .badge-red { background: rgba(238,0,0,0.15); color: var(--red); text-shadow: 0 0 8px rgba(238,0,0,0.4); }
+
+  .note { background: var(--surface); border-left: 2px solid var(--border-strong); color: #bbb; font-size: 0.82rem; margin: 1rem 0 1.5rem; max-width: 780px; padding: 0.8rem 1rem; }
+  .note strong { color: var(--heading); }
+
+  @media (max-width: 900px) {
+    .hero-grid { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 700px) {
+    html { font-size: 13px; }
+    .container { padding: 0 1.25rem 3rem; }
+    .memo-hero { padding: 3.5rem 0 2rem; }
+    .topline { align-items: flex-start; flex-direction: column; margin-bottom: 2.5rem; }
+    .memo-meta { text-align: left; }
+    h1 { font-size: 2.4rem; }
+    .mobile-only { display: block; }
+    .hero-grid, .hero-copy, .tag, .stats, .kg { max-width: calc(100vw - 2.5rem); min-width: 0; width: 100%; }
+    .stats, .kg { grid-template-columns: 1fr; }
+    .stats.four { grid-template-columns: repeat(2, 1fr); }
+    .tt, .ct { display: block; overflow-x: auto; white-space: nowrap; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header class="memo-hero">
+  <div class="topline">
+    <a class="brand" href="/">rvLLM</a>
+    <div class="memo-meta">TPU bench / April 27, 2026</div>
+  </div>
+  <div class="hero-grid">
+    <div class="hero-copy">
+      <p class="conf">M2 decode benchmark</p>
+      <h1>rvLLM on TPU</h1>
+      <p class="tag">MiniMax-M2.7-NVFP4 (230B / 10B active MoE) on v6e-8.<br class="mobile-only"> Rust + PJRT runtime vs JAX baseline. <span class="nowrap">62 layers, 256 experts, top-K=8.</span></p>
+    </div>
+    <figure class="product-shot live-workspace">
+      <div class="k">Hardware</div>
+      <div class="b">Google TPU v6e-8</div>
+      <p class="m">8 chips, 32 GB HBM each, 1.6 TB/s bandwidth, 256x256 MXU. INT8 = 2x bf16 FLOPS.</p>
+      <div class="status">
+        <span>8 chips</span>
+        <span>32 GB HBM</span>
+        <span>1.6 TB/s</span>
+      </div>
+      <figcaption class="shot-caption">
+        <span>v6e-8 / europe-west4-a</span>
+        <span>TPU VM</span>
+      </figcaption>
+    </figure>
+  </div>
+</header>
+
+<div class="stats">
+  <div class="s"><div class="n">714.9 <span style="font-size:0.6em;color:#aaa">tok/s</span></div><div class="l">rvLLM decode B=8 -- <span class="y">12.9x JAX throughput</span></div></div>
+  <div class="s"><div class="n">11.19 <span style="font-size:0.6em;color:#aaa">ms</span></div><div class="l">rvLLM ms/step B=8</div></div>
+  <div class="s"><div class="n">4.922</div><div class="l">JAX PPL on m2_ppl_corpus.txt <span class="badge badge-green">verified</span></div></div>
+</div>
+
+<div class="stats">
+  <div class="s"><div class="n">143.9 <span style="font-size:0.6em;color:#aaa">ms</span></div><div class="l">JAX baseline ms/step B=8</div></div>
+  <div class="s"><div class="n">155.8 <span style="font-size:0.6em;color:#aaa">GB</span></div><div class="l">int8 weight arena uploaded</div></div>
+  <div class="s"><div class="n">197,221</div><div class="l">rvLLM PPL (partial W1 body) <span class="badge badge-red">wip</span></div></div>
+</div>
+
+<h2>Decode throughput -- batch sweep</h2>
+<p>All results on the same v6e-8 slice, same model checkpoint, same prompt ("explain angular momentum"), ctx=2048, int8 KV cache.</p>
+
+<table class="tt">
+  <tr>
+    <th>Runtime</th>
+    <th>Batch</th>
+    <th class="r">ms/step</th>
+    <th class="r">tok/s</th>
+    <th class="r">PPL</th>
+    <th>Body status</th>
+  </tr>
+  <tr>
+    <td>JAX</td>
+    <td>1</td>
+    <td class="r">726.75</td>
+    <td class="r">1.38</td>
+    <td class="r m">--</td>
+    <td><span class="badge badge-green">complete</span></td>
+  </tr>
+  <tr>
+    <td>JAX</td>
+    <td>8</td>
+    <td class="r">143.91</td>
+    <td class="r">55.59</td>
+    <td class="r"><strong>4.922</strong></td>
+    <td><span class="badge badge-green">complete</span></td>
+  </tr>
+  <tr>
+    <td>JAX</td>
+    <td>16</td>
+    <td class="r">154.63</td>
+    <td class="r">103.47</td>
+    <td class="r m">--</td>
+    <td><span class="badge badge-green">complete</span></td>
+  </tr>
+  <tr>
+    <td>JAX</td>
+    <td>32</td>
+    <td class="r">186.87</td>
+    <td class="r">171.25</td>
+    <td class="r m">--</td>
+    <td><span class="badge badge-green">complete</span></td>
+  </tr>
+  <tr style="border-top:2px solid var(--border-strong)">
+    <td><strong>rvLLM</strong></td>
+    <td>8</td>
+    <td class="r"><strong>11.19</strong></td>
+    <td class="r"><strong>714.91</strong></td>
+    <td class="r"><span class="x">197,221</span><sup style="font-size:0.7em;color:var(--muted)">*</sup></td>
+    <td><span class="badge badge-amber">partial W1</span></td>
+  </tr>
+  <tr>
+    <td><strong>rvLLM</strong></td>
+    <td>8 <span class="m">(K128)</span></td>
+    <td class="r"><strong>11.39</strong></td>
+    <td class="r"><strong>702.65</strong></td>
+    <td class="r"><span class="x">197,221</span><sup style="font-size:0.7em;color:var(--muted)">*</sup></td>
+    <td><span class="badge badge-amber">partial W1</span></td>
+  </tr>
+</table>
+
+<div class="note">
+  <strong>* PPL caveat:</strong> rvLLM's 197,221 PPL is expected -- the Mosaic body only computes a partial W1 matmul (one 128-col tile of the 1536-col MLP up-projection). No RMSNorm, no attention, no MoE routing, no W2/W3. The throughput numbers are real but the logits are meaningless until the full layer body is wired.
+</div>
+
+<h2>JAX PPL history</h2>
+<p>Three separate JAX runs on different corpora and tokenization lengths. All on the same v6e-8 slice.</p>
+
+<table class="tt">
+  <tr>
+    <th>Run</th>
+    <th class="r">Tokens scored</th>
+    <th class="r">Avg NLL</th>
+    <th class="r">PPL</th>
+    <th>Corpus</th>
+  </tr>
+  <tr>
+    <td>JAX combined (newest)</td>
+    <td class="r">262</td>
+    <td class="r">1.594</td>
+    <td class="r"><strong>4.922</strong></td>
+    <td>m2_ppl_corpus.txt</td>
+  </tr>
+  <tr>
+    <td>JAX int8 correct</td>
+    <td class="r">318</td>
+    <td class="r">1.723</td>
+    <td class="r">5.602</td>
+    <td>default prompt</td>
+  </tr>
+  <tr>
+    <td>JAX full equiv baseline</td>
+    <td class="r">2,047</td>
+    <td class="r">1.907</td>
+    <td class="r">6.732</td>
+    <td>full context</td>
+  </tr>
+</table>
+
+<h2>Throughput scaling</h2>
+<p class="m">All points on one chart. X = batch size, left Y = tok/s, right Y = ms/step. JAX has B=1/8/16/32; rvLLM has B=8 (partial body).</p>
+
+<div class="chart-wrap">
+  <div class="chart-title">Decode performance vs batch size</div>
+  <canvas id="chart-main"></canvas>
+</div>
+
+<h2>rvLLM runtime details</h2>
+
+<div class="kg">
+  <div class="c"><div class="n">62</div><div class="l">Transformer layers</div></div>
+  <div class="c"><div class="n">191,069</div><div class="l">Weight tensors uploaded</div></div>
+  <div class="c"><div class="n">155.8 GB</div><div class="l">Int8 weight arena</div></div>
+  <div class="c"><div class="n">1.98 GB</div><div class="l">Int8 KV cache (B=8)</div></div>
+</div>
+
+<div class="kg">
+  <div class="c"><div class="n">24.18 s</div><div class="l">TTFT (K96 body, includes compile)</div></div>
+  <div class="c"><div class="n">12.85 s</div><div class="l">TTFT (K128 body, includes compile)</div></div>
+  <div class="c"><div class="n">K=128</div><div class="l">MXU tile stride (32 sublanes x 4)</div></div>
+  <div class="c"><div class="n">N=128</div><div class="l">W1 columns in body (of 1536 total)</div></div>
+</div>
+
+<h2>Body probe diagnostics</h2>
+<p>The body probe gate validates that the Mosaic custom_call body produces non-trivial output. It runs after the first decode step.</p>
+
+<table class="tt">
+  <tr>
+    <th>Check</th>
+    <th class="r">Value</th>
+    <th>Threshold</th>
+    <th>Status</th>
+  </tr>
+  <tr>
+    <td>Variance</td>
+    <td class="r">2.31e-3</td>
+    <td>> 1e-8</td>
+    <td class="g">pass</td>
+  </tr>
+  <tr>
+    <td>Range</td>
+    <td class="r">0.631</td>
+    <td>> 1e-3</td>
+    <td class="g">pass</td>
+  </tr>
+  <tr>
+    <td>Nonzero fraction</td>
+    <td class="r">0.99997</td>
+    <td>> 0.5</td>
+    <td class="g">pass</td>
+  </tr>
+  <tr>
+    <td>All finite</td>
+    <td class="r">true</td>
+    <td>true</td>
+    <td class="g">pass</td>
+  </tr>
+  <tr>
+    <td>Distinct top-1 tokens</td>
+    <td class="r">7 / 8</td>
+    <td>>= 2</td>
+    <td class="g">pass</td>
+  </tr>
+</table>
+
+<div class="note">
+  The body probe confirms the partial W1 body is <em>computing</em> -- it produces varied, finite, non-zero logits with distinct argmax across batch lanes. The problem is not a dead body; it's an <em>incomplete</em> body.
+</div>
+
+<h2>What's in the body vs what's missing</h2>
+
+<div class="kg">
+  <div class="c"><div class="n" style="color:var(--green)">Done</div><div class="l">Int8 W1 matmul (128 of 1536 cols)</div></div>
+  <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">RMSNorm (pre-attention + pre-MLP)</div></div>
+  <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">Attention (QKV + RoPE + KV cache + softmax + O)</div></div>
+  <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">MoE routing (top-8 of 256 experts)</div></div>
+  <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">W2 + W3 projections + SiLU activation</div></div>
+  <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">Residual connections</div></div>
+</div>
+
+<h2>Path to real PPL</h2>
+<p>Three paths were evaluated. The plan is to extract the JAX layer, lower to StableHLO, and link as a Mosaic body.</p>
+
+<table class="ct">
+  <tr>
+    <th>Path</th>
+    <th>Approach</th>
+    <th class="r">Est. hours</th>
+    <th>PPL target</th>
+  </tr>
+  <tr class="us">
+    <td>JAX-extract body</td>
+    <td>JIT-lower JAX layer to StableHLO, serialize via mosaic-serde, link into rvLLM graph</td>
+    <td class="r">8-16</td>
+    <td>~4.9</td>
+  </tr>
+  <tr>
+    <td>Pure StableHLO inline</td>
+    <td>Emit full layer math as inline StableHLO ops in Rust (no Mosaic body)</td>
+    <td class="r">12-16</td>
+    <td>~4.9</td>
+  </tr>
+  <tr>
+    <td>Pallas kernel</td>
+    <td>Write M2 layer as pl.pallas_call, lower via JAX, produces valid Mosaic bytecode</td>
+    <td class="r">16-24</td>
+    <td>~4.9</td>
+  </tr>
+</table>
+
+<div class="note">
+  <strong>Blocker found:</strong> JAX-emitted StableHLO bytecode was rejected at the Mosaic body slot -- PJRT enforces <code>stable_mosaic.version</code> attrs that JAX lowering doesn't produce. The current plan wraps the full JAX decode graph (not just the body) so rvLLM consumes it as a complete StableHLO program via PJRT.
+</div>
+
+<h2>What's real vs what's scaffolding</h2>
+
+<table class="tt">
+  <tr>
+    <th>Component</th>
+    <th>Status</th>
+  </tr>
+  <tr>
+    <td>62-layer StableHLO decode graph</td>
+    <td class="g">Real, compiles on TPU</td>
+  </tr>
+  <tr>
+    <td>Int8 weight arena (155.8 GB upload)</td>
+    <td class="g">Real, NVFP4-to-int8 at load time</td>
+  </tr>
+  <tr>
+    <td>Int8 KV cache allocation</td>
+    <td class="g">Real, 1.98 GB at B=8</td>
+  </tr>
+  <tr>
+    <td>PJRT execution + timing</td>
+    <td class="g">Real, 8 warmup + 8 measured iters</td>
+  </tr>
+  <tr>
+    <td>Embed gather + lm_head dot</td>
+    <td class="g">Real, in graph</td>
+  </tr>
+  <tr>
+    <td>Body probe gate</td>
+    <td class="g">Real, enforced per-batch</td>
+  </tr>
+  <tr>
+    <td>Mosaic body (layer math)</td>
+    <td><span class="a">Partial W1 only</span> -- 128 of 1536 cols, no attention/MoE</td>
+  </tr>
+  <tr>
+    <td>PPL scoring</td>
+    <td><span class="x">Invalid</span> until body is complete</td>
+  </tr>
+  <tr>
+    <td>Text generation</td>
+    <td><span class="x">Invalid</span> -- 0% top-1 match</td>
+  </tr>
+</table>
+
+<hr class="div">
+
+<p class="foot">rvLLM -- <a href="https://github.com/m0at/rvllm" style="color:var(--accent);text-decoration:none">github.com/m0at/rvllm</a> -- v6e-8 bench, April 27, 2026</p>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script>
+var grid = '#181818';
+var tick = '#999';
+var jax = '#0070f3';
+var jaxFill = 'rgba(0,112,243,0.08)';
+var rv = '#22c55e';
+var rvFill = 'rgba(34,197,94,0.08)';
+var msJax = '#8b5cf6';
+var msRv = '#f59e0b';
+
+new Chart(document.getElementById('chart-main'), {
+  type: 'scatter',
+  data: {
+    datasets: [
+      {
+        label: 'JAX tok/s',
+        data: [{x:1,y:1.38},{x:8,y:55.59},{x:16,y:103.47},{x:32,y:171.25}],
+        borderColor: jax,
+        backgroundColor: jax,
+        pointRadius: 7,
+        pointHoverRadius: 10,
+        pointStyle: 'circle',
+        showLine: true,
+        borderWidth: 2,
+        fill: { target: 'origin', above: jaxFill },
+        tension: 0.3,
+        yAxisID: 'y'
+      },
+      {
+        label: 'rvLLM tok/s (partial)',
+        data: [{x:8,y:714.91}],
+        borderColor: rv,
+        backgroundColor: rv,
+        pointRadius: 10,
+        pointHoverRadius: 13,
+        pointStyle: 'rectRot',
+        showLine: false,
+        borderWidth: 2,
+        yAxisID: 'y'
+      },
+      {
+        label: 'JAX ms/step',
+        data: [{x:1,y:726.75},{x:8,y:143.91},{x:16,y:154.63},{x:32,y:186.87}],
+        borderColor: msJax,
+        backgroundColor: msJax,
+        pointRadius: 6,
+        pointHoverRadius: 9,
+        pointStyle: 'triangle',
+        showLine: true,
+        borderWidth: 2,
+        borderDash: [6,3],
+        fill: false,
+        tension: 0.3,
+        yAxisID: 'y1'
+      },
+      {
+        label: 'rvLLM ms/step (partial)',
+        data: [{x:8,y:11.19}],
+        borderColor: msRv,
+        backgroundColor: msRv,
+        pointRadius: 10,
+        pointHoverRadius: 13,
+        pointStyle: 'star',
+        showLine: false,
+        borderWidth: 2,
+        yAxisID: 'y1'
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'nearest', intersect: false },
+    plugins: {
+      legend: {
+        position: 'top',
+        align: 'end',
+        labels: {
+          color: tick,
+          font: { size: 12, family: 'Helvetica Neue, Helvetica, Arial, sans-serif' },
+          boxWidth: 14,
+          padding: 18,
+          usePointStyle: true
+        }
+      },
+      tooltip: {
+        backgroundColor: '#111',
+        titleColor: '#fff',
+        bodyColor: '#ccc',
+        borderColor: '#333',
+        borderWidth: 1,
+        padding: 10,
+        titleFont: { size: 13, weight: 700 },
+        bodyFont: { size: 12 },
+        callbacks: {
+          title: function(ctx) { return 'Batch ' + ctx[0].parsed.x; },
+          label: function(ctx) {
+            var u = ctx.dataset.yAxisID === 'y1' ? ' ms' : ' tok/s';
+            return ctx.dataset.label + ': ' + ctx.parsed.y.toLocaleString() + u;
+          }
+        }
+      }
+    },
+    scales: {
+      x: {
+        type: 'linear',
+        position: 'bottom',
+        grid: { color: grid },
+        ticks: {
+          color: tick,
+          font: { size: 12 },
+          stepSize: 8,
+          callback: function(v) { return 'B=' + v; }
+        },
+        title: { display: true, text: 'Batch size', color: tick, font: { size: 12 } },
+        min: 0,
+        max: 36
+      },
+      y: {
+        type: 'linear',
+        position: 'left',
+        grid: { color: grid },
+        ticks: { color: jax, font: { size: 12 } },
+        title: { display: true, text: 'tok/s', color: jax, font: { size: 12, weight: 700 } },
+        min: 0,
+        max: 800
+      },
+      y1: {
+        type: 'linear',
+        position: 'right',
+        grid: { drawOnChartArea: false },
+        ticks: { color: msJax, font: { size: 12 } },
+        title: { display: true, text: 'ms/step', color: msJax, font: { size: 12, weight: 700 } },
+        min: 0,
+        max: 800
+      }
+    }
+  }
+});
+</script>
+
+</body>
+</html>
