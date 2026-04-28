@@ -123,7 +123,7 @@
 <header class="memo-hero">
   <div class="topline">
     <a class="brand" href="/">rvLLM</a>
-    <div class="memo-meta">TPU bench / April 27, 2026</div>
+    <div class="memo-meta">TPU bench / April 28, 2026</div>
   </div>
   <div class="hero-grid">
     <div class="hero-copy">
@@ -149,15 +149,15 @@
 </header>
 
 <div class="stats">
-  <div class="s"><div class="n">714.9 <span style="font-size:0.6em;color:#aaa">tok/s</span></div><div class="l">rvLLM decode B=8 -- <span class="y">12.9x JAX throughput</span></div></div>
-  <div class="s"><div class="n">11.19 <span style="font-size:0.6em;color:#aaa">ms</span></div><div class="l">rvLLM ms/step B=8</div></div>
+  <div class="s"><div class="n">135.6 <span style="font-size:0.6em;color:#aaa">tok/s</span></div><div class="l">rvLLM StableHLO decode B=16 -- <span class="y">attention path executing</span></div></div>
+  <div class="s"><div class="n">68.62 <span style="font-size:0.6em;color:#aaa">ms</span></div><div class="l">rvLLM StableHLO ms/step B=8</div></div>
   <div class="s"><div class="n">4.922</div><div class="l">JAX PPL on m2_ppl_corpus.txt <span class="badge badge-green">verified</span></div></div>
 </div>
 
 <div class="stats">
   <div class="s"><div class="n">143.9 <span style="font-size:0.6em;color:#aaa">ms</span></div><div class="l">JAX baseline ms/step B=8</div></div>
-  <div class="s"><div class="n">155.8 <span style="font-size:0.6em;color:#aaa">GB</span></div><div class="l">int8 weight arena uploaded</div></div>
-  <div class="s"><div class="n">197,221</div><div class="l">rvLLM PPL (partial W1 body) <span class="badge badge-red">wip</span></div></div>
+  <div class="s"><div class="n">5.56 <span style="font-size:0.6em;color:#aaa">GB</span></div><div class="l">bf16 dense arena uploaded</div></div>
+  <div class="s"><div class="n">B=32</div><div class="l">blocked by XLA 32-bit shape indices <span class="badge badge-red">limit</span></div></div>
 </div>
 
 <h2>Decode throughput -- batch sweep</h2>
@@ -205,25 +205,41 @@
     <td><span class="badge badge-green">complete</span></td>
   </tr>
   <tr style="border-top:2px solid var(--border-strong)">
-    <td><strong>rvLLM</strong></td>
-    <td>8</td>
-    <td class="r"><strong>11.19</strong></td>
-    <td class="r"><strong>714.91</strong></td>
-    <td class="r"><span class="x">197,221</span><sup style="font-size:0.7em;color:var(--muted)">*</sup></td>
-    <td><span class="badge badge-amber">partial W1</span></td>
+    <td><strong>rvLLM StableHLO</strong></td>
+    <td>1</td>
+    <td class="r"><strong>21.53</strong></td>
+    <td class="r"><strong>46.46</strong></td>
+    <td class="r"><span class="x">2.11e21</span><sup style="font-size:0.7em;color:var(--muted)">*</sup></td>
+    <td><span class="badge badge-amber">attention only</span></td>
   </tr>
   <tr>
-    <td><strong>rvLLM</strong></td>
-    <td>8 <span class="m">(K128)</span></td>
-    <td class="r"><strong>11.39</strong></td>
-    <td class="r"><strong>702.65</strong></td>
-    <td class="r"><span class="x">197,221</span><sup style="font-size:0.7em;color:var(--muted)">*</sup></td>
-    <td><span class="badge badge-amber">partial W1</span></td>
+    <td><strong>rvLLM StableHLO</strong></td>
+    <td>8</td>
+    <td class="r"><strong>68.62</strong></td>
+    <td class="r"><strong>116.58</strong></td>
+    <td class="r"><span class="x">9.79e45</span><sup style="font-size:0.7em;color:var(--muted)">*</sup></td>
+    <td><span class="badge badge-amber">attention only</span></td>
+  </tr>
+  <tr>
+    <td><strong>rvLLM StableHLO</strong></td>
+    <td>16</td>
+    <td class="r"><strong>117.95</strong></td>
+    <td class="r"><strong>135.65</strong></td>
+    <td class="r"><span class="x">1.00e24</span><sup style="font-size:0.7em;color:var(--muted)">*</sup></td>
+    <td><span class="badge badge-amber">attention only</span></td>
+  </tr>
+  <tr>
+    <td><strong>rvLLM StableHLO</strong></td>
+    <td>32</td>
+    <td class="r m">--</td>
+    <td class="r m">--</td>
+    <td class="r m">--</td>
+    <td><span class="badge badge-red">XLA shape-index limit</span></td>
   </tr>
 </table>
 
 <div class="note">
-  <strong>* PPL caveat:</strong> rvLLM's 197,221 PPL is expected -- the Mosaic body only computes a partial W1 matmul (one 128-col tile of the 1536-col MLP up-projection). No RMSNorm, no attention, no MoE routing, no W2/W3. The throughput numbers are real but the logits are meaningless until the full layer body is wired.
+  <strong>* PPL caveat:</strong> rvLLM StableHLO now executes RMSNorm + QKV attention + KV update + O projection across all 62 layers, with live logits and passing observability checks. PPL/top-1 are still invalid because the MoE block is currently bypassed. B=32 emits, but compile fails because XLA rewrites away x64 indices and rejects the 8.32 GB monolithic KV tensor.
 </div>
 
 <h2>JAX PPL history</h2>
@@ -261,7 +277,7 @@
 </table>
 
 <h2>Throughput scaling</h2>
-<p class="m">All points on one chart. X = batch size, left Y = tok/s, right Y = ms/step. JAX has B=1/8/16/32; rvLLM has B=8 (partial body).</p>
+<p class="m">All points on one chart. X = batch size, left Y = tok/s, right Y = ms/step. JAX has B=1/8/16/32; rvLLM StableHLO executed B=1/8/16 and B=32 is blocked by XLA shape indexing.</p>
 
 <div class="chart-wrap">
   <div class="chart-title">Decode performance vs batch size</div>
@@ -272,20 +288,20 @@
 
 <div class="kg">
   <div class="c"><div class="n">62</div><div class="l">Transformer layers</div></div>
-  <div class="c"><div class="n">191,069</div><div class="l">Weight tensors uploaded</div></div>
-  <div class="c"><div class="n">155.8 GB</div><div class="l">Int8 weight arena</div></div>
-  <div class="c"><div class="n">1.98 GB</div><div class="l">Int8 KV cache (B=8)</div></div>
+  <div class="c"><div class="n">9</div><div class="l">Runtime inputs (StableHLO path)</div></div>
+  <div class="c"><div class="n">5.56 GB</div><div class="l">Dense bf16 weight arena</div></div>
+  <div class="c"><div class="n">1.94 GB</div><div class="l">Int8 KV cache (B=8)</div></div>
 </div>
 
 <div class="kg">
-  <div class="c"><div class="n">24.18 s</div><div class="l">TTFT (K96 body, includes compile)</div></div>
-  <div class="c"><div class="n">12.85 s</div><div class="l">TTFT (K128 body, includes compile)</div></div>
-  <div class="c"><div class="n">K=128</div><div class="l">MXU tile stride (32 sublanes x 4)</div></div>
-  <div class="c"><div class="n">N=128</div><div class="l">W1 columns in body (of 1536 total)</div></div>
+  <div class="c"><div class="n">6.72 s</div><div class="l">B=8 TTFT (includes compile)</div></div>
+  <div class="c"><div class="n">6.86 s</div><div class="l">B=16 TTFT (includes compile)</div></div>
+  <div class="c"><div class="n">1 byte</div><div class="l">Placeholder weight_arena input</div></div>
+  <div class="c"><div class="n">8.32 GB</div><div class="l">B=32 KV tensor that trips XLA indices</div></div>
 </div>
 
 <h2>Body probe diagnostics</h2>
-<p>The body probe gate validates that the Mosaic custom_call body produces non-trivial output. It runs after the first decode step.</p>
+<p>The body probe gate validates that the StableHLO graph produces non-trivial logits. It runs after the first decode step.</p>
 
 <table class="tt">
   <tr>
@@ -296,19 +312,19 @@
   </tr>
   <tr>
     <td>Variance</td>
-    <td class="r">2.31e-3</td>
+    <td class="r">3.34e2</td>
     <td>> 1e-8</td>
     <td class="g">pass</td>
   </tr>
   <tr>
     <td>Range</td>
-    <td class="r">0.631</td>
+    <td class="r">267.5</td>
     <td>> 1e-3</td>
     <td class="g">pass</td>
   </tr>
   <tr>
     <td>Nonzero fraction</td>
-    <td class="r">0.99997</td>
+    <td class="r">1.000</td>
     <td>> 0.5</td>
     <td class="g">pass</td>
   </tr>
@@ -320,29 +336,29 @@
   </tr>
   <tr>
     <td>Distinct top-1 tokens</td>
-    <td class="r">7 / 8</td>
+    <td class="r">8 / 8</td>
     <td>>= 2</td>
     <td class="g">pass</td>
   </tr>
 </table>
 
 <div class="note">
-  The body probe confirms the partial W1 body is <em>computing</em> -- it produces varied, finite, non-zero logits with distinct argmax across batch lanes. The problem is not a dead body; it's an <em>incomplete</em> body.
+  The body probe confirms the StableHLO attention path is <em>computing</em> -- it produces varied, finite, non-zero logits with distinct argmax across batch lanes. The remaining correctness gap is the missing MoE block.
 </div>
 
-<h2>What's in the body vs what's missing</h2>
+<h2>What's in the graph vs what's missing</h2>
 
 <div class="kg">
-  <div class="c"><div class="n" style="color:var(--green)">Done</div><div class="l">Int8 W1 matmul (128 of 1536 cols)</div></div>
-  <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">RMSNorm (pre-attention + pre-MLP)</div></div>
-  <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">Attention (QKV + RoPE + KV cache + softmax + O)</div></div>
+  <div class="c"><div class="n" style="color:var(--green)">Done</div><div class="l">RMSNorm (pre-attention + pre-MLP)</div></div>
+  <div class="c"><div class="n" style="color:var(--green)">Done</div><div class="l">Attention (QKV + RoPE + KV cache + softmax + O)</div></div>
+  <div class="c"><div class="n" style="color:var(--green)">Done</div><div class="l">Residual connections</div></div>
   <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">MoE routing (top-8 of 256 experts)</div></div>
   <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">W2 + W3 projections + SiLU activation</div></div>
-  <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">Residual connections</div></div>
+  <div class="c"><div class="n" style="color:var(--red)">Missing</div><div class="l">Split KV layout for B=32</div></div>
 </div>
 
 <h2>Path to real PPL</h2>
-<p>Three paths were evaluated. The plan is to extract the JAX layer, lower to StableHLO, and link as a Mosaic body.</p>
+<p>The active path is pure StableHLO inline: keep the graph in PJRT-native StableHLO, add the MoE block, then split KV so B=32 no longer needs a single >2^31 element tensor.</p>
 
 <table class="ct">
   <tr>
@@ -352,27 +368,27 @@
     <th>PPL target</th>
   </tr>
   <tr class="us">
-    <td>JAX-extract body</td>
-    <td>JIT-lower JAX layer to StableHLO, serialize via mosaic-serde, link into rvLLM graph</td>
+    <td>Pure StableHLO inline</td>
+    <td>Add native MoE router + expert path, keep dense weights as bf16 input arena</td>
     <td class="r">8-16</td>
     <td>~4.9</td>
   </tr>
   <tr>
-    <td>Pure StableHLO inline</td>
-    <td>Emit full layer math as inline StableHLO ops in Rust (no Mosaic body)</td>
-    <td class="r">12-16</td>
+    <td>Split KV layout</td>
+    <td>Shard KV by layer or device-visible chunks so B=32 avoids >32-bit HLO shape indices</td>
+    <td class="r">4-8</td>
     <td>~4.9</td>
   </tr>
   <tr>
-    <td>Pallas kernel</td>
-    <td>Write M2 layer as pl.pallas_call, lower via JAX, produces valid Mosaic bytecode</td>
+    <td>JAX reference parity</td>
+    <td>Compare per-layer hidden states after attention and after MoE against JAX</td>
     <td class="r">16-24</td>
     <td>~4.9</td>
   </tr>
 </table>
 
 <div class="note">
-  <strong>Blocker found:</strong> JAX-emitted StableHLO bytecode was rejected at the Mosaic body slot -- PJRT enforces <code>stable_mosaic.version</code> attrs that JAX lowering doesn't produce. The current plan wraps the full JAX decode graph (not just the body) so rvLLM consumes it as a complete StableHLO program via PJRT.
+  <strong>Current blocker:</strong> B=32 compile fails after emit because XLA refuses a dynamic-update-slice on the 8.32 GB int8 KV tensor when shape indices exceed 32 bits. B=1, B=8, and B=16 execute end to end.
 </div>
 
 <h2>What's real vs what's scaffolding</h2>
@@ -383,16 +399,16 @@
     <th>Status</th>
   </tr>
   <tr>
-    <td>62-layer StableHLO decode graph</td>
-    <td class="g">Real, compiles on TPU</td>
+    <td>62-layer StableHLO attention graph</td>
+    <td class="g">Real, compiles and executes on TPU for B=1/8/16</td>
   </tr>
   <tr>
-    <td>Int8 weight arena (155.8 GB upload)</td>
-    <td class="g">Real, NVFP4-to-int8 at load time</td>
+    <td>Dense bf16 weight arena (5.56 GB upload)</td>
+    <td class="g">Real, sliced directly as bf16 to avoid TPU tiling blowup</td>
   </tr>
   <tr>
     <td>Int8 KV cache allocation</td>
-    <td class="g">Real, 1.98 GB at B=8</td>
+    <td class="g">Real, 1.94 GB at B=8; B=32 needs split layout</td>
   </tr>
   <tr>
     <td>PJRT execution + timing</td>
@@ -407,8 +423,8 @@
     <td class="g">Real, enforced per-batch</td>
   </tr>
   <tr>
-    <td>Mosaic body (layer math)</td>
-    <td><span class="a">Partial W1 only</span> -- 128 of 1536 cols, no attention/MoE</td>
+    <td>Layer math</td>
+    <td><span class="a">Attention complete</span> -- MoE still bypassed</td>
   </tr>
   <tr>
     <td>PPL scoring</td>
@@ -422,7 +438,7 @@
 
 <hr class="div">
 
-<p class="foot">rvLLM -- <a href="https://github.com/m0at/rvllm" style="color:var(--accent);text-decoration:none">github.com/m0at/rvllm</a> -- v6e-8 bench, April 27, 2026</p>
+<p class="foot">rvLLM -- <a href="https://github.com/m0at/rvllm" style="color:var(--accent);text-decoration:none">github.com/m0at/rvllm</a> -- v6e-8 bench, April 28, 2026</p>
 
 </div>
 
@@ -456,14 +472,14 @@ new Chart(document.getElementById('chart-main'), {
         yAxisID: 'y'
       },
       {
-        label: 'rvLLM tok/s (partial)',
-        data: [{x:8,y:714.91}],
+        label: 'rvLLM StableHLO tok/s',
+        data: [{x:1,y:46.46},{x:8,y:116.58},{x:16,y:135.65}],
         borderColor: rv,
         backgroundColor: rv,
-        pointRadius: 10,
+        pointRadius: 8,
         pointHoverRadius: 13,
         pointStyle: 'rectRot',
-        showLine: false,
+        showLine: true,
         borderWidth: 2,
         yAxisID: 'y'
       },
@@ -483,14 +499,14 @@ new Chart(document.getElementById('chart-main'), {
         yAxisID: 'y1'
       },
       {
-        label: 'rvLLM ms/step (partial)',
-        data: [{x:8,y:11.19}],
+        label: 'rvLLM StableHLO ms/step',
+        data: [{x:1,y:21.53},{x:8,y:68.62},{x:16,y:117.95}],
         borderColor: msRv,
         backgroundColor: msRv,
-        pointRadius: 10,
+        pointRadius: 8,
         pointHoverRadius: 13,
         pointStyle: 'star',
-        showLine: false,
+        showLine: true,
         borderWidth: 2,
         yAxisID: 'y1'
       }
@@ -552,7 +568,7 @@ new Chart(document.getElementById('chart-main'), {
         ticks: { color: jax, font: { size: 12 } },
         title: { display: true, text: 'tok/s', color: jax, font: { size: 12, weight: 700 } },
         min: 0,
-        max: 800
+        max: 200
       },
       y1: {
         type: 'linear',

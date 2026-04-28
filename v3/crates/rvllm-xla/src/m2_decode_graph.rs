@@ -813,10 +813,10 @@ fn emit_stablehlo_layer(
         p("k_roped"), p("k_rot_in"), p("k_pass"), b, kvh, rd, b, kvh, non_rot, b, kvh, hd);
 
     // --- KV cache: extract layer slice, write new K/V, read full history ---
-    w!("{} = stablehlo.constant dense<{}> : tensor<i32>", p("lkv_off"), lkv_offset);
+    w!("{} = stablehlo.constant dense<{}> : tensor<i64>", p("lkv_off"), lkv_offset);
     w!("{} = \"stablehlo.dynamic_slice\"({}, {}) {{", p("lkv"), kv_in, p("lkv_off"));
     w!("  slice_sizes = array<i64: {}>", lkv_bytes);
-    w!("}} : (tensor<{}xi8>, tensor<i32>) -> tensor<{}xi8>", kv_bytes, lkv_bytes);
+    w!("}} : (tensor<{}xi8>, tensor<i64>) -> tensor<{}xi8>", kv_bytes, lkv_bytes);
 
     // Reshape layer KV to [2, B, ctx, kvh, hd] for bf16 or [2, B, ctx, kvh, hd] for i8
     if kv_bpe == 2 {
@@ -1000,8 +1000,8 @@ fn emit_stablehlo_layer(
 
     // --- Write updated KV back to global cache ---
     let next_kv = format!("%kv_after_l{}", l);
-    w!("{} = stablehlo.constant dense<{}> : tensor<i32>", p("lkv_off_out"), lkv_offset);
-    w!("{} = \"stablehlo.dynamic_update_slice\"({}, {}, {}) : (tensor<{}xi8>, tensor<{}xi8>, tensor<i32>) -> tensor<{}xi8>",
+    w!("{} = stablehlo.constant dense<{}> : tensor<i64>", p("lkv_off_out"), lkv_offset);
+    w!("{} = \"stablehlo.dynamic_update_slice\"({}, {}, {}) : (tensor<{}xi8>, tensor<{}xi8>, tensor<i64>) -> tensor<{}xi8>",
         next_kv, kv_in, p("lkv_out"), p("lkv_off_out"), kv_bytes, lkv_bytes, kv_bytes);
 
     Ok((next_hidden, next_kv))
