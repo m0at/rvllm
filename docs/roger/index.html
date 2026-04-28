@@ -242,30 +242,38 @@
   <strong>* PPL caveat:</strong> rvLLM StableHLO now executes RMSNorm + QKV attention + KV update + O projection across all 62 layers, with live logits and passing observability checks. PPL/top-1 are still invalid because the MoE block is currently bypassed. B=32 emits, but compile fails because XLA rewrites away x64 indices and rejects the 8.32 GB monolithic KV tensor.
 </div>
 
-<h2>1k-token correctness sample</h2>
-<p>This is the actual PPL sanity check for the current StableHLO path, not the old Mosaic body numbers and not a sampled reply. PPL is a teacher-forced next-token metric by definition: feed token <em>t</em>, score token <em>t+1</em>. The answer path can still produce an up-to-1k-token reply, but this check verifies the PPL is not secretly low yet.</p>
+<h2>1k-token sample</h2>
+<p>Two separate 1k-token checks were run on the current StableHLO path, not the old Mosaic body. The free-run sample verifies the reply loop can execute up to 1,000 generated tokens. The teacher-forced sample verifies PPL is not secretly low yet.</p>
 
 <table class="tt">
   <tr>
     <th>Run</th>
-    <th class="r">Tokens scored</th>
-    <th class="r">Avg NLL</th>
-    <th class="r">PPL</th>
-    <th class="r">Top-1</th>
+    <th class="r">Tokens</th>
+    <th class="r">ms/token</th>
+    <th class="r">tok/s</th>
+    <th class="r">Correctness</th>
     <th>Status</th>
   </tr>
   <tr>
-    <td>StableHLO B=1 correctness sample</td>
+    <td>StableHLO B=1 free-run reply</td>
     <td class="r">1,000</td>
-    <td class="r">142.235</td>
-    <td class="r"><span class="x">5.92e61</span></td>
-    <td class="r">0.0%</td>
-    <td><span class="badge badge-red">PPL bad, expected</span></td>
+    <td class="r">24.03</td>
+    <td class="r">41.62</td>
+    <td class="r m">not a PPL run</td>
+    <td><span class="badge badge-green">reply loop executed</span></td>
+  </tr>
+  <tr>
+    <td>StableHLO B=1 teacher-forced PPL</td>
+    <td class="r">1,000</td>
+    <td class="r m">--</td>
+    <td class="r m">--</td>
+    <td class="r"><span class="x">PPL 5.92e61 / top-1 0%</span></td>
+    <td><span class="badge badge-red">quality not correct</span></td>
   </tr>
 </table>
 
 <div class="note">
-  The 1k-token sample confirms the model is not at real language-model correctness yet: PPL is extremely high and top-1 next-token match is zero. That does not contradict the up-to-1k reply smoke working as an execution path; it means the generated answer should not be treated as model-quality evidence until MoE is wired and PPL comes down.
+  The 1k free-run produced a full 1,000-token reply, so the generation path itself works. The decoded text is repetitive/garbled, and the separate 1k teacher-forced check gives avg NLL 142.235, PPL 5.92e61, top-1 0%. So this is execution progress, not model-quality correctness; MoE still has to be wired before the answer should read well.
 </div>
 
 <h2>JAX PPL history</h2>

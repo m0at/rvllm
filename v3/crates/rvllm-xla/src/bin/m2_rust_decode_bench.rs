@@ -99,6 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut nll = Vec::new();
         let mut top1_hits = 0usize;
         let mut top1_total = 0usize;
+        let mut generated_token_ids = Vec::new();
+        let mut generated_text = None;
         #[cfg(feature = "tpu")]
         let mut last_observability: Option<M2LogitsObservabilityReport> = None;
         for (item, executed) in report.sweep.iter_mut().zip(executed) {
@@ -109,6 +111,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             top1_hits += executed.top1_hits;
             top1_total += executed.top1_total;
+            if generated_token_ids.is_empty() && !executed.generated_token_ids.is_empty() {
+                generated_token_ids = executed.generated_token_ids.clone();
+                generated_text = executed.generated_text.clone();
+            }
             item.timing = Some(executed.timing);
             #[cfg(feature = "tpu")]
             {
@@ -125,13 +131,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "ppl": ppl.ppl,
             }));
         }
-        if top1_total > 0 {
+        if !generated_token_ids.is_empty() {
             report.generation.status = "executed";
             report.generation.result = Some(serde_json::json!({
-                "top1_match_rate": top1_hits as f64 / top1_total as f64,
+                "generated_tokens": generated_token_ids.len(),
+                "generated_token_ids": generated_token_ids,
+                "text": generated_text,
+                "top1_match_rate": if top1_total > 0 { Some(top1_hits as f64 / top1_total as f64) } else { None },
                 "matched": top1_hits,
                 "total": top1_total,
-                "note": "teacher-forced decode argmax vs next-token target; no sampling",
+                "note": "free-run argmax token generation; top1 fields are present only when teacher targets are provided",
             }));
         }
         #[cfg(feature = "tpu")]
@@ -170,6 +179,8 @@ struct ExecutedDecodeArtifact {
     ppl: Option<M2RustDecodePplResult>,
     top1_hits: usize,
     top1_total: usize,
+    generated_token_ids: Vec<i32>,
+    generated_text: Option<String>,
     #[cfg(feature = "tpu")]
     observability: Option<M2LogitsObservabilityReport>,
 }
@@ -532,6 +543,7 @@ fn execute_decode_artifacts(
         let mut top1_hits = 0usize;
         let mut top1_total = 0usize;
         let mut observability: Option<M2LogitsObservabilityReport> = None;
+        let mut generated_token_ids = Vec::new();
         for step in 0..(args.warmup + args.iters) {
             if let Some(tokens) = &teacher {
                 if tokens.has_input(step) {
@@ -648,7 +660,11 @@ fn execute_decode_artifacts(
                 }
             }
             if let Some(logits) = logits.as_ref() {
-                token_ids = m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
+                let next_tokens = m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
+                if step >= args.warmup {
+                    generated_token_ids.extend_from_slice(&next_tokens);
+                }
+                token_ids = next_tokens;
             }
             for pos in &mut positions {
                 *pos += 1;
@@ -718,11 +734,18 @@ fn execute_decode_artifacts(
             enforce_body_probe_if_enabled(report)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         }
+        let generated_text = if artifact.shape.batch == 1 && !generated_token_ids.is_empty() {
+            Some(decode_token_ids(&args.model_dir, &generated_token_ids)?)
+        } else {
+            None
+        };
         out.push(ExecutedDecodeArtifact {
             timing,
             ppl,
             top1_hits,
             top1_total,
+            generated_token_ids,
+            generated_text,
             observability,
         });
     }
@@ -919,6 +942,25 @@ fn tokenize_text(model_dir: &Path, text: &str) -> Result<Vec<i32>, Box<dyn std::
         .encode(text, false)
         .map_err(|e| format!("tokenize text: {e}"))?;
     Ok(encoding.get_ids().iter().map(|id| *id as i32).collect())
+}
+
+#[cfg(feature = "tpu")]
+fn decode_token_ids(
+    model_dir: &Path,
+    ids: &[i32],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| format!("load tokenizer {}: {e}", tokenizer_path.display()))?;
+    let ids = ids
+        .iter()
+        .map(|id| {
+            u32::try_from(*id).map_err(|_| format!("generated token id out of range: {id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    tokenizer
+        .decode(&ids, true)
+        .map_err(|e| format!("decode token ids: {e}").into())
 }
 
 #[cfg(feature = "tpu")]
