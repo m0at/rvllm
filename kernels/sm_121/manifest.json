@@ -157,9 +157,9 @@
       "sha256": "f197ddfd6e93f6ba7c3852a0d7f7c45cf968621a3c00597c28ee109c1e762ada"
     },
     "fused_norm_add_residual_bf16": {
-      "bytes": 26723,
+      "bytes": 40236,
       "path": "fused_norm_add_residual_bf16.ptx",
-      "sha256": "b7776acb4d8eab7178b4d593ec780e4d7e3a2a98166c02f2109c97dd4750c113"
+      "sha256": "684269357fd6dc80046c97137f397cfe3b0dc386a7633610e6a089f36f606c7f"
     },
     "fused_norm_add_residual_f16": {
       "bytes": 27355,
@@ -322,5 +322,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "afb7243"
+  "revision": "08d3dfe"
 }

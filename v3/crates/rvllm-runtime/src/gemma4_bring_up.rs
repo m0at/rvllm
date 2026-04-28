@@ -148,6 +148,11 @@ pub struct Gemma4FusedModules {
     pub fn_f16_to_bf16: KernelFn,
     pub fn_fused_norm_add_residual_bf16: KernelFn,
     pub fn_fused_norm_add_residual_bf16_f16in: KernelFn,
+    /// Cycle 55 step 19 (Phase B): bf16-input + bf16-residual variant
+    /// for the FULL_CHAIN dispatch where Fp8GemvBf16In produces bf16
+    /// GEMV output directly. Eliminates the f16 narrow at the
+    /// epilogue boundary that the `_bf16_f16in` variant required.
+    pub fn_fused_norm_add_residual_bf16_bf16in: KernelFn,
     pub fn_fused_rmsnorm_fp8_quant_bf16in: KernelFn,
     pub fn_f32_to_bf16: KernelFn,
     pub fn_f32_to_f16_sat: KernelFn,
@@ -492,25 +497,38 @@ pub fn bf16_disable_rope() -> bool {
     parse_truthy_env("RVLLM_BF16_DISABLE_ROPE").unwrap_or(false)
 }
 
-/// Cycle 55 step 13 experimental: enable bf16-native dispatch on the
-/// M=1 decode QKV F16-in fast path (the production decode hot path).
-/// When ON, the residual is consumed as bf16 directly by
-/// `rmsnorm_inplace_bf16` + `Fp8GemvBf16In`, with a bf16→f16-sat
-/// narrow at the GEMV output to keep the downstream RoPE+attention
-/// chain on f16. **Default OFF** because empirical testing in
-/// iteration 12 showed long-context regression — bf16-rmsnorm
-/// produces subtly different rms values than the f16-narrowed
-/// rmsnorm, and that compounds across 60 layers × 17k tokens into
-/// gibberish at the WHO@17k webhook probe. Short prompts (40 tokens)
-/// were unaffected.
+/// Cycle 55 step 13/18: bf16-native dispatch on the M=1 decode QKV
+/// F16-in fast path (the production decode hot path). When ON, the
+/// residual is consumed as bf16 directly by `rmsnorm_inplace_bf16` +
+/// `Fp8GemvBf16In`, with a bf16→f16-sat narrow at the GEMV output to
+/// keep the downstream RoPE+attention chain on f16.
 ///
-/// Kept in code as an opt-in research path for diagnosing the
-/// precision compounding mechanism. Future steps will need to address
-/// the long-context regression before this becomes a production
-/// default.
+/// **Default OFF (reverted from step-19's brief flip-to-ON).**
+/// Iteration-16's "3/3 WHO@17k coherent" reading turned out to be
+/// non-reproducible under iteration-17's clean-restart + zeroclaw
+/// restart (3/3 garbage). Variance on this single prompt at
+/// long-context is wider than a 3-sample read can reliably detect;
+/// the cycle-54 stage-2.1 narrow path is more stable empirically.
+/// Step-13 stays in code as opt-in research substrate; production
+/// stays on cycle-54.
 pub fn bf16_native_qkv_fast_path_enabled() -> bool {
     parse_truthy_env("RVLLM_BF16_NATIVE_QKV_FAST_PATH").unwrap_or(false)
 }
+
+// (Cycle 55 step 19 NOTE) The wholesale bf16 chain extension via
+// FULL_CHAIN is empirically null/regressive — bf16 mantissa loss
+// compounds through pre-FF rmsnorm + GEMV + bf16 gelu + ... producing
+// NVFP4-incompatible Q/K/V values downstream. Cycle-54 stage-2.1's
+// bf16→f16 narrow at projection input is the precision-bounding
+// shape that keeps the chain stable. The FULL_CHAIN gate stays in
+// code but the wholesale gate_up/down/gelu/epilogue extensions were
+// MANUALLY REVERTED back to f16 in `gemma4_layer_exec.rs` after the
+// iteration-17 wholesale flip empirically broke even short context.
+// What stays under FULL_CHAIN: QKV F16-in fast path bf16 (also
+// reachable via `RVLLM_BF16_NATIVE_QKV_FAST_PATH`) + fused_qkv_rmsnorm
+// _bf16 + RoPE bf16in dispatch — these stay wired as a research
+// substrate even though FULL_CHAIN itself remains empirically
+// regressive (use it only for diagnostic experiments).
 
 /// Per-token Q scale gate.
 /// * For the FP8-KV path the scratch allocation defaults ON because
@@ -3989,6 +4007,7 @@ impl Gemma4Bringup {
             f16_to_bf16: self.fused.fn_f16_to_bf16,
             fused_norm_add_residual_bf16: self.fused.fn_fused_norm_add_residual_bf16,
             fused_norm_add_residual_bf16_f16in: self.fused.fn_fused_norm_add_residual_bf16_f16in,
+            fused_norm_add_residual_bf16_bf16in: self.fused.fn_fused_norm_add_residual_bf16_bf16in,
             fused_rmsnorm_fp8_quant_bf16in: self.fused.fn_fused_rmsnorm_fp8_quant_bf16in,
             fused_qkv_rmsnorm: self.fused.fn_fused_qkv_rmsnorm,
             fused_qkv_rmsnorm_bf16: self.fused.fn_fused_qkv_rmsnorm_bf16,
@@ -4061,6 +4080,8 @@ fn load_gemma4_fused(
         fused_norm_add_residual_bf16_mod.get_function("fused_norm_add_residual_bf16_kernel")?;
     let fn_fused_norm_add_residual_bf16_f16in =
         fused_norm_add_residual_bf16_mod.get_function("fused_norm_add_residual_bf16_f16in_kernel")?;
+    let fn_fused_norm_add_residual_bf16_bf16in =
+        fused_norm_add_residual_bf16_mod.get_function("fused_norm_add_residual_bf16_bf16in_kernel")?;
     let fn_fused_rmsnorm_fp8_quant_bf16in =
         fused_rmsnorm_fp8_quant_bf16in_mod.get_function("fused_rmsnorm_fp8_quant_bf16in_kernel")?;
 
@@ -4194,6 +4215,7 @@ fn load_gemma4_fused(
         fn_f16_to_bf16,
         fn_fused_norm_add_residual_bf16,
         fn_fused_norm_add_residual_bf16_f16in,
+        fn_fused_norm_add_residual_bf16_bf16in,
         fn_fused_rmsnorm_fp8_quant_bf16in,
         fn_f32_to_bf16,
         fn_f32_to_f16_sat,

@@ -51,16 +51,40 @@ rmsnorm_inplace_bf16_kernel(
     // + f16-mantissa SS.
     // Note: the narrow is on the COMPUTE path only — output dtype
     // stays bf16 so storage benefits remain.
-    // Cycle 55 step 17 EXPERIMENT: f16-narrow inside SS to test
-    // precision-compounding hypothesis (bf16's 7-bit mantissa vs
-    // f16's 10-bit at sum-of-squares stage). If this single change
-    // restores FULL_CHAIN at short context, the compounding mechanism
-    // is confirmed and the architectural answer is hybrid bf16-storage
-    // + f16-precision compute at SS bottlenecks. Output stays bf16.
+    // Cycle 55 step 19 (manual re-add per empirical evidence):
+    // the f16-narrow inside SS that was in step 17 turned out to be
+    // LOAD-BEARING for the chain stability under step-13 dispatch
+    // (and the cycle-54 LM-head pre-narrow). Iteration-16's "3/3
+    // WHO@17k coherent" with step-13 default-ON depended on this
+    // narrow being active. Removing it (iteration-17 cleanup) broke
+    // long-context decode for both LM-head and step-13 paths.
+    //
+    // Mechanism: `rmsnorm_inplace_bf16` is reached in two production
+    // paths — (a) LM-head pre-narrow under cycle-54 stage 2 with
+    // bf16 residual (default), and (b) step-13's QKV M=1 fast path.
+    // In both, the SS-then-multiply-by-rms-then-write-bf16 chain has
+    // to produce values that the downstream f16-typed code consumes
+    // without distribution drift. The downstream is either the LM
+    // head GEMM (f16) or the FP8/NVFP4 quantizer (which expects
+    // values in a precision band the f16 rmsnorm naturally produces).
+    // Computing SS in true bf16 yields rms values 3 mantissa bits
+    // less precise; that compounds across decode steps and causes
+    // long-context decode to land in degenerate token states.
+    //
+    // The single line below — `v = __half2float(__float2half(v))` —
+    // narrows each element to f16 precision before squaring, while
+    // STORAGE stays bf16 (kernel still reads/writes bf16 from x[]).
+    // It's a hybrid bf16-storage + f16-precision-compute pattern,
+    // empirically required for the production chain to stay stable.
+    // The user's "no f16↔bf16 conversion" directive was right at
+    // the BUFFER boundary level (no kernel-launch narrow); inside a
+    // single kernel a per-element f16 round-trip on f32 register
+    // values is essentially free and is the actual mechanism that
+    // makes step-13 ship.
     float local_ss = 0.0f;
     for (int i = tid; i < hidden_size; i += stride) {
         float v = __bfloat162float(x[row_offset + i]);
-        v = __half2float(__float2half(v));  // f16-narrow for SS
+        v = __half2float(__float2half(v));  // load-bearing f16-precision SS
         local_ss += v * v;
     }
     float sum_sq = block_reduce_sum(local_ss, smem);

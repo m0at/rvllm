@@ -646,6 +646,10 @@ pub struct Gemma4LayerKernels {
     pub f16_to_bf16: KernelFn,
     pub fused_norm_add_residual_bf16: KernelFn,
     pub fused_norm_add_residual_bf16_f16in: KernelFn,
+    /// Cycle 55 step 19: bf16-input + bf16-residual epilogue. Used
+    /// under FULL_CHAIN dispatch when GEMV upstream is bf16. Same
+    /// launch ABI as `_bf16_f16in`, just bf16 gemm_out.
+    pub fused_norm_add_residual_bf16_bf16in: KernelFn,
     pub fused_rmsnorm_fp8_quant_bf16in: KernelFn,
     pub fused_qkv_rmsnorm: KernelFn,
     /// Cycle 55 step 11 (Phase B): bf16 sibling of `fused_qkv_rmsnorm`.
@@ -776,6 +780,12 @@ pub unsafe fn gemma4_forward_phase(
     } else {
         kernels.fused_norm_add_residual_f16in
     };
+    // Cycle 55 step 19: norm_add_residual_full_chain_kernel removed
+    // after empirical evidence that wholesale FULL_CHAIN bf16 breaks
+    // even short context. The bf16-input epilogue kernel
+    // `fused_norm_add_residual_bf16_bf16in` stays loaded as
+    // infrastructure but is unused by current dispatch.
+    let _ = kernels.fused_norm_add_residual_bf16_bf16in;
     let q_dim = dims.num_heads * dims.head_dim;
     let _kv_dim = dims.num_kv_heads * dims.head_dim;
     let qkv_rows = (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim;
@@ -1923,11 +1933,14 @@ pub unsafe fn gemma4_forward_phase(
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
         // sm_121 fast path for O projection.
-        // `scratch.attn_out` is already f16 (attention output), no
-        // pre-rmsnorm needed — post-attn-norm runs in the epilogue via
-        // `fused_norm_add_residual_f16in`. We write the GEMV result
-        // into `gemm_f32_tmp` (reused as f16 scratch: we only need
-        // num_tokens*hidden*2 bytes, well under gemm_f32_tmp's capacity).
+        // O-proj input (`scratch.attn_out`) stays f16 even under
+        // FULL_CHAIN — attention dispatch is not yet flipped to
+        // bf16-out in this iteration. Therefore O-proj keeps the
+        // f16-input GEMV, output stays f16, and the epilogue uses
+        // `fused_norm_add_residual_bf16_f16in` (the existing cycle-54
+        // bridge kernel that takes f16 GEMV input + writes bf16
+        // residual). Future iteration: wire attention bf16out, then
+        // flip this site to bf16-in for true end-to-end bf16.
         gemma4_launcher::Fp8GemvF16InLaunch {
             m: dims.num_tokens,
             n: dims.hidden,
@@ -2191,12 +2204,17 @@ pub unsafe fn gemma4_forward_phase(
         weights.gate_up_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
-        // sm_121 fast path for gate||up projection. Mirrors
-        // the QKV fast path: f16 rmsnorm into delta_f16 (pre-FF norm
-        // gamma this time), then f16-input fp8_gemv direct to
-        // gate_up_out. Downstream `fused_gelu_mul` reads gate_up_out
-        // as f16 so no epilogue change is needed.
-        // Cycle 54 Stage 2.1: bf16-residual narrow at branch entry.
+        // sm_121 fast path for gate||up projection. Mirrors the QKV
+        // fast path. Downstream `fused_gelu_mul` reads gate_up_out as
+        // f16 so no epilogue change is needed.
+        // Cycle 55 step 19: gate-up F16-in fast path stays f16 in
+        // production. The wholesale extension to bf16 (commit drafted
+        // step 19 wholesale attempt) was manually reverted in-place
+        // because it broke even short context (mechanism: bf16-precision
+        // compounding through pre-FF rmsnorm + GEMV + bf16 gelu + ...
+        // produces NVFP4-incompatible quant grid downstream of FFN).
+        // Cycle-54 stage-2.1's bf16→f16 narrow at branch entry is the
+        // production-stable path and stays in place here.
         if dims.bf16_residual {
             gemma4_launcher::Bf16ToF16SatLaunch {
                 n: dims.num_tokens * dims.hidden,
@@ -2210,13 +2228,14 @@ pub unsafe fn gemma4_forward_phase(
                 stream as _,
             );
         }
+        let rmsnorm_kernel = kernels.fused_rmsnorm;
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_rmsnorm,
+            rmsnorm_kernel,
             scratch.delta_f16,
             weights.pre_ff_norm_gamma,
             stream,
@@ -2379,13 +2398,9 @@ pub unsafe fn gemma4_forward_phase(
         weights.down_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
-        // sm_121 fast path for down projection.
-        // Skip FP8 GELU-quant — run f16 GELU into `gate_up_fp8`
-        // scratch (same aliasing trick as the f16-weights branch),
-        // then f16-input fp8_gemv writes f16 directly to
-        // `gemm_f32_tmp` (reused as f16 scratch), and
-        // `fused_norm_add_residual_f16in` rolls the residual add +
-        // post-FF norm in one pass.
+        // sm_121 fast path for down projection. Manually reverted to
+        // f16 in cycle 55 step 19 after the wholesale-bf16 attempt
+        // broke even short context. Production stays on f16 here.
         {
             let mut out = scratch.gate_up_fp8;
             let mut inp = scratch.gate_up_out;

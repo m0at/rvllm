@@ -73,6 +73,61 @@ extern "C" __global__ void fused_norm_add_residual_bf16_kernel(
     }
 }
 
+// Cycle 55 step 19: bf16-input variant. Used under FULL_CHAIN dispatch
+// when the upstream Fp8GemvBf16In produces bf16 GEMV output directly,
+// so the residual epilogue stays end-to-end bf16 with no f16 narrow.
+// Same body as the _f16in variant; only the gemm_out dtype + reader
+// flip __half/__half2float → __nv_bfloat16/__bfloat162float.
+extern "C" __global__ void fused_norm_add_residual_bf16_bf16in_kernel(
+    const __nv_bfloat16* __restrict__ gemm_out,
+    const __half*        __restrict__ gamma,
+    __nv_bfloat16*       __restrict__ residual,
+    const __half*        __restrict__ layer_scalar,
+    int hidden,
+    float eps
+) {
+    extern __shared__ float svals[];
+
+    int token = blockIdx.x;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    const __nv_bfloat16* row = gemm_out + (size_t)token * hidden;
+    __nv_bfloat16*       res = residual + (size_t)token * hidden;
+
+    float local_ss = 0.0f;
+    for (int i = tid; i < hidden; i += stride) {
+        float v = __bfloat162float(row[i]);
+        svals[i] = v;
+        local_ss += v * v;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        local_ss += __shfl_xor_sync(0xffffffff, local_ss, offset);
+
+    __shared__ float warp_ss[32];
+    int warp_id = tid / warpSize;
+    int lane = tid % warpSize;
+    if (lane == 0) warp_ss[warp_id] = local_ss;
+    __syncthreads();
+
+    if (tid == 0) {
+        int nw = (stride + warpSize - 1) / warpSize;
+        float total = 0.0f;
+        for (int w = 0; w < nw; w++) total += warp_ss[w];
+        warp_ss[0] = total;
+    }
+    __syncthreads();
+    float rms_inv = rsqrtf(warp_ss[0] / (float)hidden + eps);
+
+    float ls = layer_scalar ? __half2float(*layer_scalar) : 1.0f;
+    for (int i = tid; i < hidden; i += stride) {
+        float normed = svals[i] * rms_inv * __half2float(gamma[i]);
+        float r = __bfloat162float(res[i]) + normed;
+        res[i] = __float2bfloat16(r * ls);
+    }
+}
+
 // f16-input variant (post-channelscale-baked-into-GEMM path). Identical
 // body to the kernel above except the source row is f16, not f32.
 extern "C" __global__ void fused_norm_add_residual_bf16_f16in_kernel(
