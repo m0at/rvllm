@@ -628,7 +628,6 @@ pub struct Gemma4LayerKernels {
     /// kernel multiplies row m by `scale[m] / scale[0]` to recover
     /// the per-token scaling.
     pub scale_rows_f32_ratio: KernelFn,
-    pub compute_qkv_scales: KernelFn,
     pub fused_gelu_mul_f16: KernelFn,
     /// Cycle 55 step 6 (Phase B): bf16 sibling of fused_gelu_mul_f16.
     /// Same launch ABI; only the dtype interpretation of gate_up
