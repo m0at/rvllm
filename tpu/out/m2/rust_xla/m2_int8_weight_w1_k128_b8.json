@@ -1,0 +1,102 @@
+{
+  "schema": "rvllm.m2.rust_xla_bench_plan.v1",
+  "bench_kind": "m2_full_equivalent_decode_plan",
+  "runtime": "rust+xla",
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "kv_cache": "int8",
+  "weight_format": "int8",
+  "moe_impl": "auto",
+  "load_seconds": null,
+  "batches": [
+    8
+  ],
+  "artifacts": {
+    "model_dir": "/workspace/models/m2/MiniMax-M2.7-NVFP4",
+    "artifact_dir": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260428_004011/real_execute_b8",
+    "report_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260428_004011/real_execute_b8.json",
+    "sweep_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260428_004011/real_execute_b8/m2_decode_sweep.json",
+    "ppl_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260428_004011/real_execute_b8/m2_ppl.json",
+    "generation_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260428_004011/real_execute_b8/m2_generation.json"
+  },
+  "sweep": [
+    {
+      "batch": 8,
+      "ctx": 2048,
+      "iters": 8,
+      "warmup": 2,
+      "status": "executed",
+      "error": null,
+      "artifact_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260428_004011/real_execute_b8/m2_decode_b8.json",
+      "decode_mlir": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260428_004011/real_execute_b8/m2_decode_b8.mlir",
+      "timing": {
+        "timing_source": {
+          "runtime": "rust_xla",
+          "executed": true,
+          "device": "tpu:0-7",
+          "executable": "pjrt_mlir_decode"
+        },
+        "ms_min": 11.069779,
+        "ms_mean": 11.38547625,
+        "ms_max": 11.620887999999999,
+        "ms_p50": 11.473758,
+        "tok_per_s": 702.649570763454,
+        "ttft_ms": 12850.579866,
+        "ppl": {
+          "n_tokens_scored": 64,
+          "avg_nll": 12.19208183568235,
+          "ppl": 197221.32133819934
+        },
+        "top1_match_rate": 0.0
+      }
+    }
+  ],
+  "ppl": {
+    "status": "executed",
+    "input_text_path": "/workspace/models/runs/m2_ppl_corpus.txt",
+    "artifact_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260428_004011/real_execute_b8/m2_ppl.json",
+    "result": {
+      "avg_nll": 12.19208183568235,
+      "n_tokens_scored": 64,
+      "ppl": 197221.32133819934
+    }
+  },
+  "generation": {
+    "status": "executed",
+    "prompt": "explain angular momentum",
+    "gen_tokens": 64,
+    "artifact_json": "/workspace/models/runs/m2_bench_results/rust_xla/run_20260428_004011/real_execute_b8/m2_generation.json",
+    "result": {
+      "matched": 0,
+      "note": "teacher-forced decode argmax vs next-token target; no sampling",
+      "top1_match_rate": 0.0,
+      "total": 64
+    }
+  },
+  "rust_runtime": {
+    "graph_phase": "decode",
+    "weight_tensors": 191069,
+    "weight_upload_bytes": 167276952320,
+    "batch_shapes": [
+      {
+        "batch": 8,
+        "runtime_inputs": 7,
+        "runtime_outputs": 3,
+        "kv_cache_bytes": 2080374784
+      }
+    ]
+  },
+  "body_probe": {
+    "all_finite": true,
+    "distinct_top1": 7,
+    "failures": [],
+    "max": 0.302734375,
+    "mean": -0.00017862479064429572,
+    "min": -0.328125,
+    "nonzero_frac": 0.9999743831973769,
+    "passed": true,
+    "var": 0.002312939381812443
+  }
+}
