@@ -31,11 +31,6 @@
       "path": "cast_fp.ptx",
       "sha256": "8048461d7eb765725a6c58f4f77df3511d0c9892a9a9162cc86898e1c28225fc"
     },
-    "compute_qkv_scales": {
-      "bytes": 29333,
-      "path": "compute_qkv_scales.ptx",
-      "sha256": "2cdb98d40896b958fda55ecd6dac7bc32eb6921bf321d3ee25a37c3cf2d43e15"
-    },
     "embedding_gather_bf16": {
       "bytes": 4561,
       "path": "embedding_gather_bf16.ptx",
