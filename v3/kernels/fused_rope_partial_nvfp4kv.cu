@@ -392,15 +392,15 @@ __global__ void fused_rope_partial_nvfp4kv_kernel(
             float scale_f32;
             if (policy == RVLLM_NVFP4_POLICY_MSE && peak > 0.0f) {
                 float second = block16_second_largest_abs(v, peak);
-                // 6 candidates (E4M3-rounded before scoring, to match
-                // what the production path would actually store).
-                // Cycle 56: added c4=peak/5, c5=second/5 — finer
-                // granularity in the {peak/6, peak/4} band where the
-                // 4-candidate set was coarsest. MSE-min is monotone in
-                // candidate set so adding can only help or be neutral.
-                // Tested 8 candidates with c6=peak/3, c7=second/3:
-                // WHO regressed to English (cycle-tied 8-way ties on
-                // typical blocks pick over-clipping scales). Stay at 6.
+                // 6 candidates (E4M3-rounded before scoring).
+                // Cycle 56 sweet spot: {peak,second}/{6,5,4}.
+                // Tested 8-candidate variants ({peak,second}/3 — over-
+                // clipping; {peak,second}/4.5 — interpolation-tied
+                // ambiguity); both regressed WHO to English-or-cycle.
+                // Per-block MSE is an APPROXIMATE proxy for downstream
+                // quality, and minimizing the proxy more aggressively
+                // doesn't always help — 6 candidates is empirically the
+                // best tradeoff between proxy fit and decode behaviour.
                 float c0 = round_scale_e4m3(peak * (1.0f / 6.0f));
                 float c1 = round_scale_e4m3(peak * (1.0f / 4.0f));
                 float c2 = round_scale_e4m3(second * (1.0f / 6.0f));
