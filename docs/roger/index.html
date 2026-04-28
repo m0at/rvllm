@@ -95,6 +95,7 @@
 
   .note { background: var(--surface); border-left: 2px solid var(--border-strong); color: #bbb; font-size: 0.82rem; margin: 1rem 0 1.5rem; max-width: 780px; padding: 0.8rem 1rem; }
   .note strong { color: var(--heading); }
+  .sample-box { background: var(--surface); border: 1px solid var(--border); color: #ddd; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.78rem; line-height: 1.55; margin: 1rem 0 1.5rem; max-width: 780px; padding: 1rem; white-space: pre-wrap; }
 
   @media (max-width: 900px) {
     .hero-grid { grid-template-columns: 1fr; }
@@ -242,8 +243,8 @@
   <strong>* PPL caveat:</strong> rvLLM StableHLO now executes RMSNorm + QKV attention + KV update + O projection across all 62 layers, with live logits and passing observability checks. PPL/top-1 are still invalid because the MoE block is currently bypassed. B=32 emits, but compile fails because XLA rewrites away x64 indices and rejects the 8.32 GB monolithic KV tensor.
 </div>
 
-<h2>1k-token sample</h2>
-<p>Two separate 1k-token checks were run on the current StableHLO path, not the old Mosaic body. The free-run sample verifies the reply loop can execute up to 1,000 generated tokens. The teacher-forced sample verifies PPL is not secretly low yet.</p>
+<h2>1k-cap correctness samples</h2>
+<p>These are generation samples, not next-token-only scoring. The StableHLO path still has bad PPL because MoE is bypassed. The full-model JAX path was then sampled with the real NVFP4 MoE under a 1,000-token cap to check whether a visible answer can be coherent.</p>
 
 <table class="tt">
   <tr>
@@ -255,12 +256,12 @@
     <th>Status</th>
   </tr>
   <tr>
-    <td>StableHLO B=1 free-run reply</td>
+    <td>StableHLO B=1 free-run reply loop</td>
     <td class="r">1,000</td>
-    <td class="r">24.03</td>
-    <td class="r">41.62</td>
+    <td class="r">21.35</td>
+    <td class="r">46.83</td>
     <td class="r m">not a PPL run</td>
-    <td><span class="badge badge-green">reply loop executed</span></td>
+    <td><span class="badge badge-red">text garbled</span></td>
   </tr>
   <tr>
     <td>StableHLO B=1 teacher-forced PPL</td>
@@ -270,11 +271,29 @@
     <td class="r"><span class="x">PPL 5.92e61 / top-1 0%</span></td>
     <td><span class="badge badge-red">quality not correct</span></td>
   </tr>
+  <tr>
+    <td>Full JAX M2.7 raw chat sample</td>
+    <td class="r">1,000</td>
+    <td class="r">529.11</td>
+    <td class="r">1.89</td>
+    <td class="r">PPL 4.922 reference</td>
+    <td><span class="badge badge-red">reasoning loop</span></td>
+  </tr>
+  <tr>
+    <td>Full JAX M2.7 controlled answer</td>
+    <td class="r">64</td>
+    <td class="r">529.05</td>
+    <td class="r">1.89</td>
+    <td class="r">1k cap, prefix + sentence stop</td>
+    <td><span class="badge badge-green">coherent answer</span></td>
+  </tr>
 </table>
 
 <div class="note">
-  The 1k free-run produced a full 1,000-token reply, so the generation path itself works. The decoded text is repetitive/garbled, and the separate 1k teacher-forced check gives avg NLL 142.235, PPL 5.92e61, top-1 0%. So this is execution progress, not model-quality correctness; MoE still has to be wired before the answer should read well.
+  <strong>What this means:</strong> StableHLO execution is real but not a working language model yet: the bad PPL is not a bookkeeping artifact, and the 1k StableHLO free-run is garbled. The complete JAX M2.7 path can produce a coherent answer only after controlling the reasoning channel, giving the answer a short prefix, and stopping at a complete sentence under the 1k cap.
 </div>
+
+<div class="sample-box">Angular momentum is a vector quantity that measures rotational motion about a chosen point or axis. For a particle, the angular momentum about a point O is defined as L = r x p, where r is the particle's position vector from O, and p = mv is its linear momentum. The magnitude |L| = |r| |p| sin(theta), where theta is the angle between r and v.</div>
 
 <h2>JAX PPL history</h2>
 <p>Three separate JAX runs on different corpora and tokenization lengths. All on the same v6e-8 slice.</p>

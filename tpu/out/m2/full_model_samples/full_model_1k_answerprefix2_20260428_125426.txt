@@ -1,0 +1,1 @@
+the angular momentum about a point O is defined as **L = r × p**, where r is the particle’s position vector from O, and p = mv (the familiar linear momentum). The magnitude |L| = |r|·|p|·sinθ, where θ is the angle between r and v.

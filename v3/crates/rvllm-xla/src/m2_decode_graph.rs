@@ -647,6 +647,97 @@ fn emit_dense_bf16(
     result_name
 }
 
+fn rope_inv_freq_literal(pairs: usize) -> String {
+    let vals = (0..pairs)
+        .map(|i| {
+            let v = 1.0_f64 / 5_000_000.0_f64.powf((2 * i) as f64 / M2_HEAD_DIM as f64);
+            format!("{v:.9e}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{vals}]")
+}
+
+fn emit_rope(
+    out: &mut String,
+    input: &str,
+    pos_s: &str,
+    b: usize,
+    heads: usize,
+    hd: usize,
+    rd: usize,
+    prefix: &str,
+) -> String {
+    let pairs = rd / 2;
+    let non_rot = hd - rd;
+    let inv = rope_inv_freq_literal(pairs);
+    let result = format!("%{}_roped", prefix);
+    macro_rules! w {
+        ($($arg:tt)*) => { out.push_str("    "); out.push_str(&format!($($arg)*)); out.push('\n'); };
+    }
+    w!("%{}_rot = stablehlo.slice {} [0:{}, 0:{}, 0:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
+        prefix, input, b, heads, rd, b, heads, hd, b, heads, rd);
+    w!("%{}_pass = stablehlo.slice {} [0:{}, 0:{}, {}:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
+        prefix, input, b, heads, rd, hd, b, heads, hd, b, heads, non_rot);
+    w!("%{}_rot4 = stablehlo.reshape %{}_rot : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}x2xbf16>",
+        prefix, prefix, b, heads, rd, b, heads, pairs);
+    w!("%{}_x0_4 = stablehlo.slice %{}_rot4 [0:{}, 0:{}, 0:{}, 0:1] : (tensor<{}x{}x{}x2xbf16>) -> tensor<{}x{}x{}x1xbf16>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs, b, heads, pairs);
+    w!("%{}_x1_4 = stablehlo.slice %{}_rot4 [0:{}, 0:{}, 0:{}, 1:2] : (tensor<{}x{}x{}x2xbf16>) -> tensor<{}x{}x{}x1xbf16>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs, b, heads, pairs);
+    w!("%{}_x0_bf16 = stablehlo.reshape %{}_x0_4 : (tensor<{}x{}x{}x1xbf16>) -> tensor<{}x{}x{}xbf16>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs);
+    w!("%{}_x1_bf16 = stablehlo.reshape %{}_x1_4 : (tensor<{}x{}x{}x1xbf16>) -> tensor<{}x{}x{}xbf16>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs);
+    w!("%{}_x0 = stablehlo.convert %{}_x0_bf16 : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xf32>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs);
+    w!("%{}_x1 = stablehlo.convert %{}_x1_bf16 : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xf32>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs);
+    w!("%{}_pos_f = stablehlo.convert {} : (tensor<i32>) -> tensor<f32>",
+        prefix, pos_s);
+    w!("%{}_pos_b = stablehlo.broadcast_in_dim %{}_pos_f, dims = [] : (tensor<f32>) -> tensor<{}xf32>",
+        prefix, prefix, pairs);
+    w!("%{}_inv = stablehlo.constant dense<{}> : tensor<{}xf32>",
+        prefix, inv, pairs);
+    w!("%{}_angle = stablehlo.multiply %{}_pos_b, %{}_inv : tensor<{}xf32>",
+        prefix, prefix, prefix, pairs);
+    w!("%{}_cos = stablehlo.cosine %{}_angle : tensor<{}xf32>",
+        prefix, prefix, pairs);
+    w!("%{}_sin = stablehlo.sine %{}_angle : tensor<{}xf32>",
+        prefix, prefix, pairs);
+    w!("%{}_cos_b = stablehlo.broadcast_in_dim %{}_cos, dims = [2] : (tensor<{}xf32>) -> tensor<{}x{}x{}xf32>",
+        prefix, prefix, pairs, b, heads, pairs);
+    w!("%{}_sin_b = stablehlo.broadcast_in_dim %{}_sin, dims = [2] : (tensor<{}xf32>) -> tensor<{}x{}x{}xf32>",
+        prefix, prefix, pairs, b, heads, pairs);
+    w!("%{}_x0_cos = stablehlo.multiply %{}_x0, %{}_cos_b : tensor<{}x{}x{}xf32>",
+        prefix, prefix, prefix, b, heads, pairs);
+    w!("%{}_x1_sin = stablehlo.multiply %{}_x1, %{}_sin_b : tensor<{}x{}x{}xf32>",
+        prefix, prefix, prefix, b, heads, pairs);
+    w!("%{}_y0_f = stablehlo.subtract %{}_x0_cos, %{}_x1_sin : tensor<{}x{}x{}xf32>",
+        prefix, prefix, prefix, b, heads, pairs);
+    w!("%{}_x1_cos = stablehlo.multiply %{}_x1, %{}_cos_b : tensor<{}x{}x{}xf32>",
+        prefix, prefix, prefix, b, heads, pairs);
+    w!("%{}_x0_sin = stablehlo.multiply %{}_x0, %{}_sin_b : tensor<{}x{}x{}xf32>",
+        prefix, prefix, prefix, b, heads, pairs);
+    w!("%{}_y1_f = stablehlo.add %{}_x1_cos, %{}_x0_sin : tensor<{}x{}x{}xf32>",
+        prefix, prefix, prefix, b, heads, pairs);
+    w!("%{}_y0 = stablehlo.convert %{}_y0_f : (tensor<{}x{}x{}xf32>) -> tensor<{}x{}x{}xbf16>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs);
+    w!("%{}_y1 = stablehlo.convert %{}_y1_f : (tensor<{}x{}x{}xf32>) -> tensor<{}x{}x{}xbf16>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs);
+    w!("%{}_y0_4 = stablehlo.reshape %{}_y0 : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}x1xbf16>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs);
+    w!("%{}_y1_4 = stablehlo.reshape %{}_y1 : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}x1xbf16>",
+        prefix, prefix, b, heads, pairs, b, heads, pairs);
+    w!("%{}_rot_out4 = stablehlo.concatenate %{}_y0_4, %{}_y1_4, dim = 3 : (tensor<{}x{}x{}x1xbf16>, tensor<{}x{}x{}x1xbf16>) -> tensor<{}x{}x{}x2xbf16>",
+        prefix, prefix, prefix, b, heads, pairs, b, heads, pairs, b, heads, pairs);
+    w!("%{}_rot_out = stablehlo.reshape %{}_rot_out4 : (tensor<{}x{}x{}x2xbf16>) -> tensor<{}x{}x{}xbf16>",
+        prefix, prefix, b, heads, pairs, b, heads, rd);
+    w!("{} = stablehlo.concatenate %{}_rot_out, %{}_pass, dim = 2 : (tensor<{}x{}x{}xbf16>, tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
+        result, prefix, prefix, b, heads, rd, b, heads, non_rot, b, heads, hd);
+    result
+}
+
 fn emit_arena_bf16(
     out: &mut String,
     arena_bytes: usize,
@@ -789,28 +880,17 @@ fn emit_stablehlo_layer(
     w!("{} = stablehlo.reshape {} : (tensor<{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>", p("k3"), p("kf"), b, kvd, b, kvh, hd);
     w!("{} = stablehlo.reshape {} : (tensor<{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>", p("v3"), p("vf"), b, kvd, b, kvh, hd);
 
-    // --- RoPE: rotate first rd dims of each head ---
-    // Split head_dim into [0:rd] (rotated) and [rd:hd] (passthrough)
-    let non_rot = hd - rd;
-    w!("{} = stablehlo.slice {} [0:{}, 0:{}, 0:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
-        p("q_rot_in"), p("q3"), b, qh, rd, b, qh, hd, b, qh, rd);
-    w!("{} = stablehlo.slice {} [0:{}, 0:{}, {}:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
-        p("q_pass"), p("q3"), b, qh, rd, hd, b, qh, hd, b, qh, non_rot);
-    w!("{} = stablehlo.slice {} [0:{}, 0:{}, 0:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
-        p("k_rot_in"), p("k3"), b, kvh, rd, b, kvh, hd, b, kvh, rd);
-    w!("{} = stablehlo.slice {} [0:{}, 0:{}, {}:{}] : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
-        p("k_pass"), p("k3"), b, kvh, rd, hd, b, kvh, hd, b, kvh, non_rot);
+    // Position scalar for RoPE and KV write slot.
+    w!("{} = stablehlo.constant dense<0> : tensor<i32>", p("c0"));
+    w!("{} = stablehlo.constant dense<1> : tensor<i32>", p("c1"));
+    w!("{} = \"stablehlo.dynamic_slice\"(%positions, {}) {{", p("pos0"), p("c0"));
+    w!("  slice_sizes = array<i64: 1>");
+    w!("}} : (tensor<{}xi32>, tensor<i32>) -> tensor<1xi32>", b);
+    w!("{} = stablehlo.reshape {} : (tensor<1xi32>) -> tensor<i32>", p("pos_s"), p("pos0"));
 
-    // RoPE: x_rot = x[:,:,0::2]*cos - x[:,:,1::2]*sin, x[:,:,1::2]*cos + x[:,:,0::2]*sin
-    // Simplified: split into even/odd pairs, apply rotation matrix
-    // For decode, cos/sin come from %positions (dynamic). We need cos[pos] and sin[pos].
-    // cos/sin are precomputed as [ctx, rd/2] tensors passed as graph inputs... but they
-    // aren't in the current graph signature. For now, skip RoPE and pass Q/K through.
-    // TODO: add cos/sin as graph inputs and apply rotation.
-    w!("{} = stablehlo.concatenate {}, {}, dim = 2 : (tensor<{}x{}x{}xbf16>, tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
-        p("q_roped"), p("q_rot_in"), p("q_pass"), b, qh, rd, b, qh, non_rot, b, qh, hd);
-    w!("{} = stablehlo.concatenate {}, {}, dim = 2 : (tensor<{}x{}x{}xbf16>, tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xbf16>",
-        p("k_roped"), p("k_rot_in"), p("k_pass"), b, kvh, rd, b, kvh, non_rot, b, kvh, hd);
+    // --- RoPE: rotate first rotary_dim dims of Q/K ---
+    let q_roped = emit_rope(out, &p("q3"), &p("pos_s"), b, qh, hd, rd, &format!("l{}_q", l));
+    let k_roped = emit_rope(out, &p("k3"), &p("pos_s"), b, kvh, hd, rd, &format!("l{}_k", l));
 
     // --- KV cache: extract layer slice, write new K/V, read full history ---
     w!("{} = stablehlo.constant dense<{}> : tensor<i64>", p("lkv_off"), lkv_offset);
@@ -831,19 +911,10 @@ fn emit_stablehlo_layer(
             p("lkv5"), p("lkv"), lkv_bytes, b, ctx, kvh, hd);
     }
 
-    // Write new K at [0, :, pos, :, :] and V at [1, :, pos, :, :]
-    // For decode, pos is a scalar broadcast to batch. Use positions[0] as the write slot.
-    w!("{} = stablehlo.constant dense<0> : tensor<i32>", p("c0"));
-    w!("{} = stablehlo.constant dense<1> : tensor<i32>", p("c1"));
-    w!("{} = \"stablehlo.dynamic_slice\"(%positions, {}) {{", p("pos0"), p("c0"));
-    w!("  slice_sizes = array<i64: 1>");
-    w!("}} : (tensor<{}xi32>, tensor<i32>) -> tensor<1xi32>", b);
-    w!("{} = stablehlo.reshape {} : (tensor<1xi32>) -> tensor<i32>", p("pos_s"), p("pos0"));
-
     if kv_bpe == 2 {
         // K update: reshape k_roped [B,kvh,hd] -> [1,B,1,kvh,hd], write at [0,:,pos,:,:]
         w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}xbf16>) -> tensor<1x{}x1x{}x{}xbf16>",
-            p("k_ins"), p("k_roped"), b, kvh, hd, b, kvh, hd);
+            p("k_ins"), k_roped, b, kvh, hd, b, kvh, hd);
         w!("{} = \"stablehlo.dynamic_update_slice\"({}, {}, {}, {}, {}, {}, {}) : (tensor<2x{}x{}x{}x{}xbf16>, tensor<1x{}x1x{}x{}xbf16>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) -> tensor<2x{}x{}x{}x{}xbf16>",
             p("lkv5_k"), p("lkv5"), p("k_ins"), p("c0"), p("c0"), p("pos_s"), p("c0"), p("c0"),
             b, ctx, kvh, hd, b, kvh, hd, b, ctx, kvh, hd);
@@ -873,7 +944,7 @@ fn emit_stablehlo_layer(
     } else {
         // Int8 KV cache: convert bf16 K/V to i8 before write, i8 to bf16 on read
         w!("{} = stablehlo.convert {} : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x{}xi8>",
-            p("k_i8"), p("k_roped"), b, kvh, hd, b, kvh, hd);
+            p("k_i8"), k_roped, b, kvh, hd, b, kvh, hd);
         w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}xi8>) -> tensor<1x{}x1x{}x{}xi8>",
             p("k_ins"), p("k_i8"), b, kvh, hd, b, kvh, hd);
         w!("{} = \"stablehlo.dynamic_update_slice\"({}, {}, {}, {}, {}, {}, {}) : (tensor<2x{}x{}x{}x{}xi8>, tensor<1x{}x1x{}x{}xi8>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) -> tensor<2x{}x{}x{}x{}xi8>",
@@ -929,7 +1000,7 @@ fn emit_stablehlo_layer(
     // --- Attention scores: Q @ K.T / sqrt(hd) ---
     // q_roped: [B, qh, hd] -> add seq dim -> [B, qh, 1, hd]
     w!("{} = stablehlo.reshape {} : (tensor<{}x{}x{}xbf16>) -> tensor<{}x{}x1x{}xbf16>",
-        p("q4"), p("q_roped"), b, qh, hd, b, qh, hd);
+        p("q4"), q_roped, b, qh, hd, b, qh, hd);
     // k_full: [B, qh, ctx, hd] -> transpose last two -> [B, qh, hd, ctx]
     w!("{} = stablehlo.transpose {}, dims = [0, 1, 3, 2] : (tensor<{}x{}x{}x{}xbf16>) -> tensor<{}x{}x{}x{}xbf16>",
         p("k_t"), p("k_full"), b, qh, ctx, hd, b, qh, hd, ctx);
@@ -943,7 +1014,21 @@ fn emit_stablehlo_layer(
     w!("{} = stablehlo.broadcast_in_dim {}, dims = [] : (tensor<bf16>) -> tensor<{}x{}x1x{}xbf16>",
         p("scale_b"), p("scale"), b, qh, ctx);
     w!("{} = stablehlo.multiply {}, {} : tensor<{}x{}x1x{}xbf16>",
-        p("scores"), p("scores_raw"), p("scale_b"), b, qh, ctx);
+        p("scores_unmasked"), p("scores_raw"), p("scale_b"), b, qh, ctx);
+
+    // Causal decode mask: only attend to KV slots <= current position.
+    w!("{} = stablehlo.iota dim = 0 : tensor<{}xi32>", p("ctx_iota"), ctx);
+    w!("{} = stablehlo.broadcast_in_dim {}, dims = [] : (tensor<i32>) -> tensor<{}xi32>",
+        p("pos_ctx"), p("pos_s"), ctx);
+    w!("{} = stablehlo.compare  LE, {}, {},  SIGNED : (tensor<{}xi32>, tensor<{}xi32>) -> tensor<{}xi1>",
+        p("ctx_mask"), p("ctx_iota"), p("pos_ctx"), ctx, ctx, ctx);
+    w!("{} = stablehlo.broadcast_in_dim {}, dims = [3] : (tensor<{}xi1>) -> tensor<{}x{}x1x{}xi1>",
+        p("ctx_mask_b"), p("ctx_mask"), ctx, b, qh, ctx);
+    w!("{} = stablehlo.constant dense<0xFF80> : tensor<bf16>", p("mask_neg_inf"));
+    w!("{} = stablehlo.broadcast_in_dim {}, dims = [] : (tensor<bf16>) -> tensor<{}x{}x1x{}xbf16>",
+        p("mask_neg_inf_b"), p("mask_neg_inf"), b, qh, ctx);
+    w!("{} = stablehlo.select {}, {}, {} : tensor<{}x{}x1x{}xi1>, tensor<{}x{}x1x{}xbf16>",
+        p("scores"), p("ctx_mask_b"), p("scores_unmasked"), p("mask_neg_inf_b"), b, qh, ctx, b, qh, ctx);
 
     // --- Softmax (numerically stable) ---
     w!("{} = stablehlo.constant dense<0xFF80> : tensor<bf16>", p("neg_inf"));

@@ -28,6 +28,9 @@ use rvllm_xla::{
     PjrtClientHandle,
 };
 
+#[cfg(feature = "tpu")]
+const M2_EOS_TOKEN_ID: i32 = 200020;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(env::args().skip(1).collect())?;
     if let Some(path) = args.check {
@@ -101,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut top1_total = 0usize;
         let mut generated_token_ids = Vec::new();
         let mut generated_text = None;
+        let mut stopped_eos = false;
         #[cfg(feature = "tpu")]
         let mut last_observability: Option<M2LogitsObservabilityReport> = None;
         for (item, executed) in report.sweep.iter_mut().zip(executed) {
@@ -114,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if generated_token_ids.is_empty() && !executed.generated_token_ids.is_empty() {
                 generated_token_ids = executed.generated_token_ids.clone();
                 generated_text = executed.generated_text.clone();
+                stopped_eos = executed.stopped_eos;
             }
             item.timing = Some(executed.timing);
             #[cfg(feature = "tpu")]
@@ -136,6 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             report.generation.result = Some(serde_json::json!({
                 "generated_tokens": generated_token_ids.len(),
                 "generated_token_ids": generated_token_ids,
+                "stopped_eos": stopped_eos,
                 "text": generated_text,
                 "top1_match_rate": if top1_total > 0 { Some(top1_hits as f64 / top1_total as f64) } else { None },
                 "matched": top1_hits,
@@ -181,6 +187,7 @@ struct ExecutedDecodeArtifact {
     top1_total: usize,
     generated_token_ids: Vec<i32>,
     generated_text: Option<String>,
+    stopped_eos: bool,
     #[cfg(feature = "tpu")]
     observability: Option<M2LogitsObservabilityReport>,
 }
@@ -532,6 +539,16 @@ fn execute_decode_artifacts(
                 args.warmup + args.iters,
             )?)
         };
+        let prompt_prefill_steps = if args.ppl_text.is_none() && args.ppl_token_ids.is_none() {
+            teacher
+                .as_ref()
+                .map(|tokens| tokens.lanes.first().map_or(0, |lane| lane.len().saturating_sub(1)))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let total_steps = args.warmup + args.iters + prompt_prefill_steps;
+        let score_teacher = args.ppl_text.is_some() || args.ppl_token_ids.is_some();
         let mut token_ids = teacher
             .as_ref()
             .map(|tokens| tokens.input_at(0))
@@ -544,7 +561,8 @@ fn execute_decode_artifacts(
         let mut top1_total = 0usize;
         let mut observability: Option<M2LogitsObservabilityReport> = None;
         let mut generated_token_ids = Vec::new();
-        for step in 0..(args.warmup + args.iters) {
+        let mut stopped_eos = false;
+        for step in 0..total_steps {
             if let Some(tokens) = &teacher {
                 if tokens.has_input(step) {
                     token_ids = tokens.input_at(step);
@@ -630,7 +648,7 @@ fn execute_decode_artifacts(
             if step == 0 {
                 ttft_ms = Some(elapsed_ms);
             }
-            if step >= args.warmup {
+            if step >= args.warmup + prompt_prefill_steps {
                 samples.push(elapsed_ms);
                 if observability.is_none() {
                     if let Some(logits) = logits.as_ref() {
@@ -641,28 +659,37 @@ fn execute_decode_artifacts(
                         )?);
                     }
                 }
-                if let (Some(tokens), Some(logits)) = (&teacher, logits.as_ref()) {
-                    if let Ok(targets) = tokens.target_at(step) {
-                        let argmax = m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
-                        top1_hits += argmax
-                            .iter()
-                            .zip(targets.iter())
-                            .filter(|(got, want)| got == want)
-                            .count();
-                        top1_total += targets.len();
-                        nll.extend(m2_bf16_logits_nll(
-                            logits,
-                            &targets,
-                            artifact.shape.batch,
-                            M2_VOCAB,
-                        )?);
+                if score_teacher {
+                    if let (Some(tokens), Some(logits)) = (&teacher, logits.as_ref()) {
+                        if let Ok(targets) = tokens.target_at(step) {
+                            let argmax =
+                                m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
+                            top1_hits += argmax
+                                .iter()
+                                .zip(targets.iter())
+                                .filter(|(got, want)| got == want)
+                                .count();
+                            top1_total += targets.len();
+                            nll.extend(m2_bf16_logits_nll(
+                                logits,
+                                &targets,
+                                artifact.shape.batch,
+                                M2_VOCAB,
+                            )?);
+                        }
                     }
                 }
             }
             if let Some(logits) = logits.as_ref() {
                 let next_tokens = m2_bf16_argmax_tokens(logits, artifact.shape.batch, M2_VOCAB)?;
-                if step >= args.warmup {
+                if step >= args.warmup + prompt_prefill_steps {
                     generated_token_ids.extend_from_slice(&next_tokens);
+                    if artifact.shape.batch == 1
+                        && next_tokens.first().copied() == Some(M2_EOS_TOKEN_ID)
+                    {
+                        stopped_eos = true;
+                        break;
+                    }
                 }
                 token_ids = next_tokens;
             }
@@ -746,6 +773,7 @@ fn execute_decode_artifacts(
             top1_total,
             generated_token_ids,
             generated_text,
+            stopped_eos,
             observability,
         });
     }
@@ -897,6 +925,11 @@ fn prepare_decode_tokens(
     };
     if ids.is_empty() {
         return Err("tokenizer produced zero token ids".into());
+    }
+    if args.ppl_text.is_none() && args.ppl_token_ids.is_none() {
+        return Ok(DecodeTokenPlan {
+            lanes: vec![ids; batch],
+        });
     }
     let stride = if args.ppl_text.is_some() || args.ppl_token_ids.is_some() {
         total_steps + 1
