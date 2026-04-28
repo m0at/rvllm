@@ -64,17 +64,30 @@ pub fn m2_decode_layer_int8_lowered_body_mlir(
     let n_tiles = n_total / n_step;
     let n_loop = n_tiles > 1;
     let k_total = M2_HIDDEN;
-    let k_step = 32usize;
+    // K_step controls the inner contract shape that feeds the MXU. v6e Trillium
+    // has a 256x256 MXU, so vector<batch x K_step xf32> @ vector<K_step x N_step xf32>
+    // wants K_step >= 128 to actually use a full systolic column. Default stays
+    // at 32 (the proven path) but can be bumped via RVLLM_M2_W1_K_STEP.
+    let k_step = std::env::var("RVLLM_M2_W1_K_STEP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32);
+    if k_step == 0 || (k_step % 32) != 0 {
+        return Err(invalid(
+            "k_step",
+            "K_step must be a positive multiple of 32 (TPU sublane stride for i8)",
+        ));
+    }
+    if k_total % k_step != 0 {
+        return Err(invalid(
+            "k_total",
+            "K_total (M2_HIDDEN=3072) must be divisible by K_step",
+        ));
+    }
     let k_tiles = std::env::var("RVLLM_M2_W1_K_TILES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4);
-    if k_total % k_step != 0 {
-        return Err(invalid(
-            "k_total",
-            "K must be divisible by 32 sublane stride",
-        ));
-    }
 
     // K offset constants (compile-time literal indices into %w1_block_t and %hidden).
     let mut k_constants = String::new();
