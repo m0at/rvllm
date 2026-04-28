@@ -1,0 +1,16 @@
+{
+  "arch": "MiniMax-M2.7-NVFP4",
+  "slice": "v6e-8",
+  "nl": 62,
+  "ctx": 2048,
+  "kv_cache": "bf16",
+  "moe_impl": "auto",
+  "load_seconds": 260.7320375442505,
+  "sweep": null,
+  "ppl": {
+    "n_tokens_scored": 262,
+    "avg_nll": 1.5937532222512505,
+    "ppl": 4.922188369934368
+  },
+  "generation": null
+}
