@@ -242,6 +242,32 @@
   <strong>* PPL caveat:</strong> rvLLM StableHLO now executes RMSNorm + QKV attention + KV update + O projection across all 62 layers, with live logits and passing observability checks. PPL/top-1 are still invalid because the MoE block is currently bypassed. B=32 emits, but compile fails because XLA rewrites away x64 indices and rejects the 8.32 GB monolithic KV tensor.
 </div>
 
+<h2>1k-token correctness sample</h2>
+<p>This is the actual PPL sanity check for the current StableHLO path, not the old Mosaic body numbers and not a sampled reply. PPL is a teacher-forced next-token metric by definition: feed token <em>t</em>, score token <em>t+1</em>. The answer path can still produce an up-to-1k-token reply, but this check verifies the PPL is not secretly low yet.</p>
+
+<table class="tt">
+  <tr>
+    <th>Run</th>
+    <th class="r">Tokens scored</th>
+    <th class="r">Avg NLL</th>
+    <th class="r">PPL</th>
+    <th class="r">Top-1</th>
+    <th>Status</th>
+  </tr>
+  <tr>
+    <td>StableHLO B=1 correctness sample</td>
+    <td class="r">1,000</td>
+    <td class="r">142.235</td>
+    <td class="r"><span class="x">5.92e61</span></td>
+    <td class="r">0.0%</td>
+    <td><span class="badge badge-red">PPL bad, expected</span></td>
+  </tr>
+</table>
+
+<div class="note">
+  The 1k-token sample confirms the model is not at real language-model correctness yet: PPL is extremely high and top-1 next-token match is zero. That does not contradict the up-to-1k reply smoke working as an execution path; it means the generated answer should not be treated as model-quality evidence until MoE is wired and PPL comes down.
+</div>
+
 <h2>JAX PPL history</h2>
 <p>Three separate JAX runs on different corpora and tokenization lengths. All on the same v6e-8 slice.</p>
 
