@@ -27,7 +27,7 @@ RVLLM_NVFP4_V_SCALE_POLICY=mse        # 6-candidate (cycle 56 step 12)
 RVLLM_PER_TOKEN_Q_SCALE=1
 RVLLM_Q_SCALE=2.0
 RVLLM_NVFP4_SPLIT_KV=1
-RVLLM_PREFILL_CHUNK_SIZE=256
+RVLLM_PREFILL_CHUNK_SIZE=128
 RVLLM_TOOL_CALL_OPEN_BIAS=4.0
 RVLLM_REPETITION_PENALTY=1.05
 RVLLM_REPETITION_PENALTY_WINDOW=64
@@ -35,8 +35,9 @@ RVLLM_REPETITION_PENALTY_MIN_COUNT=2
 ```
 
 **Memory**: ~50 % of FP8 KV. **Quality**: 5/5 smoke clean (WHO, WEATHER,
-HA tool call, German poetry, time). **Speed**: ~3.5 tok/s decode, ~95 s
-prefill on 14.7 k tokens. **Use this as the default.**
+HA tool call, German poetry, time). **Speed**: ~3.5 tok/s decode, ~125 s
+prefill on 14.7 k tokens (chunk=128; vs ~95 s @ chunk=256 with the
+2-cycle quality cost). **Use this as the default.**
 
 ### N2. Conservative Long-Ctx (no V-Hadamard)
 
@@ -238,7 +239,7 @@ quality fixes. **Speed**: maximum (no extra knobs). **Use** for
 
 | Config | Prefill (s) | Decode (tok/s) | Memory (GiB) | Quality |
 |---|---|---|---|---|
-| N1 | 95 | 3.5 | 47 | 5/5 smoke clean |
+| N1 | 125 | 3.5 | 47 | **30/30 smoke clean** (cycle 56 step 28) |
 | N2 | 95 | 3.55 | 47 | WHO+WEATHER clean, HA variable |
 | N3 | 75 | 3.6 | 52 | most stable, highest variance class |
 | N4 | 90 | 3.7 | 47 | WHO+WEATHER clean, HA marginal |

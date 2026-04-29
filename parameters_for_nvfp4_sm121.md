@@ -45,7 +45,7 @@ Resolution order (first truthy wins): `RVLLM_NVFP4_KV` → `RVLLM_F16_KV` →
 | `RVLLM_BATCH_PREFILL` | 0 | Enable chunked batch prefill. Without it, prefill goes per-token (slow). | **1** |
 | `RVLLM_UNIFIED_PREFILL` | 1 | Use the unified prefill kernel (one launch per chunk, MMA path). Falls back to per-qi loop when off. | **1** |
 | `RVLLM_UNIFIED_PREFILL_MMA` | 1 | Route Q·K^T through the sm_121a FP8 tensor-core MMA. Off = scalar FMA reference. | **1** |
-| `RVLLM_PREFILL_CHUNK_SIZE` | 0 (single-shot) | Tokens processed per prefill kernel call. Empirical hard cliff at ~288 — values 256 OK, 384+ produce garbage cycles even with our quality fixes. **Root cause not pinned** (suspected FP-accumulation-order dependence in MMA reductions). | **256** |
+| `RVLLM_PREFILL_CHUNK_SIZE` | 0 (single-shot) | Tokens processed per prefill kernel call. Empirical hard cliff at ~288 — values ≤256 work, 384+ produce garbage cycles. **Root cause not pinned** (suspected FP-accumulation-order dependence in MMA reductions). 30-prompt smoke @ 14k-ctx (cycle 56 step 28): chunk=256 → 28/30 (2 cycles), chunk=128 → 30/30 clean. Tradeoff: chunk=128 prefill ~30 % slower than 256 (more kernel launches). | **128** |
 | `RVLLM_NUM_BLOCKS` | 1024 | KV cache logical blocks. Each block holds `RVLLM_BLOCK_SIZE` tokens × num_kv_heads × head_dim. | 1024 |
 | `RVLLM_BLOCK_SIZE` | 32 | Tokens per KV block. | 32 |
 | `RVLLM_ARENA_GB` | 40 | HBM arena (model weights + scratch + KV cache) in GiB. Gemma 4 31B fp8-block live-set ≈ 35 GiB. | **60** (covers max prompt + workspace) |
