@@ -1426,24 +1426,33 @@ pub unsafe fn gemma4_forward_phase(
                     let split_env_on =
                         crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_SPLIT_KV")
                             .unwrap_or(true);
-                    // Cycle 23 sweep winner: 1024 — only setting with both
-                    // (a) zero garbage on long-ctx WEATHER cliff and
-                    // (b) clean short-ctx simple tool-call (no regression).
-                    // Sweep on V=ON + cycle21 f32-tmp_out base, 5 trials each:
-                    //   512:  1 partial-clean, 1 garbage, 3 empty.
-                    //   1024: 1 fully-clean, 0 garbage, 4 empty. SHORT: clean.
-                    //   2048: 2 fully-clean, 1 partial, 1 garbage, 1 empty.
-                    //   256:  2 fully-clean, 2 partial, 1 garbage, 0 empty
-                    //         BUT regresses short-ctx tool-call to text refusal
-                    //         (same regression as SPLIT_KV=0 in cycle 20).
-                    const PARTITION_SIZE: u32 = 1024;
+                    // Cycle 23 sweep winner under OLD stack (4-cand MSE,
+                    // chunk=2048, no V-Hadamard): 1024 was the only
+                    // partition size with both (a) zero garbage on long-
+                    // ctx WEATHER cliff and (b) clean short-ctx tool
+                    // call. Cycle 56 step 28 lifted the noise floor
+                    // (6-cand MSE + V-Hadamard + chunk=128 → 30/30
+                    // smoke clean), so the partition-size constraint
+                    // may have slack now. Env-gated for A/B testing;
+                    // default 1024.
+                    let partition_size_env: u32 =
+                        std::env::var("RVLLM_NVFP4_partition_size_u32")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+                    let partition_size = if partition_size_env >= 64
+                        && partition_size_env.is_power_of_two()
+                    {
+                        partition_size_env
+                    } else {
+                        1024
+                    };
+                    let partition_size_u32: u32 = partition_size;
                     // Bucket max ctx = max_blocks_per_seq * block_size.
                     // Workspace is sized off this so the layout is
                     // stable across iterations regardless of current
                     // context growth.
                     let bucket_ctx = (dims.max_blocks_per_seq as u32)
                         * (dims.block_size as u32);
-                    let max_num_parts = bucket_ctx.div_ceil(PARTITION_SIZE).max(1);
+                    let max_num_parts = bucket_ctx.div_ceil(partition_size_u32).max(1);
                     // Current-step max ctx — used only for the dispatch
                     // gate, NOT for workspace sizing. Earlier revisions
                     // used `bucket_ctx` here, which over-fired the split
@@ -1454,7 +1463,7 @@ pub unsafe fn gemma4_forward_phase(
                         .current_max_context_len
                         .unwrap_or(bucket_ctx);
                     let current_num_parts =
-                        current_ctx.div_ceil(PARTITION_SIZE).max(1);
+                        current_ctx.div_ceil(partition_size_u32).max(1);
                     // Skip split path if: env gate off, split kernels
                     // missing, current ctx short enough that one CTA
                     // per (seq, head) fits comfortably, or workspace
@@ -1496,7 +1505,7 @@ pub unsafe fn gemma4_forward_phase(
                             meta.context_lens,
                             scratch.q_scale_ptr,
                             scratch.fa3_workspace,
-                            PARTITION_SIZE,
+                            partition_size_u32,
                             max_num_parts,
                             stream,
                         )?;
