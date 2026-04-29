@@ -1436,7 +1436,7 @@ pub unsafe fn gemma4_forward_phase(
                     // may have slack now. Env-gated for A/B testing;
                     // default 1024.
                     let partition_size_env: u32 =
-                        std::env::var("RVLLM_NVFP4_partition_size_u32")
+                        std::env::var("RVLLM_NVFP4_PARTITION_SIZE")
                             .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
                     let partition_size = if partition_size_env >= 64
                         && partition_size_env.is_power_of_two()
