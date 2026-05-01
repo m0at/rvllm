@@ -248,6 +248,28 @@ impl UnifiedPrefillParams {
                 field: "tile_size",
             });
         }
+        // QK-tile column count: the NVFP4 unified-prefill kernel only
+        // dispatches `n_tiles = ceil(tile_len/8)` MMA columns through
+        // warp IDs 0..3 (4 warps total). For `tile_size > 32` the
+        // host loop produces n_tiles > 4 and warp IDs 4+ never run,
+        // leaving scores uninitialised for the higher columns.
+        // Runtime callers pass 16 or 32 today, but the launcher
+        // boundary must enforce the assumption — silent
+        // uninitialised-score reads taint the softmax with whatever
+        // happened to be in shared memory.
+        if self.tile_size > 32 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.tile_size",
+                    reason:
+                        "tile_size > 32 is not covered by the kernel's \
+                         4-warp QK-tile dispatch (warps 0..3 only); \
+                         columns beyond would hold uninitialised scores"
+                        .into(),
+                },
+                field: "tile_size",
+            });
+        }
         Ok(())
     }
 }
@@ -1140,6 +1162,36 @@ mod tests {
         let u = UnifiedPrefillParams {
             num_queries_per_kv: 4,
             tile_size: 16,
+            block_q: 4,
+            use_mma: false,
+        };
+        assert!(u.validate().is_ok());
+    }
+
+    #[test]
+    fn unified_prefill_rejects_tile_size_above_32() {
+        // 4-warp QK-tile dispatch caps tile_size at 32. Above this
+        // the kernel's `warp_id < n_tiles` gate leaves higher
+        // columns with uninitialised scores; the launcher must
+        // refuse the shape so a future caller doesn't trip silent
+        // softmax corruption.
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 4,
+            tile_size: 64,
+            block_q: 4,
+            use_mma: false,
+        };
+        let err = u.validate().expect_err("tile_size > 32 must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("tile_size"), "wrong field: {msg}");
+    }
+
+    #[test]
+    fn unified_prefill_accepts_tile_size_32() {
+        // 32 is exactly the upper bound — must still pass.
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 4,
+            tile_size: 32,
             block_q: 4,
             use_mma: false,
         };

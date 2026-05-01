@@ -216,7 +216,15 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
     if (window_size_left > 0) {
         const int qpos_lo = q_block_local * block_q;
         const int qpos_hi = min(q_block_qpos_hi, query_len - 1);
-        const int first_allowed = prefix_len + qpos_lo - window_size_left + 1;
+        // window_size_left semantics MUST match the decode kernels
+        // (flash_attention_split_decode_nvfp4kv.cu / decode.cu) which
+        // use `first_allowed = max(0, q_abs - window_size_left)` and
+        // mask `kv_pos < window_start` → window covers `W+1` tokens
+        // [q_abs - W, q_abs]. The previous `q_abs - W + 1` here gave
+        // only `W` tokens, so a single request that hit prefill +
+        // decode saw two different window sizes — which slowly
+        // shifted attention scores at the window edge across phases.
+        const int first_allowed = prefix_len + qpos_lo - window_size_left;
         const int last_allowed  = prefix_len + qpos_hi;
         int ts = first_allowed / tile_size;
         if (first_allowed < 0) ts = 0;
@@ -353,8 +361,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_kernel(
             const int kv_pos = tile_base + t;
             const bool valid_row = (q_pos_in_seq < query_len) && (q_head < num_heads);
             const bool causal = kv_pos <= query_abs;
+            // Match decode kernels: window covers [q_abs - W, q_abs]
+            // inclusive (W+1 tokens). Was `<` (W tokens) — fixed for
+            // phase consistency. See tile-bound comment above.
             const bool sliding_ok =
-                (window_size_left <= 0) || ((query_abs - kv_pos) < window_size_left);
+                (window_size_left <= 0) || ((query_abs - kv_pos) <= window_size_left);
             const bool valid = valid_row && causal && sliding_ok
                 && (kv_pos < max_seq_prefix_len);
             return valid ? dot : -FLT_MAX;

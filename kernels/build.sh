@@ -125,13 +125,23 @@ for arch in $ARCHS; do
     OUTDIR="$DIR/$arch"
     mkdir -p "$OUTDIR"
 
+    # NVCC failures used to be swallowed with WARNING and the
+    # manifest re-published with stale PTX from a prior build. That
+    # is especially dangerous for ABI changes in the NVFP4 / FA2
+    # kernels — caller's Rust expects the new signature, PTX still
+    # has the old one → silent corruption or LaunchFailed at
+    # runtime. We can't hard-fail because some files (fa3_sm90,
+    # cutlass_*) legitimately don't build in every environment, but
+    # we DO delete the stale .ptx on failure so the manifest cannot
+    # pick up an old artifact and pretend the new source compiled.
     for cu in "$DIR"/*.cu; do
         [ -f "$cu" ] || continue
         base=$(basename "$cu" .cu)
         ptx="$OUTDIR/${base}.ptx"
         echo "  $base.cu -> $arch/$base.ptx"
         compile_kernel "$cu" "$arch" "$ptx" || {
-            echo "  WARNING: $base.cu failed for $arch (may need newer CUDA toolkit)"
+            echo "  WARNING: $base.cu failed for $arch — removing stale PTX (was: $ptx)" >&2
+            rm -f "$ptx"
         }
     done
 
@@ -142,13 +152,15 @@ for arch in $ARCHS; do
             ptx="$OUTDIR/${base}.ptx"
             echo "  (v3) $base.cu -> $arch/$base.ptx"
             compile_kernel "$cu" "$arch" "$ptx" || {
-                echo "  WARNING: v3/$base.cu failed for $arch (may need newer CUDA toolkit)"
+                echo "  WARNING: v3/$base.cu failed for $arch — removing stale PTX (was: $ptx)" >&2
+                rm -f "$ptx"
             }
         done
     fi
 
     "$DIR/gen_manifest.sh" "$OUTDIR" "$REVISION" || {
-        echo "  WARNING: manifest generation failed for $arch"
+        echo "  ERROR: manifest generation failed for $arch" >&2
+        exit 1
     }
 done
 

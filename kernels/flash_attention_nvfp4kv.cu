@@ -1032,7 +1032,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_kernel(
     int head_dim,
     int block_size,
     int max_blocks_per_seq,
-    int /*window_size_left*/
+    int window_size_left
 ) {
     const int seq_idx  = blockIdx.x;
     const int head_idx = blockIdx.y;
@@ -1121,7 +1121,19 @@ __global__ void flash_attention_2_prefill_nvfp4kv_kernel(
                 dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
                 if (tid == 0) {
                     int kv_pos = tile_start + t;
-                    s_score[t] = (kv_pos > q_abs_kv_pos) ? -FLT_MAX : dot;
+                    // Causal mask + sliding-window mask. Previously
+                    // window_size_left was commented out and only
+                    // causal applied → sliding layers in the
+                    // fallback path attended the full prefix instead
+                    // of the documented window. Now matches the
+                    // unified-prefill + decode kernels: window
+                    // covers [q_abs - W, q_abs] inclusive (W+1
+                    // tokens) when window_size_left > 0.
+                    bool masked = (kv_pos > q_abs_kv_pos);
+                    if (!masked && window_size_left > 0) {
+                        masked = ((q_abs_kv_pos - kv_pos) > window_size_left);
+                    }
+                    s_score[t] = masked ? -FLT_MAX : dot;
                 }
                 __syncthreads();
             }

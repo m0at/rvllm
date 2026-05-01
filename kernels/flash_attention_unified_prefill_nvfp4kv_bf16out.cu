@@ -224,7 +224,10 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel(
     if (window_size_left > 0) {
         const int qpos_lo = q_block_local * block_q;
         const int qpos_hi = min(q_block_qpos_hi, query_len - 1);
-        const int first_allowed = prefix_len + qpos_lo - window_size_left + 1;
+        // Match decode kernels: window covers [q_abs - W, q_abs]
+        // inclusive (W+1 tokens). Was `q_abs - W + 1` (W tokens) →
+        // mismatch with split-decode broke phase consistency.
+        const int first_allowed = prefix_len + qpos_lo - window_size_left;
         const int last_allowed  = prefix_len + qpos_hi;
         int ts = first_allowed / tile_size;
         if (first_allowed < 0) ts = 0;
@@ -361,8 +364,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_unified_bf16out_kernel(
             const int kv_pos = tile_base + t;
             const bool valid_row = (q_pos_in_seq < query_len) && (q_head < num_heads);
             const bool causal = kv_pos <= query_abs;
+            // Match decode kernels: window covers [q_abs - W, q_abs]
+            // inclusive (W+1 tokens). Was `<` (W tokens). See twin
+            // file flash_attention_unified_prefill_nvfp4kv.cu.
             const bool sliding_ok =
-                (window_size_left <= 0) || ((query_abs - kv_pos) < window_size_left);
+                (window_size_left <= 0) || ((query_abs - kv_pos) <= window_size_left);
             const bool valid = valid_row && causal && sliding_ok
                 && (kv_pos < max_seq_prefix_len);
             return valid ? dot : -FLT_MAX;
