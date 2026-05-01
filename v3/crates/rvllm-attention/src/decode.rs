@@ -441,6 +441,45 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
+        // FA3-specific gate: the SM90 ABI (`fn_paged_decode_fp8`)
+        // takes scalar K/V descales only and cannot consume per-slot
+        // caches — the launch site at the bottom of this fn drops
+        // `k_scale_cache` / `v_scale_cache` and forwards just the
+        // fallback pointers. If the caller supplied ONLY a cache
+        // (no fallback), the kernel would launch with null descale
+        // pointers and silently produce garbage. Reject the combo
+        // up front rather than passing validation under false
+        // pretences. Fa2Ptx (sm_121 path) consumes per-slot caches
+        // natively, so this restriction does not apply there.
+        #[cfg(feature = "cuda")]
+        if matches!(self.backend, super::AttentionBackend::Fa3(_)) {
+            if k_descale_fallback_ptr == 0 {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::FeatureNotAvailable {
+                        backend: "fa3-sm90",
+                        op: "paged_decode (FP8 KV) — Fa3 ABI requires \
+                             scalar K descale via k_descale_fallback_ptr; \
+                             per-slot k_scale_cache is not consumed",
+                    },
+                    ctx: AttnCtx { op: "paged_decode (FP8 KV)", stream,
+                        num_seqs: params.num_seqs, head_dim: params.head_dim },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+            if v_descale_fallback_ptr == 0 {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::FeatureNotAvailable {
+                        backend: "fa3-sm90",
+                        op: "paged_decode (FP8 KV) — Fa3 ABI requires \
+                             scalar V descale via v_descale_fallback_ptr; \
+                             per-slot v_scale_cache is not consumed",
+                    },
+                    ctx: AttnCtx { op: "paged_decode (FP8 KV)", stream,
+                        num_seqs: params.num_seqs, head_dim: params.head_dim },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+        }
         assert_head_dim_matches_backend(
             self.backend, params.head_dim,
             "paged_decode (FP8 KV)", stream, params.num_seqs,

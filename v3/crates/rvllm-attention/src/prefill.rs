@@ -153,10 +153,29 @@ impl<'a> PagedPrefillLauncher<'a> {
         _cu_seqlens_q_ptr: u64,
         _cu_seqlens_k_ptr: u64,
         _workspace_ptr: u64,
-        _stream: u64,
+        stream: u64,
     ) -> Result<()> {
+        // Previously this validated `params` and then returned `Ok(())`
+        // without launching a kernel — a silent no-op. Any future
+        // F16-prefill caller would see "successful" launches with
+        // unmodified output buffers (whatever stale bytes happened to
+        // sit there) and silently produce wrong logits. Surface the
+        // missing implementation explicitly so the caller chooses an
+        // implemented path or fails loudly.
         params.validate()?;
-        Ok(())
+        Err(rvllm_core::RvllmError::Attention {
+            err: rvllm_core::AttentionError::FeatureNotAvailable {
+                backend: "PagedPrefillLauncher (F16 prefill)",
+                op: "paged_prefill_f16",
+            },
+            ctx: rvllm_core::AttnCtx {
+                op: "paged_prefill_f16",
+                stream,
+                num_seqs: params.num_seqs,
+                head_dim: params.head_dim,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })
     }
 }
 
@@ -185,6 +204,52 @@ pub struct UnifiedPrefillParams {
     /// engine selects this per-launch from `RVLLM_UNIFIED_PREFILL_MMA`
     /// so A/B bisects stay trivial.
     pub use_mma: bool,
+}
+
+impl UnifiedPrefillParams {
+    /// Reject configurations that would divide-by-zero either on the
+    /// host (`params.num_tokens.div_ceil(unified.block_q)`) or inside
+    /// the kernel (`flash_attention_unified_prefill.cu` divides the
+    /// per-row index by `block_q` to recover seq_idx). The previous
+    /// host code computed `block_q = UNIFIED_PREFILL_BLOCK_M /
+    /// num_queries_per_kv.max(1)` which collapses to 0 for GQA
+    /// ratios > 16 (Gemma 4 sits at 4, but checkpoints with extreme
+    /// GQA / MQA exist). Returning a clear error is preferable to
+    /// the host-side `attempt to divide by zero` panic.
+    pub fn validate(&self) -> Result<()> {
+        if self.block_q == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.block_q",
+                    reason:
+                        "block_q must be >= 1; a zero value indicates \
+                         GQA ratio > UNIFIED_PREFILL_BLOCK_M and would \
+                         divide-by-zero in the kernel grid math"
+                        .into(),
+                },
+                field: "block_q",
+            });
+        }
+        if self.num_queries_per_kv == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.num_queries_per_kv",
+                    reason: "num_queries_per_kv must be >= 1".into(),
+                },
+                field: "num_queries_per_kv",
+            });
+        }
+        if self.tile_size == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.tile_size",
+                    reason: "tile_size must be >= 1".into(),
+                },
+                field: "tile_size",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl<'a> PagedPrefillFp8Launcher<'a> {
@@ -231,6 +296,7 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        unified.validate()?;
         require_nonnull(
             &[
                 ("o_f16",              o_f16),
@@ -856,6 +922,7 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        unified.validate()?;
         require_nonnull(
             &[
                 ("o_f16",              o_f16),
@@ -1049,6 +1116,46 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_prefill_rejects_zero_block_q() {
+        // Regression: GQA ratio > UNIFIED_PREFILL_BLOCK_M used to
+        // make `block_q = UNIFIED_PREFILL_BLOCK_M / ratio = 0`, the
+        // host then div_ceil-by-zero panicked or the kernel divided
+        // by zero in the grid math. Now `validate()` returns a clear
+        // ConfigError before either site is reached.
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 32,
+            tile_size: 16,
+            block_q: 0,
+            use_mma: false,
+        };
+        let err = u.validate().expect_err("block_q=0 must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("block_q"), "wrong field in error: {msg}");
+    }
+
+    #[test]
+    fn unified_prefill_accepts_valid_config() {
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 4,
+            tile_size: 16,
+            block_q: 4,
+            use_mma: false,
+        };
+        assert!(u.validate().is_ok());
+    }
+
+    #[test]
+    fn unified_prefill_rejects_zero_qpkv() {
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 0,
+            tile_size: 16,
+            block_q: 16,
+            use_mma: false,
+        };
+        assert!(u.validate().is_err());
+    }
 
     #[test]
     fn prefill_validates_head_dim() {

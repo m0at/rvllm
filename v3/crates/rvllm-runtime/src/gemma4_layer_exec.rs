@@ -293,6 +293,26 @@ impl Gemma4LayerDims {
             // catches u32 underflow / wild values.
             return Err(mk_err("Gemma4LayerDims: head_dim out of range"));
         }
+        // Tighter ceiling for the NVFP4 RoPE+Hadamard kernel: it has
+        // a static `__shared__ float s_hadamard[512]` and writes
+        // `s_hadamard[tid]` for `tid < head_dim`. head_dim > 512 on
+        // the NVFP4 path would silently overflow shared memory into
+        // the next allocation, producing wrong-but-not-crashing
+        // outputs. The Hadamard rotation is controlled at runtime
+        // via the `RVLLM_NVFP4_HADAMARD` env var, so we don't gate
+        // on enablement here — the kernel constraint is structural
+        // and the validator should refuse the shape unconditionally
+        // when `kv_dtype == Nvfp4`. Gemma 4 head_dim ∈ {256, 512}
+        // → unaffected; future models with 768/1024 head_dim need
+        // either a kernel-side `s_hadamard[max_head_dim]` lift or a
+        // path that skips the Hadamard buffer entirely.
+        if self.kv_dtype == KvDtype::Nvfp4 && self.head_dim > 512 {
+            return Err(mk_err(
+                "Gemma4LayerDims: head_dim > 512 with NVFP4 KV is \
+                 incompatible with the RoPE+Hadamard kernel \
+                 (s_hadamard[512] static smem would OOB)",
+            ));
+        }
         if self.rotary_dim > self.head_dim {
             return Err(mk_err("Gemma4LayerDims: rotary_dim > head_dim"));
         }
@@ -1528,7 +1548,7 @@ pub unsafe fn gemma4_forward_phase(
                 }
             }
         }
-        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q, num_seqs: _ } => {
+        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q, num_seqs } => {
             // NVFP4 prefill: dedicated RoPE + attention launcher. Must
             // fall through to the shared post-attention block below
             // (O proj + post-attn norm + residual add + MLP + post-FF
@@ -1550,7 +1570,13 @@ pub unsafe fn gemma4_forward_phase(
                 rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
                 let prefill_params = rvllm_attention::PagedPrefillParams {
                     num_tokens: dims.num_tokens,
-                    num_seqs: 1,
+                    // Forwarded from the scheduler-supplied
+                    // Gemma4Phase::Prefill — matters for batched
+                    // prefill where the unified kernel recovers
+                    // `seq_idx` from `cu_seqlens_q` using this count.
+                    // Hard-coding `1` silently coalesced every
+                    // batched request into a single virtual sequence.
+                    num_seqs,
                     num_heads: dims.num_heads,
                     num_kv_heads: dims.num_kv_heads,
                     head_dim: dims.head_dim,
@@ -1584,8 +1610,19 @@ pub unsafe fn gemma4_forward_phase(
                     // 16 (global, smem-tight at head_dim=512).
                     let tile_size = if dims.head_dim <= 256 { 32u32 } else { 16u32 };
                     let num_queries_per_kv = dims.num_heads / dims.num_kv_heads;
-                    let block_q = rvllm_attention::UNIFIED_PREFILL_BLOCK_M
-                        / num_queries_per_kv.max(1);
+                    // Defensive clamp: integer division collapses to
+                    // 0 when num_queries_per_kv > UNIFIED_PREFILL_BLOCK_M
+                    // (e.g. extreme GQA / MQA). The kernel's grid
+                    // math divides by `block_q`, and the host's
+                    // `num_tokens.div_ceil(block_q)` would panic.
+                    // `UnifiedPrefillParams::validate()` rejects 0
+                    // explicitly; the `.max(1)` here keeps the most
+                    // useful behaviour (single-row blocks) for
+                    // configurations where the exact block-size
+                    // doesn't matter as much as launching at all.
+                    let block_q = (rvllm_attention::UNIFIED_PREFILL_BLOCK_M
+                        / num_queries_per_kv.max(1))
+                        .max(1);
                     let unified = rvllm_attention::UnifiedPrefillParams {
                         num_queries_per_kv,
                         tile_size,
@@ -1683,7 +1720,13 @@ pub unsafe fn gemma4_forward_phase(
             if fa2_unified && dims.num_tokens > 1 {
                 let prefill_params = rvllm_attention::PagedPrefillParams {
                     num_tokens: dims.num_tokens,
-                    num_seqs: 1,
+                    // Forwarded from the scheduler-supplied
+                    // Gemma4Phase::Prefill — matters for batched
+                    // prefill where the unified kernel recovers
+                    // `seq_idx` from `cu_seqlens_q` using this count.
+                    // Hard-coding `1` silently coalesced every
+                    // batched request into a single virtual sequence.
+                    num_seqs,
                     num_heads: dims.num_heads,
                     num_kv_heads: dims.num_kv_heads,
                     head_dim: dims.head_dim,
@@ -1697,7 +1740,10 @@ pub unsafe fn gemma4_forward_phase(
                 // 99 KB opt-in cap (see UNIFIED_PREFILL_SPEC §params).
                 let tile_size = if dims.head_dim <= 256 { 32u32 } else { 16u32 };
                 let num_queries_per_kv = dims.num_heads / dims.num_kv_heads;
-                let block_q = rvllm_attention::UNIFIED_PREFILL_BLOCK_M / num_queries_per_kv.max(1);
+                // Defensive clamp — see twin site above.
+                let block_q = (rvllm_attention::UNIFIED_PREFILL_BLOCK_M
+                    / num_queries_per_kv.max(1))
+                    .max(1);
                 // Q·Kᵀ MMA is opt-in during bring-up (Phase F3).
                 // `RVLLM_UNIFIED_PREFILL_MMA=1` flips on the
                 // sm_121a `mma.sync.kind::f8f6f4` tensor-core path;
@@ -1779,11 +1825,23 @@ pub unsafe fn gemma4_forward_phase(
             // the unified attention replaces the FA2 prefill kernel.
             let ctx_host: Vec<i32> =
                 (1..=dims.num_tokens as i32).collect();
-            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                cu_seqlens_q,
-                ctx_host.as_ptr() as *const _,
-                (ctx_host.len() * 4) as _,
-                stream as _,
+            // Cycle 56-style cuda_check! guard — the HtoD that
+            // populates the per-QI context_lens MUST succeed or the
+            // following `decode.launch(...)` calls would run with
+            // stale / undefined pointer contents and silently produce
+            // wrong logits. Without the check the decode-per-QI
+            // fallback was the same anti-pattern as the unchecked
+            // host_sample_token DtoH (already fixed) on the input
+            // side.
+            cuda_check!(
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    cu_seqlens_q,
+                    ctx_host.as_ptr() as *const _,
+                    (ctx_host.len() * 4) as _,
+                    stream as _,
+                ),
+                "decode_per_qi_ctx_lens_htod",
+                stream
             );
 
             for qi in 0..dims.num_tokens {
@@ -3333,6 +3391,52 @@ mod validate_tests {
         let mut d = good();
         d.head_dim = 512;
         d.rotary_dim = 512;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        d.validate().unwrap();
+    }
+
+    /// NVFP4 RoPE+Hadamard kernel has a static `s_hadamard[512]`
+    /// shared-memory buffer. head_dim > 512 with NVFP4 KV would
+    /// silently overflow that buffer. Validator must reject the
+    /// shape before any allocation/launch reaches the kernel.
+    #[test]
+    fn rejects_nvfp4_head_dim_over_512() {
+        let mut d = good();
+        d.kv_dtype = KvDtype::Nvfp4;
+        d.f16_kv = false;
+        d.head_dim = 768; // > 512
+        d.rotary_dim = 512;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        let err = d.validate().expect_err("head_dim>512 + NVFP4 must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Hadamard") || msg.contains("s_hadamard"),
+            "wrong error variant: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_nvfp4_head_dim_512() {
+        // The exact ceiling — must still pass.
+        let mut d = good();
+        d.kv_dtype = KvDtype::Nvfp4;
+        d.f16_kv = false;
+        d.head_dim = 512;
+        d.rotary_dim = 512;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        d.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_non_nvfp4_head_dim_768() {
+        // Tighter cap is NVFP4-specific. Other KV dtypes still see
+        // the loose 1024 ceiling (FP8/F16 path has no 512-buffer
+        // dependency).
+        let mut d = good();
+        d.kv_dtype = KvDtype::Fp8;
+        d.f16_kv = false;
+        d.head_dim = 768;
+        d.rotary_dim = 256;
         d.layer_type = Gemma4LayerType::GlobalAttention;
         d.validate().unwrap();
     }

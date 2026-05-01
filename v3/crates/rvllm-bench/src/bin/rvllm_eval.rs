@@ -508,6 +508,8 @@ unsafe fn generate(
     let prefill_phase = layer_exec::LayerPhase::Prefill {
         cu_seqlens_q: cu_seqlens_q.device_ptr(),
         max_seqlen_q: prompt_len,
+        // Single-sequence bench — one prompt per run.
+        num_seqs: 1,
     };
     run_forward(prefill_phase, &plans_prefill, prompt_len, k_base_prefill, v_base_prefill)?;
     br.stream.fence().map_err(|e| e.to_string())?;

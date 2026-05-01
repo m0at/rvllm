@@ -40,6 +40,26 @@ impl FusedGeluMulFp8QuantLaunch {
         if self.num_tokens == 0 {
             return Err(invalid("num_tokens", "must be > 0"));
         }
+        // Per-thread register-cache cap. The kernel sizes
+        // `cached[MAX_VECS_PER_THREAD * VEC_SIZE]` to 32 elements
+        // and writes `cached[vec_idx * 8 + j]` per loop iteration
+        // (see kernels/fused_gelu_mul_fp8_quant.cu:18,89). With a
+        // block of 1024 threads each handling one vec, the kernel
+        // covers `intermediate <= MAX_VECS_PER_THREAD * VEC_SIZE *
+        // 1024 = 32768`. Above this the per-thread loop walks past
+        // the array bound (silent corruption — register array OOB
+        // is undefined behaviour, not a CUDA fault). Reject the
+        // shape host-side rather than relying on compile-time
+        // assertions inside the kernel.
+        const MAX_INTERMEDIATE: u32 = 32_768;
+        if self.intermediate > MAX_INTERMEDIATE {
+            return Err(invalid(
+                "intermediate",
+                "fused_gelu_mul_fp8 caches MAX_VECS_PER_THREAD*VEC_SIZE=32 \
+                 elements per thread (block=1024); intermediate > 32768 \
+                 would overflow the register cache",
+            ));
+        }
         Ok(())
     }
 
@@ -1076,6 +1096,35 @@ mod tests {
             intermediate: 21504,
         };
         assert!(l.validate().is_ok());
+    }
+
+    /// Per-thread register-cache size in the kernel
+    /// (`cached[MAX_VECS_PER_THREAD * VEC_SIZE = 32]`) caps the
+    /// intermediate dim at 32768. Anything above silently overruns
+    /// the array; the launcher must reject the shape so future
+    /// model adds (e.g. Mistral-Nemo's 32768 boundary, larger MoE
+    /// experts) hit a clean error instead of silent corruption.
+    #[test]
+    fn gelu_accepts_max_intermediate() {
+        let l = FusedGeluMulFp8QuantLaunch {
+            num_tokens: 32,
+            intermediate: 32_768,
+        };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn gelu_rejects_intermediate_above_register_cache() {
+        let l = FusedGeluMulFp8QuantLaunch {
+            num_tokens: 32,
+            intermediate: 32_776, // > 32768, multiple of 8
+        };
+        let err = l.validate().expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("intermediate") || msg.contains("register cache"),
+            "wrong field/error: {msg}"
+        );
     }
 
     #[test]

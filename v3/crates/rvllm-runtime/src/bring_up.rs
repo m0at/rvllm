@@ -746,6 +746,9 @@ impl Bringup {
                     .map(|r| r.device_ptr())
                     .unwrap_or(0),
                 max_seqlen_q: prefill_len,
+                // Single-sequence bring-up smoke — bring_up only ever
+                // runs one prompt at a time through this path.
+                num_seqs: 1,
             };
             one_step(phase)?;
             // Reset metadata to decode shape for the follow-on decode loop

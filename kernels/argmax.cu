@@ -92,7 +92,25 @@ __global__ void argmax_kernel(
     s_idx[tid] = local_idx;
     __syncthreads();
 
-    // Tree reduction for argmax (handles any blockDim including non-power-of-2)
+    // Tree reduction for argmax. Handles any `n` (= blockDim.x), not
+    // just powers-of-two — the orphan check below covers the slot
+    // that the main pair-fold misses on each step.
+    //
+    // Correctness argument for non-power-of-two n:
+    //   Each step folds pairs (i, i+s) for i in [0, s), so slots
+    //   [2*s, n) are NOT touched by the main fold. The orphan check
+    //   `if (s*2 < n)` folds the slot at index `2*s` (the leftmost
+    //   uncovered slot) into slot 0. The DEPTH of slot `2*s` carries
+    //   the data of every higher slot, because at the previous step
+    //   `2s_prev = s` and the main fold of THAT step pulled higher
+    //   data down into `[0, s_prev)`. Inductively, slot `2*s` after
+    //   each step is a complete max over the upper region the main
+    //   fold could not reach. Walking n=6 / n=11 / n=14 confirms it.
+    //
+    //   The reduction therefore terminates with `s_val[0]` holding
+    //   the global max. Power-of-two n simply degenerates to the
+    //   familiar branch-free version because the orphan check is
+    //   never triggered (s*2 == n at every step).
     for (int s = n / 2; s > 0; s >>= 1) {
         if (tid < s && tid + s < n) {
             if (s_val[tid + s] > s_val[tid]) {
@@ -100,7 +118,8 @@ __global__ void argmax_kernel(
                 s_idx[tid] = s_idx[tid + s];
             }
         }
-        // Handle odd-sized reductions: fold last element into first
+        // Orphan fold: catch slot `2*s` when n was not perfectly
+        // halved by the previous step. See the proof above.
         if (s * 2 < n && tid == 0) {
             if (s_val[s * 2] > s_val[0]) {
                 s_val[0] = s_val[s * 2];
