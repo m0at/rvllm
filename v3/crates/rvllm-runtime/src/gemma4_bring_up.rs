@@ -518,6 +518,12 @@ pub struct PrefixProvenance {
     /// (different fp4_encode path) so flipping mid-session would silently
     /// reuse incompatible V data on prefix-cache hits.
     pub stoch_round_v: bool,
+    /// Codex17-2: NVFP4 split-decode partition size. Doesn't change KV
+    /// bytes, but changes which split-decode kernel + reducer shape runs
+    /// at decode time. Tracked here so the prefix cache invalidates on
+    /// partition-size flips between requests; otherwise reproducibility
+    /// across runs that share a cache slot is silently lost.
+    pub partition_size: u32,
 }
 
 impl PrefixProvenance {
@@ -563,10 +569,12 @@ impl PrefixProvenance {
         let fp8_kv_layers = std::env::var("RVLLM_FP8_KV_LAYERS")
             .unwrap_or_default();
         let stoch_round_v = parse_truthy_env("RVLLM_NVFP4_STOCH_ROUND_V").unwrap_or(false);
+        let partition_size = effective_partition_size();
         Self { chunk_size, kv_dtype, hybrid_global_fp8, scale_policy,
                k_scale_policy, v_scale_policy, hadamard, hadamard_v,
                per_token_q_scale, batch_prefill, unified_prefill, split_kv,
-               hybrid_sliding_fp8, fp8_kv_layers, stoch_round_v }
+               hybrid_sliding_fp8, fp8_kv_layers, stoch_round_v,
+               partition_size }
     }
 }
 
@@ -3715,7 +3723,12 @@ impl Gemma4Bringup {
                     f16_kv: false, // prefill uses FP8 KV (no F16 prefill kernel)
                     kv_dtype: prefill_kv_dtype,
                     bf16_residual: bf16_residual_enabled(),
-                    current_max_context_len: None,  // prefill path — not used by split-KV decode
+                    // Codex17-1: batch-prefill writes context_lens=chunk_end_abs and
+                    // the unified-prefill kernel uses it to index block_tables. Pass
+                    // it to the validator so OOB reads on long prompts/chunks past
+                    // max_blocks_per_seq*block_size are caught at validate() time
+                    // instead of becoming a silent garbage-block-ID kernel read.
+                    current_max_context_len: Some(chunk_end_abs as u32),
                 };
                 let w = crate::gemma4_layer_exec::Gemma4LayerWeightPtrs {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,

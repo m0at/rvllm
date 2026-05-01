@@ -272,6 +272,64 @@ impl UnifiedPrefillParams {
         }
         Ok(())
     }
+
+    /// Codex17-3: cross-check the unified-prefill knobs against the
+    /// outer `PagedPrefillParams`. Standalone `validate()` only catches
+    /// internal contradictions; the public API is also easy to misuse
+    /// by passing `num_queries_per_kv` / `block_q` that disagree with
+    /// `num_heads` / `num_kv_heads`. The kernel assumes
+    /// `num_heads = num_kv_heads * num_queries_per_kv` and that
+    /// `block_q * num_queries_per_kv == UNIFIED_PREFILL_BLOCK_M`
+    /// (or `block_q == UNIFIED_PREFILL_BLOCK_M` when num_queries_per_kv
+    /// >= BLOCK_M, the GQA-clamp branch). A drifting caller would
+    /// otherwise get silently wrong head→KV mappings.
+    pub fn validate_against(&self, params: &PagedPrefillParams) -> Result<()> {
+        if params.num_kv_heads == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "PagedPrefillParams.num_kv_heads",
+                    reason: "num_kv_heads must be >= 1".into(),
+                },
+                field: "num_kv_heads",
+            });
+        }
+        if params.num_heads % params.num_kv_heads != 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "PagedPrefillParams.num_heads",
+                    reason: "num_heads must be a multiple of num_kv_heads (GQA grouping)".into(),
+                },
+                field: "num_heads",
+            });
+        }
+        let gqa_ratio = params.num_heads / params.num_kv_heads;
+        if gqa_ratio != self.num_queries_per_kv {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.num_queries_per_kv",
+                    reason:
+                        "num_queries_per_kv must equal num_heads / num_kv_heads; \
+                         a mismatch silently maps Q heads to wrong KV groups in \
+                         the kernel".into(),
+                },
+                field: "num_queries_per_kv",
+            });
+        }
+        // block_q derivation: BLOCK_M / max(1, num_queries_per_kv), clamped to >=1.
+        let expected_block_q = (UNIFIED_PREFILL_BLOCK_M / self.num_queries_per_kv.max(1)).max(1);
+        if self.block_q != expected_block_q {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.block_q",
+                    reason:
+                        "block_q must equal max(1, UNIFIED_PREFILL_BLOCK_M / num_queries_per_kv); \
+                         deviation breaks the kernel's per-row seq_idx recovery".into(),
+                },
+                field: "block_q",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl<'a> PagedPrefillFp8Launcher<'a> {
@@ -319,6 +377,7 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
     ) -> Result<()> {
         params.validate()?;
         unified.validate()?;
+        unified.validate_against(&params)?;
         require_nonnull(
             &[
                 ("o_f16",              o_f16),
@@ -955,6 +1014,7 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
     ) -> Result<()> {
         params.validate()?;
         unified.validate()?;
+        unified.validate_against(&params)?;
         require_nonnull(
             &[
                 ("o_f16",              o_f16),
