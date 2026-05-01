@@ -405,34 +405,28 @@ pub enum CutlassBackend {
 }
 
 /// Find the sm_120 `.so` via env override or the default location
-/// next to a sibling per-arch kernels dir. Returns `None` if neither
-/// candidate exists.
-fn resolve_sm120_so_path(sm90_hint: &std::path::Path) -> Option<PathBuf> {
+/// in the matching arch's kernels dir. Returns `None` if not found.
+fn resolve_sm120_so_path(
+    sm90_hint: &std::path::Path,
+    arch_name: &str,
+) -> Option<PathBuf> {
     if let Some(env) = std::env::var_os("RVLLM_CUTLASS_SM120_SO") {
         let p = PathBuf::from(env);
         if p.is_file() {
             return Some(p);
         }
     }
-    // `sm90_hint` is typically something like `.../kernels/<sm_xxx>/
-    // libcutlass_kernels.so` or the dummy-"unused" marker on sm_121.
-    // Look for `kernels/sm_120/libcutlass_sm120.so` relative to the
-    // hint's grandparent.
+    // Codex27-1: only the matching arch dir. Codex25-1's
+    // sm_121→sm_120→sm_122 fallback chain risked silently loading a
+    // .so that was built for a different Blackwell sub-arch (e.g.
+    // sm_120a on a sm_121a host); the cooperative kernel hits
+    // `CUTE_INVALID_CONTROL_PATH` because the family-conditional
+    // doesn't match. Operators with non-default layouts use the
+    // env override.
     if let Some(grandparent) = sm90_hint.parent().and_then(|p| p.parent()) {
-        // Codex25-1: build_cutlass_sm120_so.sh writes the .so into
-        // the per-arch directory (kernels/sm_121/libcutlass_sm120.so
-        // on DGX Spark, kernels/sm_120/ on RTX 5090). Earlier code
-        // looked at sm_120 only — production on sm_121 silently
-        // fell back to CutlassBackend::Absent unless the operator
-        // had set RVLLM_CUTLASS_SM120_SO. Search every Blackwell-
-        // family arch folder for the sibling .so and return the
-        // first hit; sm_121 covers DGX Spark, sm_120 covers
-        // RTX 5090 / RTX 6000 Blackwell, sm_122 covers later parts.
-        for arch in ["sm_121", "sm_120", "sm_122"] {
-            let candidate = grandparent.join(arch).join("libcutlass_sm120.so");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+        let candidate = grandparent.join(arch_name).join("libcutlass_sm120.so");
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     None
@@ -727,7 +721,7 @@ impl CutlassBackend {
         policy_variants: &[VariantId],
     ) -> Result<Self> {
         if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
-            if let Some(sm120_path) = resolve_sm120_so_path(&path) {
+            if let Some(sm120_path) = resolve_sm120_so_path(&path, "sm_121") {
                 return Ok(CutlassBackend::SoSm120(CutlassSm120Lib::load(sm120_path)?));
             }
             return Ok(CutlassBackend::Absent);

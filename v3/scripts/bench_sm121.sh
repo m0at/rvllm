@@ -59,11 +59,15 @@ export RVLLM_WARMUP="$WARMUP"
 export RVLLM_CUTLASS_SM120_SO="$SM120_SO"
 export RVLLM_FP8_GEMM_CUTLASS_SM120=1    # opt-in the CUTLASS blockwise path
 export RVLLM_ARENA_GB="${RVLLM_ARENA_GB:-40}"
-# Force FP8 KV so attention goes through `PagedDecodeFp8Launcher`,
-# which Fa2Ptx implements via `flash_attention_2_decode_fp8kv_kernel`.
-# The F16 `PagedDecodeLauncher` is not wired for Fa2Ptx and would
-# abort with `FeatureNotAvailable`.
+# Codex27-2: this only opts OUT of the F16 KV path (which on sm_121
+# would hit `Fa2Ptx::paged_decode → FeatureNotAvailable`). The
+# resulting default is **NVFP4**, not FP8 — that's the production
+# attention path on sm_121 today. To explicitly bench FP8 KV instead,
+# also set `RVLLM_FP8_KV=1` (forces fp8 on every layer regardless of
+# kv_dtype default).
 export RVLLM_F16_KV="${RVLLM_F16_KV:-0}"
+# Default-NVFP4 path is what we want for production-shape numbers;
+# don't quietly change attention dtype unless the caller asks.
 
 echo "== rvllm-bench (sm_121 / CUTLASS blockwise) =="
 echo "  batch=$BATCH iters=$ITERS warmup=$WARMUP"

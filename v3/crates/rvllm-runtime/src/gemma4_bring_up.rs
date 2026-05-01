@@ -934,14 +934,19 @@ pub fn build_nvfp4_shadow_alloc(
         shadow_throwaway_alloc,
         256,
     )?;
+    // Codex27-4: shadow init memsets used to drop their CUresult.
+    // Diagnostic output is the whole point of this path; partially
+    // uninitialised shadow regions would silently corrupt the dump.
     unsafe {
-        cudarc::driver::sys::cuMemsetD8_v2(region.device_ptr(), 0, shadow_kv_bytes_alloc);
-        cudarc::driver::sys::cuMemsetD8_v2(q_region.device_ptr(), 0, shadow_q_bytes_alloc);
-        cudarc::driver::sys::cuMemsetD8_v2(
-            throwaway_region.device_ptr(),
-            0,
-            shadow_throwaway_alloc,
-        );
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            region.device_ptr(), 0, shadow_kv_bytes_alloc),
+            "nvfp4_shadow_alloc_kv_zero", 0u64);
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            q_region.device_ptr(), 0, shadow_q_bytes_alloc),
+            "nvfp4_shadow_alloc_q_zero", 0u64);
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            throwaway_region.device_ptr(), 0, shadow_throwaway_alloc),
+            "nvfp4_shadow_alloc_throwaway_zero", 0u64);
     }
     eprintln!(
         "[nvfp4-shadow] allocated {} MiB f16 shadow KV + {} KiB per-layer Q for {} layers \

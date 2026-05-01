@@ -9,6 +9,42 @@ use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 
 const SUPPORTED_HEAD_DIMS: &[u32] = &[128, 256, 512];
 
+/// Codex27-3: opt-in dynamic shared memory at launch and propagate
+/// the CUresult instead of dropping it. The previous `let _ =` pattern
+/// silently masked failures when the requested smem exceeded the device's
+/// per-block max (head_dim=512 sm_121 sits near 99 KiB), leaving the
+/// launch to fail later as a generic kernel-launch error with no context.
+#[cfg(feature = "cuda")]
+pub(crate) unsafe fn set_max_dynamic_smem(
+    func: cudarc::driver::sys::CUfunction,
+    smem_bytes: i32,
+    op: &'static str,
+    stream: u64,
+    num_seqs: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let r = cudarc::driver::sys::cuFuncSetAttribute(
+        func,
+        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        smem_bytes,
+    );
+    if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+        eprintln!(
+            "[attn] cuFuncSetAttribute MAX_DYNAMIC_SHARED_SIZE_BYTES failed at {op}: \
+             smem_bytes={smem_bytes} CUresult={r:?}"
+        );
+        return Err(RvllmError::Attention {
+            err: AttentionError::FeatureNotAvailable {
+                backend: "host-validation",
+                op,
+            },
+            ctx: AttnCtx { op, stream, num_seqs, head_dim },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    Ok(())
+}
+
 /// Cycle 52 step 11c (codex audit finding #3): assert that the launch
 /// `params.head_dim` matches the backend's load-time head_dim. Gemma 4
 /// 31B has heterogeneous attention (sliding head_dim=256, global=512)
@@ -239,11 +275,14 @@ impl<'a> PagedDecodeLauncher<'a> {
                     let hd = params.head_dim as i32;
                     let smem_bytes = 2 * FA2_BC * hd * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
                     if smem_bytes as u32 >= 48 * 1024 {
-                        let _ = cuFuncSetAttribute(
+                        set_max_dynamic_smem(
                             fa2.fn_decode_f16io.raw() as CUfunction,
-                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                             smem_bytes,
-                        );
+                            "paged_decode_f16_dynsmem",
+                            stream,
+                            params.num_seqs,
+                            params.head_dim,
+                        )?;
                     }
 
                     let scale = params.scale;
@@ -548,11 +587,14 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     let smem_bytes =
                         2 * FA2_BC * hd * 4 + score_rows * FA2_BC * 4 + (FA2_THREADS / 32) * 4;
                     if smem_bytes as u32 >= 48 * 1024 {
-                        let _ = cuFuncSetAttribute(
+                        set_max_dynamic_smem(
                             kernel_fn.raw() as CUfunction,
-                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                             smem_bytes,
-                        );
+                            "paged_decode_fp8_dynsmem",
+                            stream,
+                            params.num_seqs,
+                            params.head_dim,
+                        )?;
                     }
 
                     // Scalar args must outlive cuLaunchKernel.
@@ -846,11 +888,14 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let smem_bytes =
                 2 * fa2_bc * hd * 2 + score_rows * fa2_bc * 4 + (FA2_THREADS / 32) * 4;
             if smem_bytes as u32 >= 48 * 1024 {
-                let _ = cuFuncSetAttribute(
+                set_max_dynamic_smem(
                     kernel_fn.raw() as CUfunction,
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     smem_bytes,
-                );
+                    "paged_decode_nvfp4_dynsmem",
+                    stream,
+                    params.num_seqs,
+                    params.head_dim,
+                )?;
             }
 
             let scale = params.scale;
@@ -1171,22 +1216,28 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let split_smem =
                 2 * fa2_bc * hd * 2 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
             if split_smem as u32 >= 48 * 1024 {
-                let _ = cuFuncSetAttribute(
+                set_max_dynamic_smem(
                     split_fn.raw() as CUfunction,
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     split_smem,
-                );
+                    "paged_decode_nvfp4_split_phase1_dynsmem",
+                    stream,
+                    params.num_seqs,
+                    params.head_dim,
+                )?;
             }
             // Phase-2 smem: 2 * max_num_partitions * 4 (max_logits +
             // rescaled exp_sums) + (REDUCE_THREADS/32) * 4 (reduce scratch).
             let reduce_smem =
                 (2 * max_num_partitions as i32) * 4 + (REDUCE_THREADS / 32) * 4;
             if reduce_smem as u32 >= 48 * 1024 {
-                let _ = cuFuncSetAttribute(
+                set_max_dynamic_smem(
                     reduce_fn.raw() as CUfunction,
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     reduce_smem,
-                );
+                    "paged_decode_nvfp4_split_phase2_dynsmem",
+                    stream,
+                    params.num_seqs,
+                    params.head_dim,
+                )?;
             }
 
             // Workspace layout inside `workspace_ptr`:

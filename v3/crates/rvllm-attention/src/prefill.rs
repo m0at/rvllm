@@ -525,11 +525,14 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
                 + 128;
 
             if smem_bytes >= 48 * 1024 {
-                let _ = cuFuncSetAttribute(
+                crate::decode::set_max_dynamic_smem(
                     kernel_fn.raw() as CUfunction,
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     smem_bytes as i32,
-                );
+                    "paged_prefill_unified_dynsmem",
+                    stream,
+                    params.num_seqs,
+                    params.head_dim,
+                )?;
             }
 
             // Scalars must outlive cuLaunchKernel.
@@ -897,11 +900,14 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
             let smem_bytes =
                 2 * fa2_bc * hd * 2 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
             if smem_bytes as u32 >= 48 * 1024 {
-                let _ = cuFuncSetAttribute(
+                crate::decode::set_max_dynamic_smem(
                     kernel_fn.raw() as CUfunction,
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     smem_bytes,
-                );
+                    "paged_prefill_nvfp4_dynsmem",
+                    stream,
+                    params.num_seqs,
+                    params.head_dim,
+                )?;
             }
 
             let scale = params.scale;
@@ -1129,11 +1135,14 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
                 + 256;                                     // alignment cushion
 
             if smem_bytes >= 48 * 1024 {
-                let _ = cuFuncSetAttribute(
+                crate::decode::set_max_dynamic_smem(
                     kernel_fn.raw() as CUfunction,
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     smem_bytes as i32,
-                );
+                    "paged_prefill_unified_dynsmem",
+                    stream,
+                    params.num_seqs,
+                    params.head_dim,
+                )?;
             }
 
             let scale = params.scale;
