@@ -1482,10 +1482,17 @@ impl Gemma4Bringup {
         let kv_cache = arena.region("kv_cache", kv_total_bytes as usize, 256).unwrap();
         let kv_scale_cache = arena.region(
             "kv_scale_cache", kv_scale_total_bytes as usize, 16).unwrap();
-        // Per-(seq, head) Q scale scratch, written fresh by rope each
+        // Per-(token, head) Q scale scratch, written fresh by rope each
         // forward and consumed by the same step's attention.
+        // Codex21: rope writes `[token_idx, head]` for token_idx in
+        // 0..num_tokens. Bench dispatches every layer with
+        // `num_tokens: num_seqs` (single-token decode), so the alloc
+        // upper-bound is num_seqs. If bench is ever extended to a
+        // multi-token-per-seq prefill path, `max_tokens_per_step` must
+        // grow accordingly or rope OOB-writes q_scale_cache.
+        let max_tokens_per_step: u32 = num_seqs;
         let q_scale_scratch_bytes =
-            (num_seqs as u64) * (arch.num_attention_heads as u64) * 4;
+            (max_tokens_per_step as u64) * (arch.num_attention_heads as u64) * 4;
         let q_scale_scratch = arena.region(
             "q_scale_scratch", q_scale_scratch_bytes as usize, 16).unwrap();
         // Opt-out for A/B testing: RVLLM_PER_TOKEN_Q_SCALE=0 falls back to
@@ -2035,8 +2042,13 @@ impl Gemma4Bringup {
             arena.region("kv_scale_cache", kv_scale_total_bytes.max(16) as usize, 16)?;
         cudarc::driver::sys::cuMemsetD8_v2(
             kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
+        // Codex21: PPL also dispatches with num_tokens==num_seqs today.
+        // If the path grows to multi-token-per-seq prefill,
+        // max_tokens_per_step must track the new upper bound; otherwise
+        // rope OOB-writes q_scale_cache at `[tok * heads + head]`.
+        let max_tokens_per_step: u32 = num_seqs;
         let q_scale_scratch_bytes =
-            (num_seqs as u64) * (arch.num_attention_heads as u64) * 4;
+            (max_tokens_per_step as u64) * (arch.num_attention_heads as u64) * 4;
         let q_scale_scratch = arena.region(
             "q_scale_scratch", q_scale_scratch_bytes as usize, 16)?;
         cudarc::driver::sys::cuMemsetD8_v2(
