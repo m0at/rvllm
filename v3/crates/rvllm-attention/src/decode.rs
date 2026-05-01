@@ -981,6 +981,15 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         workspace_ptr: u64,
         partition_size: u32,
         max_num_partitions: u32,
+        // When `true`, dispatch the bf16-output split kernel pair
+        // (`fn_decode_nvfp4kv_split{,_bc16}_bf16out` + the bf16
+        // reducer). When `false`, the original f16-output pair runs.
+        // Pair must stay in lock-step: f16 reducer reading bf16
+        // partial tiles (or vice versa) is silent layout corruption.
+        // Today's gemma4 caller passes `false`; the parameter exists
+        // to make the bf16 path actually reachable when the cycle 55
+        // bf16-everywhere work activates it.
+        output_bf16: bool,
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
@@ -1083,7 +1092,23 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             const REDUCE_THREADS: i32 = 128;
             let hd = params.head_dim as i32;
 
-            let split_fn = if hd > 256 {
+            // Dispatch split-attention + reducer pair coherently
+            // based on the requested output dtype. Previously the
+            // bf16 reducer was loaded into Fa2PtxKernels but never
+            // wired here — every call used the f16 reducer, even
+            // when a future caller would invoke `launch_split` with
+            // bf16-out. Once the bf16 split path is exercised this
+            // would mean the bf16 split kernel writes bf16 partial
+            // tiles and the f16 reducer reads them as f16 → silent
+            // numeric drift (or worse, a layout mismatch). The
+            // `output_bf16` flag now keeps the pair in lock-step.
+            let split_fn = if output_bf16 {
+                if hd > 256 {
+                    fa2.fn_decode_nvfp4kv_split_bc16_bf16out
+                } else {
+                    fa2.fn_decode_nvfp4kv_split_bf16out
+                }
+            } else if hd > 256 {
                 fa2.fn_decode_nvfp4kv_split_bc16
             } else {
                 fa2.fn_decode_nvfp4kv_split
@@ -1091,7 +1116,11 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             .ok_or_else(|| RvllmError::Attention {
                 err: AttentionError::FeatureNotAvailable {
                     backend: "Fa2Ptx",
-                    op: "paged_decode_nvfp4_split (split kernel missing — rebuild kernels/)",
+                    op: if output_bf16 {
+                        "paged_decode_nvfp4_split (bf16-out split kernel missing — rebuild kernels/)"
+                    } else {
+                        "paged_decode_nvfp4_split (split kernel missing — rebuild kernels/)"
+                    },
                 },
                 ctx: AttnCtx {
                     op: "paged_decode_nvfp4_split",
@@ -1101,20 +1130,27 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 },
                 bt: std::backtrace::Backtrace::capture(),
             })?;
-            let reduce_fn = fa2.fn_paged_attn_reduce_f16.ok_or_else(|| {
-                RvllmError::Attention {
-                    err: AttentionError::FeatureNotAvailable {
-                        backend: "Fa2Ptx",
-                        op: "paged_decode_nvfp4_split (reduce kernel missing)",
+            let reduce_fn = if output_bf16 {
+                fa2.fn_paged_attn_reduce_bf16
+            } else {
+                fa2.fn_paged_attn_reduce_f16
+            }
+            .ok_or_else(|| RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "Fa2Ptx",
+                    op: if output_bf16 {
+                        "paged_decode_nvfp4_split (bf16 reduce kernel missing)"
+                    } else {
+                        "paged_decode_nvfp4_split (reduce kernel missing)"
                     },
-                    ctx: AttnCtx {
-                        op: "paged_decode_nvfp4_split",
-                        stream,
-                        num_seqs: params.num_seqs,
-                        head_dim: params.head_dim,
-                    },
-                    bt: std::backtrace::Backtrace::capture(),
-                }
+                },
+                ctx: AttnCtx {
+                    op: "paged_decode_nvfp4_split",
+                    stream,
+                    num_seqs: params.num_seqs,
+                    head_dim: params.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
             })?;
 
             let fa2_bc: i32 = if hd > 256 { 16 } else { 32 };

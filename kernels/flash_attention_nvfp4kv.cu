@@ -1234,7 +1234,7 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_kernel(
     int head_dim,
     int block_size,
     int max_blocks_per_seq,
-    int /*window_size_left*/
+    int window_size_left
 ) {
     // Body identical to the BC=32 prefill above; FA2_BC macro drives
     // the only real difference (tile size → smem layout + loop bounds).
@@ -1316,7 +1316,18 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_kernel(
                 dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
                 if (tid == 0) {
                     int kv_pos = tile_start + t;
-                    s_score[t] = (kv_pos > q_abs_kv_pos) ? -FLT_MAX : dot;
+                    // Causal + sliding-window mask. Twin of the BC32
+                    // path above; the bf16-out variant of THIS BC16
+                    // body had the fix already, the f16-out variant
+                    // did not. Window covers [q_abs - W, q_abs]
+                    // inclusive (W+1 tokens) when window_size_left
+                    // > 0, matching the decode + unified-prefill
+                    // kernels.
+                    bool masked = (kv_pos > q_abs_kv_pos);
+                    if (!masked && window_size_left > 0) {
+                        masked = ((q_abs_kv_pos - kv_pos) > window_size_left);
+                    }
+                    s_score[t] = masked ? -FLT_MAX : dot;
                 }
                 __syncthreads();
             }

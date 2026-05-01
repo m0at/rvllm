@@ -313,6 +313,21 @@ impl Gemma4LayerDims {
                  (s_hadamard[512] static smem would OOB)",
             ));
         }
+        // NVFP4 byte/scale layout assumes `head_dim` is a multiple
+        // of 16 — kernels compute `half_D = head_dim >> 1` and
+        // `scales_per_D = head_dim >> 4` for packed-byte and per-16
+        // microscale addressing (see flash_attention_nvfp4kv.cu:184,
+        // fused_rope_partial_nvfp4kv.cu:213). Gemma 4's 256/512 are
+        // multiples of 16 → safe; defensive check catches future
+        // models with head_dim ∈ {80, 96} etc. before they corrupt
+        // KV-cache pointer math.
+        if self.kv_dtype == KvDtype::Nvfp4 && self.head_dim % 16 != 0 {
+            return Err(mk_err(
+                "Gemma4LayerDims: head_dim must be a multiple of 16 \
+                 with NVFP4 KV (kernels use head_dim >> 4 for \
+                 microscale stride and head_dim >> 1 for packed bytes)",
+            ));
+        }
         if self.rotary_dim > self.head_dim {
             return Err(mk_err("Gemma4LayerDims: rotary_dim > head_dim"));
         }
@@ -1522,6 +1537,11 @@ pub unsafe fn gemma4_forward_phase(
                             scratch.fa3_workspace,
                             partition_size_u32,
                             max_num_parts,
+                            // output_bf16: today's path always emits
+                            // f16 attention output; cycle 55 bf16
+                            // wiring will flip this when the bf16-out
+                            // attn-out scratch is plumbed through.
+                            false,
                             stream,
                         )?;
                     } else {
@@ -3425,6 +3445,24 @@ mod validate_tests {
         d.rotary_dim = 512;
         d.layer_type = Gemma4LayerType::GlobalAttention;
         d.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_nvfp4_head_dim_not_multiple_of_16() {
+        // The microscale stride is `head_dim >> 4`; the packed-byte
+        // stride is `head_dim >> 1`. head_dim=72 (4.5 * 16) is not a
+        // multiple of 16 — `head_dim >> 4 = 4` truncates and the
+        // microscale array runs short. Validator must catch this
+        // before the kernel touches the KV cache.
+        let mut d = good();
+        d.kv_dtype = KvDtype::Nvfp4;
+        d.f16_kv = false;
+        d.head_dim = 72;
+        d.rotary_dim = 72;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        let err = d.validate().expect_err("head_dim=72 + NVFP4 must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("multiple of 16"), "wrong error: {msg}");
     }
 
     #[test]
