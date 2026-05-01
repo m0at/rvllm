@@ -3354,7 +3354,22 @@ impl Gemma4Bringup {
                  using per-token path to keep KV dtype consistent"
             );
         }
-        if !skip_decode && !use_batch_prefill {
+        // Edge cases the batch-prefill block at line ~3420 cannot
+        // service correctly:
+        //   * prompt_len <= 1 — the gate further down uses
+        //     `prompt_len > 1` so the batch block never runs, and
+        //     without the per-token fallback below `residual_ptr`
+        //     would stay stale and the LM head would read garbage.
+        //   * total_new_q == 0 (full prefix-cache hit) — the chunk
+        //     loop never iterates, `new_q` stays 0, and the diag
+        //     capture below uses `new_q - 1` which underflows
+        //     usize and reads from invalid memory.
+        // Both collapse to "no real work for batch-prefill" → fall
+        // through to the per-token path which handles them.
+        let total_new_q_for_gate = prompt_len.saturating_sub(common_prefix_len);
+        let use_batch_path =
+            use_batch_prefill && prompt_len > 1 && total_new_q_for_gate > 0;
+        if !skip_decode && !use_batch_path {
             // Prefix-cache fast path: if common_prefix_len > 0, the
             // persistent KV region already holds valid entries for
             // slots [0..common_prefix_len). Skip those tokens; the
@@ -3363,8 +3378,21 @@ impl Gemma4Bringup {
             // below doesn't use this shortcut yet (unified kernel
             // would need partial-query support wired through).
             let start = common_prefix_len as usize;
-            for (i, &tok) in prompt_ids.iter().enumerate().skip(start) {
-                run_one_token(tok, i)?;
+            if start >= prompt_len as usize && prompt_len > 0 {
+                // Full prefix-cache hit: every prompt token's KV is
+                // already cached, but `residual_ptr` is empty for THIS
+                // request. Recompute the last token's residual through
+                // the per-layer loop so the LM head has something to
+                // consume. The KV write at slot `prompt_len-1`
+                // overwrites cached value with the same bits
+                // (idempotent given identical prompt), so cache state
+                // stays consistent for subsequent requests.
+                let last_idx = (prompt_len - 1) as usize;
+                run_one_token(prompt_ids[last_idx], last_idx)?;
+            } else {
+                for (i, &tok) in prompt_ids.iter().enumerate().skip(start) {
+                    run_one_token(tok, i)?;
+                }
             }
         }
 
@@ -3410,14 +3438,21 @@ impl Gemma4Bringup {
             self.stream.fence()?;
         }
 
-        // Dead prefill block retained behind `if false`; flip to the
-        // diag gate to re-run the prompt through batch prefill
-        // (correctness is still broken — this path is instrumentation,
-        // not production). `skip_decode` takes the prefill path
-        // standalone so the existing DBG probes fire on prefill's
-        // layer 0 / layer 1 for direct comparison against a normal
-        // decode-only run.
-        if (diag_compare && prompt_len > 1) || skip_decode || (use_batch_prefill && prompt_len > 1) {
+        // Batch-prefill path. Originally retained as instrumentation
+        // (see commit history for the diag-only days), now also the
+        // production path on sm_121/NVFP4 when RVLLM_BATCH_PREFILL=1
+        // — the parameters_for_nvfp4_sm121.md profile recommends it
+        // and Cortex production runs with this flag set. The earlier
+        // "correctness is still broken" comment was stale.
+        //
+        // Two edge cases route AWAY from this block via the gate
+        // above: prompt_len ≤ 1 (single-token prompts have no
+        // batched work) and total_new_q == 0 (full prefix-cache
+        // hit, no NEW tokens to prefill). Per-token fallback handles
+        // both. With those guarded, the chunk loop below always
+        // sees total_new_q ≥ 1 and `new_q ≥ 1` after the first
+        // iteration, so `new_q - 1` arithmetic is safe.
+        if (diag_compare && prompt_len > 1) || skip_decode || use_batch_path {
             // Prefix-cache aware batch prefill, OPTIONALLY chunked.
             //
             // When `use_prefix_cache` reports a common prefix of length
