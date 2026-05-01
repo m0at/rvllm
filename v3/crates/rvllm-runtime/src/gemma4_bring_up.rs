@@ -858,6 +858,103 @@ pub fn build_nvfp4_hadamard_signs(
 }
 // === END HADAMARD ROTATION ===
 
+/// Allocate the NVFP4 shadow KV / Q / Q-throwaway regions for the
+/// layers named in `RVLLM_NVFP4_SHADOW_LAYERS`. Returns `Ok(None)`
+/// when the env is unset (no shadow path active).
+///
+/// Same lifetime-correctness contract as `build_nvfp4_hadamard_signs`:
+/// the bytes returned by `arena.region(...)` stay reserved as soon as
+/// the bump pointer has advanced, but the regions MUST be allocated
+/// BEFORE the cuda worker takes its scratch checkpoint — otherwise
+/// `arena.restore(scratch_ck)` between requests rewinds the bump
+/// pointer past them and the persistent pointer in
+/// `Gemma4Bringup::nvfp4_shadow` aliases freshly-overwritten scratch.
+/// The previous lazy-allocation site inside `run_generate` had this
+/// exact bug (Codex14 / Codex16 #2): silent corruption from request
+/// 2 onward. The cuda worker now calls this at startup, before the
+/// checkpoint; `run_generate` re-resolves the same allocation through
+/// `self.nvfp4_shadow.lock()` and never re-allocates.
+#[cfg(feature = "cuda")]
+pub fn build_nvfp4_shadow_alloc(
+    arch: &rvllm_loader::gemma4_arch::Gemma4Arch,
+    num_blocks_total: u32,
+    sliding_blocks: u32,
+    block_size: u32,
+    arena: &HbmArena<'_>,
+) -> Result<Option<NvFp4ShadowAlloc>> {
+    let shadow_set = match crate::gemma4_layer_exec::parse_shadow_layers() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    if shadow_set.is_empty() {
+        return Ok(None);
+    }
+    let mut layer_offsets: Vec<u64> = vec![u64::MAX; arch.num_hidden_layers];
+    let mut shadow_total_bytes: u64 = 0;
+    {
+        let mut cursor: u64 = 0;
+        for l in 0..arch.num_hidden_layers {
+            if !shadow_set.contains(&(l as u32)) {
+                continue;
+            }
+            layer_offsets[l] = cursor;
+            let is_global = arch.layer_types[l]
+                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+            let hd = arch.head_dim_for_layer(l) as u32;
+            let layer_bytes = 2u64 * (layer_blocks as u64) * (block_size as u64)
+                * (nkvh as u64) * (hd as u64) * 2;
+            cursor += layer_bytes;
+            shadow_total_bytes += layer_bytes;
+        }
+    }
+    let shadow_q_per_layer_bytes: u64 =
+        2u64 * (arch.num_attention_heads as u64) * (arch.max_head_dim() as u64);
+    let shadow_q_throwaway_bytes: u64 =
+        (num_blocks_total as u64) * (block_size as u64) * shadow_q_per_layer_bytes;
+    let shadow_q_total_bytes: u64 = shadow_q_per_layer_bytes * (shadow_set.len() as u64);
+
+    let shadow_kv_bytes_alloc = shadow_total_bytes.max(16) as usize;
+    let shadow_q_bytes_alloc = shadow_q_total_bytes.max(16) as usize;
+    let shadow_throwaway_alloc = shadow_q_throwaway_bytes.max(16) as usize;
+
+    let region = arena.region("nvfp4_shadow_kv", shadow_kv_bytes_alloc, 256)?;
+    let q_region = arena.region("nvfp4_shadow_q", shadow_q_bytes_alloc, 256)?;
+    let throwaway_region = arena.region(
+        "nvfp4_shadow_q_throwaway",
+        shadow_throwaway_alloc,
+        256,
+    )?;
+    unsafe {
+        cudarc::driver::sys::cuMemsetD8_v2(region.device_ptr(), 0, shadow_kv_bytes_alloc);
+        cudarc::driver::sys::cuMemsetD8_v2(q_region.device_ptr(), 0, shadow_q_bytes_alloc);
+        cudarc::driver::sys::cuMemsetD8_v2(
+            throwaway_region.device_ptr(),
+            0,
+            shadow_throwaway_alloc,
+        );
+    }
+    eprintln!(
+        "[nvfp4-shadow] allocated {} MiB f16 shadow KV + {} KiB per-layer Q for {} layers \
+         (above scratch checkpoint, persistent across requests): {:?}",
+        shadow_total_bytes / (1024 * 1024),
+        shadow_q_total_bytes / 1024,
+        shadow_set.len(),
+        shadow_set,
+    );
+    Ok(Some(NvFp4ShadowAlloc {
+        shadow_ptr: region.device_ptr(),
+        shadow_bytes: shadow_total_bytes,
+        layer_offsets,
+        layer_indices: shadow_set,
+        shadow_q_ptr: q_region.device_ptr(),
+        shadow_q_total_bytes,
+        shadow_q_per_layer_bytes,
+        shadow_q_throwaway_ptr: throwaway_region.device_ptr(),
+    }))
+}
+
 // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
 /// Parallel to the main KV region but: (a) only the instrumented
 /// layers have a slot; (b) every instrumented layer is stored as F16

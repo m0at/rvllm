@@ -54,6 +54,15 @@ impl WorkerHandle {
         Self { submit }
     }
 
+    /// True if the worker thread is still alive (the receive side of
+    /// the submit channel hasn't been dropped). Used by /health to
+    /// turn ok-vs-503 on the worker's actual liveness instead of
+    /// reporting ok regardless. After a CUDA worker thread crashes
+    /// or exits, the channel closes and this flips to false.
+    pub fn is_alive(&self) -> bool {
+        !self.submit.is_closed()
+    }
+
     /// Try to enqueue a request. Returns [`ApiError::Busy`] if the
     /// worker's queue is full (bounded `mpsc::channel`).
     pub async fn submit(&self, req: GenerateRequest) -> Result<(), ApiError> {
@@ -80,7 +89,12 @@ impl WorkerHandle {
 pub fn spawn_mock_worker(
     queue_depth: usize,
 ) -> (WorkerHandle, std::thread::JoinHandle<()>) {
-    let (tx, mut rx) = mpsc::channel::<GenerateRequest>(queue_depth.max(1));
+    // Match the cuda_worker's queue arithmetic: channel buffer is
+    // `queue_depth - 1` queued slots + 1 in-flight on the worker
+    // thread = `queue_depth` total. Asymmetry between mock and CUDA
+    // would let admission tests pass against the mock while failing
+    // in production (one extra request slips through).
+    let (tx, mut rx) = mpsc::channel::<GenerateRequest>(queue_depth.saturating_sub(1).max(1));
     let join = std::thread::Builder::new()
         .name("rvllm-serve-mock-worker".into())
         .spawn(move || {
@@ -105,7 +119,12 @@ pub fn spawn_erroring_mock_worker(
     queue_depth: usize,
     error_msg: impl Into<String>,
 ) -> (WorkerHandle, std::thread::JoinHandle<()>) {
-    let (tx, mut rx) = mpsc::channel::<GenerateRequest>(queue_depth.max(1));
+    // Match the cuda_worker's queue arithmetic: channel buffer is
+    // `queue_depth - 1` queued slots + 1 in-flight on the worker
+    // thread = `queue_depth` total. Asymmetry between mock and CUDA
+    // would let admission tests pass against the mock while failing
+    // in production (one extra request slips through).
+    let (tx, mut rx) = mpsc::channel::<GenerateRequest>(queue_depth.saturating_sub(1).max(1));
     let msg = error_msg.into();
     let join = std::thread::Builder::new()
         .name("rvllm-serve-erroring-mock-worker".into())

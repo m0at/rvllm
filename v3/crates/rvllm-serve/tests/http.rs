@@ -491,15 +491,36 @@ async fn chat_stream_options_returns_400() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chat_max_completion_tokens_alone_returns_400() {
-    let model = match model_dir() {
-        Some(d) => d.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-        None => return,
-    };
+async fn chat_max_completion_tokens_alone_is_aliased_to_max_tokens() {
+    // Modern OpenAI SDKs send only `max_completion_tokens`. The
+    // server now treats it as an alias for `max_tokens` instead
+    // of 400'ing — `max_completion_tokens_alone` should reach
+    // the worker.
+    let (state, _join) = need_model!();
+    let model = state.config.model_id.clone();
+    let router = build_router(state);
     let body = format!(
         r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"max_completion_tokens":4}}"#
     );
-    assert_chat_400(body, "max_completion_tokens", "max_completion_tokens_unaliased").await;
+    let (status, _h, _body) = send(router, Method::POST, "/v1/chat/completions", body).await;
+    assert_ne!(
+        status, StatusCode::BAD_REQUEST,
+        "max_completion_tokens alone must be accepted (alias for max_tokens)",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_max_completion_tokens_conflict_returns_400() {
+    let (state, _join) = need_model!();
+    let model = state.config.model_id.clone();
+    let router = build_router(state);
+    let body = format!(
+        r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"max_tokens":4,"max_completion_tokens":8}}"#
+    );
+    let (status, _h, body) = send(router, Method::POST, "/v1/chat/completions", body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(v["error"]["code"], "conflicting_max_tokens");
 }
 
 // ─── Per-role message shape validation ───────────────────────────────

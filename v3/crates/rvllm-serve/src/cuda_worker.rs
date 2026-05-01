@@ -166,23 +166,47 @@ pub async fn spawn_cuda_worker(
                 }
             }
 
-            // TODO(nvfp4-shadow-lifetime): the same checkpoint/restore
-            // bug applies to `nvfp4_shadow` (lazy-allocated inside
-            // run_generate). Refactoring requires factoring the shadow
-            // alloc out of run_generate (it depends on per-layer KV
-            // sizes and the shadow_set env var). RVLLM_NVFP4_SHADOW_F16
-            // is a diagnostic gate not enabled in production, so the
-            // fix is deferred. If you set the env, expect silent
-            // corruption from request 2 onward until this lands.
-            if env_truthy("RVLLM_NVFP4_SHADOW_F16") {
-                tracing::warn!(
-                    "RVLLM_NVFP4_SHADOW_F16=1 — note: nvfp4_shadow lazy \
-                     allocation has a known scratch/checkpoint lifetime \
-                     bug; output of requests after the first may be \
-                     silently corrupted. Use only for single-request \
-                     diagnostics until the alloc is hoisted above the \
-                     scratch checkpoint."
-                );
+            // Pre-allocate the NVFP4 shadow KV / Q / throwaway regions
+            // BEFORE the scratch checkpoint, mirroring the hadamard
+            // pre-alloc above. Same lifetime contract — the lazy alloc
+            // inside `run_generate` had a known silent-corruption bug
+            // from request 2 onward (regions allocated below the
+            // checkpoint were marked free by `arena.restore(scratch_ck)`
+            // and aliased into fresh scratch on the next request). The
+            // helper returns `None` when `RVLLM_NVFP4_SHADOW_LAYERS` is
+            // unset, so this is a no-op on production where the
+            // diagnostic is disabled.
+            {
+                const BLOCK_SIZE: u32 = 32;
+                let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+                    .ok().and_then(|s| s.parse().ok())
+                    .unwrap_or(1024);
+                // Sliding layers share the same block budget on the
+                // current code path; if that ever diverges, mirror
+                // the runtime's calculation here.
+                let sliding_blocks: u32 = num_blocks_total;
+                match rvllm_runtime::gemma4_bring_up::build_nvfp4_shadow_alloc(
+                    &bringup.arch,
+                    num_blocks_total,
+                    sliding_blocks,
+                    BLOCK_SIZE,
+                    &bringup.arena,
+                ) {
+                    Ok(alloc) => {
+                        if alloc.is_some() {
+                            tracing::info!(
+                                "nvfp4_shadow regions pre-allocated above scratch checkpoint"
+                            );
+                        }
+                        *bringup.nvfp4_shadow.lock().unwrap() = alloc;
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "build_nvfp4_shadow_alloc: {e:?}"
+                        )));
+                        return;
+                    }
+                }
             }
             let scratch_ck = bringup.arena.checkpoint();
             tracing::info!(

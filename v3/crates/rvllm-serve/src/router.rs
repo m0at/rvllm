@@ -83,8 +83,30 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok" }))
+async fn health(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // Liveness: report 503 with `status:"unavailable"` if the worker
+    // thread has dropped its end of the submit channel (CUDA crash,
+    // panic, clean shutdown). The previous always-200 `{"status":"ok"}`
+    // stayed green even after a worker exit while every generate
+    // request would 500 — turning health checks into a false signal
+    // for orchestrators / load balancers.
+    if state.worker.is_alive() {
+        (
+            axum::http::StatusCode::OK,
+            Json(json!({ "status": "ok" })),
+        )
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unavailable",
+                "reason": "worker submit channel closed; the inference \
+                          thread has exited and generate requests will fail",
+            })),
+        )
+    }
 }
 
 async fn responses_unsupported() -> (axum::http::StatusCode, Json<serde_json::Value>) {

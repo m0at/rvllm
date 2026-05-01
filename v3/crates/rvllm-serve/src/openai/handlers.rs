@@ -382,7 +382,12 @@ pub async fn chat_completions(
     }
 
     let sampling = req.sampling_params().ensure_supported()?;
-    let max_new = resolve_max_new(req.max_tokens, state.config.max_new_tokens_cap)?;
+    // Modern OpenAI SDKs (Python ≥1.30, TS ≥4.x) send only
+    // `max_completion_tokens`. Fall through to it when `max_tokens`
+    // is missing — the conflict-vs-equal validation above already
+    // ensured the two cannot disagree.
+    let effective_max_tokens = req.max_tokens.or(req.max_completion_tokens);
+    let max_new = resolve_max_new(effective_max_tokens, state.config.max_new_tokens_cap)?;
     let stop_text = req.stop.as_ref().map(|s| extract_stop(s)).unwrap_or_default();
     validate_stops(&stop_text)?;
     // Cycle 37 P1 (codex audit): cycle-36 reject of stream+stop fired
@@ -976,13 +981,22 @@ fn chat_stream_sse(
                                     continue;
                                 }
                                 Err(e) => {
-                                    // Cycle 36 P1 (codex audit): decoder
-                                    // step errors were silently mapped to
-                                    // FinishReason::Stop, hiding tokenizer
-                                    // failures. Log + Cancelled instead.
+                                    // Tokenizer decoder.step failure is a
+                                    // server-side fault, not a clean
+                                    // cancellation. Codex4-5 routed
+                                    // worker-error and timeout to
+                                    // EmitError but missed this third
+                                    // "fault → silent success" path.
+                                    // Stream now produces the same
+                                    // OpenAI-shaped error envelope so
+                                    // clients can distinguish a
+                                    // tokenizer crash from a deliberate
+                                    // client-side cancel.
                                     tracing::error!(error = ?e,
-                                        "chat SSE decoder step failed — terminating stream");
-                                    ctx.state = S::Finish(FinishReason::Cancelled);
+                                        "chat SSE decoder step failed — emitting error event");
+                                    ctx.state = S::EmitError(format!(
+                                        "tokenizer decode failed: {e:?}"
+                                    ));
                                     continue;
                                 }
                             }
@@ -1640,12 +1654,17 @@ fn completion_stream_sse(
                             return Some((Ok(sse_json(&chunk)), ctx));
                         }
                         Err(e) => {
-                            // Cycle 36 P1 (codex audit): completion SSE
-                            // decoder errors were also silently Stop. Now
-                            // Cancelled with log to match chat SSE.
+                            // Tokenizer fault → OpenAI error envelope
+                            // (twin of the chat SSE site). Surfaces
+                            // tokenizer crashes as `data: {"error":...}`
+                            // chunks instead of finish_reason="cancelled"
+                            // which clients read as a successful
+                            // truncation.
                             tracing::error!(error = ?e,
-                                "completion SSE decoder step failed — terminating stream");
-                            ctx.state = S::Finish(FinishReason::Cancelled);
+                                "completion SSE decoder step failed — emitting error event");
+                            ctx.state = S::EmitError(format!(
+                                "tokenizer decode failed: {e:?}"
+                            ));
                             continue;
                         }
                     },
@@ -1745,6 +1764,12 @@ fn reject_v1_unsupported_chat(req: &ChatCompletionRequest) -> ApiResult<()> {
             "stream_options_unsupported",
         ));
     }
+    // `max_completion_tokens` is the OpenAI 2025 rename of
+    // `max_tokens` and is what the modern Python / TypeScript SDKs
+    // (gpt-4-omni / gpt-4-turbo defaults) actually send. We accept
+    // it as an alias: alone → use it as max_tokens. Both set with
+    // identical value → use either. Both set with different values
+    // → conflict 400.
     if req.max_completion_tokens.is_some() && req.max_tokens.is_some()
         && req.max_completion_tokens != req.max_tokens
     {
@@ -1753,17 +1778,6 @@ fn reject_v1_unsupported_chat(req: &ChatCompletionRequest) -> ApiResult<()> {
              not both with conflicting values",
             "max_completion_tokens",
             "conflicting_max_tokens",
-        ));
-    }
-    if req.max_completion_tokens.is_some() && req.max_tokens.is_none() {
-        // OpenAI 2025+ clients send only the new name. Until handlers
-        // alias them properly, reject loudly so the caller knows the
-        // field was seen.
-        return Err(ApiError::invalid_param(
-            "max_completion_tokens is recognised but not yet aliased \
-             to max_tokens in this build; pass `max_tokens` instead.",
-            "max_completion_tokens",
-            "max_completion_tokens_unaliased",
         ));
     }
     if req.n.is_some_and(|n| n != 1) {
