@@ -135,13 +135,30 @@ impl Bringup {
         let fused_modules = load_fused(&kernels)?;
 
         // 4. Attention backend.
-        //    Non-Gemma4 architectures currently always use the FA3 .so.
-        //    The Gemma4 bring-up branches on CompileTarget; if you add a
-        //    non-Gemma4 sm_121 model, wire the same branch here.
-        let fa3 = AttentionBackend::Fa3(Fa3Kernels::load(
-            paths.fa3_so.clone(),
-            arch.head_dim as u32,
-        )?);
+        //    Codex28-1: branch on CompileTarget so sm_121 (GB10) routes
+        //    through the PTX-launched Fa2Ptx backend. FA3 (.so, WGMMA +
+        //    TMA) cannot load on Blackwell consumer silicon — every
+        //    non-Gemma4 generic startup on sm_121 used to crash here
+        //    even with sm_121 PTX present. Mirrors the gemma4_bring_up
+        //    branching at gemma4_bring_up.rs:1152.
+        #[cfg(feature = "gb10")]
+        let target = rvllm_core::CompileTarget::from_compute_capability(
+            ctx.compute_capability().0,
+            ctx.compute_capability().1,
+        );
+        #[cfg(not(feature = "gb10"))]
+        let target: Option<rvllm_core::CompileTarget> = None;
+        let fa3 = if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+            AttentionBackend::Fa2Ptx(rvllm_attention::Fa2PtxKernels::load(
+                &kernels,
+                arch.head_dim as u32,
+            )?)
+        } else {
+            AttentionBackend::Fa3(Fa3Kernels::load(
+                paths.fa3_so.clone(),
+                arch.head_dim as u32,
+            )?)
+        };
 
         // 5. Policy + CUTLASS .so (resolve every variant referenced in
         //    the policy).
