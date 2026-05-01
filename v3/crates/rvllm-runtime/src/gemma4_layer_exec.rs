@@ -320,12 +320,29 @@ impl Gemma4LayerDims {
         // fused_rope_partial_nvfp4kv.cu:213). Gemma 4's 256/512 are
         // multiples of 16 → safe; defensive check catches future
         // models with head_dim ∈ {80, 96} etc. before they corrupt
-        // KV-cache pointer math.
+        // KV-cache pointer math. Checked BEFORE the power-of-two
+        // gate below so non-multiples land here with the more
+        // specific error.
         if self.kv_dtype == KvDtype::Nvfp4 && self.head_dim % 16 != 0 {
             return Err(mk_err(
                 "Gemma4LayerDims: head_dim must be a multiple of 16 \
                  with NVFP4 KV (kernels use head_dim >> 4 for \
                  microscale stride and head_dim >> 1 for packed bytes)",
+            ));
+        }
+        // The Hadamard helper (`kernels/hadamard.cuh`) requires
+        // `head_dim` to be a power of two — the recursion `H_n =
+        // H_{n/2} ⊗ {{1,1},{1,-1}}` only closes when n is a power of
+        // two. The earlier `<= 512` + `% 16 == 0` checks accept
+        // values like 384 (= 256 + 128, multiple of 16, below the
+        // smem cap) which the kernel would silently mishandle. Gemma
+        // 4 head_dim ∈ {256, 512} → both power-of-two, safe.
+        if self.kv_dtype == KvDtype::Nvfp4 && !self.head_dim.is_power_of_two() {
+            return Err(mk_err(
+                "Gemma4LayerDims: head_dim must be a power of two with \
+                 NVFP4 KV (the Hadamard recursion only closes on \
+                 power-of-two D — 384 / 768 are rejected even though \
+                 they pass the size + multiple-of-16 checks)",
             ));
         }
         if self.rotary_dim > self.head_dim {
@@ -538,6 +555,15 @@ pub struct Gemma4LayerScratch {
     pub cutlass_workspace: u64,
     pub cutlass_workspace_bytes: usize,
     pub fa3_workspace: u64,
+    /// Capacity of `fa3_workspace` in bytes. Used by the split-decode
+    /// gate to refuse the split path when the per-call scratch
+    /// requirement exceeds the actual allocation. Previously the
+    /// gate hard-coded `16 * 1024 * 1024` regardless of which arena
+    /// was wired in — production `run_generate` allocates 128 MiB
+    /// while `run_bench` / `run_ppl` allocate 16 MiB, so the gate
+    /// was simultaneously too restrictive in production and exactly
+    /// right in the diagnostic paths.
+    pub fa3_workspace_bytes: u64,
     // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
     // When non-zero on an NVFP4 layer in the instrumented set, the layer
     // performs a pre-write `rope_f16kv` into these pointers BEFORE the
@@ -1530,7 +1556,13 @@ pub unsafe fn gemma4_forward_phase(
                     let use_split = split_env_on
                         && decode.has_split_kernels(dims.head_dim)
                         && current_num_parts > 1
-                        && ws_need <= 16 * 1024 * 1024; // fa3_ws is 16MiB
+                        // Compare against the actual fa3_workspace
+                        // size (varies by caller: bench/ppl 16 MiB,
+                        // generate 128 MiB). Previously hard-coded
+                        // 16 MiB silently dropped to single-CTA in
+                        // generate where the larger alloc would
+                        // have admitted the split path.
+                        && ws_need <= scratch.fa3_workspace_bytes;
                     // === DYNAMIC NVFP4 Q SCALE ===
                     // When `RVLLM_PER_TOKEN_Q_SCALE=1`, pass the per-
                     // (token, head) Q descale table populated by
@@ -3090,6 +3122,31 @@ unsafe fn rope_nvfp4kv(
             bt: std::backtrace::Backtrace::capture(),
         }
     })?;
+    // Pre-launch null-pointer guard for the NVFP4 K/V scale arenas.
+    // The attention launchers downstream (`launch` / `launch_split`)
+    // already require_nonnull these, but rope_nvfp4kv runs FIRST and
+    // would write the new K/V row's scales into NULL if the layer's
+    // dtype/scratch wiring was misconfigured. NULL deref here is at
+    // best a clean segfault and at worst (if the page happens to be
+    // mapped) silent corruption of an unrelated arena slot. Catch
+    // before the kernel touches device memory.
+    if scratch.k_cache_scale == 0 || scratch.v_cache_scale == 0 {
+        return Err(rvllm_core::RvllmError::Attention {
+            err: rvllm_core::AttentionError::FeatureNotAvailable {
+                backend: "Fa2Ptx",
+                op: "rope_nvfp4kv — k_cache_scale / v_cache_scale must be \
+                     non-null before launching the rope kernel; the layer's \
+                     KV-dtype dispatch is wired wrong",
+            },
+            ctx: rvllm_core::AttnCtx {
+                op: "rope_nvfp4kv",
+                stream,
+                num_seqs: dims.num_tokens,
+                head_dim: dims.head_dim,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
     let mut q_in = scratch.q_normed;
     let mut k_in = scratch.k_normed;
     // Gemma 4 applies a parameter-free v-norm BEFORE writing V to the
@@ -3504,6 +3561,23 @@ mod validate_tests {
         d.rotary_dim = 512;
         d.layer_type = Gemma4LayerType::GlobalAttention;
         d.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_nvfp4_head_dim_not_power_of_two() {
+        // 384 = 256 + 128: multiple of 16, ≤ 512, but not a power
+        // of two. The Hadamard recursion in kernels/hadamard.cuh
+        // only closes on power-of-two D; the validator must reject
+        // the shape before the kernel sees it.
+        let mut d = good();
+        d.kv_dtype = KvDtype::Nvfp4;
+        d.f16_kv = false;
+        d.head_dim = 384;
+        d.rotary_dim = 384;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        let err = d.validate().expect_err("head_dim=384 + NVFP4 must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("power of two"), "wrong error: {msg}");
     }
 
     #[test]

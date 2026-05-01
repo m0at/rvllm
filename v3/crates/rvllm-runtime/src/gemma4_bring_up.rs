@@ -1427,7 +1427,8 @@ impl Gemma4Bringup {
             kv_scale_region.copy_from_host(&kv_s.to_le_bytes()).unwrap();
         }
 
-        let fa3_ws = arena.region("fa3_ws", 16 * 1024 * 1024, 256).unwrap();
+        const FA3_WS_BYTES: usize = 16 * 1024 * 1024;
+        let fa3_ws = arena.region("fa3_ws", FA3_WS_BYTES, 256).unwrap();
         let residual = arena
             .region("residual", (num_seqs * hidden * 2) as usize, 16)
             .unwrap();
@@ -1666,6 +1667,7 @@ impl Gemma4Bringup {
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    fa3_workspace_bytes: FA3_WS_BYTES as u64,
                     // NVFP4 shadow diagnostic: default 0 (no shadow).
                     // Overridden in the run_generate decode path when
                     // RVLLM_NVFP4_SHADOW_F16 is on.
@@ -1959,7 +1961,8 @@ impl Gemma4Bringup {
             kv_scale_region.copy_from_host(&kv_s.to_le_bytes())?;
         }
 
-        let fa3_ws = arena.region("fa3_ws", 16 * 1024 * 1024, 256)?;
+        const FA3_WS_BYTES: usize = 16 * 1024 * 1024;
+        let fa3_ws = arena.region("fa3_ws", FA3_WS_BYTES, 256)?;
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
         let cutlass_ws = arena.region("cutlass_ws_ppl", cutlass_ws_bytes, 256)?;
 
@@ -2154,6 +2157,7 @@ impl Gemma4Bringup {
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    fa3_workspace_bytes: FA3_WS_BYTES as u64,
                     // NVFP4 shadow diagnostic: default 0 (no shadow).
                     // Overridden in the run_generate decode path when
                     // RVLLM_NVFP4_SHADOW_F16 is on.
@@ -2888,7 +2892,8 @@ impl Gemma4Bringup {
             kv_scale_region.copy_from_host(&kv_s.to_le_bytes())?;
         }
 
-        let fa3_ws = arena.region("gen_fa3_ws", 128 * 1024 * 1024, 256)?;
+        const FA3_WS_BYTES: usize = 128 * 1024 * 1024;
+        let fa3_ws = arena.region("gen_fa3_ws", FA3_WS_BYTES, 256)?;
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
         let cutlass_ws = arena.region("gen_cutlass_ws", cutlass_ws_bytes, 256)?;
 
@@ -3284,6 +3289,7 @@ impl Gemma4Bringup {
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
                     cutlass_workspace: cutlass_ws.device_ptr(), cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    fa3_workspace_bytes: FA3_WS_BYTES as u64,
                     shadow_k_cache: shadow_k,
                     shadow_v_cache: shadow_v,
                     shadow_q_cache: shadow_q,
@@ -3667,6 +3673,7 @@ impl Gemma4Bringup {
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
                     cutlass_workspace: cutlass_ws.device_ptr(), cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    fa3_workspace_bytes: FA3_WS_BYTES as u64,
                     shadow_k_cache: prefill_shadow_k,
                     shadow_v_cache: prefill_shadow_v,
                     shadow_q_cache: prefill_shadow_q,
