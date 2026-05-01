@@ -3098,12 +3098,17 @@ unsafe fn rope_nvfp4kv(
     // match in rvllm-core; we don't have a KernelError variant).
     // Cycle 55 step 14: pick bf16-input NVFP4 RoPE kernel when full
     // chain is enabled. Same launch ABI; Q/K/V inputs flip f16 → bf16.
-    let kernel_opt = if dims.bf16_residual
+    // Codex20-1: when bf16 residual + FULL_CHAIN is on, Q/K/V come in
+    // as bf16. The bf16-in NVFP4 RoPE kernel reads bf16; the f16 kernel
+    // reads __half. Falling back to the f16 kernel (`.or(...)`) was
+    // silent numeric corruption — bf16 patterns reinterpreted as
+    // little-endian half. Hard-fail instead so the operator either
+    // unsets RVLLM_BF16_NATIVE_FULL_CHAIN or rebuilds kernels/.
+    let bf16_in_path = dims.bf16_residual
         && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
-        && !crate::gemma4_bring_up::bf16_disable_rope()
-    {
+        && !crate::gemma4_bring_up::bf16_disable_rope();
+    let kernel_opt = if bf16_in_path {
         kernels.fused_rope_partial_nvfp4kv_bf16in
-            .or(kernels.fused_rope_partial_nvfp4kv)
     } else {
         kernels.fused_rope_partial_nvfp4kv
     };
@@ -3111,7 +3116,13 @@ unsafe fn rope_nvfp4kv(
         rvllm_core::RvllmError::Attention {
             err: rvllm_core::AttentionError::FeatureNotAvailable {
                 backend: "Fa2Ptx",
-                op: "rope_nvfp4kv (fused_rope_partial_nvfp4kv.ptx not in $KERNELS_DIR)",
+                op: if bf16_in_path {
+                    "rope_nvfp4kv (fused_rope_partial_nvfp4kv_bf16in.ptx missing — \
+                     RVLLM_BF16_NATIVE_FULL_CHAIN=1 requires the bf16-input NVFP4 \
+                     RoPE kernel; rebuild kernels/ or unset the env)"
+                } else {
+                    "rope_nvfp4kv (fused_rope_partial_nvfp4kv.ptx not in $KERNELS_DIR)"
+                },
             },
             ctx: rvllm_core::AttnCtx {
                 op: "rope_nvfp4kv",

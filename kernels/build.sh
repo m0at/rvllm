@@ -84,7 +84,25 @@ compile_kernel() {
     # (`cvt.rn.*.e2m1x2`) live in the CUDA family-specific PTX feature
     # set. Plain `sm_121` rejects them at ptxas time even though nvcc
     # -ptx emits the instruction successfully.
-    if grep -q 'kind::f8f6f4\|mma.sync.*e4m3\|mma.sync.*e2m1\|fp8_mma_frag_pack\|mma_m16n8k32\|cvt.rn.f16x2.e2m1x2\|cvt.rn.bf16x2.e2m1x2\|cvt.rn.e2m1x2' "$cu" 2>/dev/null; then
+    #
+    # Codex20-4: scan the .cu *and* its #include'd local headers. The
+    # actual NVFP4 dequant inline asm lives in `nvfp4_utils.cuh`
+    # (~line 291) and a kernel that simply `#include "nvfp4_utils.cuh"`
+    # without mentioning `e2m1` in its own source would otherwise miss
+    # the regex. Earlier .cu files relied on load-bearing comments
+    # containing `cvt.rn.f16x2.e2m1x2` to coerce the grep — that's
+    # hostile to maintenance. Now any kernel including the helper
+    # header (or that header chain) is auto-detected. Scope: only
+    # local quoted includes; system <...> headers stay out.
+    local sources="$cu"
+    while IFS= read -r inc; do
+        local hdr="${inc#*\"}"; hdr="${hdr%\"*}"
+        local hdr_path="$(dirname "$cu")/$hdr"
+        if [ -f "$hdr_path" ]; then
+            sources="$sources $hdr_path"
+        fi
+    done < <(grep -E '^#include[[:space:]]*"[^"]+"' "$cu" 2>/dev/null)
+    if grep -q 'kind::f8f6f4\|mma.sync.*e4m3\|mma.sync.*e2m1\|fp8_mma_frag_pack\|mma_m16n8k32\|cvt.rn.f16x2.e2m1x2\|cvt.rn.bf16x2.e2m1x2\|cvt.rn.e2m1x2' $sources 2>/dev/null; then
         case "$arch" in
             sm_120) arch="sm_120a" ;;
             sm_121) arch="sm_121a" ;;

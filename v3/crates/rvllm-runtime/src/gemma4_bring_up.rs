@@ -1505,23 +1505,15 @@ impl Gemma4Bringup {
             cudarc::driver::sys::cuMemsetD8_v2(
                 q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
         }
-        // Scale region only exists on the NVFP4 path; keep a 1-byte
-        // placeholder region on F16/Fp8 so the Option branches in
-        // scratch stay simple (0 pointer = don't touch).
-        // Cycle 56 step 1: rename to `_kv_cache_scale` to silence the
-        // unused-variable warning. The Region returned MUST be held to
-        // function end (RAII keeps the arena allocation live for the
-        // bench duration); the value itself is never read further.
-        let _kv_cache_scale = if kv_dtype.is_nvfp4() {
-            let r = arena.region("kv_cache_scale", kv_scale_total_bytes as usize, 256).unwrap();
-            #[cfg(feature = "cuda")]
-            {
-                cudarc::driver::sys::cuMemsetD8_v2(r.device_ptr(), 0, kv_scale_total_bytes as usize);
-            }
-            Some(r)
-        } else {
-            None
-        };
+        // Codex20-3: previously bench allocated a second NVFP4 scale
+        // region ("kv_cache_scale") of the same size as kv_scale_cache
+        // and held it RAII for the bench duration even though no
+        // launcher pointed at it. That was redundant — kv_scale_cache
+        // above already covers all NVFP4 scale slots; the duplicate
+        // just ate VRAM and pushed long bench runs closer to OOM.
+        // Removed. F16 / FP8 paths leave kv_scale_cache zero-sized
+        // (kv_scale_total_bytes==0 on F16); kernels that don't read
+        // scales pass 0 already.
 
         let q_scale_region = arena.region("q_scale", 4, 4).unwrap();
         let kv_scale_region = arena.region("kv_scale", 4, 4).unwrap();
@@ -2859,6 +2851,23 @@ impl Gemma4Bringup {
                             pc.provenance, cur_prov
                         );
                         prefix = 0;
+                        // Codex20-2: layout-relevant flags that affect
+                        // per-layer KV byte-stride (HYBRID_GLOBAL_FP8,
+                        // HYBRID_SLIDING_FP8, FP8_KV_LAYERS) should never
+                        // change at runtime — env is read once at startup
+                        // and the persistent KV allocation +
+                        // kv_layer_offsets are sized for that snapshot.
+                        // We continue to reuse pc.kv_layer_offsets here
+                        // (computed at first run_generate); a runtime flip
+                        // of those flags would write the new layout into
+                        // offsets sized for the old layout. Out of scope:
+                        // rvllm-serve has no env-reload mechanism, the
+                        // service is restarted between configurations
+                        // (see kv_policy_matrix.sh), so this path is not
+                        // reachable in production. If env-reload ever
+                        // lands, this branch must also re-allocate
+                        // pc.kv_cache_ptr / pc.kv_scale_ptr or refuse
+                        // the request.
                     } else {
                         // Chunk-shape cap: only reuse up to the last
                         // FULLY-WRITTEN chunk boundary of the
