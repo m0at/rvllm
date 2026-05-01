@@ -263,6 +263,25 @@ impl FusedRopePartialFp8KvLaunch {
                 "num_heads must be a multiple of num_kv_heads",
             ));
         }
+        // Kernel-side barrier hazard: the rope kernel exits threads
+        // with `tid >= half_head` early and then calls block-wide
+        // `block_max_abs(...)` which contains `__syncthreads()`. CUDA
+        // requires every thread of a block to reach a barrier
+        // (otherwise: deadlock or undefined behaviour). The launcher
+        // uses `block = max(head_dim/2, 32)`, so when half_head < 32
+        // (head_dim < 64) the upper threads return before the
+        // barrier — UB. Gemma 4 head_dim ∈ {256, 512} is unaffected;
+        // reject smaller dims so the kernel is honest about its
+        // contract.
+        if self.head_dim < 64 {
+            return Err(invalid(
+                "head_dim",
+                "fused_rope_partial_fp8kv requires head_dim >= 64; \
+                 below this the early-exit on `tid >= head_dim/2` \
+                 leaves half the warp before block_max_abs's \
+                 __syncthreads() and the launch is UB",
+            ));
+        }
         Ok(())
     }
 
@@ -853,6 +872,14 @@ impl AwqInt4GemvF16Launch {
         output_f16: u64,
         stream: u64,
     ) -> Result<()> {
+        // Validate before touching the kernel — the WMMA AWQ sibling
+        // launcher calls `self.validate()?` and the GEMV path is
+        // expected to have the same contract. Without this, a caller
+        // passing n=0 / k=0 / k % 8 != 0 / k % group_size != 0 lands
+        // inside the kernel where divisions by `group_size` and
+        // INT4-along-K layout assumptions silently corrupt or
+        // divide-by-zero (see kernels/awq_int4_gemv_f16.cu:61).
+        self.validate()?;
         let mut act = activation;
         let mut w   = weight_packed;
         let mut s   = weight_scale;

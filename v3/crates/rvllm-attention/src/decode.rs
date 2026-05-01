@@ -984,6 +984,60 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        // Enforce the documented caller invariants up front. Caller
+        // code in `gemma4_layer_exec` already gets these right today,
+        // but the launcher is an exported boundary and the docs
+        // promise checks that weren't actually performed. The reduce
+        // kernel's scratch indexing assumes `max_num_partitions` is
+        // an upper bound on the per-seq partition count derived from
+        // the device-side `context_lens`; a mismatched value silently
+        // OOB-reads / -writes the partition scratch arena
+        // (kernels/flash_attention_split_decode_nvfp4kv.cu:654).
+        if partition_size == 0 || partition_size % 16 != 0 {
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op: "paged_decode_nvfp4_split — partition_size must be a non-zero multiple of 16",
+                },
+                ctx: AttnCtx { op: "paged_decode_nvfp4_split", stream,
+                    num_seqs: params.num_seqs, head_dim: params.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if max_num_partitions == 0 {
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op: "paged_decode_nvfp4_split — max_num_partitions must be >= 1",
+                },
+                ctx: AttnCtx { op: "paged_decode_nvfp4_split", stream,
+                    num_seqs: params.num_seqs, head_dim: params.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        // Bucket-context-len ceiling check: max_num_partitions must
+        // cover ceil(max_ctx_len / partition_size). max_ctx_len is
+        // bounded by the page table: `max_blocks_per_seq *
+        // block_size`. If the caller's `max_num_partitions` is
+        // smaller than this ceiling, the reduce-kernel will read
+        // partition slots that were never written.
+        let bucket_ctx = (params.max_blocks_per_seq as u64)
+            .saturating_mul(params.block_size as u64);
+        let needed_parts = bucket_ctx
+            .div_ceil(partition_size as u64)
+            .max(1) as u32;
+        if max_num_partitions < needed_parts {
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op: "paged_decode_nvfp4_split — max_num_partitions too small \
+                         for bucket_ctx / partition_size",
+                },
+                ctx: AttnCtx { op: "paged_decode_nvfp4_split", stream,
+                    num_seqs: params.num_seqs, head_dim: params.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
         require_nonnull(
             &[
                 ("o_f16",          o_f16),
