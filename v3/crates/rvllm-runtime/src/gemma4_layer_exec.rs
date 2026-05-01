@@ -1435,17 +1435,12 @@ pub unsafe fn gemma4_forward_phase(
                     // smoke clean), so the partition-size constraint
                     // may have slack now. Env-gated for A/B testing;
                     // default 1024.
-                    let partition_size_env: u32 =
-                        std::env::var("RVLLM_NVFP4_PARTITION_SIZE")
-                            .ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
-                    let partition_size = if partition_size_env >= 64
-                        && partition_size_env.is_power_of_two()
-                    {
-                        partition_size_env
-                    } else {
-                        1024
-                    };
-                    let partition_size_u32: u32 = partition_size;
+                    // Single source of truth: shared with the
+                    // decode-graph eligibility check in
+                    // `run_generate` so the guard cannot disagree
+                    // with the kernel that actually runs.
+                    let partition_size_u32: u32 =
+                        crate::gemma4_bring_up::effective_partition_size();
                     // Bucket max ctx = max_blocks_per_seq * block_size.
                     // Workspace is sized off this so the layout is
                     // stable across iterations regardless of current

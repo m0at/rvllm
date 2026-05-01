@@ -1,21 +1,22 @@
 //! Sampling parameters parsed from request bodies.
 //!
-//! v1 of the runtime only supports **greedy** decoding
-//! (`run_generate` ends in `argmax`). We accept the full OpenAI
-//! sampling surface in the request schema and **coerce** anything
-//! non-greedy to greedy, with a `tracing::warn!` line on the first
-//! occurrence of each distinct parameter so an operator sees it once
-//! without log spam. Rationale: clients like zeroclaw and most
-//! OpenAI SDKs default to `temperature=1.0` / `top_p=1.0`; rejecting
-//! those with a 400 forced every caller to hard-code
-//! `temperature=0`. Coercing silently surprises callers; coercing
-//! with one warn-per-process is the honest middle.
+//! The HTTP request schema accepts the OpenAI sampling surface
+//! (`temperature`, `top_p`, `top_k`, `seed`) and `ensure_supported()`
+//! validates them and produces a [`SamplingDecision`] that the worker
+//! consumes. The runtime branches once per request:
 //!
-//! When a sampling kernel lands, this file becomes the place to route
-//! to stochastic decode.
+//! - `temperature == 0.0` → [`SamplingDecision::Greedy`] (existing
+//!   argmax kernel + CUDA-Graph capture eligible).
+//! - `temperature > 0.0` → [`SamplingDecision::Stochastic`] (host-side
+//!   temperature + top-p + multinomial sample with a seeded PRNG;
+//!   CUDA-Graph capture disabled for the request).
+//!
+//! Stochastic decode is host-side today: the LM-head argmax is
+//! replaced with a full-vocab DtoH + CPU softmax/top-p/sample. A
+//! follow-up wires a GPU `top_k_select` kernel so only K floats
+//! cross the bus per step.
 
 use crate::error::ApiError;
-use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingParams {
@@ -32,22 +33,18 @@ impl Default for SamplingParams {
     }
 }
 
-/// Once-per-process warn latches for each non-greedy parameter.
-static WARN_TEMPERATURE: OnceLock<()> = OnceLock::new();
-static WARN_TOP_P:       OnceLock<()> = OnceLock::new();
-static WARN_TOP_K:       OnceLock<()> = OnceLock::new();
-
 impl SamplingParams {
-    /// Coerce to greedy for the worker. Returns `GreedyParams` — the
-    /// type-level proof that stochastic params never reach the
-    /// runtime. Any non-default param triggers a one-shot WARN log.
-    /// Negative values (temperature < 0, top_p < 0) are still a hard
-    /// 400 because they're nonsensical, not just unsupported.
-    pub fn ensure_supported(self) -> Result<GreedyParams, ApiError> {
-        // Cycle 36 P1 (codex audit): NaN previously slipped through every
-        // <0 / >1 comparison and got silently coerced to greedy. Reject
-        // any non-finite first so callers see a clear 400 instead of
-        // unspecified behavior.
+    /// Validate the request shape and produce a [`SamplingDecision`].
+    ///
+    /// `temperature == 0.0` deterministically picks the [`Greedy`]
+    /// branch — bit-identical to the pre-sampler runtime, including
+    /// CUDA-Graph eligibility. Any positive finite temperature picks
+    /// the [`Stochastic`] branch with the requested `top_p` / `top_k`
+    /// honored. NaN/inf and out-of-range values still hard-400.
+    ///
+    /// [`Greedy`]: SamplingDecision::Greedy
+    /// [`Stochastic`]: SamplingDecision::Stochastic
+    pub fn ensure_supported(self) -> Result<SamplingDecision, ApiError> {
         if !self.temperature.is_finite() {
             return Err(ApiError::invalid_param(
                 "temperature must be a finite number",
@@ -76,44 +73,72 @@ impl SamplingParams {
                 "invalid_value",
             ));
         }
-        if self.temperature != 0.0 {
-            WARN_TEMPERATURE.get_or_init(|| {
-                tracing::warn!(
-                    temperature = self.temperature,
-                    "coercing temperature to 0.0 (greedy) — sampling kernel \
-                     not wired yet; this warning fires once per process"
-                );
-            });
+        if let Some(k) = self.top_k {
+            if k == 0 {
+                return Err(ApiError::invalid_param(
+                    "top_k must be >= 1 when set",
+                    "top_k",
+                    "invalid_value",
+                ));
+            }
         }
-        if self.top_p != 1.0 {
-            WARN_TOP_P.get_or_init(|| {
-                tracing::warn!(
-                    top_p = self.top_p,
-                    "coercing top_p to 1.0 (greedy) — sampling kernel not \
-                     wired yet; this warning fires once per process"
-                );
-            });
+
+        if self.temperature == 0.0 {
+            // Greedy: top_p / top_k / seed are all moot under argmax.
+            // Accept and discard rather than 400 on harmless params.
+            Ok(SamplingDecision::Greedy)
+        } else {
+            // Resolve the seed at validation time so the runtime path
+            // is fully deterministic given the chosen seed. If the
+            // caller did not supply one, draw from a process-wide
+            // entropy source (SystemTime ^ a fixed odd constant).
+            let seed = self.seed.unwrap_or_else(default_seed);
+            Ok(SamplingDecision::Stochastic(StochasticParams {
+                temperature: self.temperature,
+                top_p: self.top_p,
+                top_k: self.top_k,
+                seed,
+            }))
         }
-        if self.top_k.is_some() {
-            WARN_TOP_K.get_or_init(|| {
-                tracing::warn!(
-                    top_k = self.top_k,
-                    "ignoring top_k — sampling kernel not wired yet; this \
-                     warning fires once per process"
-                );
-            });
-        }
-        // `seed` is harmless with greedy decoding (deterministic anyway);
-        // accept and ignore.
-        Ok(GreedyParams { _seed: self.seed })
     }
 }
 
-/// Sampling parameters after validation — type-level proof that the
-/// worker only ever sees greedy.
-#[derive(Debug, Clone, Copy)]
-pub struct GreedyParams {
-    _seed: Option<u64>,
+/// Validated sampling decision handed to the worker / runtime.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SamplingDecision {
+    /// `temperature == 0.0`. The runtime takes the existing argmax
+    /// path and is eligible for CUDA-Graph capture.
+    Greedy,
+    /// `temperature > 0.0`. The runtime replaces the LM-head argmax
+    /// with a host-side temperature + top-p multinomial sample.
+    Stochastic(StochasticParams),
+}
+
+impl SamplingDecision {
+    pub fn is_greedy(&self) -> bool {
+        matches!(self, SamplingDecision::Greedy)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StochasticParams {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: Option<u32>,
+    /// Resolved at HTTP-validation time: if the caller supplied
+    /// `seed`, we forward it; otherwise [`default_seed`] draws one
+    /// from system entropy. Either way the runtime sees a concrete
+    /// `u64` and the request is reproducible if the caller records
+    /// the seed.
+    pub seed: u64,
+}
+
+fn default_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ 0x517c_c1b7_2722_0a95u64
 }
 
 #[cfg(test)]
@@ -121,28 +146,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai_defaults_coerce_to_greedy() {
-        // temperature=1.0 / top_p=1.0 is the OpenAI SDK default — must
-        // not error, must coerce silently (one WARN log, fired once
-        // per process).
-        assert!(SamplingParams::default().ensure_supported().is_ok());
+    fn openai_defaults_pick_stochastic() {
+        // temperature=1.0 / top_p=1.0 is the OpenAI SDK default. Now
+        // that the sampler is wired, defaults route to Stochastic.
+        let d = SamplingParams::default().ensure_supported().unwrap();
+        assert!(matches!(d, SamplingDecision::Stochastic(_)));
     }
 
     #[test]
-    fn greedy_accepted() {
-        let p = SamplingParams {
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: None,
-            seed: Some(42),
-        };
-        assert!(p.ensure_supported().is_ok());
+    fn temperature_zero_picks_greedy() {
+        let p = SamplingParams { temperature: 0.0, top_p: 1.0, top_k: None, seed: Some(42) };
+        let d = p.ensure_supported().unwrap();
+        assert_eq!(d, SamplingDecision::Greedy);
     }
 
     #[test]
-    fn non_default_top_p_accepted_and_coerced() {
-        let p = SamplingParams { temperature: 0.0, top_p: 0.9, ..Default::default() };
-        assert!(p.ensure_supported().is_ok());
+    fn positive_temperature_picks_stochastic_and_forwards_seed() {
+        let p = SamplingParams { temperature: 0.7, top_p: 0.9, top_k: Some(64), seed: Some(7) };
+        let d = p.ensure_supported().unwrap();
+        match d {
+            SamplingDecision::Stochastic(s) => {
+                assert_eq!(s.temperature, 0.7);
+                assert_eq!(s.top_p, 0.9);
+                assert_eq!(s.top_k, Some(64));
+                assert_eq!(s.seed, 7);
+            }
+            _ => panic!("expected Stochastic"),
+        }
+    }
+
+    #[test]
+    fn missing_seed_resolves_to_concrete_value() {
+        let p = SamplingParams { temperature: 0.7, ..Default::default() };
+        let d = p.ensure_supported().unwrap();
+        assert!(matches!(d, SamplingDecision::Stochastic(_)));
+    }
+
+    #[test]
+    fn top_p_zero_accepted_at_temp_zero() {
+        let p = SamplingParams { temperature: 0.0, top_p: 0.0, ..Default::default() };
+        assert_eq!(p.ensure_supported().unwrap(), SamplingDecision::Greedy);
     }
 
     #[test]
@@ -157,7 +200,11 @@ mod tests {
         assert!(p.ensure_supported().is_err());
     }
 
-    // === Cycle 36 NaN/inf rejection tests ===
+    #[test]
+    fn top_k_zero_rejected() {
+        let p = SamplingParams { temperature: 0.7, top_k: Some(0), ..Default::default() };
+        assert!(p.ensure_supported().is_err());
+    }
 
     #[test]
     fn nan_temperature_rejected() {
@@ -187,10 +234,45 @@ mod tests {
         assert!(p.ensure_supported().is_err());
     }
 
+    /// Pin the seed-routing contract: same caller seed must reach the
+    /// runtime as the same `Stochastic.seed` value. The integration
+    /// tests cannot prove this end-to-end because the mock worker
+    /// bypasses the sampler entirely — so this assertion lives here,
+    /// at the unit boundary that the production path threads through.
     #[test]
-    fn top_p_zero_accepted() {
-        // top_p=0 is technically valid (means "argmax"); not a rejection case.
-        let p = SamplingParams { temperature: 0.0, top_p: 0.0, ..Default::default() };
-        assert!(p.ensure_supported().is_ok());
+    fn explicit_seed_is_forwarded_unchanged() {
+        let p = SamplingParams { temperature: 0.7, seed: Some(42), ..Default::default() };
+        match p.ensure_supported().expect("validates") {
+            SamplingDecision::Stochastic(s) => assert_eq!(s.seed, 42),
+            _ => panic!("temperature>0 must route to Stochastic"),
+        }
+    }
+
+    /// Companion to the "no-seed" rule: two consecutive requests with
+    /// no caller-supplied seed must each receive a concrete `u64`,
+    /// and they must NOT be the literal default sentinel (`0` or the
+    /// fixed `0x517c…` constant standing alone). System-entropy mixing
+    /// is the property that prevents accidental cross-request
+    /// determinism in production.
+    #[test]
+    fn missing_seed_draws_from_entropy() {
+        let a = SamplingParams { temperature: 0.7, seed: None, ..Default::default() }
+            .ensure_supported().expect("a");
+        // Sleep one nanosecond is sufficient since the seed mixes the
+        // SystemTime nanos with a fixed odd constant.
+        std::thread::sleep(std::time::Duration::from_nanos(1));
+        let b = SamplingParams { temperature: 0.7, seed: None, ..Default::default() }
+            .ensure_supported().expect("b");
+        let (sa, sb) = match (a, b) {
+            (SamplingDecision::Stochastic(a), SamplingDecision::Stochastic(b)) => (a.seed, b.seed),
+            _ => panic!("temperature>0 must route to Stochastic"),
+        };
+        assert_ne!(sa, 0);
+        assert_ne!(sb, 0);
+        // Two SystemTime samples within the same process tick CAN
+        // collide; we only assert a soft inequality across a small
+        // sleep. If this proves flaky on slow CI clocks, the assert
+        // can be relaxed to `sa | sb != 0`.
+        assert_ne!(sa, sb, "consecutive no-seed calls produced identical seeds: {sa}");
     }
 }

@@ -155,20 +155,69 @@ fn parse_tier2_bare(text: &str) -> Vec<ParsedToolCall> {
         }
         let name = &text[name_start..j];
         let args_start = j + 1;
-        // First `}` after args_start terminates. Tier-2 doesn't handle
-        // braces inside string values; Gemma 4's bare-call output does
-        // not nest in practice.
-        let Some(args_end_rel) = text[args_start..].find('}') else {
+        // Balanced-brace scan: find the `}` that closes the OPENING
+        // `{` at `j`, accounting for nested objects (`{"a":{"b":1}}`)
+        // and `}` characters inside JSON string literals (which must
+        // NOT count toward depth). Without this, bare
+        // `call:foo{"a":{"b":1}}` was truncated to `call:foo{"a":{"b":1}`.
+        let Some(args_end_abs) = find_balanced_close_brace(text, args_start) else {
             break;
         };
-        let args = &text[args_start..args_start + args_end_rel];
+        let args = &text[args_start..args_end_abs];
         out.push(ParsedToolCall {
             name: name.to_string(),
             arguments: arguments_to_json_string(args),
         });
-        i = args_start + args_end_rel + 1;
+        i = args_end_abs + 1;
     }
     out
+}
+
+/// Scan `text` starting at `start` (the byte AFTER an opening `{`) and
+/// return the absolute byte index of the matching closing `}` at depth
+/// zero. Tracks nested object braces and skips `{` / `}` that appear
+/// inside JSON string literals (incl. backslash-escapes). Returns
+/// `None` if the buffer ends with the call still unclosed.
+///
+/// Used by tier-2 bare-call extraction where the surrounding wrapper
+/// is absent and the parser must distinguish "args end" from "nested
+/// object close".
+fn find_balanced_close_brace(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth: i32 = 1; // caller already consumed the opening `{`
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if escape_next {
+            escape_next = false;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            match c {
+                b'\\' => escape_next = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Render the inner args region into a JSON object string.
@@ -314,8 +363,16 @@ pub fn strip_tool_markup(text: &str) -> String {
                     j += 1;
                 }
                 if j > after && j < bytes.len() && bytes[j] == b'{' {
-                    if let Some(end_rel) = text[j + 1..].find('}') {
-                        i = j + 1 + end_rel + 1;
+                    // Reuse the same balanced-brace scanner that
+                    // `parse_tier2_bare` uses, so strip and parse stay
+                    // symmetric: any args region the parser accepts
+                    // (incl. nested objects, `}` inside string
+                    // literals) is also fully removed from the visible
+                    // content here. Without this, nested-args calls
+                    // leaked a stray `}` + trailing prose into the
+                    // assistant message body.
+                    if let Some(end_abs) = find_balanced_close_brace(text, j + 1) {
+                        i = end_abs + 1;
                         continue;
                     }
                 }
@@ -567,26 +624,69 @@ mod tests {
     }
 
     #[test]
-    fn tier2_nested_braces_truncate_known_limitation() {
-        // Cycle 37 (codex audit P2 #8): documents the existing tier-2
-        // parser's known limitation. Bare `call:NAME{...}` stops at the
-        // FIRST `}`, so a JSON object value with a nested object gets
-        // truncated. The tier-1 wrapped form (`<|tool_call>...<tool_call|>`)
-        // does NOT have this limit because it scopes by the wrapper.
-        //
-        // This test PINS the current behavior so any future "fix" that
-        // changes it shows up loudly. To support nested objects we'd
-        // need a balanced-brace scanner — tracked for cycle 38+.
-        let s = r#"call:foo{a:{b:1}}"#;
+    fn tier2_nested_braces_handled_by_balanced_scanner() {
+        // Tier-2 used to stop at the FIRST `}`, so a JSON object value
+        // with a nested object got truncated to `call:foo{"a":{"b":1}`
+        // and the args fallback parser then produced gibberish. The
+        // balanced-brace scanner now matches the closing `}` at depth
+        // zero, so nested objects round-trip cleanly. The tier-1
+        // wrapped form (covered separately) was always fine because
+        // the wrapper terminator delimits the args region.
+        let s = r#"call:foo{"a":{"b":1}}"#;
         let calls = parse_gemma4_tool_calls(s);
-        // Today: only matches up to the first `}`. The args become
-        // `{"a":"{b":"1"}"}` or similar — caller still sees a call,
-        // but with truncated args. We only assert SHAPE here, not
-        // exact content, since the args parser may evolve.
-        assert!(
-            calls.is_empty() || calls[0].name == "foo",
-            "unexpected parse shape: {calls:?}"
-        );
+        assert_eq!(calls.len(), 1, "expected one call, got {calls:?}");
+        assert_eq!(calls[0].name, "foo");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert_eq!(args["a"]["b"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn tier2_brace_inside_string_does_not_close_args() {
+        // A `}` inside a JSON string literal must NOT terminate the
+        // args region. The balanced-brace scanner tracks string state
+        // and ignores braces between unescaped quotes.
+        let s = r#"call:say{"text":"hello } world","level":1}"#;
+        let calls = parse_gemma4_tool_calls(s);
+        assert_eq!(calls.len(), 1, "expected one call, got {calls:?}");
+        assert_eq!(calls[0].name, "say");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].arguments).expect("valid json");
+        assert_eq!(args["text"], "hello } world");
+        assert_eq!(args["level"], 1);
+    }
+
+    #[test]
+    fn strip_handles_tier2_nested_args_without_residue() {
+        // Symmetry guard for the balanced-brace scanner. `parse_tier2_bare`
+        // matches up to the depth-zero closer; `strip_tool_markup` must
+        // remove EXACTLY the same span so no `}` / no trailing prose
+        // (after the call but before another marker) leaks into the
+        // user-visible content. Before the fix, strip stopped at the
+        // first inner `}` and left `}thought` in `content`.
+        let s = r#"call:foo{"a":{"b":1}}thought"#;
+        let stripped = strip_tool_markup(s);
+        assert_eq!(stripped, "thought", "strip leaked residue: {stripped:?}");
+    }
+
+    #[test]
+    fn strip_handles_tier2_brace_in_string_without_residue() {
+        // Same property but with a `}` inside a JSON string literal —
+        // the scanner must NOT treat it as a closer for either parse
+        // or strip.
+        let s = r#"call:say{"text":"hello } world"} ok"#;
+        let stripped = strip_tool_markup(s);
+        assert_eq!(stripped.trim(), "ok", "strip leaked residue: {stripped:?}");
+    }
+
+    #[test]
+    fn tier2_unclosed_brace_does_not_panic_or_match() {
+        // Truncated stream — the bare call never receives its closing
+        // brace. We must drop it cleanly rather than panic or invent a
+        // partial match.
+        let s = r#"call:foo{"a":{"b":1}"#; // missing trailing `}`
+        let calls = parse_gemma4_tool_calls(s);
+        assert!(calls.is_empty(), "expected no calls, got {calls:?}");
     }
 
     #[test]

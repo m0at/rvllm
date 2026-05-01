@@ -21,6 +21,186 @@ use crate::gemma4_layer_exec::Gemma4LayerKernels;
 
 // Cycle 56 step 7: cuda_check! macro hoisted to crate root in lib.rs.
 
+/// Per-request sampling configuration handed to [`Gemma4Bringup::run_generate`].
+///
+/// `Greedy` is unconditional argmax — the runtime does NOT consult
+/// `RVLLM_SAMPLING_TEMPERATURE` / `_TOP_P` here. A previous iteration
+/// kept that env-var fallback as a "dev knob" for bench/probe, but it
+/// also fired for HTTP requests that explicitly sent `temperature: 0`
+/// and silently broke their determinism the moment the env var was
+/// exported on the box. Stochastic semantics live exclusively on
+/// `Stochastic`. Bench/probe binaries call `SamplingConfig::greedy()`
+/// and run argmax; if they ever want sampling, they should plumb
+/// their own CLI flags into `Stochastic`.
+#[derive(Debug, Clone, Copy)]
+pub enum SamplingConfig {
+    Greedy,
+    Stochastic {
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        seed: u64,
+    },
+}
+
+impl SamplingConfig {
+    /// Default for callers that do not opt into per-request sampling
+    /// (bench, probe). Always argmax — there is no env-var fallback.
+    pub fn greedy() -> Self {
+        SamplingConfig::Greedy
+    }
+}
+
+/// Resolve the effective NVFP4 attention partition size from the
+/// environment. Single source of truth — the attention-dispatch site
+/// in `gemma4_layer_exec.rs` and the decode-graph eligibility check
+/// in `run_generate` BOTH consult this so the eligibility guard
+/// can never disagree with the kernel that actually runs.
+///
+/// Default `1024` matches the dispatch-side default. Values that are
+/// not powers of two or smaller than 64 fall back to the default,
+/// mirroring the dispatch validator.
+pub fn effective_partition_size() -> u32 {
+    const DEFAULT: u32 = 1024;
+    let raw: u32 = std::env::var("RVLLM_NVFP4_PARTITION_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT);
+    if raw >= 64 && raw.is_power_of_two() {
+        raw
+    } else {
+        DEFAULT
+    }
+}
+
+/// Decide whether decode-graph capture is safe for a single generation.
+///
+/// The captured graph freezes the split-KV partition decision (single-
+/// CTA vs multi-partition attention dispatch). If `capture_ctx`
+/// (= `prompt_len + capture_decode_step + 1`) and
+/// `prompt_len + max_new` (the end of generation) fall on different
+/// sides of the `partition_size` threshold, replay would run the
+/// frozen kernel for an entire generation that grows past the
+/// capture-time decision. The kernel is still correct in that case
+/// but pays the wrong-path overhead, which negates the launch-overhead
+/// win that motivates capture in the first place.
+///
+/// `capture_decode_step` mirrors the `RVLLM_DECODE_GRAPH_CAPTURE_AT`
+/// runtime knob — operators who tune the capture point also shift the
+/// boundary at which this check evaluates.
+///
+/// Returns `true` when capture is safe (parts-count at capture == 1
+/// and parts-count at end of gen == 1, OR both > 1).
+pub fn decode_graph_eligible_for_generation(
+    prompt_len: u32,
+    max_new: u32,
+    partition_size: u32,
+    capture_decode_step: u32,
+) -> bool {
+    if partition_size == 0 {
+        return false;
+    }
+    let capture_ctx = prompt_len
+        .saturating_add(capture_decode_step)
+        .saturating_add(1);
+    let end_ctx = prompt_len.saturating_add(max_new);
+    let parts_at_capture = capture_ctx.div_ceil(partition_size).max(1);
+    let parts_at_end = end_ctx.div_ceil(partition_size).max(1);
+    (parts_at_capture == 1) == (parts_at_end == 1)
+}
+
+#[cfg(test)]
+mod decode_graph_eligibility_tests {
+    use super::{decode_graph_eligible_for_generation, effective_partition_size};
+
+    #[test]
+    fn short_prompt_short_generation_eligible() {
+        // Capture at ctx=2, end at ctx=33, partition=256 → both <= 256.
+        assert!(decode_graph_eligible_for_generation(0, 33, 256, 1));
+    }
+
+    #[test]
+    fn long_prompt_inside_one_partition_eligible() {
+        // prompt_len=200, max_new=40, partition=256 → end_ctx=240 ≤ 256.
+        assert!(decode_graph_eligible_for_generation(200, 40, 256, 1));
+    }
+
+    #[test]
+    fn generation_crosses_partition_boundary_blocked() {
+        // prompt_len=200, max_new=200, end_ctx=400 → 400/256=2 parts,
+        // capture_ctx=202 → 1 part. Capture would freeze single-CTA
+        // path; replay the second half wrongly. Block capture.
+        assert!(!decode_graph_eligible_for_generation(200, 200, 256, 1));
+    }
+
+    #[test]
+    fn long_prompt_already_past_boundary_eligible() {
+        // prompt_len=2000, max_new=40 — capture_ctx and end_ctx both
+        // produce >1 partitions, so the split-path decision is stable.
+        assert!(decode_graph_eligible_for_generation(2000, 40, 256, 1));
+    }
+
+    #[test]
+    fn zero_partition_size_blocks() {
+        // Defensive: a misconfigured partition_size of 0 must not
+        // panic via div_ceil; the eligibility just becomes false.
+        assert!(!decode_graph_eligible_for_generation(100, 100, 0, 1));
+    }
+
+    /// Regression: the eligibility check used to default to 256 while
+    /// the attention dispatch defaulted to 1024. With 1024 the split-
+    /// path threshold lives further out, so a default-config request
+    /// of `prompt_len=900, max_new=200` (end_ctx=1100) crosses the
+    /// boundary at 1024 and must NOT be eligible. Pinning the
+    /// shared default catches a future drift loudly.
+    #[test]
+    fn shared_default_blocks_900_plus_200_request() {
+        let p = effective_partition_size();
+        assert_eq!(p, 1024, "shared default drifted away from dispatch site");
+        assert!(
+            !decode_graph_eligible_for_generation(900, 200, p, 1),
+            "default-config 900+200 should cross the 1024 partition boundary",
+        );
+    }
+
+    /// Honour `RVLLM_DECODE_GRAPH_CAPTURE_AT`. Operators tuning the
+    /// capture point (e.g. to capture later when prompt KV is more
+    /// settled) shift the boundary the eligibility check evaluates.
+    /// A capture deep into the partition-2 region must NOT be marked
+    /// eligible just because the early steps still fit in
+    /// partition-1 — otherwise the captured kernel freezes the
+    /// wrong path.
+    #[test]
+    fn capture_at_shifts_eligibility_boundary() {
+        // prompt_len=200, max_new=300, p=256, capture_at=1 →
+        // capture_ctx=202 (parts=1), end_ctx=500 (parts=2) → blocked.
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 1));
+        // Same prompt+gen, capture_at=300 → capture_ctx=501
+        // (parts=2), end_ctx=500 (parts=2) → eligible (both >1).
+        assert!(decode_graph_eligible_for_generation(200, 300, 256, 300));
+    }
+
+    /// Lock down the env-var resolver: invalid (non-power-of-two,
+    /// too small) values fall back to the dispatch-site default
+    /// rather than letting the eligibility check use a bogus value
+    /// the dispatch site rejects.
+    #[test]
+    fn effective_partition_size_rejects_invalid_env() {
+        // Save + restore prior value so we don't pollute other tests.
+        let prior = std::env::var_os("RVLLM_NVFP4_PARTITION_SIZE");
+        std::env::set_var("RVLLM_NVFP4_PARTITION_SIZE", "777"); // not pow2
+        assert_eq!(effective_partition_size(), 1024);
+        std::env::set_var("RVLLM_NVFP4_PARTITION_SIZE", "32"); // < 64
+        assert_eq!(effective_partition_size(), 1024);
+        std::env::set_var("RVLLM_NVFP4_PARTITION_SIZE", "256"); // valid
+        assert_eq!(effective_partition_size(), 256);
+        match prior {
+            Some(v) => std::env::set_var("RVLLM_NVFP4_PARTITION_SIZE", v),
+            None => std::env::remove_var("RVLLM_NVFP4_PARTITION_SIZE"),
+        }
+    }
+}
+
 /// Cycle 46 step 5c: convert the loader's optional per-layer AWQ weight
 /// table into the runtime's flat-pointer struct. Returns the all-zero
 /// default when no AWQ tensors were uploaded for this layer (every
@@ -2215,6 +2395,19 @@ impl Gemma4Bringup {
         // (zeroclaw classifier, internal probes) cannot accidentally
         // burn the one-shot latch.
         shadow_requested: bool,
+        // Per-request sampling decision. `Greedy` keeps the legacy
+        // argmax path; `Stochastic` activates host-side temperature +
+        // top-p sampling with the supplied seed.
+        sampling: SamplingConfig,
+        // Optional cancellation signal. The decode loop checks this
+        // flag at the top of every step and returns the tokens
+        // produced so far if it transitions to `true`. Without this,
+        // an HTTP-layer timeout / client disconnect would 504 the
+        // request but the worker thread would stay blocked in
+        // `run_generate` until natural completion, monopolising the
+        // GPU and starving subsequent requests. Pass `None` from
+        // bench / probe binaries that have no cancellation source.
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<u32>> {
         // Cycle 37 P2 (codex audit): max_new=0 used to underflow at
         // `0..max_new - 1`. Caller (handlers.rs::resolve_max_new) already
@@ -2235,24 +2428,36 @@ impl Gemma4Bringup {
         let vocab = arch.vocab_size as u32;
         let stream = self.stream.raw();
 
-        // === HOST-SIDE TEMPERATURE SAMPLING (cycle 16) ===
+        // === HOST-SIDE TEMPERATURE SAMPLING ===
         // Greedy argmax at razor-thin margins (~0.1-0.5 logit units)
         // makes long-context tool-call generation produce confident
-        // garbage. Sampling at temp>0 lets the model explore alternative
-        // continuations when the top-1 winner is questionable. Env-
-        // gated; default 0.0 → existing argmax path. The first
-        // `RVLLM_SAMPLING_TEMPERATURE>0` request seeds an LCG; same
-        // process keeps state across requests for variety.
-        let sampling_temp: f32 = std::env::var("RVLLM_SAMPLING_TEMPERATURE")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        let sampling_top_p: f32 = std::env::var("RVLLM_SAMPLING_TOP_P")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(0.95);
-        // LCG state — seeded once per request from current time.
-        let mut rng_state: u64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
-            ^ 0x517cc1b727220a95u64;
+        // garbage. Sampling at temp>0 lets the model explore
+        // alternative continuations when the top-1 winner is
+        // questionable.
+        //
+        // `SamplingConfig::Greedy` is UNCONDITIONAL argmax. We do NOT
+        // read `RVLLM_SAMPLING_TEMPERATURE` / `_TOP_P` here. The
+        // previous fallback meant a stray env var on the production
+        // box silently broke deterministic `temperature: 0` API
+        // requests. Stochastic decode requires an explicit
+        // `SamplingConfig::Stochastic` from the caller — there is no
+        // "ambient" sampling state.
+        let (sampling_temp, sampling_top_p, sampling_top_k, mut rng_state): (f32, f32, Option<u32>, u64) = match sampling {
+            SamplingConfig::Stochastic { temperature, top_p, top_k, seed } => {
+                (temperature, top_p, top_k, seed)
+            }
+            // Hard zero. The host-side sampler below is gated on
+            // `sampling_temp > 0.0`, so the inert tuple here just
+            // routes through the existing `ArgmaxLaunch` path
+            // without ever entering `host_sample_token`.
+            SamplingConfig::Greedy => (0.0, 1.0, None, 0),
+        };
         let mut next_rand_f32 = || -> f32 {
-            // 64-bit LCG (Knuth) → take high 24 bits as fraction in [0, 1)
+            // 64-bit LCG (Knuth) — bit-for-bit compatible with the
+            // pre-SamplingConfig path. Replaceable by Philox-4×32 if
+            // cross-engine reproducibility against vLLM ever matters;
+            // for now LCG + caller-supplied seed is enough for
+            // request-level determinism (same seed → same output).
             rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((rng_state >> 40) as f32) / (1u32 << 24) as f32
         };
@@ -2260,31 +2465,69 @@ impl Gemma4Bringup {
                                  vocab: u32,
                                  temp: f32,
                                  top_p: f32,
-                                 rng_f32: &mut dyn FnMut() -> f32| -> u32 {
+                                 top_k: Option<u32>,
+                                 rng_f32: &mut dyn FnMut() -> f32|
+            -> Result<u32> {
             #[cfg(feature = "cuda")]
             unsafe {
                 let mut host_logits = vec![0f32; vocab as usize];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                // Check the cuMemcpyDtoH return — a silently-failing
+                // copy left `host_logits` all-zeros, every entry tied,
+                // and lex-tiebreak picked token-id 0 deterministically.
+                // The caller saw "successful" generation of <pad>/<bos>
+                // sequences while a real CUDA fault sat masked under
+                // it. Now we propagate the error and the request ends
+                // with a clear `RvllmError::Cuda { kind: MemcpyFailed,
+                // op: "host_sample_token_dtoh", … }`.
+                let r = cudarc::driver::sys::cuMemcpyDtoH_v2(
                     host_logits.as_mut_ptr() as *mut _,
                     logits_dev_ptr,
                     (vocab as usize) * 4,
                 );
+                if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::Cuda {
+                        kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                        op: "host_sample_token_dtoh",
+                        ctx: rvllm_core::CudaCtx {
+                            stream: stream as u64,
+                            kernel: "",
+                            launch: None,
+                            device: 0,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
                 // Apply temperature: divide by temp (clamped to >=1e-3 to
                 // avoid div-by-zero on sloppy callers).
                 let inv_temp = 1.0f32 / temp.max(1e-3);
                 let mut scaled: Vec<(u32, f32)> = host_logits.iter().enumerate()
                     .map(|(i, &v)| (i as u32, v * inv_temp)).collect();
-                // top_p: sort, take cumulative-prob window covering top_p mass
-                scaled.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                // Softmax-stabilise on the top slice (avoids overflow on
-                // huge logits — Gemma 4 sees 60+).
+                // Sort by scaled logit desc; lex-tiebreak on token id so
+                // ties are deterministic (caller-supplied `seed` then
+                // fully reproduces a request).
+                scaled.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.cmp(&b.0))
+                });
+                // top_k: if set, drop everything past rank K before the
+                // softmax. Avoids wasted exp() on the long tail and is
+                // the canonical OpenAI ordering (top_k, then top_p).
+                let mut effective_len = scaled.len();
+                if let Some(k) = top_k {
+                    effective_len = effective_len.min(k as usize).max(1);
+                }
+                // Softmax-stabilise on the kept slice (avoids overflow
+                // on huge logits — Gemma 4 sees 60+).
                 let max_l = scaled[0].1;
-                let mut probs: Vec<f32> = scaled.iter().map(|&(_, l)| (l - max_l).exp()).collect();
+                let mut probs: Vec<f32> = scaled[..effective_len].iter()
+                    .map(|&(_, l)| (l - max_l).exp())
+                    .collect();
                 let z: f32 = probs.iter().sum();
                 if z > 0.0 { for p in &mut probs { *p /= z; } }
                 // top_p: keep tokens until cumulative >= top_p, drop rest.
                 let mut cum = 0.0f32;
-                let mut cutoff = scaled.len();
+                let mut cutoff = probs.len();
                 for (i, &p) in probs.iter().enumerate() {
                     cum += p;
                     if cum >= top_p { cutoff = i + 1; break; }
@@ -2297,12 +2540,12 @@ impl Gemma4Bringup {
                 let mut acc = 0.0f32;
                 for (i, &p) in probs[..cutoff].iter().enumerate() {
                     acc += p;
-                    if r < acc { return scaled[i].0; }
+                    if r < acc { return Ok(scaled[i].0); }
                 }
-                scaled[cutoff - 1].0
+                Ok(scaled[cutoff - 1].0)
             }
             #[cfg(not(feature = "cuda"))]
-            { let _ = (logits_dev_ptr, vocab, temp, top_p, rng_f32); 0 }
+            { let _ = (logits_dev_ptr, vocab, temp, top_p, top_k, rng_f32); Ok(0u32) }
         };
         // === END HOST-SIDE TEMPERATURE SAMPLING ===
 
@@ -2753,9 +2996,39 @@ impl Gemma4Bringup {
         // === END HADAMARD ROTATION ===
 
         // Helper: run one token through all layers (decode path)
-        let run_one_token = |tok_id: u32, step: usize| -> Result<()> {
+        // === CUDA-graph-capturable factoring (cycle 60+) ===
+        //
+        // Original `run_one_token` interleaved host→device input copies
+        // (token id, positions, slot_mapping, context_lens) with the
+        // pure-device kernel chain. CUDA Graph capture cannot replay
+        // HtoD copies whose source pointers are stack-local — they go
+        // out of scope after the capture closure returns. The PPL path
+        // (line ~2099) already factors the same way; we mirror it here
+        // for the decode hot path.
+        //
+        //   * `prepare_decode_inputs(tok_id, step)` — host-side HtoDs,
+        //     ALWAYS runs eagerly between graph replays.
+        //   * `decode_forward()` — pure device kernel chain (embedding
+        //     gather + optional f16→bf16 widen + 60-layer body).
+        //     Capturable into a CUDA graph; replayable any number of
+        //     times as long as the device-side input buffers are
+        //     refreshed via `prepare_decode_inputs` between replays.
+        //
+        // `run_one_token` keeps its existing signature for the prefill
+        // (line ~3012) and diagnostic (line ~3044) call sites; it just
+        // calls the two helpers in sequence.
+        let prepare_decode_inputs = |tok_id: u32, step: usize| -> Result<()> {
             let tok_i32 = [tok_id as i32];
             token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_i32))?;
+            let pos = [step as i32];
+            let slot = [step as i32];
+            let ctx = [step as i32 + 1];
+            positions.copy_from_host(bytemuck_cast_i32(&pos))?;
+            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot))?;
+            context_lens.copy_from_host(bytemuck_cast_i32(&ctx))?;
+            Ok(())
+        };
+        let decode_forward = |step: usize| -> Result<()> {
             rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
                 .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
                     token_ids_region.device_ptr(), stream)?;
@@ -2766,13 +3039,6 @@ impl Gemma4Bringup {
                 rvllm_fused::gemma4_launcher::F16ToBf16Launch { n: hidden }
                     .launch(kernels.f16_to_bf16, residual_ptr, residual_ptr, stream)?;
             }
-
-            let pos = [step as i32];
-            let slot = [step as i32];
-            let ctx = [step as i32 + 1];
-            positions.copy_from_host(bytemuck_cast_i32(&pos))?;
-            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot))?;
-            context_lens.copy_from_host(bytemuck_cast_i32(&ctx))?;
 
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
                 if layer_idx >= max_layers { break; }
@@ -2959,6 +3225,10 @@ impl Gemma4Bringup {
                 )?;
             }
             Ok(())
+        };
+        let run_one_token = |tok_id: u32, step: usize| -> Result<()> {
+            prepare_decode_inputs(tok_id, step)?;
+            decode_forward(step)
         };
 
         let t0 = std::time::Instant::now();
@@ -3519,9 +3789,9 @@ impl Gemma4Bringup {
             // Host-side temperature sampling
             self.stream.fence()?;
             host_tok[0] = host_sample_token(
-                logits_f32.device_ptr(), vocab, sampling_temp, sampling_top_p,
+                logits_f32.device_ptr(), vocab, sampling_temp, sampling_top_p, sampling_top_k,
                 &mut next_rand_f32,
-            ) as i32;
+            )? as i32;
         } else {
             rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
                 .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
@@ -3577,9 +3847,140 @@ impl Gemma4Bringup {
         }
 
         // Phase 2: Decode new tokens
+        //
+        // === CUDA Graph capture (cycle 60 step Y, RVLLM_DECODE_GRAPH=1) ===
+        // The 60-layer-per-token kernel chain is ~660 cuLaunchKernel
+        // calls per decode step. Eliminating per-step launch overhead
+        // via CUDA Graph replay is the largest perf lever after the
+        // partition-size win. We capture once on the second decode
+        // step (decode_step == 1) — after eager warmup at step=0
+        // populates KV[prompt_len] AND past the once-per-generate
+        // shadow_q diagnostic gate. From then on, replay the graph
+        // for every subsequent decode step. Per-step host work
+        // (prepare_decode_inputs HtoDs, post-graph LM head, sampling,
+        // rep-penalty) stays eager outside the graph.
+        //
+        // ## Known limitation: split-KV partition decision is frozen
+        //
+        // `decode_forward(step)` sets
+        // `current_max_context_len = Some(step+1)`, and the attention
+        // dispatch in `gemma4_layer_exec.rs` uses that to pick between
+        // `decode.launch_split` (multi-partition) and `decode.launch`
+        // (single CTA per seq/head). The captured graph records ONE
+        // of those kernel calls. Replay then runs that kernel for
+        // every later step regardless of how the partition count
+        // would have evolved.
+        //
+        // This is a PERFORMANCE bug, not a correctness bug: the
+        // non-split kernel handles long contexts correctly (it just
+        // loops serially within one CTA), and the split kernel sizes
+        // its workspace from `bucket_ctx = max_blocks_per_seq *
+        // block_size` so it can run at any step's actual ctx.
+        //
+        // To minimise the perf hit, we delay capture until a
+        // representative decode step — `RVLLM_DECODE_GRAPH_CAPTURE_AT`
+        // (default 1) — and we ABORT capture eligibility when the
+        // partition decision at the capture step would differ from
+        // the decision at the GENERATION END (`prompt_len + max_new`).
+        // In that case we silently fall through to eager
+        // `run_one_token` for the whole generation and emit a one-
+        // shot tracing::warn so the operator sees why the graph
+        // didn't fire. A future cycle can capture multiple graphs
+        // (one per partition-decision range) and replay the
+        // appropriate one — out of scope here.
+        let use_decode_graph = std::env::var("RVLLM_DECODE_GRAPH")
+            .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false);
+        // `RVLLM_DECODE_GRAPH_CAPTURE_AT` controls which decode_step
+        // is used as the capture body. Default 1 — first step beyond
+        // the eager warmup (decode_step==0 populates KV[prompt_len]
+        // and runs the once-per-generate shadow_q diagnostic). The
+        // floor of 1 is a hard requirement; values < 1 collapse to 1.
+        let decode_graph_capture_at: usize = std::env::var("RVLLM_DECODE_GRAPH_CAPTURE_AT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1usize)
+            .max(1);
+        // Eligibility check: would the partition decision at capture
+        // time still hold at the end of generation? If not, fall back
+        // to eager; the captured-but-wrong-path replay would just be
+        // a slow no-op compared to eager. Crucially, the partition
+        // size queried here MUST match the value the attention
+        // dispatch in `gemma4_layer_exec.rs` will use — both sites
+        // call `effective_partition_size()` so a future change to
+        // the default cannot silently desync the guard. (A previous
+        // iteration hardcoded `256` here while the dispatch defaulted
+        // to `1024`; the guard let plain-default requests through
+        // and the captured graph froze a single-CTA branch that
+        // flipped to split-KV mid-generation.)
+        let partition_size_for_graph = effective_partition_size();
+        let decode_graph_eligible = use_decode_graph
+            && decode_graph_eligible_for_generation(
+                prompt_ids.len() as u32,
+                max_new as u32,
+                partition_size_for_graph,
+                decode_graph_capture_at as u32,
+            );
+        if use_decode_graph && !decode_graph_eligible {
+            tracing::warn!(
+                prompt_len = prompt_ids.len(),
+                max_new,
+                partition_size = partition_size_for_graph,
+                "RVLLM_DECODE_GRAPH=1 but partition decision would change \
+                 mid-generation; falling back to eager decode for this \
+                 request to avoid replaying a frozen split-KV branch"
+            );
+        }
+        let use_decode_graph = decode_graph_eligible;
+        let mut decode_graph: Option<rvllm_graph::CapturedGraph> = None;
         for decode_step in 0..max_new - 1 {
+            // Early-out on caller-side cancellation. Checked once per
+            // step (cheap atomic load) so the worker thread releases
+            // its monopoly on the GPU within ~one decode latency
+            // (~270 ms on Gemma 4 31B / GB10) of a client timeout
+            // rather than running to completion in the background.
+            if let Some(c) = cancel {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        decode_step,
+                        max_new,
+                        "run_generate cancelled by caller — returning partial output",
+                    );
+                    break;
+                }
+            }
             let tok_id = *output_ids.last().unwrap();
-            run_one_token(tok_id, prompt_ids.len() + decode_step)?;
+            let step = prompt_ids.len() + decode_step;
+            if use_decode_graph && decode_step >= decode_graph_capture_at {
+                // Post-warmup path: prepare inputs eagerly, then either
+                // capture (first time) or replay the captured graph.
+                prepare_decode_inputs(tok_id, step)?;
+                if decode_graph.is_none() {
+                    // Capture body: kernels are RECORDED into the graph,
+                    // not executed. So we still need an eager run BEFORE
+                    // capture to populate KV[step]; the capture body is
+                    // a second invocation that records but does not run.
+                    decode_forward(step)?;
+                    self.stream.fence()?;
+                    let g = rvllm_graph::CapturedGraph::capture(
+                        1u32,
+                        max_blocks_per_seq as u32,
+                        rvllm_metadata::MetadataLayout::compute(
+                            1u32, max_blocks_per_seq as u32).hash(),
+                        rvllm_graph::GraphFingerprint([0u8; 32]),
+                        stream,
+                        || decode_forward(step),
+                    )?;
+                    self.stream.fence()?;
+                    eprintln!("[decode-graph] captured at decode_step={} step={}",
+                        decode_step, step);
+                    decode_graph = Some(g);
+                } else {
+                    decode_graph.as_ref().unwrap().replay(stream)?;
+                }
+            } else {
+                run_one_token(tok_id, step)?;
+            }
 
             // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
             // First-token dump: runs exactly once on decode_step == 0
@@ -3841,9 +4242,9 @@ impl Gemma4Bringup {
             if sampling_temp > 0.0 {
                 self.stream.fence()?;
                 host_tok[0] = host_sample_token(
-                    logits_f32.device_ptr(), vocab, sampling_temp, sampling_top_p,
+                    logits_f32.device_ptr(), vocab, sampling_temp, sampling_top_p, sampling_top_k,
                     &mut next_rand_f32,
-                ) as i32;
+                )? as i32;
             } else {
                 rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
                     .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;

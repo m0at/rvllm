@@ -104,7 +104,10 @@ fn dump_write(request_id: &Uuid, suffix: &str, body: &serde_json::Value) {
 fn slash_command_reply(req: &crate::openai::chat::ChatCompletionRequest) -> Option<&'static str> {
     let last_user = req.messages.iter().rev()
         .find(|m| m.role == Role::User)?
-        .content.as_deref()?;
+        .content_text();
+    if last_user.is_empty() {
+        return None;
+    }
     match last_user.trim() {
         "/new"   => Some("Session reset."),
         "/clear" => Some("Session cleared."),
@@ -204,6 +207,13 @@ pub async fn chat_completions(
         "stop": &req.stop,
     }));
 
+    if req.model.is_empty() {
+        return Err(ApiError::invalid_param(
+            "`model` is required and must be a non-empty string",
+            "model",
+            "missing_required_param",
+        ));
+    }
     ensure_model_matches(&state, &req.model)?;
     reject_v1_unsupported_chat(&req)?;
 
@@ -213,6 +223,87 @@ pub async fn chat_completions(
             "messages",
             "empty_messages",
         ));
+    }
+    // Reject unsupported content-part types AND malformed per-role
+    // message shapes early. OpenAI's spec is strict here, and accepting
+    // these shapes silently produces low-quality model output (the
+    // chat template renders them as empty strings). Per role:
+    //   * user / system  → `content` REQUIRED, must be non-empty after
+    //     flattening parts (a parts-array with only non-text entries
+    //     is functionally empty and rejected upstream of this loop).
+    //   * tool            → `content` AND `tool_call_id` REQUIRED.
+    //   * assistant       → `content` MAY be null, but only if
+    //     `tool_calls` is present and non-null. Bare assistant turns
+    //     with neither content nor tool_calls are nonsensical.
+    for (i, m) in req.messages.iter().enumerate() {
+        if let Some(c) = m.content.as_ref() {
+            if let Some(unsupported) = c.first_unsupported_part_type() {
+                return Err(ApiError::invalid_param(
+                    format!(
+                        "messages[{i}].content contains unsupported part type `{unsupported}`; \
+                         only `text` parts are supported in v1"
+                    ),
+                    "messages",
+                    "unsupported_content_part",
+                ));
+            }
+        }
+        match m.role {
+            Role::User | Role::System => {
+                let text = m.content_text();
+                if text.is_empty() {
+                    return Err(ApiError::invalid_param(
+                        format!(
+                            "messages[{i}] has role={:?} but no content; user and system messages \
+                             require a non-empty `content`",
+                            m.role
+                        ),
+                        "messages",
+                        "missing_content",
+                    ));
+                }
+            }
+            Role::Tool => {
+                if m.content_text().is_empty() {
+                    return Err(ApiError::invalid_param(
+                        format!(
+                            "messages[{i}] is a tool message but has no `content` (the tool \
+                             result text is required)"
+                        ),
+                        "messages",
+                        "missing_content",
+                    ));
+                }
+                if m.tool_call_id.as_deref().map(str::is_empty).unwrap_or(true) {
+                    return Err(ApiError::invalid_param(
+                        format!(
+                            "messages[{i}] is a tool message but has no `tool_call_id`; \
+                             OpenAI requires it to link the result back to the assistant call"
+                        ),
+                        "messages",
+                        "missing_tool_call_id",
+                    ));
+                }
+            }
+            Role::Assistant => {
+                let has_content = !m.content_text().is_empty();
+                let has_tool_calls = m
+                    .tool_calls
+                    .as_ref()
+                    .map(|v| !v.is_null() && !matches!(v, serde_json::Value::Array(a) if a.is_empty()))
+                    .unwrap_or(false);
+                if !has_content && !has_tool_calls {
+                    return Err(ApiError::invalid_param(
+                        format!(
+                            "messages[{i}] is an assistant message with neither `content` nor \
+                             `tool_calls`; one of the two is required"
+                        ),
+                        "messages",
+                        "empty_assistant_message",
+                    ));
+                }
+            }
+        }
     }
 
     // === SLASH-COMMAND SHORT-CIRCUIT ===
@@ -632,6 +723,9 @@ fn chat_stream_sse(
         },
         FlushToolCalls(Vec<ToolCall>),
         Finish(FinishReason),
+        /// Worker errored or its channel closed unexpectedly. Emit an
+        /// OpenAI-shaped `data: {"error":{...}}` event, then `[DONE]`.
+        EmitError(String),
         Done,
         End,
     }
@@ -706,11 +800,16 @@ fn chat_stream_sse(
                         _ = tokio::time::sleep_until(deadline) => {
                             ctx.cancelled.store(true, Ordering::Relaxed);
                             tracing::warn!("sse request timeout — cancelling worker");
-                            // Cycle 36 P1 (codex audit): timeout was reported
-                            // as FinishReason::Length, indistinguishable from
-                            // hitting max_tokens. Now Cancelled — clients can
-                            // tell wall-clock-timeout apart from natural stop.
-                            ctx.state = S::Finish(FinishReason::Cancelled);
+                            // Server-side wall-clock timeout is
+                            // semantically a server failure, not a
+                            // legitimate client cancel — non-streaming
+                            // returns 504 here. Emit the same OpenAI-
+                            // shaped error event the worker-error path
+                            // uses so streaming clients can tell the
+                            // two apart from a graceful finish.
+                            ctx.state = S::EmitError(
+                                "request timed out (server-side deadline)".to_string(),
+                            );
                             continue;
                         }
                         ev = rx.recv() => ev,
@@ -728,21 +827,60 @@ fn chat_stream_sse(
                                 }
                                 Ok(text) => {
                                     accum.push_str(&text);
-                                    // Latch in_tool the moment a tool-call
-                                    // marker appears anywhere in accum.
-                                    if !in_tool
-                                        && (accum.contains(TOOL_CALL_OPENER)
-                                            || find_anchored_call(&accum, 0)
-                                                .map(|p| accum[p + 5..].contains('{'))
-                                                .unwrap_or(false))
-                                    {
-                                        in_tool = true;
+                                    // Detect tool-call latch. We have to
+                                    // flush any visible prose that sits
+                                    // between `emitted` and the earliest
+                                    // marker BEFORE flipping `in_tool`,
+                                    // because once latched
+                                    // `safe_content_emit_end(...)` always
+                                    // returns the `emitted` floor (which
+                                    // the call site passes as 0) so no
+                                    // further visible bytes ever leave.
+                                    // Without this drain, prose like
+                                    // "Schau her: <|tool_call>…" lost the
+                                    // "Schau her: " prefix on the
+                                    // streaming path while the
+                                    // non-streaming response correctly
+                                    // preserved it via
+                                    // `shape_assistant_message`.
+                                    let mut prefix_chunk: Option<String> = None;
+                                    if !in_tool {
+                                        let (chunk_opt, latched) =
+                                            detect_tool_call_latch(&accum, emitted);
+                                        if latched {
+                                            in_tool = true;
+                                            if let Some(chunk_text) = chunk_opt {
+                                                emitted += chunk_text.len();
+                                                streamed_visible
+                                                    .push_str(&chunk_text);
+                                                prefix_chunk = Some(chunk_text);
+                                            }
+                                        }
                                     }
-                                    // Compute the safe RAW prefix (holds back
-                                    // anything that could start an unclosed
-                                    // marker), then strip control markup to
-                                    // get the visible view, then ship only
-                                    // the new visible suffix.
+                                    if let Some(chunk_text) = prefix_chunk {
+                                        let chunk = ChatCompletionChunk {
+                                            id: ctx.id.clone(),
+                                            object: "chat.completion.chunk",
+                                            created: ctx.created,
+                                            model: ctx.model.clone(),
+                                            choices: vec![ChatChunkChoice {
+                                                index: 0,
+                                                delta: ChatDelta::content(chunk_text),
+                                                finish_reason: None,
+                                            }],
+                                        };
+                                        ctx.state = S::Content {
+                                            rx, decoder, accum, emitted, in_tool,
+                                            token_ids, streamed_visible,
+                                        };
+                                        return Some((Ok(sse_json(&chunk)), ctx));
+                                    }
+                                    // Normal emit path. Compute the safe
+                                    // RAW prefix (holds back anything that
+                                    // could start an unclosed marker),
+                                    // strip control markup to get the
+                                    // visible view, then ship only the
+                                    // new visible suffix.
                                     let safe_end = safe_content_emit_end(
                                         &accum, 0, in_tool,
                                     );
@@ -849,21 +987,24 @@ fn chat_stream_sse(
                             ctx.state = S::Finish(finish);
                             continue;
                         }
-                        // Cycle 34 P0 fix (codex bug #2): SSE was mapping
-                        // worker error AND channel-close to FinishReason::Stop —
-                        // a CUDA crash looked like a clean completion to the
-                        // client. Now we log loudly + emit an error-flavored
-                        // SSE sentinel chunk so operators can see the failure
-                        // in journalctl AND clients can detect via the
-                        // non-`stop` finish_reason.
+                        // Worker error / channel close used to be mapped to
+                        // FinishReason::Cancelled, which clients interpret as
+                        // "completed but truncated" — the same shape as a
+                        // legitimate client-cancelled stream. That hid CUDA
+                        // crashes and worker shutdowns behind a successful-
+                        // looking SSE stream. We now emit an OpenAI-shaped
+                        // error event (`data: {"error":{...}}`) before
+                        // `[DONE]` so clients can distinguish reliably.
                         Some(GenerateEvent::Error(msg)) => {
-                            tracing::error!(error = %msg, "SSE worker error event — terminating stream");
-                            ctx.state = S::Finish(FinishReason::Cancelled);
+                            tracing::error!(error = %msg, "SSE worker error — emitting error event");
+                            ctx.state = S::EmitError(msg);
                             continue;
                         }
                         None => {
-                            tracing::error!("SSE worker channel closed without Done — terminating stream");
-                            ctx.state = S::Finish(FinishReason::Cancelled);
+                            tracing::error!("SSE worker channel closed without Done — emitting error event");
+                            ctx.state = S::EmitError(
+                                "worker channel closed unexpectedly before Done".to_string(),
+                            );
                             continue;
                         }
                     }
@@ -898,6 +1039,10 @@ fn chat_stream_sse(
                     ctx.state = S::Done;
                     return Some((Ok(sse_json(&chunk)), ctx));
                 }
+                S::EmitError(msg) => {
+                    ctx.state = S::Done;
+                    return Some((Ok(sse_error_event(msg)), ctx));
+                }
                 S::Done => {
                     ctx.state = S::End;
                     return Some((Ok(Event::default().data("[DONE]")), ctx));
@@ -931,6 +1076,49 @@ fn chat_stream_sse(
 ///       - tier-2: a word-anchored `call:` sequence.
 ///     Also hold back the final `max(opener.len()) - 1` bytes in case
 ///     a marker is straddling chunks. Split on UTF-8 boundaries.
+/// Detect a tool-call latch transition in the streaming chat handler.
+///
+/// Returns:
+///   * `Some(prefix_text)` if there is visible prose between `emitted`
+///     and the earliest tool-call marker that has NOT yet reached the
+///     wire — caller must flush this as one final content delta
+///     before flipping its `in_tool` state.
+///   * `None` for the prefix when either no marker was found, or the
+///     prose between `emitted` and the marker is empty.
+///   * `bool` is `true` if a marker was found (caller should latch
+///     `in_tool = true`).
+///
+/// Pure function on `&str` so the streaming path's drain-then-latch
+/// invariant is unit-testable without spinning up a tokenizer or worker.
+/// Without this drain, prose that arrives in the SAME decode chunk as
+/// the tool-call opener was lost on the streaming path while
+/// `shape_assistant_message` correctly preserved it on the
+/// non-streaming response.
+pub(crate) fn detect_tool_call_latch(
+    accum: &str,
+    emitted: usize,
+) -> (Option<String>, bool) {
+    let tier1 = accum.find(TOOL_CALL_OPENER);
+    let tier2 = find_anchored_call(accum, 0)
+        .filter(|&p| accum[p + 5..].contains('{'));
+    let earliest = match (tier1, tier2) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    match earliest {
+        None => (None, false),
+        Some(mark) => {
+            let visible_before = strip_tool_markup(&accum[..mark]);
+            if visible_before.len() > emitted {
+                (Some(visible_before[emitted..].to_string()), true)
+            } else {
+                (None, true)
+            }
+        }
+    }
+}
+
 fn safe_content_emit_end(accum: &str, emitted: usize, in_tool: bool) -> usize {
     if in_tool {
         return emitted;
@@ -1058,6 +1246,29 @@ fn sse_json<T: serde::Serialize>(value: &T) -> Event {
     }
 }
 
+/// Build an OpenAI-shaped SSE error event:
+///
+/// `data: {"error":{"message":"...","type":"server_error","code":null,"param":null}}\n\n`
+///
+/// Used by both chat and completions stream handlers when the worker
+/// emits a [`GenerateEvent::Error`] or the worker channel closes
+/// unexpectedly. Lets clients reliably distinguish a crashed/aborted
+/// stream from a clean [`FinishReason::Stop`] / `Length` completion —
+/// previously both were collapsed onto `finish_reason="cancelled"`,
+/// which clients (correctly) interpret as "completed successfully,
+/// just truncated", masking the real failure.
+pub(crate) fn sse_error_event(message: impl Into<String>) -> Event {
+    let payload = serde_json::json!({
+        "error": {
+            "message": message.into(),
+            "type":    "server_error",
+            "code":    serde_json::Value::Null,
+            "param":   serde_json::Value::Null,
+        }
+    });
+    sse_json(&payload)
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // /v1/completions  (legacy text-completion)
 // ═════════════════════════════════════════════════════════════════════
@@ -1075,6 +1286,13 @@ pub async fn completions(
     );
     let _enter = span.enter();
 
+    if req.model.is_empty() {
+        return Err(ApiError::invalid_param(
+            "`model` is required and must be a non-empty string",
+            "model",
+            "missing_required_param",
+        ));
+    }
     ensure_model_matches(&state, &req.model)?;
     reject_v1_unsupported_completions(&req)?;
 
@@ -1265,6 +1483,11 @@ fn completion_stream_sse(
             decoder: crate::tokenize::StreamDecoder,
         },
         Finish(FinishReason),
+        /// Worker errored or its channel closed unexpectedly. Same
+        /// rationale as the chat SSE handler — emit a clear OpenAI
+        /// error event before `[DONE]` rather than collapsing onto
+        /// `finish_reason="cancelled"`.
+        EmitError(String),
         Done,
         End,
     }
@@ -1303,11 +1526,16 @@ fn completion_stream_sse(
                         _ = tokio::time::sleep_until(deadline) => {
                             ctx.cancelled.store(true, Ordering::Relaxed);
                             tracing::warn!("sse request timeout — cancelling worker");
-                            // Cycle 36 P1 (codex audit): timeout was reported
-                            // as FinishReason::Length, indistinguishable from
-                            // hitting max_tokens. Now Cancelled — clients can
-                            // tell wall-clock-timeout apart from natural stop.
-                            ctx.state = S::Finish(FinishReason::Cancelled);
+                            // Server-side wall-clock timeout is
+                            // semantically a server failure, not a
+                            // legitimate client cancel — non-streaming
+                            // returns 504 here. Emit the same OpenAI-
+                            // shaped error event the worker-error path
+                            // uses so streaming clients can tell the
+                            // two apart from a graceful finish.
+                            ctx.state = S::EmitError(
+                                "request timed out (server-side deadline)".to_string(),
+                            );
                             continue;
                         }
                         ev = rx.recv() => ev,
@@ -1348,18 +1576,22 @@ fn completion_stream_sse(
                         ctx.state = S::Finish(finish);
                         continue;
                     }
-                    // Cycle 35 P1 fix (codex bug #2): completion SSE was
-                    // mapping worker errors AND channel close to
-                    // FinishReason::Stop — mirror the cycle 34 chat-SSE
-                    // fix so CUDA faults are not silently clean here either.
+                    // Worker error / channel close: emit an OpenAI-shaped
+                    // error event before [DONE], same fix as the chat SSE
+                    // handler. Previously these collapsed to FinishReason::
+                    // Cancelled, which clients read as "completed but
+                    // truncated" and silently masked CUDA faults / worker
+                    // shutdowns as successful streams.
                     Some(GenerateEvent::Error(msg)) => {
-                        tracing::error!(error = %msg, "completion SSE worker error event — terminating stream");
-                        ctx.state = S::Finish(FinishReason::Cancelled);
+                        tracing::error!(error = %msg, "completion SSE worker error — emitting error event");
+                        ctx.state = S::EmitError(msg);
                         continue;
                     }
                     None => {
-                        tracing::error!("completion SSE worker channel closed without Done — terminating stream");
-                        ctx.state = S::Finish(FinishReason::Cancelled);
+                        tracing::error!("completion SSE worker channel closed without Done — emitting error event");
+                        ctx.state = S::EmitError(
+                            "worker channel closed unexpectedly before Done".to_string(),
+                        );
                         continue;
                     }
                     }
@@ -1380,6 +1612,10 @@ fn completion_stream_sse(
                     ctx.state = S::Done;
                     return Some((Ok(sse_json(&chunk)), ctx));
                 }
+                S::EmitError(msg) => {
+                    ctx.state = S::Done;
+                    return Some((Ok(sse_error_event(msg)), ctx));
+                }
                 S::Done => {
                     ctx.state = S::End;
                     return Some((Ok(Event::default().data("[DONE]")), ctx));
@@ -1397,6 +1633,62 @@ fn completion_stream_sse(
 // ═════════════════════════════════════════════════════════════════════
 
 fn reject_v1_unsupported_chat(req: &ChatCompletionRequest) -> ApiResult<()> {
+    // Capture-and-reject for params we don't honour. Without an
+    // explicit error here, OpenAI clients silently get plain greedy/
+    // sampled output even though they asked for JSON mode, penalties,
+    // streaming usage, etc. Each branch returns a 400 with the actual
+    // field name so the caller can either remove it or escalate.
+    if req.response_format.is_some() {
+        return Err(ApiError::invalid_param(
+            "response_format / JSON mode is not supported (no \
+             grammar-constrained decoding in this build); the server \
+             would silently produce free-form text instead.",
+            "response_format",
+            "response_format_unsupported",
+        ));
+    }
+    if req.presence_penalty.is_some_and(|p| p != 0.0)
+        || req.frequency_penalty.is_some_and(|p| p != 0.0)
+    {
+        return Err(ApiError::invalid_param(
+            "presence_penalty / frequency_penalty are not yet wired \
+             through the logits processor; use \
+             `RVLLM_REPETITION_PENALTY` env override server-side or \
+             omit the field.",
+            "presence_penalty",
+            "penalty_unsupported",
+        ));
+    }
+    if req.stream_options.is_some() {
+        return Err(ApiError::invalid_param(
+            "stream_options (e.g. include_usage) is not yet supported; \
+             usage counts are returned with the final SSE chunk only \
+             on non-streaming requests.",
+            "stream_options",
+            "stream_options_unsupported",
+        ));
+    }
+    if req.max_completion_tokens.is_some() && req.max_tokens.is_some()
+        && req.max_completion_tokens != req.max_tokens
+    {
+        return Err(ApiError::invalid_param(
+            "specify either `max_tokens` or `max_completion_tokens`, \
+             not both with conflicting values",
+            "max_completion_tokens",
+            "conflicting_max_tokens",
+        ));
+    }
+    if req.max_completion_tokens.is_some() && req.max_tokens.is_none() {
+        // OpenAI 2025+ clients send only the new name. Until handlers
+        // alias them properly, reject loudly so the caller knows the
+        // field was seen.
+        return Err(ApiError::invalid_param(
+            "max_completion_tokens is recognised but not yet aliased \
+             to max_tokens in this build; pass `max_tokens` instead.",
+            "max_completion_tokens",
+            "max_completion_tokens_unaliased",
+        ));
+    }
     if req.n.is_some_and(|n| n != 1) {
         return Err(ApiError::invalid_param(
             "n must be 1 (multi-candidate sampling not yet supported)",
@@ -1585,6 +1877,84 @@ fn validate_stops(stops: &[String]) -> ApiResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tool_call_latch_tests {
+    //! Coverage for `detect_tool_call_latch`. The streaming chat
+    //! handler must drain visible prose that arrives in the same
+    //! decode chunk as a tool-call opener BEFORE flipping `in_tool`.
+    //! Otherwise the streaming response loses the prose prefix while
+    //! the non-streaming response correctly preserves it.
+    use super::*;
+
+    #[test]
+    fn no_marker_no_latch() {
+        let (chunk, latched) = detect_tool_call_latch("hello world", 6);
+        assert_eq!(chunk, None);
+        assert!(!latched);
+    }
+
+    #[test]
+    fn tier1_marker_with_unsent_prefix() {
+        // Prose then tier-1 wrapper in the same accum. emitted=0.
+        // Note: `strip_tool_markup` trims trailing whitespace before
+        // the marker, so the drained prefix is "Schau her:" not
+        // "Schau her: ". That trim is pre-existing behavior; the
+        // important property is that the prose IS drained at all.
+        let s = "Schau her: <|tool_call>call:foo{}<tool_call|>";
+        let (chunk, latched) = detect_tool_call_latch(s, 0);
+        assert!(latched);
+        let chunk = chunk.expect("must drain prose prefix before latching");
+        assert!(chunk.starts_with("Schau her"), "drained prefix was {chunk:?}");
+    }
+
+    #[test]
+    fn tier1_marker_with_partial_prefix_already_streamed() {
+        // "Hallo " (6 bytes) was already streamed; the next decode
+        // produced "wie geht's?<|tool_call>call:foo{}<tool_call|>".
+        // The drain must emit a non-empty suffix, NOT re-emit
+        // "Hallo " AND NOT drop "wie geht's?".
+        let s = "Hallo  wie geht's?<|tool_call>call:foo{}<tool_call|>";
+        let (chunk, latched) = detect_tool_call_latch(s, 6);
+        assert!(latched);
+        let chunk = chunk.expect("must drain new visible suffix");
+        assert!(chunk.contains("wie geht"),
+            "drained chunk lost the new prefix bytes: {chunk:?}");
+        assert!(!chunk.starts_with("Hallo"),
+            "drained chunk re-emitted bytes already on the wire: {chunk:?}");
+    }
+
+    #[test]
+    fn tier2_bare_marker_with_prefix() {
+        // Bare tier-2 (anchored after newline): "Hier:\ncall:weather{...}".
+        let s = "Hier:\ncall:weather{\"city\":\"Bern\"}";
+        let (chunk, latched) = detect_tool_call_latch(s, 0);
+        assert!(latched);
+        let chunk = chunk.expect("must drain prose prefix");
+        assert!(chunk.starts_with("Hier"), "drained prefix was {chunk:?}");
+    }
+
+    #[test]
+    fn marker_with_no_visible_prefix() {
+        // Tool call starts immediately at byte 0 — nothing to drain,
+        // but we still latch.
+        let s = "<|tool_call>call:foo{}<tool_call|>";
+        let (chunk, latched) = detect_tool_call_latch(s, 0);
+        assert!(latched);
+        assert_eq!(chunk, None);
+    }
+
+    #[test]
+    fn prefix_already_fully_streamed() {
+        // The prose was already emitted on a prior iteration; this
+        // call should latch without producing a new chunk.
+        let s = "prose <|tool_call>call:foo{}<tool_call|>";
+        // emitted == "prose ".len() == 6
+        let (chunk, latched) = detect_tool_call_latch(s, 6);
+        assert!(latched);
+        assert_eq!(chunk, None);
+    }
 }
 
 #[cfg(test)]

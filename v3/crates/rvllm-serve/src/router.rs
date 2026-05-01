@@ -63,10 +63,39 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/completions",
             post(crate::openai::handlers::completions),
         )
+        // OpenAI's 2025 "Responses API". Different request/response
+        // shape from `/v1/chat/completions` (conversation-state,
+        // different streaming-event taxonomy, server-side reasoning
+        // tokens). We do not implement the full surface yet, but
+        // routing it explicitly to a 501-with-guidance handler is
+        // strictly better than the default 404 — the OpenAI Python
+        // SDK's `client.responses.create(...)` users get a clear
+        // server-side message pointing them at `/v1/chat/completions`
+        // instead of a generic "endpoint not found".
+        .route("/v1/responses", post(responses_unsupported))
         .layer(trace)
         .with_state(state)
 }
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn responses_unsupported() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // OpenAI-shaped error envelope — same fields the rest of the
+    // server uses so SDKs that surface `error.message` show the
+    // same path on both endpoints.
+    let body = json!({
+        "error": {
+            "message":
+                "The Responses API (`/v1/responses`) is not implemented yet on \
+                 this server. Use `/v1/chat/completions` instead — it covers \
+                 the same generation surface and is fully OpenAI-compatible \
+                 for chat, tools, and streaming.",
+            "type":  "invalid_request_error",
+            "code":  "responses_api_unsupported",
+            "param": serde_json::Value::Null,
+        }
+    });
+    (axum::http::StatusCode::NOT_IMPLEMENTED, Json(body))
 }

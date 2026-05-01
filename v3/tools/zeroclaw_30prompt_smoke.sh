@@ -25,6 +25,28 @@ LABEL="${1:-baseline}"
 TS=$(date +%Y%m%d-%H%M%S)
 OUT=/tmp/rvllm_smoke_${LABEL}_${TS}.log
 WEBHOOK=http://127.0.0.1:42617/webhook
+RVLLM_API=http://127.0.0.1:8010/v1/chat/completions
+RVLLM_MODEL="gemma-4-31b-it"
+
+# Short prompts that bypass ZeroClaw and hit rvllm-serve directly.
+# These exercise the model in isolation: short context (no [Memory
+# context] retrieval, no tool-call flow, no persona system prompt
+# beyond the OpenAI default), single turn, low max_tokens. The
+# attention dispatch lands on the non-split decode path (ctx <
+# partition_size) which the long-ctx ZeroClaw prompts skip.
+#
+# Quality criterion: coherent text in any language (German/English).
+# After the default-scenario wipe, brain has no Lola / Vinz entries —
+# so "I don't have any data on Lola" or "Lola is unknown to me" is
+# CORRECT, not a regression. Only cycles / repetition-guard aborts /
+# mojibake count as FAIL.
+DIRECT_PROMPTS=(
+  "Hallo!"
+  "Was ist 2 plus 2?"
+  "Schreib mir bitte das Wort Apfel."
+  "Welche Farbe hat Schnee?"
+  "Sag mir kurz, wer du bist."
+)
 
 PROMPTS=(
   # WHO / free-chat (5)
@@ -127,6 +149,55 @@ classify() {
         echo "FAIL"
         return
     fi
+    # Mixed-content cycle: any 4-15 char NON-WHITESPACE substring
+    # repeated back-to-back ≥3×. Catches cycles whose period contains
+    # non-letter chars (digits, backslash, slash, quotes) that the
+    # earlier rules miss when their period exceeds 4. Examples:
+    #   "T1000\T1000\T1000\T1000"   period=6 (T,1,0,0,0,\\)
+    #   "name=x,name=y,name=z,..."  period=7
+    # Natural prose rarely has 4-15 non-whitespace chars repeating
+    # back-to-back-to-back; whitespace breaks up legitimate enumerations.
+    if grep -qE "([^[:space:]]{4,15})\1\1" <<< "$resp"; then
+        echo "FAIL"
+        return
+    fi
+    # Multi-line cycle: any non-empty line repeated ≥4 times back-to-
+    # back. Catches the long-period `// 1.0 = 100% // 2.0 = 200% ...`
+    # multi-line cycle seen at P=1024 light_flur which all the per-
+    # character regexes above miss. Only flags when the SAME line
+    # appears identically ≥4 times in a row — natural prose never does
+    # that, only failure modes where the model emits the same token
+    # sequence repeatedly do.
+    if awk 'BEGIN{prev="";n=0} {if ($0==prev && length($0)>0) {n++; if (n>=3) {found=1; exit}} else {prev=$0; n=0}} END{exit !found}' <<< "$resp"; then
+        echo "FAIL"
+        return
+    fi
+    # Multi-line BLOCK cycle: detect a block of K (2-8) consecutive
+    # lines repeating ≥3 times back-to-back. Catches the `// 1.0=100%
+    # // 2.0=200% // 3.0=300% // ... // n.0=n*100%` pattern (5-line
+    # block, repeats 18× in the P=1024 light_flur regression).
+    if awk '
+    {
+        lines[NR] = $0
+    }
+    END {
+        for (k = 2; k <= 8; ++k) {
+            for (i = 1; i + 3*k - 1 <= NR; ++i) {
+                ok = 1
+                empty_block = 1
+                for (j = 0; j < k; ++j) {
+                    if (lines[i+j] != lines[i+k+j] || lines[i+j] != lines[i+2*k+j]) { ok = 0; break }
+                    if (length(lines[i+j]) > 0) empty_block = 0
+                }
+                if (ok && !empty_block) { found = 1; exit }
+            }
+            if (found) exit
+        }
+        exit !found
+    }' <<< "$resp"; then
+        echo "FAIL"
+        return
+    fi
     echo "PASS"
 }
 
@@ -138,8 +209,26 @@ PASS=0
 SUSP=0
 FAIL=0
 INFRA=0
-PROMPTS_BEFORE_RESTART=4     # rvllm prefix-cache state-corruption seen after 4-5 long prompts
+PROMPTS_BEFORE_RESTART="${PROMPTS_BEFORE_RESTART:-4}"   # env-overridable
+# Default 4 mirrors the documented rvllm prefix-cache corruption
+# workaround. Set PROMPTS_BEFORE_RESTART=0 (or any value > total
+# prompts) from the caller to DISABLE the mid-run cold-restart and
+# run all 30 prompts in one continuous session. Used by
+# sweep_variants.sh which prefers single-session-per-variant.
 i=0
+
+# Default-scenario hard-wipe helper. Cycle 60 confirmed that
+# chat-history-only purge wasn't enough — diary entries and notes
+# also captured prior garbage and got retrieved as [Memory context]
+# for new prompts. We wipe every scenario-tagged table so each
+# cold-restart cycle in the smoke starts from a guaranteed-empty
+# retrieval state. brain memory/task/etc rm only soft-deletes;
+# wipe_default_scenario.sh hits SurrealDB directly with hard DELETE.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+purge_chat_history_inline() {
+    bash "${SCRIPT_DIR}/wipe_default_scenario.sh" 2>&1 \
+        | sed 's/^/[harness] /'
+}
 
 # Restart BOTH rvllm-serve and zeroclaw ONCE at the start. rvllm-serve
 # restart clears the in-memory prefix cache (poisoned-state recovery).
@@ -154,6 +243,9 @@ until curl -fsS http://127.0.0.1:8010/v1/models >/dev/null 2>&1; do sleep 2; don
 echo "[harness] restart zeroclaw + warm-up..."
 sudo systemctl restart zeroclaw >/dev/null 2>&1 || true
 sleep 5
+# Initial chat-history purge — clears any poison that survived
+# prior smokes / production traffic.
+purge_chat_history_inline
 
 # Warm-up call: zeroclaw's 2-call pattern (classifier + persona-reply)
 # means the FIRST call after restart primes the prefix cache. This
@@ -177,8 +269,11 @@ for p in "${PROMPTS[@]}"; do
     # 4-5 long-context prompts. Pinpointed iter 51 — predates this PR.
     # Restart-zc-only does NOT clear it; only cold restart of rvllm
     # resets the prefix-cache region.
-    if (( i > 0 && i % PROMPTS_BEFORE_RESTART == 0 )); then
+    if (( PROMPTS_BEFORE_RESTART > 0 && i > 0 && i % PROMPTS_BEFORE_RESTART == 0 )); then
         echo "[harness] periodic cold restart (rvllm-serve + zeroclaw) at prompt $i..."
+        # Purge chat-history first so the next cold-restart cycle
+        # starts with a clean [Memory context] block.
+        purge_chat_history_inline
         sudo systemctl restart rvllm-serve >/dev/null 2>&1 || true
         until curl -fsS http://127.0.0.1:8010/v1/models >/dev/null 2>&1; do sleep 2; done
         sudo systemctl restart zeroclaw >/dev/null 2>&1 || true
@@ -224,4 +319,42 @@ TOTAL=${#PROMPTS[@]}
 echo "---"
 printf "SUMMARY %s: %d/%d PASS, %d SUSPECT, %d FAIL, %d INFRA\n" \
     "$LABEL" "$PASS" "$TOTAL" "$SUSP" "$FAIL" "$INFRA"
+
+# === Direct rvllm prompts (bypass ZeroClaw) ===========================
+# Short single-turn prompts to /v1/chat/completions on port 8010. No
+# memory context, no tool flow, no persona injection. Tests the model
+# in isolation under the non-split decode path. After the
+# default-scenario wipe, "I don't know Lola/Vinz" answers are CORRECT
+# (the entities don't exist anymore) — only garbage cycles count as
+# FAIL.
+echo "[harness] === direct rvllm prompts (bypass zeroclaw) ==="
+DIRECT_PASS=0
+DIRECT_FAIL=0
+for p in "${DIRECT_PROMPTS[@]}"; do
+    payload=$(jq -n --arg m "$p" --arg model "$RVLLM_MODEL" \
+        '{model: $model, messages: [{role: "user", content: $m}], max_tokens: 80, temperature: 0}')
+    r=$(curl -s -X POST "$RVLLM_API" \
+        -H 'Content-Type: application/json' --max-time 120 \
+        -d "$payload" 2>/dev/null \
+        | jq -r '.choices[0].message.content // .error.message // ""' 2>/dev/null)
+    cls=$(classify "$r")
+    snippet=$(printf '%s' "$r" | tr -d '\n' | head -c 180)
+    echo "===DIRECT [$cls] $p===" >> "$OUT"
+    echo "$r" >> "$OUT"
+    echo "" >> "$OUT"
+    case "$cls" in
+        PASS)
+            DIRECT_PASS=$((DIRECT_PASS+1))
+            printf "[direct PASS] %-50s | %s\n" "$p" "$snippet"
+            ;;
+        FAIL|INFRA|SUSPECT|*)
+            DIRECT_FAIL=$((DIRECT_FAIL+1))
+            printf "[direct %s]  %-50s | %s\n" "$cls" "$p" "$snippet"
+            ;;
+    esac
+    sleep 1
+done
+DIRECT_TOTAL=${#DIRECT_PROMPTS[@]}
+printf "DIRECT_SUMMARY %s: %d/%d PASS, %d FAIL\n" \
+    "$LABEL" "$DIRECT_PASS" "$DIRECT_TOTAL" "$DIRECT_FAIL"
 echo "log: $OUT"

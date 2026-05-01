@@ -226,17 +226,25 @@ impl TokenizerHandle {
             .iter()
             .map(|m| m.tool_calls.as_ref().map(normalize_tool_calls))
             .collect();
+        // `content_text()` flattens a content-parts array (when the
+        // caller used the OpenAI `[{"type":"text","text":"..."}]` shape)
+        // into a single space-joined string. Plain `String` content
+        // round-trips unchanged. Result is owned so the borrow can
+        // outlive `messages.iter()` for the templating step.
+        let flattened_content: Vec<String> =
+            messages.iter().map(|m| m.content_text()).collect();
         let serde_msgs: Vec<TemplateMsg> = messages
             .iter()
             .zip(normalized_tool_calls.iter())
-            .map(|(m, tc)| TemplateMsg {
+            .zip(flattened_content.iter())
+            .map(|((m, tc), c)| TemplateMsg {
                 role: match m.role {
                     Role::System => "system",
                     Role::User => "user",
                     Role::Assistant => "assistant",
                     Role::Tool => "tool",
                 },
-                content: m.content.as_deref().unwrap_or(""),
+                content: c.as_str(),
                 tool_calls: tc.as_ref(),
                 tool_call_id: m.tool_call_id.as_deref(),
                 name: m.name.as_deref(),

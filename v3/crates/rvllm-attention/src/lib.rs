@@ -678,8 +678,34 @@ impl Fa2PtxKernels {
         }
         #[cfg(not(feature = "cuda"))]
         {
+            // Non-CUDA build (mock worker, laptop integration tests).
+            // The bf16in / bf16out NVFP4 fields are declared without a
+            // `#[cfg(feature = "cuda")]` gate, so the struct shape is
+            // identical across feature flags — initialising them all
+            // to `None` keeps `cargo check --workspace` and
+            // `--no-default-features` building. Without these explicit
+            // None fields, this branch fails compile with E0063
+            // "missing fields …" the moment a new bf16 kernel slot
+            // is added to the struct.
             let _ = loader;
-            Ok(Self { head_dim })
+            Ok(Self {
+                head_dim,
+                fused_rope_nvfp4kv_bf16in_mod: None,
+                flash_attention_nvfp4kv_bf16out_mod: None,
+                unified_prefill_nvfp4kv_bf16out_mod: None,
+                split_decode_nvfp4kv_bf16out_mod: None,
+                fn_rope_nvfp4kv_bf16in: None,
+                fn_decode_nvfp4kv_bf16out: None,
+                fn_decode_nvfp4kv_bc16_bf16out: None,
+                fn_decode_nvfp4kv_gqa_bf16out: None,
+                fn_decode_nvfp4kv_gqa_bc16_bf16out: None,
+                fn_prefill_nvfp4kv_bf16out: None,
+                fn_prefill_nvfp4kv_bc16_bf16out: None,
+                fn_prefill_nvfp4kv_unified_bf16out: None,
+                fn_decode_nvfp4kv_split_bf16out: None,
+                fn_decode_nvfp4kv_split_bc16_bf16out: None,
+                fn_paged_attn_reduce_bf16: None,
+            })
         }
     }
 

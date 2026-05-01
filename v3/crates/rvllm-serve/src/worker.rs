@@ -15,13 +15,13 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::openai::types::FinishReason;
-use crate::sampling::GreedyParams;
+use crate::sampling::SamplingDecision;
 
 /// Sent from a handler to the worker.
 pub struct GenerateRequest {
     pub request_id: Uuid,
     pub prompt_ids: Vec<u32>,
-    pub sampling: GreedyParams,
+    pub sampling: SamplingDecision,
     pub max_new_tokens: u32,
     pub stop_token_ids: Vec<u32>,
     pub events_tx: mpsc::Sender<GenerateEvent>,
@@ -91,6 +91,37 @@ pub fn spawn_mock_worker(
         })
         .unwrap_or_else(|e| {
             panic!("failed to spawn mock worker thread: {e}");
+        });
+    (WorkerHandle { submit: tx }, join)
+}
+
+/// Test-only: spawn a worker that emits a single `GenerateEvent::Error`
+/// for every request and then drops the events channel.
+///
+/// Used by SSE error-path integration tests to assert that worker
+/// errors surface as OpenAI-shaped error events on the wire (not as
+/// successful-looking `finish_reason="cancelled"` chunks).
+pub fn spawn_erroring_mock_worker(
+    queue_depth: usize,
+    error_msg: impl Into<String>,
+) -> (WorkerHandle, std::thread::JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::channel::<GenerateRequest>(queue_depth.max(1));
+    let msg = error_msg.into();
+    let join = std::thread::Builder::new()
+        .name("rvllm-serve-erroring-mock-worker".into())
+        .spawn(move || {
+            while let Some(req) = rx.blocking_recv() {
+                let _ = req
+                    .events_tx
+                    .blocking_send(GenerateEvent::Error(msg.clone()));
+                // Drop events_tx implicitly — the SSE handler treats
+                // a dropped channel as the "channel closed before Done"
+                // failure mode, but it has already received the
+                // Error event above so EmitError fires from that path.
+            }
+        })
+        .unwrap_or_else(|e| {
+            panic!("failed to spawn erroring-mock worker thread: {e}");
         });
     (WorkerHandle { submit: tx }, join)
 }

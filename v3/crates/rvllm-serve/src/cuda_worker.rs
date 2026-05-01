@@ -196,6 +196,19 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         max_new = req.max_new_tokens,
         "calling run_generate",
     );
+    let sampling_cfg = match req.sampling {
+        crate::sampling::SamplingDecision::Greedy => {
+            rvllm_runtime::gemma4_bring_up::SamplingConfig::Greedy
+        }
+        crate::sampling::SamplingDecision::Stochastic(s) => {
+            rvllm_runtime::gemma4_bring_up::SamplingConfig::Stochastic {
+                temperature: s.temperature,
+                top_p: s.top_p,
+                top_k: s.top_k,
+                seed: s.seed,
+            }
+        }
+    };
     let result = unsafe {
         bringup.run_generate(
             kernels.fn_embed,
@@ -207,6 +220,13 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             // the env var directly so cycle-26 ShadowDumper analysis can
             // fire without needing to restore the header path.
             env_truthy("RVLLM_NVFP4_SHADOW_F16"),
+            sampling_cfg,
+            // Forward the request-level cancellation flag. The HTTP
+            // handler sets this on client disconnect / wall-clock
+            // timeout; the runtime breaks out of the decode loop on
+            // the next step so the worker thread does not stay
+            // blocked rendering tokens nobody will read.
+            Some(req.cancelled.as_ref()),
         )
     };
 
@@ -278,14 +298,43 @@ pub fn resolve_paths(
     const MINIMAL_POLICY: &str =
         r#"{"revision":"serve-sm121","arch":"sm_121","variants":[],"entries":{}}"#;
 
+    // Resolve the policy-json path. We never write into `kernels_dir`
+    // here — that path can be a system-wide read-only location
+    // (read-only container layer, immutable Nix store, root-owned
+    // shared install) and a resolver should not depend on being able
+    // to write there.
+    //
+    // Order:
+    //   1. Caller-supplied `policy_json` — used as-is.
+    //   2. `RVLLM_MINIMAL_POLICY_PATH` env var — explicit operator
+    //      override; useful for read-only filesystems where the
+    //      operator wants the file in a known location.
+    //   3. `std::env::temp_dir()` fallback — written once per process
+    //      with the placeholder body. The file is small (~80 B) and
+    //      idempotent, so a stale copy from a prior process is
+    //      harmless.
+    // The runtime loader at `Gemma4Bringup::load` reads
+    // `paths.policy_json` strictly via `std::fs::read`, so the file
+    // must exist on disk before bring-up. Both fallback branches
+    // therefore write the placeholder body if the file is not
+    // already there. A previous iteration only wrote the temp_dir
+    // path and returned the env-override path raw — operators
+    // following the "set RVLLM_MINIMAL_POLICY_PATH" hint then hit
+    // ENOENT despite obeying the error message.
     let policy_json = match policy_json {
         Some(p) => p,
         None => {
-            let p = kernels_dir.join(".serve-minimal-policy.json");
+            let p = std::env::var_os("RVLLM_MINIMAL_POLICY_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::temp_dir().join("rvllm-serve-minimal-policy.json")
+                });
             if !p.exists() {
                 std::fs::write(&p, MINIMAL_POLICY).map_err(|e| {
                     ApiError::Internal(format!(
-                        "write minimal policy {}: {e}",
+                        "write minimal policy {}: {e} \
+                         (set RVLLM_MINIMAL_POLICY_PATH to a writeable path or \
+                         pass an explicit policy via --policy-json)",
                         p.display()
                     ))
                 })?;
@@ -301,4 +350,115 @@ pub fn resolve_paths(
         fa3_so: fa3_so.unwrap_or_else(|| PathBuf::from(UNUSED)),
         policy_json,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Both tests in this module manipulate the
+    /// `RVLLM_MINIMAL_POLICY_PATH` env var. cargo runs lib tests in
+    /// parallel by default, so without serialisation they race and
+    /// one observes the other's env state. A process-wide lock keeps
+    /// the env-var critical section ordered without needing
+    /// `--test-threads=1` from the user.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// `resolve_paths` must NOT write into `kernels_dir`. A read-only
+    /// kernel install (Nix store, container layer, root-owned shared
+    /// dir) is a legitimate deploy shape; the resolver writing a
+    /// `.serve-minimal-policy.json` there used to fail at startup
+    /// with a confusing IO error. The fallback now lives in
+    /// `std::env::temp_dir()`.
+    #[test]
+    fn resolve_paths_does_not_write_into_kernels_dir() {
+        let _g = env_lock().lock().expect("env lock");
+        let tmp = std::env::temp_dir().join(format!(
+            "rvllm-serve-resolve-paths-test-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("setup tmp");
+        let kernels_dir = tmp.join("kernels-readonly");
+        std::fs::create_dir_all(&kernels_dir).expect("setup kernels");
+        let model_dir = tmp.join("model");
+        std::fs::create_dir_all(&model_dir).expect("setup model");
+
+        // Sanity: the kernels_dir starts empty.
+        let before: Vec<_> = std::fs::read_dir(&kernels_dir)
+            .expect("read kernels_dir")
+            .collect();
+        assert!(before.is_empty(), "test setup not empty");
+
+        // Strip env override so we exercise the temp_dir fallback path.
+        std::env::remove_var("RVLLM_MINIMAL_POLICY_PATH");
+        let paths = resolve_paths(model_dir, kernels_dir.clone(), None, None, None)
+            .expect("resolve");
+
+        // Postcondition #1: kernels_dir untouched.
+        let after: Vec<_> = std::fs::read_dir(&kernels_dir)
+            .expect("read kernels_dir")
+            .collect();
+        assert!(after.is_empty(),
+            "resolve_paths wrote into kernels_dir: {:?}",
+            after.into_iter().filter_map(|e| e.ok().map(|e| e.path())).collect::<Vec<_>>()
+        );
+
+        // Postcondition #2: policy_json points somewhere outside
+        // kernels_dir AND the file exists.
+        assert!(!paths.policy_json.starts_with(&kernels_dir),
+            "policy_json {:?} is inside kernels_dir {:?}",
+            paths.policy_json, kernels_dir);
+        assert!(paths.policy_json.exists(),
+            "policy_json {:?} not created", paths.policy_json);
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Operator can override the policy path via env var, e.g. on a
+    /// read-only host where /tmp is also read-only. The override path
+    /// MUST be materialised on disk by `resolve_paths` — the runtime
+    /// loader reads it strictly, and a path that "exists in the env
+    /// var" but not on the filesystem produces an ENOENT that
+    /// contradicts the error message we hand the operator.
+    #[test]
+    fn resolve_paths_honours_env_override() {
+        let _g = env_lock().lock().expect("env lock");
+        let tmp = std::env::temp_dir().join(format!(
+            "rvllm-serve-resolve-env-test-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("setup tmp");
+        let kernels_dir = tmp.join("kernels");
+        std::fs::create_dir_all(&kernels_dir).expect("setup kernels");
+        let custom_policy = tmp.join("my-policy.json");
+
+        std::env::set_var("RVLLM_MINIMAL_POLICY_PATH", &custom_policy);
+        let paths = resolve_paths(
+            tmp.join("model"),
+            kernels_dir.clone(),
+            None,
+            None,
+            None,
+        )
+        .expect("resolve");
+        std::env::remove_var("RVLLM_MINIMAL_POLICY_PATH");
+
+        assert_eq!(paths.policy_json, custom_policy,
+            "env override not honoured: got {:?}", paths.policy_json);
+        assert!(paths.policy_json.exists(),
+            "env-override path {:?} not materialised on disk — runtime loader will ENOENT",
+            paths.policy_json);
+        let body = std::fs::read_to_string(&paths.policy_json)
+            .expect("read materialised policy");
+        assert!(body.contains("serve-sm121"), "minimal-policy body missing: {body:?}");
+        let after: Vec<_> = std::fs::read_dir(&kernels_dir)
+            .expect("read kernels_dir")
+            .collect();
+        assert!(after.is_empty(), "kernels_dir was written to despite env override");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
