@@ -2084,9 +2084,22 @@ impl Gemma4Bringup {
             16,
         )?;
         {
-            let mut bt: Vec<i32> = Vec::with_capacity(max_blocks_per_seq as usize);
-            for b in 0..max_blocks_per_seq as i32 {
-                bt.push(b);
+            // Codex22-1: NVFP4 attention kernels read
+            // `block_tables[seq_idx * max_blocks_per_seq + page_idx]`,
+            // so the table must hold `num_seqs * max_blocks_per_seq`
+            // entries. The previous init wrote only the first row
+            // (max_blocks_per_seq entries); for num_seqs > 1 every
+            // sequence past row 0 read uninitialised page IDs →
+            // either OOB-access into KV or cross-seq KV aliasing.
+            // Tile the page-id sequence per row so each sequence
+            // sees its own contiguous block range, mirroring how
+            // run_bench / run_generate lay out their tables.
+            let total_entries = (num_seqs as usize) * (max_blocks_per_seq as usize);
+            let mut bt: Vec<i32> = Vec::with_capacity(total_entries);
+            for s in 0..num_seqs as i32 {
+                for b in 0..max_blocks_per_seq as i32 {
+                    bt.push(s * max_blocks_per_seq as i32 + b);
+                }
             }
             block_tables.copy_from_host(bytemuck_cast_i32(&bt))?;
         }
