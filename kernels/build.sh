@@ -73,6 +73,12 @@ compile_kernel() {
     case "$base" in cutlass_*)
         if [ -z "$CUTLASS_FLAGS" ]; then
             echo "  SKIP: $base.cu (CUTLASS not found)"
+            # Codex23-1: drop any pre-existing .ptx for the skipped
+            # kernel. Otherwise an old artifact from a prior CUTLASS-
+            # capable build survives, gen_manifest.sh re-publishes it
+            # via its `find kernels/sm_*/*.ptx` walk, and the runtime
+            # loads stale code paired with new launch ABIs.
+            rm -f "$ptx"
             return 0
         fi
         extra_flags="$CUTLASS_FLAGS -std=c++17"

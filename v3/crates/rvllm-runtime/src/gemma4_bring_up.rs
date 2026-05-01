@@ -1114,6 +1114,13 @@ impl Gemma4Bringup {
         let kernels_dir = crate::bring_up::resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
         let manifest_path = kernels_dir.join("manifest.json");
         let manifest = rvllm_kernels::manifest::KernelManifest::load_and_verify(&manifest_path)?;
+        // Codex23-2: warn (not fail) on manifest-vs-binary revision drift.
+        // The kernels crate's build.rs bakes `RVLLM_BUILD_REVISION` from
+        // git short HEAD; the manifest carries the same field per
+        // kernels/build.sh. A self-consistent stale manifest passing
+        // load_and_verify (size + sha match each other) but pairing
+        // with a binary that has a newer launch ABI shows up here.
+        manifest.warn_if_revision_drift(rvllm_kernels::manifest::VerifiedManifest::BUILD_REVISION);
         let kernels = Arc::new(KernelLoader::new(manifest));
 
         // Attention backend selection. On SM80/SM89/SM90 we stick with

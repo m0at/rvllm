@@ -63,8 +63,41 @@ impl VerifiedManifest {
     pub fn revision(&self) -> &str {
         &self.manifest.revision
     }
+
+    /// Compile-time git revision of the binary that bundles this crate.
+    /// Set by `rvllm-kernels`'s `build.rs` from `git rev-parse --short HEAD`,
+    /// `"dev"` when git is absent. Use as the `expected` argument to
+    /// `warn_if_revision_drift`.
+    pub const BUILD_REVISION: &'static str = env!("RVLLM_BUILD_REVISION");
     pub fn arch(&self) -> &str {
         &self.manifest.arch
+    }
+
+    /// Codex23-2: compare the manifest's `revision` against the
+    /// expected one (typically `env!("RVLLM_BUILD_REVISION")` baked
+    /// in by the kernels crate's `build.rs`) and emit a one-shot
+    /// stderr WARN on mismatch. Not a hard-fail: dev rebuilds where
+    /// the binary moves ahead of the kernels (or vice versa) are
+    /// legitimate; the warn just makes the drift visible so
+    /// "wrong-math / launch-error" failures further down trace
+    /// back to a stale manifest pairing instead of looking like
+    /// fresh kernel bugs.
+    pub fn warn_if_revision_drift(&self, expected: &str) {
+        if expected == "dev" || self.manifest.revision == "dev" {
+            return; // local hack-builds opt out
+        }
+        if self.manifest.revision != expected {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[kernels] WARN: manifest revision {} does not match binary {} \
+                     — wrong-math or launch-error failures may follow. Rebuild \
+                     kernels/ or the binary so the pair lines up.",
+                    self.manifest.revision, expected
+                );
+            }
+        }
     }
 }
 
