@@ -1019,16 +1019,26 @@ fn assert_rope_kernels_match(
     label: &'static str,
     sliding: Option<rvllm_kernels::KernelFn>,
     global: Option<rvllm_kernels::KernelFn>,
-) {
+) -> Result<()> {
+    // Codex26-2: a partial PTX/manifest state used to panic the
+    // server here. Return a typed config error instead so the bring-
+    // up failure surfaces as a request-level 500 (or shutdown path)
+    // rather than aborting the whole process. Operators rebuild
+    // kernels/ and retry.
     match (sliding.is_some(), global.is_some()) {
-        (true, true) | (false, false) => {}
-        _ => panic!(
-            "{label}: sliding/global Fa2PtxKernels disagree on whether \
-             this NVFP4 RoPE kernel is loaded (sliding={}, global={}). \
-             Symptomatic of a partial PTX build; rebuild kernels/.",
-            sliding.is_some(),
-            global.is_some(),
-        ),
+        (true, true) | (false, false) => Ok(()),
+        _ => Err(rvllm_core::RvllmError::Config {
+            err: rvllm_core::ConfigError::Inconsistent {
+                reasons: vec![format!(
+                    "{label}: sliding/global Fa2PtxKernels disagree on whether \
+                     this NVFP4 RoPE kernel is loaded (sliding={}, global={}). \
+                     Symptomatic of a partial PTX build; rebuild kernels/.",
+                    sliding.is_some(),
+                    global.is_some(),
+                )],
+            },
+            field: "Fa2PtxKernels.rope_nvfp4kv",
+        }),
     }
 }
 
@@ -1511,13 +1521,32 @@ impl Gemma4Bringup {
             } else {
                 0
             };
+        // Codex26-4: previously the bench-init memsets dropped their
+        // CUresult. On OOM / ECC / invalid-pointer the path kept
+        // running with uninitialised KV / scale state and produced
+        // misleading bench numbers. run_bench returns BenchResult
+        // (no Result<>), so the cuda_check! macro can't be used
+        // directly; panic with context so bench failures surface
+        // immediately instead of contaminating the published numbers.
         #[cfg(feature = "cuda")]
         {
-            cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
-            cudarc::driver::sys::cuMemsetD8_v2(
-                kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
-            cudarc::driver::sys::cuMemsetD8_v2(
-                q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
+            let memset_check = |r: cudarc::driver::sys::CUresult, what: &str| {
+                if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    panic!("bench: cuMemsetD8_v2 {what} failed: {:?}", r);
+                }
+            };
+            memset_check(
+                cudarc::driver::sys::cuMemsetD8_v2(
+                    kv_cache.device_ptr(), 0, kv_total_bytes as usize),
+                "kv_cache");
+            memset_check(
+                cudarc::driver::sys::cuMemsetD8_v2(
+                    kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize),
+                "kv_scale_cache");
+            memset_check(
+                cudarc::driver::sys::cuMemsetD8_v2(
+                    q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize),
+                "q_scale_scratch");
         }
         // Codex20-3: previously bench allocated a second NVFP4 scale
         // region ("kv_cache_scale") of the same size as kv_scale_cache
@@ -1597,7 +1626,10 @@ impl Gemma4Bringup {
             .region("cutlass_ws_gemma4", cutlass_ws_bytes, 256)
             .unwrap();
         let residual_ptr = residual.device_ptr();
-        let kernels = self.layer_kernels();
+        // Codex26-2: bench is dev-only and has no Result return path,
+        // so unwrap with a clear panic message.
+        let kernels = self.layer_kernels()
+            .expect("bench: layer_kernels — partial PTX/manifest state, rebuild kernels/");
 
         // GEMM plans — uniform shapes across all layers (the sliding/global
         // distinction is a runtime head reshape, weight dims are identical).
@@ -2040,15 +2072,19 @@ impl Gemma4Bringup {
             kv_total_bytes as f64 / 1e6, kv_dtype, sliding_blocks, num_blocks_total, kv_bytes_per_elem_log);
 
         let kv_cache = arena.region("kv_cache", kv_total_bytes as usize, 256)?;
-        cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
+        // Codex26-4: wrap PPL memsets with cuda_check (run_ppl returns Result<>).
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            kv_cache.device_ptr(), 0, kv_total_bytes as usize),
+            "ppl_kv_cache_zero", stream);
         // Scale cache shared across FP8 (F-series per-slot f32 scales)
         // and NVFP4 (per-16-elem E4M3 scales). F16 path has 0 scale bytes
         // but we still allocate a placeholder region so region indexing
         // stays uniform.
         let kv_scale_cache =
             arena.region("kv_scale_cache", kv_scale_total_bytes.max(16) as usize, 16)?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize),
+            "ppl_kv_scale_cache_zero", stream);
         // Codex21: PPL also dispatches with num_tokens==num_seqs today.
         // If the path grows to multi-token-per-seq prefill,
         // max_tokens_per_step must track the new upper bound; otherwise
@@ -2058,8 +2094,9 @@ impl Gemma4Bringup {
             (max_tokens_per_step as u64) * (arch.num_attention_heads as u64) * 4;
         let q_scale_scratch = arena.region(
             "q_scale_scratch", q_scale_scratch_bytes as usize, 16)?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize),
+            "ppl_q_scale_scratch_zero", stream);
         // See run_bench: RVLLM_PER_TOKEN_Q_SCALE=0 opts out.
         let q_scale_cache_ptr: u64 =
             if per_token_q_scale_enabled(/*default_on=*/true) {
@@ -2116,7 +2153,7 @@ impl Gemma4Bringup {
         let logits_f32 = arena.region("logits_f32_ppl", (num_seqs * vocab * 4) as usize, 16)?;
         let token_ids_region = arena.region("token_ids_ppl", (num_seqs * 4) as usize, 16)?;
         let residual_ptr = residual.device_ptr();
-        let kernels = self.layer_kernels();
+        let kernels = self.layer_kernels()?;
 
         let q_dim_s = (arch.num_attention_heads * arch.head_dim_sliding) as u32;
         let kv_dim_s = (arch.num_kv_heads_sliding * arch.head_dim_sliding) as u32;
@@ -3064,7 +3101,15 @@ impl Gemma4Bringup {
         // and indexes it by `qi * 4`. With only 8 bytes (old FA2
         // prefill layout) writing beyond entry 1 corrupted adjacent
         // arena regions and degenerated generation quality.
-        let cu_seqlens_q = arena.region("gen_cu_seqlens", (max_tokens * 4) as usize, 16)?;
+        // Codex26-3: prefix-sum holds at least `[0, chunk_q]` = 2 i32
+        // entries even when max_tokens=1 (RVLLM_DIAG_SKIP_DECODE +
+        // single-token prompt). The previous `max_tokens*4` produced
+        // a 4-byte region, so the 8-byte copy_from_host below failed.
+        let cu_seqlens_q = arena.region(
+            "gen_cu_seqlens",
+            ((max_tokens.max(1) + 1) * 4) as usize,
+            16,
+        )?;
         let block_tables = arena.region("gen_bt", (max_blocks_per_seq * 4) as usize, 16)?;
         {
             let bt: Vec<i32> = (0..max_blocks_per_seq as i32).collect();
@@ -3076,7 +3121,7 @@ impl Gemma4Bringup {
         let token_ids_region = arena.region("gen_tok_ids", (max_tokens * 4) as usize, 16)?;
         let sampled = arena.region("gen_sampled", 4, 16)?;
         let residual_ptr = residual.device_ptr();
-        let kernels = self.layer_kernels();
+        let kernels = self.layer_kernels()?;
 
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
         let max_layers = std::env::var("RVLLM_MAX_LAYERS")
@@ -3175,12 +3220,20 @@ impl Gemma4Bringup {
                 // past the wrapper falling out of scope below.
                 let bytes = shadow_total_bytes.max(16) as usize;
                 let region = arena.region("nvfp4_shadow_kv", bytes, 256)?;
-                cudarc::driver::sys::cuMemsetD8_v2(region.device_ptr(), 0, bytes);
+                // Codex26-4: NVFP4 shadow diagnostic memsets — wrap with
+                // cuda_check so OOM / ECC during shadow init surfaces
+                // as a typed error instead of producing misleading
+                // shadow snapshots.
+                cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+                    region.device_ptr(), 0, bytes),
+                    "nvfp4_shadow_kv_zero", stream);
                 let ptr = region.device_ptr();
                 // Per-layer Q snapshot region.
                 let q_bytes = shadow_q_total_bytes.max(16) as usize;
                 let q_region = arena.region("nvfp4_shadow_q", q_bytes, 256)?;
-                cudarc::driver::sys::cuMemsetD8_v2(q_region.device_ptr(), 0, q_bytes);
+                cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+                    q_region.device_ptr(), 0, q_bytes),
+                    "nvfp4_shadow_q_zero", stream);
                 let q_ptr = q_region.device_ptr();
                 // Q throwaway scratch: one slot. Shadow rope targets
                 // this when we're not capturing, so q_normed stays
@@ -3190,8 +3243,9 @@ impl Gemma4Bringup {
                 let throwaway_bytes = shadow_q_throwaway_bytes.max(16) as usize;
                 let throwaway_region = arena.region(
                     "nvfp4_shadow_q_throwaway", throwaway_bytes, 256)?;
-                cudarc::driver::sys::cuMemsetD8_v2(
-                    throwaway_region.device_ptr(), 0, throwaway_bytes);
+                cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+                    throwaway_region.device_ptr(), 0, throwaway_bytes),
+                    "nvfp4_shadow_q_throwaway_zero", stream);
                 let throwaway_ptr = throwaway_region.device_ptr();
                 *guard = Some(NvFp4ShadowAlloc {
                     shadow_ptr: ptr,
@@ -4708,13 +4762,19 @@ impl Gemma4Bringup {
                         // chunk shapes; without them, keep the cache metadata
                         // for diagnostics but do not reuse it.
                         0
-                    } else if chunk_size > 0 && prompt_len_u32 >= chunk_size {
+                    } else if batch_prefill && chunk_size > 0 {
+                        // Codex26-1: chunked batch-prefill commits ONLY full
+                        // chunks. A short prompt (prompt_len < chunk_size)
+                        // ran as a single sub-chunk under batch shape
+                        // (1, prompt_len), which is NOT the same shape a
+                        // later longer request's first chunk sees — sm121
+                        // small-batch GEMM paths aren't bit-identical, so
+                        // reusing those KV bytes can poison the next
+                        // request. Strict floor commits 0 in that case.
                         (prompt_len_u32 / chunk_size) * chunk_size
                     } else {
                         // Per-token decode prefill is shape-stable, so the
-                        // whole prompt is safe to reuse. For fixed chunked
-                        // batch prefill where the prompt fits in one chunk,
-                        // the single chunk is likewise the committed unit.
+                        // whole prompt is safe to reuse.
                         prompt_len_u32
                     };
                     // Refresh provenance so subsequent provenance
@@ -4727,7 +4787,7 @@ impl Gemma4Bringup {
         Ok(output_ids)
     }
 
-    pub fn layer_kernels(&self) -> Gemma4LayerKernels {
+    pub fn layer_kernels(&self) -> Result<Gemma4LayerKernels> {
         // (helper defined just above) — see assert_rope_kernels_match
         // NVFP4 RoPE kernel handle — `None` on branches without the
         // NVFP4 PTX built into $KERNELS_DIR. Lives on Fa2PtxKernels
@@ -4758,7 +4818,7 @@ impl Gemma4Bringup {
                 "fn_rope_nvfp4kv",
                 sliding,
                 global,
-            );
+            )?;
             sliding
         };
         #[cfg(feature = "cuda")]
@@ -4775,7 +4835,7 @@ impl Gemma4Bringup {
                 "fn_rope_nvfp4kv_bf16in",
                 sliding,
                 global,
-            );
+            )?;
             sliding
         };
         #[cfg(not(feature = "cuda"))]
@@ -4783,7 +4843,7 @@ impl Gemma4Bringup {
         #[cfg(not(feature = "cuda"))]
         let fused_rope_partial_nvfp4kv_bf16in = None;
 
-        Gemma4LayerKernels {
+        Ok(Gemma4LayerKernels {
             fused_rmsnorm: self.fused.fn_rmsnorm,
             fused_rmsnorm_fp8_quant: self.fused.fn_rmsnorm_fp8_quant,
             fused_qk_rmsnorm: self.fused.fn_qk_rmsnorm,
@@ -4824,7 +4884,7 @@ impl Gemma4Bringup {
             hadamard_unrotate_f16: self.fused.fn_hadamard_unrotate_f16,
             awq_int4_gemv_f16: self.fused.fn_awq_int4_gemv_f16,
             awq_int4_gemm_sm120_wmma: self.fused.fn_awq_int4_gemm_sm120_wmma,
-        }
+        })
     }
 }
 
