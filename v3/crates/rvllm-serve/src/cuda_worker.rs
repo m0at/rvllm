@@ -56,7 +56,15 @@ pub struct CudaWorkerConfig {
 pub async fn spawn_cuda_worker(
     cfg: CudaWorkerConfig,
 ) -> Result<(WorkerHandle, std::thread::JoinHandle<()>), ApiError> {
-    let (req_tx, mut req_rx) = mpsc::channel::<GenerateRequest>(cfg.queue_depth.max(1));
+    // `max_queue_depth` is documented as "in-flight + queued"; the
+    // worker pulls one request out of the channel and processes it
+    // synchronously, so the channel buffer should be sized for
+    // `queue_depth - 1` (queued) and the in-flight slot lives on the
+    // worker thread. Clamp to >= 1 because `mpsc::channel(0)`
+    // panics; depth=1 then accepts one in-flight + zero queued
+    // (effectively channel-of-1, matching the doc within ±0).
+    let channel_buf = cfg.queue_depth.saturating_sub(1).max(1);
+    let (req_tx, mut req_rx) = mpsc::channel::<GenerateRequest>(channel_buf);
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
     let CudaWorkerConfig { paths, arena_bytes, .. } = cfg;
@@ -117,6 +125,65 @@ pub async fn spawn_cuda_worker(
                 }
             }
             // === END DIAGNOSTIC ===
+
+            // Pre-allocate persistent NVFP4 helper buffers BEFORE the
+            // scratch checkpoint. The lazy allocation paths inside
+            // `run_generate` had a fatal lifetime bug: they ran
+            // AFTER the checkpoint, so `arena.restore(scratch_ck)`
+            // at the end of every request marked the buffers' bytes
+            // as free, and the SAME pointer in
+            // `Gemma4Bringup::nvfp4_hadamard` (or `_shadow`) on the
+            // next request silently aliased fresh scratch
+            // allocations. With `RVLLM_NVFP4_HADAMARD=1` enabled in
+            // production this could corrupt every Nth request's
+            // attention math without crashing — the worst kind of
+            // failure mode in an inference server.
+            //
+            // `build_nvfp4_hadamard_signs` is a no-op (returns
+            // `Ok(None)`) when the env gate is off, so adding the
+            // pre-allocation step here is free for the default
+            // configuration.
+            {
+                let max_hd = bringup.arch.max_head_dim() as u32;
+                let nl = bringup.arch.num_hidden_layers as u32;
+                match rvllm_runtime::gemma4_bring_up::build_nvfp4_hadamard_signs(
+                    nl, max_hd, &bringup.arena,
+                ) {
+                    Ok(alloc) => {
+                        if alloc.is_some() {
+                            tracing::info!(
+                                "nvfp4_hadamard signs pre-allocated above scratch checkpoint"
+                            );
+                        }
+                        *bringup.nvfp4_hadamard.lock().unwrap() = alloc;
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "build_nvfp4_hadamard_signs: {e:?}"
+                        )));
+                        return;
+                    }
+                }
+            }
+
+            // TODO(nvfp4-shadow-lifetime): the same checkpoint/restore
+            // bug applies to `nvfp4_shadow` (lazy-allocated inside
+            // run_generate). Refactoring requires factoring the shadow
+            // alloc out of run_generate (it depends on per-layer KV
+            // sizes and the shadow_set env var). RVLLM_NVFP4_SHADOW_F16
+            // is a diagnostic gate not enabled in production, so the
+            // fix is deferred. If you set the env, expect silent
+            // corruption from request 2 onward until this lands.
+            if env_truthy("RVLLM_NVFP4_SHADOW_F16") {
+                tracing::warn!(
+                    "RVLLM_NVFP4_SHADOW_F16=1 — note: nvfp4_shadow lazy \
+                     allocation has a known scratch/checkpoint lifetime \
+                     bug; output of requests after the first may be \
+                     silently corrupted. Use only for single-request \
+                     diagnostics until the alloc is hoisted above the \
+                     scratch checkpoint."
+                );
+            }
             let scratch_ck = bringup.arena.checkpoint();
             tracing::info!(
                 compute_cap = ?bringup.ctx.compute_capability(),

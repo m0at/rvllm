@@ -467,7 +467,29 @@ async fn chat_collect(
                 return Err(ApiError::Timeout { secs: request_timeout.as_secs() });
             }
             ev = events_rx.recv() => match ev {
-                Some(GenerateEvent::Token { id, .. }) => token_ids.push(id),
+                Some(GenerateEvent::Token { id, .. }) => {
+                    token_ids.push(id);
+                    // User-supplied `stop` strings: detect a match
+                    // incrementally so the GPU stops generating
+                    // immediately. Previously stops only ran in the
+                    // post-loop `apply_stop_truncation`, so the
+                    // worker produced everything up to EOS / max_tokens
+                    // and we just trimmed the visible answer — wasting
+                    // GPU time, inflating `usage.completion_tokens`,
+                    // breaking timeouts. Setting `cancelled = true`
+                    // signals `run_generate` to break out of its
+                    // decode loop on the next step (Codex4-2).
+                    if !stop_text.is_empty() && !cancelled.load(Ordering::Relaxed) {
+                        if let Ok(probe) = tokenizer.decode_raw(&token_ids) {
+                            for s in stop_text {
+                                if probe.contains(s.as_str()) {
+                                    cancelled.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
                 Some(GenerateEvent::Done { finish: f, prompt_tokens, completion_tokens }) => {
                     finish = Some(f);
                     usage = Usage::new(prompt_tokens, completion_tokens);
@@ -1429,7 +1451,24 @@ async fn completion_collect(
                 return Err(ApiError::Timeout { secs: request_timeout.as_secs() });
             }
             ev = events_rx.recv() => match ev {
-                Some(GenerateEvent::Token { id, .. }) => token_ids.push(id),
+                Some(GenerateEvent::Token { id, .. }) => {
+                    token_ids.push(id);
+                    // Same incremental stop-detection as the chat
+                    // path — match against the user-supplied stop
+                    // strings each token and signal the worker to
+                    // cancel the GPU loop early instead of running
+                    // to EOS and trimming post-hoc.
+                    if !stop_text.is_empty() && !cancelled.load(Ordering::Relaxed) {
+                        if let Ok(probe) = tokenizer.decode_raw(&token_ids) {
+                            for s in stop_text {
+                                if probe.contains(s.as_str()) {
+                                    cancelled.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
                 Some(GenerateEvent::Done { finish: f, prompt_tokens, completion_tokens }) => {
                     finish = Some(f);
                     usage = Usage::new(prompt_tokens, completion_tokens);

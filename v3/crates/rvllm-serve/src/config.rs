@@ -23,7 +23,13 @@ pub struct ServerConfig {
     /// bodies. Defaults to the directory's last component.
     pub model_id: String,
     /// Max number of in-flight + queued generate requests. Full =
-    /// admission returns 429. 1 = strictly serial.
+    /// admission returns 429. The worker pulls one request out of the
+    /// queue and processes it on its dedicated thread, so the channel
+    /// buffer is sized as `max_queue_depth - 1` (queued slots) + 1
+    /// in-flight = `max_queue_depth` total. `1` permits exactly two
+    /// concurrent requests (one queued + one in-flight) because
+    /// `mpsc::channel(0)` is invalid; set `2` for the same effective
+    /// behaviour with cleaner semantics.
     pub max_queue_depth: usize,
     /// Hard upper bound on `max_tokens` a request may ask for. Prevents
     /// a single client from pinning the worker.

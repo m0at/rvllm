@@ -3917,7 +3917,22 @@ impl Gemma4Bringup {
             rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
                 .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
             self.stream.fence()?;
-            cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
+            // Same anti-pattern as the host_sample_token DtoH already
+            // fixed in Codex3: a silently-failing greedy-argmax DtoH
+            // would leave host_tok[0] == 0 (or a stale value from a
+            // prior step) and the server would emit token-0 as if the
+            // greedy decode succeeded. CUDA faults must surface as
+            // 500s, not as wrong tokens that look like model
+            // hallucinations.
+            cuda_check!(
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    host_tok.as_mut_ptr() as *mut _,
+                    sampled.device_ptr(),
+                    4,
+                ),
+                "argmax_sample_token_dtoh_decode",
+                stream
+            );
         }
         // Cycle 53 step 5: top-K logit dump at first decode step. Gated by
         // RVLLM_DUMP_TOPK_LOGITS=1. Cost: 1 MiB DtoH + partial-sort vocab
@@ -4370,7 +4385,19 @@ impl Gemma4Bringup {
                 rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
                     .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
                 self.stream.fence()?;
-                cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
+                // See twin site at the prefill argmax above: a silent
+                // DtoH failure left host_tok[0] at its prior value
+                // and the loop emitted that token as the next one,
+                // masking CUDA faults as model hallucinations.
+                cuda_check!(
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        host_tok.as_mut_ptr() as *mut _,
+                        sampled.device_ptr(),
+                        4,
+                    ),
+                    "argmax_sample_token_dtoh_decode_loop",
+                    stream
+                );
             }
             let next_id = host_tok[0] as u32;
             output_ids.push(next_id);
