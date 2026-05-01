@@ -1133,13 +1133,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bf16out_kernel(
                 dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
                 if (tid == 0) {
                     int kv_pos = tile_start + t;
-                    // Causal + sliding-window mask. Previously
-                    // window_size_left was commented out → sliding
-                    // layers in the fallback path attended the full
-                    // prefix. Matches unified-prefill + decode
-                    // (window [q_abs - W, q_abs] inclusive = W+1).
+                    // Causal + sliding-window mask. Codex19: gate is
+                    // `>= 0` (was `> 0`) so window=0 means only-current,
+                    // matching decode + f16-out sibling (Codex18-2).
                     bool masked = (kv_pos > q_abs_kv_pos);
-                    if (!masked && window_size_left > 0) {
+                    if (!masked && window_size_left >= 0) {
                         masked = ((q_abs_kv_pos - kv_pos) > window_size_left);
                     }
                     s_score[t] = masked ? -FLT_MAX : dot;
@@ -1325,13 +1323,11 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_bf16out_kernel(
                 dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
                 if (tid == 0) {
                     int kv_pos = tile_start + t;
-                    // Causal + sliding-window mask. Previously
-                    // window_size_left was commented out → sliding
-                    // layers in the fallback path attended the full
-                    // prefix. Matches unified-prefill + decode
-                    // (window [q_abs - W, q_abs] inclusive = W+1).
+                    // Causal + sliding-window mask. Codex19: gate is
+                    // `>= 0` (was `> 0`) so window=0 means only-current,
+                    // matching decode + f16-out sibling (Codex18-2).
                     bool masked = (kv_pos > q_abs_kv_pos);
-                    if (!masked && window_size_left > 0) {
+                    if (!masked && window_size_left >= 0) {
                         masked = ((q_abs_kv_pos - kv_pos) > window_size_left);
                     }
                     s_score[t] = masked ? -FLT_MAX : dot;
