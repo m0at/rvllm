@@ -3320,6 +3320,26 @@ unsafe fn unrotate_attn_out_v_if_enabled(
     let rotate_v = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
         .unwrap_or(false);
     if !rotate_v { return Ok(()); }
+    // Codex18-3: kernel-side V-rotate gate is `hadamard_on && rotate_v`
+    // (fused_rope_partial_nvfp4kv.cu:475). If the master Hadamard flag
+    // is off, V was never rotated → no unrotate to do. Previously the
+    // host gated solely on RVLLM_NVFP4_HADAMARD_V, so a config
+    // typo (V flag set, master flag unset) hit the "missing signs"
+    // hard-fail below even though the kernel had correctly skipped
+    // V rotation. Match the gates so the host is a no-op in the
+    // same cases the kernel is.
+    let hadamard_on = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD")
+        .unwrap_or(false);
+    if !hadamard_on {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[hadamard] RVLLM_NVFP4_HADAMARD_V=1 set without RVLLM_NVFP4_HADAMARD=1 — \
+                 kernel did not rotate V, so host-side unrotate is skipped (no-op)."
+            );
+        }
+        return Ok(());
+    }
     // V was rotated by R inside the rope kernel; the O-projection
     // expects unrotated `P·V`. If the unrotate kernel or sign
     // vector are missing here, returning Ok(()) silently leaves

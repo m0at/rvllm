@@ -1002,11 +1002,23 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         // the device-side `context_lens`; a mismatched value silently
         // OOB-reads / -writes the partition scratch arena
         // (kernels/flash_attention_split_decode_nvfp4kv.cu:654).
-        if partition_size == 0 || partition_size % 16 != 0 {
+        // Codex18-1: partition_size must be a multiple of the BC-tile
+        // the split kernel iterates over. The kernel computes
+        // `kv_pos = part_start / FA2_BC * FA2_BC + tile_offset` without
+        // a `kv_pos < part_start` mask, so a sub-BC partition_size lets
+        // partition N read tokens that partition N-1 already covered.
+        // BC=32 path runs for head_dim <= 256 (fn_decode_nvfp4kv_split);
+        // BC=16 path runs for head_dim > 256 (fn_decode_nvfp4kv_split_bc16).
+        let required_bc: u32 = if params.head_dim > 256 { 16 } else { 32 };
+        if partition_size == 0 || partition_size % required_bc != 0 {
             return Err(RvllmError::Attention {
                 err: AttentionError::FeatureNotAvailable {
                     backend: "host-validation",
-                    op: "paged_decode_nvfp4_split — partition_size must be a non-zero multiple of 16",
+                    op: if required_bc == 32 {
+                        "paged_decode_nvfp4_split — partition_size must be a non-zero multiple of 32 (BC=32 path, head_dim<=256)"
+                    } else {
+                        "paged_decode_nvfp4_split — partition_size must be a non-zero multiple of 16 (BC=16 path, head_dim>256)"
+                    },
                 },
                 ctx: AttnCtx { op: "paged_decode_nvfp4_split", stream,
                     num_seqs: params.num_seqs, head_dim: params.head_dim },

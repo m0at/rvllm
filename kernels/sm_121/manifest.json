@@ -82,9 +82,9 @@
       "sha256": "84eeb1e52112fda81b9190569b483dff6f0618bda68015d7ead1f6958ebb20e6"
     },
     "flash_attention_nvfp4kv": {
-      "bytes": 603240,
+      "bytes": 603242,
       "path": "flash_attention_nvfp4kv.ptx",
-      "sha256": "eff3c7df72bfcf93292cbd1feda5a64106bbddfa12747716b6488e2927cde40f"
+      "sha256": "4c65b23a7ea6ffdf986776ad91077f9b07101cdccf8810e5fe6a4f60c629ea51"
     },
     "flash_attention_nvfp4kv_bf16out": {
       "bytes": 606088,
@@ -109,7 +109,7 @@
     "flash_attention_unified_prefill_nvfp4kv": {
       "bytes": 48543,
       "path": "flash_attention_unified_prefill_nvfp4kv.ptx",
-      "sha256": "8f39e9d35ab7e4048e0bebc22d19fc82f3332a2ef10223a3e9fe9dee6854c5d5"
+      "sha256": "df2b8e077570583763944d0da335806a67050bfed1e80f6e2ab8bec8dc836635"
     },
     "flash_attention_unified_prefill_nvfp4kv_bf16out": {
       "bytes": 48916,
@@ -317,5 +317,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "1935580"
+  "revision": "6842760"
 }

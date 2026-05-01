@@ -1128,9 +1128,13 @@ __global__ void flash_attention_2_prefill_nvfp4kv_kernel(
                     // of the documented window. Now matches the
                     // unified-prefill + decode kernels: window
                     // covers [q_abs - W, q_abs] inclusive (W+1
-                    // tokens) when window_size_left > 0.
+                    // tokens) when window_size_left >= 0. Codex18-2:
+                    // align with decode kernels — `< 0` is the only
+                    // "no window" sentinel; `0` means "only current
+                    // token" (delta>0 masked). Prefill previously
+                    // treated `0` as no-mask, diverging from decode.
                     bool masked = (kv_pos > q_abs_kv_pos);
-                    if (!masked && window_size_left > 0) {
+                    if (!masked && window_size_left >= 0) {
                         masked = ((q_abs_kv_pos - kv_pos) > window_size_left);
                     }
                     s_score[t] = masked ? -FLT_MAX : dot;
@@ -1321,10 +1325,10 @@ __global__ void flash_attention_2_prefill_nvfp4kv_bc16_kernel(
                     // body had the fix already, the f16-out variant
                     // did not. Window covers [q_abs - W, q_abs]
                     // inclusive (W+1 tokens) when window_size_left
-                    // > 0, matching the decode + unified-prefill
-                    // kernels.
+                    // >= 0; Codex18-2: `< 0` is the lone "no window"
+                    // sentinel — `0` means only current token.
                     bool masked = (kv_pos > q_abs_kv_pos);
-                    if (!masked && window_size_left > 0) {
+                    if (!masked && window_size_left >= 0) {
                         masked = ((q_abs_kv_pos - kv_pos) > window_size_left);
                     }
                     s_score[t] = masked ? -FLT_MAX : dot;

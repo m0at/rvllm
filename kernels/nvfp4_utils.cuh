@@ -60,8 +60,14 @@ __device__ __forceinline__ float fp4_decode(uint32_t bits) {
 /// is what the MMA-time dequant will multiply back; we pick the FP4
 /// representable closest to `scaled`.
 ///
-/// Rounds-to-nearest-even on ties. Returns the 4-bit pattern in the
-/// low nibble of the u32.
+/// Round-to-nearest with ties-away-from-zero (Codex18-4 — earlier
+/// comment claimed RNE but the strict-`<` thresholds round exact
+/// midpoints like 0.25 / 0.75 / 1.25 to the larger magnitude).
+/// True RNE would need an even-bin tie-break; not changing the
+/// rounding mode here because it would shift quantization quality
+/// across every NVFP4 layer in production. Stochastic rounding is
+/// available via `fp4_encode_stoch` + `RVLLM_NVFP4_STOCH_ROUND_V`.
+/// Returns the 4-bit pattern in the low nibble of the u32.
 __device__ __forceinline__ uint32_t fp4_encode(float scaled) {
     uint32_t sign = (scaled < 0.0f) ? 0x8u : 0x0u;
     float mag = fabsf(scaled);
