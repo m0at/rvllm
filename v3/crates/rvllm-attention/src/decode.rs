@@ -1331,21 +1331,31 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
     }
 
     /// Returns true iff the PTX module exposes the split + reduce
-    /// kernels. Callers use this to decide whether to attempt the
-    /// split path vs the single-CTA fallback.
+    /// kernels for the given `head_dim`. The launcher only ever
+    /// dispatches one of `fn_decode_nvfp4kv_split` (head_dim ≤ 256)
+    /// or `fn_decode_nvfp4kv_split_bc16` (head_dim > 256), so the
+    /// other variant being missing must NOT disable the split path
+    /// for callers that don't use it. Previously this method
+    /// required BOTH variants present; a partial PTX build (or a
+    /// future single-head-dim model) would silently fall back to
+    /// the single-CTA decode and lose the long-context performance
+    /// win on layers that COULD have used split.
     #[cfg(feature = "cuda")]
-    pub fn has_split_kernels(&self) -> bool {
+    pub fn has_split_kernels(&self, head_dim: u32) -> bool {
         match self.backend {
             super::AttentionBackend::Fa2Ptx(fa2) => {
-                fa2.fn_decode_nvfp4kv_split.is_some()
-                    && fa2.fn_decode_nvfp4kv_split_bc16.is_some()
-                    && fa2.fn_paged_attn_reduce_f16.is_some()
+                let split_for_hd = if head_dim > 256 {
+                    fa2.fn_decode_nvfp4kv_split_bc16.is_some()
+                } else {
+                    fa2.fn_decode_nvfp4kv_split.is_some()
+                };
+                split_for_hd && fa2.fn_paged_attn_reduce_f16.is_some()
             }
             _ => false,
         }
     }
     #[cfg(not(feature = "cuda"))]
-    pub fn has_split_kernels(&self) -> bool { false }
+    pub fn has_split_kernels(&self, _head_dim: u32) -> bool { false }
 }
 
 #[cfg(test)]

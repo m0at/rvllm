@@ -941,6 +941,16 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
         cu_seqlens_q: u64,
         context_lens: u64,
         q_descale_fallback: u64,
+        // When `true`, dispatch the bf16-output variant of the
+        // unified prefill kernel (`fn_prefill_nvfp4kv_unified_bf16out`).
+        // The bf16-out kernel was loaded into Fa2PtxKernels but
+        // never selected — every call hard-coded the f16-out
+        // variant regardless of the caller's intent. Same dormant-
+        // wiring pattern that the cycle 55 bf16-everywhere PR will
+        // activate; making the parameter live now lets that PR
+        // simply flip a boolean rather than refactor the launcher.
+        // Today's gemma4 caller passes `false`.
+        output_bf16: bool,
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
@@ -987,11 +997,27 @@ impl<'a> PagedPrefillNvfp4Launcher<'a> {
             };
             use cudarc::driver::sys::*;
             const FA2_THREADS: i32 = 128;
-            let kernel_fn = fa2.fn_prefill_nvfp4kv_unified.ok_or_else(|| {
+            // Dispatch f16-out vs bf16-out variant. Closes the same
+            // dormant-wiring gap as the bf16 split-decode reducer
+            // (Codex9): both kernels are loaded by the loader, but
+            // the launcher previously always reached for the f16-out
+            // one. With output_bf16 plumb live, cycle 55 Stage 3
+            // can flip a flag at the caller instead of touching the
+            // launcher.
+            let kernel_handle = if output_bf16 {
+                fa2.fn_prefill_nvfp4kv_unified_bf16out
+            } else {
+                fa2.fn_prefill_nvfp4kv_unified
+            };
+            let kernel_fn = kernel_handle.ok_or_else(|| {
                 RvllmError::Attention {
                     err: AttentionError::FeatureNotAvailable {
                         backend: "Fa2Ptx",
-                        op: "paged_prefill_nvfp4_unified (kernel missing from PTX)",
+                        op: if output_bf16 {
+                            "paged_prefill_nvfp4_unified (bf16-out kernel missing from PTX)"
+                        } else {
+                            "paged_prefill_nvfp4_unified (kernel missing from PTX)"
+                        },
                     },
                     ctx: AttnCtx {
                         op: "paged_prefill_nvfp4_unified",

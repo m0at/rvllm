@@ -878,11 +878,33 @@ pub unsafe fn gemma4_forward_phase(
     // which reads `scratch.hidden_fp8` and needs the quant to have
     // produced it. Dropping `blockscale != 0` here silently zeroed
     // `hidden_fp8` and propagated zero logits through the LM head.
+    // The gate must check the kernel that the dispatch below will
+    // ACTUALLY pick — the bf16-native fast-path branch (further
+    // down) selects `fp8_gemv_wpr_native_bf16in` when bf16 residual
+    // gates are on, while otherwise it picks `_f16in`. Previously
+    // this gate hard-coded `_f16in.is_some()`; if the bf16in kernel
+    // was missing while the f16in one was present and bf16-native
+    // was active, `skip_attn_quant=true` skipped the FP8 quant,
+    // the bf16in dispatch then fell through to
+    // `fp8_gemm_channelscale_or_fallback` which read uninitialised
+    // `scratch.hidden_fp8` / `scratch.hidden_scale` for the layer.
+    // Mirror the dispatch's selection here.
+    #[cfg(feature = "cuda")]
+    let bf16_native_qkv_gate = dims.bf16_residual
+        && (crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled()
+            || crate::gemma4_bring_up::bf16_native_full_chain_enabled());
+    #[cfg(feature = "cuda")]
+    let qkv_native_kernel_present = if bf16_native_qkv_gate {
+        kernels.fp8_gemv_wpr_native_bf16in.is_some()
+    } else {
+        kernels.fp8_gemv_wpr_native_f16in.is_some()
+    };
+    #[cfg(feature = "cuda")]
     let skip_attn_quant = dims.num_tokens == 1
         && weights.qkv_chscale != 0
         && weights.qkv_blockscale != 0
         && weights.qkv_f16 == 0
-        && kernels.fp8_gemv_wpr_native_f16in.is_some();
+        && qkv_native_kernel_present;
     #[cfg(not(feature = "cuda"))]
     let skip_attn_quant = false;
     if !skip_attn_quant {
@@ -1506,7 +1528,7 @@ pub unsafe fn gemma4_forward_phase(
                     let ws_need = slots * (dims.head_dim as u64) * 4
                         + slots * 4 * 2;
                     let use_split = split_env_on
-                        && decode.has_split_kernels()
+                        && decode.has_split_kernels(dims.head_dim)
                         && current_num_parts > 1
                         && ws_need <= 16 * 1024 * 1024; // fa3_ws is 16MiB
                     // === DYNAMIC NVFP4 Q SCALE ===
@@ -1676,6 +1698,11 @@ pub unsafe fn gemma4_forward_phase(
                         cu_seqlens_q,
                         meta.context_lens,
                         scratch.q_scale_ptr,
+                        // output_bf16: today's attn_out scratch is f16;
+                        // cycle 55 Stage 3 will flip this when the
+                        // bf16-out attention scratch is plumbed
+                        // through.
+                        false,
                         stream,
                     )?;
                 } else {
