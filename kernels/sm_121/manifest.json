@@ -236,6 +236,11 @@
       "path": "ldmatrix_probe.ptx",
       "sha256": "cd2ac37a4ec5b691346fdfd6b0fdefc1b98a4c25c6cb84d7556b2392406496a7"
     },
+    "libcutlass_sm120": {
+      "bytes": 216408,
+      "path": "libcutlass_sm120.so",
+      "sha256": "8dac8b263accbe4712bfe857f02dfc13ba0ec251572f6013e948579b2591ede0"
+    },
     "logit_softcap": {
       "bytes": 1985,
       "path": "logit_softcap.ptx",
@@ -317,5 +322,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "590e34b"
+  "revision": "b6ae63a"
 }

@@ -1769,6 +1769,33 @@ pub unsafe fn gemma4_forward_phase(
                 // a single call here covers both.
                 unrotate_attn_out_v_if_enabled(dims, kernels, scratch, stream)?;
             } else {
+            // Codex25-4: hard-fail at the layer-API boundary if the
+            // caller asks for F16 KV in the Prefill phase. This branch
+            // writes FP8 KV unconditionally (no F16 prefill kernel
+            // exists on sm_121), so a later decode that reads
+            // dims.kv_dtype == F16 would interpret the FP8 bytes as
+            // halves — silent numeric corruption. run_generate gates
+            // batch-prefill against f16_kv (gemma4_bring_up.rs:3506)
+            // already, but the lower-level Gemma4Phase::Prefill API
+            // is reachable from new call sites; refuse the
+            // configuration here so the contract is enforced at the
+            // single point that knows it.
+            if dims.f16_kv || dims.kv_dtype == KvDtype::F16 {
+                return Err(rvllm_core::RvllmError::Config {
+                    err: rvllm_core::ConfigError::InvalidField {
+                        name: "Gemma4Phase::Prefill",
+                        reason:
+                            "F16 KV is not supported in the Prefill phase: \
+                             no F16 prefill kernel exists on sm_121 and the \
+                             dispatch would write FP8 bytes that the matching \
+                             F16 decode path would later read as halves. Use \
+                             FP8 or NVFP4 KV, or run prefill via the \
+                             per-token decode loop."
+                            .into(),
+                    },
+                    field: "kv_dtype",
+                });
+            }
             // FP8 / F16 prefill: share the FP8 write path (no F16 prefill
             // kernel on sm_121). F-series unified-or-fallback structure:
             // Prefill always uses FP8 KV path (no F16 prefill kernel).

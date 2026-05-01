@@ -419,9 +419,20 @@ fn resolve_sm120_so_path(sm90_hint: &std::path::Path) -> Option<PathBuf> {
     // Look for `kernels/sm_120/libcutlass_sm120.so` relative to the
     // hint's grandparent.
     if let Some(grandparent) = sm90_hint.parent().and_then(|p| p.parent()) {
-        let candidate = grandparent.join("sm_120").join("libcutlass_sm120.so");
-        if candidate.is_file() {
-            return Some(candidate);
+        // Codex25-1: build_cutlass_sm120_so.sh writes the .so into
+        // the per-arch directory (kernels/sm_121/libcutlass_sm120.so
+        // on DGX Spark, kernels/sm_120/ on RTX 5090). Earlier code
+        // looked at sm_120 only — production on sm_121 silently
+        // fell back to CutlassBackend::Absent unless the operator
+        // had set RVLLM_CUTLASS_SM120_SO. Search every Blackwell-
+        // family arch folder for the sibling .so and return the
+        // first hit; sm_121 covers DGX Spark, sm_120 covers
+        // RTX 5090 / RTX 6000 Blackwell, sm_122 covers later parts.
+        for arch in ["sm_121", "sm_120", "sm_122"] {
+            let candidate = grandparent.join(arch).join("libcutlass_sm120.so");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None

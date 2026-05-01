@@ -20,7 +20,10 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "dev".to_string());
     println!("cargo:rustc-env=RVLLM_BUILD_REVISION={rev}");
-    // Re-run if HEAD moves.
-    println!("cargo:rerun-if-changed=../../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../../.git/refs/heads");
+    // Codex25-3: crate sits in `v3/crates/rvllm-kernels/`, so the
+    // repo-root `.git/` is FOUR levels up, not three. The previous
+    // 3-level path resolved to `v3/.git/HEAD` (non-existent) so the
+    // build.rs never re-ran on commits and the baked revision drifted.
+    println!("cargo:rerun-if-changed=../../../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../../../.git/refs/heads");
 }
