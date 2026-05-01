@@ -267,7 +267,8 @@ fn run() -> Result<(), String> {
             bringup
                 .run_generate(fn_embed, fn_argmax, &prompt_ids, max_new, &eos_ids, false,
                     rvllm_runtime::gemma4_bring_up::SamplingConfig::greedy(),
-                    None /* no cancellation source in probe */)
+                    None /* no cancellation source in probe */,
+                    None /* no per-token streaming sink in probe */)
                 .map_err(|e| format!("run_generate: {e}"))?
         };
         let elapsed = t_gen.elapsed();

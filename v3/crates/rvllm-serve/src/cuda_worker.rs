@@ -276,6 +276,36 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             }
         }
     };
+    // Per-token streaming sink. Fires on every token the runtime
+    // emits (prefill's first + every decode-loop token, in order).
+    // Returning `false` stops generation — used for closed-channel
+    // (client disconnect / handler exit) and for the existing
+    // cancellation flag (timeout, stop-string match in handler,
+    // SSE Drop). Counter `emitted` runs from 0 so SSE position
+    // matches.
+    //
+    // This is the change that makes `stream=true` actually deliver
+    // tokens incrementally instead of in a burst at the end of
+    // run_generate, AND lets handler-side stop-string detection
+    // cancel the worker within ~one decode step instead of after
+    // all max_tokens are produced.
+    let mut emitted: u32 = 0;
+    let cancelled_ref = req.cancelled.clone();
+    let events_tx_ref = req.events_tx.clone();
+    let mut on_token = |id: u32| -> bool {
+        if cancelled_ref.load(Ordering::Relaxed) {
+            return false;
+        }
+        let pos = emitted;
+        match events_tx_ref.blocking_send(GenerateEvent::Token { id, position: pos }) {
+            Ok(()) => {
+                emitted += 1;
+                true
+            }
+            Err(_) => false,
+        }
+    };
+
     let result = unsafe {
         bringup.run_generate(
             kernels.fn_embed,
@@ -294,51 +324,33 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             // the next step so the worker thread does not stay
             // blocked rendering tokens nobody will read.
             Some(req.cancelled.as_ref()),
+            Some(&mut on_token),
         )
     };
 
     match result {
         Ok(generated_ids) => {
-            // `run_generate` returns ONLY the generated tokens (not
-            // prompt + generated). See gemma4_bring_up.rs:1634 —
-            // `output_ids` starts empty and only decode samples push.
-            let generated: &[u32] = &generated_ids;
-
-            let mut emitted: u32 = 0;
-            for (i, &id) in generated.iter().enumerate() {
-                if req.cancelled.load(Ordering::Relaxed) {
-                    let _ = req.events_tx.blocking_send(GenerateEvent::Done {
-                        finish: FinishReason::Cancelled,
-                        prompt_tokens: prompt_len,
-                        completion_tokens: emitted,
-                    });
-                    return;
-                }
-                if req
-                    .events_tx
-                    .blocking_send(GenerateEvent::Token { id, position: i as u32 })
-                    .is_err()
-                {
-                    return;
-                }
-                emitted += 1;
-            }
-
-            let finish = if generated
+            // Tokens were already emitted to the events channel via
+            // the on_token callback during run_generate. We just
+            // need the final Done event with the right finish_reason
+            // and completion_tokens count.
+            let final_emitted = emitted;
+            let finish = if req.cancelled.load(Ordering::Relaxed) {
+                FinishReason::Cancelled
+            } else if generated_ids
                 .last()
                 .is_some_and(|id| req.stop_token_ids.contains(id))
             {
                 FinishReason::Stop
-            } else if emitted >= req.max_new_tokens {
+            } else if final_emitted >= req.max_new_tokens {
                 FinishReason::Length
             } else {
                 FinishReason::Stop
             };
-
             let _ = req.events_tx.blocking_send(GenerateEvent::Done {
                 finish,
                 prompt_tokens: prompt_len,
-                completion_tokens: emitted,
+                completion_tokens: final_emitted,
             });
         }
         Err(e) => {

@@ -18,13 +18,51 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{FromRequest, Request, State},
     response::{sse::Event, IntoResponse, Sse},
     Json,
 };
+use axum::body::Bytes;
+use serde::de::DeserializeOwned;
 use futures::stream::{self, Stream};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// JSON extractor that maps serde / body-read failures into
+/// `ApiError::invalid_request_error`. Axum's stock `Json<T>`
+/// returns plain-text 400 bodies on parse failure — OpenAI SDKs
+/// decode `error.message` from the response envelope and see
+/// nothing useful when the server has handed them axum's
+/// "Failed to deserialize JSON" string. This wrapper produces the
+/// same `{"error": {...}}` shape any other 400 from this server
+/// emits, so SDK clients get a consistent error model.
+pub struct OpenAiJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for OpenAiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let body = Bytes::from_request(req, state)
+            .await
+            .map_err(|_| ApiError::invalid_param(
+                "failed to read request body",
+                "body",
+                "body_read_failed",
+            ))?;
+        let value = serde_json::from_slice::<T>(&body).map_err(|e| {
+            ApiError::invalid_param(
+                format!("invalid JSON: {e}"),
+                "body",
+                "invalid_json",
+            )
+        })?;
+        Ok(OpenAiJson(value))
+    }
+}
 
 /// Erased SSE event stream used by the streaming handlers' return
 /// types. Writing out `Pin<Box<dyn Stream ...>>` at every call site
@@ -183,7 +221,7 @@ use crate::worker::{GenerateEvent, GenerateRequest};
 pub async fn chat_completions(
     State(state): State<AppState>,
     _headers: axum::http::HeaderMap,
-    Json(req): Json<ChatCompletionRequest>,
+    OpenAiJson(req): OpenAiJson<ChatCompletionRequest>,
 ) -> ApiResult<ChatCompletionsResponse> {
     let request_id = Uuid::new_v4();
     let span = tracing::info_span!(
@@ -1298,7 +1336,7 @@ pub(crate) fn sse_error_event(message: impl Into<String>) -> Event {
 pub async fn completions(
     State(state): State<AppState>,
     _headers: axum::http::HeaderMap,
-    Json(req): Json<CompletionRequest>,
+    OpenAiJson(req): OpenAiJson<CompletionRequest>,
 ) -> ApiResult<CompletionsResponse> {
     let request_id = Uuid::new_v4();
     let span = tracing::info_span!(
@@ -1815,6 +1853,38 @@ fn reject_v1_unsupported_chat(req: &ChatCompletionRequest) -> ApiResult<()> {
 }
 
 fn reject_v1_unsupported_completions(req: &CompletionRequest) -> ApiResult<()> {
+    // Mirror the chat handler's reject for OpenAI sampling params we
+    // don't honour. Without this, completions silently dropped
+    // response_format / penalties / stream_options instead of 400'ing
+    // — clients believed their settings applied while the runtime
+    // ignored them. See `reject_v1_unsupported_chat` (Codex4-4).
+    if req.response_format.is_some() {
+        return Err(ApiError::invalid_param(
+            "response_format / JSON mode is not supported (no \
+             grammar-constrained decoding in this build).",
+            "response_format",
+            "response_format_unsupported",
+        ));
+    }
+    if req.presence_penalty.is_some_and(|p| p != 0.0)
+        || req.frequency_penalty.is_some_and(|p| p != 0.0)
+    {
+        return Err(ApiError::invalid_param(
+            "presence_penalty / frequency_penalty are not yet wired \
+             through the logits processor; use \
+             `RVLLM_REPETITION_PENALTY` env override server-side or \
+             omit the field.",
+            "presence_penalty",
+            "penalty_unsupported",
+        ));
+    }
+    if req.stream_options.is_some() {
+        return Err(ApiError::invalid_param(
+            "stream_options (e.g. include_usage) is not yet supported.",
+            "stream_options",
+            "stream_options_unsupported",
+        ));
+    }
     if req.n.is_some_and(|n| n != 1) {
         return Err(ApiError::invalid_param(
             "n must be 1",
@@ -1877,22 +1947,30 @@ fn reject_oversized_prompt(
     max_new: u32,
     _cap: u32,
 ) -> ApiResult<()> {
-    // Cheap upper bound — model max context is enforced downstream
-    // by the runtime (block_tables). We refuse wildly-large prompts
-    // here so we never load the worker for a request that will fail.
-    const SOFT_MAX_PROMPT: usize = 200_000;
-    if prompt_len > SOFT_MAX_PROMPT {
+    // The runtime's KV cache holds `RVLLM_NUM_BLOCKS * block_size`
+    // token slots; anything beyond that fails inside the worker
+    // with an opaque allocation error. We derive the limit from
+    // the same env vars the runtime reads so HTTP admission stays
+    // in lockstep with actual capacity. Previously a hard 262_144
+    // ceiling let through requests up to 256k tokens that the
+    // default RVLLM_NUM_BLOCKS=1024 (= 32k slots) couldn't service.
+    const BLOCK_SIZE: u32 = 32;
+    let num_blocks: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024);
+    let kv_capacity_tokens = num_blocks as u64 * BLOCK_SIZE as u64;
+    if prompt_len as u64 + max_new as u64 > kv_capacity_tokens {
         return Err(ApiError::invalid_param(
-            format!("prompt is {prompt_len} tokens — soft limit is {SOFT_MAX_PROMPT}"),
-            "messages",
-            "prompt_too_large",
-        ));
-    }
-    if prompt_len as u64 + max_new as u64 > 262_144 {
-        return Err(ApiError::invalid_param(
-            "prompt + max_tokens exceeds model max context (256k)",
+            format!(
+                "prompt + max_tokens ({} + {}) exceeds runtime KV capacity \
+                 of {} tokens (RVLLM_NUM_BLOCKS={} × block_size={}). \
+                 Either shorten the prompt, lower max_tokens, or raise \
+                 RVLLM_NUM_BLOCKS in the server profile.",
+                prompt_len, max_new, kv_capacity_tokens, num_blocks, BLOCK_SIZE
+            ),
             "max_tokens",
-            "context_too_large",
+            "context_exceeds_kv_capacity",
         ));
     }
     Ok(())

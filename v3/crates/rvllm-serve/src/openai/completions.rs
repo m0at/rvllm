@@ -31,6 +31,15 @@ pub struct CompletionRequest {
     pub logprobs: Option<u32>,
     pub echo: Option<bool>,
     pub suffix: Option<String>,
+
+    // OpenAI sampling-shaping params we don't honour. Captured here
+    // so the completions handler rejects them with a clear 400
+    // instead of silently dropping (mirrors the chat handler's
+    // reject_v1_unsupported_chat — Codex4-4).
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub response_format: Option<serde_json::Value>,
+    pub stream_options: Option<serde_json::Value>,
 }
 
 impl Default for CompletionRequest {
@@ -50,6 +59,10 @@ impl Default for CompletionRequest {
             logprobs: None,
             echo: None,
             suffix: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            response_format: None,
+            stream_options: None,
         }
     }
 }

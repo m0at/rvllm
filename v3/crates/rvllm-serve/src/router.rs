@@ -72,6 +72,12 @@ pub fn build_router(state: AppState) -> Router {
         // SDK's `client.responses.create(...)` users get a clear
         // server-side message pointing them at `/v1/chat/completions`
         // instead of a generic "endpoint not found".
+        //
+        // The 501 is intentional, not a bug. Test suites that probe
+        // OpenAI compat will see `/v1/responses` as not-implemented;
+        // responses-API support is its own project (~500 LOC) and
+        // out of scope for this server's current feature set.
+        // Mark Responses-API tests as skipped or expected-501.
         .route("/v1/responses", post(responses_unsupported))
         .layer(trace)
         .with_state(state)

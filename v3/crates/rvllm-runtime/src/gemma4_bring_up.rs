@@ -2491,6 +2491,18 @@ impl Gemma4Bringup {
         // GPU and starving subsequent requests. Pass `None` from
         // bench / probe binaries that have no cancellation source.
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        // Optional per-token emission callback. Called from the
+        // worker thread immediately after each token (prefill's
+        // first token + every decode-loop token, in order) is
+        // produced. Returning `false` is interpreted as "stop the
+        // stream" — the decode loop breaks. Default `None` keeps
+        // the legacy "all tokens returned at end" semantics so
+        // bench / probe / ppl callers are unaffected. The HTTP
+        // worker plumbs in a closure that does
+        // `events_tx.blocking_send(GenerateEvent::Token { ... })`
+        // for true tokenwise SSE delivery and to feed the handler-
+        // side stop-string detector incrementally.
+        mut on_token: Option<&mut dyn FnMut(u32) -> bool>,
     ) -> Result<Vec<u32>> {
         // Cycle 37 P2 (codex audit): max_new=0 used to underflow at
         // `0..max_new - 1`. Caller (handlers.rs::resolve_max_new) already
@@ -3977,8 +3989,18 @@ impl Gemma4Bringup {
             prompt_ids.len(), prefill_ms, prefill_ms);
 
         let mut output_ids: Vec<u32> = Vec::with_capacity(max_new);
-        output_ids.push(host_tok[0] as u32);
-        if eos_ids.contains(&(host_tok[0] as u32)) {
+        let first_tok = host_tok[0] as u32;
+        output_ids.push(first_tok);
+        // Per-token emission for true streaming. The callback runs
+        // synchronously on the worker thread; if it returns false
+        // (channel closed / client disconnected), we treat that as
+        // a cancel signal and return the partial output.
+        if let Some(cb) = on_token.as_mut() {
+            if !cb(first_tok) {
+                return Ok(output_ids);
+            }
+        }
+        if eos_ids.contains(&first_tok) {
             return Ok(output_ids);
         }
 
@@ -4401,6 +4423,15 @@ impl Gemma4Bringup {
             }
             let next_id = host_tok[0] as u32;
             output_ids.push(next_id);
+            // True-streaming hook: emit each token to the worker's
+            // event channel before checking EOS / repetition guards.
+            // A `false` return means the consumer is gone (closed
+            // channel) — treat as cancel and stop decoding.
+            if let Some(cb) = on_token.as_mut() {
+                if !cb(next_id) {
+                    break;
+                }
+            }
             if eos_ids.contains(&next_id) { break; }
             // Cycle 33 fix (codex bug #5): tool-call close `<tool_call|>`
             // (token 49) was not a generation stop. After a valid tool

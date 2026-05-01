@@ -26,10 +26,10 @@ pub struct ServerConfig {
     /// admission returns 429. The worker pulls one request out of the
     /// queue and processes it on its dedicated thread, so the channel
     /// buffer is sized as `max_queue_depth - 1` (queued slots) + 1
-    /// in-flight = `max_queue_depth` total. `1` permits exactly two
-    /// concurrent requests (one queued + one in-flight) because
-    /// `mpsc::channel(0)` is invalid; set `2` for the same effective
-    /// behaviour with cleaner semantics.
+    /// in-flight = `max_queue_depth` total. Minimum 2 (validate()
+    /// rejects 1 because mpsc::channel(0) is invalid and the
+    /// resulting clamp would silently admit 2 against a doc-promised
+    /// "strictly serial" semantics).
     pub max_queue_depth: usize,
     /// Hard upper bound on `max_tokens` a request may ask for. Prevents
     /// a single client from pinning the worker.
@@ -68,6 +68,15 @@ impl ServerConfig {
             return Err(ConfigError::ModelDirMissing(self.model_dir.clone()));
         }
         if self.max_queue_depth == 0 {
+            return Err(ConfigError::InvalidQueueDepth);
+        }
+        if self.max_queue_depth < 2 {
+            // depth=1 admits 2 concurrent requests (one in-flight on
+            // the worker thread + one in the channel buffer, because
+            // `mpsc::channel(0)` is invalid). The doc says
+            // "1 = strictly serial" but the actual semantics need
+            // depth >= 2 to honour the count exactly. Refuse depth=1
+            // at validate() so admission control matches the doc.
             return Err(ConfigError::InvalidQueueDepth);
         }
         if self.max_new_tokens_cap == 0 {

@@ -161,7 +161,8 @@ fn run() -> Result<(), String> {
         let output_ids = unsafe {
             g4.run_generate(fn_embed, fn_argmax, &prompt_with_bos, max_new as usize, &eos_ids, false,
                 rvllm_runtime::gemma4_bring_up::SamplingConfig::greedy(),
-                None /* no cancellation source in bench */)
+                None /* no cancellation source in bench */,
+                None /* no per-token streaming sink in bench */)
         }.map_err(|e| format!("gemma4 generate: {e}"))?;
 
         let elapsed = t_gen.elapsed();
