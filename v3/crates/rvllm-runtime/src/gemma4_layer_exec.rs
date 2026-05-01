@@ -3236,11 +3236,43 @@ unsafe fn unrotate_attn_out_v_if_enabled(
     let rotate_v = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
         .unwrap_or(false);
     if !rotate_v { return Ok(()); }
-    let kernel = match kernels.hadamard_unrotate_f16 {
-        Some(k) => k,
-        None => return Ok(()),
-    };
-    if scratch.hadamard_signs_k == 0 { return Ok(()); }
+    // V was rotated by R inside the rope kernel; the O-projection
+    // expects unrotated `P·V`. If the unrotate kernel or sign
+    // vector are missing here, returning Ok(()) silently leaves
+    // attn_out as `P·V·R` and the rest of the layer math is
+    // mathematically wrong without any crash or log — the worst
+    // class of failure. Fail HARD when V rotation is requested
+    // but the companion can't run; the operator must either drop
+    // RVLLM_NVFP4_HADAMARD_V or rebuild the kernels module.
+    let kernel = kernels.hadamard_unrotate_f16.ok_or_else(|| {
+        rvllm_core::RvllmError::Config {
+            err: rvllm_core::ConfigError::InvalidField {
+                name: "RVLLM_NVFP4_HADAMARD_V",
+                reason:
+                    "V rotation is enabled but `hadamard_unrotate_f16` kernel \
+                     is missing from the loaded PTX module. attn_out would \
+                     stay rotated as P·V·R and the O-projection would see \
+                     wrong values silently. Rebuild kernels/ or unset \
+                     RVLLM_NVFP4_HADAMARD_V."
+                    .into(),
+            },
+            field: "RVLLM_NVFP4_HADAMARD_V",
+        }
+    })?;
+    if scratch.hadamard_signs_k == 0 {
+        return Err(rvllm_core::RvllmError::Config {
+            err: rvllm_core::ConfigError::InvalidField {
+                name: "RVLLM_NVFP4_HADAMARD_V",
+                reason:
+                    "V rotation is enabled but the per-layer sign vector \
+                     `hadamard_signs_k` is null. The unrotate kernel needs \
+                     the same signs the rope kernel used to rotate V; \
+                     proceeding without them leaves attn_out as P·V·R."
+                    .into(),
+            },
+            field: "RVLLM_NVFP4_HADAMARD_V",
+        });
+    }
     let mut x = scratch.attn_out;
     let mut signs = scratch.hadamard_signs_k;
     let mut nt = dims.num_tokens as i32;

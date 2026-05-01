@@ -739,10 +739,36 @@ pub fn bf16_native_qkv_fast_path_enabled() -> bool {
 ///   `RVLLM_PER_TOKEN_Q_SCALE=0`.
 /// * For the NVFP4-KV path the rope launcher gates separately and
 ///   defaults OFF; operator opts in via `RVLLM_PER_TOKEN_Q_SCALE=1`.
-/// The asymmetry is intentional but the parsing must agree, otherwise a
-/// profile typo silently changes Q dequant behavior on one path only.
+///
+/// **Hadamard auto-implies per-token Q-scale.** When
+/// `RVLLM_NVFP4_HADAMARD=1` is set, the rotated Q saturates the static
+/// scalar Q-scale (rotation amax shifts so the fixed scalar can no
+/// longer cover the post-rotation range). The rope kernel comment
+/// pins this requirement explicitly. The two env vars used to be
+/// independent — operators who set `HADAMARD=1` without
+/// `PER_TOKEN_Q_SCALE=1` would silently get saturated Q values and
+/// numerically wrong attention. We now force per-token Q-scale ON
+/// whenever Hadamard is requested, with a one-shot warn so the
+/// operator sees the auto-enable in journalctl. An explicit
+/// `RVLLM_PER_TOKEN_Q_SCALE=0` together with `HADAMARD=1` is treated
+/// as a contradiction the operator clearly meant by accident — the
+/// auto-enable wins, but the warn line names it.
 pub(crate) fn per_token_q_scale_enabled(default_on: bool) -> bool {
-    parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(default_on)
+    static HADAMARD_OVERRIDE_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let raw = parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(default_on);
+    let hadamard = parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(false);
+    if hadamard && !raw {
+        HADAMARD_OVERRIDE_WARNED.get_or_init(|| {
+            tracing::warn!(
+                "RVLLM_NVFP4_HADAMARD=1 requires per-token Q-scale to keep \
+                 rotated Q below the static-scalar saturation threshold; \
+                 auto-enabling RVLLM_PER_TOKEN_Q_SCALE for this process \
+                 (set both to 1 explicitly to silence this warning)"
+            );
+        });
+        return true;
+    }
+    raw
 }
 
 /// Generate a deterministic ±1 sign byte from
@@ -865,6 +891,41 @@ pub struct NvFp4ShadowAlloc {
     pub shadow_q_throwaway_ptr: u64,
 }
 // === END NVFP4 SHADOW DIAGNOSTIC ===
+
+/// Defensive presence check used by `Gemma4Bringup::layer_kernels`.
+///
+/// `Gemma4LayerKernels` is a per-bringup struct shared across both
+/// sliding and global layers, so it can hold only one symbol per
+/// kernel slot. The current loader instantiates two `Fa2PtxKernels`
+/// (one per attention backend) from the SAME NVFP4 RoPE PTX source,
+/// so the symbols are functionally identical even though the raw
+/// `KernelFn` pointers differ (two `cuModuleLoad` calls produce two
+/// distinct handles into the same code). What matters structurally
+/// is presence symmetry: if sliding has the kernel loaded but
+/// global doesn't (or vice versa), pulling from `sliding_attention`
+/// here would silently feed sliding's RoPE into global layers, or
+/// global's `None` would mask a partial-build problem. We panic
+/// loudly on the asymmetric case so a partial PTX rebuild surfaces
+/// here instead of as wrong attention 60 layers later. Pointer
+/// equality is NOT asserted because it's not the property the
+/// downstream code relies on.
+#[cfg(feature = "cuda")]
+fn assert_rope_kernels_match(
+    label: &'static str,
+    sliding: Option<rvllm_kernels::KernelFn>,
+    global: Option<rvllm_kernels::KernelFn>,
+) {
+    match (sliding.is_some(), global.is_some()) {
+        (true, true) | (false, false) => {}
+        _ => panic!(
+            "{label}: sliding/global Fa2PtxKernels disagree on whether \
+             this NVFP4 RoPE kernel is loaded (sliding={}, global={}). \
+             Symptomatic of a partial PTX build; rebuild kernels/.",
+            sliding.is_some(),
+            global.is_some(),
+        ),
+    }
+}
 
 impl Gemma4Bringup {
     pub fn load(paths: Gemma4EnginePaths, arena_bytes: usize) -> Result<Self> {
@@ -1265,6 +1326,17 @@ impl Gemma4Bringup {
         // Bench path KV dtype: env-driven via RVLLM_NVFP4_KV /
         // RVLLM_F16_KV (NVFP4-branch addition). FP8 remains the
         // pre-NVFP4 default.
+        //
+        // TODO(hybrid-kv-bench): `run_bench` allocates and dispatches
+        // with one uniform kv_dtype, while live `run_generate` uses
+        // `KvDtype::for_layer_index_or_env(...)` so per-layer hybrids
+        // like `RVLLM_NVFP4_HYBRID_GLOBAL_FP8` and `RVLLM_FP8_KV_LAYERS`
+        // take effect. As a result the bench path cannot validate
+        // those exact production configs — perf numbers come from a
+        // simpler dispatch than what the running server uses. Plumbing
+        // per-layer dtype through bench requires per-layer scratch
+        // sizing and is bigger than this round's scope; documented as
+        // a known asymmetry for now.
         let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
         // aa01001pftrope0 cliff-fix (F-series): sliding layers need
         // `slot_mapping[t] < sliding_blocks * block_size` at every rope
@@ -1799,6 +1871,13 @@ impl Gemma4Bringup {
         )?;
 
         let f16_only = std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1");
+        // TODO(hybrid-kv-ppl): same asymmetry as run_bench (see
+        // its TODO marker). `run_ppl` uses one uniform kv_dtype so
+        // per-layer hybrids like RVLLM_NVFP4_HYBRID_GLOBAL_FP8 and
+        // RVLLM_FP8_KV_LAYERS are not validated by the perplexity
+        // path. Production-side `run_generate` does honour them via
+        // KvDtype::for_layer_index_or_env. Plumbing per-layer dtype
+        // through ppl requires per-layer scratch sizing.
         let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(f16_only);
         let kv_bytes_per_elem_log: u32 = match kv_dtype {
             crate::gemma4_layer_exec::KvDtype::F16 => 2,
@@ -4398,21 +4477,55 @@ impl Gemma4Bringup {
     }
 
     pub fn layer_kernels(&self) -> Gemma4LayerKernels {
+        // (helper defined just above) — see assert_rope_kernels_match
         // NVFP4 RoPE kernel handle — `None` on branches without the
         // NVFP4 PTX built into $KERNELS_DIR. Lives on Fa2PtxKernels
         // so the module lifetime outlives the fn handle; extracting
         // via `match` here instead of a helper method to avoid
         // enlarging the AttentionBackend API for a single field.
+        //
+        // Sliding and global attention each own their own
+        // Fa2PtxKernels; both currently load the SAME PTX file for
+        // RoPE (`fused_rope_partial_nvfp4kv.ptx`) so the function
+        // pointers are identical. We pull from `sliding_attention`
+        // to feed `Gemma4LayerKernels` (struct is per-bringup, not
+        // per-layer) and assert symmetry at runtime so any future
+        // refactor that loads different RoPE modules for global vs
+        // sliding fails LOUDLY here instead of silently feeding
+        // sliding's RoPE into global layers (or vice versa).
         #[cfg(feature = "cuda")]
-        let fused_rope_partial_nvfp4kv = match &self.sliding_attention {
-            rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv,
-            _ => None,
+        let fused_rope_partial_nvfp4kv = {
+            let sliding = match &self.sliding_attention {
+                rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv,
+                _ => None,
+            };
+            let global = match &self.global_attention {
+                rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv,
+                _ => None,
+            };
+            assert_rope_kernels_match(
+                "fn_rope_nvfp4kv",
+                sliding,
+                global,
+            );
+            sliding
         };
-        // Cycle 55 step 8 (Phase B): bf16-input sibling.
         #[cfg(feature = "cuda")]
-        let fused_rope_partial_nvfp4kv_bf16in = match &self.sliding_attention {
-            rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv_bf16in,
-            _ => None,
+        let fused_rope_partial_nvfp4kv_bf16in = {
+            let sliding = match &self.sliding_attention {
+                rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv_bf16in,
+                _ => None,
+            };
+            let global = match &self.global_attention {
+                rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv_bf16in,
+                _ => None,
+            };
+            assert_rope_kernels_match(
+                "fn_rope_nvfp4kv_bf16in",
+                sliding,
+                global,
+            );
+            sliding
         };
         #[cfg(not(feature = "cuda"))]
         let fused_rope_partial_nvfp4kv = None;
