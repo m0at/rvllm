@@ -249,10 +249,14 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
     // tile_start stays 0, tile_end is the full range.
     int tile_start = 0;
     int tile_end   = (max_seq_prefix_len + tile_size - 1) / tile_size;
-    if (window_size_left > 0) {
+    // Codex24-1: gate is `>= 0` (was `> 0`) — `< 0` is the only "no
+    // window" sentinel matching decode + NVFP4 unified prefill;
+    // window=0 means only-current. Also fix off-by-one: window covers
+    // [q_abs - W, q_abs] inclusive (W+1 tokens), not `q_abs - W + 1`.
+    if (window_size_left >= 0) {
         const int qpos_lo = q_block_local * block_q;
         const int qpos_hi = min(q_block_qpos_hi, query_len - 1);
-        const int first_allowed = prefix_len + qpos_lo - window_size_left + 1;
+        const int first_allowed = prefix_len + qpos_lo - window_size_left;
         const int last_allowed  = prefix_len + qpos_hi;
         int ts = first_allowed / tile_size;
         if (first_allowed < 0) ts = 0;
@@ -408,8 +412,10 @@ __global__ void flash_attention_2_prefill_fp8kv_unified_kernel(
             const int kv_pos = tile_base + t;
             const bool valid_row = (q_pos_in_seq < query_len) && (q_head < num_heads);
             const bool causal = kv_pos <= query_abs;
+            // Codex24-1: `< 0` is "no window" sentinel; window covers
+            // [q_abs - W, q_abs] inclusive (delta <= W, not <).
             const bool sliding_ok =
-                (window_size_left <= 0) || ((query_abs - kv_pos) < window_size_left);
+                (window_size_left < 0) || ((query_abs - kv_pos) <= window_size_left);
             const bool valid = valid_row && causal && sliding_ok
                 && (kv_pos < max_seq_prefix_len);
             return valid ? dot : -FLT_MAX;

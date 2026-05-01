@@ -239,6 +239,27 @@ impl UnifiedPrefillParams {
                 field: "num_queries_per_kv",
             });
         }
+        // Codex24-2: kernel maps `q_head = kv_head*ratio + (m % ratio)`
+        // with `m` in `0..UNIFIED_PREFILL_BLOCK_M-1` (=0..15). For
+        // ratio > BLOCK_M, query heads `BLOCK_M..ratio-1` within each
+        // kv-group never get written — silent corruption. Gemma 4 sits
+        // at ratio=4 so this is theoretical for production, but
+        // extreme-GQA / MQA checkpoints exist and the launcher
+        // boundary must enforce the invariant. A larger BLOCK_M kernel
+        // variant would be a separate change; until then, reject.
+        if self.num_queries_per_kv > UNIFIED_PREFILL_BLOCK_M {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.num_queries_per_kv",
+                    reason:
+                        "num_queries_per_kv must be <= UNIFIED_PREFILL_BLOCK_M (16); \
+                         a larger ratio would leave query heads BLOCK_M..ratio-1 \
+                         unwritten in the kernel's per-row mapping"
+                        .into(),
+                },
+                field: "num_queries_per_kv",
+            });
+        }
         if self.tile_size == 0 {
             return Err(rvllm_core::RvllmError::Config {
                 err: rvllm_core::ConfigError::InvalidField {
