@@ -1335,13 +1335,13 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let window_size_left  = params.window_size_left;
             let partition_size_i  = partition_size as i32;
             let max_parts_i       = max_num_partitions as i32;
-            // Codex41-2 / Codex42-1 / Codex46-1: BC=32 base, GQA-shared,
-            // and bf16-out BC=32 kernels all accept partition_offset.
-            // BC=16 (head_dim>256) variants stay on the legacy "launch
-            // all" shape — Gemma 4 global layers (head_dim=512) don't
-            // run sliding-window so partition_offset is always 0 there
-            // anyway, and the kernel surface for changing them is
-            // larger than the workload justifies.
+            // Codex41-2 / Codex42-1 / Codex46-1 / Codex49-2: all four
+            // NVFP4 split kernels (BC=32 f16-out + BC=32 bf16-out +
+            // BC=16 f16-out + BC=16 bf16-out) plus the GQA-shared
+            // BC=32 variant accept partition_offset. The host gate
+            // therefore no longer restricts on head_dim or output
+            // dtype; the only remaining requirement is the sentinel-
+            // init kernel.
             //
             // Codex44-1: the offset path REQUIRES the sentinel-init
             // kernel — without it, partitions [0, partition_offset)
@@ -1354,8 +1354,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             // (offset=0, full grid.z) when the init kernel isn't
             // present — costs wasted CTAs on partial PTX builds but
             // keeps results correct.
-            let split_supports_offset = hd <= 256
-                && fa2.fn_init_split_scratch_sentinels.is_some();
+            let split_supports_offset = fa2.fn_init_split_scratch_sentinels.is_some();
             let part_off_i: i32 = if split_supports_offset {
                 partition_offset as i32
             } else {

@@ -436,11 +436,16 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_bc16_bf16out_kernel(
     int max_blocks_per_seq,
     int window_size_left,
     int partition_size,
-    int max_num_partitions
+    int max_num_partitions,
+    // Codex49-2: BC=16 bf16-out path mirrors the BC=32 / BC=16
+    // f16-out partition_offset contract for future hd>256 +
+    // sliding-window models. Pass 0 for the legacy "launch every
+    // partition" behaviour.
+    int partition_offset
 ) {
     const int seq_idx      = blockIdx.x;
     const int head_idx     = blockIdx.y;
-    const int partition_id = blockIdx.z;
+    const int partition_id = blockIdx.z + partition_offset;
     const int tid          = threadIdx.x;
 
     const int context_len = context_lens[seq_idx];

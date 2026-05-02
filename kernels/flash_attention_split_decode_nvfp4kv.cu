@@ -755,11 +755,17 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_bc16_kernel(
     int max_blocks_per_seq,
     int window_size_left,
     int partition_size,
-    int max_num_partitions
+    int max_num_partitions,
+    // Codex49-2: BC=16 path now mirrors the BC=32 / GQA-shared
+    // partition_offset contract. Future hd>256 + sliding-window
+    // models would otherwise always launch the full partition
+    // grid; Gemma 4 globals (hd=512 + window_size_left=-1) keep
+    // offset=0, so this is dead-code-only on the current target.
+    int partition_offset
 ) {
     const int seq_idx      = blockIdx.x;
     const int head_idx     = blockIdx.y;
-    const int partition_id = blockIdx.z;
+    const int partition_id = blockIdx.z + partition_offset;
     const int tid          = threadIdx.x;
 
     const int context_len = context_lens[seq_idx];
