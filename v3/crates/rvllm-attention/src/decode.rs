@@ -1416,13 +1416,25 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             };
             // Pre-fill sentinels for partitions before the launched
             // window when we actually skipped any.
+            // Codex43-1: scratch is laid out [S, num_heads, P, D] with
+            // stride `num_heads` regardless of which split kernel runs
+            // (GQA-shared still writes per-q-head slots via
+            //  `kv_head*GQA + q`). The init kernel takes the row
+            // stride as its `num_heads` param, so we MUST pass the
+            // real `params.num_heads` here — passing `launch_y`
+            // (= num_kv_heads in the GQA-shared case) would index
+            // with the wrong stride AND skip the per-q slots
+            // `[num_kv_heads, num_heads)`, leaving them unin-
+            // itialised. The reducer iterates all per-q heads and
+            // would then read stale floats for every pre-window
+            // partition — silent garbage tokens.
             if split_supports_offset && part_off_i > 0 {
                 if let Some(init_fn) = fa2.fn_init_split_scratch_sentinels {
                     let mut a_t = d_tmp_out;
                     let mut a_m = d_max_logits;
                     let mut a_e = d_exp_sums;
                     let nseq = params.num_seqs as i32;
-                    let nh = launch_y as i32;
+                    let init_nh = params.num_heads as i32;
                     let p_lo: i32 = 0;
                     let p_hi: i32 = part_off_i;
                     let init_args: [*mut core::ffi::c_void; 9] = [
@@ -1430,7 +1442,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                         &mut a_m as *mut _ as *mut _,
                         &mut a_e as *mut _ as *mut _,
                         &nseq             as *const _ as *mut _,
-                        &nh               as *const _ as *mut _,
+                        &init_nh          as *const _ as *mut _,
                         &max_parts_i      as *const _ as *mut _,
                         &head_dim         as *const _ as *mut _,
                         &p_lo             as *const _ as *mut _,
@@ -1439,7 +1451,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                     let rc_init = cuLaunchKernel(
                         init_fn.raw() as CUfunction,
                         params.num_seqs as u32,
-                        launch_y,
+                        params.num_heads,
                         part_off_i as u32,
                         FA2_THREADS as u32,
                         1, 1,
