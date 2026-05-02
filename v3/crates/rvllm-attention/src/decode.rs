@@ -1040,6 +1040,15 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         workspace_ptr: u64,
         partition_size: u32,
         max_num_partitions: u32,
+        // Codex35-2: how many partitions actually need to run for the
+        // current request's context length. `max_num_partitions` is
+        // the bucket-derived upper bound used for scratch indexing
+        // (and for the reduce kernel's stride); launching that many
+        // CTAs at decode time is wasteful when the live context only
+        // fills a few partitions. Pass the actual count so gridDim.z
+        // matches the work; `0` is treated as "use max" for callers
+        // that haven't been migrated.
+        current_num_partitions: u32,
         // When `true`, dispatch the bf16-output split kernel pair
         // (`fn_decode_nvfp4kv_split{,_bc16}_bf16out` + the bf16
         // reducer). When `false`, the original f16-output pair runs.
@@ -1323,11 +1332,19 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 &max_parts_i        as *const _ as *mut _,
             ];
 
+            // Codex35-2: launch only the partitions the live context
+            // actually needs. When the caller passes 0, fall back to
+            // max (preserves old behavior for un-migrated paths).
+            let launch_z = if current_num_partitions == 0 {
+                max_num_partitions
+            } else {
+                current_num_partitions.min(max_num_partitions).max(1)
+            };
             let rc = cuLaunchKernel(
                 split_fn.raw() as CUfunction,
                 params.num_seqs as u32,
                 params.num_heads as u32,
-                max_num_partitions,
+                launch_z,
                 FA2_THREADS as u32,
                 1,
                 1,

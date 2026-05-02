@@ -156,7 +156,15 @@ __global__ void flash_attention_2_decode_nvfp4kv_bf16out_kernel(
     const int tid      = threadIdx.x;
 
     const int context_len = context_lens[seq_idx];
-    if (context_len == 0) return;
+    if (context_len == 0) {
+        // Codex35-3: zero padded-slot output so stale attn_out
+        // doesn't bleed into the bf16 O-proj input.
+        const int out_base = (seq_idx * num_heads + head_idx) * head_dim;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            output[out_base + d] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
 
     const int kv_head_idx = (num_kv_heads == num_heads)
         ? head_idx
@@ -400,7 +408,14 @@ __global__ void flash_attention_2_decode_nvfp4kv_bc16_bf16out_kernel(
     const int head_idx = blockIdx.y;
     const int tid      = threadIdx.x;
     const int context_len = context_lens[seq_idx];
-    if (context_len == 0) return;
+    if (context_len == 0) {
+        // Codex35-3: zero padded-slot output (bf16 BC=16 twin).
+        const int out_base = (seq_idx * num_heads + head_idx) * head_dim;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            output[out_base + d] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
     const int kv_head_idx = (num_kv_heads == num_heads)
         ? head_idx
         : (head_idx / (num_heads / num_kv_heads));

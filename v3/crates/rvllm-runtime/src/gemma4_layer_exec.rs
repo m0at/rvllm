@@ -8,24 +8,31 @@
 //!   - Partial RoPE (only rotate first rotary_dim dims per head)
 //!   - Per-layer KV head count (sliding vs global)
 //!   - head_dim = 256 (requires FA3 .so compiled for 256)
-//!   - Per-layer learnable scalar (applied ONCE after both sub-blocks)
+//!   - Per-layer learnable scalar (folded into the post-attn and
+//!     post-FF FusedNormAddResidual kernels — Codex35-4 corrects
+//!     the older "applied ONCE after both sub-blocks" comment)
 //!
-//! Launch sequence:
-//!   1.  fused_rmsnorm_fp8_quant          input_layernorm
+//! Launch sequence (current sm_121 / Gemma 4 path):
+//!   1.  fused_rmsnorm_fp8_quant         input_layernorm
 //!   2.  fp8_gemm (cuBLASLt)             Q||K||V projection
 //!  2b.  vnorm_f16                       parameter-free RMS norm on V
 //!   3.  fused_qk_rmsnorm                QK-norm on Q and K heads
-//!   4.  fused_rope_partial_fp8kv        partial RoPE + FP8 Q + paged KV
-//!   5.  paged_decode / paged_prefill    FA3 attention (head_dim=256)
+//!   4.  fused_rope_partial_*kv          partial RoPE + (FP8 | NVFP4) KV
+//!   5.  paged_decode / unified_prefill  FA2-PTX attention (head_dim 256/512)
 //!   6.  quantize_fp8_per_token          attn_out -> fp8
-//!   7.  fp8_gemm_residual (cuBLASLt)    O proj += residual
-//!   8.  fused_rmsnorm                   post_attention_layernorm (norm only)
+//!   7.  fp8_gemm                        O proj
+//!   8.  fused_norm_add_residual{,_f16}  post_attn_norm + residual + layer_scalar
 //!   9.  fused_rmsnorm_fp8_quant         pre_feedforward_layernorm
 //!  10.  fp8_gemm (cuBLASLt)             gate||up projection
-//!  11.  fused_gelu_mul_fp8_quant        GELU(tanh)(gate) * up -> FP8
-//!  12.  fp8_gemm_residual (cuBLASLt)    down proj += residual
-//!  13.  fused_rmsnorm                   post_feedforward_layernorm (norm only)
-//!  14.  residual_scale_f16              residual *= layer_scalar (once)
+//!  11.  fused_gelu_mul_*                GELU(tanh)(gate) * up
+//!  12.  fp8_gemm                        down proj
+//!  13.  fused_norm_add_residual{,_f16}  post_ff_norm + residual + layer_scalar
+//!
+//! Steps 8 and 13 fold the per-layer scalar into the residual write —
+//! every down-proj branch (awq / fp8_gemv fast path / fp8 / f16) MUST
+//! call the matching FusedNormAddResidual* afterwards or the FFN block
+//! (and its layer_scalar) silently drops. Codex35-1 closed the f16
+//! branch which had been missing this epilog.
 
 use rvllm_core::Result;
 use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan};
@@ -1591,6 +1598,9 @@ pub unsafe fn gemma4_forward_phase(
                             scratch.fa3_workspace,
                             partition_size_u32,
                             max_num_parts,
+                            // Codex35-2: launch only as many partition
+                            // CTAs as the current context needs.
+                            current_num_parts,
                             // output_bf16: today's path always emits
                             // f16 attention output; cycle 55 bf16
                             // wiring will flip this when the bf16-out
@@ -2564,6 +2574,18 @@ pub unsafe fn gemma4_forward_phase(
             dims.hidden as i32,
             dims.intermediate as i32,
             stream,
+        )?;
+        // Codex35-1: post-FF residual epilog. Earlier this branch
+        // dropped through without writing the FFN output back to the
+        // residual stream — the down_f16 path silently ate the entire
+        // FFN block (and its layer_scalar). Mirrors the awq / fp8
+        // branches above and below.
+        gemma4_launcher::FusedNormAddResidualF16InLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(
+            norm_add_residual_f16in_kernel, scratch.gemm_f32_tmp,
+            weights.post_ff_norm_gamma, residual,
+            weights.layer_scalar_ptr, stream,
         )?;
     } else if let (true, Some(fn_gemv)) = (
         weights.down_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
