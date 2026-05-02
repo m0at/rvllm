@@ -1613,13 +1613,26 @@ pub unsafe fn gemma4_forward_phase(
                             scratch.fa3_workspace,
                             partition_size_u32,
                             max_num_parts,
-                            // Codex35-2: launch only as many partition
-                            // CTAs as the current context needs.
                             current_num_parts,
-                            // output_bf16: today's path always emits
-                            // f16 attention output; cycle 55 bf16
-                            // wiring will flip this when the bf16-out
-                            // attn-out scratch is plumbed through.
+                            // Codex41-2: for sliding layers we know
+                            // partitions before window_start are
+                            // entirely masked. Skip launching them
+                            // and pre-fill sentinels for the slots
+                            // the reducer still reads. Global layers
+                            // use offset=0 (full ctx attended).
+                            {
+                                let is_sliding = dims.layer_type
+                                    == rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention;
+                                if is_sliding && dims.sliding_window > 0 {
+                                    let q_abs = current_ctx.saturating_sub(1);
+                                    let window_start = q_abs.saturating_sub(
+                                        dims.sliding_window.saturating_sub(1),
+                                    );
+                                    (window_start / partition_size_u32).min(current_num_parts.saturating_sub(1))
+                                } else {
+                                    0
+                                }
+                            },
                             false,
                             stream,
                         )?;

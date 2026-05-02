@@ -85,6 +85,48 @@ __device__ __forceinline__ float fp8kv_decode_byte(unsigned char b) {
 #endif
 }
 
+// Codex41-2: partition_offset support for sliding-window split-decode.
+//
+// Sliding layers attend only the last `sliding_window` KV positions, so
+// partitions before `window_start` write sentinels and produce no
+// output. Earlier the launcher launched ALL `current_num_parts` CTAs
+// per (seq, head) and let early-out write sentinels. With long context
+// + small partition_size that's a real CTA-overhead tax (e.g. 60-4=56
+// wasted CTAs × 50 sliding layers per token).
+//
+// Fix: launcher pre-runs `init_split_scratch_sentinels_kernel` over the
+// pre-window partition range to seed the reducer-visible sentinel slots
+// (max_logits=-INF, exp_sums=0, tmp_out=0); the main split kernel then
+// launches only `parts_to_run` CTAs and uses `partition_offset` to map
+// blockIdx.z back to the absolute partition index for scratch indexing
+// and KV-slice computation.
+extern "C"
+__global__ void init_split_scratch_sentinels_kernel(
+    float* __restrict__ tmp_out,
+    float* __restrict__ max_logits,
+    float* __restrict__ exp_sums,
+    int num_seqs,
+    int num_heads,
+    int max_num_partitions,
+    int head_dim,
+    int partition_lo,    // inclusive
+    int partition_hi     // exclusive
+) {
+    const int seq  = blockIdx.x;
+    const int head = blockIdx.y;
+    const int p    = blockIdx.z + partition_lo;
+    if (seq >= num_seqs || head >= num_heads || p >= partition_hi) return;
+    const int sidx = (seq * num_heads + head) * max_num_partitions + p;
+    const int trow = sidx * head_dim;
+    if (threadIdx.x == 0) {
+        max_logits[sidx] = -FLT_MAX;
+        exp_sums  [sidx] = 0.0f;
+    }
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        tmp_out[trow + d] = 0.0f;
+    }
+}
+
 // Helper for empty-partition / all-masked-partition writes. CUDA
 // device lambdas need `--extended-lambda`; we don't pass it, so this
 // is a named function instead.
@@ -156,11 +198,16 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_kernel(
     int max_blocks_per_seq,
     int window_size_left,
     int partition_size,
-    int max_num_partitions
+    int max_num_partitions,
+    // Codex41-2: launcher pre-fills sentinels for partitions
+    // [0, partition_offset); CTAs we launch cover absolute
+    // partition_id = blockIdx.z + partition_offset. Pass 0 to keep
+    // the legacy "launch every partition" behaviour.
+    int partition_offset
 ) {
     const int seq_idx      = blockIdx.x;
     const int head_idx     = blockIdx.y;
-    const int partition_id = blockIdx.z;
+    const int partition_id = blockIdx.z + partition_offset;
     const int tid          = threadIdx.x;
 
     const int context_len = context_lens[seq_idx];

@@ -1055,6 +1055,13 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         // matches the work; `0` is treated as "use max" for callers
         // that haven't been migrated.
         current_num_partitions: u32,
+        // Codex41-2: starting partition index. >0 for sliding layers
+        // with long context — partitions [0, partition_offset) are
+        // entirely outside the sliding window and would only write
+        // sentinels. The caller pre-fills those sentinel slots via
+        // `init_split_scratch_sentinels_kernel` (the runtime calls
+        // it for us when this is >0). 0 = legacy "launch all".
+        partition_offset: u32,
         // When `true`, dispatch the bf16-output split kernel pair
         // (`fn_decode_nvfp4kv_split{,_bc16}_bf16out` + the bf16
         // reducer). When `false`, the original f16-output pair runs.
@@ -1328,6 +1335,18 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let window_size_left  = params.window_size_left;
             let partition_size_i  = partition_size as i32;
             let max_parts_i       = max_num_partitions as i32;
+            // Codex41-2: only the BC=32 base split kernel currently
+            // accepts a partition_offset arg. Other split variants
+            // (BC=16 / GQA-shared) keep the legacy "every partition
+            // launches" shape, so we force partition_offset=0 for
+            // them. Pre-init runs only when the kernel can consume
+            // the offset AND the runtime asks for offset > 0.
+            let split_supports_offset = !want_gqa_shared && hd <= 256;
+            let part_off_i: i32 = if split_supports_offset {
+                partition_offset as i32
+            } else {
+                0
+            };
 
             // --- Phase 1: split kernel ---
             let mut a_tmp   = d_tmp_out;
@@ -1345,7 +1364,11 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let mut a_cl    = context_lens;
             let mut a_qd    = q_descale_ptr;
 
-            let split_args: [*mut core::ffi::c_void; 21] = [
+            // Codex41-2: BC=32 split kernel takes 22 args (with
+            // partition_offset trailing); BC=16 and GQA stay at 21.
+            // Use a flat Vec to keep both shapes in one place; the
+            // launch-arg pointer just sees a contiguous array.
+            let mut split_argv: Vec<*mut core::ffi::c_void> = vec![
                 &mut a_tmp  as *mut _ as *mut _,
                 &mut a_maxl as *mut _ as *mut _,
                 &mut a_esum as *mut _ as *mut _,
@@ -1354,9 +1377,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 &mut a_vp   as *mut _ as *mut _,
                 &mut a_ks   as *mut _ as *mut _,
                 &mut a_vs   as *mut _ as *mut _,
-                // === DYNAMIC NVFP4 Q SCALE ===
                 &mut a_qsc  as *mut _ as *mut _,
-                // === END DYNAMIC NVFP4 Q SCALE ===
                 &mut a_bt   as *mut _ as *mut _,
                 &mut a_cl   as *mut _ as *mut _,
                 &mut a_qd   as *mut _ as *mut _,
@@ -1370,23 +1391,79 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 &partition_size_i   as *const _ as *mut _,
                 &max_parts_i        as *const _ as *mut _,
             ];
+            if split_supports_offset {
+                split_argv.push(&part_off_i as *const _ as *mut _);
+            }
 
-            // Codex35-2: launch only the partitions the live context
-            // actually needs. When the caller passes 0, fall back to
-            // max (preserves old behavior for un-migrated paths).
-            let launch_z = if current_num_partitions == 0 {
+            // Codex35-2 / Codex41-2: launch only the in-window
+            // partitions. With partition_offset > 0 the kernel writes
+            // its absolute partition slot via blockIdx.z+offset. We
+            // pre-fill sentinels for [0, partition_offset) below so
+            // the reducer's per-partition isfinite()-check ignores
+            // them.
+            let total_parts = if current_num_partitions == 0 {
                 max_num_partitions
             } else {
                 current_num_partitions.min(max_num_partitions).max(1)
             };
+            let launch_z = total_parts.saturating_sub(part_off_i as u32).max(1);
             // Codex36-3: GQA-shared variant collapses gridDim.y from
-            // num_heads to num_kv_heads — one CTA handles every q-head
-            // in the kv-group.
+            // num_heads to num_kv_heads.
             let launch_y = if want_gqa_shared && fa2.fn_decode_nvfp4kv_split_gqa.is_some() {
                 params.num_kv_heads as u32
             } else {
                 params.num_heads as u32
             };
+            // Pre-fill sentinels for partitions before the launched
+            // window when we actually skipped any.
+            if split_supports_offset && part_off_i > 0 {
+                if let Some(init_fn) = fa2.fn_init_split_scratch_sentinels {
+                    let mut a_t = d_tmp_out;
+                    let mut a_m = d_max_logits;
+                    let mut a_e = d_exp_sums;
+                    let nseq = params.num_seqs as i32;
+                    let nh = launch_y as i32;
+                    let p_lo: i32 = 0;
+                    let p_hi: i32 = part_off_i;
+                    let init_args: [*mut core::ffi::c_void; 9] = [
+                        &mut a_t as *mut _ as *mut _,
+                        &mut a_m as *mut _ as *mut _,
+                        &mut a_e as *mut _ as *mut _,
+                        &nseq             as *const _ as *mut _,
+                        &nh               as *const _ as *mut _,
+                        &max_parts_i      as *const _ as *mut _,
+                        &head_dim         as *const _ as *mut _,
+                        &p_lo             as *const _ as *mut _,
+                        &p_hi             as *const _ as *mut _,
+                    ];
+                    let rc_init = cuLaunchKernel(
+                        init_fn.raw() as CUfunction,
+                        params.num_seqs as u32,
+                        launch_y,
+                        part_off_i as u32,
+                        FA2_THREADS as u32,
+                        1, 1,
+                        0,
+                        stream as CUstream,
+                        init_args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc_init != CUresult::CUDA_SUCCESS {
+                        return Err(RvllmError::Attention {
+                            err: AttentionError::KernelLaunchFailed {
+                                cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                            },
+                            ctx: AttnCtx {
+                                op: "init_split_scratch_sentinels",
+                                stream,
+                                num_seqs: params.num_seqs,
+                                head_dim: params.head_dim,
+                            },
+                            bt: std::backtrace::Backtrace::capture(),
+                        });
+                    }
+                }
+            }
             let rc = cuLaunchKernel(
                 split_fn.raw() as CUfunction,
                 params.num_seqs as u32,
@@ -1397,7 +1474,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 1,
                 split_smem as u32,
                 stream as CUstream,
-                split_args.as_ptr() as *mut *mut core::ffi::c_void,
+                split_argv.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
             if rc != CUresult::CUDA_SUCCESS {

@@ -445,6 +445,12 @@ pub struct Fa2PtxKernels {
     /// via kv_policy_matrix.sh.
     #[cfg(feature = "cuda")]
     pub fn_decode_nvfp4kv_split_gqa: Option<rvllm_kernels::KernelFn>,
+    /// Codex41-2: pre-fills sentinel slots [0, partition_offset) so
+    /// the main split kernel can launch only the in-window CTAs.
+    /// Lives in the same `flash_attention_split_decode_nvfp4kv` PTX
+    /// module as the BC=32 split kernel itself.
+    #[cfg(feature = "cuda")]
+    pub fn_init_split_scratch_sentinels: Option<rvllm_kernels::KernelFn>,
     /// `paged_attention_reduce_f16_kernel` — combines partial outputs.
     /// Head-dtype-agnostic (f16 in / out). Shared by FP8 split path
     /// when that's added.
@@ -628,6 +634,7 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_split_bc16,
                 fn_paged_attn_reduce_f16,
                 fn_decode_nvfp4kv_split_gqa,
+                fn_init_split_scratch_sentinels,
             ) = match loader.load_ptx("flash_attention_split_decode_nvfp4kv") {
                 Ok(m) => {
                     let s32 = m.get_function(
@@ -636,14 +643,16 @@ impl Fa2PtxKernels {
                         "flash_attention_2_decode_nvfp4kv_split_bc16_kernel").ok();
                     let r   = m.get_function(
                         "paged_attention_reduce_f16_kernel").ok();
-                    // Codex36-3: GQA-shared variant. `.ok()` so PTX
-                    // trees predating it still load (env-gate at
-                    // dispatch time keeps default-off behavior).
                     let gqa = m.get_function(
                         "flash_attention_2_decode_nvfp4kv_split_gqa_kernel").ok();
-                    (Some(m), s32, s16, r, gqa)
+                    // Codex41-2: sentinel-init kernel. `.ok()` keeps
+                    // older PTX trees loadable; the launcher detects
+                    // None and falls back to launching all partitions.
+                    let init = m.get_function(
+                        "init_split_scratch_sentinels_kernel").ok();
+                    (Some(m), s32, s16, r, gqa, init)
                 }
-                Err(_) => (None, None, None, None, None),
+                Err(_) => (None, None, None, None, None, None),
             };
 
             Ok(Self {
@@ -688,6 +697,7 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_split_bc16,
                 fn_paged_attn_reduce_f16,
                 fn_decode_nvfp4kv_split_gqa,
+                fn_init_split_scratch_sentinels,
             })
         }
         #[cfg(not(feature = "cuda"))]
