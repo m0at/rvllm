@@ -105,9 +105,21 @@ pub fn decode_graph_eligible_for_generation(
     max_new: u32,
     partition_size: u32,
     capture_decode_step: u32,
+    split_kv_active: bool,
 ) -> bool {
     if partition_size == 0 {
         return false;
+    }
+    // Codex37-3: the parts-count drift check only matters when split-KV
+    // is actually used. With split-KV disabled (env=0, FP8/F16 KV, no
+    // split kernels loaded, or unsuitable layer mix), gridDim.z stays
+    // at 1 and the live `context_lens` read by the reducer can't read
+    // stale slots — capture is safe regardless of partition crossings.
+    // Earlier this function refused capture across partition boundaries
+    // unconditionally, costing decode-graph perf with no correctness
+    // gain.
+    if !split_kv_active {
+        return true;
     }
     let capture_ctx = prompt_len
         .saturating_add(capture_decode_step)
@@ -125,13 +137,13 @@ mod decode_graph_eligibility_tests {
     #[test]
     fn short_prompt_short_generation_eligible() {
         // Capture at ctx=2, end at ctx=33, partition=256 → both <= 256.
-        assert!(decode_graph_eligible_for_generation(0, 33, 256, 1));
+        assert!(decode_graph_eligible_for_generation(0, 33, 256, 1, true));
     }
 
     #[test]
     fn long_prompt_inside_one_partition_eligible() {
         // prompt_len=200, max_new=40, partition=256 → end_ctx=240 ≤ 256.
-        assert!(decode_graph_eligible_for_generation(200, 40, 256, 1));
+        assert!(decode_graph_eligible_for_generation(200, 40, 256, 1, true));
     }
 
     #[test]
@@ -139,14 +151,14 @@ mod decode_graph_eligibility_tests {
         // prompt_len=200, max_new=200, end_ctx=400 → 400/256=2 parts,
         // capture_ctx=202 → 1 part. Capture would freeze single-CTA
         // path; replay the second half wrongly. Block capture.
-        assert!(!decode_graph_eligible_for_generation(200, 200, 256, 1));
+        assert!(!decode_graph_eligible_for_generation(200, 200, 256, 1, true));
     }
 
     #[test]
     fn long_prompt_already_past_boundary_eligible() {
         // prompt_len=2000, max_new=40 — capture_ctx and end_ctx both
         // produce 8 partitions, so the split-path decision is stable.
-        assert!(decode_graph_eligible_for_generation(2000, 40, 256, 1));
+        assert!(decode_graph_eligible_for_generation(2000, 40, 256, 1, true));
     }
 
     #[test]
@@ -159,14 +171,23 @@ mod decode_graph_eligibility_tests {
         // prompt_len=2000, max_new=300, partition=256
         //   capture_ctx = 2002 → 8 parts
         //   end_ctx     = 2300 → 9 parts
-        assert!(!decode_graph_eligible_for_generation(2000, 300, 256, 1));
+        assert!(!decode_graph_eligible_for_generation(2000, 300, 256, 1, true));
+    }
+
+    #[test]
+    fn crossing_boundary_eligible_when_split_inactive() {
+        // Codex37-3 regression test: when split-KV is OFF, gridDim.z
+        // stays at 1 and the parts-count drift can't cause stale-slot
+        // reads. The same shape that Codex36-1 rejects (capture=8,
+        // end=9) is therefore safe to capture with split_kv_active=false.
+        assert!(decode_graph_eligible_for_generation(2000, 300, 256, 1, false));
     }
 
     #[test]
     fn zero_partition_size_blocks() {
         // Defensive: a misconfigured partition_size of 0 must not
         // panic via div_ceil; the eligibility just becomes false.
-        assert!(!decode_graph_eligible_for_generation(100, 100, 0, 1));
+        assert!(!decode_graph_eligible_for_generation(100, 100, 0, 1, true));
     }
 
     /// Regression: the eligibility check used to default to 256 while
@@ -180,7 +201,7 @@ mod decode_graph_eligibility_tests {
         let p = effective_partition_size();
         assert_eq!(p, 1024, "shared default drifted away from dispatch site");
         assert!(
-            !decode_graph_eligible_for_generation(900, 200, p, 1),
+            !decode_graph_eligible_for_generation(900, 200, p, 1, true),
             "default-config 900+200 should cross the 1024 partition boundary",
         );
     }
@@ -196,10 +217,12 @@ mod decode_graph_eligibility_tests {
     fn capture_at_shifts_eligibility_boundary() {
         // prompt_len=200, max_new=300, p=256, capture_at=1 →
         // capture_ctx=202 (parts=1), end_ctx=500 (parts=2) → blocked.
-        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 1));
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 1, true));
         // Same prompt+gen, capture_at=300 → capture_ctx=501
         // (parts=2), end_ctx=500 (parts=2) → eligible (both >1).
-        assert!(decode_graph_eligible_for_generation(200, 300, 256, 300));
+        // Same prompt+gen, capture_at=300 → capture_ctx=501 (parts=2),
+        // end_ctx=500 (parts=2) → eligible (both =2, equal).
+        assert!(decode_graph_eligible_for_generation(200, 300, 256, 300, true));
     }
 
     /// Lock down the env-var resolver: invalid (non-power-of-two,
@@ -4311,12 +4334,21 @@ impl Gemma4Bringup {
         // and the captured graph froze a single-CTA branch that
         // flipped to split-KV mid-generation.)
         let partition_size_for_graph = effective_partition_size();
+        // Codex37-3: only the split-KV path freezes a context-dependent
+        // gridDim.z into the captured graph. With split-KV disabled
+        // (env off, FP8/F16 KV) the parts-count drift can't poison
+        // the reducer, so we can capture across partition boundaries.
+        let split_kv_active_for_graph = parse_truthy_env("RVLLM_NVFP4_SPLIT_KV")
+            .unwrap_or(true)
+            && crate::gemma4_layer_exec::KvDtype::from_env(false)
+                == crate::gemma4_layer_exec::KvDtype::Nvfp4;
         let decode_graph_eligible = use_decode_graph
             && decode_graph_eligible_for_generation(
                 prompt_ids.len() as u32,
                 max_new as u32,
                 partition_size_for_graph,
                 decode_graph_capture_at as u32,
+                split_kv_active_for_graph,
             );
         if use_decode_graph && !decode_graph_eligible {
             tracing::warn!(

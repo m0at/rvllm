@@ -1544,11 +1544,28 @@ pub unsafe fn gemma4_forward_phase(
                     // path on short-context turns (each empty partition
                     // still launches a CTA, just writing sentinels).
                     // Fall back to bucket_ctx when caller didn't supply.
-                    let current_ctx = dims
+                    let current_ctx_full = dims
                         .current_max_context_len
                         .unwrap_or(bucket_ctx);
+                    // Codex37-1: sliding layers only attend the last
+                    // `sliding_window` tokens; any partition outside
+                    // that window is masked end-to-end and writes
+                    // sentinels only. Cap the partition-count
+                    // estimate at the sliding window for sliding
+                    // layers so split-KV is skipped once
+                    // ceil(window/partition_size) == 1, instead of
+                    // routing all 50 sliding layers through the
+                    // wasteful split path on long contexts.
+                    let effective_ctx = if dims.layer_type
+                        == rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+                        && dims.sliding_window > 0
+                    {
+                        current_ctx_full.min(dims.sliding_window)
+                    } else {
+                        current_ctx_full
+                    };
                     let current_num_parts =
-                        current_ctx.div_ceil(partition_size_u32).max(1);
+                        effective_ctx.div_ceil(partition_size_u32).max(1);
                     // Skip split path if: env gate off, split kernels
                     // missing, current ctx short enough that one CTA
                     // per (seq, head) fits comfortably, or workspace

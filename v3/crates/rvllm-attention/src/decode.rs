@@ -1187,9 +1187,21 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             // Default OFF until validated through kv_policy_matrix.sh.
             // Other paths (BC=16 / bf16-out) fall through to the
             // existing per-Q kernel regardless.
+            // Codex37-2: cap ratio at MAX_GQA_SPLIT (=8) — kernel
+            // returns early without writing sentinels for ratios
+            // larger than that, so the reduce phase would read
+            // uninitialised scratch. Gemma 4 ratio = 4, well within
+            // the cap, but the gate is generic.
+            const MAX_GQA_SPLIT: u32 = 8;
+            let gqa_ratio = if params.num_kv_heads > 0 {
+                params.num_heads / params.num_kv_heads
+            } else {
+                0
+            };
             let want_gqa_shared = !output_bf16
                 && hd <= 256
-                && params.num_heads > params.num_kv_heads
+                && gqa_ratio >= 2
+                && gqa_ratio <= MAX_GQA_SPLIT
                 && std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
                     .map(|v| v == "1" || v == "true" || v == "TRUE")
                     .unwrap_or(false);

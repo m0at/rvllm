@@ -433,14 +433,14 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_gqa_kernel(
     const int tid          = threadIdx.x;
 
     const int GQA = (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 0;
-    if (GQA <= 0 || GQA > MAX_GQA_SPLIT) return; // host should reject; defensive
-
-    const int context_len = context_lens[seq_idx];
 
     // Per-q scratch slots — write empty sentinels for each q on bail-out.
-    auto write_empties = [&]() {
-        for (int q = 0; q < GQA; ++q) {
-            int h = kv_head * GQA + q;
+    // `sweep_gqa` chooses the iteration bound: defensive paths walk all
+    // num_heads bound by the kv-group; the kernel happy path uses GQA
+    // (which is ≤ MAX_GQA_SPLIT once the host gate ran).
+    auto write_empties = [&](int sweep_gqa) {
+        for (int q = 0; q < sweep_gqa; ++q) {
+            int h = kv_head * sweep_gqa + q;
             if (h >= num_heads) break;
             int sidx = (seq_idx * num_heads + h) * max_num_partitions + partition_id;
             int trow = sidx * head_dim;
@@ -449,17 +449,30 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_gqa_kernel(
         }
     };
 
-    if (context_len == 0) { write_empties(); return; }
+    if (GQA <= 0 || GQA > MAX_GQA_SPLIT) {
+        // Codex37-2: defensive — host gate (decode.rs Codex37-2)
+        // already rejects ratios outside [2, MAX_GQA_SPLIT], so
+        // arriving here means a misuse. Earlier the kernel just
+        // `return`-ed and the reduce kernel read stale scratch slots.
+        // Now write sentinels for every q-head this CTA was supposed
+        // to cover so the reducer ignores them.
+        write_empties(GQA > 0 ? GQA : 1);
+        return;
+    }
+
+    const int context_len = context_lens[seq_idx];
+
+    if (context_len == 0) { write_empties(GQA); return; }
 
     const int part_start = partition_id * partition_size;
     const int part_end   = min(part_start + partition_size, context_len);
-    if (part_start >= context_len) { write_empties(); return; }
+    if (part_start >= context_len) { write_empties(GQA); return; }
 
     const int decode_q_abs_pos = context_len - 1;
     const int window_start = (window_size_left < 0)
         ? 0
         : max(0, decode_q_abs_pos - window_size_left);
-    if (part_end <= window_start) { write_empties(); return; }
+    if (part_end <= window_start) { write_empties(GQA); return; }
 
     // Smem layout: shared K/V tiles + per-q score rows + reduce scratch.
     extern __shared__ unsigned char smem_u8[];
