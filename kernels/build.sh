@@ -180,6 +180,12 @@ for arch in $ARCHS; do
         # exploded later. The patterns below mirror lib.rs's
         # load_ptx calls 1:1 plus the fused/util kernels every
         # gemma4 pass touches.
+        # Codex33-1 extends the list to cover the util/fused kernels
+        # gemma4 bring-up loads via KernelLoader::load_ptx (see
+        # gemma4_bring_up.rs:4911 and below). Each one will fail at
+        # bring-up if its PTX is missing; build.sh now treats that
+        # as a build error instead of silently shipping a partial
+        # manifest.
         case "$1" in
             flash_attention|\
             flash_attention_2_decode_*|flash_attention_2_prefill_*|\
@@ -189,7 +195,12 @@ for arch in $ARCHS; do
             flash_attention_split_decode_nvfp4kv_*|\
             paged_attention_v2_reduce_*|\
             fused_rope_partial_fp8kv*|fused_rope_partial_nvfp4kv*|fused_rope_cache_fp8kv*|\
-            fused_rmsnorm_*|fused_qk_rmsnorm*|fused_gelu_mul_fp8*|\
+            fused_rmsnorm_*|fused_qk_rmsnorm*|fused_qkv_rmsnorm*|\
+            fused_gelu_mul_fp8*|fused_gelu_mul_f16*|fused_gelu_mul_bf16*|\
+            fused_norm_add_residual|fused_norm_add_residual_f16|fused_norm_add_residual_bf16|\
+            fp8_gemv|fp8_gemv_*|\
+            logit_softcap|hadamard_unrotate_f16|\
+            scale_cols_f16|scale_cols_f32|scale_rows_f32_ratio|\
             argmax|rmsnorm_inplace_*|residual_scale_f16|vnorm_f16|\
             vector_add_*|f32_to_*|f16_to_*|bf16_to_*) return 0 ;;
             *) return 1 ;;

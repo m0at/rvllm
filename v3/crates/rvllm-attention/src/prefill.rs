@@ -349,6 +349,29 @@ impl UnifiedPrefillParams {
                 field: "block_q",
             });
         }
+        // Codex33-2: continuous batching for unified prefill is not
+        // covered by the test harness — the grid mapping
+        // `q_block_global = cu_seqlens_q[i] / block_q + i` produces
+        // intentional gap-CTAs that early-return for num_seqs > 1,
+        // and that branch is currently un-validated end-to-end.
+        // Today's caller always passes num_seqs == 1 (gemma4_bring_up
+        // sets cu_seq=[0, chunk_q]); reject anything else at the
+        // boundary so a future caller can't silently drift onto
+        // the untested path. Remove this guard once the harness
+        // lands a num_seqs>1 cell.
+        if params.num_seqs > 1 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "PagedPrefillParams.num_seqs",
+                    reason:
+                        "unified prefill with num_seqs > 1 is not exercised by the test \
+                         harness; the kernel's q_block_global gap-CTA mapping is unverified \
+                         for continuous batching. Run prefill per-sequence or land coverage \
+                         before removing this guard".into(),
+                },
+                field: "num_seqs",
+            });
+        }
         Ok(())
     }
 }

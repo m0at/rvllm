@@ -704,13 +704,17 @@ impl CutlassBackend {
     /// Construct a backend per device `CompileTarget`. `path` and
     /// `policy_variants` are only consulted for the `So` path — when
     /// the live device is sm_121 we skip `.so` loading entirely.
-    /// On sm_121 we first look for a sm_120 `libcutlass_sm120.so`.
-    /// The file is resolved in this order:
+    /// On sm_121 we look for the matching `libcutlass_sm120.so` in
+    /// the runtime arch's directory (Codex27-1 tightened earlier
+    /// sm_120/sm_122 fallbacks to a single arch). The file is
+    /// resolved in this order:
     ///   1. env `RVLLM_CUTLASS_SM120_SO` (absolute path).
-    ///   2. `<path.parent()>/sm_120/libcutlass_sm120.so` — the layout
-    ///      produced by `kernels/build_cutlass_sm120_so.sh`, which
-    ///      makes "kernels_dir" a natural resolution root for
-    ///      `probe-gemma4-load` / `rvllm-server`.
+    ///   2. `<path.parent().parent()>/sm_121/libcutlass_sm120.so`
+    ///      — the layout produced by `kernels/build_cutlass_sm120_so.sh`
+    ///      (auto-detect picks `sm_121a` on GB10 hosts so the .so
+    ///      lands in `kernels/sm_121/`). Operators on RTX 5090 /
+    ///      RTX 6000 Blackwell (sm_120) or sm_122 use the env override
+    ///      since the resolver is locked to sm_121 here.
     /// If neither is present, fall through to `Absent` — previous
     /// behaviour, so a host without the library built keeps working
     /// via the PTX fallback.
