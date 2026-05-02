@@ -5,10 +5,18 @@
 //   Each CTA runs standard FA2 decode over its partition's KV slice
 //   `[p*P, (p+1)*P)`, tile size FA2_BC. After the softmax-over-
 //   partition, it stores into scratch:
-//     tmp_out    [S, H, P, D]  f16 — per-partition attention output,
+//     tmp_out    [S, H, P, D]  f32 — per-partition attention output,
 //                                    DIVIDED by the partition's own
 //                                    `exp_sum` (this is the invariant
-//                                    the reduce relies on).
+//                                    the reduce relies on). Was f16
+//                                    until codex cycle21; widened to
+//                                    f32 to avoid the f16 round-trip
+//                                    precision loss between phase-1
+//                                    normalize and phase-2 combine.
+//                                    Workspace is sized accordingly
+//                                    in v3/crates/rvllm-attention/
+//                                    src/decode.rs (`tmp_bytes =
+//                                    slots * head_dim * 4`). Codex45-4.
 //     max_logits [S, H, P]     f32
 //     exp_sums   [S, H, P]     f32
 //   Empty / fully-sliding-masked partitions write sentinels

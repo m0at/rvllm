@@ -4406,9 +4406,33 @@ impl Gemma4Bringup {
             crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(lt, li, false)
                 == crate::gemma4_layer_exec::KvDtype::Nvfp4
         });
+        // Codex45-1: also mirror the runtime workspace gate at
+        // gemma4_layer_exec.rs:1578 (`ws_need <= fa3_workspace_bytes`).
+        // If the worst-case split scratch can't fit in the live FA3
+        // workspace, the runtime path will never dispatch the split
+        // kernel — the parts-boundary check would then refuse graph
+        // capture for nothing. Compute the same `ws_need` formula the
+        // dispatch site uses, against the upper-bound bucket context
+        // (max_blocks_per_seq * block_size) and the worst-case
+        // head_dim across layer types.
+        let max_num_parts_for_graph: u64 = ((max_blocks_per_seq as u64) * (block_size as u64))
+            .div_ceil(partition_size_for_graph.max(1) as u64)
+            .max(1);
+        let max_hd_for_graph: u64 = arch
+            .head_dim_sliding
+            .max(arch.head_dim_global) as u64;
+        let split_slots: u64 = 1u64 // num_seqs in run_generate
+            * (arch.num_attention_heads as u64)
+            * max_num_parts_for_graph;
+        // tmp_out f32 (codex cycle21 widening) + max_logits f32 + exp_sums f32.
+        let split_ws_need: u64 = split_slots * max_hd_for_graph * 4
+            + split_slots * 4 * 2;
+        const FA3_WS_BYTES_FOR_GRAPH: u64 = 128 * 1024 * 1024;
+        let workspace_can_fit_split = split_ws_need <= FA3_WS_BYTES_FOR_GRAPH;
         let split_kv_active_for_graph = parse_truthy_env("RVLLM_NVFP4_SPLIT_KV")
             .unwrap_or(true)
             && any_layer_nvfp4
+            && workspace_can_fit_split
             && (split_decode_for_graph.has_split_kernels(arch.head_dim_sliding as u32, false)
                 || global_split_decode_for_graph
                     .has_split_kernels(arch.head_dim_global as u32, false));
