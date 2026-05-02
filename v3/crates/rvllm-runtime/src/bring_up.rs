@@ -173,19 +173,30 @@ impl Bringup {
 
         // 5. Policy + CUTLASS .so (resolve every variant referenced in
         //    the policy).
-        let policy_bytes = std::fs::read(&paths.policy_json).map_err(|source| RvllmError::Io {
-            err: rvllm_core::IoError::from(&source),
-            path: paths.policy_json.clone(),
-            source,
-        })?;
-        let policy: Policy = serde_json::from_slice(&policy_bytes).map_err(|e| {
-            RvllmError::config(
-                ConfigError::Inconsistent {
-                    reasons: vec![format!("policy.json parse: {e}")],
-                },
-                "policy.json",
-            )
-        })?;
+        // Codex30-2: on sm_121 the CUTLASS backend lands on SoSm120 /
+        // Absent — neither path consumes policy.json. Skip the load so
+        // a generic sm_121 startup doesn't crash on a missing /
+        // /dev/null policy.json. Mirrors the sm_121 documentation in
+        // crates/rvllm-bench/src/main.rs (RVLLM_POLICY ignored).
+        let is_sm121 = matches!(target, Some(rvllm_core::CompileTarget::Sm121));
+        let policy: Policy = if is_sm121 {
+            Policy::default()
+        } else {
+            let policy_bytes = std::fs::read(&paths.policy_json)
+                .map_err(|source| RvllmError::Io {
+                    err: rvllm_core::IoError::from(&source),
+                    path: paths.policy_json.clone(),
+                    source,
+                })?;
+            serde_json::from_slice(&policy_bytes).map_err(|e| {
+                RvllmError::config(
+                    ConfigError::Inconsistent {
+                        reasons: vec![format!("policy.json parse: {e}")],
+                    },
+                    "policy.json",
+                )
+            })?
+        };
         // Pre-resolve a generous universe of variants so a bench sweep
         // can try any of them without re-bringup. If a symbol is
         // missing from the .so the load path returns typed err — that's

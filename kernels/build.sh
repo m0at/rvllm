@@ -158,15 +158,46 @@ for arch in $ARCHS; do
     # cutlass_*) legitimately don't build in every environment, but
     # we DO delete the stale .ptx on failure so the manifest cannot
     # pick up an old artifact and pretend the new source compiled.
+    #
+    # Codex30-3: distinguish required vs optional. The pre-fix script
+    # treated every kernel as best-effort, so a partial sm_121 build
+    # could succeed at script level but ship a manifest missing
+    # FA2/NVFP4/fused_* — runtime later failed as
+    # FeatureNotAvailable / LaunchFailed without pointing at the
+    # missing PTX. The required-list below is conservative: anything
+    # FA2-decode/prefill, NVFP4 rope/decode/prefill, fused_*,
+    # rope_partial_fp8kv, rmsnorm/qk_rmsnorm/argmax — drop one and
+    # the engine refuses to start. fa3_sm90_* and cutlass_* stay
+    # opt-in.
+    is_required_kernel() {
+        case "$1" in
+            flash_attention_2_decode_*|flash_attention_2_prefill_*|\
+            flash_attention_decode_nvfp4kv_*|flash_attention_split_decode_nvfp4kv_*|\
+            flash_attention_unified_prefill_*|\
+            flash_attention_nvfp4kv_*|flash_attention_unified_prefill_nvfp4kv_*|\
+            fused_rope_partial_fp8kv*|fused_rope_partial_nvfp4kv*|fused_rope_cache_fp8kv*|\
+            fused_rmsnorm_*|fused_qk_rmsnorm*|fused_gelu_mul_fp8*|\
+            argmax|rmsnorm_inplace_*|residual_scale_f16|vnorm_f16|\
+            vector_add_*|f32_to_*|f16_to_*|bf16_to_*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    REQUIRED_FAILURES=0
+    record_failure() {
+        local label="$1" base="$2" ptx="$3"
+        echo "  WARNING: $label$base.cu failed for $arch — removing stale PTX (was: $ptx)" >&2
+        rm -f "$ptx"
+        if is_required_kernel "$base"; then
+            echo "  REQUIRED kernel $base failed — manifest would be incomplete" >&2
+            REQUIRED_FAILURES=$((REQUIRED_FAILURES + 1))
+        fi
+    }
     for cu in "$DIR"/*.cu; do
         [ -f "$cu" ] || continue
         base=$(basename "$cu" .cu)
         ptx="$OUTDIR/${base}.ptx"
         echo "  $base.cu -> $arch/$base.ptx"
-        compile_kernel "$cu" "$arch" "$ptx" || {
-            echo "  WARNING: $base.cu failed for $arch — removing stale PTX (was: $ptx)" >&2
-            rm -f "$ptx"
-        }
+        compile_kernel "$cu" "$arch" "$ptx" || record_failure "" "$base" "$ptx"
     done
 
     if [ -d "$V3_KERNELS_DIR" ]; then
@@ -175,11 +206,13 @@ for arch in $ARCHS; do
             base=$(basename "$cu" .cu)
             ptx="$OUTDIR/${base}.ptx"
             echo "  (v3) $base.cu -> $arch/$base.ptx"
-            compile_kernel "$cu" "$arch" "$ptx" || {
-                echo "  WARNING: v3/$base.cu failed for $arch — removing stale PTX (was: $ptx)" >&2
-                rm -f "$ptx"
-            }
+            compile_kernel "$cu" "$arch" "$ptx" || record_failure "v3/" "$base" "$ptx"
         done
+    fi
+
+    if [ "$REQUIRED_FAILURES" -gt 0 ]; then
+        echo "  ERROR: $REQUIRED_FAILURES required kernel(s) failed for $arch — refusing to publish manifest" >&2
+        exit 1
     fi
 
     "$DIR/gen_manifest.sh" "$OUTDIR" "$REVISION" || {
