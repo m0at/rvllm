@@ -307,9 +307,9 @@
       "sha256": "c552368211e2f0f9a65f166626ef8193266ac4605b8698cc62d43eb74a38e605"
     },
     "scale_rows_f32_ratio": {
-      "bytes": 1431,
+      "bytes": 1573,
       "path": "scale_rows_f32_ratio.ptx",
-      "sha256": "a36004d41b697e6e4b4369ed2fa0685828317dec254d61bc0b934037b01153fd"
+      "sha256": "a9a6f1907c0be8f1ed0d08cf958d626f21dc20b2004d912c31b7e1f35aa12c11"
     },
     "vector_add_bf16_to_f16": {
       "bytes": 1430,
@@ -327,5 +327,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "2be83cb"
+  "revision": "a5370d0"
 }
