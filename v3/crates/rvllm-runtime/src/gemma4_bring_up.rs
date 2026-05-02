@@ -393,6 +393,10 @@ pub struct Gemma4FusedModules {
     /// flips f16 → bf16.
     pub fn_qk_rmsnorm_bf16: KernelFn,
     pub fn_softcap: KernelFn,
+    /// Codex40-2: f32 variant for the generate-path logit softcap.
+    /// generate samples directly from f32 logits (no f16 conversion);
+    /// PPL/bench convert through f16 and use `fn_softcap`.
+    pub fn_softcap_f32: KernelFn,
     pub fn_residual_scale: KernelFn,
     pub fn_vnorm: KernelFn,
     pub fn_vector_add: KernelFn,
@@ -1871,6 +1875,7 @@ impl Gemma4Bringup {
                     mlp_out_fp8: mlp_out_fp8.device_ptr(),
                     mlp_out_scale: mlp_out_scale.device_ptr(),
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
+                    gemm_f32_tmp_bytes: (num_seqs * gemm_f32_max_n * 4) as usize,
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
@@ -2384,6 +2389,7 @@ impl Gemma4Bringup {
                     mlp_out_fp8: mlp_out_fp8.device_ptr(),
                     mlp_out_scale: mlp_out_scale.device_ptr(),
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
+                    gemm_f32_tmp_bytes: (num_seqs * gemm_f32_max_n * 4) as usize,
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
@@ -3563,6 +3569,9 @@ impl Gemma4Bringup {
                     gate_up_scale: gate_up_scale.device_ptr(),
                     mlp_out_fp8: mlp_out_fp8.device_ptr(), mlp_out_scale: mlp_out_scale.device_ptr(),
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
+                    // Codex40-3: run_generate alloc uses `max_tokens`,
+                    // not num_seqs.
+                    gemm_f32_tmp_bytes: (max_tokens * gemm_f32_max_n * 4) as usize,
                     cutlass_workspace: cutlass_ws.device_ptr(), cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
                     fa3_workspace_bytes: FA3_WS_BYTES as u64,
@@ -3987,6 +3996,9 @@ impl Gemma4Bringup {
                     gate_up_scale: gate_up_scale.device_ptr(),
                     mlp_out_fp8: mlp_out_fp8.device_ptr(), mlp_out_scale: mlp_out_scale.device_ptr(),
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
+                    // Codex40-3: run_generate alloc uses `max_tokens`,
+                    // not num_seqs.
+                    gemm_f32_tmp_bytes: (max_tokens * gemm_f32_max_n * 4) as usize,
                     cutlass_workspace: cutlass_ws.device_ptr(), cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
                     fa3_workspace_bytes: FA3_WS_BYTES as u64,
@@ -4156,6 +4168,20 @@ impl Gemma4Bringup {
         }
         self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
             logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
+        // Codex40-2: apply Gemma final logit softcap before bias /
+        // sampling. Bench + PPL paths apply this; generate previously
+        // skipped it so greedy/top-p decisions could flip on
+        // ungated large logits, and tool-call bias landed on
+        // pre-softcap values that don't match training-time
+        // distribution. f32 variant matches the f32 logits dtype.
+        if arch.logit_softcap > 0.0 {
+            rvllm_fused::gemma4_launcher::LogitSoftcapLaunch {
+                num_tokens: 1,
+                vocab,
+                cap: arch.logit_softcap,
+            }
+            .launch(self.fused.fn_softcap_f32, logits_f32.device_ptr(), stream)?;
+        }
         // === TOOL-CALL OPEN-TAG BIAS (cycle 14 pragmatic fix) ===
         // Cumulative quantization noise over 60 layers gives ~1.5 logit
         // units of consistent bias toward token 49 ("<tool_call|>",
@@ -5028,6 +5054,7 @@ fn load_gemma4_fused(
     let fn_qk_rmsnorm = qk_norm_mod.get_function("fused_qk_rmsnorm_kernel")?;
     let fn_qk_rmsnorm_bf16 = qk_norm_bf16_mod.get_function("fused_qk_rmsnorm_bf16_kernel")?;
     let fn_softcap = softcap_mod.get_function("logit_softcap_kernel")?;
+    let fn_softcap_f32 = softcap_mod.get_function("logit_softcap_f32_kernel")?;
     let fn_residual_scale = residual_scale_mod.get_function("residual_scale_f16_kernel")?;
     let fn_vnorm = vnorm_mod.get_function("vnorm_f16_kernel")?;
     let fn_vector_add = vector_add_mod.get_function("vector_add_f16_kernel")?;
@@ -5165,6 +5192,7 @@ fn load_gemma4_fused(
         fn_qk_rmsnorm,
         fn_qk_rmsnorm_bf16,
         fn_softcap,
+        fn_softcap_f32,
         fn_residual_scale,
         fn_vnorm,
         fn_vector_add,

@@ -559,6 +559,11 @@ pub struct Gemma4LayerScratch {
     pub mlp_out_fp8: u64,
     pub mlp_out_scale: u64,
     pub gemm_f32_tmp: u64,
+    /// Codex40-3: capacity of `gemm_f32_tmp` in bytes. Used by the
+    /// CUTLASS sm120 blockwise fastpath to refuse dispatch if its
+    /// SFA+SFB scale-prep regions wouldn't fit and fall through to
+    /// cuBLASLt instead of overlapping into adjacent scratch.
+    pub gemm_f32_tmp_bytes: usize,
     pub cutlass_workspace: u64,
     pub cutlass_workspace_bytes: usize,
     pub fa3_workspace: u64,
@@ -1335,6 +1340,7 @@ pub unsafe fn gemma4_forward_phase(
             scratch.hidden_scale, weights.qkv_chscale, weights.qkv_blockscale, weights.qkv_scale,
             dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
             scratch.gemm_f32_tmp,
+            scratch.gemm_f32_tmp_bytes,
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
             stream,
         )?;
@@ -2181,6 +2187,9 @@ pub unsafe fn gemma4_forward_phase(
             scratch.attn_out_scale, weights.o_chscale, weights.o_blockscale, weights.o_scale,
             dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
             scratch.gemm_f32_tmp + (dims.num_tokens * dims.hidden * 2) as u64,
+            // Codex40-3: tail of gemm_f32_tmp after the f16 staging.
+            scratch.gemm_f32_tmp_bytes
+                .saturating_sub((dims.num_tokens * dims.hidden * 2) as usize),
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
             stream,
         )?;
@@ -2450,6 +2459,7 @@ pub unsafe fn gemma4_forward_phase(
             scratch.hidden_scale, weights.gate_up_chscale, weights.gate_up_blockscale, weights.gate_up_scale,
             dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
             scratch.gemm_f32_tmp,
+            scratch.gemm_f32_tmp_bytes,
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
             stream,
         )?;
@@ -2667,6 +2677,9 @@ pub unsafe fn gemma4_forward_phase(
                 scratch.mlp_out_scale, weights.down_chscale, weights.down_blockscale, weights.down_scale,
                 dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
                 scratch.gemm_f32_tmp + (dims.num_tokens * dims.hidden * 2) as u64,
+                // Codex40-3: tail of gemm_f32_tmp after the f16 staging.
+                scratch.gemm_f32_tmp_bytes
+                    .saturating_sub((dims.num_tokens * dims.hidden * 2) as usize),
                 scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
                 stream,
             )?;
@@ -2794,6 +2807,7 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     n: i32,
     k: i32,
     scratch_f32: u64,
+    scratch_f32_bytes: usize,
     cutlass_workspace: u64,
     cutlass_workspace_bytes: usize,
     stream: u64,
@@ -2846,9 +2860,25 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
         if let CutlassBackend::SoSm120(lib) = cutlass {
             if lib.prep_sfa.is_some() && lib.prep_sfb.is_some() {
                 let sfa_bytes = lib.sfa_bytes(m, k);
-                let _sfb_bytes = lib.sfb_bytes(n, k);
+                let sfb_bytes = lib.sfb_bytes(n, k);
                 // 16-byte-align the SFB offset inside scratch_f32.
                 let sfa_aligned = (sfa_bytes + 15) & !15;
+                // Codex40-3: refuse the CUTLASS prep path if scratch_f32
+                // can't hold both SFA and SFB regions without overlap.
+                // Earlier the offsets were derived without checking
+                // scratch_f32_bytes — for current Gemma 4 shapes the
+                // gemm-scratch is large enough by accident, but a
+                // future shape/kernel change could overflow into the
+                // adjacent allocations silently. Falling through to
+                // cuBLASLt is a safe-but-slower outcome.
+                let need = sfa_aligned + sfb_bytes;
+                if need > scratch_f32_bytes {
+                    eprintln!(
+                        "[cutlass-sm120] scratch_f32 too small for prep \
+                         (need {need} bytes, have {scratch_f32_bytes}); \
+                         m={m} n={n} k={k} → falling back to cuBLASLt"
+                    );
+                } else {
                 let sfa_ptr = scratch_f32;
                 let sfb_ptr = scratch_f32 + sfa_aligned as u64;
                 lib.launch_prep_sfa(a_scale, sfa_ptr, m, k, stream)?;
@@ -2866,6 +2896,7 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
                     cutlass_workspace_bytes,
                     stream,
                 );
+                } // size-check else
             }
         }
     }
