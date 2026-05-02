@@ -401,13 +401,16 @@ pub fn resolve_paths(
     const MINIMAL_POLICY: &str =
         r#"{"revision":"serve-sm121","arch":"sm_121","variants":[],"entries":{}}"#;
 
-    // Codex31: detect sm_121 host so we can (a) point cutlass_so at the
-    // real `kernels_dir/sm_121/libcutlass_sm120.so` (lib_so.rs's resolver
-    // anchors at sm90_hint.parent().parent() — feeding it the literal
-    // "<unused-on-sm121>" placeholder breaks the search and silently
-    // falls to CutlassBackend::Absent), and (b) skip the minimal-policy
-    // placeholder write on read-only /tmp / restricted containers.
-    fn is_sm121_host() -> bool {
+    // Codex31/34: detect sm_121 host so we can (a) point cutlass_so at
+    // the real libcutlass_sm120.so (lib_so.rs's resolver anchors at
+    // sm90_hint.parent().parent() — placeholder breaks the search),
+    // and (b) skip the minimal-policy placeholder write on read-only
+    // /tmp / restricted containers. Two signals, OR'd: nvidia-smi
+    // (preferred — matches the runtime's actual device) and the
+    // kernels_dir layout (deterministic fallback for containers
+    // without nvidia-smi or whose first-line cap doesn't match the
+    // CUDA device). Either is sufficient.
+    fn is_sm121_via_nvidia_smi() -> bool {
         let out = std::process::Command::new("nvidia-smi")
             .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
             .output();
@@ -419,7 +422,17 @@ pub fn resolve_paths(
             _ => false,
         }
     }
-    let sm121 = is_sm121_host();
+    fn is_sm121_via_kernels_dir(p: &std::path::Path) -> bool {
+        // Codex34-3: kernels_dir already pointed at the per-arch
+        // sm_121 dir (allowed by Codex32-2) OR the kernels root has
+        // a sm_121/ subdir on disk. Either implies the operator
+        // expects sm_121.
+        if p.file_name().and_then(|s| s.to_str()) == Some("sm_121") {
+            return true;
+        }
+        p.join("sm_121").is_dir()
+    }
+    let sm121 = is_sm121_via_nvidia_smi() || is_sm121_via_kernels_dir(&kernels_dir);
 
     // Resolve the policy-json path. We never write into `kernels_dir`
     // here — that path can be a system-wide read-only location
@@ -487,7 +500,18 @@ pub fn resolve_paths(
     // hidden behind a string-shaped tripwire.
     let cutlass_so = cutlass_so.unwrap_or_else(|| {
         if sm121 {
-            kernels_dir.join("sm_121").join("libcutlass_sm120.so")
+            // Codex34-2: when the operator already pointed kernels_dir
+            // at the per-arch sm_121 subdir (Codex32-2 lets that work
+            // for resolve_kernels_dir), don't append sm_121 again —
+            // that would land at .../sm_121/sm_121/libcutlass_sm120.so
+            // and the resolver's parent().parent() walk would still
+            // land in the wrong dir, falling back to Absent.
+            let arch_dir = if kernels_dir.file_name().and_then(|s| s.to_str()) == Some("sm_121") {
+                kernels_dir.clone()
+            } else {
+                kernels_dir.join("sm_121")
+            };
+            arch_dir.join("libcutlass_sm120.so")
         } else {
             PathBuf::from(UNUSED)
         }

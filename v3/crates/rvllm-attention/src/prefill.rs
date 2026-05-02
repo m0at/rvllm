@@ -349,28 +349,31 @@ impl UnifiedPrefillParams {
                 field: "block_q",
             });
         }
-        // Codex33-2: continuous batching for unified prefill is not
-        // covered by the test harness — the grid mapping
+        // Codex34-1: continuous batching for unified prefill is not
+        // exercised by the test harness — the grid mapping
         // `q_block_global = cu_seqlens_q[i] / block_q + i` produces
         // intentional gap-CTAs that early-return for num_seqs > 1,
-        // and that branch is currently un-validated end-to-end.
-        // Today's caller always passes num_seqs == 1 (gemma4_bring_up
-        // sets cu_seq=[0, chunk_q]); reject anything else at the
-        // boundary so a future caller can't silently drift onto
-        // the untested path. Remove this guard once the harness
-        // lands a num_seqs>1 cell.
+        // and that branch is currently un-validated end-to-end. The
+        // earlier Codex33-2 reject was too strict: Gemma4Phase::Prefill
+        // propagates the scheduler's num_seqs straight through the
+        // public boundary, so a hard-fail here turned every batched
+        // prefill into a server 5xx instead of a slow fallback. Now
+        // emits a one-shot stderr warning and lets the launch
+        // proceed; the gemma4 caller still always passes num_seqs=1
+        // today (cu_seq=[0,chunk_q]), so this branch is normally
+        // silent. Remove once the harness lands a num_seqs>1 cell.
         if params.num_seqs > 1 {
-            return Err(rvllm_core::RvllmError::Config {
-                err: rvllm_core::ConfigError::InvalidField {
-                    name: "PagedPrefillParams.num_seqs",
-                    reason:
-                        "unified prefill with num_seqs > 1 is not exercised by the test \
-                         harness; the kernel's q_block_global gap-CTA mapping is unverified \
-                         for continuous batching. Run prefill per-sequence or land coverage \
-                         before removing this guard".into(),
-                },
-                field: "num_seqs",
-            });
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[prefill] WARN: unified prefill with num_seqs={} is not covered by \
+                     the test harness; running anyway. The kernel's q_block_global gap-CTA \
+                     mapping is unverified for continuous batching — watch for \
+                     wrong-attention regressions and land coverage before relying on it.",
+                    params.num_seqs
+                );
+            }
         }
         Ok(())
     }
