@@ -1441,33 +1441,34 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             // itialised. The reducer iterates all per-q heads and
             // would then read stale floats for every pre-window
             // partition — silent garbage tokens.
-            // Codex50-1: the reducer derives its iteration bound
-            // `num_partitions = ceil(context_len/p)` at runtime from
-            // device context_lens. If a future caller (or stale
-            // graph-replay state) lets context_lens imply more
-            // partitions than the host-passed `total_parts` covers,
-            // slots [total_parts, num_partitions) would be read
-            // uninitialised. Defend the launcher boundary by also
-            // sentinel-stamping the trailing range
-            // [total_parts, max_num_partitions). For the steady-
-            // state caller (host total_parts == ctx-derived
-            // num_partitions) this is a small extra cost
-            // proportional to (max_num_partitions - total_parts)
-            // — for long context that delta is 0.
-            let need_pre_init  = split_supports_offset && part_off_i > 0;
-            let need_post_init = split_supports_offset
-                && (total_parts as i32) < max_parts_i;
-            if (need_pre_init || need_post_init) && fa2.fn_init_split_scratch_sentinels.is_some() {
-                let init_fn = fa2.fn_init_split_scratch_sentinels.unwrap();
-                let launch_init = |p_lo: i32, p_hi: i32| -> Result<()> {
-                    if p_hi <= p_lo {
-                        return Ok(());
-                    }
+            // Codex52-1 (reverts Codex50-1's trailing range): only
+            // pre-window sentinels are required. The reducer iterates
+            // `p < num_partitions = ceil(ctx/p)` which is ALWAYS
+            // <= host-passed total_parts when the contract is
+            // honoured (caller computed total_parts from the same
+            // ctx the kernel reads via context_lens). Graph capture's
+            // parts_at_capture == parts_at_end check enforces this
+            // for replay; direct callers (bench, probe) compute
+            // current_num_parts from the same context_len they pass
+            // to the kernel, so divergence isn't reachable.
+            //
+            // Codex50-1 had added a defensive trailing-init covering
+            // [total_parts, max_num_partitions). At Gemma 4's
+            // max_blocks_per_seq=1024 / partition_size=1024 → max
+            // 32 partitions; short-to-mid ctx made the trailing
+            // launch dominate (24+ partitions × 64 heads × 50
+            // sliding layers = ~75K extra sentinel-CTAs/step) and
+            // defeated Codex35-2's "launch only current_num_parts"
+            // optimization. Reverted; the contract handles it.
+            if split_supports_offset && part_off_i > 0 {
+                if let Some(init_fn) = fa2.fn_init_split_scratch_sentinels {
                     let mut a_t = d_tmp_out;
                     let mut a_m = d_max_logits;
                     let mut a_e = d_exp_sums;
                     let nseq = params.num_seqs as i32;
                     let init_nh = params.num_heads as i32;
+                    let p_lo: i32 = 0;
+                    let p_hi: i32 = part_off_i;
                     let init_args: [*mut core::ffi::c_void; 9] = [
                         &mut a_t as *mut _ as *mut _,
                         &mut a_m as *mut _ as *mut _,
@@ -1483,7 +1484,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                         init_fn.raw() as CUfunction,
                         params.num_seqs as u32,
                         params.num_heads,
-                        (p_hi - p_lo) as u32,
+                        part_off_i as u32,
                         FA2_THREADS as u32,
                         1, 1,
                         0,
@@ -1505,13 +1506,6 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                             bt: std::backtrace::Backtrace::capture(),
                         });
                     }
-                    Ok(())
-                };
-                if need_pre_init {
-                    launch_init(0, part_off_i)?;
-                }
-                if need_post_init {
-                    launch_init(total_parts as i32, max_parts_i)?;
                 }
             }
             let rc = cuLaunchKernel(

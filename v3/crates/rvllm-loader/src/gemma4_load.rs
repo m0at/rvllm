@@ -1007,12 +1007,38 @@ fn upload_fp8_direct_channelscale(
         // expects the full 2-D shape (e.g. Fp8GemvBlockwiseF16InLaunch
         // on the sm_121 fast path). `None` when the source is per-row
         // 1-D — those weights stay on the channelscale path.
+        // Codex52-3: the sm121 GEMV fastpath
+        // (`fp8_gemv_blockwise_*_kernel`, kernels/fp8_gemv.cu:873)
+        // indexes the blockscale tensor as
+        // `scale[n >> 7, k_block]` — a strict 128×128 layout requires
+        // shape [ceil(N/128), ceil(K/128)]. Older compressed-tensors
+        // checkpoints sometimes ship `[N, K/g]`-shaped 2-D scales
+        // (per-row × per-K-group); feeding those into the fastpath
+        // would silently produce wrong scales for rows >= 128.
+        // Reject the blockscale role for shape mismatches: store
+        // None so the dispatch falls back to channelscale, which
+        // matches the safety rail at gemma4_layer_exec.rs:2844.
+        let weight_n = entry.shape[0];
+        let weight_k = if entry.shape.len() >= 2 { entry.shape[1] } else { 0 };
+        let expect_n_blocks = (weight_n + 127) / 128;
+        let expect_k_blocks = (weight_k + 127) / 128;
         let (block_ptr, n_blocks, k_blocks) =
             if let Some((bs, rb, cb)) = read_blockscale_bf16(se, shards) {
-                let bs_bytes: Vec<u8> = bs.iter().flat_map(|s| s.to_le_bytes()).collect();
-                let bs_r = arena.region("fp8_blockscale", bs_bytes.len(), 16)?;
-                unsafe { bs_r.copy_from_host(&bs_bytes)? };
-                (Some(bs_r.device_ptr()), rb as u32, cb as u32)
+                if rb == expect_n_blocks && cb == expect_k_blocks {
+                    let bs_bytes: Vec<u8> = bs.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let bs_r = arena.region("fp8_blockscale", bs_bytes.len(), 16)?;
+                    unsafe { bs_r.copy_from_host(&bs_bytes)? };
+                    (Some(bs_r.device_ptr()), rb as u32, cb as u32)
+                } else {
+                    eprintln!(
+                        "[loader] {region_name}: 2-D scale shape [{rb}, {cb}] does not \
+                         match the sm121 GEMV fastpath layout \
+                         [ceil(N/128)={expect_n_blocks}, ceil(K/128)={expect_k_blocks}] \
+                         for weight [N={weight_n}, K={weight_k}]; \
+                         dropping to channelscale-only dispatch."
+                    );
+                    (None, 0u32, 0u32)
+                }
             } else {
                 (None, 0u32, 0u32)
             };
