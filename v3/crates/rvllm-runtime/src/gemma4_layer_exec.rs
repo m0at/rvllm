@@ -1628,10 +1628,31 @@ pub unsafe fn gemma4_forward_phase(
                             // and pre-fill sentinels for the slots
                             // the reducer still reads. Global layers
                             // use offset=0 (full ctx attended).
+                            //
+                            // Codex48-1: guard the optimisation on
+                            // num_seqs == 1. partition_offset is one
+                            // value per launch, but the kernel reads
+                            // window_start from `context_lens[seq]`
+                            // per-sequence. With heterogeneous batches
+                            // (different ctx lengths per seq), a
+                            // shorter seq could need a SMALLER offset
+                            // than the batch-max-derived value — its
+                            // valid pre-window partitions would be
+                            // sentinel-stamped by the init kernel and
+                            // never launched, so the reducer would
+                            // read sentinels for that seq. Force
+                            // offset=0 + full-grid launch when
+                            // batched (extra CTAs but correct). The
+                            // production HTTP path runs num_seqs=1
+                            // so this gate only surfaces the issue
+                            // when batched decode lands.
                             {
                                 let is_sliding = dims.layer_type
                                     == rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention;
-                                if is_sliding && dims.sliding_window > 0 {
+                                if decode_params.num_seqs == 1
+                                    && is_sliding
+                                    && dims.sliding_window > 0
+                                {
                                     let q_abs = current_ctx.saturating_sub(1);
                                     let window_start = q_abs.saturating_sub(
                                         dims.sliding_window.saturating_sub(1),
@@ -2990,6 +3011,18 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
         CutlassBackend::Absent => {
             if b_chscale != 0 {
                 fallback_f32_scale_cast()
+            } else if m > 1 {
+                // Codex48-2: cuBLASLt scalar `fp8_gemm` applies
+                // `a_scale[0]` uniformly to all M output rows. For
+                // M>1 with per-token activation scales rows 1..M-1
+                // are wrong by `a_scale[m] / a_scale[0]`. Route
+                // through the f32-scratch path so
+                // `scale_rows_f32_ratio` can recover the correct
+                // per-row scale before the f16 cast — same
+                // correction the b_chscale!=0 fallback already
+                // applies. M==1 stays on the direct cublaslt path
+                // (no row to correct, no extra kernel overhead).
+                fallback_f32_scale_cast()
             } else {
                 cublaslt.fp8_gemm(
                     a_fp8, b_fp8, output_f16,
@@ -3009,6 +3042,12 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
         // below that we land here.
         CutlassBackend::SoSm120(_) => {
             if b_chscale != 0 {
+                fallback_f32_scale_cast()
+            } else if m > 1 {
+                // Codex48-2: same per-row scale-correction need as
+                // the Absent arm above when b_chscale == 0 and the
+                // SM120 CUTLASS .so falls through to cublaslt
+                // scalar mode for M>1.
                 fallback_f32_scale_cast()
             } else {
                 cublaslt.fp8_gemm(
