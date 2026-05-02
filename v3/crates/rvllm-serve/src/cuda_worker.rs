@@ -401,6 +401,26 @@ pub fn resolve_paths(
     const MINIMAL_POLICY: &str =
         r#"{"revision":"serve-sm121","arch":"sm_121","variants":[],"entries":{}}"#;
 
+    // Codex31: detect sm_121 host so we can (a) point cutlass_so at the
+    // real `kernels_dir/sm_121/libcutlass_sm120.so` (lib_so.rs's resolver
+    // anchors at sm90_hint.parent().parent() — feeding it the literal
+    // "<unused-on-sm121>" placeholder breaks the search and silently
+    // falls to CutlassBackend::Absent), and (b) skip the minimal-policy
+    // placeholder write on read-only /tmp / restricted containers.
+    fn is_sm121_host() -> bool {
+        let out = std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.lines().next().map(|l| l.trim() == "12.1").unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    let sm121 = is_sm121_host();
+
     // Resolve the policy-json path. We never write into `kernels_dir`
     // here — that path can be a system-wide read-only location
     // (read-only container layer, immutable Nix store, root-owned
@@ -432,7 +452,14 @@ pub fn resolve_paths(
                 .unwrap_or_else(|| {
                     std::env::temp_dir().join("rvllm-serve-minimal-policy.json")
                 });
-            if !p.exists() {
+            // Codex31-2: on sm_121 the runtime (Codex30-2) skips
+            // policy.json entirely — neither the generic nor the
+            // gemma4 bring-up reads it. Avoid touching disk when
+            // unnecessary so a read-only /tmp or restricted container
+            // doesn't abort startup. Still record the path so any
+            // diagnostic that prints `policy_json` shows the would-be
+            // location.
+            if !sm121 && !p.exists() {
                 std::fs::write(&p, MINIMAL_POLICY).map_err(|e| {
                     ApiError::Internal(format!(
                         "write minimal policy {}: {e} \
@@ -446,10 +473,29 @@ pub fn resolve_paths(
         }
     };
 
+    // Codex31-1: when the operator hasn't supplied an explicit
+    // cutlass_so on a sm_121 host, point at the per-arch dir so
+    // CutlassBackend::resolve_sm120_so_path (which anchors at
+    // sm90_hint.parent().parent().join(arch)) actually finds the
+    // shipped libcutlass_sm120.so. The legacy "<unused-on-sm121>"
+    // placeholder broke that search and silently fell to
+    // CutlassBackend::Absent — production was running without the
+    // CUTLASS blockwise FP8 path unless RVLLM_CUTLASS_SM120_SO was
+    // set explicitly. The file may still be absent (operators
+    // without CUTLASS), in which case the resolver keeps falling
+    // through to Absent — same outcome as before, just no longer
+    // hidden behind a string-shaped tripwire.
+    let cutlass_so = cutlass_so.unwrap_or_else(|| {
+        if sm121 {
+            kernels_dir.join("sm_121").join("libcutlass_sm120.so")
+        } else {
+            PathBuf::from(UNUSED)
+        }
+    });
     Ok(Gemma4EnginePaths {
         model_dir,
         kernels_dir,
-        cutlass_so: cutlass_so.unwrap_or_else(|| PathBuf::from(UNUSED)),
+        cutlass_so,
         fa3_so: fa3_so.unwrap_or_else(|| PathBuf::from(UNUSED)),
         policy_json,
     })
