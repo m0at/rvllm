@@ -1479,10 +1479,16 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
     pub fn has_split_kernels(&self, head_dim: u32) -> bool {
         match self.backend {
             super::AttentionBackend::Fa2Ptx(fa2) => {
+                // Codex38-4: count the GQA-shared variant as a valid
+                // split-capable kernel for the BC=32 path. The
+                // dispatcher prefers it when RVLLM_NVFP4_SPLIT_GQA=1
+                // and gqa_ratio is in range, so a PTX tree shipping
+                // only that symbol must still report has_split=true.
                 let split_for_hd = if head_dim > 256 {
                     fa2.fn_decode_nvfp4kv_split_bc16.is_some()
                 } else {
                     fa2.fn_decode_nvfp4kv_split.is_some()
+                        || fa2.fn_decode_nvfp4kv_split_gqa.is_some()
                 };
                 split_for_hd && fa2.fn_paged_attn_reduce_f16.is_some()
             }

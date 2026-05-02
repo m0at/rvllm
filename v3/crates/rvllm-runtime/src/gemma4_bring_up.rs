@@ -124,7 +124,14 @@ pub fn decode_graph_eligible_for_generation(
     let capture_ctx = prompt_len
         .saturating_add(capture_decode_step)
         .saturating_add(1);
-    let end_ctx = prompt_len.saturating_add(max_new);
+    // Codex38-3: end_ctx = prompt_len + max_new - 1. The decode loop
+    // emits the first new token directly after prefill and runs the
+    // remaining `max_new - 1` forward passes; the last one sees
+    // context length `prompt_len + max_new - 1`. Using the old
+    // `prompt_len + max_new` upper-bound rejected requests that
+    // happened to land on a partition boundary just one token past
+    // their actual final ctx.
+    let end_ctx = prompt_len.saturating_add(max_new.saturating_sub(1)).max(1);
     let parts_at_capture = capture_ctx.div_ceil(partition_size).max(1);
     let parts_at_end = end_ctx.div_ceil(partition_size).max(1);
     parts_at_capture == parts_at_end
@@ -4338,10 +4345,23 @@ impl Gemma4Bringup {
         // gridDim.z into the captured graph. With split-KV disabled
         // (env off, FP8/F16 KV) the parts-count drift can't poison
         // the reducer, so we can capture across partition boundaries.
+        // Codex38-2: also gate on actual split-kernel availability.
+        // Earlier the predicate trusted env+kv_dtype only; a kernels
+        // tree without the split symbols (or running a head_dim
+        // variant the build doesn't ship) used to reject graph
+        // capture at partition boundaries even though decode never
+        // actually launched split kernels.
+        let split_decode_for_graph =
+            rvllm_attention::PagedDecodeNvfp4Launcher::new(&self.sliding_attention);
+        let global_split_decode_for_graph =
+            rvllm_attention::PagedDecodeNvfp4Launcher::new(&self.global_attention);
         let split_kv_active_for_graph = parse_truthy_env("RVLLM_NVFP4_SPLIT_KV")
             .unwrap_or(true)
             && crate::gemma4_layer_exec::KvDtype::from_env(false)
-                == crate::gemma4_layer_exec::KvDtype::Nvfp4;
+                == crate::gemma4_layer_exec::KvDtype::Nvfp4
+            && (split_decode_for_graph.has_split_kernels(arch.head_dim_sliding as u32)
+                || global_split_decode_for_graph
+                    .has_split_kernels(arch.head_dim_global as u32));
         let decode_graph_eligible = use_decode_graph
             && decode_graph_eligible_for_generation(
                 prompt_ids.len() as u32,
