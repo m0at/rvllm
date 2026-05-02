@@ -224,16 +224,30 @@ impl<'a> PagedDecodeLauncher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        // Codex32-3: only require a workspace pointer when the
+        // backend actually consumes one. Fa2Ptx::workspace_size()
+        // returns 0 (the sm_121 F16 decode kernel doesn't allocate
+        // an external workspace) — a generic caller that respects
+        // the contract and passes 0 here used to fail host-validation
+        // even though the kernel ignores the pointer. Fa3 still
+        // wants the workspace for its persistent metadata.
+        let workspace_required = self.backend.workspace_size(
+            params.num_seqs as i32,
+            params.num_heads as i32,
+        ) > 0;
+        let mut required = vec![
+            ("out_ptr",          out_ptr),
+            ("q_ptr",            q_ptr),
+            ("k_cache_ptr",      k_cache_ptr),
+            ("v_cache_ptr",      v_cache_ptr),
+            ("block_tables_ptr", block_tables_ptr),
+            ("context_lens_ptr", context_lens_ptr),
+        ];
+        if workspace_required {
+            required.push(("workspace_ptr", workspace_ptr));
+        }
         require_nonnull(
-            &[
-                ("out_ptr",          out_ptr),
-                ("q_ptr",            q_ptr),
-                ("k_cache_ptr",      k_cache_ptr),
-                ("v_cache_ptr",      v_cache_ptr),
-                ("block_tables_ptr", block_tables_ptr),
-                ("context_lens_ptr", context_lens_ptr),
-                ("workspace_ptr",    workspace_ptr),
-            ],
+            &required,
             "paged_decode (Fa3/SM90)",
             stream, params.num_seqs, params.head_dim,
         )?;

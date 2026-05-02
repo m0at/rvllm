@@ -170,11 +170,24 @@ for arch in $ARCHS; do
     # the engine refuses to start. fa3_sm90_* and cutlass_* stay
     # opt-in.
     is_required_kernel() {
+        # Codex32-1: bare-name attention sources (`flash_attention`,
+        # `flash_attention_nvfp4kv`, `flash_attention_unified_prefill`)
+        # are hard-loaded by the sm_121 Fa2Ptx backend (lib.rs's
+        # load_ptx calls don't have a `_2_` infix). Earlier patterns
+        # only matched the prefixed sub-variants and missed the
+        # bare names — a compile failure on flash_attention.cu
+        # silently shipped a manifest without it, and bring-up
+        # exploded later. The patterns below mirror lib.rs's
+        # load_ptx calls 1:1 plus the fused/util kernels every
+        # gemma4 pass touches.
         case "$1" in
+            flash_attention|\
             flash_attention_2_decode_*|flash_attention_2_prefill_*|\
-            flash_attention_decode_nvfp4kv_*|flash_attention_split_decode_nvfp4kv_*|\
-            flash_attention_unified_prefill_*|\
-            flash_attention_nvfp4kv_*|flash_attention_unified_prefill_nvfp4kv_*|\
+            flash_attention_unified_prefill|flash_attention_unified_prefill_*|\
+            flash_attention_nvfp4kv|flash_attention_nvfp4kv_*|\
+            flash_attention_decode_nvfp4kv_*|flash_attention_split_decode_nvfp4kv|\
+            flash_attention_split_decode_nvfp4kv_*|\
+            paged_attention_v2_reduce_*|\
             fused_rope_partial_fp8kv*|fused_rope_partial_nvfp4kv*|fused_rope_cache_fp8kv*|\
             fused_rmsnorm_*|fused_qk_rmsnorm*|fused_gelu_mul_fp8*|\
             argmax|rmsnorm_inplace_*|residual_scale_f16|vnorm_f16|\

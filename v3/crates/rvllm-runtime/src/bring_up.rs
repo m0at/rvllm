@@ -1636,7 +1636,20 @@ pub fn resolve_kernels_dir(
                 "compute_capability",
             )
         })?;
-        let sub = kernels_root.join(target.as_sm_str());
+        // Codex32-2: tolerate operators who pointed RVLLM_KERNELS_DIR
+        // directly at the per-arch dir (matches the user-facing doc
+        // in parameters_for_nvfp4_sm121.md). When the input already
+        // ends in the matching `sm_*` segment, treat it as the
+        // resolved dir instead of appending `sm_*` again — which
+        // produced `.../sm_121/sm_121` and a confusing
+        // "subdirectory does not exist" error. Mismatched suffix
+        // (e.g. RVLLM_KERNELS_DIR=.../sm_120 on a sm_121 host) still
+        // falls through to the normal append + is_dir check so
+        // wrong-arch dirs get caught.
+        let sub = match kernels_root.file_name().and_then(|s| s.to_str()) {
+            Some(name) if name == target.as_sm_str() => kernels_root.to_path_buf(),
+            _ => kernels_root.join(target.as_sm_str()),
+        };
         if !sub.is_dir() {
             return Err(RvllmError::config(
                 ConfigError::InvalidField {

@@ -108,7 +108,7 @@ Resolution order (first truthy wins): `RVLLM_NVFP4_KV` → `RVLLM_F16_KV` →
 | `RVLLM_BIND` | `127.0.0.1:8080` | HTTP listener |
 | `RVLLM_MODEL_DIR` | required | HF model directory (config.json, tokenizer, safetensors) |
 | `RVLLM_MODEL_ID` | dirname | Advertised on `/v1/models` |
-| `RVLLM_KERNELS_DIR` | required for cuda | Per-arch PTX + manifest.json |
+| `RVLLM_KERNELS_DIR` | required for cuda | Kernel root (`.../kernels/`); the runtime appends the per-arch subdir (`sm_121/`) automatically. Pointing it at the per-arch dir directly (`.../kernels/sm_121/`) also works — Codex32-2 detects the suffix and skips the append. |
 | `RVLLM_CUTLASS_SM120_SO` | sibling of kernels_dir | CUTLASS sm_120 blockwise FP8 GEMM `.so` (built via `kernels/build_cutlass_sm120_so.sh sm_121a`) |
 | `RVLLM_QUEUE_DEPTH` | 8 | Worker queue depth (admission control = 429 when full) |
 | `RVLLM_MAX_TOKENS_CAP` | 4096 | Hard cap on per-request `max_tokens` |
