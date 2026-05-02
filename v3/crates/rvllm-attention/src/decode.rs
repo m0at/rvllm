@@ -1182,7 +1182,20 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             // tiles and the f16 reducer reads them as f16 → silent
             // numeric drift (or worse, a layout mismatch). The
             // `output_bf16` flag now keeps the pair in lock-step.
-            let split_fn = if output_bf16 {
+            // Codex36-3: env-gated GQA-shared split kernel for the
+            // BC=32 path (head_dim ≤ 256 = Gemma 4 sliding layers).
+            // Default OFF until validated through kv_policy_matrix.sh.
+            // Other paths (BC=16 / bf16-out) fall through to the
+            // existing per-Q kernel regardless.
+            let want_gqa_shared = !output_bf16
+                && hd <= 256
+                && params.num_heads > params.num_kv_heads
+                && std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
+                    .map(|v| v == "1" || v == "true" || v == "TRUE")
+                    .unwrap_or(false);
+            let split_fn = if want_gqa_shared && fa2.fn_decode_nvfp4kv_split_gqa.is_some() {
+                fa2.fn_decode_nvfp4kv_split_gqa
+            } else if output_bf16 {
                 if hd > 256 {
                     fa2.fn_decode_nvfp4kv_split_bc16_bf16out
                 } else {
@@ -1236,8 +1249,16 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let fa2_bc: i32 = if hd > 256 { 16 } else { 32 };
             // Phase-1 smem: 2 * BC * D (f16 K+V) + BC * 4 (scores) +
             // (FA2_THREADS/32) * 4 (reduce scratch).
+            // Codex36-3: GQA-shared variant carries one score row per
+            // q-head in the kv-group, so the score region scales with
+            // GQA. K/V tiles + reduce scratch unchanged.
+            let gqa_factor = if want_gqa_shared && fa2.fn_decode_nvfp4kv_split_gqa.is_some() {
+                (params.num_heads / params.num_kv_heads.max(1)) as i32
+            } else {
+                1
+            };
             let split_smem =
-                2 * fa2_bc * hd * 2 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
+                2 * fa2_bc * hd * 2 + gqa_factor * fa2_bc * 4 + (FA2_THREADS / 32) * 4;
             if split_smem as u32 >= 48 * 1024 {
                 set_max_dynamic_smem(
                     split_fn.raw() as CUfunction,
@@ -1340,10 +1361,18 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             } else {
                 current_num_partitions.min(max_num_partitions).max(1)
             };
+            // Codex36-3: GQA-shared variant collapses gridDim.y from
+            // num_heads to num_kv_heads — one CTA handles every q-head
+            // in the kv-group.
+            let launch_y = if want_gqa_shared && fa2.fn_decode_nvfp4kv_split_gqa.is_some() {
+                params.num_kv_heads as u32
+            } else {
+                params.num_heads as u32
+            };
             let rc = cuLaunchKernel(
                 split_fn.raw() as CUfunction,
                 params.num_seqs as u32,
-                params.num_heads as u32,
+                launch_y,
                 launch_z,
                 FA2_THREADS as u32,
                 1,

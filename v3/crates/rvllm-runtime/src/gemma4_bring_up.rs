@@ -89,8 +89,17 @@ pub fn effective_partition_size() -> u32 {
 /// runtime knob — operators who tune the capture point also shift the
 /// boundary at which this check evaluates.
 ///
-/// Returns `true` when capture is safe (parts-count at capture == 1
-/// and parts-count at end of gen == 1, OR both > 1).
+/// Returns `true` when capture is safe. Codex36-1 tightened the
+/// rule: capture is safe only when the partition count is identical
+/// at capture and at end-of-generation. The earlier "both > 1"
+/// branch tolerated count drift across partition-size boundaries,
+/// but Codex35-2 made `gridDim.z = current_num_partitions` at
+/// launch time. Captured graphs freeze that gridDim, so once the
+/// live context crosses the next partition boundary the reducer
+/// (which still reads the live `context_lens`) reads from
+/// scratch slots no CTA wrote — silent stale-attention.
+/// Drift case → eager path, which re-launches with the correct
+/// per-step gridDim.z.
 pub fn decode_graph_eligible_for_generation(
     prompt_len: u32,
     max_new: u32,
@@ -106,7 +115,7 @@ pub fn decode_graph_eligible_for_generation(
     let end_ctx = prompt_len.saturating_add(max_new);
     let parts_at_capture = capture_ctx.div_ceil(partition_size).max(1);
     let parts_at_end = end_ctx.div_ceil(partition_size).max(1);
-    (parts_at_capture == 1) == (parts_at_end == 1)
+    parts_at_capture == parts_at_end
 }
 
 #[cfg(test)]
@@ -136,8 +145,21 @@ mod decode_graph_eligibility_tests {
     #[test]
     fn long_prompt_already_past_boundary_eligible() {
         // prompt_len=2000, max_new=40 — capture_ctx and end_ctx both
-        // produce >1 partitions, so the split-path decision is stable.
+        // produce 8 partitions, so the split-path decision is stable.
         assert!(decode_graph_eligible_for_generation(2000, 40, 256, 1));
+    }
+
+    #[test]
+    fn long_prompt_crossing_higher_boundary_blocked() {
+        // Codex36-1 regression test: parts_at_capture=8, parts_at_end=9
+        // (generation crosses one more partition boundary). The old
+        // "both > 1" rule incorrectly accepted this; with frozen
+        // gridDim.z and a live-context-driven reducer, partition slot
+        // 8 would be read but never written. New rule rejects.
+        // prompt_len=2000, max_new=300, partition=256
+        //   capture_ctx = 2002 → 8 parts
+        //   end_ctx     = 2300 → 9 parts
+        assert!(!decode_graph_eligible_for_generation(2000, 300, 256, 1));
     }
 
     #[test]

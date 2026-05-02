@@ -1150,9 +1150,19 @@ __global__ void flash_attention_2_decode_fp8kv_gqa_kernel(
     const int tid     = threadIdx.x;
 
     const int context_len = context_lens[seq_idx];
-    if (context_len == 0) return;
-
-    const int GQA = num_heads / num_kv_heads;
+    const int GQA = (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 0;
+    if (context_len == 0) {
+        // Codex36-2: FP8 GQA padded-zero (twin of NVFP4 GQA).
+        for (int q = 0; q < GQA; ++q) {
+            int h = kv_head * GQA + q;
+            if (h >= num_heads) break;
+            const int out_base = (seq_idx * num_heads + h) * head_dim;
+            for (int d = tid; d < head_dim; d += blockDim.x) {
+                output[out_base + d] = __float2half(0.0f);
+            }
+        }
+        return;
+    }
     if (GQA <= 0 || GQA > MAX_GQA_DECODE) return;
 
     const bool k_perslot = (k_scale_cache != nullptr);

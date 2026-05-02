@@ -383,6 +383,267 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_kernel(
     }
 }
 
+// =====================================================================
+// Codex36-3: GQA-shared split decode (BC=32, head_dim ≤ 256).
+//
+// **STATUS: opt-in via RVLLM_NVFP4_SPLIT_GQA=1 (default OFF).
+//   This implementation has not yet been validated end-to-end through
+//   kv_policy_matrix.sh. The math is a mechanical merge of the existing
+//   per-Q split kernel above + the single-CTA GQA-sharing pattern in
+//   flash_attention_nvfp4kv.cu's `flash_attention_2_decode_nvfp4kv_gqa_kernel`.
+//   Output layout matches the per-Q kernel byte-for-byte
+//   (`tmp_out[seq, q_head, partition, :]`), so the existing reduce
+//   kernel handles it without changes. K/V dequant runs once per
+//   tile (this is the perf win); each q-head in the kv-group then
+//   uses the same s_key / s_val to compute its own scores +
+//   accumulator.
+//
+// Grid:  (num_seqs, num_kv_heads, max_num_partitions)
+// Block: FA2_THREADS
+// Dynamic smem: same layout as per-Q version PLUS per-q score rows
+// =====================================================================
+#define MAX_GQA_SPLIT 8
+extern "C"
+__global__ void flash_attention_2_decode_nvfp4kv_split_gqa_kernel(
+    float*               __restrict__ tmp_out,
+    float*               __restrict__ max_logits,
+    float*               __restrict__ exp_sums,
+    const unsigned char* __restrict__ query,
+    const uint8_t*       __restrict__ key_cache_packed,
+    const uint8_t*       __restrict__ value_cache_packed,
+    const __nv_fp8_e4m3* __restrict__ key_cache_scale,
+    const __nv_fp8_e4m3* __restrict__ value_cache_scale,
+    const float*         __restrict__ q_scale_cache,
+    const int*           __restrict__ block_tables,
+    const int*           __restrict__ context_lens,
+    const float*         __restrict__ q_descale,
+    float scale,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq,
+    int window_size_left,
+    int partition_size,
+    int max_num_partitions
+) {
+    const int seq_idx      = blockIdx.x;
+    const int kv_head      = blockIdx.y;
+    const int partition_id = blockIdx.z;
+    const int tid          = threadIdx.x;
+
+    const int GQA = (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 0;
+    if (GQA <= 0 || GQA > MAX_GQA_SPLIT) return; // host should reject; defensive
+
+    const int context_len = context_lens[seq_idx];
+
+    // Per-q scratch slots — write empty sentinels for each q on bail-out.
+    auto write_empties = [&]() {
+        for (int q = 0; q < GQA; ++q) {
+            int h = kv_head * GQA + q;
+            if (h >= num_heads) break;
+            int sidx = (seq_idx * num_heads + h) * max_num_partitions + partition_id;
+            int trow = sidx * head_dim;
+            write_split_empty_partition(tmp_out, max_logits, exp_sums,
+                                        sidx, trow, head_dim, tid);
+        }
+    };
+
+    if (context_len == 0) { write_empties(); return; }
+
+    const int part_start = partition_id * partition_size;
+    const int part_end   = min(part_start + partition_size, context_len);
+    if (part_start >= context_len) { write_empties(); return; }
+
+    const int decode_q_abs_pos = context_len - 1;
+    const int window_start = (window_size_left < 0)
+        ? 0
+        : max(0, decode_q_abs_pos - window_size_left);
+    if (part_end <= window_start) { write_empties(); return; }
+
+    // Smem layout: shared K/V tiles + per-q score rows + reduce scratch.
+    extern __shared__ unsigned char smem_u8[];
+    __half* s_key   = reinterpret_cast<__half*>(smem_u8);
+    __half* s_val   = s_key + FA2_BC * head_dim;
+    float*  s_score = reinterpret_cast<float*>(s_val + FA2_BC * head_dim);
+    // s_score laid out as [GQA][FA2_BC]; reduce scratch follows.
+    float*  s_reduce = s_score + GQA * FA2_BC;
+
+    const int tile_lo = part_start / FA2_BC;
+    const int tile_hi = (part_end + FA2_BC - 1) / FA2_BC;
+    const int ws_tile_lo = window_start / FA2_BC;
+    const int first_tile = max(tile_lo, ws_tile_lo);
+
+    const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
+    const int half_D      = head_dim >> 1;
+    const int scales_per_D = head_dim >> 4;
+
+    // Per-q Q load + scale.
+    float q_reg[MAX_GQA_SPLIT][8];
+    float q_scale_per[MAX_GQA_SPLIT];
+    for (int q = 0; q < GQA; ++q) {
+        int h = kv_head * GQA + q;
+        q_scale_per[q] = (q_scale_cache != nullptr)
+            ? __ldg(&q_scale_cache[seq_idx * num_heads + h])
+            : *q_descale;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            int d = tid + r * FA2_THREADS;
+            if (r < dims_per_thread && d < head_dim) {
+                unsigned char qb = query[(seq_idx * num_heads + h) * head_dim + d];
+                q_reg[q][r] = fp8kv_decode_byte(qb) * q_scale_per[q] * scale;
+            } else {
+                q_reg[q][r] = 0.0f;
+            }
+        }
+    }
+
+    // Per-q running softmax state.
+    float row_max[MAX_GQA_SPLIT];
+    float row_sum[MAX_GQA_SPLIT];
+    float acc[MAX_GQA_SPLIT][8];
+    for (int q = 0; q < GQA; ++q) {
+        row_max[q] = -FLT_MAX;
+        row_sum[q] = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) acc[q][r] = 0.0f;
+    }
+
+    for (int tile = first_tile; tile < tile_hi; ++tile) {
+        const int tile_start = tile * FA2_BC;
+        const int tile_end   = min((tile + 1) * FA2_BC, part_end);
+        const int tile_len   = tile_end - tile_start;
+        if (tile_len <= 0) continue;
+
+        // K tile dequant — SHARED across all q-heads in the GQA group.
+        for (int t = 0; t < tile_len; ++t) {
+            int kv_pos   = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_blk = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            const uint8_t*       k_packed = key_cache_packed
+                + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * half_D;
+            const __nv_fp8_e4m3* k_scale  = key_cache_scale
+                + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * scales_per_D;
+            dequant_nvfp4_row_to_smem(k_packed, k_scale, s_key + t * head_dim, tid, head_dim);
+        }
+        __syncthreads();
+
+        // Per-q Q·K^T (shared K).
+        for (int q = 0; q < GQA; ++q) {
+            for (int t = 0; t < tile_len; ++t) {
+                float dot = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    int d = tid + r * FA2_THREADS;
+                    if (r < dims_per_thread && d < head_dim) {
+                        dot += q_reg[q][r] * __half2float(s_key[t * head_dim + d]);
+                    }
+                }
+                dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
+                if (tid == 0) {
+                    int kv_pos = tile_start + t;
+                    s_score[q * FA2_BC + t] = (kv_pos < window_start) ? -FLT_MAX : dot;
+                }
+                __syncthreads();
+            }
+        }
+
+        // Per-q online-softmax + correction.
+        for (int q = 0; q < GQA; ++q) {
+            float tile_max = -FLT_MAX;
+            if (tid == 0) {
+                for (int t = 0; t < tile_len; ++t)
+                    tile_max = fmaxf(tile_max, s_score[q * FA2_BC + t]);
+                s_reduce[0] = tile_max;
+            }
+            __syncthreads();
+            tile_max = s_reduce[0];
+            __syncthreads();
+
+            float prev_max = row_max[q];
+            float new_max  = fmaxf(prev_max, tile_max);
+            if (new_max > prev_max && prev_max > -FLT_MAX) {
+                float correction = expf(prev_max - new_max);
+                #pragma unroll
+                for (int r = 0; r < 8; ++r) acc[q][r] *= correction;
+                row_sum[q] *= correction;
+            }
+            row_max[q] = new_max;
+
+            if (tid == 0) {
+                float tsum = 0.0f;
+                for (int t = 0; t < tile_len; ++t) {
+                    float v = (s_score[q * FA2_BC + t] > -FLT_MAX + 1.0f)
+                        ? expf(s_score[q * FA2_BC + t] - row_max[q]) : 0.0f;
+                    s_score[q * FA2_BC + t] = v;
+                    tsum += v;
+                }
+                s_reduce[0] = tsum;
+            }
+            __syncthreads();
+            row_sum[q] += s_reduce[0];
+            __syncthreads();
+        }
+
+        // V tile dequant — SHARED across all q-heads in the GQA group.
+        for (int t = 0; t < tile_len; ++t) {
+            int kv_pos   = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_blk = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            const uint8_t*       v_packed = value_cache_packed
+                + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * half_D;
+            const __nv_fp8_e4m3* v_scale  = value_cache_scale
+                + ((phys_blk * block_size + page_off) * num_kv_heads + kv_head) * scales_per_D;
+            dequant_nvfp4_row_to_smem(v_packed, v_scale, s_val + t * head_dim, tid, head_dim);
+        }
+        __syncthreads();
+
+        // Per-q P·V accumulate (shared V).
+        for (int q = 0; q < GQA; ++q) {
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                int d = tid + r * FA2_THREADS;
+                if (r < dims_per_thread && d < head_dim) {
+                    float val_acc = 0.0f;
+                    for (int t = 0; t < tile_len; ++t) {
+                        val_acc += s_score[q * FA2_BC + t] * __half2float(s_val[t * head_dim + d]);
+                    }
+                    acc[q][r] += val_acc;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Per-q write tmp_out + sentinels for empty rows.
+    for (int q = 0; q < GQA; ++q) {
+        int h = kv_head * GQA + q;
+        if (h >= num_heads) break;
+        int sidx = (seq_idx * num_heads + h) * max_num_partitions + partition_id;
+        int trow = sidx * head_dim;
+        if (row_sum[q] <= 0.0f) {
+            write_split_empty_partition(tmp_out, max_logits, exp_sums,
+                                        sidx, trow, head_dim, tid);
+            continue;
+        }
+        float inv_sum = 1.0f / row_sum[q];
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            int d = tid + r * FA2_THREADS;
+            if (r < dims_per_thread && d < head_dim) {
+                tmp_out[trow + d] = acc[q][r] * inv_sum;
+            }
+        }
+        if (tid == 0) {
+            max_logits[sidx] = row_max[q];
+            exp_sums  [sidx] = row_sum[q];
+        }
+    }
+}
+#undef MAX_GQA_SPLIT
+
 // ---------------------------------------------------------------------
 // BC=16 variant for head_dim=512 (doesn't fit 2*32*512*2 smem budget).
 // Body identical; FA2_BC macro switched.

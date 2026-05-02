@@ -438,6 +438,13 @@ pub struct Fa2PtxKernels {
     /// `flash_attention_2_decode_nvfp4kv_split_bc16_kernel`.
     #[cfg(feature = "cuda")]
     pub fn_decode_nvfp4kv_split_bc16: Option<rvllm_kernels::KernelFn>,
+    /// Codex36-3: `flash_attention_2_decode_nvfp4kv_split_gqa_kernel`
+    /// — BC=32 GQA-shared split decode. Shares K/V dequant across
+    /// the GQA group (grid = num_kv_heads not num_heads). Opt-in
+    /// via `RVLLM_NVFP4_SPLIT_GQA=1`; default off until validated
+    /// via kv_policy_matrix.sh.
+    #[cfg(feature = "cuda")]
+    pub fn_decode_nvfp4kv_split_gqa: Option<rvllm_kernels::KernelFn>,
     /// `paged_attention_reduce_f16_kernel` — combines partial outputs.
     /// Head-dtype-agnostic (f16 in / out). Shared by FP8 split path
     /// when that's added.
@@ -620,6 +627,7 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_split,
                 fn_decode_nvfp4kv_split_bc16,
                 fn_paged_attn_reduce_f16,
+                fn_decode_nvfp4kv_split_gqa,
             ) = match loader.load_ptx("flash_attention_split_decode_nvfp4kv") {
                 Ok(m) => {
                     let s32 = m.get_function(
@@ -628,9 +636,14 @@ impl Fa2PtxKernels {
                         "flash_attention_2_decode_nvfp4kv_split_bc16_kernel").ok();
                     let r   = m.get_function(
                         "paged_attention_reduce_f16_kernel").ok();
-                    (Some(m), s32, s16, r)
+                    // Codex36-3: GQA-shared variant. `.ok()` so PTX
+                    // trees predating it still load (env-gate at
+                    // dispatch time keeps default-off behavior).
+                    let gqa = m.get_function(
+                        "flash_attention_2_decode_nvfp4kv_split_gqa_kernel").ok();
+                    (Some(m), s32, s16, r, gqa)
                 }
-                Err(_) => (None, None, None, None),
+                Err(_) => (None, None, None, None, None),
             };
 
             Ok(Self {
@@ -674,6 +687,7 @@ impl Fa2PtxKernels {
                 fn_decode_nvfp4kv_split,
                 fn_decode_nvfp4kv_split_bc16,
                 fn_paged_attn_reduce_f16,
+                fn_decode_nvfp4kv_split_gqa,
             })
         }
         #[cfg(not(feature = "cuda"))]
