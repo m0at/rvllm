@@ -118,6 +118,16 @@ pub fn decode_graph_eligible_for_generation(
     // Earlier this function refused capture across partition boundaries
     // unconditionally, costing decode-graph perf with no correctness
     // gain.
+    // Codex51-2: the decode loop runs `0..max_new - 1`, so the
+    // largest decode_step ever reached is `max_new - 2`. If
+    // `capture_decode_step` lands at or beyond `max_new - 1`, the
+    // capture site is never executed and `RVLLM_DECODE_GRAPH=1`
+    // silently does nothing. Reject up front so the eager-fallback
+    // log line surfaces the misconfiguration. (max_new = 1 has zero
+    // decode-loop iterations; nothing to capture there either.)
+    if max_new < 2 || capture_decode_step >= max_new.saturating_sub(1) {
+        return false;
+    }
     if !split_kv_active {
         return true;
     }
@@ -225,11 +235,29 @@ mod decode_graph_eligibility_tests {
         // prompt_len=200, max_new=300, p=256, capture_at=1 →
         // capture_ctx=202 (parts=1), end_ctx=500 (parts=2) → blocked.
         assert!(!decode_graph_eligible_for_generation(200, 300, 256, 1, true));
-        // Same prompt+gen, capture_at=300 → capture_ctx=501
-        // (parts=2), end_ctx=500 (parts=2) → eligible (both >1).
-        // Same prompt+gen, capture_at=300 → capture_ctx=501 (parts=2),
+        // Same prompt+gen, capture_at=200 → capture_ctx=401 (parts=2),
         // end_ctx=500 (parts=2) → eligible (both =2, equal).
-        assert!(decode_graph_eligible_for_generation(200, 300, 256, 300, true));
+        // Codex51-2: must stay below max_new-1 (the loop bound) for
+        // the capture step to actually be reached at runtime.
+        assert!(decode_graph_eligible_for_generation(200, 300, 256, 200, true));
+    }
+
+    /// Codex51-2: capture_decode_step >= max_new - 1 is unreachable
+    /// because the decode loop runs `0..max_new - 1`. Earlier this
+    /// returned eligible and silently produced a no-op graph
+    /// capture; now reject up front so the eager-fallback warn line
+    /// makes the misconfiguration visible.
+    #[test]
+    fn unreachable_capture_at_blocks() {
+        // capture_at == max_new - 1 → loop never executes step 299
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 299, true));
+        // capture_at > max_new - 1 → also unreachable
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 300, true));
+        // max_new = 1 → zero decode-loop iterations; nothing to capture
+        assert!(!decode_graph_eligible_for_generation(200, 1, 256, 0, true));
+        // max_new = 2 → loop runs step 0 only; capture_at = 0 should
+        // still be eligible if the parts check holds.
+        assert!(decode_graph_eligible_for_generation(0, 2, 256, 0, true));
     }
 
     /// Lock down the env-var resolver: invalid (non-power-of-two,
@@ -1312,6 +1340,60 @@ impl Gemma4Bringup {
         // for the full rationale (sm_121 has no compatible `.so`).
         let cutlass =
             CutlassBackend::load_for(compile_target, paths.cutlass_so.clone(), &variants)?;
+
+        // Codex51-3: surface the SM121 fast-path status so operators
+        // can see at a glance whether `RVLLM_FP8_GEMM_CUTLASS_SM120`
+        // is wired correctly. Single-token decode (M=1) uses the
+        // native GEMV fastpath regardless; the CUTLASS SoSm120 path
+        // matters for batched decode and prefill (M>=128). Without
+        // explicit logging, a missing .so or unset env silently
+        // routes M>=128 traffic onto cuBLASLt scalar mode, costing
+        // significant prefill TTFT on sm_121.
+        {
+            let env_on = parse_truthy_env("RVLLM_FP8_GEMM_CUTLASS_SM120").unwrap_or(false);
+            let backend_name = match &cutlass {
+                CutlassBackend::SoSm120(_) => "SoSm120",
+                CutlassBackend::So(_) => "So",
+                CutlassBackend::Absent => "Absent",
+                _ => "Other",
+            };
+            if matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121)) {
+                if matches!(cutlass, CutlassBackend::SoSm120(_)) {
+                    if env_on {
+                        tracing::info!(
+                            backend = backend_name,
+                            env_on = env_on,
+                            "[cutlass-sm120] SoSm120 .so loaded AND env enabled — \
+                             M>=128 GEMM takes the CUTLASS blockwise fast path."
+                        );
+                    } else {
+                        tracing::info!(
+                            backend = backend_name,
+                            env_on = env_on,
+                            "[cutlass-sm120] SoSm120 .so loaded but \
+                             RVLLM_FP8_GEMM_CUTLASS_SM120 is unset — M>=128 \
+                             traffic falls back to cuBLASLt scalar. Set \
+                             RVLLM_FP8_GEMM_CUTLASS_SM120=1 to enable the fast path."
+                        );
+                    }
+                } else if env_on {
+                    tracing::warn!(
+                        backend = backend_name,
+                        "[cutlass-sm120] RVLLM_FP8_GEMM_CUTLASS_SM120=1 is set but \
+                         the SoSm120 .so wasn't loaded (backend = {backend_name}). \
+                         Build via kernels/build_cutlass_sm120_so.sh and verify \
+                         kernels/sm_121/libcutlass_sm120.so is present.",
+                    );
+                } else {
+                    tracing::info!(
+                        backend = backend_name,
+                        "[cutlass-sm120] CUTLASS .so not loaded \
+                         (backend = {backend_name}). M>=128 paths use cuBLASLt scalar. \
+                         For best prefill TTFT on sm_121 build the SoSm120 .so."
+                    );
+                }
+            }
+        }
 
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
         let cublaslt_ws_region = arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;
