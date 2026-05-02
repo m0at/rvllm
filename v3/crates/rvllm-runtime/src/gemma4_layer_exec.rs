@@ -1576,7 +1576,10 @@ pub unsafe fn gemma4_forward_phase(
                     let ws_need = slots * (dims.head_dim as u64) * 4
                         + slots * 4 * 2;
                     let use_split = split_env_on
-                        && decode.has_split_kernels(dims.head_dim)
+                        // Codex42-2: production gemma4 path always
+                        // launches the f16-out variant (cycle-55 bf16
+                        // wiring not flipped here). Probe matches.
+                        && decode.has_split_kernels(dims.head_dim, /*output_bf16=*/false)
                         && current_num_parts > 1
                         // Compare against the actual fa3_workspace
                         // size (varies by caller: bench/ppl 16 MiB,

@@ -1335,13 +1335,13 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let window_size_left  = params.window_size_left;
             let partition_size_i  = partition_size as i32;
             let max_parts_i       = max_num_partitions as i32;
-            // Codex41-2: only the BC=32 base split kernel currently
-            // accepts a partition_offset arg. Other split variants
-            // (BC=16 / GQA-shared) keep the legacy "every partition
-            // launches" shape, so we force partition_offset=0 for
-            // them. Pre-init runs only when the kernel can consume
-            // the offset AND the runtime asks for offset > 0.
-            let split_supports_offset = !want_gqa_shared && hd <= 256;
+            // Codex41-2 / Codex42-1: BC=32 base + GQA-shared kernels
+            // both accept partition_offset. BC=16 (head_dim>256) and
+            // bf16-out variants stay on the legacy "launch all" shape
+            // — they don't service the production sliding-layer path
+            // that benefits from the optimization, and changing their
+            // signatures is a larger kernel surface to validate.
+            let split_supports_offset = !output_bf16 && hd <= 256;
             let part_off_i: i32 = if split_supports_offset {
                 partition_offset as i32
             } else {
@@ -1559,16 +1559,26 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
     /// the single-CTA decode and lose the long-context performance
     /// win on layers that COULD have used split.
     #[cfg(feature = "cuda")]
-    pub fn has_split_kernels(&self, head_dim: u32) -> bool {
+    pub fn has_split_kernels(&self, head_dim: u32, output_bf16: bool) -> bool {
         match self.backend {
             super::AttentionBackend::Fa2Ptx(fa2) => {
-                // Codex39-4: tighten Codex38-4. The dispatcher only
-                // takes the GQA-shared kernel when RVLLM_NVFP4_SPLIT_GQA=1
-                // and the ratio fits; otherwise it falls back to the
-                // per-Q symbol. Reporting "available" when only the
-                // GQA symbol exists with the env unset would hand the
-                // caller a green light that turns into FeatureNotAvailable
-                // at launch time. Accept GQA-only ⇔ env explicitly set.
+                // Codex42-2: pick the split + reduce symbol pair the
+                // launcher will actually dispatch for this head_dim
+                // and output dtype. Earlier this only checked the
+                // f16-out path; a future caller flipping output_bf16
+                // would have hit FeatureNotAvailable in the hot path
+                // despite the probe greenlighting it.
+                if output_bf16 {
+                    let split_for_hd = if head_dim > 256 {
+                        fa2.fn_decode_nvfp4kv_split_bc16_bf16out.is_some()
+                    } else {
+                        fa2.fn_decode_nvfp4kv_split_bf16out.is_some()
+                    };
+                    return split_for_hd && fa2.fn_paged_attn_reduce_bf16.is_some();
+                }
+                // Codex39-4: GQA-only counts as split-capable iff the
+                // env switch is set (else launch_split picks the per-Q
+                // symbol).
                 let gqa_env_on = std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
                     .map(|v| v == "1" || v == "true" || v == "TRUE")
                     .unwrap_or(false);
@@ -1584,7 +1594,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
         }
     }
     #[cfg(not(feature = "cuda"))]
-    pub fn has_split_kernels(&self, _head_dim: u32) -> bool { false }
+    pub fn has_split_kernels(&self, _head_dim: u32, _output_bf16: bool) -> bool { false }
 }
 
 #[cfg(test)]

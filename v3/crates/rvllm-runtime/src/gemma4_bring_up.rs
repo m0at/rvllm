@@ -4406,9 +4406,9 @@ impl Gemma4Bringup {
         let split_kv_active_for_graph = parse_truthy_env("RVLLM_NVFP4_SPLIT_KV")
             .unwrap_or(true)
             && any_layer_nvfp4
-            && (split_decode_for_graph.has_split_kernels(arch.head_dim_sliding as u32)
+            && (split_decode_for_graph.has_split_kernels(arch.head_dim_sliding as u32, false)
                 || global_split_decode_for_graph
-                    .has_split_kernels(arch.head_dim_global as u32));
+                    .has_split_kernels(arch.head_dim_global as u32, false));
         let decode_graph_eligible = use_decode_graph
             && decode_graph_eligible_for_generation(
                 prompt_ids.len() as u32,

@@ -472,11 +472,18 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_gqa_kernel(
     int max_blocks_per_seq,
     int window_size_left,
     int partition_size,
-    int max_num_partitions
+    int max_num_partitions,
+    // Codex42-1: GQA-shared variant gets the same partition_offset
+    // contract as the BC=32 base kernel — caller pre-fills sentinels
+    // for [0, partition_offset) and we offset blockIdx.z to the
+    // absolute partition slot. Keeps sliding-window decode from
+    // launching wasted CTAs over old KV partitions when
+    // RVLLM_NVFP4_SPLIT_GQA=1.
+    int partition_offset
 ) {
     const int seq_idx      = blockIdx.x;
     const int kv_head      = blockIdx.y;
-    const int partition_id = blockIdx.z;
+    const int partition_id = blockIdx.z + partition_offset;
     const int tid          = threadIdx.x;
 
     const int GQA = (num_kv_heads > 0) ? (num_heads / num_kv_heads) : 0;
