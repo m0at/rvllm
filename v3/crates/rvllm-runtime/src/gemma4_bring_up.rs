@@ -1518,21 +1518,17 @@ impl Gemma4Bringup {
             .region("gemm_f32_tmp", (num_seqs * gemm_f32_max_n * 4) as usize, 16)
             .unwrap();
 
-        // Bench path KV dtype: env-driven via RVLLM_NVFP4_KV /
-        // RVLLM_F16_KV (NVFP4-branch addition). FP8 remains the
-        // pre-NVFP4 default.
-        //
-        // TODO(hybrid-kv-bench): `run_bench` allocates and dispatches
-        // with one uniform kv_dtype, while live `run_generate` uses
-        // `KvDtype::for_layer_index_or_env(...)` so per-layer hybrids
-        // like `RVLLM_NVFP4_HYBRID_GLOBAL_FP8` and `RVLLM_FP8_KV_LAYERS`
-        // take effect. As a result the bench path cannot validate
-        // those exact production configs — perf numbers come from a
-        // simpler dispatch than what the running server uses. Plumbing
-        // per-layer dtype through bench requires per-layer scratch
-        // sizing and is bigger than this round's scope; documented as
-        // a known asymmetry for now.
-        let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
+        // Bench path KV dtype — Codex44-3: matches run_generate's
+        // per-layer dispatch via `KvDtype::for_layer_index_or_env(l)`
+        // so hybrid configs (`RVLLM_NVFP4_HYBRID_GLOBAL_FP8`,
+        // `RVLLM_NVFP4_HYBRID_SLIDING_FP8`, `RVLLM_FP8_KV_LAYERS`)
+        // measure the same dispatch shape the live server runs.
+        // The earlier uniform `from_env(false)` made bench numbers
+        // diverge silently from prod whenever a per-layer override
+        // was active — wrong target for tuning. Per-layer sizing +
+        // dispatch reads `kv_dtype_per_layer[layer_idx]` everywhere.
+        let mut kv_dtype_per_layer: Vec<crate::gemma4_layer_exec::KvDtype> =
+            Vec::with_capacity(arch.num_hidden_layers);
         // aa01001pftrope0 cliff-fix (F-series): sliding layers need
         // `slot_mapping[t] < sliding_blocks * block_size` at every rope
         // write. The old cap `sliding_window/block_size` broke at
@@ -1553,7 +1549,11 @@ impl Gemma4Bringup {
             let nkvh_l = arch.num_kv_heads_for_layer(l) as u32;
             let hd_l = arch.head_dim_for_layer(l) as u32;
             let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh_l as u64 * hd_l as u64;
-            kv_total_bytes += match kv_dtype {
+            // Codex44-3: per-layer dtype matches run_generate (line 1373).
+            let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                arch.layer_types[l], l, false);
+            kv_dtype_per_layer.push(kv_dtype_l);
+            kv_total_bytes += match kv_dtype_l {
                 crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
                 crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
                 crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2, // 2 elems/byte
@@ -1563,7 +1563,7 @@ impl Gemma4Bringup {
             // scale per 16 elems. F16 self-scaled so 0 bytes.
             let layer_scale_slots =
                 2u64 * layer_blocks as u64 * block_size as u64 * nkvh_l as u64;
-            kv_scale_total_bytes += match kv_dtype {
+            kv_scale_total_bytes += match kv_dtype_l {
                 crate::gemma4_layer_exec::KvDtype::F16 => 0,
                 crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
                 crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
@@ -1771,8 +1771,9 @@ impl Gemma4Bringup {
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
                     sliding_window: arch.sliding_window_size as u32,
-                    f16_kv: kv_dtype.is_f16(),
-                    kv_dtype,
+                    // Codex44-3: per-layer dtype, matches run_generate.
+                    f16_kv: kv_dtype_per_layer[layer_idx].is_f16(),
+                    kv_dtype: kv_dtype_per_layer[layer_idx],
                     bf16_residual: bf16_residual_enabled(),
                     current_max_context_len: None,
                 };
@@ -1785,7 +1786,9 @@ impl Gemma4Bringup {
                 let is_global = lt == Gemma4LayerType::GlobalAttention;
                 let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-                let kv_layer_bytes = match kv_dtype {
+                // Codex44-3: per-layer dtype determines per-layer KV bytes.
+                let layer_kv_dtype = kv_dtype_per_layer[layer_idx];
+                let kv_layer_bytes = match layer_kv_dtype {
                     crate::gemma4_layer_exec::KvDtype::F16 => layer_kv_elems * 2,
                     crate::gemma4_layer_exec::KvDtype::Fp8 => layer_kv_elems,
                     crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_kv_elems / 2,
@@ -1800,7 +1803,7 @@ impl Gemma4Bringup {
                 // NVFP4 path: K gets the first half of the layer's scale
                 // slab, V the second half. layer_kv_elems covers K+V so
                 // each half is `layer_kv_elems / 32` bytes (`/2/16`).
-                let (k_cache_scale, v_cache_scale) = if kv_dtype
+                let (k_cache_scale, v_cache_scale) = if layer_kv_dtype
                     == crate::gemma4_layer_exec::KvDtype::Nvfp4
                 {
                     let k_scale_bytes = layer_kv_elems / 32;

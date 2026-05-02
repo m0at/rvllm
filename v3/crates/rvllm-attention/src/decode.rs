@@ -1341,7 +1341,21 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             // — they don't service the production sliding-layer path
             // that benefits from the optimization, and changing their
             // signatures is a larger kernel surface to validate.
-            let split_supports_offset = !output_bf16 && hd <= 256;
+            //
+            // Codex44-1: the offset path REQUIRES the sentinel-init
+            // kernel — without it, partitions [0, partition_offset)
+            // never get written and the phase-2 reducer (which loops
+            // p < num_partitions) reads stale scratch. The loader at
+            // lib.rs:648 keeps the init kernel optional so older PTX
+            // trees still load, but the runtime fallback was
+            // missing: we used to launch with offset>0 anyway. Fall
+            // back to the legacy "launch every partition" shape
+            // (offset=0, full grid.z) when the init kernel isn't
+            // present — costs wasted CTAs on partial PTX builds but
+            // keeps results correct.
+            let split_supports_offset = !output_bf16
+                && hd <= 256
+                && fa2.fn_init_split_scratch_sentinels.is_some();
             let part_off_i: i32 = if split_supports_offset {
                 partition_offset as i32
             } else {
