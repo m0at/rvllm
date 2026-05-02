@@ -938,8 +938,13 @@ pub unsafe fn gemma4_forward_phase(
         kernels.fp8_gemv_wpr_native_f16in.is_some()
     };
     #[cfg(feature = "cuda")]
+    // Codex46-2: skip-gate must MATCH the fastpath dispatch gate at
+    // line 1220 (`qkv_blockscale != 0 && num_tokens == 1`). The
+    // fastpath kernel (`Fp8GemvF16InLaunch`) only reads the 2-D
+    // blockscale tensor — chscale is ignored. Requiring chscale != 0
+    // here was over-restrictive: blockscale-only weights would run
+    // the rmsnorm-quant prelude that the fastpath then ignores.
     let skip_attn_quant = dims.num_tokens == 1
-        && weights.qkv_chscale != 0
         && weights.qkv_blockscale != 0
         && weights.qkv_f16 == 0
         && qkv_native_kernel_present;
@@ -2031,9 +2036,10 @@ pub unsafe fn gemma4_forward_phase(
     // or when the Sm121 fast path will read `scratch.attn_out`
     // as f16 directly in step 7).
     #[cfg(feature = "cuda")]
+    // Codex46-2: align skip-gate with fastpath dispatch — chscale not
+    // required by `Fp8GemvF16InLaunch`.
     let skip_o_quant = dims.num_tokens <= FAST_PATH_M_MAX
         && weights.o_f16 == 0
-        && weights.o_chscale != 0
         && weights.o_blockscale != 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
@@ -2233,8 +2239,9 @@ pub unsafe fn gemma4_forward_phase(
     // f16 rmsnorm into delta_f16, leaving hidden_fp8/hidden_scale
     // unused.
     #[cfg(feature = "cuda")]
+    // Codex46-2: align skip-gate with fastpath dispatch — chscale not
+    // required by `Fp8GemvF16InLaunch`.
     let skip_ff_quant = dims.num_tokens <= FAST_PATH_M_MAX
-        && weights.gate_up_chscale != 0
         && weights.gate_up_blockscale != 0
         && weights.gate_up_f16 == 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();

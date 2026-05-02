@@ -167,11 +167,17 @@ __global__ void flash_attention_2_decode_nvfp4kv_split_bf16out_kernel(
     int max_blocks_per_seq,
     int window_size_left,
     int partition_size,
-    int max_num_partitions
+    int max_num_partitions,
+    // Codex46-1: bf16-out BC=32 split kernel now mirrors the f16-out
+    // BC=32 contract — caller pre-fills sentinels for partitions
+    // [0, partition_offset) via init_split_scratch_sentinels_kernel
+    // and we offset blockIdx.z to the absolute partition slot. Pass
+    // 0 to keep the legacy "launch every partition" behaviour.
+    int partition_offset
 ) {
     const int seq_idx      = blockIdx.x;
     const int head_idx     = blockIdx.y;
-    const int partition_id = blockIdx.z;
+    const int partition_id = blockIdx.z + partition_offset;
     const int tid          = threadIdx.x;
 
     const int context_len = context_lens[seq_idx];
