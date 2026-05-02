@@ -1350,7 +1350,23 @@ impl Gemma4Bringup {
         // routes M>=128 traffic onto cuBLASLt scalar mode, costing
         // significant prefill TTFT on sm_121.
         {
-            let env_on = parse_truthy_env("RVLLM_FP8_GEMM_CUTLASS_SM120").unwrap_or(false);
+            // Codex53-3: dispatch gate is `parse_truthy_env(...)
+            // .unwrap_or(true)` at gemma4_layer_exec.rs:2902 — env
+            // unset DEFAULTS TO ENABLED. The Codex51-3 startup log
+            // had this inverted (claimed unset → fallback) which
+            // would have led operators to set the env unnecessarily
+            // and possibly miss the real "opt-out" semantics
+            // (`RVLLM_FP8_GEMM_CUTLASS_SM120=0`). Three states to
+            // surface:
+            //   .so loaded + env != "0"  → fast path active (default
+            //                              when env is unset)
+            //   .so loaded + env  = "0"  → operator opt-out (regression
+            //                              diagnosis per the
+            //                              gemma4_layer_exec.rs comment)
+            //   .so missing              → fallback (warn if env != "0",
+            //                              info otherwise)
+            let env_raw = std::env::var("RVLLM_FP8_GEMM_CUTLASS_SM120").ok();
+            let env_off = matches!(env_raw.as_deref(), Some("0") | Some("false") | Some("FALSE"));
             let backend_name = match &cutlass {
                 CutlassBackend::SoSm120(_) => "SoSm120",
                 CutlassBackend::So(_) => "So",
@@ -1359,37 +1375,40 @@ impl Gemma4Bringup {
             };
             if matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121)) {
                 if matches!(cutlass, CutlassBackend::SoSm120(_)) {
-                    if env_on {
-                        tracing::info!(
+                    if env_off {
+                        tracing::warn!(
                             backend = backend_name,
-                            env_on = env_on,
-                            "[cutlass-sm120] SoSm120 .so loaded AND env enabled — \
-                             M>=128 GEMM takes the CUTLASS blockwise fast path."
+                            env = env_raw.as_deref().unwrap_or(""),
+                            "[cutlass-sm120] SoSm120 .so loaded but \
+                             RVLLM_FP8_GEMM_CUTLASS_SM120=0 — M>=128 GEMM \
+                             routed to cuBLASLt scalar (operator opt-out, \
+                             regression-diagnosis mode). Unset the env or \
+                             set =1 to re-enable the fast path."
                         );
                     } else {
                         tracing::info!(
                             backend = backend_name,
-                            env_on = env_on,
-                            "[cutlass-sm120] SoSm120 .so loaded but \
-                             RVLLM_FP8_GEMM_CUTLASS_SM120 is unset — M>=128 \
-                             traffic falls back to cuBLASLt scalar. Set \
-                             RVLLM_FP8_GEMM_CUTLASS_SM120=1 to enable the fast path."
+                            env = env_raw.as_deref().unwrap_or("(unset, default-on)"),
+                            "[cutlass-sm120] SoSm120 .so loaded — M>=128 GEMM \
+                             takes the CUTLASS blockwise fast path."
                         );
                     }
-                } else if env_on {
+                } else if !env_off {
                     tracing::warn!(
                         backend = backend_name,
-                        "[cutlass-sm120] RVLLM_FP8_GEMM_CUTLASS_SM120=1 is set but \
-                         the SoSm120 .so wasn't loaded (backend = {backend_name}). \
-                         Build via kernels/build_cutlass_sm120_so.sh and verify \
-                         kernels/sm_121/libcutlass_sm120.so is present.",
+                        "[cutlass-sm120] CUTLASS .so not loaded \
+                         (backend = {backend_name}); M>=128 paths run on \
+                         cuBLASLt scalar. Build via \
+                         kernels/build_cutlass_sm120_so.sh and verify \
+                         kernels/sm_121/libcutlass_sm120.so is present \
+                         to recover the prefill TTFT.",
                     );
                 } else {
                     tracing::info!(
                         backend = backend_name,
-                        "[cutlass-sm120] CUTLASS .so not loaded \
-                         (backend = {backend_name}). M>=128 paths use cuBLASLt scalar. \
-                         For best prefill TTFT on sm_121 build the SoSm120 .so."
+                        "[cutlass-sm120] CUTLASS .so not loaded and \
+                         RVLLM_FP8_GEMM_CUTLASS_SM120=0 — operator-disabled, \
+                         M>=128 paths use cuBLASLt scalar."
                     );
                 }
             }

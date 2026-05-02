@@ -662,6 +662,44 @@ impl Fp8GemvF16InLaunch {
         input_f16: u64,
         stream: u64,
     ) -> Result<()> {
+        // Codex53-4: kernels/fp8_gemv.cu loads FP8 weights via
+        // 64-bit reinterpret_cast (8 bytes = 8 e4m3 elements per
+        // load) and F16 input via 32-bit reads (2 halves). Both row
+        // strides == K, so K must be divisible by 8 for the FP8
+        // load and by 2 for the F16 load. K=8 alignment subsumes
+        // both. Gemma 4 dims (head_dim=256/512, hidden=5376) all
+        // satisfy this; reject at the launcher boundary so a future
+        // odd projection size doesn't silently miscompile.
+        if self.k % 8 != 0 {
+            return Err(rvllm_core::RvllmError::config(
+                rvllm_core::ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "Fp8GemvF16InLaunch requires K % 8 == 0 \
+                         (FP8 64-bit reinterpret_cast load); got K={}",
+                        self.k
+                    )],
+                },
+                "Fp8GemvF16InLaunch.k",
+            ));
+        }
+        // The block-scale layout is [ceil(N/128), ceil(K/128)] —
+        // see kernels/fp8_gemv.cu's `scale_row = n >> 7` indexing.
+        // The loader-side validator at gemma4_load.rs already
+        // guards the shape (Codex52-3); this is a defensive sanity
+        // check on the dispatch dims themselves so a stub blockscale
+        // pointer cannot be paired with degenerate N=0 or K=0.
+        if self.n == 0 || self.k == 0 || self.m == 0 {
+            return Err(rvllm_core::RvllmError::config(
+                rvllm_core::ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "Fp8GemvF16InLaunch rejects zero-size dims \
+                         (m={}, n={}, k={})",
+                        self.m, self.n, self.k
+                    )],
+                },
+                "Fp8GemvF16InLaunch.dims",
+            ));
+        }
         let mut output = output_f16;
         let mut weight = weight_fp8;
         let mut scale = b_chscale;
