@@ -313,8 +313,13 @@ impl<'a> PagedDecodeLauncher<'a> {
                     let mut arg_bt = block_tables_ptr;
                     let mut arg_cl = context_lens_ptr;
                     let _ = workspace_ptr; // unused: FA2 allocates smem dynamically
+                    // Codex39-2: forward sliding-window setting to the
+                    // f16io kernel. Earlier the param wasn't passed and
+                    // sliding layers attended the full context with
+                    // RVLLM_F16_KV=1 — both correctness and perf bug.
+                    let window_size_left = params.window_size_left;
 
-                    let args: [*mut core::ffi::c_void; 12] = [
+                    let args: [*mut core::ffi::c_void; 13] = [
                         &mut arg_out as *mut _ as *mut _,
                         &mut arg_q as *mut _ as *mut _,
                         &mut arg_k as *mut _ as *mut _,
@@ -327,6 +332,7 @@ impl<'a> PagedDecodeLauncher<'a> {
                         &head_dim as *const _ as *mut _,
                         &block_size as *const _ as *mut _,
                         &max_blocks_per_seq as *const _ as *mut _,
+                        &window_size_left as *const _ as *mut _,
                     ];
 
                     let rc = cuLaunchKernel(
@@ -1479,16 +1485,21 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
     pub fn has_split_kernels(&self, head_dim: u32) -> bool {
         match self.backend {
             super::AttentionBackend::Fa2Ptx(fa2) => {
-                // Codex38-4: count the GQA-shared variant as a valid
-                // split-capable kernel for the BC=32 path. The
-                // dispatcher prefers it when RVLLM_NVFP4_SPLIT_GQA=1
-                // and gqa_ratio is in range, so a PTX tree shipping
-                // only that symbol must still report has_split=true.
+                // Codex39-4: tighten Codex38-4. The dispatcher only
+                // takes the GQA-shared kernel when RVLLM_NVFP4_SPLIT_GQA=1
+                // and the ratio fits; otherwise it falls back to the
+                // per-Q symbol. Reporting "available" when only the
+                // GQA symbol exists with the env unset would hand the
+                // caller a green light that turns into FeatureNotAvailable
+                // at launch time. Accept GQA-only ⇔ env explicitly set.
+                let gqa_env_on = std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
+                    .map(|v| v == "1" || v == "true" || v == "TRUE")
+                    .unwrap_or(false);
                 let split_for_hd = if head_dim > 256 {
                     fa2.fn_decode_nvfp4kv_split_bc16.is_some()
                 } else {
                     fa2.fn_decode_nvfp4kv_split.is_some()
-                        || fa2.fn_decode_nvfp4kv_split_gqa.is_some()
+                        || (gqa_env_on && fa2.fn_decode_nvfp4kv_split_gqa.is_some())
                 };
                 split_for_hd && fa2.fn_paged_attn_reduce_f16.is_some()
             }

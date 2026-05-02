@@ -924,7 +924,14 @@ __global__ void flash_attention_2_decode_fp8kv_kernel(
     const int tid      = threadIdx.x;
 
     const int context_len = context_lens[seq_idx];
-    if (context_len == 0) return;
+    if (context_len == 0) {
+        // Codex39-1: FP8 non-GQA padded-zero (twin of NVFP4 + GQA).
+        const int out_base = (seq_idx * num_heads + head_idx) * head_dim;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            output[out_base + d] = __float2half(0.0f);
+        }
+        return;
+    }
 
     const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx
                                                          : (head_idx / (num_heads / num_kv_heads));
@@ -1375,14 +1382,26 @@ __global__ void flash_attention_2_decode_f16io_kernel(
     int num_kv_heads,
     int head_dim,
     int block_size,
-    int max_blocks_per_seq
+    int max_blocks_per_seq,
+    // Codex39-2: sliding window. `< 0` = no window (matches the
+    // FP8 + NVFP4 sibling kernels' convention). When >= 0, only KV
+    // positions in `[decode_q_abs - window_size_left, decode_q_abs]`
+    // are attended; earlier tiles are skipped wholesale.
+    int window_size_left
 ) {
     const int seq_idx  = blockIdx.x;
     const int head_idx = blockIdx.y;
     const int tid      = threadIdx.x;
 
     const int context_len = context_lens[seq_idx];
-    if (context_len == 0) return;
+    if (context_len == 0) {
+        // Codex39-3: F16 padded-zero (twin of FP8 + NVFP4).
+        const int out_base = (seq_idx * num_heads + head_idx) * head_dim;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            output[out_base + d] = __float2half(0.0f);
+        }
+        return;
+    }
 
     const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx : (head_idx / (num_heads / num_kv_heads));
 
@@ -1394,6 +1413,15 @@ __global__ void flash_attention_2_decode_f16io_kernel(
 
     const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
     const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
+
+    // Codex39-2: sliding-window prune. `window_size_left < 0` ⇒ no
+    // window (full-causal). Otherwise only attend KV in
+    // `[max(0, decode_q_abs - window_size_left), decode_q_abs]`.
+    const int decode_q_abs_pos = context_len - 1;
+    const int window_start = (window_size_left < 0)
+        ? 0
+        : max(0, decode_q_abs_pos - window_size_left);
+    const int first_tile = window_start / FA2_BC;
 
     // Load Q (f16 -> f32 registers)
     float q_reg[8];
@@ -1411,7 +1439,7 @@ __global__ void flash_attention_2_decode_f16io_kernel(
     float acc[8];
     for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] = 0.0f;
 
-    for (int tile = 0; tile < num_kv_tiles; tile++) {
+    for (int tile = first_tile; tile < num_kv_tiles; tile++) {
         const int tile_start = tile * FA2_BC;
         const int tile_len = min(FA2_BC, context_len - tile_start);
 
@@ -1433,7 +1461,14 @@ __global__ void flash_attention_2_decode_f16io_kernel(
                 if (d < head_dim) dot += q_reg[r] * s_key[t * head_dim + d];
             }
             dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
-            if (tid == 0) s_score[t] = dot;
+            if (tid == 0) {
+                // Codex39-2: per-element sliding-window mask for the
+                // boundary tile (only `first_tile` may straddle the
+                // window edge; all later tiles satisfy kv_pos >=
+                // window_start by construction).
+                int kv_pos = tile_start + t;
+                s_score[t] = (kv_pos < window_start) ? -FLT_MAX : dot;
+            }
             __syncthreads();
         }
 

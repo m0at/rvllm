@@ -4355,10 +4355,21 @@ impl Gemma4Bringup {
             rvllm_attention::PagedDecodeNvfp4Launcher::new(&self.sliding_attention);
         let global_split_decode_for_graph =
             rvllm_attention::PagedDecodeNvfp4Launcher::new(&self.global_attention);
+        // Codex39-5: per-layer overrides (RVLLM_FP8_KV_LAYERS,
+        // HYBRID_GLOBAL_FP8, HYBRID_SLIDING_FP8) can pull every layer
+        // off NVFP4 even when the env-default is Nvfp4. If no layer
+        // actually runs NVFP4 split, the parts-boundary check costs
+        // graph capture for nothing. Walk all layers once at startup
+        // and require at least one to land on Nvfp4 KV before
+        // treating split-KV as active for the graph predicate.
+        let any_layer_nvfp4 = (0..arch.num_hidden_layers).any(|li| {
+            let lt = arch.layer_types[li];
+            crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(lt, li, false)
+                == crate::gemma4_layer_exec::KvDtype::Nvfp4
+        });
         let split_kv_active_for_graph = parse_truthy_env("RVLLM_NVFP4_SPLIT_KV")
             .unwrap_or(true)
-            && crate::gemma4_layer_exec::KvDtype::from_env(false)
-                == crate::gemma4_layer_exec::KvDtype::Nvfp4
+            && any_layer_nvfp4
             && (split_decode_for_graph.has_split_kernels(arch.head_dim_sliding as u32)
                 || global_split_decode_for_graph
                     .has_split_kernels(arch.head_dim_global as u32));
