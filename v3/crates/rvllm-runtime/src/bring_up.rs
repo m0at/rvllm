@@ -131,6 +131,17 @@ impl Bringup {
         let kernels_dir = resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
         let manifest_path = kernels_dir.join("manifest.json");
         let manifest = KernelManifest::load_and_verify(&manifest_path)?;
+        // Codex29-1: assert manifest.arch matches the runtime arch.
+        // resolve_kernels_dir already picked by arch, but a stale /
+        // copied manifest from another arch is size+sha-consistent
+        // and would otherwise slip through to kernel-launch failures.
+        #[cfg(feature = "cuda")]
+        {
+            let (maj, min) = ctx.compute_capability();
+            if let Some(t) = rvllm_core::CompileTarget::from_compute_capability(maj, min) {
+                manifest.assert_arch(t.as_sm_str())?;
+            }
+        }
         let kernels = Arc::new(KernelLoader::new(manifest));
         let fused_modules = load_fused(&kernels)?;
 

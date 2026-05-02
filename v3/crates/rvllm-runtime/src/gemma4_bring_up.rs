@@ -1129,6 +1129,13 @@ impl Gemma4Bringup {
         let kernels_dir = crate::bring_up::resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
         let manifest_path = kernels_dir.join("manifest.json");
         let manifest = rvllm_kernels::manifest::KernelManifest::load_and_verify(&manifest_path)?;
+        // Codex29-1: hard-fail if manifest.arch != runtime arch. The
+        // kernels_dir was picked by arch already, but a stale / copied
+        // manifest from another arch can be size+sha-consistent and
+        // would otherwise slip through.
+        if let Some(t) = compile_target {
+            manifest.assert_arch(t.as_sm_str())?;
+        }
         // Codex23-2: warn (not fail) on manifest-vs-binary revision drift.
         // The kernels crate's build.rs bakes `RVLLM_BUILD_REVISION` from
         // git short HEAD; the manifest carries the same field per

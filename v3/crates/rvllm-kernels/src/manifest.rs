@@ -56,8 +56,18 @@ impl VerifiedManifest {
     }
     /// Resolve a logical name to its on-disk absolute path.
     /// Returns `None` if the name is not in the manifest.
+    /// Codex29-2: load_and_verify already rejected absolute / parent-
+    /// dir entries, so anything reaching this method is safely below
+    /// `root`. Defense-in-depth: drop entries that gained absolute /
+    /// parent components after load (corrupted in memory, fuzz, …).
     pub fn path_of(&self, logical_name: &str) -> Option<PathBuf> {
-        let rel = &self.manifest.entries.get(logical_name)?.path;
+        let rel_str = &self.manifest.entries.get(logical_name)?.path;
+        let rel = Path::new(rel_str);
+        if rel.is_absolute()
+            || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return None;
+        }
         Some(self.root.join(rel))
     }
     pub fn revision(&self) -> &str {
@@ -69,6 +79,29 @@ impl VerifiedManifest {
     /// `"dev"` when git is absent. Use as the `expected` argument to
     /// `warn_if_revision_drift`.
     pub const BUILD_REVISION: &'static str = env!("RVLLM_BUILD_REVISION");
+
+    /// Codex29-1: hard-fail if the manifest's `arch` field disagrees
+    /// with the runtime-detected compute capability. resolve_kernels_dir
+    /// already picked the directory by arch (e.g. `kernels/sm_121/`),
+    /// but a stale or copied manifest.json from a different arch can
+    /// still be size+sha-consistent and slip through. The fix: compare
+    /// strings here, before any kernel is loaded.
+    pub fn assert_arch(&self, expected: &str) -> Result<()> {
+        if self.manifest.arch != expected {
+            return Err(RvllmError::config(
+                ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "manifest arch {:?} does not match runtime arch {:?} — \
+                         manifest.json is stale or copied from another arch; \
+                         rebuild kernels/ for this device",
+                        self.manifest.arch, expected
+                    )],
+                },
+                "manifest.arch",
+            ));
+        }
+        Ok(())
+    }
     pub fn arch(&self) -> &str {
         &self.manifest.arch
     }
@@ -123,9 +156,38 @@ impl KernelManifest {
             )
         })?;
 
+        // Codex29-2: every entry path must be a plain relative path
+        // that stays under `root`. Reject absolute paths and parent
+        // (`..`) components up front so a malicious / corrupted
+        // manifest can't point at `/etc/...` or `../sm_90/foo.ptx`
+        // and have the size+sha gate accept whatever happens to
+        // match. After the textual check, canonicalize and re-verify
+        // the resolved path is rooted at `root.canonicalize()`.
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         let mut mismatches = Vec::new();
         for (name, entry) in &manifest.entries {
-            let path = root.join(&entry.path);
+            let rel = Path::new(&entry.path);
+            if rel.is_absolute()
+                || rel.components().any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                mismatches.push(format!(
+                    "{name}: entry path {:?} must be relative and not contain `..`",
+                    entry.path
+                ));
+                continue;
+            }
+            let path = root.join(rel);
+            // Symlink-resistant containment check: canonicalize and
+            // verify it is still under `canon_root`.
+            if let Ok(canon) = path.canonicalize() {
+                if !canon.starts_with(&canon_root) {
+                    mismatches.push(format!(
+                        "{name}: resolved path {:?} escapes manifest root {:?}",
+                        canon, canon_root
+                    ));
+                    continue;
+                }
+            }
             let bytes = fs::read(&path).map_err(|source| RvllmError::Io {
                 err: IoError::from(&source),
                 path: path.clone(),
