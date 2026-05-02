@@ -1377,11 +1377,11 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
             let mut a_cl    = context_lens;
             let mut a_qd    = q_descale_ptr;
 
-            // Codex41-2: BC=32 split kernel takes 22 args (with
-            // partition_offset trailing); BC=16 and GQA stay at 21.
-            // Use a flat Vec to keep both shapes in one place; the
-            // launch-arg pointer just sees a contiguous array.
-            let mut split_argv: Vec<*mut core::ffi::c_void> = vec![
+            // Codex54-1: all NVFP4 split kernels (BC=32, BC=16, both
+            // f16-out and bf16-out, plus GQA-shared) now take 22 args
+            // including the trailing partition_offset. The argv is
+            // therefore fixed-shape; no conditional push.
+            let split_argv: [*mut core::ffi::c_void; 22] = [
                 &mut a_tmp  as *mut _ as *mut _,
                 &mut a_maxl as *mut _ as *mut _,
                 &mut a_esum as *mut _ as *mut _,
@@ -1403,10 +1403,21 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 &window_size_left   as *const _ as *mut _,
                 &partition_size_i   as *const _ as *mut _,
                 &max_parts_i        as *const _ as *mut _,
+                // Codex54-1: all currently-shipped NVFP4 split kernels
+                // (BC=32 / BC=16 × f16-out / bf16-out + GQA-shared)
+                // take partition_offset unconditionally as their last
+                // arg. Earlier this push was gated on
+                // `split_supports_offset` (which also checked the
+                // optional init-sentinel kernel), creating an ABI
+                // skew on partial PTX trees where the init symbol
+                // was missing but the split kernels were present:
+                // launcher would push 21 args while the kernel
+                // expects 22. Always push the arg; when the init
+                // kernel isn't loaded, `part_off_i` is forced to 0
+                // upstream so the kernel runs the legacy "launch
+                // every partition" shape.
+                &part_off_i         as *const _ as *mut _,
             ];
-            if split_supports_offset {
-                split_argv.push(&part_off_i as *const _ as *mut _);
-            }
 
             // Codex35-2 / Codex41-2: launch only the in-window
             // partitions. With partition_offset > 0 the kernel writes
