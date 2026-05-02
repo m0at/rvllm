@@ -358,6 +358,8 @@ pub struct Gemma4FusedModules {
     /// Cycle 55 step 5 (Phase B): bf16-typed sibling of qk_norm_mod.
     pub qk_norm_bf16_mod: LoadedModule,
     pub softcap_mod: LoadedModule,
+    /// Codex41-3: device-side repetition penalty PTX module.
+    pub repetition_penalty_mod: LoadedModule,
     pub residual_scale_mod: LoadedModule,
     pub vnorm_mod: LoadedModule,
     pub vector_add_mod: LoadedModule,
@@ -397,6 +399,9 @@ pub struct Gemma4FusedModules {
     /// generate samples directly from f32 logits (no f16 conversion);
     /// PPL/bench convert through f16 and use `fn_softcap`.
     pub fn_softcap_f32: KernelFn,
+    /// Codex41-3: GPU-side repetition penalty (replaces the host
+    /// DtoH-edit-HtoD path that cost ~7ms/decode-step).
+    pub fn_apply_repetition_penalty_f32: KernelFn,
     pub fn_residual_scale: KernelFn,
     pub fn_vnorm: KernelFn,
     pub fn_vector_add: KernelFn,
@@ -3188,6 +3193,11 @@ impl Gemma4Bringup {
 
         let residual = arena.region("gen_residual", (max_tokens * hidden * 2) as usize, 16)?;
         let logits_f32 = arena.region("gen_logits_f32", (vocab * 4) as usize, 16)?;
+        // Codex41-3: device-side scratch for the recent-IDs list the
+        // GPU repetition-penalty kernel reads. 1024 i32 = 4 KB —
+        // covers any reasonable rep-window without bouncing the full
+        // vocab through host memory.
+        let rep_ids_dev = arena.region("gen_rep_ids", 1024 * 4, 16)?;
         let token_ids_region = arena.region("gen_tok_ids", (max_tokens * 4) as usize, 16)?;
         let sampled = arena.region("gen_sampled", 4, 16)?;
         let residual_ptr = residual.device_ptr();
@@ -4679,12 +4689,48 @@ impl Gemma4Bringup {
             }
             self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
                 logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
-            // === REPETITION PENALTY (decode-loop site) ===
+            // Codex41-1: apply Gemma final logit_softcap on EVERY
+            // decode step. Codex40-2 only patched the prefill-site
+            // softcap; the decode loop runs its own LM-head GEMM and
+            // was sampling from un-capped logits for tokens 2..N,
+            // diverging from PPL/bench and from the trained-output
+            // distribution.
+            if arch.logit_softcap > 0.0 {
+                rvllm_fused::gemma4_launcher::LogitSoftcapLaunch {
+                    num_tokens: 1,
+                    vocab,
+                    cap: arch.logit_softcap,
+                }
+                .launch(self.fused.fn_softcap_f32, logits_f32.device_ptr(), stream)?;
+            }
+            // Codex41-4: tool_call_open_bias also belongs on every
+            // decode step. The first-token site (line ~4196) had it;
+            // later tokens were missing the bias, so the sampler's
+            // open-tag preference was inconsistent across the
+            // generation. Mirror the bias write here.
+            if tool_call_bias != 0.0 {
+                let mut logit_48: f32 = 0.0;
+                cuda_check!(cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    &mut logit_48 as *mut _ as *mut _,
+                    logits_f32.device_ptr() + 48 * 4,
+                    4,
+                ), "tool_bias_logit48_dtoh_decode", stream);
+                let new_logit = logit_48 + tool_call_bias;
+                cuda_check!(cudarc::driver::sys::cuMemcpyHtoD_v2(
+                    logits_f32.device_ptr() + 48 * 4,
+                    &new_logit as *const _ as *const _,
+                    4,
+                ), "tool_bias_logit48_htod_decode", stream);
+            }
+            // === REPETITION PENALTY (decode-loop site) — Codex41-3 ===
+            // Earlier this synchronised the stream and bounced the
+            // entire 262k-vocab logits through host memory every step
+            // (~7ms/token). Now we collect the recent-id set on the
+            // host, HtoD-copy just that small list (≤ rep_window i32),
+            // and invoke `apply_repetition_penalty_f32_kernel` to
+            // mutate the f32 logits in place — no DtoH, no fence.
             if rep_active && !output_ids.is_empty() {
-                self.stream.fence()?;
                 let start_idx = output_ids.len().saturating_sub(rep_window);
-                // Count occurrences in the window, then keep only IDs
-                // that meet the min_count threshold.
                 let mut counts: std::collections::HashMap<u32, u32> =
                     std::collections::HashMap::new();
                 for &id in &output_ids[start_idx..] {
@@ -4699,29 +4745,26 @@ impl Gemma4Bringup {
                 // the model wants to terminate.
                 for sid in eos_ids { recent.remove(sid); }
                 if !recent.is_empty() {
-                    let mut host_logits = vec![0f32; vocab as usize];
-                    cudarc::driver::sys::cuMemcpyDtoH_v2(
-                        host_logits.as_mut_ptr() as *mut _,
+                    let cap = 1024usize; // device buffer capacity
+                    let ids_vec: Vec<i32> = recent.iter()
+                        .take(cap)
+                        .map(|&id| id as i32)
+                        .collect();
+                    cuda_check!(cudarc::driver::sys::cuMemcpyHtoD_v2(
+                        rep_ids_dev.device_ptr(),
+                        ids_vec.as_ptr() as *const _,
+                        ids_vec.len() * 4,
+                    ), "rep_penalty_ids_htod", stream);
+                    rvllm_fused::gemma4_launcher::ApplyRepetitionPenaltyLaunch {
+                        num_ids: ids_vec.len() as u32,
+                        vocab,
+                        penalty: rep_penalty,
+                    }.launch(
+                        self.fused.fn_apply_repetition_penalty_f32,
                         logits_f32.device_ptr(),
-                        (vocab as usize) * 4,
-                    );
-                    for id in &recent {
-                        let i = *id as usize;
-                        if i < host_logits.len() {
-                            // HF convention: positive → divide, negative → multiply.
-                            // Both push the logit toward zero (less attractive).
-                            if host_logits[i] >= 0.0 {
-                                host_logits[i] /= rep_penalty;
-                            } else {
-                                host_logits[i] *= rep_penalty;
-                            }
-                        }
-                    }
-                    cudarc::driver::sys::cuMemcpyHtoD_v2(
-                        logits_f32.device_ptr(),
-                        host_logits.as_ptr() as *const _,
-                        (vocab as usize) * 4,
-                    );
+                        rep_ids_dev.device_ptr(),
+                        stream,
+                    )?;
                 }
             }
             // === END REPETITION PENALTY ===
@@ -5055,6 +5098,10 @@ fn load_gemma4_fused(
     let fn_qk_rmsnorm_bf16 = qk_norm_bf16_mod.get_function("fused_qk_rmsnorm_bf16_kernel")?;
     let fn_softcap = softcap_mod.get_function("logit_softcap_kernel")?;
     let fn_softcap_f32 = softcap_mod.get_function("logit_softcap_f32_kernel")?;
+    // Codex41-3: GPU repetition penalty.
+    let repetition_penalty_mod = loader.load_ptx("repetition_penalty")?;
+    let fn_apply_repetition_penalty_f32 =
+        repetition_penalty_mod.get_function("apply_repetition_penalty_f32_kernel")?;
     let fn_residual_scale = residual_scale_mod.get_function("residual_scale_f16_kernel")?;
     let fn_vnorm = vnorm_mod.get_function("vnorm_f16_kernel")?;
     let fn_vector_add = vector_add_mod.get_function("vector_add_f16_kernel")?;
@@ -5164,6 +5211,7 @@ fn load_gemma4_fused(
         qk_norm_mod,
         qk_norm_bf16_mod,
         softcap_mod,
+        repetition_penalty_mod,
         residual_scale_mod,
         vnorm_mod,
         vector_add_mod,
@@ -5193,6 +5241,7 @@ fn load_gemma4_fused(
         fn_qk_rmsnorm_bf16,
         fn_softcap,
         fn_softcap_f32,
+        fn_apply_repetition_penalty_f32,
         fn_residual_scale,
         fn_vnorm,
         fn_vector_add,

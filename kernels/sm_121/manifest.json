@@ -276,6 +276,11 @@
       "path": "probe_green_ctx.ptx",
       "sha256": "7fddcc1223529f89736a859f33a5b7fab538c90ee2411dffb3282b9cec1f57fc"
     },
+    "repetition_penalty": {
+      "bytes": 4570,
+      "path": "repetition_penalty.ptx",
+      "sha256": "71214e10474cd96ebf0cf2e0965834fcdee6c8d0ad19a6659b6134b4e83afdda"
+    },
     "residual_scale_f16": {
       "bytes": 1513,
       "path": "residual_scale_f16.ptx",
@@ -322,5 +327,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "882529d"
+  "revision": "2803a1a"
 }

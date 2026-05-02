@@ -790,6 +790,57 @@ impl F16ToBf16Launch {
 // logit_softcap
 // ---------------------------------------------------------------------------
 
+// Codex41-3: GPU-side repetition penalty.
+// Kernel sig: `(logits_f32, ids_i32, num_ids, vocab, penalty)`
+pub struct ApplyRepetitionPenaltyLaunch {
+    pub num_ids: u32,
+    pub vocab: u32,
+    pub penalty: f32,
+}
+
+impl ApplyRepetitionPenaltyLaunch {
+    pub fn validate(&self) -> Result<()> {
+        if self.vocab == 0 {
+            return Err(invalid("repetition_penalty.vocab", "0"));
+        }
+        if self.penalty <= 0.0 {
+            return Err(invalid("repetition_penalty.penalty", "must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// Caller owns pointers. `ids_dev` must be a device pointer to
+    /// `num_ids` i32 entries; `logits_dev` to `vocab` f32 entries.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        logits_dev: u64,
+        ids_dev: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        // No-op when nothing to penalize. Saves a launch.
+        if self.num_ids == 0 {
+            return Ok(());
+        }
+        let mut logits = logits_dev;
+        let mut ids = ids_dev;
+        let mut n = self.num_ids as i32;
+        let mut vocab = self.vocab as i32;
+        let mut pen = self.penalty;
+        let args = [
+            (&mut logits) as *mut u64 as *mut core::ffi::c_void,
+            (&mut ids) as *mut u64 as *mut core::ffi::c_void,
+            (&mut n) as *mut i32 as *mut core::ffi::c_void,
+            (&mut vocab) as *mut i32 as *mut core::ffi::c_void,
+            (&mut pen) as *mut f32 as *mut core::ffi::c_void,
+        ];
+        let block_w = self.num_ids.min(1024).max(1);
+        launch_raw(kernel, (1, 1, 1), (block_w, 1, 1), 0, stream, &args)
+    }
+}
+
 pub struct LogitSoftcapLaunch {
     pub num_tokens: u32,
     pub vocab: u32,
