@@ -49,6 +49,11 @@ pub struct Qwen36OutsideKernels {
     /// cuBLASLt's fp8_gemm consumes.
     pub fused_rmsnorm_fp8_quant_mod: LoadedModule,
     pub fn_fused_rmsnorm_fp8_quant: KernelFn,
+    /// Phase 4g: partial-rotary RoPE kernel (f16 Q/K/V → f16 q_out
+    /// + KV cache write). Qwen 3.6 uses partial_rotary_factor=0.25,
+    /// so only `head_dim * 0.25 = 64` of the 256 head_dim is rotated.
+    pub fused_rope_partial_f16kv_mod: LoadedModule,
+    pub fn_fused_rope_partial_f16kv: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -177,6 +182,10 @@ impl Qwen36Bringup {
         let fused_rmsnorm_fp8_quant_mod = kernels.load_ptx("fused_rmsnorm_fp8_quant")?;
         let fn_fused_rmsnorm_fp8_quant =
             fused_rmsnorm_fp8_quant_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
+        let fused_rope_partial_f16kv_mod =
+            kernels.load_ptx("fused_rope_partial_f16kv")?;
+        let fn_fused_rope_partial_f16kv = fused_rope_partial_f16kv_mod
+            .get_function("fused_rope_partial_f16kv_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -188,11 +197,13 @@ impl Qwen36Bringup {
             fn_argmax,
             fused_rmsnorm_fp8_quant_mod,
             fn_fused_rmsnorm_fp8_quant,
+            fused_rope_partial_f16kv_mod,
+            fn_fused_rope_partial_f16kv,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
              rmsnorm_inplace_f16, fp8_gemv (wpr_native_f16in: {}), \
-             argmax, fused_rmsnorm_fp8_quant.",
+             argmax, fused_rmsnorm_fp8_quant, fused_rope_partial_f16kv.",
             outside_kernels.fn_fp8_gemv_wpr_native_f16in.is_some(),
         );
 
@@ -267,7 +278,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4f bring-up complete: outside (incl. \
+            "[qwen36] Phase 4g bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -319,6 +330,10 @@ impl Qwen36Bringup {
         // blockwise FP8 weights. Synthetic input — proves all three
         // projection roles work end-to-end through the same kernel.
         bringup.forward_layer3_qkv_probe()?;
+        // Phase 4g: partial RoPE launch against the precomputed
+        // cos/sin tables. Identity at position 0, sanity-checks
+        // ABI + table indexing.
+        bringup.forward_layer3_rope_probe()?;
 
         Ok(bringup)
     }
@@ -715,6 +730,146 @@ impl Qwen36Bringup {
         eprintln!(
             "[qwen36] forward_layer3_qknorm: per-head rmsnorm (head_dim={head_dim}, eps={eps:.0e}) \
              q_norm[head0,0..4]={qn:?} k_norm[head0,0..4]={kn:?}"
+        );
+        Ok(())
+    }
+
+    /// Phase 4g probe: launch `fused_rope_partial_f16kv` against
+    /// synthetic Q/K/V buffers and a small KV-cache stand-in. Validates:
+    ///   - the partial RoPE kernel ABI (15 args: q_in/k_in/v_in/
+    ///     q_out/k_cache/v_cache/cos/sin/positions/slot_mapping +
+    ///     5 ints) matches what the qwen36 RoPE wiring will need.
+    ///   - the RoPE cos/sin tables uploaded in Phase 4f are usable
+    ///     by the kernel (kernel reads cos[pos*hd/2 + i] / sin
+    ///     analogues, so a position-0 lookup hits cos=1.0/sin=0.0,
+    ///     which means RoPE is identity for position 0 — the
+    ///     post-rope Q values should equal the pre-rope Q values).
+    /// MRoPE section dispatch (sections [11, 11, 10]) is a no-op
+    /// for text-only mode at position 0; Phase 4h+ wires real
+    /// positions from the input sequence.
+    pub fn forward_layer3_rope_probe(&self) -> Result<()> {
+        let head_dim = self.arch.base.head_dim as u32;
+        let num_heads = self.arch.base.num_attention_heads as u32;
+        let num_kv_heads = self.arch.base.num_key_value_heads as u32;
+        // Qwen 3.6 partial_rotary_factor = 0.25 → rotary_dim = 64
+        // (only the first 64 of the 256 head_dim values are rotated).
+        let rotary_dim = (head_dim as f32 * 0.25) as u32;
+        let num_tokens: u32 = 1;
+
+        // Synthetic f16 all-twos for Q/K/V (per-head, all positions).
+        let two_bits = 0x4000u16.to_le_bytes();
+        let q_elems = (num_tokens as usize) * (num_heads as usize) * (head_dim as usize);
+        let kv_elems =
+            (num_tokens as usize) * (num_kv_heads as usize) * (head_dim as usize);
+        let mut q_in_bytes = Vec::with_capacity(q_elems * 2);
+        for _ in 0..q_elems {
+            q_in_bytes.extend_from_slice(&two_bits);
+        }
+        let mut kv_in_bytes = Vec::with_capacity(kv_elems * 2);
+        for _ in 0..kv_elems {
+            kv_in_bytes.extend_from_slice(&two_bits);
+        }
+
+        let q_region = self.arena.region("qwen36_l3rope_q", q_in_bytes.len(), 16)?;
+        let k_region = self.arena.region("qwen36_l3rope_k", kv_in_bytes.len(), 16)?;
+        let v_region = self.arena.region("qwen36_l3rope_v", kv_in_bytes.len(), 16)?;
+        unsafe {
+            q_region.copy_from_host(&q_in_bytes)?;
+            k_region.copy_from_host(&kv_in_bytes)?;
+            v_region.copy_from_host(&kv_in_bytes)?;
+        }
+        // KV cache stand-in: 1 slot's worth, same byte size as one
+        // [num_kv_heads, head_dim] vector. Real KV cache lives in
+        // Phase 4h.
+        let k_cache_region =
+            self.arena.region("qwen36_l3rope_kc", kv_in_bytes.len(), 16)?;
+        let v_cache_region =
+            self.arena.region("qwen36_l3rope_vc", kv_in_bytes.len(), 16)?;
+
+        // Position [0] + slot_mapping [0] (single-token, slot index 0).
+        let zero_i32 = 0i32.to_le_bytes();
+        let pos_region = self.arena.region("qwen36_l3rope_pos", 4, 16)?;
+        let slot_region = self.arena.region("qwen36_l3rope_slot", 4, 16)?;
+        unsafe {
+            pos_region.copy_from_host(&zero_i32)?;
+            slot_region.copy_from_host(&zero_i32)?;
+        }
+
+        // Launch fused_rope_partial_f16kv. Kernel sig (16 args from
+        // gemma4_layer_exec.rs::rope_f16kv): q_in, k_in, v_in, q_out
+        // (alias=q_in for in-place), k_cache, v_cache, cos, sin,
+        // positions, slot_mapping, num_tokens, num_heads, num_kv_heads,
+        // head_dim, rotary_dim.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let mut q_in = q_region.device_ptr();
+            let mut k_in = k_region.device_ptr();
+            let mut v_in = v_region.device_ptr();
+            let mut q_out = q_region.device_ptr(); // in-place
+            let mut k_cache = k_cache_region.device_ptr();
+            let mut v_cache = v_cache_region.device_ptr();
+            let mut cos = self.rope_cos;
+            let mut sin = self.rope_sin;
+            let mut positions = pos_region.device_ptr();
+            let mut slot_mapping = slot_region.device_ptr();
+            let mut nt = num_tokens as i32;
+            let mut nh = num_heads as i32;
+            let mut nkvh = num_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut rd = rotary_dim as i32;
+            let args = [
+                (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+                (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+                (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let max_heads = num_heads.max(num_kv_heads);
+            let grid = (num_tokens, max_heads, 1);
+            let block = ((head_dim / 2).max(32), 1, 1);
+            rvllm_fused::launch_raw(
+                self.outside_kernels.fn_fused_rope_partial_f16kv,
+                grid,
+                block,
+                0,
+                self.stream.raw() as u64,
+                &args,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // DtoH first 4 f16 of post-rope Q. At position=0 RoPE should
+        // be identity (cos=1, sin=0), so q_out[0..4] == 2.0 if the
+        // kernel honours the position-0 contract.
+        let mut probe = [0u8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                q_region.device_ptr(),
+                probe.len(),
+            );
+        }
+        let q0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
+        let q1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+        let q2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
+        let q3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+        eprintln!(
+            "[qwen36] forward_layer3_rope_probe: head_dim={head_dim} \
+             rotary_dim={rotary_dim} (partial 0.25) pos=0 → \
+             q_post_rope[head0,0..4]=[{q0:.3}, {q1:.3}, {q2:.3}, {q3:.3}] \
+             (expected ≈ 2.0 at pos=0 — RoPE is identity there)"
         );
         Ok(())
     }
