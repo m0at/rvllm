@@ -94,11 +94,11 @@ pub async fn spawn_cuda_worker(
                         }
                     };
                     let _ = ready_tx.send(Err(
-                        "qwen36 phase 3g: full Qwen weight load + \
-                         outside-only forward smoke (embed → rmsnorm \
-                         + fp8quant → cublaslt.fp8_gemm → cpu argmax) \
-                         validated end-to-end. Per-layer forward \
-                         (full-attn + linear-attn + MoE) still TODO. \
+                        "qwen36 phase 4a: outside-only forward exposed \
+                         as `Qwen36Bringup::forward_outside_only(tokens)` \
+                         — ready for cuda_worker dispatch in Phase 4b. \
+                         Per-layer forward (full-attn + linear-attn + \
+                         MoE) still TODO. \
                          See ~/.claude/plans/abundant-meandering-sifakis.md"
                             .to_string(),
                     ));

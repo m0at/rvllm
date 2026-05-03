@@ -207,7 +207,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 3g bring-up complete: outside (incl. \
+            "[qwen36] Phase 4a bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -238,6 +238,19 @@ impl Qwen36Bringup {
         // loaded weights. If this throws, the rest of the forward
         // pipeline can't be built on top — fail fast.
         bringup.forward_outside_smoke()?;
+
+        // Phase 4a: verify the reusable `forward_outside_only` API by
+        // calling it on a slightly different sequence and logging the
+        // argmax token id. Confirms the same kernel chain works
+        // through the public method, ready for cuda_worker dispatch
+        // in Phase 4b.
+        let probe = bringup.forward_outside_only(&[1, 200, 2000, 20_000, 50_000])?;
+        eprintln!(
+            "[qwen36] forward_outside_only smoke: 5-token input → \
+             argmax_token_id={probe} (garbage by design — per-layer \
+             forward still TODO)"
+        );
+
         Ok(bringup)
     }
 
@@ -255,6 +268,142 @@ impl Qwen36Bringup {
     ///     the right layout
     ///   - the EmbeddingGatherLaunch ABI matches Qwen 3.6 dims
     /// without exercising any per-layer math (still Phase 3f+).
+    /// Phase 4a: outside-only forward over arbitrary input tokens.
+    /// Skips all 40 transformer layers — runs only:
+    ///   embed_tokens → final_norm + fp8quant → lm_head fp8_gemm →
+    ///   CPU argmax over the LAST token's logits.
+    /// Returns the argmax token id of the last input position. Output
+    /// will be garbage (no per-layer math), but the kernel pipeline
+    /// is exercised end-to-end.
+    pub fn forward_outside_only(&self, token_ids: &[i32]) -> Result<i32> {
+        if token_ids.is_empty() {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_outside_only: empty token_ids",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let last_idx = token_ids.len() - 1;
+        let hidden = self.arch.base.hidden_size as u32;
+        let vocab = self.arch.base.vocab_size as u32;
+        let num_tokens = token_ids.len() as u32;
+
+        // Allocate device regions: token IDs (i32) + hidden state (f16).
+        let mut token_bytes_owned: Vec<u8> = Vec::with_capacity(token_ids.len() * 4);
+        for t in token_ids {
+            token_bytes_owned.extend_from_slice(&t.to_le_bytes());
+        }
+        let tokens_region = self.arena.region(
+            "qwen36_outside_tokens",
+            token_bytes_owned.len(),
+            16,
+        )?;
+        unsafe { tokens_region.copy_from_host(&token_bytes_owned)? };
+
+        let hidden_bytes = (num_tokens as usize) * (hidden as usize) * 2; // f16
+        let hidden_region =
+            self.arena.region("qwen36_outside_hidden", hidden_bytes, 16)?;
+
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens,
+                hidden,
+                vocab,
+            }
+            .launch(
+                self.outside_kernels.fn_embedding_gather_f16,
+                hidden_region.device_ptr(),
+                self.model.outside.embed_tokens.offset_bytes,
+                tokens_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+        }
+
+        let eps = self.arch.base.rms_norm_eps;
+        let hidden_fp8_bytes = (num_tokens as usize) * (hidden as usize);
+        let hidden_scale_bytes = (num_tokens as usize) * 4;
+        let logits_bytes = (num_tokens as usize) * (vocab as usize) * 2;
+        let hidden_fp8_region =
+            self.arena.region("qwen36_outside_hidden_fp8", hidden_fp8_bytes, 16)?;
+        let hidden_scale_region = self.arena.region(
+            "qwen36_outside_hidden_scale",
+            hidden_scale_bytes,
+            16,
+        )?;
+        let logits_region =
+            self.arena.region("qwen36_outside_logits", logits_bytes, 16)?;
+        let stream_raw = self.stream.raw() as u64;
+
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                hidden_region.device_ptr(),
+                self.model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+
+        #[cfg(feature = "cuda")]
+        unsafe {
+            self.cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                self.model.outside.lm_head_fp8.offset_bytes,
+                logits_region.device_ptr(),
+                num_tokens as i32,
+                vocab as i32,
+                hidden as i32,
+                hidden_scale_region.device_ptr(),
+                self.model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // DtoH only the LAST token's logits row (the argmax output is
+        // the prediction for the next token).
+        let logits_row_bytes = (vocab as usize) * 2;
+        let last_offset = (last_idx as u64) * (logits_row_bytes as u64);
+        let mut logits_row_f16 = vec![0u8; logits_row_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                logits_row_f16.as_mut_ptr() as *mut _,
+                logits_region.device_ptr() + last_offset,
+                logits_row_bytes,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "forward_outside_only DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        let mut best_logit = f32::NEG_INFINITY;
+        let mut best_token: i32 = -1;
+        for v in 0..vocab as usize {
+            let bits = u16::from_le_bytes([
+                logits_row_f16[v * 2],
+                logits_row_f16[v * 2 + 1],
+            ]);
+            let l = f16_bits_to_f32(bits);
+            if l > best_logit {
+                best_logit = l;
+                best_token = v as i32;
+            }
+        }
+        Ok(best_token)
+    }
+
     pub fn forward_outside_smoke(&self) -> Result<()> {
         let hidden = self.arch.base.hidden_size as u32;
         let vocab = self.arch.base.vocab_size as u32;
