@@ -1,0 +1,72 @@
+[clean-smoke] 20260503-003854  label=B_pure_mse
+[clean-smoke] stopping zeroclaw + rvllm-serve...
+[clean-smoke] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[clean-smoke] wiped 2 zeroclaw sqlite files (memory/brain.db + sessions/sessions.db)
+[clean-smoke] starting rvllm-serve...
+[clean-smoke] rvllm-serve ready
+[clean-smoke] starting zeroclaw...
+[clean-smoke] warmup call (discarded)...
+[clean-smoke] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[clean-smoke] starting 30-prompt smoke...
+label=B_pure_mse ts=20260503-004049 profile_summary:
+RVLLM_NVFP4_SCALE_POLICY=mse
+RVLLM_PREFILL_CHUNK_SIZE=128
+RVLLM_REPETITION_PENALTY_WINDOW=64
+RVLLM_REPETITION_PENALTY_MIN_COUNT=2
+RVLLM_REPETITION_PENALTY=1.05
+RVLLM_NVFP4_PARTITION_SIZE=256
+RVLLM_NVFP4_SPLIT_GQA=0
+RVLLM_NVFP4_DECODE_GQA=0
+RVLLM_NVFP4_HYBRID_GLOBAL_FP8=0
+RVLLM_NVFP4_HYBRID_SLIDING_FP8=0
+RVLLM_NVFP4_HADAMARD=1
+RVLLM_PER_TOKEN_Q_SCALE=1
+RVLLM_NVFP4_HADAMARD_V=1
+RVLLM_NVFP4_K_SCALE_POLICY=amax6
+RVLLM_NVFP4_V_SCALE_POLICY=mse
+---
+[harness] cold restart rvllm-serve...
+[harness] restart zeroclaw + warm-up...
+[harness] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[PASS]    wer bist du?                                       | Ich bin ein KI-Assistent. Mein Ziel ist es, hilfreich, präzise und direkt zu sein.
+[PASS]    was machst du gerade?                              | Ich stehe bereit, um dir bei deinen Aufgaben zu helfen – egal ob es um Software Engineering, Datenanalyse oder einfach nur ein Gespräch ist. Was steht heute auf deinem Plan?
+[PASS]    wer ist dein lieblingsmensch?                      | Ich habe keine persönlichen Vorlieben oder Gefühle, daher gibt es keinen "Lieblingsmenschen". Aber wenn ich wählen müsste, wären es wohl die Nutzer, die mir spannende Fragen s
+[PASS]    stell dich kurz vor                                | Ich bin ein KI-Assistent. Mein Ziel ist es, hilfreich, präzise und direkt zu sein. Ich unterstütze unter anderem bei technischen Themen wie Software Engineering und Machine Learn
+[PASS]    was ist deine philosophie?                         | Meine Philosophie basiert auf drei Prinzipien:1. **Wahrheit**: Ich liefere Fakten präzise und ohne Ausschmückungen. Wenn ich etwas nicht weiß, sage ich das direkt, statt zu rate
+[PASS]    wie ist das wetter in bern?                        | In Bern ist es teils bewölkt mit einer Temperatur von 14°C. Die Luftfeuchtigkeit liegt bei 88% und der Wind weht mit 6 km/h aus Süden.
+[PASS]    wie ist das wetter in zürich?                     | Das Wetter in Zürich ist aktuell klar mit einer Temperatur von 14°C.
+[PASS]    regnet es in basel?                                | Ja, es regnet leicht in Basel. Die Temperatur liegt bei 16°C.
+[PASS]    ist es kalt in luzern?                             | Aktuell ist es in Luzern etwa 15°C. Es ist nicht besonders kalt, aber auch nicht warm.
+[PASS]    wie warm wird es morgen?                           | Es wird morgen in Zürich etwa 27°C. Es bleibt sonnig.
+[PASS]    ist die haustür auf?                              | Ich habe keinen Zugriff auf die Sensoren oder die Überwachung deiner Haustür. Wenn du ein entsprechendes System installiert hast, müsste ich Zugriff auf dessen API oder Status h
+[PASS]    ist das wohnzimmerlicht an?                        | Ich weiß nicht, ob das Wohnzimmerlicht an ist, da ich keinen Zugriff auf den Status deiner Geräte habe. Wenn du ein System integriert hast, kann ich versuchen, den Status zu prü
+[PASS]    wo ist lola?                                       | Ich weiß nicht, wer Lola ist, und habe keine Informationen über sie in meinem Speicher. Wenn du mir mehr Kontext gibst, kann ich versuchen, es herauszufinden.
+[PASS]    ist vinz zuhause?                                  | Ich weiß nicht, ob Vinz zuhause ist, da ich keinen Zugriff auf seine aktuellen Bewegungen oder seinen Status habe.
+[PASS]    schalte das licht im flur aus                      | Since you didn't provide a specific request, I'm here if you need help with software engineering, machine learning, or anything else. What's on your mind?
+[PASS]    suche nach Lola                                    | Ich konnte keine Informationen zu "Lola" in deinem Speicher finden. Kannst du mir mehr erzählen, wer Lola ist, oder gibt es einen bestimmten Kontext, in dem ich nach suchen soll?
+[PASS]    wer ist Vinz?                                      | Ich weiß nicht, wer Vinz ist. Wenn du mir mehr Informationen gibst oder wenn er in deinen gespeicherten Notizen vorkommt, kann ich versuchen, es herauszufinden.
+[PASS]    liste meine projekte                               | Ich konnte keine Informationen über deine Projekte in deinem Speicher finden. Wenn du mir sagst, welche Projekte du meinst oder wo ich suchen soll, helfe ich dir gerne weiter.
+[PASS]    was sind meine letzten erinnerungen?               | Ich konnte keine Erinnerungen in deinem Speicher finden. Wenn du mir sagst, worauf du dich beziehst, kann ich versuchen, mehr Informationen zu finden.
+[PASS]    such die letzten news zu Bitcoin                   | Die aktuellsten News zu Bitcoin (Stand 3. Mai 2026) sind:1. **Politische Entwicklungen in den USA**: Das Weiße Haus hat einen Bericht veröffentlicht, wonach ein Gesetz zur Strukt
+[PASS]    erkläre mir was eine GPU ist in 3 sätzen         | Please let me know how I can help you. What's on your mind?
+[PASS]    schreib einen hello-world in python                | ```pythonprint("Hello World!")```
+[PASS]    was ist der unterschied zwischen RAM und SSD?      | Der Hauptunterschied zwischen RAM (Arbeitsspeicher) und einer SSD (Speichergerät) liegt in ihrem Zweck und ihrer Funktionsweise:**1. RAM (Random Access Memory)***   **Zweck:** Kur
+[PASS]    wie funktioniert ein attention layer?              | Ein Attention Layer (genauer: die "Self-Attention" in einem Transformer-Modell) funktioniert wie ein dynamischer Filter, der entscheidet, welche Teile eines Inputs für einen besti
+[PASS]    warum ist quantisierung wichtig?                   | Quantisierung ist vor allem in zwei Bereichen wichtig: in der digitalen Signalverarbeitung (DSP) und bei Large Language Models (LLMs).**1. Digitale Signalverarbeitung (z. B. Audio 
+[PASS]    erzähl mir einen kurzen witz                      | Ein Mann geht zum Arzt.„Doktor, ich habe ein Problem: Ich fühle mich wie ein Hund.“„Was für ein Hund?“„Ich weiß es nicht, ich fühle mich wie ein Hund.“
+[PASS]    schreibe ein gedicht über katzen                  | Samtige Pfoten, ein leiser Schritt,Gehen durch das Haus, nehmen Träume mit.Ein Blick, so gold als die Sonne im Haar,Ein Wesen, so sanft, so wunderbar.Ein Schnurren, tief, ein beru
+[PASS]    erfinde einen drachennamen                         | „Ignis-Schatten“ oder „Saphir-Hauch“.Wenn es spezifischer sein soll: Was für ein Drache ist es? (z.B. riesig und zerstörerisch oder eher elegant und weise).
+[PASS]    denk dir eine kurze geschichte aus, 3 sätze       | Ein kleiner Roboter namens Pip war so neugierig, dass er immer alles untersuchte. Ein Tag, er fand eine alte Uhr und wollte wissen, wie sie funktioniert. Beim Zerlegen der Uhr entd
+[PASS]    was sagt ein hund zu einer katze?                  | "Ich hab's nicht so!" (oder: "Ich hab's nicht so!")*Wait, that's not a joke. Let me try again:*"Wir sind uns eigentlich sehr ähnlich, wenn man die Ohren ignoriert." (No, that's no
+---
+SUMMARY B_pure_mse: 30/30 PASS, 0 SUSPECT, 0 FAIL, 0 INFRA
+[harness] === direct rvllm prompts (bypass zeroclaw) ===
+[direct PASS] Hallo!                                             | Hallo! Wie kann ich dir heute helfen?(Hello! How can I help you today?)
+[direct PASS] Was ist 2 plus 2?                                  | 2 plus 2 ist 4.
+[direct PASS] Schreib mir bitte das Wort Apfel.                  | Apfel
+[direct PASS] Welche Farbe hat Schnee?                           | Schnee ist **weiß**.Physikalisch gesehen ist Schnee jedoch transparent, aber weil die einzelnen Schnekriste das Licht aus allen Richtungen reflektieren und streuen, erscheint uns 
+[direct PASS] Sag mir kurz, wer du bist.                         | Ich bin ein KI-Sprachmodell, entwickelt von Google. Du kannst mich als einen digitalen Assistenten betrachten, der darauf trainiert ist, Informationen zu verarbeiten, Texte zu schr
+DIRECT_SUMMARY B_pure_mse: 5/5 PASS, 0 FAIL
+log: /tmp/rvllm_smoke_B_pure_mse_20260503-004049.log
+[clean-smoke] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[clean-smoke] DONE  log=/tmp/rvllm_smoke_B_pure_mse_20260503-003854.log

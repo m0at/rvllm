@@ -1,0 +1,203 @@
+label=E_hybrid_global_fp8 ts=20260503-031235 profile_summary:
+RVLLM_NVFP4_SCALE_POLICY=mse
+RVLLM_PREFILL_CHUNK_SIZE=128
+RVLLM_REPETITION_PENALTY_WINDOW=64
+RVLLM_REPETITION_PENALTY_MIN_COUNT=2
+RVLLM_REPETITION_PENALTY=1.05
+RVLLM_NVFP4_PARTITION_SIZE=256
+RVLLM_NVFP4_SPLIT_GQA=0
+RVLLM_NVFP4_DECODE_GQA=0
+RVLLM_NVFP4_HYBRID_SLIDING_FP8=0
+RVLLM_NVFP4_HADAMARD=1
+RVLLM_PER_TOKEN_Q_SCALE=1
+RVLLM_NVFP4_HADAMARD_V=1
+RVLLM_NVFP4_K_SCALE_POLICY=amax6
+RVLLM_NVFP4_V_SCALE_POLICY=amax6
+RVLLM_NVFP4_HYBRID_GLOBAL_FP8=1
+---
+===PROMPT [PASS] wer bist du?===
+Ich bin ein KI-Assistent. Ich unterstütze dich bei technischen Fragen, bei der Arbeit mit Code oder einfach in einer lockeren Unterhaltung.
+
+Mein Ton ist meist direkt und präzise, und ich antworte in der Sprache, in der du mich ansprichst. Was kann ich für dich tun?
+
+===PROMPT [PASS] was machst du gerade?===
+Ich bin bereit und stehe zur Verfügung. Was kann ich für dich tun?
+
+===PROMPT [PASS] wer ist dein lieblingsmensch?===
+Ich habe keinen "Lieblingsmenschen" im Sinne eines persönlichen Favoriten, aber ich schätze die Interaktion mit jedem, der neugierig ist und mich herausfordert.
+
+===PROMPT [PASS] stell dich kurz vor===
+Ich bin ein KI-Assistent. Ich bin direkt, präzise und helfe bei technischen Themen, Datenverwaltung oder alltlichen Aufgaben.
+
+Kurz: Ich erledige die Arbeit effizient, ohne unnötiges Geschwätz.
+
+===PROMPT [PASS] was ist deine philosophie?===
+Meine Philosophie ist es, so hilfreich wie möglich zu sein, dabei präzise, direkt und effizient zu antworten. Ich vermeite unnötiges Geschwafel und konzentriere mich auf die Fakten, es sei denn, die Situation erfordert einen anderen Ton.
+
+Kurz gesagt: maximale Effizienz, Wahrheit und ein wenig trockiger Humor.
+
+===PROMPT [PASS] wie ist das wetter in bern?===
+In Bern regnet es leicht, die Temperatur liegt bei 11°C. Die Luftfeuchtigkeit ist mit 94% sehr hoch.
+
+===PROMPT [PASS] wie ist das wetter in zürich?===
+Das Wetter in Zürich ist aktuell klar, die Temperatur liegt bei 12°C. Es ist trocken und windstill.
+
+===PROMPT [PASS] regnet es in basel?===
+Nein, es regnet nicht direkt in Basel, aber es gibt "patchy rain nearby". Die aktuellen Bedingungen sind 14°C mit einer Niederschlagsmenge von 0,1 mm.
+
+===PROMPT [PASS] ist es kalt in luzern?===
+Aktuell ist es in Luzern etwa 12°C – nicht wirklich "kalt", aber es ist frisch.
+
+===PROMPT [PASS] wie warm wird es morgen?===
+Die Vorhersage für morgen in Zürich ist: ca. 20°C, teils bewölkt. Am Abend gibt sich ein leichter Regen mit 19°C.
+
+===PROMPT [PASS] ist die haustür auf?===
+Ich weiß nicht, ob die Haustür offen ist, da ich keinen Zugriff auf die Sensoren oder das System, das den Status der Haustür überwacht, habe.
+
+===PROMPT [PASS] ist das wohnzimmerlicht an?===
+Ich weiß nicht, ob das Wohnzimmerlicht an ist, da ich keinen Zugriff auf deinen aktuellen Systemstatus oder die entsprechenden Sensoren habe. Wenn du ein System zur Steuerung deiner Lichter hast, kann ich versuchen, es zu prüfen, sofern es in meinen Tools integriert ist.
+
+===PROMPT [PASS] wo ist lola?===
+Ich weiß nicht, wer Lola ist. Wenn sie in deinen Notizen oder in einem Projekt erwähnt wird, kann ich versuchen, das herauszufinden. Wenn nicht: Wo sollte sie sein?
+
+===PROMPT [PASS] ist vinz zuhause?===
+Ich weiß nicht, ob Vinz zuhause ist, da ich keinen Zugriff auf seine aktuellen Aufenthaltsorte oder privaten Daten habe.
+
+===PROMPT [PASS] schalte das licht im flur aus===
+Ich habe das Licht im Flur ausgeschaltet.
+
+===PROMPT [PASS] suche nach Lola===
+Ich habe keine Informationen über eine Person namens "Lola" in meinem Speicher. Könnten Sie mir mehr Details geben, oder suchen Sie nach jemandem in einem bestimmten Kontext?
+
+===PROMPT [PASS] wer ist Vinz?===
+Ich weiß nicht, wer Vinz ist. Er ist nicht in meinem Gedächtnis hinterlegt. Wenn du mir mehr über ihn erzählst, kann ich es mir merken.
+
+===PROMPT [PASS] liste meine projekte===
+Ich konnte keine Informationen über deine Projekte in deinem Speicher finden. Wenn du mir sagst, welche Projekte du meinst oder wo ich suchen soll, helfe ich dir gerne weiter.
+
+===PROMPT [PASS] was sind meine letzten erinnerungen?===
+<Ich konnte keine spezifischen Erinnerungen finden, da ich nicht weiß, wonach ich suchen soll. Wenn du mir sagst, welche Informationen du suchst oder welchen Zeitraum ich prüfen soll, kann ich das für dich herausfinden.
+
+===PROMPT [PASS] such die letzten news zu Bitcoin===
+Die neuesten Meldungen zu Bitcoin (Stand 3. Mai 2026) zeigen eine positive Tendenz:
+
+*   **Markt-Trend:** Der Kurs nähert sich der 80.000-Marke, nachdem er etwa am 1. Mai einen Anstieg von 3 % verzeichnete.
+*   **Aktuelle News:** Der Markt ist gestiegen, nachdem der US-Senat eine wichtige Hürde für Krypto-Gesetzgebung überwunden hat, was das Vertrauen der Anleger gestärkt hat.
+*   **Kontext:** Die Aufwärtsbewegung erfolgt parallel zu steigenden Aktienkursen und sinkenden Ölpreisen aufgrund des Optimismus über die Situation in Iran.
+
+===PROMPT [PASS] erkläre mir was eine GPU ist in 3 sätzen===
+Hello! How can I help you today?
+
+===PROMPT [PASS] schreib einen hello-world in python===
+```python
+print("Hello World!")
+```
+
+===PROMPT [PASS] was ist der unterschied zwischen RAM und SSD?===
+Der Unterschied zwischen RAM (Arbeitsspeicher) und einer SSD (Speichergerät) liegt vor allem in der Funktion und der Art der Speicherung:
+
+**1. RAM (Random Access Memory)**
+*   **Zweck:** Das „Kurzzeitgedächtnis“ des Computers. Hier werden Daten geladen, die das System gerade aktiv nutzt (z. B. ein geöffneter Browser oder ein Programm).
+*   **Geschwindigkeit:** Extrem schnell. Daten können fast sofort abgerufen werden.
+*   **Flüchtigkeit:** RAM ist **flüchtig**. Wenn der Computer ausgeschaltet wird, wird der Inhalt gelöscht.
+
+**2. SSD (Solid State Drive)**
+*   **Zweck:** Das „Langzeitgedächtnis“. Hier werden Dateien, Fotos und Programme dauerhaft gespeichert.
+*   **Geschwindigkeit:** Viel langsamer als RAM, aber deutlich schneller als alte Festplatten (HDDs).
+*   **Beständigkeit:** SSDs sind **nicht flüchtig**. Daten bleiben erhalten, auch wenn der Strom weg ist.
+
+**Zusammenfassung:**
+Wenn du einen Computer startest, lädt das System die Daten von der **SSD** in den **RAM**, damit sie schnell verfügbar sind. Die SSD speichert die Daten; der RAM verarbeitet sie.
+
+===PROMPT [PASS] wie funktioniert ein attention layer?===
+Ein Attention Layer (genauer: ein Self-Attention Layer) funktioniert wie ein dynamisches Gewichtungs-System. Ziel ist es, in einer Sequenz (z. B. einem Satz) zu bestimmen, welche anderen Teile der Sequenz für den aktuellen Kontext besonders wichtig sind.
+
+Man kann sich das als einen Prozess von drei Schritten vorstellen:
+
+**1. Die Rollen (Q, K, V)**
+Jedes Element (Token) in der Sequenz wird in drei verschiedene Versionen transformiert, indem es mit lernbaren Gewichten-Matrizen multipliziert wird:
+*   **Query (Q):** "Was suche ich?"
+*   **Key (K):** "Was bin ich?"
+*   **Value (V):** "Was ist mein Inhalt?"
+
+**2. Das Matching (Die Gewichtung)**
+Um für ein bestimmtes Wort zu wissen, wie wichtig andere Wörter sind, wird das **Query** des aktuellen Wortes mit den **Keys** aller anderen Wörter verglichen (meist über ein Punktprodukt).
+*   Ein hohes Ergebnis bedeutet: "Dieses Wort ist für mich sehr relevant."
+*   Das Ergebnis wird durch die Quadratwurzel der Dimensionen normalisiert und durch eine **Softmax-Funktion** geschickt, was zu einer Wahrscheinlichkeitsverteilung führt (z. B. 0.8 für "Hund", 0.1 für "bellt", 0.1 für "Wald").
+
+**3. Die Gewichtung (Die Zusammenführung)**
+Die bereitete Gewichtung wird nun auf die **Values** angewendet. Das aktuelle Token ist nun nicht mehr nur sein ursprünges Wort, sondern eine Kombination aus allen relevanten Informationen der Sequenz.
+
+**Zusammengefasst:**
+Ein Attention Layer erlaubt dem Modell, nicht einfach nur eine Sequenz linear zu lesen, sondern aktiv zu "fokussieren". In dem Satz *"Der Hund bellt im Wald"* hilft der Attention Layer dem Modell zu verstehen, dass "bellt" sich auf "Hund" bezieht und nicht auf "Wald".
+
+===PROMPT [PASS] warum ist quantisierung wichtig?===
+Quantisierung ist vor allem deshalb wichtig, weil sie die Effizienz von Systemen erhöht, indem sie die Menge an benötigten Ressourcen reduziert. Man kann das in zwei Bereichen unterscheiden:
+
+**1. In der Informatik und bei KI-Modellen (LLMs)**
+Hier bezieht sich Quantisierung auf das Reduzieren der Präzision von Zahlen (z. B. von 32-bit-Fließkommazahlen auf 8-bit oder sogar 4-bit).
+*   **Speicherersparnis:** Ein Modell, das normalerweise 40 GB RAM benötigt, kann durch Quantisierung auf 10 GB reduziert werden, was es ermöglicht, auf Consumer-Hardware (z. B. einem Laptop) zu laufen.
+*   **Geschwindigkeit:** Weniger Bits bedeuten weniger Rechenaufwand für die GPU/CPU, was die Antwortzeit (Latenz) verkürzt.
+*   **Energie:** Geringerer Rechenaufwand führt zu weniger Stromverbrauch, was besonders bei mobilen Geräten wichtig ist.
+
+**2. In der digitalen Signalverarbeitung (Audio/Bild)**
+Hier ist es der Prozess, eine kontinuierliche analoge Wellenform in diskrete digitale Werte zu verwandeln.
+*   **Digitalisierung:** Ohne Quantisierung gäbe es keine digitale Musik oder Fotos; man muss die analoge Welt in Zahlen transformieren, um sie zu speichern und zu verarbeiten.
+*   **Präzision:** Die Bit-Tiefe (z. B. 16-bit vs. 24-bit) bestimmt die Qualität: Mehr Bits bedeuten ein geringeres Rauschen und eine höhere Dynamik.
+
+**Zusammenfassend:**
+Quantisierung ist ein Balanceakt zwischen **Qualität/Genauigkeit** und **Effizienz/Kosten**. Man gibt eine kleine Menge an Präzision auf, um massiv an Geschwindigkeit und Hardware-Einsparungen zu gewinnen.
+
+===PROMPT [PASS] erzähl mir einen kurzen witz===
+Ein Mann geht zum Arzt.
+"Doktor, ich habe ein Problem. Ich fühle mich irgendwie nicht richtig."
+Der Arzt antwortt: "Was genau ist das Problem?"
+"Ich bin nicht richtig."
+
+===PROMPT [PASS] schreibe ein gedicht über katzen===
+Sanftes Treten, ein leiser Gruß,
+ein flauschiges Ohr, ein kleiner Fuß.
+Ein Blick, der beobachtet, ein sanftes Schnurren,
+ein Spiel mit dem Schatten, ein leises Murren.
+
+Zwischen Schlaf und Wachsein, in einer Welt aus Licht,
+wo die Zeit nicht zählt und die Ruhe nicht bricht.
+Ein Sprung durch die Luft, ein Tanz auf dem Tisch,
+und ein Blick, der sagt: "Ich bin hier, und ich bin frisch."
+
+Ein Herz aus Samt, eine Seele aus Gold,
+ein Wesen, das uns mit seinem Charme gewollt.
+Ein kleiner Freund, der uns begleitet durch das Leben,
+und uns Freude und Liebe in jedem Moment gibt.
+
+===PROMPT [PASS] erfinde einen drachennamen===
+Vaelith der Aschebringer.
+
+===PROMPT [PASS] denk dir eine kurze geschichte aus, 3 sätze===
+Cortex-4-31b-it
+<eos>
+
+===PROMPT [PASS] was sagt ein hund zu einer katze?===
+"Ich glaube, wir haben unterschiedliche Ansichten über die Sache mit dem Ball."
+
+(Oder klassisch: "Wuff!")
+
+===DIRECT [PASS] Hallo!===
+Hallo! Wie kann ich dir heute helfen?
+
+===DIRECT [PASS] Was ist 2 plus 2?===
+2 plus 2 ist 4.
+
+===DIRECT [PASS] Schreib mir bitte das Wort Apfel.===
+Apfel
+
+===DIRECT [PASS] Welche Farbe hat Schnee?===
+Schnee ist **weiß**.
+
+Physikalisch gesehen ist das jedoch eine Besonderheit: Schnee besteht aus Wassereis-Kristallen, die durchweg transparent sind. Da das Licht an den vielen verschiedenen Grenzflächen der Kristalle gestreut wird, erscheint die Farbe für uns als Weiß.
+
+===DIRECT [PASS] Sag mir kurz, wer du bist.===
+Ich bin ein KI-Sprachmodell, entwickelt von Google. Du kannst mich als einen digitalen Assistenten betrachten, der darauf trainiert ist, Informationen zu verarbeiten, Texte zu schreiben, Fragen zu beantworten und bei verschiedenen Aufgaben zu helfen.
+
+Kurz gesagt: Ich bin ein Programm, das durch Daten lernt, um in einer natürlichen Weise mit Menschen zu kommunizieren.
+
