@@ -23,7 +23,8 @@ use crate::gemma4_bring_up::Gemma4EnginePaths;
 use crate::qwen36_arch::Qwen36Arch;
 
 /// Kernel function pointers + their LoadedModule anchors needed for the
-/// Qwen 3.6 outside-only forward path (embedding lookup, final RMSNorm).
+/// Qwen 3.6 outside-only forward path (embedding lookup, final RMSNorm,
+/// lm_head matmul, argmax).
 ///
 /// `LoadedModule` is RAII — its `Drop` calls `cuModuleUnload`, after
 /// which the matching `KernelFn` handles become invalid. Holding the
@@ -34,6 +35,14 @@ pub struct Qwen36OutsideKernels {
     pub fn_embedding_gather_f16: KernelFn,
     pub rmsnorm_inplace_f16_mod: LoadedModule,
     pub fn_rmsnorm_inplace_f16: KernelFn,
+    /// FP8 GEMV for the lm_head matmul. Phase 3d will CPU-quantize the
+    /// bf16 lm_head to FP8 at load time so this kernel can be used.
+    /// `None` on platforms where the f16-input native-CVT variant
+    /// isn't available (gated on `__CUDA_ARCH__ >= 1000`).
+    pub fp8_gemv_mod: LoadedModule,
+    pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    pub argmax_mod: LoadedModule,
+    pub fn_argmax: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -135,15 +144,35 @@ impl Qwen36Bringup {
         let rmsnorm_inplace_f16_mod = kernels.load_ptx("rmsnorm_inplace_f16")?;
         let fn_rmsnorm_inplace_f16 =
             rmsnorm_inplace_f16_mod.get_function("rmsnorm_inplace_f16_kernel")?;
+        let fp8_gemv_mod = kernels.load_ptx(rvllm_kernels::FP8_GEMV_PTX_STEM)?;
+        let fn_fp8_gemv_wpr_native_f16in = match compile_target {
+            Some(t)
+                if rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t) =>
+            {
+                Some(
+                    fp8_gemv_mod.get_function(
+                        rvllm_kernels::Fp8GemvVariant::WprNativeF16In.entry_point(),
+                    )?,
+                )
+            }
+            _ => None,
+        };
+        let argmax_mod = kernels.load_ptx("argmax")?;
+        let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
             rmsnorm_inplace_f16_mod,
             fn_rmsnorm_inplace_f16,
+            fp8_gemv_mod,
+            fn_fp8_gemv_wpr_native_f16in,
+            argmax_mod,
+            fn_argmax,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
-             rmsnorm_inplace_f16 (lm_head matmul deferred to Phase 3c)."
+             rmsnorm_inplace_f16, fp8_gemv (wpr_native_f16in: {}), argmax.",
+            outside_kernels.fn_fp8_gemv_wpr_native_f16in.is_some(),
         );
 
         let n_full = model.layers.iter().filter(|l| matches!(
@@ -155,11 +184,12 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 3b bring-up complete: outside + {n_full} \
+            "[qwen36] Phase 3c bring-up complete: outside + {n_full} \
              full-attention + {n_linear} linear-attention + per-layer \
              MoE blocks ({} experts/layer) + KernelLoader + outside \
-             kernel pointers. arena.used()={used:.2} GiB / {total:.2} \
-             GiB. Forward launches NOT yet wired. \
+             kernel pointers (embed, rmsnorm, fp8_gemv, argmax). \
+             arena.used()={used:.2} GiB / {total:.2} GiB. \
+             Forward launches NOT yet wired. \
              See ~/.claude/plans/abundant-meandering-sifakis.md.",
             arch.num_experts,
             used = arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
