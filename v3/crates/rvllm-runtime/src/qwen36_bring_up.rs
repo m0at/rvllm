@@ -290,7 +290,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4h bring-up complete: outside (incl. \
+            "[qwen36] Phase 4i bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -351,6 +351,8 @@ impl Qwen36Bringup {
         // decode kernel ABI works for Qwen's heterogeneous
         // (num_heads=16, num_kv_heads=2) shape.
         bringup.forward_layer3_paged_attn_probe()?;
+        // Phase 4i: o_proj (closes the attention block).
+        bringup.forward_layer3_o_proj_probe()?;
 
         Ok(bringup)
     }
@@ -1057,6 +1059,80 @@ impl Qwen36Bringup {
              kv_heads={num_kv_heads} hd={head_dim} block_size={block_size} \
              ctx_len=1 → out[head0,0..4]=[{o0:.3}, {o1:.3}, {o2:.3}, {o3:.3}] \
              (expected ≈ 3.0 — single-key softmax weight is 1.0, output = V = 3.0)"
+        );
+        Ok(())
+    }
+
+    /// Phase 4i probe: launch o_proj (last step of the attention
+    /// block). Same blockwise FP8 GEMV kernel as Q/K/V — only the
+    /// shape changes: `[hidden=2048, n=num_heads*head_dim=4096]`. The
+    /// input is the per-token attention output (concatenated across
+    /// heads); the output is the residual contribution that feeds
+    /// the post-attention residual + MoE block.
+    pub fn forward_layer3_o_proj_probe(&self) -> Result<()> {
+        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
+            matches!(t, rvllm_loader::LayerAttnType::Full)
+        }) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let layer = match &self.model.layers[layer_idx].attn {
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(l) => l,
+            _ => return Ok(()),
+        };
+        let kernel = match self.outside_kernels.fn_fp8_gemv_wpr_native_f16in {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        let n = layer.o_proj.shape[0] as u32;
+        let k = layer.o_proj.shape[1] as u32;
+        let m: u32 = 1;
+        let blockscale_ptr = match layer.o_proj.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        // Synthetic f16 all-twos input matching o_proj's K dim.
+        let two_bits = 0x4000u16.to_le_bytes();
+        let mut input_bytes = Vec::with_capacity((k as usize) * 2);
+        for _ in 0..k {
+            input_bytes.extend_from_slice(&two_bits);
+        }
+        let in_region = self.arena.region("qwen36_l3op_in", input_bytes.len(), 16)?;
+        unsafe { in_region.copy_from_host(&input_bytes)? };
+        let out_bytes = (m as usize) * (n as usize) * 2;
+        let out_region = self.arena.region("qwen36_l3op_out", out_bytes, 16)?;
+
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
+                kernel,
+                out_region.device_ptr(),
+                layer.o_proj.offset_bytes,
+                blockscale_ptr,
+                in_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        let mut probe = [0u8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                out_region.device_ptr(),
+                probe.len(),
+            );
+        }
+        let o0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
+        let o1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+        let o2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
+        let o3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+        eprintln!(
+            "[qwen36] forward_layer3_o_proj_probe: o_proj=[{n}, {k}] → \
+             out[0..4]=[{o0:.3}, {o1:.3}, {o2:.3}, {o3:.3}] \
+             (blockwise FP8 GEMV o_proj against synthetic f16 attn-out)"
         );
         Ok(())
     }
