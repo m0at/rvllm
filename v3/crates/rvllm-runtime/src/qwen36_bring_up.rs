@@ -207,7 +207,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4d bring-up complete: outside (incl. \
+            "[qwen36] Phase 4e bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -526,6 +526,132 @@ impl Qwen36Bringup {
             q, layer.q_proj.shape,
             k, layer.k_proj.shape,
             v, layer.v_proj.shape,
+        );
+
+        // Phase 4e: Q-Norm + K-Norm. Qwen 3.6 ships per-head RMSNorm
+        // weights separately (`q_norm [head_dim]`, `k_norm [head_dim]`)
+        // — different from Gemma 4's fused QK-norm. We re-use the
+        // generic `rmsnorm_inplace_f16` kernel with `num_tokens =
+        // <heads>` rows of `hidden = head_dim`, which is exactly the
+        // per-head pattern (each head's [head_dim] vector RMSNorm'd
+        // against the same gamma).
+        //
+        // Smoke uses a fresh synthetic per-head all-twos input rather
+        // than chaining off the previous Q/K out regions — keeps the
+        // probe self-contained and proves the kernel + per-layer
+        // q_norm / k_norm gamma weights work without depending on the
+        // qkv-projection layout (which varies with `attn_output_gate`).
+        let head_dim = self.arch.base.head_dim as u32;
+        let num_heads = self.arch.base.num_attention_heads as u32;
+        let num_kv_heads = self.arch.base.num_key_value_heads as u32;
+        let eps = self.arch.base.rms_norm_eps;
+        let two_bits = 0x4000u16.to_le_bytes(); // f16 2.0
+        let mut q_in_bytes = Vec::with_capacity(
+            (num_heads as usize) * (head_dim as usize) * 2,
+        );
+        for _ in 0..(num_heads as usize) * (head_dim as usize) {
+            q_in_bytes.extend_from_slice(&two_bits);
+        }
+        let mut k_in_bytes = Vec::with_capacity(
+            (num_kv_heads as usize) * (head_dim as usize) * 2,
+        );
+        for _ in 0..(num_kv_heads as usize) * (head_dim as usize) {
+            k_in_bytes.extend_from_slice(&two_bits);
+        }
+        let q_norm_in_region =
+            self.arena.region("qwen36_l3qnorm_in", q_in_bytes.len(), 16)?;
+        let k_norm_in_region =
+            self.arena.region("qwen36_l3knorm_in", k_in_bytes.len(), 16)?;
+        unsafe {
+            q_norm_in_region.copy_from_host(&q_in_bytes)?;
+            k_norm_in_region.copy_from_host(&k_in_bytes)?;
+        }
+
+        // Per-head RMSNorm: num_tokens = num_heads, hidden = head_dim.
+        let launch_norm = |x_ptr: u64,
+                           gamma_ptr: u64,
+                           heads: u32,
+                           label: &'static str|
+         -> Result<()> {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut x = x_ptr;
+                let mut g = gamma_ptr;
+                let mut e = eps;
+                let mut h = head_dim as i32;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut g) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut e) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut h) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block = head_dim.min(1024);
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_rmsnorm_inplace_f16.raw() as CUfunction,
+                    heads, 1, 1,
+                    block, 1, 1,
+                    0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        label,
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            Ok(())
+        };
+
+        launch_norm(
+            q_norm_in_region.device_ptr(),
+            layer.q_norm.offset_bytes,
+            num_heads,
+            "qwen36_q_norm",
+        )?;
+        launch_norm(
+            k_norm_in_region.device_ptr(),
+            layer.k_norm.offset_bytes,
+            num_kv_heads,
+            "qwen36_k_norm",
+        )?;
+        self.stream.fence()?;
+
+        let mut q_probe = [0u8; 8];
+        let mut k_probe = [0u8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                q_probe.as_mut_ptr() as *mut _,
+                q_norm_in_region.device_ptr(),
+                q_probe.len(),
+            );
+            let _ = cuMemcpyDtoH_v2(
+                k_probe.as_mut_ptr() as *mut _,
+                k_norm_in_region.device_ptr(),
+                k_probe.len(),
+            );
+        }
+        let qn = [
+            f16_bits_to_f32(u16::from_le_bytes([q_probe[0], q_probe[1]])),
+            f16_bits_to_f32(u16::from_le_bytes([q_probe[2], q_probe[3]])),
+            f16_bits_to_f32(u16::from_le_bytes([q_probe[4], q_probe[5]])),
+            f16_bits_to_f32(u16::from_le_bytes([q_probe[6], q_probe[7]])),
+        ];
+        let kn = [
+            f16_bits_to_f32(u16::from_le_bytes([k_probe[0], k_probe[1]])),
+            f16_bits_to_f32(u16::from_le_bytes([k_probe[2], k_probe[3]])),
+            f16_bits_to_f32(u16::from_le_bytes([k_probe[4], k_probe[5]])),
+            f16_bits_to_f32(u16::from_le_bytes([k_probe[6], k_probe[7]])),
+        ];
+        eprintln!(
+            "[qwen36] forward_layer3_qknorm: per-head rmsnorm (head_dim={head_dim}, eps={eps:.0e}) \
+             q_norm[head0,0..4]={qn:?} k_norm[head0,0..4]={kn:?}"
         );
         Ok(())
     }
