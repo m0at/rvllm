@@ -15,12 +15,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_core::Result;
-use rvllm_kernels::KernelLoader;
+use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_loader::qwen36_weights::Qwen36LoadedModel;
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
 use crate::gemma4_bring_up::Gemma4EnginePaths;
 use crate::qwen36_arch::Qwen36Arch;
+
+/// Kernel function pointers + their LoadedModule anchors needed for the
+/// Qwen 3.6 outside-only forward path (embedding lookup, final RMSNorm).
+///
+/// `LoadedModule` is RAII — its `Drop` calls `cuModuleUnload`, after
+/// which the matching `KernelFn` handles become invalid. Holding the
+/// modules alongside the function pointers in this struct keeps the
+/// pair alive for the lifetime of the bring-up.
+pub struct Qwen36OutsideKernels {
+    pub embedding_gather_f16_mod: LoadedModule,
+    pub fn_embedding_gather_f16: KernelFn,
+    pub rmsnorm_inplace_f16_mod: LoadedModule,
+    pub fn_rmsnorm_inplace_f16: KernelFn,
+}
 
 pub struct Qwen36Bringup {
     pub paths: Gemma4EnginePaths,
@@ -31,6 +45,7 @@ pub struct Qwen36Bringup {
     pub stream: Stream,
     pub model: Qwen36LoadedModel,
     pub kernels: Arc<KernelLoader>,
+    pub outside_kernels: Qwen36OutsideKernels,
 }
 
 impl Qwen36Bringup {
@@ -107,6 +122,30 @@ impl Qwen36Bringup {
             .warn_if_revision_drift(rvllm_kernels::manifest::VerifiedManifest::BUILD_REVISION);
         let kernels = Arc::new(KernelLoader::new(manifest));
 
+        // Phase 3b: resolve the outside-path kernel function pointers
+        // (embedding_gather + final RMSNorm). The matching modules
+        // stay in the bring-up struct so the function handles outlive
+        // any per-request scope. lm_head matmul resolution is deferred
+        // to Phase 3c — bf16 vs FP8 lm_head dispatch needs an explicit
+        // decision (CPU-quantize at load like Gemma's tied path, or
+        // route through a bf16 cuBLASLt GEMM).
+        let embedding_gather_f16_mod = kernels.load_ptx("embedding_gather_f16")?;
+        let fn_embedding_gather_f16 =
+            embedding_gather_f16_mod.get_function("embedding_gather_f16_kernel")?;
+        let rmsnorm_inplace_f16_mod = kernels.load_ptx("rmsnorm_inplace_f16")?;
+        let fn_rmsnorm_inplace_f16 =
+            rmsnorm_inplace_f16_mod.get_function("rmsnorm_inplace_f16_kernel")?;
+        let outside_kernels = Qwen36OutsideKernels {
+            embedding_gather_f16_mod,
+            fn_embedding_gather_f16,
+            rmsnorm_inplace_f16_mod,
+            fn_rmsnorm_inplace_f16,
+        };
+        eprintln!(
+            "[qwen36] outside kernels resolved: embedding_gather_f16, \
+             rmsnorm_inplace_f16 (lm_head matmul deferred to Phase 3c)."
+        );
+
         let n_full = model.layers.iter().filter(|l| matches!(
             l.attn,
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(_)
@@ -116,11 +155,11 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 3a bring-up complete: outside + {n_full} \
+            "[qwen36] Phase 3b bring-up complete: outside + {n_full} \
              full-attention + {n_linear} linear-attention + per-layer \
-             MoE blocks ({} experts/layer) + KernelLoader init. \
-             arena.used()={used:.2} GiB / {total:.2} GiB. \
-             Forward kernels NOT yet wired. \
+             MoE blocks ({} experts/layer) + KernelLoader + outside \
+             kernel pointers. arena.used()={used:.2} GiB / {total:.2} \
+             GiB. Forward launches NOT yet wired. \
              See ~/.claude/plans/abundant-meandering-sifakis.md.",
             arch.num_experts,
             used = arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -136,6 +175,7 @@ impl Qwen36Bringup {
             stream,
             model,
             kernels,
+            outside_kernels,
         })
     }
 

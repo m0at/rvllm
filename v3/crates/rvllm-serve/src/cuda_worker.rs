@@ -94,11 +94,11 @@ pub async fn spawn_cuda_worker(
                         }
                     };
                     let _ = ready_tx.send(Err(
-                        "qwen36 phase 3a: arch + every per-layer block \
-                         + 256-expert MoE + KernelLoader initialized. \
-                         Forward kernel wiring (full-attn + linear-attn \
-                         + MoE) NOT yet implemented. See \
-                         ~/.claude/plans/abundant-meandering-sifakis.md"
+                        "qwen36 phase 3b: arch + every per-layer block \
+                         + 256-expert MoE + KernelLoader + outside \
+                         kernel pointers (embedding_gather, RMSNorm) \
+                         resolved. Forward launches NOT yet wired. \
+                         See ~/.claude/plans/abundant-meandering-sifakis.md"
                             .to_string(),
                     ));
                     return;
