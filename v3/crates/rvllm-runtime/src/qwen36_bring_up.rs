@@ -54,6 +54,12 @@ pub struct Qwen36OutsideKernels {
     /// so only `head_dim * 0.25 = 64` of the 256 head_dim is rotated.
     pub fused_rope_partial_f16kv_mod: LoadedModule,
     pub fn_fused_rope_partial_f16kv: KernelFn,
+    /// Phase 4h: paged f16 attention decode kernel
+    /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
+    /// paged f16 KV cache; sliding-window param `< 0` means no window
+    /// (Qwen 3.6 full-attn layers don't use sliding).
+    pub flash_attention_mod: LoadedModule,
+    pub fn_flash_attention_2_decode_f16io: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -186,6 +192,9 @@ impl Qwen36Bringup {
             kernels.load_ptx("fused_rope_partial_f16kv")?;
         let fn_fused_rope_partial_f16kv = fused_rope_partial_f16kv_mod
             .get_function("fused_rope_partial_f16kv_kernel")?;
+        let flash_attention_mod = kernels.load_ptx("flash_attention")?;
+        let fn_flash_attention_2_decode_f16io = flash_attention_mod
+            .get_function("flash_attention_2_decode_f16io_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -199,11 +208,14 @@ impl Qwen36Bringup {
             fn_fused_rmsnorm_fp8_quant,
             fused_rope_partial_f16kv_mod,
             fn_fused_rope_partial_f16kv,
+            flash_attention_mod,
+            fn_flash_attention_2_decode_f16io,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
              rmsnorm_inplace_f16, fp8_gemv (wpr_native_f16in: {}), \
-             argmax, fused_rmsnorm_fp8_quant, fused_rope_partial_f16kv.",
+             argmax, fused_rmsnorm_fp8_quant, fused_rope_partial_f16kv, \
+             flash_attention_2_decode_f16io.",
             outside_kernels.fn_fp8_gemv_wpr_native_f16in.is_some(),
         );
 
@@ -278,7 +290,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4g bring-up complete: outside (incl. \
+            "[qwen36] Phase 4h bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -334,6 +346,11 @@ impl Qwen36Bringup {
         // cos/sin tables. Identity at position 0, sanity-checks
         // ABI + table indexing.
         bringup.forward_layer3_rope_probe()?;
+        // Phase 4h: paged f16 attention decode launch with a
+        // single-token KV cache stand-in. Validates the FA2
+        // decode kernel ABI works for Qwen's heterogeneous
+        // (num_heads=16, num_kv_heads=2) shape.
+        bringup.forward_layer3_paged_attn_probe()?;
 
         Ok(bringup)
     }
@@ -870,6 +887,176 @@ impl Qwen36Bringup {
              rotary_dim={rotary_dim} (partial 0.25) pos=0 → \
              q_post_rope[head0,0..4]=[{q0:.3}, {q1:.3}, {q2:.3}, {q3:.3}] \
              (expected ≈ 2.0 at pos=0 — RoPE is identity there)"
+        );
+        Ok(())
+    }
+
+    /// Phase 4h probe: launch `flash_attention_2_decode_f16io_kernel`
+    /// against a tiny paged f16 KV cache. Validates the 14-arg ABI of
+    /// the f16-IO decode kernel works for Qwen's dims (num_heads=16,
+    /// num_kv_heads=2, head_dim=256). Synthetic single-token input
+    /// with `context_len = 1` (one slot of KV in the cache); attention
+    /// reduces to `softmax(QK^T/sqrt(d))V` over a single key — the
+    /// softmax weight is exactly 1.0, so output should equal V.
+    pub fn forward_layer3_paged_attn_probe(&self) -> Result<()> {
+        let head_dim = self.arch.base.head_dim as u32;
+        let num_heads = self.arch.base.num_attention_heads as u32;
+        let num_kv_heads = self.arch.base.num_key_value_heads as u32;
+        let block_size: u32 = 16;
+        let num_blocks: u32 = 1;
+        let max_blocks_per_seq: u32 = 1;
+        let num_seqs: u32 = 1;
+
+        // Sized buffers (all f16 except block_tables/context_lens int).
+        let q_bytes = (num_seqs as usize) * (num_heads as usize) * (head_dim as usize) * 2;
+        let kv_cache_bytes =
+            (num_blocks as usize) * (block_size as usize) * (num_kv_heads as usize)
+                * (head_dim as usize) * 2;
+        let out_bytes = q_bytes;
+
+        // Q = all-twos, V = all-threes, K = all-ones (so softmax weight
+        // simplifies but the output isn't trivially equal to V — lets
+        // us see that the kernel actually composes Q·K^T·V correctly).
+        let q_region = self.arena.region("qwen36_l3pa_q", q_bytes, 16)?;
+        let k_cache_region =
+            self.arena.region("qwen36_l3pa_kc", kv_cache_bytes, 16)?;
+        let v_cache_region =
+            self.arena.region("qwen36_l3pa_vc", kv_cache_bytes, 16)?;
+        let out_region = self.arena.region("qwen36_l3pa_out", out_bytes, 16)?;
+
+        let two_bits = 0x4000u16.to_le_bytes(); // f16 2.0
+        let one_bits = 0x3c00u16.to_le_bytes(); // f16 1.0
+        let three_bits = 0x4200u16.to_le_bytes(); // f16 3.0
+        let mut q_init = Vec::with_capacity(q_bytes);
+        for _ in 0..q_bytes / 2 {
+            q_init.extend_from_slice(&two_bits);
+        }
+        let mut k_init = Vec::with_capacity(kv_cache_bytes);
+        for _ in 0..kv_cache_bytes / 2 {
+            k_init.extend_from_slice(&one_bits);
+        }
+        let mut v_init = Vec::with_capacity(kv_cache_bytes);
+        for _ in 0..kv_cache_bytes / 2 {
+            v_init.extend_from_slice(&three_bits);
+        }
+        unsafe {
+            q_region.copy_from_host(&q_init)?;
+            k_cache_region.copy_from_host(&k_init)?;
+            v_cache_region.copy_from_host(&v_init)?;
+        }
+
+        // block_tables = [[0]] (seq 0 → block 0)
+        // context_lens = [1] (one valid token in the cache)
+        let zero_i32 = 0i32.to_le_bytes();
+        let one_i32 = 1i32.to_le_bytes();
+        let bt_region = self.arena.region("qwen36_l3pa_bt", 4, 16)?;
+        let cl_region = self.arena.region("qwen36_l3pa_cl", 4, 16)?;
+        unsafe {
+            bt_region.copy_from_host(&zero_i32)?;
+            cl_region.copy_from_host(&one_i32)?;
+        }
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            // FA2 decode kernel needs dynamic shared memory:
+            //   2 * FA2_BC * hd * 4 (K/V tiles) + FA2_BC * 4 (max_logits) + warps * 4
+            // Mirrors gemma4 decode.rs:290. For Qwen hd=256 this is
+            // ~64 KiB which exceeds the 48 KiB static cap, so the
+            // kernel needs `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE)`
+            // before the launch.
+            const FA2_THREADS: i32 = 128;
+            const FA2_BC: i32 = 32;
+            let hd_i = head_dim as i32;
+            let smem_bytes =
+                2 * FA2_BC * hd_i * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+            if smem_bytes as u32 >= 48 * 1024 {
+                let rc = cuFuncSetAttribute(
+                    self.outside_kernels
+                        .fn_flash_attention_2_decode_f16io
+                        .raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36_l3pa cuFuncSetAttribute",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+
+            let mut output = out_region.device_ptr();
+            let mut query = q_region.device_ptr();
+            let mut key_cache = k_cache_region.device_ptr();
+            let mut value_cache = v_cache_region.device_ptr();
+            let mut block_tables = bt_region.device_ptr();
+            let mut context_lens = cl_region.device_ptr();
+            let mut scale_arg = scale;
+            let mut nh = num_heads as i32;
+            let mut nkvh = num_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut bs = block_size as i32;
+            let mut mbps = max_blocks_per_seq as i32;
+            let mut window: i32 = -1; // no sliding window
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut query) as *mut u64 as *mut core::ffi::c_void,
+                (&mut key_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut value_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
+                (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
+                (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut bs) as *mut i32 as *mut core::ffi::c_void,
+                (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
+                (&mut window) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels
+                    .fn_flash_attention_2_decode_f16io
+                    .raw() as CUfunction,
+                num_seqs, num_heads, 1,
+                FA2_THREADS as u32, 1, 1,
+                smem_bytes as u32,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_l3pa flash_attention_2_decode_f16io",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        self.stream.fence()?;
+
+        let mut probe = [0u8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                out_region.device_ptr(),
+                probe.len(),
+            );
+        }
+        let o0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
+        let o1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+        let o2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
+        let o3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+        eprintln!(
+            "[qwen36] forward_layer3_paged_attn_probe: heads={num_heads} \
+             kv_heads={num_kv_heads} hd={head_dim} block_size={block_size} \
+             ctx_len=1 → out[head0,0..4]=[{o0:.3}, {o1:.3}, {o2:.3}, {o3:.3}] \
+             (expected ≈ 3.0 — single-key softmax weight is 1.0, output = V = 3.0)"
         );
         Ok(())
     }
