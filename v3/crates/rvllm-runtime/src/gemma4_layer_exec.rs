@@ -1599,7 +1599,7 @@ pub unsafe fn gemma4_forward_phase(
                     // `rope_nvfp4kv`. Required for `RVLLM_NVFP4_HADAMARD=1`
                     // where rotated Q saturates the static scalar.
                     let nvfp4_per_token_q =
-                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/false);
+                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/true);
                     let nvfp4_q_scale_cache: u64 =
                         if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
                     // === END DYNAMIC NVFP4 Q SCALE ===
@@ -1779,7 +1779,7 @@ pub unsafe fn gemma4_forward_phase(
                     // quantize time. Required for RVLLM_NVFP4_HADAMARD
                     // where rotated Q can saturate the static scalar.
                     let nvfp4_per_token_q =
-                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/false);
+                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/true);
                     let nvfp4_q_scale_cache: u64 =
                         if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
                     // === END DYNAMIC NVFP4 Q SCALE ===
@@ -1807,7 +1807,7 @@ pub unsafe fn gemma4_forward_phase(
                 } else {
                     // === DYNAMIC NVFP4 Q SCALE ===
                     let nvfp4_per_token_q =
-                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/false);
+                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/true);
                     let nvfp4_q_scale_cache: u64 =
                         if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
                     // === END DYNAMIC NVFP4 Q SCALE ===
@@ -3336,7 +3336,7 @@ unsafe fn rope_nvfp4kv(
     // the kernel reads the static `q_scale_ptr` (pre-Hadamard
     // behaviour, byte-identical to the prior path).
     let per_token_q_scale =
-        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/false);
+        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/true);
     let mut q_scale_cache_arg: u64 =
         if per_token_q_scale { scratch.q_scale_cache } else { 0 };
     // === END DYNAMIC NVFP4 Q SCALE ===
@@ -3355,7 +3355,7 @@ unsafe fn rope_nvfp4kv(
     // can A/B without touching the Q+K rotation.
     let mut rotate_v: i32 =
         if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
-            .unwrap_or(false) { 1 } else { 0 };
+            .unwrap_or(true) { 1 } else { 0 };
     // === END HADAMARD ROTATION ===
     // === CYCLE 28 PRE-QUANT K SIDECAR ===
     // Reuse the shadow K region: when shadow is enabled, primary
@@ -3480,7 +3480,7 @@ unsafe fn unrotate_attn_out_v_if_enabled(
     stream: u64,
 ) -> Result<()> {
     let rotate_v = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !rotate_v { return Ok(()); }
     // Codex18-3: kernel-side V-rotate gate is `hadamard_on && rotate_v`
     // (fused_rope_partial_nvfp4kv.cu:475). If the master Hadamard flag
@@ -3491,7 +3491,7 @@ unsafe fn unrotate_attn_out_v_if_enabled(
     // V rotation. Match the gates so the host is a no-op in the
     // same cases the kernel is.
     let hadamard_on = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD")
-        .unwrap_or(false);
+        .unwrap_or(true);
     if !hadamard_on {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {

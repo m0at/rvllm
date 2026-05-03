@@ -636,13 +636,17 @@ impl PrefixProvenance {
             .ok().and_then(|s| parse_policy(&s)).unwrap_or(scale_policy);
         let v_scale_policy = std::env::var("RVLLM_NVFP4_V_SCALE_POLICY")
             .ok().and_then(|s| parse_policy(&s)).unwrap_or(scale_policy);
-        let hadamard = parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(false);
-        // Provenance tracks the NVFP4 path's effective gate (default OFF).
-        // The FP8 scratch-allocation path uses default ON via
-        // per_token_q_scale_enabled(true); the two record different bools
-        // when env is unset, intentionally, but parsing is unified.
-        let per_token_q_scale = parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(false);
-        let hadamard_v = parse_truthy_env("RVLLM_NVFP4_HADAMARD_V").unwrap_or(false);
+        // Codex56-default: A_prod sweep config (cycle 55) is the
+        // sweep-validated production target — flipping the unset
+        // defaults to ON means a fresh deployment with no profile
+        // env vars set still lands on production-quality config.
+        // Operators opt OUT explicitly via `=0` for diagnostics.
+        let hadamard = parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(true);
+        // Provenance tracks the NVFP4 path's effective gate. Per Codex10-2
+        // HADAMARD=1 auto-implies PER_TOKEN_Q_SCALE; the explicit default
+        // here matches that contract so unset-env behaviour stays clean.
+        let per_token_q_scale = parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(true);
+        let hadamard_v = parse_truthy_env("RVLLM_NVFP4_HADAMARD_V").unwrap_or(true);
         let batch_prefill = parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false)
             && kv_dtype != crate::gemma4_layer_exec::KvDtype::F16;
         // Match the NVFP4/FP8 prefill dispatch gate: unified prefill is
@@ -744,10 +748,11 @@ pub(crate) fn parse_truthy_env(name: &str) -> Option<bool> {
     }
 }
 
-/// Master env gate. Default OFF — production paths byte-identical
-/// when unset. Operator opts in by setting `RVLLM_NVFP4_HADAMARD=1`.
+/// Master env gate. Codex56-default: ON — sweep-validated A_prod
+/// config (cycle 55) is the production target; unset-env now lands
+/// on production-quality. Operator opts OUT via `=0` for diagnostics.
 pub fn nvfp4_hadamard_enabled() -> bool {
-    parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(false)
+    parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(true)
 }
 
 /// BF16 residual chain. Cycle 54 Stage 1 introduced this as an
@@ -853,7 +858,7 @@ pub fn bf16_native_qkv_fast_path_enabled() -> bool {
 pub(crate) fn per_token_q_scale_enabled(default_on: bool) -> bool {
     static HADAMARD_OVERRIDE_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let raw = parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(default_on);
-    let hadamard = parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(false);
+    let hadamard = parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(true);
     if hadamard && !raw {
         HADAMARD_OVERRIDE_WARNED.get_or_init(|| {
             tracing::warn!(
