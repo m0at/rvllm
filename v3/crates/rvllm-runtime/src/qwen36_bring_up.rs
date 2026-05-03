@@ -300,7 +300,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4j bring-up complete: outside (incl. \
+            "[qwen36] Phase 4k bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -366,6 +366,9 @@ impl Qwen36Bringup {
         // Phase 4j: attn_output_gate (sigmoid · attn_out via new
         // sigmoid_mul_f16 kernel).
         bringup.forward_layer3_attn_gate_probe()?;
+        // Phase 4k: shared-expert gate_proj (first MoE-block kernel
+        // launch). Routed-expert dispatch + bf16 router land in 4l/4m.
+        bringup.forward_layer3_moe_shared_probe()?;
 
         Ok(bringup)
     }
@@ -1229,6 +1232,83 @@ impl Qwen36Bringup {
              values=4.0 gate_logits=0.0 → out[0..4]=[{o0:.3}, {o1:.3}, \
              {o2:.3}, {o3:.3}] (expected ≈ 2.0 — sigmoid(0)=0.5, \
              4.0×0.5=2.0)"
+        );
+        Ok(())
+    }
+
+    /// Phase 4k probe: launch the SHARED-EXPERT gate_proj of the
+    /// per-layer MoE block. Reuses the same blockwise FP8 GEMV kernel
+    /// as Q/K/V/o_proj — proves the MoE block's `shared_expert.*`
+    /// weight pointers + blockscales are populated correctly by the
+    /// Phase-2b loader. The 256 routed experts (top-8 dispatch) and
+    /// the bf16 router (`mlp.gate`) are deferred to Phase 4l/4m where
+    /// the per-token expert selection + grouped-GEMM dispatch land.
+    pub fn forward_layer3_moe_shared_probe(&self) -> Result<()> {
+        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
+            matches!(t, rvllm_loader::LayerAttnType::Full)
+        }) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let moe = &self.model.layers[layer_idx].moe;
+        let kernel = match self.outside_kernels.fn_fp8_gemv_wpr_native_f16in {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        let w = &moe.shared_expert_gate_proj;
+        let blockscale_ptr = match w.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let n = w.shape[0] as u32;
+        let k = w.shape[1] as u32;
+        let m: u32 = 1;
+
+        // Synthetic f16 all-twos input matching gate_proj's K dim
+        // (= hidden_size = 2048).
+        let two_bits = 0x4000u16.to_le_bytes();
+        let mut input_bytes = Vec::with_capacity((k as usize) * 2);
+        for _ in 0..k {
+            input_bytes.extend_from_slice(&two_bits);
+        }
+        let in_region =
+            self.arena.region("qwen36_l3moe_sh_in", input_bytes.len(), 16)?;
+        unsafe { in_region.copy_from_host(&input_bytes)? };
+        let out_bytes = (m as usize) * (n as usize) * 2;
+        let out_region =
+            self.arena.region("qwen36_l3moe_sh_out", out_bytes, 16)?;
+
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
+                kernel,
+                out_region.device_ptr(),
+                w.offset_bytes,
+                blockscale_ptr,
+                in_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        let mut probe = [0u8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                out_region.device_ptr(),
+                probe.len(),
+            );
+        }
+        let o0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
+        let o1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+        let o2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
+        let o3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+        eprintln!(
+            "[qwen36] forward_layer3_moe_shared_probe: layer={layer_idx} \
+             shared_expert.gate_proj=[{n}, {k}] → \
+             out[0..4]=[{o0:.3}, {o1:.3}, {o2:.3}, {o3:.3}] \
+             (blockwise FP8 GEMV against per-layer shared-expert weights)"
         );
         Ok(())
     }
