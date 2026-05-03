@@ -71,6 +71,47 @@ pub async fn spawn_cuda_worker(
     let join = std::thread::Builder::new()
         .name("rvllm-serve-cuda-worker".into())
         .spawn(move || {
+            // Phase-0 Qwen 3.6 detection. If the model_dir's config.json
+            // carries the Qwen-3.6 markers (linear+full hybrid attention,
+            // 256-expert MoE, attn_output_gate=true), short-circuit
+            // before the Gemma 4 loader hits a missing-tensor panic.
+            // Phase 1+ replaces this branch with a real Qwen36Bringup
+            // forward path; until then we surface a clean "not yet
+            // implemented" message at startup so the operator knows
+            // the branch is intentionally a scaffold.
+            match rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(&paths.model_dir) {
+                Ok(Some(_)) => {
+                    let _stub = match rvllm_runtime::qwen36_bring_up::Qwen36Bringup::load(
+                        paths,
+                        arena_bytes,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "Qwen36Bringup::load: {e:?}"
+                            )));
+                            return;
+                        }
+                    };
+                    let _ = ready_tx.send(Err(
+                        "qwen36 phase 0: arch detected + validated, but \
+                         forward pass not yet implemented. See \
+                         ~/.claude/plans/abundant-meandering-sifakis.md"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                Ok(None) => {
+                    // Not Qwen 3.6 — fall through to Gemma 4 path.
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "Qwen36Arch::from_dir: {e:?}"
+                    )));
+                    return;
+                }
+            }
+
             // Bring-up on the worker thread so Gemma4Bringup (which
             // contains !Send CUDA state like streams) never crosses
             // a thread boundary.
