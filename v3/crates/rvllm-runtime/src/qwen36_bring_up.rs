@@ -300,7 +300,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4l bring-up complete: outside (incl. \
+            "[qwen36] Phase 4m bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -371,6 +371,9 @@ impl Qwen36Bringup {
         bringup.forward_layer3_moe_shared_probe()?;
         // Phase 4l: router GEMV + top-8 selection (CPU-side smoke).
         bringup.forward_layer3_router_probe()?;
+        // Phase 4m: full SwiGLU FFN for routed expert 0
+        // (gate + up → silu·mul (host) → down).
+        bringup.forward_layer3_routed_expert_probe()?;
 
         Ok(bringup)
     }
@@ -1402,6 +1405,194 @@ impl Qwen36Bringup {
              num_experts={num_experts} top_k={top_k} → \
              selected: {}",
             pretty.join(", ")
+        );
+        Ok(())
+    }
+
+    /// Phase 4m probe: full SwiGLU FFN for ONE routed expert.
+    /// Chain: input f16 → expert0.gate_proj → expert0.up_proj →
+    ///        host(silu(gate)*up) → expert0.down_proj → out f16.
+    ///
+    /// The host silu*mul step is a stand-in until a `silu_mul_f16`
+    /// device kernel lands (would mirror Phase 4j's `sigmoid_mul_f16`
+    /// — both fall in the same "tiny new f16 element-wise" CUDA cost).
+    /// Validates the fused-experts arena layout: expert e's weight
+    /// slice begins at `experts_*_proj_fused.offset_bytes +
+    /// e * per_expert_fp8_bytes` and the blockscale slice at
+    /// `blockscale_ptr + e * per_expert_blockscale_f32_bytes`. For
+    /// e=0 both offsets are zero, which is the simplest-cut probe.
+    pub fn forward_layer3_routed_expert_probe(&self) -> Result<()> {
+        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
+            matches!(t, rvllm_loader::LayerAttnType::Full)
+        }) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let moe = &self.model.layers[layer_idx].moe;
+        let kernel = match self.outside_kernels.fn_fp8_gemv_wpr_native_f16in {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+
+        // experts_gate_proj_fused.shape = [num_experts, N, K]
+        // For Qwen 3.6: N = moe_intermediate_size = 512, K = hidden = 2048.
+        let gate_w = &moe.experts_gate_proj_fused;
+        let up_w = &moe.experts_up_proj_fused;
+        let down_w = &moe.experts_down_proj_fused;
+        let n_int = gate_w.shape[1] as u32; // 512
+        let k_in = gate_w.shape[2] as u32; // 2048
+        let n_down = down_w.shape[1] as u32; // 2048
+        let k_down = down_w.shape[2] as u32; // 512
+        let m: u32 = 1;
+
+        // Synthetic f16 all-twos input over the hidden dim.
+        let two_bits = 0x4000u16.to_le_bytes();
+        let mut input_bytes = Vec::with_capacity((k_in as usize) * 2);
+        for _ in 0..k_in {
+            input_bytes.extend_from_slice(&two_bits);
+        }
+        let in_region =
+            self.arena.region("qwen36_l3rex_in", input_bytes.len(), 16)?;
+        unsafe { in_region.copy_from_host(&input_bytes)? };
+
+        // Outputs of gate / up are size N_int = 512 each (f16).
+        let mid_bytes = (n_int as usize) * 2;
+        let gate_out_region =
+            self.arena.region("qwen36_l3rex_g", mid_bytes, 16)?;
+        let up_out_region =
+            self.arena.region("qwen36_l3rex_u", mid_bytes, 16)?;
+        let silu_mul_region =
+            self.arena.region("qwen36_l3rex_silu", mid_bytes, 16)?;
+        let down_bytes = (n_down as usize) * 2;
+        let down_out_region =
+            self.arena.region("qwen36_l3rex_o", down_bytes, 16)?;
+
+        // Expert 0's weight slice begins at the fused region start.
+        // For e>0: weight_ptr += e * (N * K), blockscale_ptr +=
+        //          e * (N/128 * K/128 * sizeof(f32)).
+        let gate_blockscale = match gate_w.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let up_blockscale = match up_w.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let down_blockscale = match down_w.blockscale_ptr {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m,
+                n: n_int,
+                k: k_in,
+            }
+            .launch(
+                kernel,
+                gate_out_region.device_ptr(),
+                gate_w.offset_bytes,
+                gate_blockscale,
+                in_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m,
+                n: n_int,
+                k: k_in,
+            }
+            .launch(
+                kernel,
+                up_out_region.device_ptr(),
+                up_w.offset_bytes,
+                up_blockscale,
+                in_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // Host-side silu(gate) * up: DtoH both, compute, HtoD result.
+        let mut gate_host = vec![0u8; mid_bytes];
+        let mut up_host = vec![0u8; mid_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                gate_host.as_mut_ptr() as *mut _,
+                gate_out_region.device_ptr(),
+                mid_bytes,
+            );
+            let _ = cuMemcpyDtoH_v2(
+                up_host.as_mut_ptr() as *mut _,
+                up_out_region.device_ptr(),
+                mid_bytes,
+            );
+        }
+        let mut silu_mul_host = Vec::with_capacity(mid_bytes);
+        for i in 0..(n_int as usize) {
+            let g = f16_bits_to_f32(u16::from_le_bytes([
+                gate_host[i * 2],
+                gate_host[i * 2 + 1],
+            ]));
+            let u = f16_bits_to_f32(u16::from_le_bytes([
+                up_host[i * 2],
+                up_host[i * 2 + 1],
+            ]));
+            // SiLU: x · sigmoid(x) = x / (1 + exp(-x))
+            let silu_g = g / (1.0f32 + (-g).exp());
+            let v = silu_g * u;
+            silu_mul_host.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+        }
+        unsafe { silu_mul_region.copy_from_host(&silu_mul_host)? };
+
+        // down_proj: mid [N=512] → out [hidden=2048]
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m,
+                n: n_down,
+                k: k_down,
+            }
+            .launch(
+                kernel,
+                down_out_region.device_ptr(),
+                down_w.offset_bytes,
+                down_blockscale,
+                silu_mul_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        let mut probe = [0u8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                down_out_region.device_ptr(),
+                probe.len(),
+            );
+        }
+        let o0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
+        let o1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+        let o2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
+        let o3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+
+        // Log a sample of the silu*mul intermediate too, so we see
+        // both stages of the SwiGLU FFN.
+        let m0 = f16_bits_to_f32(u16::from_le_bytes([silu_mul_host[0], silu_mul_host[1]]));
+        let m1 = f16_bits_to_f32(u16::from_le_bytes([silu_mul_host[2], silu_mul_host[3]]));
+        let m2 = f16_bits_to_f32(u16::from_le_bytes([silu_mul_host[4], silu_mul_host[5]]));
+        let m3 = f16_bits_to_f32(u16::from_le_bytes([silu_mul_host[6], silu_mul_host[7]]));
+
+        eprintln!(
+            "[qwen36] forward_layer3_routed_expert_probe: layer={layer_idx} \
+             expert=0 gate/up=[{n_int}, {k_in}] down=[{n_down}, {k_down}] \
+             silu_mul[0..4]=[{m0:.3}, {m1:.3}, {m2:.3}, {m3:.3}] \
+             out[0..4]=[{o0:.3}, {o1:.3}, {o2:.3}, {o3:.3}] \
+             (full SwiGLU FFN: gate → up → silu·mul (host) → down)"
         );
         Ok(())
     }
