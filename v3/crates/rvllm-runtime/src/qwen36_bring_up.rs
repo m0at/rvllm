@@ -60,6 +60,11 @@ pub struct Qwen36OutsideKernels {
     /// (Qwen 3.6 full-attn layers don't use sliding).
     pub flash_attention_mod: LoadedModule,
     pub fn_flash_attention_2_decode_f16io: KernelFn,
+    /// Phase 4j: Qwen-specific element-wise `sigmoid(gate) * values`
+    /// for the `attn_output_gate=true` path. New CUDA kernel added
+    /// in this phase — kernels/sigmoid_mul_f16.cu.
+    pub sigmoid_mul_f16_mod: LoadedModule,
+    pub fn_sigmoid_mul_f16: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -195,6 +200,9 @@ impl Qwen36Bringup {
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
+        let sigmoid_mul_f16_mod = kernels.load_ptx("sigmoid_mul_f16")?;
+        let fn_sigmoid_mul_f16 =
+            sigmoid_mul_f16_mod.get_function("sigmoid_mul_f16_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -210,12 +218,14 @@ impl Qwen36Bringup {
             fn_fused_rope_partial_f16kv,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
+            sigmoid_mul_f16_mod,
+            fn_sigmoid_mul_f16,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
              rmsnorm_inplace_f16, fp8_gemv (wpr_native_f16in: {}), \
              argmax, fused_rmsnorm_fp8_quant, fused_rope_partial_f16kv, \
-             flash_attention_2_decode_f16io.",
+             flash_attention_2_decode_f16io, sigmoid_mul_f16.",
             outside_kernels.fn_fp8_gemv_wpr_native_f16in.is_some(),
         );
 
@@ -290,7 +300,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4i bring-up complete: outside (incl. \
+            "[qwen36] Phase 4j bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -353,6 +363,9 @@ impl Qwen36Bringup {
         bringup.forward_layer3_paged_attn_probe()?;
         // Phase 4i: o_proj (closes the attention block).
         bringup.forward_layer3_o_proj_probe()?;
+        // Phase 4j: attn_output_gate (sigmoid · attn_out via new
+        // sigmoid_mul_f16 kernel).
+        bringup.forward_layer3_attn_gate_probe()?;
 
         Ok(bringup)
     }
@@ -1133,6 +1146,89 @@ impl Qwen36Bringup {
             "[qwen36] forward_layer3_o_proj_probe: o_proj=[{n}, {k}] → \
              out[0..4]=[{o0:.3}, {o1:.3}, {o2:.3}, {o3:.3}] \
              (blockwise FP8 GEMV o_proj against synthetic f16 attn-out)"
+        );
+        Ok(())
+    }
+
+    /// Phase 4j probe: launch the new `sigmoid_mul_f16_kernel` with
+    /// gate_logits = 0.0 (sigmoid(0) = 0.5) and values = 4.0, so the
+    /// expected output is 2.0 across the buffer. Validates the new
+    /// CUDA kernel built + the launch ABI.
+    pub fn forward_layer3_attn_gate_probe(&self) -> Result<()> {
+        let head_dim = self.arch.base.head_dim as u32;
+        let num_heads = self.arch.base.num_attention_heads as u32;
+        let n = num_heads * head_dim;
+
+        // values = 4.0 (f16 0x4400), gate_logits = 0.0 (f16 0x0000).
+        let four_bits = 0x4400u16.to_le_bytes();
+        let zero_bits = 0x0000u16.to_le_bytes();
+        let mut v_bytes = Vec::with_capacity((n as usize) * 2);
+        let mut g_bytes = Vec::with_capacity((n as usize) * 2);
+        for _ in 0..n {
+            v_bytes.extend_from_slice(&four_bits);
+            g_bytes.extend_from_slice(&zero_bits);
+        }
+        let v_region = self.arena.region("qwen36_l3sg_v", v_bytes.len(), 16)?;
+        let g_region = self.arena.region("qwen36_l3sg_g", g_bytes.len(), 16)?;
+        let o_region = self.arena.region("qwen36_l3sg_o", v_bytes.len(), 16)?;
+        unsafe {
+            v_region.copy_from_host(&v_bytes)?;
+            g_region.copy_from_host(&g_bytes)?;
+        }
+
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut output = o_region.device_ptr();
+            let mut values = v_region.device_ptr();
+            let mut gate = g_region.device_ptr();
+            let mut nn = n as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut values) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gate) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid = (n + block - 1) / block;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_sigmoid_mul_f16.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_l3sg sigmoid_mul_f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        self.stream.fence()?;
+
+        let mut probe = [0u8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                o_region.device_ptr(),
+                probe.len(),
+            );
+        }
+        let o0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
+        let o1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+        let o2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
+        let o3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+        eprintln!(
+            "[qwen36] forward_layer3_attn_gate_probe: n={n} \
+             values=4.0 gate_logits=0.0 → out[0..4]=[{o0:.3}, {o1:.3}, \
+             {o2:.3}, {o3:.3}] (expected ≈ 2.0 — sigmoid(0)=0.5, \
+             4.0×0.5=2.0)"
         );
         Ok(())
     }

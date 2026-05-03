@@ -311,6 +311,11 @@
       "path": "scale_rows_f32_ratio.ptx",
       "sha256": "a9a6f1907c0be8f1ed0d08cf958d626f21dc20b2004d912c31b7e1f35aa12c11"
     },
+    "sigmoid_mul_f16": {
+      "bytes": 2008,
+      "path": "sigmoid_mul_f16.ptx",
+      "sha256": "5cda217b5208b5ab4ba41d4a3c8a4e42c5c6aff5215b48ff2e934e0ba228aeea"
+    },
     "vector_add_bf16_to_f16": {
       "bytes": 1430,
       "path": "vector_add_bf16_to_f16.ptx",
@@ -327,5 +332,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "3f5d26a"
+  "revision": "2b27771"
 }
