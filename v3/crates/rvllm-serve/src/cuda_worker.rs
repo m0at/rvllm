@@ -81,7 +81,7 @@ pub async fn spawn_cuda_worker(
             // the branch is intentionally a scaffold.
             match rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(&paths.model_dir) {
                 Ok(Some(_)) => {
-                    let _stub = match rvllm_runtime::qwen36_bring_up::Qwen36Bringup::load(
+                    let qwen = match rvllm_runtime::qwen36_bring_up::Qwen36Bringup::load(
                         paths,
                         arena_bytes,
                     ) {
@@ -93,15 +93,58 @@ pub async fn spawn_cuda_worker(
                             return;
                         }
                     };
-                    let _ = ready_tx.send(Err(
-                        "qwen36 phase 4a: outside-only forward exposed \
-                         as `Qwen36Bringup::forward_outside_only(tokens)` \
-                         — ready for cuda_worker dispatch in Phase 4b. \
-                         Per-layer forward (full-attn + linear-attn + \
-                         MoE) still TODO. \
-                         See ~/.claude/plans/abundant-meandering-sifakis.md"
-                            .to_string(),
-                    ));
+                    let scratch_ck = qwen.arena.checkpoint();
+                    tracing::info!(
+                        "qwen36 cuda worker ready (Phase 4b: outside-only \
+                         forward — output is garbage until Phase 4c lands \
+                         per-layer math)"
+                    );
+                    let _ = ready_tx.send(Ok(()));
+
+                    // Phase-4b request loop. One token per request:
+                    // forward_outside_only returns the argmax for the
+                    // last input position; we ship that as a single
+                    // Token event then Done (Stop). max_new_tokens > 1
+                    // would require KV cache + decode loop, deferred
+                    // to Phase 4c+.
+                    while let Some(req) = req_rx.blocking_recv() {
+                        let prompt_len = req.prompt_ids.len() as u32;
+                        if req.cancelled.load(Ordering::Relaxed) {
+                            let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+                                finish: FinishReason::Cancelled,
+                                prompt_tokens: prompt_len,
+                                completion_tokens: 0,
+                            });
+                            unsafe { qwen.arena.restore(scratch_ck); }
+                            continue;
+                        }
+                        let i32_tokens: Vec<i32> = req
+                            .prompt_ids
+                            .iter()
+                            .map(|&t| t as i32)
+                            .collect();
+                        match qwen.forward_outside_only(&i32_tokens) {
+                            Ok(next_token) => {
+                                let id = if next_token < 0 { 0u32 } else { next_token as u32 };
+                                let _ = req.events_tx.blocking_send(GenerateEvent::Token {
+                                    id,
+                                    position: prompt_len,
+                                });
+                                let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+                                    finish: FinishReason::Stop,
+                                    prompt_tokens: prompt_len,
+                                    completion_tokens: 1,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                                    format!("qwen36 forward_outside_only: {e:?}"),
+                                ));
+                            }
+                        }
+                        unsafe { qwen.arena.restore(scratch_ck); }
+                    }
+                    tracing::info!("qwen36 cuda worker queue closed, exiting");
                     return;
                 }
                 Ok(None) => {
