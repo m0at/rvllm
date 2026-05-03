@@ -331,14 +331,23 @@ pub async fn chat_completions(
                     .map(|v| !v.is_null() && !matches!(v, serde_json::Value::Array(a) if a.is_empty()))
                     .unwrap_or(false);
                 if !has_content && !has_tool_calls {
-                    return Err(ApiError::invalid_param(
-                        format!(
-                            "messages[{i}] is an assistant message with neither `content` nor \
-                             `tool_calls`; one of the two is required"
-                        ),
-                        "messages",
-                        "empty_assistant_message",
-                    ));
+                    // RVLLM_LEGACY_ALLOWED=1 tolerates empty assistant turns
+                    // for clients that persist tool-only / voice-only replies
+                    // without a body. Off by default; enable per-profile.
+                    let legacy_allowed = std::env::var("RVLLM_LEGACY_ALLOWED")
+                        .ok()
+                        .as_deref()
+                        == Some("1");
+                    if !legacy_allowed {
+                        return Err(ApiError::invalid_param(
+                            format!(
+                                "messages[{i}] is an assistant message with neither `content` nor \
+                                 `tool_calls`; one of the two is required"
+                            ),
+                            "messages",
+                            "empty_assistant_message",
+                        ));
+                    }
                 }
             }
         }
