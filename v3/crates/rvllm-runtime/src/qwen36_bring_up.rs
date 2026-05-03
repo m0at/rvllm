@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_core::Result;
+use rvllm_cutlass::CublasLt;
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_loader::qwen36_weights::Qwen36LoadedModel;
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
@@ -43,6 +44,11 @@ pub struct Qwen36OutsideKernels {
     pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
     pub argmax_mod: LoadedModule,
     pub fn_argmax: KernelFn,
+    /// Phase 3g: fused (final RMSNorm + FP8-quantize) for the lm_head
+    /// pre-matmul step. Outputs FP8 hidden + per-token f32 scale that
+    /// cuBLASLt's fp8_gemm consumes.
+    pub fused_rmsnorm_fp8_quant_mod: LoadedModule,
+    pub fn_fused_rmsnorm_fp8_quant: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -55,6 +61,7 @@ pub struct Qwen36Bringup {
     pub model: Qwen36LoadedModel,
     pub kernels: Arc<KernelLoader>,
     pub outside_kernels: Qwen36OutsideKernels,
+    pub cublaslt: CublasLt,
 }
 
 impl Qwen36Bringup {
@@ -159,6 +166,9 @@ impl Qwen36Bringup {
         };
         let argmax_mod = kernels.load_ptx("argmax")?;
         let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
+        let fused_rmsnorm_fp8_quant_mod = kernels.load_ptx("fused_rmsnorm_fp8_quant")?;
+        let fn_fused_rmsnorm_fp8_quant =
+            fused_rmsnorm_fp8_quant_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -168,11 +178,24 @@ impl Qwen36Bringup {
             fn_fp8_gemv_wpr_native_f16in,
             argmax_mod,
             fn_argmax,
+            fused_rmsnorm_fp8_quant_mod,
+            fn_fused_rmsnorm_fp8_quant,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
-             rmsnorm_inplace_f16, fp8_gemv (wpr_native_f16in: {}), argmax.",
+             rmsnorm_inplace_f16, fp8_gemv (wpr_native_f16in: {}), \
+             argmax, fused_rmsnorm_fp8_quant.",
             outside_kernels.fn_fp8_gemv_wpr_native_f16in.is_some(),
+        );
+
+        // Phase 3g: cuBLASLt for the lm_head FP8 GEMM. Same 32 MiB
+        // workspace size Gemma 4 uses (gemma4_bring_up.rs:1415).
+        let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
+        let cublaslt_ws_region = arena.region("qwen36_cublaslt_ws", cublaslt_ws_bytes, 256)?;
+        let cublaslt = CublasLt::new(cublaslt_ws_region.device_ptr(), cublaslt_ws_bytes)?;
+        eprintln!(
+            "[qwen36] cuBLASLt initialized with {} MiB workspace.",
+            cublaslt_ws_bytes / (1024 * 1024)
         );
 
         let n_full = model.layers.iter().filter(|l| matches!(
@@ -184,13 +207,15 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 3f bring-up complete: outside (incl. \
+            "[qwen36] Phase 3g bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
-             pointers + embedding_gather + rmsnorm_inplace_f16 smoke \
-             launches validated. arena.used()={used:.2} GiB / \
-             {total:.2} GiB. lm_head matmul + argmax NOT yet wired. \
+             pointers + cuBLASLt + outside-only forward smoke \
+             (embed → rmsnorm+fp8quant → fp8_gemm → cpu_argmax) \
+             validated end-to-end. arena.used()={used:.2} GiB / \
+             {total:.2} GiB. Per-layer forward (full-attn + \
+             linear-attn + MoE) still TODO. \
              See ~/.claude/plans/abundant-meandering-sifakis.md.",
             arch.num_experts,
             used = arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -207,6 +232,7 @@ impl Qwen36Bringup {
             model,
             kernels,
             outside_kernels,
+            cublaslt,
         };
         // Phase 3e smoke: actually launch embedding_gather against the
         // loaded weights. If this throws, the rest of the forward
@@ -270,76 +296,109 @@ impl Qwen36Bringup {
             )?;
         }
 
-        // Phase 3f: chain `rmsnorm_inplace_f16` against the embedded
-        // hidden state + the final-norm gamma weight. Kernel sig
-        // (kernels/rmsnorm_inplace_f16.cu): `(half* x [num_tokens,
-        // hidden] in-place, const half* gamma [hidden], float eps,
-        // int hidden)`. Grid: (num_tokens, 1, 1). Block: hidden (capped
-        // at 1024). lm_head matmul + argmax land in Phase 3g once the
-        // f16→f32 + per-tensor scaled fp8_gemv variant is selected.
+        // Phase 3g: fused (RMSNorm + FP8-quantize) → cuBLASLt
+        // FP8 matmul against lm_head → DtoH logits → CPU argmax.
+        // Mirrors Gemma 4's outside-only path (gemma4_bring_up.rs:2058).
         let eps = self.arch.base.rms_norm_eps;
+        let hidden_fp8_bytes = (num_tokens as usize) * (hidden as usize); // 1 byte/elem
+        let hidden_scale_bytes = (num_tokens as usize) * 4; // f32/token
+        let logits_bytes = (num_tokens as usize) * (vocab as usize) * 2; // f16
+        let hidden_fp8_region =
+            self.arena.region("qwen36_smoke_hidden_fp8", hidden_fp8_bytes, 16)?;
+        let hidden_scale_region =
+            self.arena.region("qwen36_smoke_hidden_scale", hidden_scale_bytes, 16)?;
+        let logits_region = self.arena.region("qwen36_smoke_logits", logits_bytes, 16)?;
+
+        let stream_raw = self.stream.raw() as u64;
+
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                hidden_region.device_ptr(),
+                self.model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+
+        // cuBLASLt fp8_gemm: D = A * B^T.
+        //   A = hidden_fp8 [num_tokens, hidden]
+        //   B = lm_head_fp8 [vocab, hidden]
+        //   D = logits f16 [num_tokens, vocab]
         #[cfg(feature = "cuda")]
         unsafe {
-            use cudarc::driver::sys::*;
-            let mut x_ptr = hidden_region.device_ptr();
-            let mut gamma_ptr = self.model.outside.final_norm.offset_bytes;
-            let mut eps_arg = eps;
-            let mut hidden_arg = hidden as i32;
-            let args = [
-                (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut gamma_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut eps_arg) as *mut f32 as *mut core::ffi::c_void,
-                (&mut hidden_arg) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let block = hidden.min(1024);
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_rmsnorm_inplace_f16.raw() as CUfunction,
-                num_tokens, 1, 1,
-                block, 1, 1,
-                0,
-                self.stream.raw() as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36_smoke rmsnorm_inplace_f16",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
+            self.cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                self.model.outside.lm_head_fp8.offset_bytes,
+                logits_region.device_ptr(),
+                num_tokens as i32,
+                vocab as i32,
+                hidden as i32,
+                hidden_scale_region.device_ptr(),
+                self.model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
         }
         self.stream.fence()?;
 
-        // DtoH the first 4 f16 values of token-0's hidden state so the
-        // log is non-trivial — proves the kernel actually wrote.
-        // rvllm_mem::Region only exposes copy_from_host; raw cuMemcpyDtoH
-        // is the only DtoH path here.
-        let mut probe = [0u8; 8]; // 4 × f16
+        // DtoH the first 4 normalized hidden values for sanity, plus
+        // token-0's full logits row for CPU-side argmax (the f16→f32
+        // upcast + argmax fits in <10 ms on host for vocab=248k).
+        let mut hidden_probe = [0u8; 8];
+        let logits_row_bytes = (vocab as usize) * 2;
+        let mut logits_row_f16 = vec![0u8; logits_row_bytes];
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let rc = cuMemcpyDtoH_v2(
-                probe.as_mut_ptr() as *mut _,
+            let rc1 = cuMemcpyDtoH_v2(
+                hidden_probe.as_mut_ptr() as *mut _,
                 hidden_region.device_ptr(),
-                probe.len(),
+                hidden_probe.len(),
             );
-            if rc != CUresult::CUDA_SUCCESS {
+            let rc2 = cuMemcpyDtoH_v2(
+                logits_row_f16.as_mut_ptr() as *mut _,
+                logits_region.device_ptr(),
+                logits_row_bytes,
+            );
+            if rc1 != CUresult::CUDA_SUCCESS || rc2 != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36_smoke cuMemcpyDtoH",
+                    "qwen36_smoke DtoH",
                     rvllm_core::CudaErrorKind::MemcpyFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
         }
-        let f0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
-        let f1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
-        let f2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
-        let f3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+        let f0 = f16_bits_to_f32(u16::from_le_bytes([hidden_probe[0], hidden_probe[1]]));
+        let f1 = f16_bits_to_f32(u16::from_le_bytes([hidden_probe[2], hidden_probe[3]]));
+        let f2 = f16_bits_to_f32(u16::from_le_bytes([hidden_probe[4], hidden_probe[5]]));
+        let f3 = f16_bits_to_f32(u16::from_le_bytes([hidden_probe[6], hidden_probe[7]]));
+
+        let mut best_logit = f32::NEG_INFINITY;
+        let mut best_token: i32 = -1;
+        for v in 0..vocab as usize {
+            let bits = u16::from_le_bytes([
+                logits_row_f16[v * 2],
+                logits_row_f16[v * 2 + 1],
+            ]);
+            let l = f16_bits_to_f32(bits);
+            if l > best_logit {
+                best_logit = l;
+                best_token = v as i32;
+            }
+        }
+
         eprintln!(
-            "[qwen36] forward_outside_smoke: embedding_gather + rmsnorm \
+            "[qwen36] forward_outside_smoke: embed → rmsnorm+fp8 → \
+             cublaslt.fp8_gemm → cpu_argmax \
              token_ids={token_ids:?} \
-             token0_normed[0..4]=[{f0:.4}, {f1:.4}, {f2:.4}, {f3:.4}] \
+             token0_embed[0..4]=[{f0:.4}, {f1:.4}, {f2:.4}, {f3:.4}] \
+             token0_argmax_id={best_token} logit={best_logit:.3} \
              eps={eps:.0e}"
         );
         Ok(())
