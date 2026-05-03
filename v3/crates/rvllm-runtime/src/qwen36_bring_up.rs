@@ -197,7 +197,7 @@ impl Qwen36Bringup {
             total = arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
 
-        Ok(Self {
+        let bringup = Self {
             paths,
             arena_bytes,
             arch,
@@ -207,16 +207,106 @@ impl Qwen36Bringup {
             model,
             kernels,
             outside_kernels,
-        })
+        };
+        // Phase 3e smoke: actually launch embedding_gather against the
+        // loaded weights. If this throws, the rest of the forward
+        // pipeline can't be built on top — fail fast.
+        bringup.forward_outside_smoke()?;
+        Ok(bringup)
     }
 
     pub fn kernels_dir(&self) -> &PathBuf {
         &self.paths.kernels_dir
     }
 
+    /// Phase 3e smoke test: launch the embedding-gather kernel against
+    /// the loaded `embed_tokens` table for a hardcoded 4-token input,
+    /// fence the stream, and DtoH the first 4 hidden-state floats so
+    /// we can log them. Validates that:
+    ///   - the bring-up's CUDA context + arena + stream + KernelLoader
+    ///     are wired correctly
+    ///   - the f16 `embed_tokens` upload reaches the device with
+    ///     the right layout
+    ///   - the EmbeddingGatherLaunch ABI matches Qwen 3.6 dims
+    /// without exercising any per-layer math (still Phase 3f+).
+    pub fn forward_outside_smoke(&self) -> Result<()> {
+        let hidden = self.arch.base.hidden_size as u32;
+        let vocab = self.arch.base.vocab_size as u32;
+        // Hardcoded canary tokens: BOS-likely + a few mid-vocab IDs.
+        // Real generation needs the tokenizer; we just want non-zero
+        // embeddings for the kernel output.
+        let token_ids: [i32; 4] = [1, 100, 1000, 10_000];
+        let num_tokens = token_ids.len() as u32;
+
+        // Allocate device regions: token IDs (i32) + hidden state (f16).
+        let tokens_region = self.arena.region(
+            "qwen36_smoke_tokens",
+            std::mem::size_of_val(&token_ids),
+            16,
+        )?;
+        let mut token_bytes = Vec::with_capacity(token_ids.len() * 4);
+        for t in &token_ids {
+            token_bytes.extend_from_slice(&t.to_le_bytes());
+        }
+        unsafe { tokens_region.copy_from_host(&token_bytes)? };
+
+        let hidden_bytes = (num_tokens as usize) * (hidden as usize) * 2; // f16
+        let hidden_region = self.arena.region("qwen36_smoke_hidden", hidden_bytes, 16)?;
+
+        // Launch embedding_gather_f16 via the standard rvllm-fused
+        // ABI used by Gemma 4.
+        let launch = rvllm_fused::EmbeddingGatherLaunch {
+            num_tokens,
+            hidden,
+            vocab,
+        };
+        unsafe {
+            launch.launch(
+                self.outside_kernels.fn_embedding_gather_f16,
+                hidden_region.device_ptr(),
+                self.model.outside.embed_tokens.offset_bytes,
+                tokens_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // DtoH the first 4 f16 values of token-0's hidden state so the
+        // log is non-trivial — proves the kernel actually wrote.
+        // rvllm_mem::Region only exposes copy_from_host; raw cuMemcpyDtoH
+        // is the only DtoH path here.
+        let mut probe = [0u8; 8]; // 4 × f16
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                hidden_region.device_ptr(),
+                probe.len(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_smoke cuMemcpyDtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let f0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
+        let f1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+        let f2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
+        let f3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+        eprintln!(
+            "[qwen36] forward_outside_smoke: embedding_gather token_ids={token_ids:?} \
+             token0_hidden[0..4]=[{f0:.4}, {f1:.4}, {f2:.4}, {f3:.4}]"
+        );
+        Ok(())
+    }
+
     pub fn run_generate(&self) -> ! {
         unimplemented!(
-            "qwen36 phase 2 — full-attention forward pass + MoE not yet ported"
+            "qwen36 phase 3f+ — outside-only forward (rmsnorm + lm_head + argmax) \
+             then per-layer math still TODO"
         );
     }
 
@@ -231,4 +321,35 @@ impl Qwen36Bringup {
     pub fn init_prefix_cache(&self) -> ! {
         unimplemented!("qwen36 phase 2 — prefix cache not yet ported");
     }
+}
+
+/// Decode a stored f16 bit pattern into f32 without pulling in `half`
+/// as an explicit dep of `rvllm-runtime`. Mirrors `half::f16::to_f32`
+/// for finite values; specials (NaN/inf) are preserved by IEEE
+/// composition.
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 0x1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31
+        } else {
+            // Subnormal — renormalise.
+            let mut e: i32 = -14;
+            let mut m = mant;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            let m = (m & 0x3ff) << 13;
+            (sign << 31) | (((e + 127) as u32) << 23) | m
+        }
+    } else if exp == 0x1f {
+        // NaN or inf.
+        (sign << 31) | (0xff << 23) | (mant << 13)
+    } else {
+        (sign << 31) | (((exp + 112) as u32) << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
 }

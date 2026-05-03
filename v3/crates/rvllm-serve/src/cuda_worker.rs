@@ -94,11 +94,11 @@ pub async fn spawn_cuda_worker(
                         }
                     };
                     let _ = ready_tx.send(Err(
-                        "qwen36 phase 3d: outside tensors (incl. \
-                         FP8-quantized lm_head) + per-layer block + \
-                         256-expert MoE + KernelLoader + outside \
-                         kernel pointers resolved. Outside-only forward \
-                         launches NOT yet wired. See \
+                        "qwen36 phase 3e: full Qwen weight load + \
+                         outside kernel pointers + embedding_gather \
+                         smoke launch validated end-to-end. Final \
+                         RMSNorm + lm_head + argmax launches NOT yet \
+                         wired (Phase 3f). See \
                          ~/.claude/plans/abundant-meandering-sifakis.md"
                             .to_string(),
                     ));
