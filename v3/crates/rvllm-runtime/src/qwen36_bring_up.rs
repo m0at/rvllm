@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_core::Result;
+use rvllm_kernels::KernelLoader;
 use rvllm_loader::qwen36_weights::Qwen36LoadedModel;
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
@@ -29,6 +30,7 @@ pub struct Qwen36Bringup {
     pub arena: HbmArena<'static>,
     pub stream: Stream,
     pub model: Qwen36LoadedModel,
+    pub kernels: Arc<KernelLoader>,
 }
 
 impl Qwen36Bringup {
@@ -86,6 +88,25 @@ impl Qwen36Bringup {
             arch.num_experts,
         )?;
 
+        // Phase 3a: load + verify the PTX kernel manifest the same way
+        // Gemma 4 does. The Qwen forward path will need the same
+        // model-agnostic kernel set (embedding_gather, fused_rmsnorm,
+        // CUTLASS FP8-GEMM, FA2 paged-attn) plus future Qwen-specific
+        // ones (qwen_qk_norm, attn_output_gate, linear-attn recurrent,
+        // MoE grouped-FP8-GEMM). Initializing the loader here proves
+        // the manifest path and arch-pinning still hold for the Qwen
+        // bring-up before Phase 3b starts wiring kernel calls.
+        let kernels_dir = crate::bring_up::resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
+        let manifest_path = kernels_dir.join("manifest.json");
+        let manifest =
+            rvllm_kernels::manifest::KernelManifest::load_and_verify(&manifest_path)?;
+        if let Some(t) = compile_target {
+            manifest.assert_arch(t.as_sm_str())?;
+        }
+        manifest
+            .warn_if_revision_drift(rvllm_kernels::manifest::VerifiedManifest::BUILD_REVISION);
+        let kernels = Arc::new(KernelLoader::new(manifest));
+
         let n_full = model.layers.iter().filter(|l| matches!(
             l.attn,
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(_)
@@ -95,10 +116,11 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 2b tensor upload complete: outside + {n_full} \
+            "[qwen36] Phase 3a bring-up complete: outside + {n_full} \
              full-attention + {n_linear} linear-attention + per-layer \
-             MoE blocks ({} experts/layer). arena.used()={used:.2} GiB \
-             / {total:.2} GiB. Forward pass NOT yet implemented. \
+             MoE blocks ({} experts/layer) + KernelLoader init. \
+             arena.used()={used:.2} GiB / {total:.2} GiB. \
+             Forward kernels NOT yet wired. \
              See ~/.claude/plans/abundant-meandering-sifakis.md.",
             arch.num_experts,
             used = arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -113,6 +135,7 @@ impl Qwen36Bringup {
             arena,
             stream,
             model,
+            kernels,
         })
     }
 

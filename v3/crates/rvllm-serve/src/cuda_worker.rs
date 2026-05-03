@@ -94,10 +94,10 @@ pub async fn spawn_cuda_worker(
                         }
                     };
                     let _ = ready_tx.send(Err(
-                        "qwen36 phase 2b: arch + outside + every \
-                         per-layer block (10 full-attn + 30 linear-attn) \
-                         + 256-expert MoE per layer uploaded. Forward \
-                         kernels NOT yet implemented. See \
+                        "qwen36 phase 3a: arch + every per-layer block \
+                         + 256-expert MoE + KernelLoader initialized. \
+                         Forward kernel wiring (full-attn + linear-attn \
+                         + MoE) NOT yet implemented. See \
                          ~/.claude/plans/abundant-meandering-sifakis.md"
                             .to_string(),
                     ));
