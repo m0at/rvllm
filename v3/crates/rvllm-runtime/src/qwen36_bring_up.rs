@@ -300,7 +300,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4k bring-up complete: outside (incl. \
+            "[qwen36] Phase 4l bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -369,6 +369,8 @@ impl Qwen36Bringup {
         // Phase 4k: shared-expert gate_proj (first MoE-block kernel
         // launch). Routed-expert dispatch + bf16 router land in 4l/4m.
         bringup.forward_layer3_moe_shared_probe()?;
+        // Phase 4l: router GEMV + top-8 selection (CPU-side smoke).
+        bringup.forward_layer3_router_probe()?;
 
         Ok(bringup)
     }
@@ -1309,6 +1311,97 @@ impl Qwen36Bringup {
              shared_expert.gate_proj=[{n}, {k}] → \
              out[0..4]=[{o0:.3}, {o1:.3}, {o2:.3}, {o3:.3}] \
              (blockwise FP8 GEMV against per-layer shared-expert weights)"
+        );
+        Ok(())
+    }
+
+    /// Phase 4l probe: router GEMV + top-8 selection on the host
+    /// (no GPU launch). The router weight is small — `[256, 2048]`
+    /// bf16 = 1 MiB — so a one-shot DtoH + CPU matmul on a synthetic
+    /// hidden state is cheap enough for a smoke probe and avoids
+    /// committing to a GPU bf16-GEMV kernel before the dispatch
+    /// shape is finalized. Phase 4m wires this on-device once the
+    /// per-token routing decision drives a real grouped-expert
+    /// dispatch.
+    ///
+    /// The MoE block also stores the router weight as f16 (after the
+    /// loader's bf16→f16 upload), so we DtoH the f16 buffer directly.
+    pub fn forward_layer3_router_probe(&self) -> Result<()> {
+        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
+            matches!(t, rvllm_loader::LayerAttnType::Full)
+        }) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let moe = &self.model.layers[layer_idx].moe;
+        let hidden = self.arch.base.hidden_size as usize;
+        let num_experts = self.arch.num_experts;
+        let top_k = self.arch.num_experts_per_tok;
+
+        // The router weight is stored as f16 [num_experts, hidden]
+        // (loader converts bf16 → f16 in `LoadCtx::upload_f16`).
+        let weight_bytes = num_experts * hidden * 2;
+        let mut router_f16 = vec![0u8; weight_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemcpyDtoH_v2(
+                router_f16.as_mut_ptr() as *mut _,
+                moe.router.offset_bytes,
+                weight_bytes,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_l3router DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // Synthetic hidden state h[i] = (i % 8) * 0.125 — small, varied,
+        // not constant so the per-expert dot products differentiate.
+        let hidden_state: Vec<f32> = (0..hidden)
+            .map(|i| ((i % 8) as f32) * 0.125)
+            .collect();
+
+        // Host matmul: logits[e] = Σ_k router[e, k] * hidden[k].
+        let mut logits = vec![0.0f32; num_experts];
+        for e in 0..num_experts {
+            let row_off = e * hidden * 2;
+            let mut acc = 0.0f32;
+            for k in 0..hidden {
+                let bits = u16::from_le_bytes([
+                    router_f16[row_off + k * 2],
+                    router_f16[row_off + k * 2 + 1],
+                ]);
+                acc += f16_bits_to_f32(bits) * hidden_state[k];
+            }
+            logits[e] = acc;
+        }
+
+        // Top-k selection: partial sort over (logit, expert_idx).
+        let mut indexed: Vec<(usize, f32)> =
+            logits.iter().enumerate().map(|(i, &l)| (i, l)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top: Vec<(usize, f32)> = indexed.iter().take(top_k).copied().collect();
+
+        // Softmax-normalize the top-k (Qwen's router head_mode).
+        let max = top.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = top.iter().map(|(_, v)| (v - max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let weights: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+
+        let pretty: Vec<String> = top
+            .iter()
+            .zip(weights.iter())
+            .map(|((e, l), w)| format!("e{e}({l:.3}/{w:.3})"))
+            .collect();
+        eprintln!(
+            "[qwen36] forward_layer3_router_probe: layer={layer_idx} \
+             num_experts={num_experts} top_k={top_k} → \
+             selected: {}",
+            pretty.join(", ")
         );
         Ok(())
     }
