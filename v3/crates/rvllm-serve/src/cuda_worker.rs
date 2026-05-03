@@ -94,9 +94,10 @@ pub async fn spawn_cuda_worker(
                         }
                     };
                     let _ = ready_tx.send(Err(
-                        "qwen36 phase 0: arch detected + validated, but \
-                         forward pass not yet implemented. See \
-                         ~/.claude/plans/abundant-meandering-sifakis.md"
+                        "qwen36 phase 1: arch detected + outside tensors \
+                         (embedding, final_norm, lm_head) uploaded. Forward \
+                         pass + per-layer tensors not yet implemented. \
+                         See ~/.claude/plans/abundant-meandering-sifakis.md"
                             .to_string(),
                     ));
                     return;
