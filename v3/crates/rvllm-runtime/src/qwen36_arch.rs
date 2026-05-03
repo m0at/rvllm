@@ -64,7 +64,16 @@ impl Qwen36Arch {
             return Ok(None);
         }
 
-        let base = ModelArch::from_dir(model_dir)?;
+        let mut base = ModelArch::from_dir(model_dir)?;
+        // Qwen 3.6 config nests rope under `rope_parameters` at the top
+        // level (not `rope_parameters.sliding_attention.*` like Gemma 4),
+        // so the generic `ModelArch::from_dir` can't find it and falls
+        // back to 10_000. Re-read the correct value here so downstream
+        // code (RoPE table precompute, MRoPE section math) gets the
+        // real Qwen `rope_theta` (10_000_000 for the 35B-A3B variant).
+        if let Some(t) = tc["rope_parameters"]["rope_theta"].as_f64() {
+            base.rope_theta = t as f32;
+        }
         let n_linear = base
             .layer_types
             .iter()

@@ -62,6 +62,14 @@ pub struct Qwen36Bringup {
     pub kernels: Arc<KernelLoader>,
     pub outside_kernels: Qwen36OutsideKernels,
     pub cublaslt: CublasLt,
+    /// Phase 4f: precomputed RoPE cos/sin tables for Qwen 3.6
+    /// (rope_theta=10M, head_dim=256). Single-axis tables uploaded
+    /// at bring-up; MRoPE's section-aware position encoding
+    /// (sections [11, 11, 10]) is applied at launch time on top of
+    /// these base tables in Phase 4g.
+    pub rope_cos: u64,
+    pub rope_sin: u64,
+    pub rope_max_pos: u32,
 }
 
 impl Qwen36Bringup {
@@ -198,6 +206,58 @@ impl Qwen36Bringup {
             cublaslt_ws_bytes / (1024 * 1024)
         );
 
+        // Phase 4f: precompute single-axis RoPE cos/sin tables.
+        // Qwen 3.6's `rope_theta` (10_000_000) + `head_dim` (256)
+        // give a base table of shape `[max_pos, head_dim/2]` for
+        // each of cos and sin. Cap `max_pos` to RVLLM_MAX_TOKENS_CAP
+        // (typically 4096) — the model's `max_position_embeddings`
+        // is 262144 which would mean 128 MiB of f16 cos/sin tables;
+        // capping keeps the bring-up cost reasonable until Phase 4g
+        // wires the real RoPE launch and we know the actual decode
+        // window. MRoPE section math (sections [11, 11, 10]) is
+        // applied on top of these tables at launch time, not baked
+        // into the tables themselves (text-only mode, sections
+        // collapse to standard RoPE per-position).
+        let rope_max_pos = std::env::var("RVLLM_MAX_TOKENS_CAP")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4096)
+            .min(262_144);
+        let rope_theta = arch.base.rope_theta;
+        let rope_head_dim = arch.base.head_dim as u32;
+        let half = (rope_head_dim / 2) as usize;
+        let inv_theta: Vec<f32> = (0..half)
+            .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / rope_head_dim as f32))
+            .collect();
+        let rope_table_elems = (rope_max_pos as usize) * half;
+        let rope_table_bytes = rope_table_elems * 2; // f16
+        let mut cos_bytes = Vec::with_capacity(rope_table_bytes);
+        let mut sin_bytes = Vec::with_capacity(rope_table_bytes);
+        for pos in 0..rope_max_pos as usize {
+            for &freq in &inv_theta {
+                let angle = pos as f32 * freq;
+                let c = angle.cos();
+                let s = angle.sin();
+                // Inline f32 → f16 (avoid pulling `half` as a runtime dep).
+                cos_bytes.extend_from_slice(&f32_to_f16_bits(c).to_le_bytes());
+                sin_bytes.extend_from_slice(&f32_to_f16_bits(s).to_le_bytes());
+            }
+        }
+        let rope_cos_region = arena.region("qwen36_rope_cos", rope_table_bytes, 16)?;
+        let rope_sin_region = arena.region("qwen36_rope_sin", rope_table_bytes, 16)?;
+        unsafe {
+            rope_cos_region.copy_from_host(&cos_bytes)?;
+            rope_sin_region.copy_from_host(&sin_bytes)?;
+        }
+        let rope_cos = rope_cos_region.device_ptr();
+        let rope_sin = rope_sin_region.device_ptr();
+        eprintln!(
+            "[qwen36] RoPE tables uploaded: max_pos={rope_max_pos} head_dim={rope_head_dim} \
+             theta={rope_theta:.1e} ({:.1} KiB cos + {:.1} KiB sin)",
+            rope_table_bytes as f64 / 1024.0,
+            rope_table_bytes as f64 / 1024.0,
+        );
+
         let n_full = model.layers.iter().filter(|l| matches!(
             l.attn,
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(_)
@@ -207,7 +267,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4e bring-up complete: outside (incl. \
+            "[qwen36] Phase 4f bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -233,6 +293,9 @@ impl Qwen36Bringup {
             kernels,
             outside_kernels,
             cublaslt,
+            rope_cos,
+            rope_sin,
+            rope_max_pos,
         };
         // Phase 3e smoke: actually launch embedding_gather against the
         // loaded weights. If this throws, the rest of the forward
@@ -823,6 +886,54 @@ impl Qwen36Bringup {
     pub fn init_prefix_cache(&self) -> ! {
         unimplemented!("qwen36 phase 2 — prefix cache not yet ported");
     }
+}
+
+/// IEEE 754 f32 → f16 round-to-nearest-even encode without pulling
+/// `half` in as a runtime dep here. Saturates to ±MAX_F16 outside
+/// the f16 range; NaN preserved.
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 31) & 0x1) as u16;
+    let exp32 = ((bits >> 23) & 0xff) as i32;
+    let mant32 = bits & 0x7f_ffff;
+    if exp32 == 0xff {
+        // NaN / inf
+        let mant16 = if mant32 != 0 { 0x200 } else { 0 };
+        return (sign << 15) | (0x1f << 10) | mant16;
+    }
+    let exp_unbiased = exp32 - 127;
+    if exp_unbiased >= 16 {
+        // Overflow → ±inf.
+        return (sign << 15) | (0x1f << 10);
+    }
+    if exp_unbiased < -24 {
+        // Underflow → ±0.
+        return sign << 15;
+    }
+    if exp_unbiased < -14 {
+        // Subnormal in f16.
+        let shift = (-14 - exp_unbiased) as u32;
+        let mant_full = mant32 | (1 << 23);
+        let rshift = 13 + shift;
+        let m = mant_full >> rshift;
+        let round_bit = (mant_full >> (rshift - 1)) & 1;
+        let sticky = mant_full & ((1 << (rshift - 1)) - 1);
+        let m = m + (round_bit & ((sticky != 0) as u32 | (m & 1)));
+        return (sign << 15) | (m as u16 & 0x3ff);
+    }
+    let exp16 = (exp_unbiased + 15) as u16;
+    let mant16 = (mant32 >> 13) as u16;
+    let round_bit = (mant32 >> 12) & 1;
+    let sticky = mant32 & 0xfff;
+    let m = mant16 + (round_bit as u16 & ((sticky != 0) as u16 | (mant16 & 1)));
+    if m & 0x400 != 0 {
+        let exp16 = exp16 + 1;
+        if exp16 >= 0x1f {
+            return (sign << 15) | (0x1f << 10);
+        }
+        return (sign << 15) | (exp16 << 10);
+    }
+    (sign << 15) | (exp16 << 10) | (m & 0x3ff)
 }
 
 /// Decode a stored f16 bit pattern into f32 without pulling in `half`
