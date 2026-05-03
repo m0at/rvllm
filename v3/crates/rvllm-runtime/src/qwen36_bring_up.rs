@@ -83,16 +83,24 @@ impl Qwen36Bringup {
             &paths.model_dir,
             &arena,
             &arch.base.layer_types,
+            arch.num_experts,
         )?;
 
+        let n_full = model.layers.iter().filter(|l| matches!(
+            l.attn,
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(_)
+        )).count();
+        let n_linear = model.layers.iter().filter(|l| matches!(
+            l.attn,
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
+        )).count();
         eprintln!(
-            "[qwen36] Phase 2a tensor upload complete: outside + \
-             {full_loaded} full-attention layer attention blocks. \
-             arena.used()={used:.2} GiB / {total:.2} GiB. \
-             Linear-attention + MoE per-layer tensors NOT yet \
-             uploaded; forward pass NOT yet implemented. \
+            "[qwen36] Phase 2b tensor upload complete: outside + {n_full} \
+             full-attention + {n_linear} linear-attention + per-layer \
+             MoE blocks ({} experts/layer). arena.used()={used:.2} GiB \
+             / {total:.2} GiB. Forward pass NOT yet implemented. \
              See ~/.claude/plans/abundant-meandering-sifakis.md.",
-            full_loaded = model.full_attn_layers.iter().filter(|l| l.is_some()).count(),
+            arch.num_experts,
             used = arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
             total = arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );

@@ -22,7 +22,10 @@ use rvllm_core::{DType, LoaderCtx, LoaderError, Result, RvllmError};
 use rvllm_mem::HbmArena;
 
 use crate::load::LayerAttnType;
-use crate::qwen36_weights::{Qwen36FullAttnLayer, Qwen36LoadedModel, Qwen36LoadedOutside};
+use crate::qwen36_weights::{
+    Qwen36FullAttnLayer, Qwen36Layer, Qwen36LayerAttn, Qwen36LinearAttnLayer,
+    Qwen36LoadedModel, Qwen36LoadedOutside, Qwen36MoeBlock,
+};
 use crate::safetensors::{ShardHeader, ShardIndex, TensorEntry};
 use crate::weights::{F16Weight, Fp8Weight};
 
@@ -210,6 +213,132 @@ impl<'a> LoadCtx<'a> {
             blockscale_k_blocks: k_blocks as u32,
         })
     }
+
+    /// Upload `num_experts` expert weight tensors (all sharing one
+    /// projection role: `gate_proj`, `up_proj`, or `down_proj`) as a
+    /// single fused FP8 arena region. Per-expert blockwise scales are
+    /// stacked into one f32 region the same way.
+    ///
+    /// Layout in the fused region: expert `e` starts at byte offset
+    /// `e * per_expert_fp8_bytes`. The shape recorded in the returned
+    /// `Fp8Weight` is `[num_experts, N, K]` (3-D), making it explicit
+    /// to downstream MoE-GEMM kernels that the leading axis is the
+    /// expert index rather than a row of a 2-D matrix.
+    fn upload_experts_fused(
+        &self,
+        region_name: &'static str,
+        layer_idx: usize,
+        num_experts: usize,
+        projection: &str,
+    ) -> Result<Fp8Weight> {
+        let first_w_name = format!(
+            "{QWEN36_PREFIX}.layers.{layer_idx}.mlp.experts.0.{projection}.weight"
+        );
+        let first_s_name = format!(
+            "{QWEN36_PREFIX}.layers.{layer_idx}.mlp.experts.0.{projection}.weight_scale_inv"
+        );
+        let (_, w0) = self.must_get(&first_w_name)?;
+        let (_, s0) = self.must_get(&first_s_name)?;
+        if w0.dtype != DType::Fp8E4M3 {
+            return Err(RvllmError::Loader {
+                err: LoaderError::DtypeMismatch {
+                    tensor: w0.name.clone(),
+                    expected: DType::Fp8E4M3,
+                    got: w0.dtype,
+                },
+                ctx: LoaderCtx {
+                    path: self.model_dir.to_path_buf(),
+                    tensor: Some(w0.name.clone()),
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let per_w_bytes = w0.nbytes as usize;
+        let per_scale_elems = (s0.nbytes as usize) / 2; // bf16 → 2 bytes/elem
+        let total_w_bytes = per_w_bytes * num_experts;
+        let total_scale_bytes = per_scale_elems * 4 * num_experts; // bf16 → f32
+
+        // Stage host-side, then one HtoD per fused region.
+        let mut fused_w: Vec<u8> = Vec::with_capacity(total_w_bytes);
+        let mut fused_s: Vec<u8> = Vec::with_capacity(total_scale_bytes);
+        let n0 = w0.shape[0];
+        let k0 = if w0.shape.len() >= 2 { w0.shape[1] } else { 0 };
+
+        for e in 0..num_experts {
+            let wn = format!(
+                "{QWEN36_PREFIX}.layers.{layer_idx}.mlp.experts.{e}.{projection}.weight"
+            );
+            let sn = format!(
+                "{QWEN36_PREFIX}.layers.{layer_idx}.mlp.experts.{e}.{projection}.weight_scale_inv"
+            );
+            let (wsi, we) = self.must_get(&wn)?;
+            if we.nbytes as usize != per_w_bytes
+                || we.shape.first().copied() != Some(n0)
+                || we.shape.get(1).copied() != Some(k0)
+            {
+                return Err(RvllmError::Loader {
+                    err: LoaderError::Corrupt {
+                        detail: format!(
+                            "expert {e} {projection} shape {:?} mismatches expert 0 shape {:?}",
+                            we.shape, w0.shape
+                        ),
+                    },
+                    ctx: LoaderCtx {
+                        path: self.model_dir.to_path_buf(),
+                        tensor: Some(wn),
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+            fused_w.extend_from_slice(self.bytes_of(wsi, &we));
+
+            let (ssi, se) = self.must_get(&sn)?;
+            let scale_f32 = match se.dtype {
+                DType::Bf16 => bf16_bytes_to_f32_bytes(self.bytes_of(ssi, &se)),
+                DType::F32 => self.bytes_of(ssi, &se).to_vec(),
+                _ => {
+                    return Err(RvllmError::Loader {
+                        err: LoaderError::DtypeMismatch {
+                            tensor: se.name.clone(),
+                            expected: DType::F32,
+                            got: se.dtype,
+                        },
+                        ctx: LoaderCtx {
+                            path: self.model_dir.to_path_buf(),
+                            tensor: Some(sn),
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            fused_s.extend_from_slice(&scale_f32);
+        }
+
+        let region = self.arena.region(region_name, fused_w.len(), 16)?;
+        unsafe { region.copy_from_host(&fused_w)? };
+        let bs_region = self.arena.region("qwen36_moe_blockscale", fused_s.len(), 16)?;
+        unsafe { bs_region.copy_from_host(&fused_s)? };
+
+        let one = 1.0f32;
+        let one_r = self.arena.region("qwen36_fp8_scale", 4, 4)?;
+        unsafe { one_r.copy_from_host(&one.to_le_bytes())? };
+
+        let n_blocks = (n0 + 127) / 128;
+        let k_blocks = (k0 + 127) / 128;
+
+        Ok(Fp8Weight {
+            offset_bytes: region.device_ptr(),
+            scale_ptr: one_r.device_ptr(),
+            shape: vec![num_experts, n0, k0],
+            scale: 1.0,
+            clamp_ppm: 0.0,
+            dtype: DType::Fp8E4M3,
+            channelscale_ptr: None,
+            blockscale_ptr: Some(bs_region.device_ptr()),
+            blockscale_n_blocks: n_blocks as u32,
+            blockscale_k_blocks: k_blocks as u32,
+        })
+    }
 }
 
 /// Phase 1 entry point: outside tensors only.
@@ -221,45 +350,64 @@ pub fn load_qwen36_outside(
     load_outside_via_ctx(&ctx)
 }
 
-/// Phase 2a entry point: outside tensors + per-layer attention weights
-/// for the 10 full-attention layers. Linear-attention layers + MoE
-/// blocks are still TODO; their corresponding `Option` slots are `None`.
+/// Phase 2b entry point: outside tensors + every per-layer block
+/// (linear-attn or full-attn) + 256-expert MoE per layer.
+///
+/// `num_experts` must match `Qwen36Arch::num_experts` (typically 256
+/// for the 35B-A3B variant).
 pub fn load_qwen36_model(
     model_dir: &Path,
     arena: &HbmArena,
     layer_types: &[LayerAttnType],
+    num_experts: usize,
 ) -> Result<Qwen36LoadedModel> {
     let ctx = LoadCtx::new(model_dir, arena)?;
     let outside = load_outside_via_ctx(&ctx)?;
 
-    let mut full_attn_layers: Vec<Option<Qwen36FullAttnLayer>> = Vec::with_capacity(layer_types.len());
-    let mut full_loaded = 0usize;
-    let mut full_skipped = 0usize;
+    let mut layers: Vec<Qwen36Layer> = Vec::with_capacity(layer_types.len());
+    let mut n_full = 0usize;
+    let mut n_linear = 0usize;
+    let load_started = std::time::Instant::now();
 
     for (l, ty) in layer_types.iter().enumerate() {
-        match ty {
+        let attn = match ty {
             LayerAttnType::Full => {
-                let layer = load_full_attn_layer(&ctx, l)?;
-                full_attn_layers.push(Some(layer));
-                full_loaded += 1;
+                n_full += 1;
+                Qwen36LayerAttn::Full(load_full_attn_layer(&ctx, l)?)
             }
             LayerAttnType::Linear | LayerAttnType::SlidingAttention => {
-                full_attn_layers.push(None);
-                full_skipped += 1;
+                n_linear += 1;
+                Qwen36LayerAttn::Linear(load_linear_attn_layer(&ctx, l)?)
             }
+        };
+        let moe = load_moe_block(&ctx, l, num_experts)?;
+        let elapsed = load_started.elapsed().as_secs_f64();
+        if l == 0 || l == layer_types.len() - 1 || (l + 1) % 10 == 0 {
+            eprintln!(
+                "[qwen36-loader] layer {l}/{total} loaded ({attn_kind}) \
+                 [{elapsed:.1}s elapsed, arena.used={:.2} GiB]",
+                arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
+                total = layer_types.len(),
+                attn_kind = match ty {
+                    LayerAttnType::Full => "full",
+                    LayerAttnType::Linear => "linear",
+                    LayerAttnType::SlidingAttention => "sliding",
+                },
+                elapsed = elapsed,
+            );
         }
+        layers.push(Qwen36Layer { attn, moe });
     }
 
     eprintln!(
-        "[qwen36-loader] per-layer attention upload complete: \
-         {full_loaded} full-attn layers loaded, {full_skipped} non-full \
-         layers skipped (linear-attn + MoE land in Phase 2b/3)."
+        "[qwen36-loader] full per-layer upload complete: \
+         {n_full} full-attn + {n_linear} linear-attn layers, \
+         {num_experts} experts/layer + shared expert. \
+         Total wall: {:.1}s.",
+        load_started.elapsed().as_secs_f64(),
     );
 
-    Ok(Qwen36LoadedModel {
-        outside,
-        full_attn_layers,
-    })
+    Ok(Qwen36LoadedModel { outside, layers })
 }
 
 fn load_outside_via_ctx(ctx: &LoadCtx) -> Result<Qwen36LoadedOutside> {
@@ -291,6 +439,99 @@ fn load_outside_via_ctx(ctx: &LoadCtx) -> Result<Qwen36LoadedOutside> {
         embed_tokens_bytes,
         final_norm_bytes,
         lm_head_bytes,
+    })
+}
+
+fn load_linear_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen36LinearAttnLayer> {
+    let ln = |s: &str| format!("{QWEN36_PREFIX}.layers.{layer_idx}.{s}");
+
+    let (input_layernorm, _) = ctx.upload_f16("qwen36_input_ln", &ln("input_layernorm.weight"))?;
+    let (post_attention_layernorm, _) =
+        ctx.upload_f16("qwen36_post_attn_ln", &ln("post_attention_layernorm.weight"))?;
+    let (a_log, _) = ctx.upload_f16("qwen36_a_log", &ln("linear_attn.A_log"))?;
+    let (dt_bias, _) = ctx.upload_f16("qwen36_dt_bias", &ln("linear_attn.dt_bias"))?;
+    let (conv1d, _) = ctx.upload_f16("qwen36_conv1d", &ln("linear_attn.conv1d.weight"))?;
+    let (in_proj_a, _) = ctx.upload_f16("qwen36_in_proj_a", &ln("linear_attn.in_proj_a.weight"))?;
+    let (in_proj_b, _) = ctx.upload_f16("qwen36_in_proj_b", &ln("linear_attn.in_proj_b.weight"))?;
+    let (norm, _) = ctx.upload_f16("qwen36_la_norm", &ln("linear_attn.norm.weight"))?;
+
+    let in_proj_qkv =
+        ctx.upload_fp8_blockwise("qwen36_la_in_qkv", &ln("linear_attn.in_proj_qkv.weight"))?;
+    let in_proj_z =
+        ctx.upload_fp8_blockwise("qwen36_la_in_z", &ln("linear_attn.in_proj_z.weight"))?;
+    let out_proj =
+        ctx.upload_fp8_blockwise("qwen36_la_out", &ln("linear_attn.out_proj.weight"))?;
+
+    if layer_idx <= 2 {
+        eprintln!(
+            "[qwen36-loader] layer {layer_idx} linear-attn: \
+             qkv={:?} z={:?} out={:?} a_log={:?} conv1d={:?}",
+            in_proj_qkv.shape, in_proj_z.shape, out_proj.shape,
+            a_log.shape, conv1d.shape,
+        );
+    }
+
+    Ok(Qwen36LinearAttnLayer {
+        input_layernorm,
+        post_attention_layernorm,
+        a_log,
+        dt_bias,
+        conv1d,
+        in_proj_a,
+        in_proj_b,
+        in_proj_qkv,
+        in_proj_z,
+        norm,
+        out_proj,
+    })
+}
+
+/// Load the per-layer MoE block. Routes 256 experts into 3 fused FP8
+/// arena regions (gate / up / down) — each holds 256 expert weight
+/// matrices stacked along the leading axis. Per-expert blockwise
+/// scales are likewise stacked into a single f32 region per role.
+fn load_moe_block(ctx: &LoadCtx, layer_idx: usize, num_experts: usize) -> Result<Qwen36MoeBlock> {
+    let ln = |s: &str| format!("{QWEN36_PREFIX}.layers.{layer_idx}.mlp.{s}");
+
+    let (router, _) = ctx.upload_f16("qwen36_moe_router", &ln("gate.weight"))?;
+    let (shared_expert_gate_logit, _) =
+        ctx.upload_f16("qwen36_moe_shared_gate", &ln("shared_expert_gate.weight"))?;
+
+    let shared_expert_gate_proj = ctx
+        .upload_fp8_blockwise("qwen36_moe_sh_gp", &ln("shared_expert.gate_proj.weight"))?;
+    let shared_expert_up_proj =
+        ctx.upload_fp8_blockwise("qwen36_moe_sh_up", &ln("shared_expert.up_proj.weight"))?;
+    let shared_expert_down_proj = ctx
+        .upload_fp8_blockwise("qwen36_moe_sh_dn", &ln("shared_expert.down_proj.weight"))?;
+
+    let experts_gate_proj_fused = ctx.upload_experts_fused(
+        "qwen36_moe_exp_gp",
+        layer_idx,
+        num_experts,
+        "gate_proj",
+    )?;
+    let experts_up_proj_fused = ctx.upload_experts_fused(
+        "qwen36_moe_exp_up",
+        layer_idx,
+        num_experts,
+        "up_proj",
+    )?;
+    let experts_down_proj_fused = ctx.upload_experts_fused(
+        "qwen36_moe_exp_dn",
+        layer_idx,
+        num_experts,
+        "down_proj",
+    )?;
+
+    Ok(Qwen36MoeBlock {
+        router,
+        shared_expert_gate_logit,
+        experts_gate_proj_fused,
+        experts_up_proj_fused,
+        experts_down_proj_fused,
+        shared_expert_gate_proj,
+        shared_expert_up_proj,
+        shared_expert_down_proj,
     })
 }
 

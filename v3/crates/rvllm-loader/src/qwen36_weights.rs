@@ -49,18 +49,88 @@ pub struct Qwen36FullAttnLayer {
     pub o_proj: Fp8Weight,
 }
 
-/// Qwen 3.6 loaded model, growing per-phase.
+/// Linear-attention layer weights (Phase 2b).
 ///
-/// Phase 1: `outside` populated.
-/// Phase 2a: `full_attn_layers` populated for the 10 full-attention
-/// layer indices; other slots are `None`.
-/// Phase 2b/3: linear-attention + MoE expansions land in additional
-/// `Option<...>` fields rather than reshuffling existing ones.
+/// 30 of the 40 Qwen 3.6 35B-A3B layers are `linear_attention` (the
+/// `qwen3_next` Gated-DeltaNet style state-space block). Per-layer:
+///   - 2× layer RMSNorm (input, post_attention)
+///   - SSM scalars: A_log [num_ssm_heads], dt_bias [num_ssm_heads]
+///   - 1D causal conv: conv1d.weight [conv_channels, 1, kernel]
+///   - small bf16 projections in_proj_a / in_proj_b [num_ssm_heads, H]
+///   - FP8 blockwise projections: in_proj_qkv [N_qkv, H],
+///     in_proj_z [N_z, H], out_proj [H, N_out]
+///   - SSM head-wise RMSNorm: norm.weight [head_dim_ssm]
+///
+/// MoE block lives on a separate struct (every layer carries one).
+#[derive(Debug)]
+pub struct Qwen36LinearAttnLayer {
+    pub input_layernorm: F16Weight,
+    pub post_attention_layernorm: F16Weight,
+    pub a_log: F16Weight,
+    pub dt_bias: F16Weight,
+    pub conv1d: F16Weight,
+    pub in_proj_a: F16Weight,
+    pub in_proj_b: F16Weight,
+    pub in_proj_qkv: Fp8Weight,
+    pub in_proj_z: Fp8Weight,
+    pub norm: F16Weight,
+    pub out_proj: Fp8Weight,
+}
+
+/// Per-layer MoE block (Phase 2b). Present on EVERY Qwen 3.6 layer
+/// (both linear and full attention variants share the same FFN block
+/// structure).
+///
+/// Storage layout (fused-by-projection):
+///   - Per-layer 256 experts are concatenated into one FP8 region per
+///     projection role (gate / up / down). For experts[e][role], the
+///     slice begins at `e * expert_role_bytes` within the fused
+///     region. The blockscale tensor likewise stacks 256 expert
+///     scales contiguously. This keeps 30 720 expert tensors collapsed
+///     to 9 device pointers per layer — friendly for grouped-FP8
+///     MoE-GEMM kernels in Phase 3.
+///   - Shared expert is a single (gate, up, down) triplet — same
+///     shape as one routed expert.
+///   - Router (`mlp.gate`) is a small bf16 [num_experts, hidden]
+///     classifier; no FP8.
+///   - `shared_expert_gate` is a bf16 [1, hidden] sigmoid gate that
+///     scales the shared expert's contribution per token.
+#[derive(Debug)]
+pub struct Qwen36MoeBlock {
+    pub router: F16Weight,
+    pub shared_expert_gate_logit: F16Weight,
+    pub experts_gate_proj_fused: Fp8Weight,
+    pub experts_up_proj_fused: Fp8Weight,
+    pub experts_down_proj_fused: Fp8Weight,
+    pub shared_expert_gate_proj: Fp8Weight,
+    pub shared_expert_up_proj: Fp8Weight,
+    pub shared_expert_down_proj: Fp8Weight,
+}
+
+/// Per-layer attention block — exactly one of the two variants is
+/// populated per layer, matching the `layer_types` array.
+#[derive(Debug)]
+pub enum Qwen36LayerAttn {
+    Linear(Qwen36LinearAttnLayer),
+    Full(Qwen36FullAttnLayer),
+}
+
+/// Full per-layer weights (attention block + MoE block).
+#[derive(Debug)]
+pub struct Qwen36Layer {
+    pub attn: Qwen36LayerAttn,
+    pub moe: Qwen36MoeBlock,
+}
+
+/// Qwen 3.6 loaded model — fully populated after Phase 2b.
+///
+/// Phase 1: `outside` populated, `layers` empty.
+/// Phase 2b: `outside` + `layers` (all 40 slots, attn variant matches
+///   `layer_types`, MoE block + 256 experts uploaded).
 #[derive(Debug)]
 pub struct Qwen36LoadedModel {
     pub outside: Qwen36LoadedOutside,
-    /// Indexed by absolute layer index (0..num_hidden_layers). `Some`
-    /// for full-attention layers, `None` for linear-attention layers
-    /// (which carry no `self_attn.*` tensors).
-    pub full_attn_layers: Vec<Option<Qwen36FullAttnLayer>>,
+    /// All 40 layers, fully populated in Phase 2b. Linear/full attn
+    /// distinction lives inside the per-layer `attn` enum.
+    pub layers: Vec<Qwen36Layer>,
 }
