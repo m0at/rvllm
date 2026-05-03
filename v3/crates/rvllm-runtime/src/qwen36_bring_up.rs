@@ -207,7 +207,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4c bring-up complete: outside (incl. \
+            "[qwen36] Phase 4d bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -251,12 +251,11 @@ impl Qwen36Bringup {
              forward still TODO)"
         );
 
-        // Phase 4c: first per-layer kernel call. Launches the SM121
-        // blockwise FP8 GEMV against the Q-projection weights of the
-        // first full-attention layer. Synthetic input — exercises the
-        // weight + blockscale pointer chain without claiming the math
-        // is part of a real forward pass yet.
-        bringup.forward_layer3_q_probe()?;
+        // Phase 4c/4d: per-layer kernel chain. Launches Q+K+V
+        // projections against the first full-attention layer's
+        // blockwise FP8 weights. Synthetic input — proves all three
+        // projection roles work end-to-end through the same kernel.
+        bringup.forward_layer3_qkv_probe()?;
 
         Ok(bringup)
     }
@@ -411,56 +410,46 @@ impl Qwen36Bringup {
         Ok(best_token)
     }
 
-    /// Phase 4c probe: launch the SM121 Fp8GemvF16In kernel against
-    /// the Q-projection FP8 weights of the first full-attention layer
-    /// (typically layer 3 in the 3:1 hybrid pattern). Uses a synthetic
-    /// all-ones f16 input to keep the smoke self-contained — output
-    /// values are nonsense but the launch path is real.
+    /// Phase 4c/4d probe: chain Q + K + V projection launches against
+    /// the first full-attention layer's blockwise FP8 weights. Uses a
+    /// synthetic all-ones f16 input row to keep the smoke self-
+    /// contained — the kernel chain is real, the values aren't.
     /// Validates:
-    ///   - blockwise FP8 GEMV ABI (`fp8_gemv_blockwise_wpr_native_f16in`)
-    ///     consumes the per-layer weight + [N/128, K/128] f32 blockscale
-    ///     uploaded by the qwen36 loader without ABI mismatch.
-    ///   - the loaded q_proj device pointer + blockscale pointer are
-    ///     non-zero and consistent with the q_proj shape recorded at
-    ///     load time.
-    pub fn forward_layer3_q_probe(&self) -> Result<()> {
+    ///   - blockwise FP8 GEMV ABI consumes per-layer weight + [N/128,
+    ///     K/128] f32 blockscale for all three projection roles.
+    ///   - q_proj / k_proj / v_proj device pointers + blockscales are
+    ///     populated correctly by the qwen36 loader.
+    ///   - shape relations: q_proj outputs `2 * num_heads * head_dim`
+    ///     (Q + per-head gate concat for `attn_output_gate=true`);
+    ///     k_proj / v_proj output `num_kv_heads * head_dim`.
+    pub fn forward_layer3_qkv_probe(&self) -> Result<()> {
         let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
             matches!(t, rvllm_loader::LayerAttnType::Full)
         }) {
             Some(i) => i,
             None => {
-                eprintln!("[qwen36] forward_layer3_q_probe: no full-attention layer found, skipping");
+                eprintln!("[qwen36] forward_layer3_qkv_probe: no full-attention layer found, skipping");
                 return Ok(());
             }
         };
-        let q_proj = match &self.model.layers[layer_idx].attn {
-            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(l) => &l.q_proj,
+        let layer = match &self.model.layers[layer_idx].attn {
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(l) => l,
             _ => {
-                eprintln!("[qwen36] forward_layer3_q_probe: layer {layer_idx} is not Full");
-                return Ok(());
-            }
-        };
-        let hidden = self.arch.base.hidden_size as u32;
-        let n = q_proj.shape[0] as u32;
-        let k = q_proj.shape[1] as u32;
-        let m: u32 = 1;
-        let blockscale_ptr = match q_proj.blockscale_ptr {
-            Some(p) => p,
-            None => {
-                eprintln!("[qwen36] forward_layer3_q_probe: q_proj has no blockscale_ptr, skipping");
+                eprintln!("[qwen36] forward_layer3_qkv_probe: layer {layer_idx} is not Full");
                 return Ok(());
             }
         };
         let kernel = match self.outside_kernels.fn_fp8_gemv_wpr_native_f16in {
             Some(k) => k,
             None => {
-                eprintln!("[qwen36] forward_layer3_q_probe: f16in GEMV kernel unavailable on this arch, skipping");
+                eprintln!("[qwen36] forward_layer3_qkv_probe: f16in GEMV kernel unavailable on this arch, skipping");
                 return Ok(());
             }
         };
+        let hidden = self.arch.base.hidden_size as u32;
+        let m: u32 = 1;
 
-        // Synthetic f16 all-ones input — h(i) = 1.0 for i in 0..hidden
-        // (f16 1.0 = 0x3c00).
+        // Synthetic f16 all-ones input — h(i) = 1.0 (f16 1.0 = 0x3c00).
         let one_bits = 0x3c00u16.to_le_bytes();
         let mut input_bytes = Vec::with_capacity((hidden as usize) * 2);
         for _ in 0..hidden {
@@ -468,50 +457,75 @@ impl Qwen36Bringup {
         }
         let in_region = self
             .arena
-            .region("qwen36_l3q_in", input_bytes.len(), 16)?;
+            .region("qwen36_l3qkv_in", input_bytes.len(), 16)?;
         unsafe { in_region.copy_from_host(&input_bytes)? };
 
-        let out_bytes = (m as usize) * (n as usize) * 2; // f16
-        let out_region = self.arena.region("qwen36_l3q_out", out_bytes, 16)?;
-
-        unsafe {
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
-                kernel,
-                out_region.device_ptr(),
-                q_proj.offset_bytes,
-                blockscale_ptr,
-                in_region.device_ptr(),
-                self.stream.raw() as u64,
-            )?;
-        }
-        self.stream.fence()?;
-
-        let mut probe = [0u8; 8];
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let rc = cuMemcpyDtoH_v2(
-                probe.as_mut_ptr() as *mut _,
-                out_region.device_ptr(),
-                probe.len(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36_l3q DtoH",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+        // Closure: run one projection role + return the first 4 f16
+        // output values as f32 for logging.
+        let project = |name: &'static str,
+                       region_name: &'static str,
+                       weight: &rvllm_loader::weights::Fp8Weight|
+         -> Result<[f32; 4]> {
+            let blockscale_ptr = match weight.blockscale_ptr {
+                Some(p) => p,
+                None => {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36_qkv_probe missing blockscale_ptr",
+                        rvllm_core::CudaErrorKind::Other,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            };
+            let n = weight.shape[0] as u32;
+            let k = weight.shape[1] as u32;
+            let out_bytes = (m as usize) * (n as usize) * 2;
+            let out_region = self.arena.region(region_name, out_bytes, 16)?;
+            unsafe {
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
+                    kernel,
+                    out_region.device_ptr(),
+                    weight.offset_bytes,
+                    blockscale_ptr,
+                    in_region.device_ptr(),
+                    self.stream.raw() as u64,
+                )?;
             }
-        }
-        let q0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
-        let q1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
-        let q2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
-        let q3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+            self.stream.fence()?;
+            let mut probe = [0u8; 8];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let rc = cuMemcpyDtoH_v2(
+                    probe.as_mut_ptr() as *mut _,
+                    out_region.device_ptr(),
+                    probe.len(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36_qkv_probe DtoH",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            let _ = name;
+            Ok([
+                f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]])),
+                f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]])),
+                f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]])),
+                f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]])),
+            ])
+        };
+
+        let q = project("q", "qwen36_l3q_out", &layer.q_proj)?;
+        let k = project("k", "qwen36_l3k_out", &layer.k_proj)?;
+        let v = project("v", "qwen36_l3v_out", &layer.v_proj)?;
         eprintln!(
-            "[qwen36] forward_layer3_q_probe: layer={layer_idx} \
-             q_proj=[{n}, {k}] m={m} → q_out[0..4]=[{q0:.3}, {q1:.3}, \
-             {q2:.3}, {q3:.3}] (blockwise FP8 GEMV against real Qwen \
-             per-layer weights)"
+            "[qwen36] forward_layer3_qkv_probe: layer={layer_idx} \
+             q={:?} ({:?}) k={:?} ({:?}) v={:?} ({:?})",
+            q, layer.q_proj.shape,
+            k, layer.k_proj.shape,
+            v, layer.v_proj.shape,
         );
         Ok(())
     }
