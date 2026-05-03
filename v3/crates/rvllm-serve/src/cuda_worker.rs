@@ -94,11 +94,11 @@ pub async fn spawn_cuda_worker(
                         }
                     };
                     let _ = ready_tx.send(Err(
-                        "qwen36 phase 3e: full Qwen weight load + \
-                         outside kernel pointers + embedding_gather \
-                         smoke launch validated end-to-end. Final \
-                         RMSNorm + lm_head + argmax launches NOT yet \
-                         wired (Phase 3f). See \
+                        "qwen36 phase 3f: full Qwen weight load + \
+                         outside kernel pointers + embedding_gather + \
+                         rmsnorm_inplace_f16 smoke launches validated \
+                         end-to-end. lm_head matmul + argmax NOT yet \
+                         wired (Phase 3g). See \
                          ~/.claude/plans/abundant-meandering-sifakis.md"
                             .to_string(),
                     ));

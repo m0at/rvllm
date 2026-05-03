@@ -184,13 +184,13 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 3d bring-up complete: outside (incl. \
+            "[qwen36] Phase 3f bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
-             pointers (embed, rmsnorm, fp8_gemv, argmax). \
-             arena.used()={used:.2} GiB / {total:.2} GiB. \
-             Outside-only forward launches still TODO. \
+             pointers + embedding_gather + rmsnorm_inplace_f16 smoke \
+             launches validated. arena.used()={used:.2} GiB / \
+             {total:.2} GiB. lm_head matmul + argmax NOT yet wired. \
              See ~/.claude/plans/abundant-meandering-sifakis.md.",
             arch.num_experts,
             used = arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -269,6 +269,46 @@ impl Qwen36Bringup {
                 self.stream.raw() as u64,
             )?;
         }
+
+        // Phase 3f: chain `rmsnorm_inplace_f16` against the embedded
+        // hidden state + the final-norm gamma weight. Kernel sig
+        // (kernels/rmsnorm_inplace_f16.cu): `(half* x [num_tokens,
+        // hidden] in-place, const half* gamma [hidden], float eps,
+        // int hidden)`. Grid: (num_tokens, 1, 1). Block: hidden (capped
+        // at 1024). lm_head matmul + argmax land in Phase 3g once the
+        // f16→f32 + per-tensor scaled fp8_gemv variant is selected.
+        let eps = self.arch.base.rms_norm_eps;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut x_ptr = hidden_region.device_ptr();
+            let mut gamma_ptr = self.model.outside.final_norm.offset_bytes;
+            let mut eps_arg = eps;
+            let mut hidden_arg = hidden as i32;
+            let args = [
+                (&mut x_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hidden_arg) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block = hidden.min(1024);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_rmsnorm_inplace_f16.raw() as CUfunction,
+                num_tokens, 1, 1,
+                block, 1, 1,
+                0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_smoke rmsnorm_inplace_f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         self.stream.fence()?;
 
         // DtoH the first 4 f16 values of token-0's hidden state so the
@@ -297,8 +337,10 @@ impl Qwen36Bringup {
         let f2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
         let f3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
         eprintln!(
-            "[qwen36] forward_outside_smoke: embedding_gather token_ids={token_ids:?} \
-             token0_hidden[0..4]=[{f0:.4}, {f1:.4}, {f2:.4}, {f3:.4}]"
+            "[qwen36] forward_outside_smoke: embedding_gather + rmsnorm \
+             token_ids={token_ids:?} \
+             token0_normed[0..4]=[{f0:.4}, {f1:.4}, {f2:.4}, {f3:.4}] \
+             eps={eps:.0e}"
         );
         Ok(())
     }
