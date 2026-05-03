@@ -19,10 +19,18 @@ use crate::weights::{F16Weight, Fp8Weight};
 pub struct Qwen36LoadedOutside {
     pub embed_tokens: F16Weight,
     pub final_norm: F16Weight,
+    /// f16 mirror of lm_head (Phase 1) — kept for any future bf16
+    /// matmul fallback. The fp8_gemv kernel path consumes
+    /// `lm_head_fp8` instead.
     pub lm_head: F16Weight,
+    /// CPU-quantized FP8 mirror of lm_head (Phase 3d). Per-tensor
+    /// scale; consumed by the `fp8_gemv` kernel in the outside-only
+    /// forward path.
+    pub lm_head_fp8: Fp8Weight,
     pub embed_tokens_bytes: u64,
     pub final_norm_bytes: u64,
     pub lm_head_bytes: u64,
+    pub lm_head_fp8_bytes: u64,
 }
 
 /// Full-attention layer weights (Phase 2a).

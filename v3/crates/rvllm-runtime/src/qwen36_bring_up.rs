@@ -184,12 +184,13 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 3c bring-up complete: outside + {n_full} \
-             full-attention + {n_linear} linear-attention + per-layer \
-             MoE blocks ({} experts/layer) + KernelLoader + outside \
-             kernel pointers (embed, rmsnorm, fp8_gemv, argmax). \
+            "[qwen36] Phase 3d bring-up complete: outside (incl. \
+             FP8-quantized lm_head) + {n_full} full-attention + \
+             {n_linear} linear-attention + per-layer MoE blocks \
+             ({} experts/layer) + KernelLoader + outside kernel \
+             pointers (embed, rmsnorm, fp8_gemv, argmax). \
              arena.used()={used:.2} GiB / {total:.2} GiB. \
-             Forward launches NOT yet wired. \
+             Outside-only forward launches still TODO. \
              See ~/.claude/plans/abundant-meandering-sifakis.md.",
             arch.num_experts,
             used = arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),

@@ -21,6 +21,8 @@ use memmap2::Mmap;
 use rvllm_core::{DType, LoaderCtx, LoaderError, Result, RvllmError};
 use rvllm_mem::HbmArena;
 
+use crate::fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, FP8_E4M3_MAX};
+
 use crate::load::LayerAttnType;
 use crate::qwen36_weights::{
     Qwen36FullAttnLayer, Qwen36Layer, Qwen36LayerAttn, Qwen36LinearAttnLayer,
@@ -212,6 +214,60 @@ impl<'a> LoadCtx<'a> {
             blockscale_n_blocks: n_blocks as u32,
             blockscale_k_blocks: k_blocks as u32,
         })
+    }
+
+    /// CPU-quantize a bf16/f16 tensor to FP8 with per-tensor scale,
+    /// clamp-gate, and arena upload. Used for the lm_head FP8 mirror
+    /// (Phase 3d) — the same idea Gemma 4 uses for the tied-embedding
+    /// lm_head, inlined here to avoid widening the loader pub API.
+    fn upload_lm_head_fp8(
+        &self,
+        f16_weight: &F16Weight,
+        f16_bytes_len: u64,
+        tensor_name: &str,
+    ) -> Result<(Fp8Weight, u64)> {
+        // Re-read the source tensor from the safetensors mmap and run
+        // the same bf16→f16 conversion the f16 upload used. Cheaper
+        // than DtoH on the just-uploaded f16 region.
+        let (si, e) = self.must_get(tensor_name)?;
+        let f16_bytes = tensor_to_f16_bytes(&e, self.bytes_of(si, &e), self.model_dir)?;
+        debug_assert_eq!(f16_bytes.len() as u64, f16_bytes_len);
+        // f16 → f32 (rayon-parallel)
+        use rayon::prelude::*;
+        let f32_vals: Vec<f32> = f16_bytes
+            .par_chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+        let q = quantize_per_tensor_ref(&f32_vals);
+        check_clamp_gate(tensor_name, q.clamp_ppm, self.model_dir)?;
+        let fp8: Vec<u8> = f32_vals
+            .par_iter()
+            .map(|v| {
+                fp8_e4m3_encode((*v / q.scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX))
+            })
+            .collect();
+
+        let region_name: &'static str = "qwen36_lm_head_fp8";
+        let region = self.arena.region(region_name, fp8.len(), 16)?;
+        unsafe { region.copy_from_host(&fp8)? };
+        let scale_region = self.arena.region("qwen36_lm_head_fp8_scale", 4, 4)?;
+        unsafe { scale_region.copy_from_host(&q.scale.to_le_bytes())? };
+
+        Ok((
+            Fp8Weight {
+                offset_bytes: region.device_ptr(),
+                scale_ptr: scale_region.device_ptr(),
+                shape: f16_weight.shape.clone(),
+                scale: q.scale,
+                clamp_ppm: q.clamp_ppm,
+                dtype: DType::Fp8E4M3,
+                channelscale_ptr: None,
+                blockscale_ptr: None,
+                blockscale_n_blocks: 0,
+                blockscale_k_blocks: 0,
+            },
+            fp8.len() as u64,
+        ))
     }
 
     /// Upload `num_experts` expert weight tensors (all sharing one
@@ -419,26 +475,40 @@ fn load_outside_via_ctx(ctx: &LoadCtx) -> Result<Qwen36LoadedOutside> {
     let (final_norm, final_norm_bytes) = ctx.upload_f16("qwen36_final_norm", &norm_name)?;
     let (lm_head, lm_head_bytes) = ctx.upload_f16("qwen36_lm_head", lm_head_name)?;
 
+    // Phase 3d: CPU-quantize lm_head bf16 → FP8 per-tensor for the
+    // fp8_gemv kernel path. Mirrors Gemma 4's tied-embedding case
+    // (gemma4_load.rs:198-211) — same `upload_fp8` shape used there,
+    // inlined here to avoid widening the rvllm-loader pub API.
+    let (lm_head_fp8, lm_head_fp8_bytes) =
+        ctx.upload_lm_head_fp8(&lm_head, lm_head_bytes, lm_head_name)?;
+
     eprintln!(
         "[qwen36-loader] outside tensors uploaded: \
          embed_tokens {:?} ({:.1} MiB), \
          final_norm {:?} ({:.2} KiB), \
-         lm_head {:?} ({:.1} MiB)",
+         lm_head_f16 {:?} ({:.1} MiB), \
+         lm_head_fp8 {:?} ({:.1} MiB, scale={:.6e}, clamp_ppm={:.3})",
         embed_tokens.shape,
         embed_tokens_bytes as f64 / (1024.0 * 1024.0),
         final_norm.shape,
         final_norm_bytes as f64 / 1024.0,
         lm_head.shape,
         lm_head_bytes as f64 / (1024.0 * 1024.0),
+        lm_head_fp8.shape,
+        lm_head_fp8_bytes as f64 / (1024.0 * 1024.0),
+        lm_head_fp8.scale,
+        lm_head_fp8.clamp_ppm,
     );
 
     Ok(Qwen36LoadedOutside {
         embed_tokens,
         final_norm,
         lm_head,
+        lm_head_fp8,
         embed_tokens_bytes,
         final_norm_bytes,
         lm_head_bytes,
+        lm_head_fp8_bytes,
     })
 }
 
@@ -610,6 +680,60 @@ fn bf16_bytes_to_f32_bytes(raw: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&as_f32.to_le_bytes());
     }
     out
+}
+
+/// FP8 E4M3FN encoder with round-to-nearest-even. Mirrors the private
+/// helper in `load.rs` — kept duplicate here so the qwen36 loader
+/// stays self-contained without widening the loader pub API. Finite
+/// range [-448, 448]; `+/-0` canonicalises to 0x00.
+fn fp8_e4m3_encode(v: f32) -> u8 {
+    if v.is_nan() {
+        return 0x7f;
+    }
+    let s: u8 = if v.to_bits() >> 31 != 0 { 0x80 } else { 0 };
+    let a = v.abs();
+    if a == 0.0 {
+        return 0;
+    }
+    if a > FP8_E4M3_MAX {
+        return s | 0x7e;
+    }
+    let bits = a.to_bits();
+    let exp32 = ((bits >> 23) & 0xff) as i32 - 127;
+    let mant32 = bits & 0x7f_ffff;
+    let mut exp8 = exp32 + 7;
+    if exp8 <= 0 {
+        let shift = 1 - exp8;
+        let full = mant32 | (1 << 23);
+        let rshift = (20 + shift) as u32;
+        let mut m = full >> rshift;
+        let round_bit = if rshift > 0 { (full >> (rshift - 1)) & 1 } else { 0 };
+        let sticky = if rshift > 1 {
+            (full & ((1 << (rshift - 1)) - 1) != 0) as u32
+        } else {
+            0
+        };
+        m += round_bit & (sticky | (m & 1));
+        if m >= 8 {
+            return s | 0x08;
+        }
+        return s | (m as u8 & 0x07);
+    }
+    let trunc = mant32 >> 20;
+    let round_bit = (mant32 >> 19) & 1;
+    let sticky = (mant32 & 0x7_ffff) != 0;
+    let m = trunc + (round_bit & (sticky as u32 | (trunc & 1)));
+    if m >= 8 {
+        exp8 += 1;
+        if exp8 > 15 {
+            return s | 0x7e;
+        }
+        return s | ((exp8 as u8 & 0x0f) << 3);
+    }
+    if exp8 > 15 {
+        return s | 0x7e;
+    }
+    s | ((exp8 as u8 & 0x0f) << 3) | (m as u8 & 0x07)
 }
 
 fn f32_bytes_to_f16_bytes(raw: &[u8]) -> Vec<u8> {
