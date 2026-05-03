@@ -94,10 +94,13 @@ pub async fn spawn_cuda_worker(
                         }
                     };
                     let _ = ready_tx.send(Err(
-                        "qwen36 phase 1: arch detected + outside tensors \
-                         (embedding, final_norm, lm_head) uploaded. Forward \
-                         pass + per-layer tensors not yet implemented. \
-                         See ~/.claude/plans/abundant-meandering-sifakis.md"
+                        "qwen36 phase 2a: arch + outside tensors + \
+                         full-attention layer attention blocks (10/40 \
+                         layers, Q/K/V/O FP8 + Q/K-norm + RMSNorms) \
+                         uploaded. Linear-attention state matrices, \
+                         MoE experts, and forward kernels NOT yet \
+                         implemented. See \
+                         ~/.claude/plans/abundant-meandering-sifakis.md"
                             .to_string(),
                     ));
                     return;

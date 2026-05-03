@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_core::Result;
-use rvllm_loader::qwen36_weights::Qwen36LoadedOutside;
+use rvllm_loader::qwen36_weights::Qwen36LoadedModel;
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
 use crate::gemma4_bring_up::Gemma4EnginePaths;
@@ -28,7 +28,7 @@ pub struct Qwen36Bringup {
     pub ctx: Arc<CudaContextHandle>,
     pub arena: HbmArena<'static>,
     pub stream: Stream,
-    pub outside: Qwen36LoadedOutside,
+    pub model: Qwen36LoadedModel,
 }
 
 impl Qwen36Bringup {
@@ -79,17 +79,22 @@ impl Qwen36Bringup {
         let arena: HbmArena<'static> = unsafe { std::mem::transmute(arena) };
         let stream = Stream::new(&ctx)?;
 
-        let outside =
-            rvllm_loader::qwen36_load::load_qwen36_outside(&paths.model_dir, &arena)?;
+        let model = rvllm_loader::qwen36_load::load_qwen36_model(
+            &paths.model_dir,
+            &arena,
+            &arch.base.layer_types,
+        )?;
 
         eprintln!(
-            "[qwen36] Phase 1 outside-tensor upload complete. \
-             arena.used()={:.2} GiB / {:.2} GiB. \
-             Forward pass not yet implemented — first \
-             /v1/chat/completions request will return 500. \
+            "[qwen36] Phase 2a tensor upload complete: outside + \
+             {full_loaded} full-attention layer attention blocks. \
+             arena.used()={used:.2} GiB / {total:.2} GiB. \
+             Linear-attention + MoE per-layer tensors NOT yet \
+             uploaded; forward pass NOT yet implemented. \
              See ~/.claude/plans/abundant-meandering-sifakis.md.",
-            arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
-            arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            full_loaded = model.full_attn_layers.iter().filter(|l| l.is_some()).count(),
+            used = arena.used() as f64 / (1024.0 * 1024.0 * 1024.0),
+            total = arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
 
         Ok(Self {
@@ -99,7 +104,7 @@ impl Qwen36Bringup {
             ctx,
             arena,
             stream,
-            outside,
+            model,
         })
     }
 
