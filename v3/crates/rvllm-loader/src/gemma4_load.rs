@@ -51,6 +51,21 @@ pub fn load_gemma4_model(
     arena: &HbmArena,
     arch: &Gemma4Arch,
 ) -> Result<Gemma4LoadedModel> {
+    // Cycle 47 step 6a + cycle 48 step 7b: detect AWQ checkpoints at
+    // entry. parse_awq_config malformed → Corrupt. Valid AWQ →
+    // (cycle 48 step 7b) walk the per-layer tensor shapes against the
+    // shard index using `validate_awq_linear`, then fail with a
+    // detailed "validated, upload pending" message. Cycle 48 step 7c
+    // replaces this with the actual upload + layer.awq population.
+    let awq_config = crate::compressed_tensors::read_awq_config_from_dir(model_dir)
+        .map_err(|e| RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!("quantization_config: {e}"),
+            },
+            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        })?;
+
     let idx = ShardIndex::resolve(model_dir)?;
     let mut shards = Vec::with_capacity(idx.shards.len());
     for p in &idx.shards {
@@ -61,6 +76,24 @@ pub fn load_gemma4_model(
         for (name, entry) in &sm.header.tensors {
             tensors.insert(name.clone(), (si, entry.clone()));
         }
+    }
+
+    if let Some(awq) = &awq_config {
+        eprintln!(
+            "[loader] AWQ-quantized checkpoint detected (format={:?}, num_bits={}, group_size={}, ignore={:?})",
+            awq.format, awq.scheme.num_bits, awq.scheme.group_size, awq.ignore
+        );
+        validate_gemma4_awq_layout(arch, awq, &tensors).map_err(|e| RvllmError::Loader {
+            err: LoaderError::UnsupportedQuantization {
+                detail: format!("AWQ layout validation failed: {e}"),
+            },
+            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        })?;
+        // (validate_gemma4_awq_layout already logs the per-linear total)
+        return load_gemma4_awq_model_inner(
+            model_dir, arena, arch, awq, &shards, &tensors,
+        );
     }
 
     let bytes_of = |si: usize, e: &TensorEntry| -> &[u8] {
@@ -195,9 +228,15 @@ pub fn load_gemma4_model(
         sliding_rotary_dim,
     );
     // Global RoPE: theta=1M, partial rotation (0.25 * head_dim_global = 128 of 512)
-    let global_rotary_dim = arch.rotary_dim_for_layer(
-        arch.layer_types.iter().position(|t| *t == crate::gemma4_arch::Gemma4LayerType::GlobalAttention).unwrap_or(0)
-    );
+    // Cycle 50: derive directly from arch (head_dim_global *
+    // partial_rotary_factor_global, even-rounded). The previous
+    // `.position(...).unwrap_or(0)` fallback returned layer 0's
+    // rotary dim if no global layer was found — silently producing
+    // the sliding dim while the cos/sin tables below were built
+    // for head_dim_global. Codex review of cycle 49 step 8a flagged
+    // this; fix applies to both load_gemma4_model and
+    // load_gemma4_awq_model_inner.
+    let global_rotary_dim = arch.rotary_dim_global();
     let (cos_g, sin_g) = rope_cos_sin_bytes(
         arch.head_dim_global,
         arch.max_position_embeddings,
@@ -504,10 +543,10 @@ pub fn load_gemma4_model(
         }
 
         layers.push(Gemma4LayerWeights {
-            qkv,
-            o_proj,
-            gate_up,
-            down_proj,
+            qkv: Some(qkv),
+            o_proj: Some(o_proj),
+            gate_up: Some(gate_up),
+            down_proj: Some(down_proj),
             qkv_f16: qkv_f16_w,
             o_proj_f16: o_proj_f16_w,
             gate_up_f16: gate_up_f16_w,
@@ -519,6 +558,10 @@ pub fn load_gemma4_model(
             q_norm,
             k_norm,
             layer_scalar,
+            // Cycle 46 step 5c: AWQ load path is wired in cycle 47.
+            // For now every checkpoint falls through the FP8 cascade
+            // and `Gemma4AwqLayerPtrs` defaults all-zero in bring-up.
+            awq: None,
         });
     }
 
@@ -588,6 +631,81 @@ fn tensor_to_f16_bytes(e: &TensorEntry, raw: &[u8], model_dir: &Path) -> Result<
             bt: std::backtrace::Backtrace::capture(),
         }),
     }
+}
+
+/// Cycle 55 step 12 (Phase D): bf16 sibling of `tensor_to_f16_bytes`.
+/// The Gemma 4 checkpoint stores weights natively as bf16 — this
+/// helper passes them through verbatim instead of narrowing to f16.
+/// Used by callers that want to load weight slots (norm gammas,
+/// layer_scalar, embedding, lm_head) directly into bf16 device
+/// memory so the bf16-native kernels added in cycle 55 steps 5-11
+/// can consume them without a runtime f16↔bf16 conversion.
+///
+/// f16 inputs are widened to bf16 (loses 3 mantissa bits but gains
+/// 3 exponent bits — matches training distribution), f32 narrows to
+/// bf16 round-to-nearest, fp8 dequants to bf16 via f32 intermediate.
+#[allow(dead_code)] // Phase D wiring lands in cycle 55 step 13+
+fn tensor_to_bf16_bytes(e: &TensorEntry, raw: &[u8], model_dir: &Path) -> Result<Vec<u8>> {
+    match e.dtype {
+        DType::Bf16 => Ok(raw.to_vec()),
+        DType::F16 => Ok(f16_to_bf16(raw)),
+        DType::F32 => Ok(f32_to_bf16(raw)),
+        DType::Fp8E4M3 => Ok(fp8e4m3_to_bf16(raw)),
+        _ => Err(RvllmError::Loader {
+            err: LoaderError::DtypeMismatch {
+                tensor: e.name.clone(),
+                expected: DType::Bf16,
+                got: e.dtype,
+            },
+            ctx: LoaderCtx {
+                path: model_dir.to_path_buf(),
+                tensor: Some(e.name.clone()),
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        }),
+    }
+}
+
+#[allow(dead_code)] // Phase D wiring lands in cycle 55 step 13+
+fn f16_to_bf16(raw: &[u8]) -> Vec<u8> {
+    let n = raw.len() / 2;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let bits = u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+        let v = f16::from_bits(bits).to_f32();
+        // bf16 = upper 16 bits of f32 with round-to-nearest-even.
+        let f32_bits = v.to_bits();
+        let rounding_bias = 0x7FFF + ((f32_bits >> 16) & 1);
+        let bf16_bits = ((f32_bits + rounding_bias) >> 16) as u16;
+        out.extend_from_slice(&bf16_bits.to_le_bytes());
+    }
+    out
+}
+
+#[allow(dead_code)] // Phase D wiring lands in cycle 55 step 13+
+fn f32_to_bf16(raw: &[u8]) -> Vec<u8> {
+    let n = raw.len() / 4;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let f32_bits = u32::from_le_bytes(raw[4 * i..4 * i + 4].try_into().unwrap());
+        // Round-to-nearest-even narrowing
+        let rounding_bias = 0x7FFF + ((f32_bits >> 16) & 1);
+        let bf16_bits = ((f32_bits + rounding_bias) >> 16) as u16;
+        out.extend_from_slice(&bf16_bits.to_le_bytes());
+    }
+    out
+}
+
+#[allow(dead_code)] // Phase D wiring lands in cycle 55 step 13+
+fn fp8e4m3_to_bf16(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() * 2);
+    for &b in raw {
+        let f32_bits = fp8_e4m3_to_f32(b).to_bits();
+        let rounding_bias = 0x7FFF + ((f32_bits >> 16) & 1);
+        let bf16_bits = ((f32_bits + rounding_bias) >> 16) as u16;
+        out.extend_from_slice(&bf16_bits.to_le_bytes());
+    }
+    out
 }
 
 fn fp8e4m3_to_f16(raw: &[u8]) -> Vec<u8> {
@@ -889,12 +1007,38 @@ fn upload_fp8_direct_channelscale(
         // expects the full 2-D shape (e.g. Fp8GemvBlockwiseF16InLaunch
         // on the sm_121 fast path). `None` when the source is per-row
         // 1-D — those weights stay on the channelscale path.
+        // Codex52-3: the sm121 GEMV fastpath
+        // (`fp8_gemv_blockwise_*_kernel`, kernels/fp8_gemv.cu:873)
+        // indexes the blockscale tensor as
+        // `scale[n >> 7, k_block]` — a strict 128×128 layout requires
+        // shape [ceil(N/128), ceil(K/128)]. Older compressed-tensors
+        // checkpoints sometimes ship `[N, K/g]`-shaped 2-D scales
+        // (per-row × per-K-group); feeding those into the fastpath
+        // would silently produce wrong scales for rows >= 128.
+        // Reject the blockscale role for shape mismatches: store
+        // None so the dispatch falls back to channelscale, which
+        // matches the safety rail at gemma4_layer_exec.rs:2844.
+        let weight_n = entry.shape[0];
+        let weight_k = if entry.shape.len() >= 2 { entry.shape[1] } else { 0 };
+        let expect_n_blocks = (weight_n + 127) / 128;
+        let expect_k_blocks = (weight_k + 127) / 128;
         let (block_ptr, n_blocks, k_blocks) =
             if let Some((bs, rb, cb)) = read_blockscale_bf16(se, shards) {
-                let bs_bytes: Vec<u8> = bs.iter().flat_map(|s| s.to_le_bytes()).collect();
-                let bs_r = arena.region("fp8_blockscale", bs_bytes.len(), 16)?;
-                unsafe { bs_r.copy_from_host(&bs_bytes)? };
-                (Some(bs_r.device_ptr()), rb as u32, cb as u32)
+                if rb == expect_n_blocks && cb == expect_k_blocks {
+                    let bs_bytes: Vec<u8> = bs.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let bs_r = arena.region("fp8_blockscale", bs_bytes.len(), 16)?;
+                    unsafe { bs_r.copy_from_host(&bs_bytes)? };
+                    (Some(bs_r.device_ptr()), rb as u32, cb as u32)
+                } else {
+                    eprintln!(
+                        "[loader] {region_name}: 2-D scale shape [{rb}, {cb}] does not \
+                         match the sm121 GEMV fastpath layout \
+                         [ceil(N/128)={expect_n_blocks}, ceil(K/128)={expect_k_blocks}] \
+                         for weight [N={weight_n}, K={weight_k}]; \
+                         dropping to channelscale-only dispatch."
+                    );
+                    (None, 0u32, 0u32)
+                }
             } else {
                 (None, 0u32, 0u32)
             };
@@ -1073,6 +1217,404 @@ fn fp8_e4m3_to_f32(b: u8) -> f32 {
         f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
     };
     if s != 0 { -val } else { val }
+}
+
+/// Cycle 49 step 8a: AWQ-only Gemma 4 load path. Implements the
+/// non-quantized preludes (embedding sqrt(H) pre-scale, final_norm,
+/// lm_head, RoPE tables) and stubs the per-layer body so cycle 49
+/// step 8b can land per-layer norms, 8c can land the AWQ upload, and
+/// 8d can land debug-probe guards + smoke.
+///
+/// This is structurally a near-twin of `load_gemma4_model`'s FP8 path
+/// (lines ~140-250 above) but tailored for AWQ checkpoints:
+/// - lm_head + embedding stay BF16-source per AwqConfig.ignore (no
+///   FP8E4M3 weight tensor exists in AWQ checkpoints).
+/// - per-layer FP8 fields all populate as `None`; AWQ tensors land
+///   in `layer.awq` instead.
+fn load_gemma4_awq_model_inner(
+    model_dir: &Path,
+    arena: &HbmArena,
+    arch: &crate::gemma4_arch::Gemma4Arch,
+    awq: &crate::compressed_tensors::AwqConfig,
+    shards: &[ShardMap],
+    tensors: &BTreeMap<String, (usize, TensorEntry)>,
+) -> Result<Gemma4LoadedModel> {
+    let prefix = &arch.weight_prefix;
+
+    let bytes_of = |si: usize, e: &TensorEntry| -> &[u8] {
+        let s = shards[si].bytes();
+        let start = e.file_offset as usize;
+        &s[start..start + e.nbytes as usize]
+    };
+    let must_get = |name: &str| -> Result<(usize, TensorEntry)> {
+        tensors.get(name).cloned().ok_or_else(|| RvllmError::Loader {
+            err: LoaderError::MissingTensor { name: name.to_string() },
+            ctx: LoaderCtx {
+                path: model_dir.to_path_buf(),
+                tensor: Some(name.to_string()),
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })
+    };
+    let get_tensor = |name: &str| tensors.get(name).cloned();
+
+    let upload_f16 = |name: &'static str, hf_name: &str| -> Result<F16Weight> {
+        let (si, e) = must_get(hf_name)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let region = arena.region(name, buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        Ok(F16Weight {
+            offset_bytes: region.device_ptr(),
+            shape: e.shape.clone(),
+        })
+    };
+
+    // ----- embedding (sqrt(H) pre-scale, identical to FP8 path) -----
+    let embed_name = format!("{prefix}.embed_tokens.weight");
+    let embedding = {
+        let (si, e) = must_get(&embed_name)?;
+        let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let scale = (arch.hidden_size as f32).sqrt();
+        eprintln!("[awq-loader] embedding sqrt({}) = {:.2}", arch.hidden_size, scale);
+        let n = buf.len() / 2;
+        for i in 0..n {
+            let bits = u16::from_le_bytes([buf[2*i], buf[2*i+1]]);
+            let v = f16::from_bits(bits);
+            let scaled = f16::from_f32(v.to_f32() * scale);
+            let out = scaled.to_le_bytes();
+            buf[2*i] = out[0];
+            buf[2*i+1] = out[1];
+        }
+        let region = arena.region("embedding", buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        F16Weight { offset_bytes: region.device_ptr(), shape: e.shape.clone() }
+    };
+
+    // ----- final_norm (F16) -----
+    let final_norm = {
+        let nm = format!("{prefix}.norm.weight");
+        let (si, e) = must_get(&nm)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let region = arena.region("final_norm", buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        F16Weight { offset_bytes: region.device_ptr(), shape: e.shape.clone() }
+    };
+
+    // ----- lm_head (typically in AwqConfig.ignore → BF16 source) -----
+    // AwqConfig.ignore lists "lm_head" → it's stored as BF16 in the
+    // safetensors. Same code paths as the FP8-from-BF16 branch in
+    // load_gemma4_model. fp8 form for the existing decode path; f16
+    // form for the f16 logit projection.
+    let lm_head_fp8 = if let Some((si, e)) = get_tensor("lm_head.weight") {
+        if e.dtype == DType::Fp8E4M3 {
+            let scale_entry = get_tensor("lm_head.weight_scale");
+            upload_fp8_direct_channelscale(arena, "lm_head", &(si, e), scale_entry.as_ref(), shards)?
+        } else {
+            upload_fp8(arena, "lm_head",
+                &tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?,
+                &e.shape, "lm_head.weight", model_dir)?
+        }
+    } else {
+        let (si, e) = must_get(&embed_name)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        upload_fp8(arena, "lm_head", &buf, &e.shape, "lm_head(tied_embed)", model_dir)?
+    };
+    let lm_head_f16 = {
+        let (si, e) = if let Some(t) = get_tensor("lm_head.weight") { t } else { must_get(&embed_name)? };
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let region = arena.region("lm_head_f16", buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        F16Weight { offset_bytes: region.device_ptr(), shape: e.shape.clone() }
+    };
+
+    // ----- RoPE tables (sliding + global, identical to FP8 path) -----
+    let sliding_rotary_dim = arch.head_dim_sliding;
+    let (cos_s, sin_s) = rope_cos_sin_bytes(
+        arch.head_dim_sliding, arch.max_position_embeddings,
+        arch.rope_theta_sliding, sliding_rotary_dim,
+    );
+    // Cycle 50: derive directly from arch (head_dim_global *
+    // partial_rotary_factor_global, even-rounded). The previous
+    // `.position(...).unwrap_or(0)` fallback returned layer 0's
+    // rotary dim if no global layer was found — silently producing
+    // the sliding dim while the cos/sin tables below were built
+    // for head_dim_global. Codex review of cycle 49 step 8a flagged
+    // this; fix applies to both load_gemma4_model and
+    // load_gemma4_awq_model_inner.
+    let global_rotary_dim = arch.rotary_dim_global();
+    let (cos_g, sin_g) = rope_cos_sin_bytes(
+        arch.head_dim_global, arch.max_position_embeddings,
+        arch.rope_theta_global, global_rotary_dim,
+    );
+    let rope_cos_sliding = upload_rope(arena, "rope_cos_sliding", &cos_s)?;
+    let rope_sin_sliding = upload_rope(arena, "rope_sin_sliding", &sin_s)?;
+    let rope_cos_global  = upload_rope(arena, "rope_cos_global",  &cos_g)?;
+    let rope_sin_global  = upload_rope(arena, "rope_sin_global",  &sin_g)?;
+
+    // ----- per-layer (cycle 49 step 8b: norms uploaded; 8c stubs AWQ) -----
+    let load_max_layers = std::env::var("RVLLM_MAX_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.min(arch.num_hidden_layers))
+        .unwrap_or(arch.num_hidden_layers);
+    if load_max_layers < arch.num_hidden_layers {
+        eprintln!(
+            "[awq-loader] RVLLM_MAX_LAYERS={load_max_layers}: loading only first {load_max_layers} of {} layers",
+            arch.num_hidden_layers
+        );
+    }
+
+    let mut layers: Vec<crate::gemma4_weights::Gemma4LayerWeights> = Vec::with_capacity(load_max_layers);
+    for l in 0..load_max_layers {
+        let ln = |s: &str| format!("{prefix}.layers.{l}.{s}");
+
+        // F16 norms (identical names + shapes to FP8 path).
+        let input_layernorm =
+            upload_f16("input_ln", &ln("input_layernorm.weight"))?;
+        let post_attention_layernorm =
+            upload_f16("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
+        let pre_feedforward_layernorm =
+            upload_f16("pre_ff_ln", &ln("pre_feedforward_layernorm.weight"))?;
+        let post_feedforward_layernorm =
+            upload_f16("post_ff_ln", &ln("post_feedforward_layernorm.weight"))?;
+        let q_norm = upload_f16("q_norm", &ln("self_attn.q_norm.weight"))?;
+        let k_norm = upload_f16("k_norm", &ln("self_attn.k_norm.weight"))?;
+        let layer_scalar = upload_f16("layer_scalar", &ln("layer_scalar"))?;
+
+        // Cycle 49 step 8c: AWQ tensor upload via upload_gemma4_awq_layer.
+        // Build a byte_lookup closure that maps safetensors entry name
+        // to (DType, shape, owned bytes Vec). For global layers
+        // (attention_k_eq_v=true), self_attn.v_proj.* aliases to
+        // self_attn.k_proj.* — runtime sees v_packed/scale/zero
+        // pointers identical to k_packed/scale/zero, the AWQ kernel
+        // happily produces the V output by re-running on K's weights.
+        let (q_out, kv_out, o_in, has_v_proj) = awq_layer_shape_for(arch, l);
+        let layer_prefix = format!("{prefix}.layers.{l}");
+        let v_alias_prefix = format!("{layer_prefix}.self_attn.v_proj.");
+        let k_alias_prefix = format!("{layer_prefix}.self_attn.k_proj.");
+        let byte_lookup = |name: &str| -> Option<(rvllm_core::DType, Vec<usize>, Vec<u8>)> {
+            // Global-layer alias: redirect any v_proj.* lookup to k_proj.*
+            // so upload_gemma4_awq_layer's "all 7 linears" contract
+            // succeeds without a synthetic v_proj tensor.
+            let aliased: String;
+            let resolved = if !has_v_proj && name.starts_with(&v_alias_prefix) {
+                aliased = format!("{}{}", k_alias_prefix, &name[v_alias_prefix.len()..]);
+                aliased.as_str()
+            } else {
+                name
+            };
+            let (si, e) = tensors.get(resolved)?.clone();
+            let raw = bytes_of(si, &e).to_vec();
+            Some((e.dtype, e.shape.clone(), raw))
+        };
+        // Reuse awq_layer_shape_for outputs (codex review of 92cd9e0)
+        // — keeps the validator and the upload path in lock-step on
+        // global v_proj / heterogeneous head-dim handling.
+        let geom = crate::compressed_tensors::AwqLayerShapes {
+            q_out, kv_out,
+            o_out:            arch.hidden_size,
+            o_in,
+            mlp_intermediate: arch.intermediate_size,
+            hidden:           arch.hidden_size,
+        };
+        let awq_layer = crate::compressed_tensors::upload_gemma4_awq_layer(
+            arena, &layer_prefix, &geom, &awq.scheme, &byte_lookup, has_v_proj,
+        ).map_err(|e| RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!("layer {l} AWQ upload: {e}"),
+            },
+            ctx: LoaderCtx {
+                path: model_dir.to_path_buf(),
+                tensor: Some(format!("{layer_prefix}.self_attn.*")),
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })?;
+
+        // Cycle 49 step 8e: upload_gemma4_awq_layer now handles the V/K
+        // alias internally (skips the v_proj arena region for globals
+        // and clones K's AwqLinearWeight into the v_proj slot), so no
+        // post-upload alias step is needed here.
+
+        if l == 0 || l == load_max_layers - 1 {
+            eprintln!(
+                "[awq-loader] layer {l} ({:?}) AWQ uploaded: q_packed=0x{:x} (group_size={}{})",
+                arch.layer_types[l], awq_layer.q_proj.packed_offset_bytes, awq_layer.q_proj.group_size,
+                if has_v_proj { "" } else { ", v=k alias" },
+            );
+        }
+
+        layers.push(crate::gemma4_weights::Gemma4LayerWeights {
+            qkv:       None,  // AWQ replaces FP8 fused QKV
+            o_proj:    None,
+            gate_up:   None,
+            down_proj: None,
+            qkv_f16:        None,
+            o_proj_f16:     None,
+            gate_up_f16:    None,
+            down_proj_f16:  None,
+            input_layernorm,
+            post_attention_layernorm,
+            pre_feedforward_layernorm,
+            post_feedforward_layernorm,
+            q_norm,
+            k_norm,
+            layer_scalar,
+            awq: Some(awq_layer),
+        });
+    }
+
+    eprintln!(
+        "[awq-loader] all {} layers uploaded; building Gemma4LoadedModel",
+        layers.len()
+    );
+
+    Ok(Gemma4LoadedModel {
+        embedding,
+        lm_head_fp8,
+        lm_head_f16,
+        final_norm,
+        rope_cos_sliding,
+        rope_sin_sliding,
+        rope_cos_global,
+        rope_sin_global,
+        layers,
+    })
+}
+
+/// Cycle 48 step 7c: per-layer AWQ geometry derived from
+/// `Gemma4Arch.layer_types[i]`. Shared between the validator
+/// (`validate_gemma4_awq_layout`) and the future upload path so they
+/// can't drift.
+///
+/// Returns `(q_out, kv_out, o_in, has_v_proj)`:
+///   Sliding: q = num_attention_heads * head_dim_sliding, kv similar;
+///            has_v_proj = true (all 7 linears in the checkpoint).
+///   Global:  q = num_attention_heads * head_dim_global,  kv similar;
+///            has_v_proj = false (`attention_k_eq_v=true`, K reused as V).
+pub(crate) fn awq_layer_shape_for(
+    arch: &crate::gemma4_arch::Gemma4Arch,
+    layer_idx: usize,
+) -> (usize, usize, usize, bool) {
+    match arch.layer_types[layer_idx] {
+        crate::gemma4_arch::Gemma4LayerType::SlidingAttention => {
+            let q = arch.num_attention_heads * arch.head_dim_sliding;
+            let kv = arch.num_kv_heads_sliding * arch.head_dim_sliding;
+            (q, kv, q, true)
+        }
+        crate::gemma4_arch::Gemma4LayerType::GlobalAttention => {
+            let q = arch.num_attention_heads * arch.head_dim_global;
+            let kv = arch.num_kv_heads_global * arch.head_dim_global;
+            (q, kv, q, false)
+        }
+    }
+}
+
+/// Cycle 48 step 7c roadmap (documented here so cycle 49 can pick up
+/// without re-deriving the plan from scratch):
+///
+/// 1. Drop the `UnsupportedQuantization` early-return at the
+///    validator-pass site in `load_gemma4_model`.
+///
+/// 2. Branch into a separate `load_gemma4_awq_model_inner` function
+///    that is structurally a near-twin of the FP8 path:
+///      a. embedding (sqrt(H) pre-scale, F16 upload)
+///      b. final_norm (F16 upload)
+///      c. lm_head: AwqConfig.ignore typically lists "lm_head" → loaded
+///         as-is via the existing CPU-quantize-to-FP8 fallback (the
+///         BF16 source matches the FP8 path's existing input shape)
+///      d. RoPE tables (sliding + global, identical to FP8 path)
+///      e. per-layer:
+///         * f16 norms (input/post_attn/pre_ff/post_ff_layernorm,
+///           q_norm, k_norm, layer_scalar) — identical to FP8 path
+///         * Build a byte_lookup closure over &shards + &tensors that
+///           returns (DType, Vec<usize>, Vec<u8>) per entry name. The
+///           bytes Vec is owned (memcpy from mmap) so the closure
+///           doesn't borrow shards across `upload_gemma4_awq_layer`'s
+///           internal allocations.
+///         * Derive per-layer geometry via `awq_layer_shape_for(arch, l)`.
+///           Build `AwqLayerShapes { q_out, kv_out, o_in, o_out: hidden,
+///           mlp_intermediate: arch.intermediate_size, hidden:
+///           arch.hidden_size }`.
+///         * Call `upload_gemma4_awq_layer(arena, &layer_prefix, &geom,
+///           &awq.scheme, &byte_lookup)` — gets back AwqLayerWeights.
+///         * For global layers, splice K's AwqLinearWeight into V's slot
+///           in the returned struct (mirrors the FP8 path's K-as-V
+///           reuse). Or: have a `upload_gemma4_awq_layer_global` that
+///           skips v_proj and copies q_proj-style — TBD in cycle 49.
+///         * Push `Gemma4LayerWeights { qkv: None, o_proj: None,
+///           gate_up: None, down_proj: None, qkv_f16: None,
+///           o_proj_f16: None, gate_up_f16: None, down_proj_f16: None,
+///           input_layernorm, ..., awq: Some(awq_layer_weights) }`.
+///      f. Build `Gemma4LoadedModel { embedding, lm_head_fp8,
+///         lm_head_f16, final_norm, rope_*, layers }`.
+///
+/// 3. Codex finding from cycle 48 step 7a: guard CUDA debug probes in
+///    `gemma4_layer_exec.rs` that unconditionally read `weights.qkv_scale`
+///    + `weights.qkv_fp8`. Add `if weights.qkv_fp8 != 0` around them
+///    so AWQ-only layers (qkv_fp8 = 0) don't trigger SIGSEGV in
+///    debug mode.
+///
+/// 4. Smoke test: load `ebircak/gemma-4-31B-it-4bit-W4A16-AWQ`, fire
+///    the same prompts the FP8 production path serves
+///    (`v3/scripts/bench_sm121.sh 1 1` + ZeroClaw weather query),
+///    confirm decoding works, measure tok/s. Target: 6-10 tok/s vs
+///    FP8 production 3.3-4.0.
+///
+/// Walk every Gemma 4 layer's expected AWQ tensor
+/// names against the shard index, validate dtype + shape per linear
+/// via `validate_awq_linear`. Sliding layers (`head_dim=256, kv=16`)
+/// have different N for q/k/v/o vs global layers
+/// (`head_dim=512, kv=4`); per-layer geometry is derived from
+/// `arch.layer_types[i]` so heterogeneous Gemma 4 attention is handled
+/// the same way the bring-up reads it.
+///
+/// Returns `Ok(())` when every linear in every non-ignored layer
+/// validates cleanly. Returns a descriptive `Err(String)` on the
+/// first failure so the caller can attribute the abort to one
+/// specific tensor.
+fn validate_gemma4_awq_layout(
+    arch: &crate::gemma4_arch::Gemma4Arch,
+    awq: &crate::compressed_tensors::AwqConfig,
+    tensors: &BTreeMap<String, (usize, TensorEntry)>,
+) -> std::result::Result<(), String> {
+    let lookup = |key: &str| -> Option<(rvllm_core::DType, Vec<usize>)> {
+        tensors.get(key).map(|(_, e)| (e.dtype, e.shape.clone()))
+    };
+    let prefix = &arch.weight_prefix;
+    let mut total_validated = 0usize;
+    for (i, lt) in arch.layer_types.iter().enumerate() {
+        // Per-layer geometry via the shared helper so the validator
+        // and the cycle-49 upload path can't drift on global v_proj
+        // handling.
+        let (q_out, kv_out, o_in, has_v_proj) = awq_layer_shape_for(arch, i);
+        let layer_prefix = format!("{prefix}.layers.{i}");
+        let mut layer_validated = 0usize;
+        let mut lin = |name: &str, dense: [usize; 2]| -> std::result::Result<(), String> {
+            let full = format!("{layer_prefix}.{name}");
+            if awq.is_ignored(&full) {
+                return Ok(()); // not AWQ-quantized; FP8 path will load it
+            }
+            crate::compressed_tensors::validate_awq_linear(
+                &full, dense, &awq.scheme, &lookup,
+            ).map(|_| { layer_validated += 1; })
+              .map_err(|e| format!("layer {i} ({lt:?}) {name}: {e}"))
+        };
+        lin("self_attn.q_proj",  [q_out, arch.hidden_size])?;
+        lin("self_attn.k_proj",  [kv_out, arch.hidden_size])?;
+        if has_v_proj {
+            lin("self_attn.v_proj",  [kv_out, arch.hidden_size])?;
+        }
+        lin("self_attn.o_proj",  [arch.hidden_size, o_in])?;
+        lin("mlp.gate_proj",     [arch.intermediate_size, arch.hidden_size])?;
+        lin("mlp.up_proj",       [arch.intermediate_size, arch.hidden_size])?;
+        lin("mlp.down_proj",     [arch.hidden_size, arch.intermediate_size])?;
+        total_validated += layer_validated;
+    }
+    eprintln!(
+        "[loader] AWQ layout validated: {} layer-linear entries across {} layers",
+        total_validated, arch.num_hidden_layers
+    );
+    Ok(())
 }
 
 #[cfg(test)]

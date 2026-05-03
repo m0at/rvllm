@@ -9,6 +9,14 @@
 //!   to proceed.
 //! - Full weight set resident before first forward; no lazy loading.
 
+pub mod compressed_tensors;
+pub use compressed_tensors::{
+    AwqConfig, AwqExpectedShapes, AwqLayerShapes, AwqLinearLayout, AwqLinearStaged,
+    AwqLinearWeight, AwqPackFormat, AwqTensorNames, AwqWeightScheme, read_awq_config_from_dir,
+    stage_awq_linear, validate_awq_linear,
+};
+pub use compressed_tensors::{upload_awq_linear, upload_gemma4_awq_layer};
+pub use weights::AwqLayerWeights;
 pub mod fp8_quant;
 pub mod gemma4_arch;
 pub mod gemma4_load;

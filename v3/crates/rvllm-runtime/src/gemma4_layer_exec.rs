@@ -8,24 +8,31 @@
 //!   - Partial RoPE (only rotate first rotary_dim dims per head)
 //!   - Per-layer KV head count (sliding vs global)
 //!   - head_dim = 256 (requires FA3 .so compiled for 256)
-//!   - Per-layer learnable scalar (applied ONCE after both sub-blocks)
+//!   - Per-layer learnable scalar (folded into the post-attn and
+//!     post-FF FusedNormAddResidual kernels — Codex35-4 corrects
+//!     the older "applied ONCE after both sub-blocks" comment)
 //!
-//! Launch sequence:
-//!   1.  fused_rmsnorm_fp8_quant          input_layernorm
+//! Launch sequence (current sm_121 / Gemma 4 path):
+//!   1.  fused_rmsnorm_fp8_quant         input_layernorm
 //!   2.  fp8_gemm (cuBLASLt)             Q||K||V projection
 //!  2b.  vnorm_f16                       parameter-free RMS norm on V
 //!   3.  fused_qk_rmsnorm                QK-norm on Q and K heads
-//!   4.  fused_rope_partial_fp8kv        partial RoPE + FP8 Q + paged KV
-//!   5.  paged_decode / paged_prefill    FA3 attention (head_dim=256)
+//!   4.  fused_rope_partial_*kv          partial RoPE + (FP8 | NVFP4) KV
+//!   5.  paged_decode / unified_prefill  FA2-PTX attention (head_dim 256/512)
 //!   6.  quantize_fp8_per_token          attn_out -> fp8
-//!   7.  fp8_gemm_residual (cuBLASLt)    O proj += residual
-//!   8.  fused_rmsnorm                   post_attention_layernorm (norm only)
+//!   7.  fp8_gemm                        O proj
+//!   8.  fused_norm_add_residual{,_f16}  post_attn_norm + residual + layer_scalar
 //!   9.  fused_rmsnorm_fp8_quant         pre_feedforward_layernorm
 //!  10.  fp8_gemm (cuBLASLt)             gate||up projection
-//!  11.  fused_gelu_mul_fp8_quant        GELU(tanh)(gate) * up -> FP8
-//!  12.  fp8_gemm_residual (cuBLASLt)    down proj += residual
-//!  13.  fused_rmsnorm                   post_feedforward_layernorm (norm only)
-//!  14.  residual_scale_f16              residual *= layer_scalar (once)
+//!  11.  fused_gelu_mul_*                GELU(tanh)(gate) * up
+//!  12.  fp8_gemm                        down proj
+//!  13.  fused_norm_add_residual{,_f16}  post_ff_norm + residual + layer_scalar
+//!
+//! Steps 8 and 13 fold the per-layer scalar into the residual write —
+//! every down-proj branch (awq / fp8_gemv fast path / fp8 / f16) MUST
+//! call the matching FusedNormAddResidual* afterwards or the FFN block
+//! (and its layer_scalar) silently drops. Codex35-1 closed the f16
+//! branch which had been missing this epilog.
 
 use rvllm_core::Result;
 use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan};
@@ -36,6 +43,176 @@ use rvllm_kernels::KernelFn;
 use rvllm_attention::{AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams};
 
 use rvllm_loader::gemma4_arch::Gemma4LayerType;
+
+// Cycle 56 step 7: cuda_check! macro hoisted to crate root in lib.rs.
+// Submodules pick it up via `#[macro_use] extern crate` semantics
+// (the macro is `#[macro_export]`-ed at crate root).
+
+/// Storage dtype of the paged KV cache. Picked once at bring-up time
+/// per the `RVLLM_NVFP4_KV` / `RVLLM_F16_KV` env-flag priority and
+/// threaded through on every attention launch.
+///
+///   * `F16`  — 2 bytes per element, dense. CPU-host-visible path,
+///              still the engine default when no env flag is set.
+///   * `Fp8`  — 1 byte per element, per-tensor E4M3 descale. Current
+///              sm_121 hot path (`RVLLM_F16_KV=0`).
+///   * `Nvfp4`— 4 bits per element packed two-per-byte + 1 E4M3
+///              microscale per 16 elements. `RVLLM_NVFP4_KV=1`.
+///              Storage = elements × 0.5 bytes, scale region =
+///              elements × 0.0625 bytes, total 4.5 effective bits.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KvDtype {
+    F16,
+    Fp8,
+    Nvfp4,
+}
+
+impl KvDtype {
+    /// Main-cache bytes per element (scale region is separate).
+    #[must_use]
+    pub fn cache_bytes_per_elem(&self) -> u32 {
+        match self {
+            KvDtype::F16 => 2,
+            KvDtype::Fp8 => 1,
+            // Packed 4-bit → 0.5 byte per element. Callers that need
+            // an integer byte count should compute on multiples of 16
+            // elements (which NVFP4 requires anyway for the scale
+            // block). Returned here as `0` to force the caller to
+            // explicitly use `nvfp4_total_bytes` below.
+            KvDtype::Nvfp4 => 0,
+        }
+    }
+
+    /// Scale-region bytes per element. 0 for F16/Fp8 (per-tensor
+    /// descale lives in a separate 4-byte f32). For NVFP4, 1 E4M3
+    /// scale per 16 elements → 1/16 byte/elem.
+    #[must_use]
+    pub fn scale_bytes_per_elem_x16(&self) -> u32 {
+        match self {
+            KvDtype::Nvfp4 => 1,
+            _ => 0,
+        }
+    }
+
+    /// Is this an NVFP4 packed layout?
+    #[must_use]
+    pub fn is_nvfp4(&self) -> bool {
+        matches!(self, KvDtype::Nvfp4)
+    }
+
+    /// Is the cache dense F16 (no descale)?
+    #[must_use]
+    pub fn is_f16(&self) -> bool {
+        matches!(self, KvDtype::F16)
+    }
+
+    /// Resolve from the engine env flags. Precedence (post-Phase-2b
+    /// of task aa01001nvf4f16mma, commit 8e8f517 — NVFP4 + f16-MMA
+    /// unified prefill is 13× faster than the per-qi kernel and
+    /// beats FP8 unified prefill at 1082-tok prompts, so NVFP4 is
+    /// now the default KV dtype):
+    ///
+    ///   1. `RVLLM_NVFP4_KV=1`    → Nvfp4 (explicit opt-in).
+    ///   2. `RVLLM_F16_KV=1`      → F16.
+    ///   3. `RVLLM_FP8_KV=1`      → Fp8.
+    ///   4. `RVLLM_NVFP4_KV=0`    → F16 (explicit opt-out of the
+    ///                              NVFP4 default — matches the
+    ///                              pre-2b engine default for
+    ///                              legacy tests / probes).
+    ///   5. unset → Nvfp4.
+    ///
+    /// `f16_only` short-circuits to F16 — used by the bench path
+    /// when the caller explicitly asks for f16 regardless of env.
+    #[must_use]
+    pub fn from_env(f16_only: bool) -> Self {
+        if f16_only {
+            return KvDtype::F16;
+        }
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_KV").unwrap_or(false) {
+            return KvDtype::Nvfp4;
+        }
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_F16_KV").unwrap_or(false) {
+            return KvDtype::F16;
+        }
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_FP8_KV").unwrap_or(false) {
+            return KvDtype::Fp8;
+        }
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_KV") == Some(false) {
+            return KvDtype::F16;
+        }
+        KvDtype::Nvfp4
+    }
+
+    /// Hybrid per-layer KV dtype for Gemma 4. When
+    /// `RVLLM_NVFP4_HYBRID_GLOBAL_FP8=1` is set, global-attention layers
+    /// (head_dim=512, see-everything) use FP8 while sliding-window
+    /// layers stay on the env-default (typically NVFP4). Hypothesis H1
+    /// for the long-context Rusty-persona garbage: outlier-channel
+    /// pressure hits the 10 global layers harder than the 50 sliding
+    /// layers; FP8 on globals + NVFP4 on slidings should rescue
+    /// quality while still saving most of the KV memory.
+    ///
+    /// When the env flag is absent or `0`, returns `from_env(f16_only)`
+    /// for every layer (uniform mode, default behaviour).
+    #[must_use]
+    pub fn for_layer_or_env(
+        layer_type: rvllm_loader::gemma4_arch::Gemma4LayerType,
+        f16_only: bool,
+    ) -> Self {
+        Self::for_layer_index_or_env(layer_type, /*layer_idx=*/usize::MAX, f16_only)
+    }
+
+    /// Layer-index-aware variant. Adds a comma-separated list env var
+    /// `RVLLM_FP8_KV_LAYERS=0,30,59` that forces specific layer indices
+    /// to FP8 KV when the default would have been NVFP4. Strictly
+    /// generalizes `RVLLM_NVFP4_HYBRID_GLOBAL_FP8` (which forces the
+    /// 10 global layers to FP8). Cycle 24: targeted-FP8 attack on
+    /// high-divergence layers identified empirically.
+    ///
+    /// `layer_idx == usize::MAX` is the "unknown index" sentinel — only
+    /// the global-fp8 hybrid env applies, list env is ignored. Call
+    /// sites with the index available should pass the real index.
+    #[must_use]
+    pub fn for_layer_index_or_env(
+        layer_type: rvllm_loader::gemma4_arch::Gemma4LayerType,
+        layer_idx: usize,
+        f16_only: bool,
+    ) -> Self {
+        let default = Self::from_env(f16_only);
+        // Env-list override fires first. Most targeted, lets operators
+        // pin specific layer indices to FP8 even if hybrid is off.
+        if default == KvDtype::Nvfp4 && layer_idx != usize::MAX {
+            if let Ok(list) = std::env::var("RVLLM_FP8_KV_LAYERS") {
+                if list.split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .any(|i| i == layer_idx)
+                {
+                    return KvDtype::Fp8;
+                }
+            }
+        }
+        let hybrid = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
+            .unwrap_or(false);
+        if hybrid && default == KvDtype::Nvfp4
+            && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention
+        {
+            return KvDtype::Fp8;
+        }
+        // Inverse hybrid (cycle 25 research): all SLIDING layers FP8,
+        // globals stay NVFP4. Tests whether sliding-layer cumulative
+        // noise dominates over global-layer noise, given that the prior
+        // global-FP8 hybrid did not close the WEATHER cliff.
+        let hybrid_sliding =
+            crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HYBRID_SLIDING_FP8")
+                .unwrap_or(false);
+        if hybrid_sliding && default == KvDtype::Nvfp4
+            && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
+        {
+            return KvDtype::Fp8;
+        }
+        default
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct Gemma4LayerDims {
@@ -49,11 +226,183 @@ pub struct Gemma4LayerDims {
     pub block_size: u32,
     pub max_blocks_per_seq: u32,
     pub num_blocks_total: u32,
+    /// Current-step upper bound on KV context length across the active
+    /// batch, when the caller can compute it cheaply (e.g. decode step
+    /// knows `step + 1`). Used by the split-KV decode dispatch to skip
+    /// the split path when the current context is short enough that
+    /// the single-CTA kernel wins, without conflating it with the
+    /// bucket max that still sizes workspace. `None` falls back to
+    /// `max_blocks_per_seq * block_size` — correct but conservative.
+    pub current_max_context_len: Option<u32>,
     pub attn_scale: f32,
     pub rms_eps: f32,
     pub layer_type: Gemma4LayerType,
     pub sliding_window: u32,
+    /// Retained for existing branches that still key on the bool
+    /// (rope_f16kv vs rope_fp8kv). Equivalent to `kv_dtype.is_f16()`.
     pub f16_kv: bool,
+    pub kv_dtype: KvDtype,
+    /// Cycle 54 Stage 1: when true, the residual buffer is interpreted
+    /// as bf16 (still 2 bytes per element, same allocation). Set by
+    /// the engine when `RVLLM_RESIDUAL_BF16=1`. The math inside each
+    /// rmsnorm + residual-add is unchanged (f32 internally); only the
+    /// inter-layer storage dtype differs. f16 vs bf16 trade 3 mantissa
+    /// bits for 3 exponent bits — bf16 keeps long-context cumulative
+    /// residual values from saturating/underflowing across 60 layers.
+    /// Matches vLLM's bf16-activation production setup.
+    pub bf16_residual: bool,
+}
+
+impl Gemma4LayerDims {
+    /// Cycle 53 hardening: catch plumbing misconfigurations before they
+    /// reach the kernel layer. The attention launchers already validate
+    /// their own params, but several invariants live at the *layer*
+    /// level — across attn + RoPE + cache layout — and previously had
+    /// to be caught either by visual review of the call sites or by
+    /// kernel-side OOB reads (silent garbage on long context). This
+    /// runs once per `gemma4_forward_phase` call; cost is negligible
+    /// vs the kernel launches that follow.
+    ///
+    /// Failure converts to `AttentionError::FeatureNotAvailable` with
+    /// a descriptive `op` so the source of the misconfiguration is
+    /// obvious in logs.
+    pub fn validate(&self) -> Result<()> {
+        let mk_err = |op: &'static str| -> rvllm_core::RvllmError {
+            rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "Gemma4LayerDims",
+                    op,
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "gemma4_forward_phase.validate",
+                    stream: 0,
+                    num_seqs: self.num_tokens,
+                    head_dim: self.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            }
+        };
+        if self.num_tokens == 0 {
+            return Err(mk_err("Gemma4LayerDims: num_tokens == 0"));
+        }
+        if self.hidden == 0 || self.num_heads == 0 || self.num_kv_heads == 0 {
+            return Err(mk_err(
+                "Gemma4LayerDims: hidden/num_heads/num_kv_heads must be > 0",
+            ));
+        }
+        if self.num_heads % self.num_kv_heads != 0 {
+            return Err(mk_err(
+                "Gemma4LayerDims: num_heads not divisible by num_kv_heads",
+            ));
+        }
+        if self.head_dim == 0 || self.head_dim > 1024 {
+            // 1024 is well above any real Gemma 4 head_dim (256 / 512);
+            // catches u32 underflow / wild values.
+            return Err(mk_err("Gemma4LayerDims: head_dim out of range"));
+        }
+        // Tighter ceiling for the NVFP4 RoPE+Hadamard kernel: it has
+        // a static `__shared__ float s_hadamard[512]` and writes
+        // `s_hadamard[tid]` for `tid < head_dim`. head_dim > 512 on
+        // the NVFP4 path would silently overflow shared memory into
+        // the next allocation, producing wrong-but-not-crashing
+        // outputs. The Hadamard rotation is controlled at runtime
+        // via the `RVLLM_NVFP4_HADAMARD` env var, so we don't gate
+        // on enablement here — the kernel constraint is structural
+        // and the validator should refuse the shape unconditionally
+        // when `kv_dtype == Nvfp4`. Gemma 4 head_dim ∈ {256, 512}
+        // → unaffected; future models with 768/1024 head_dim need
+        // either a kernel-side `s_hadamard[max_head_dim]` lift or a
+        // path that skips the Hadamard buffer entirely.
+        if self.kv_dtype == KvDtype::Nvfp4 && self.head_dim > 512 {
+            return Err(mk_err(
+                "Gemma4LayerDims: head_dim > 512 with NVFP4 KV is \
+                 incompatible with the RoPE+Hadamard kernel \
+                 (s_hadamard[512] static smem would OOB)",
+            ));
+        }
+        // NVFP4 byte/scale layout assumes `head_dim` is a multiple
+        // of 16 — kernels compute `half_D = head_dim >> 1` and
+        // `scales_per_D = head_dim >> 4` for packed-byte and per-16
+        // microscale addressing (see flash_attention_nvfp4kv.cu:184,
+        // fused_rope_partial_nvfp4kv.cu:213). Gemma 4's 256/512 are
+        // multiples of 16 → safe; defensive check catches future
+        // models with head_dim ∈ {80, 96} etc. before they corrupt
+        // KV-cache pointer math. Checked BEFORE the power-of-two
+        // gate below so non-multiples land here with the more
+        // specific error.
+        if self.kv_dtype == KvDtype::Nvfp4 && self.head_dim % 16 != 0 {
+            return Err(mk_err(
+                "Gemma4LayerDims: head_dim must be a multiple of 16 \
+                 with NVFP4 KV (kernels use head_dim >> 4 for \
+                 microscale stride and head_dim >> 1 for packed bytes)",
+            ));
+        }
+        // The Hadamard helper (`kernels/hadamard.cuh`) requires
+        // `head_dim` to be a power of two — the recursion `H_n =
+        // H_{n/2} ⊗ {{1,1},{1,-1}}` only closes when n is a power of
+        // two. The earlier `<= 512` + `% 16 == 0` checks accept
+        // values like 384 (= 256 + 128, multiple of 16, below the
+        // smem cap) which the kernel would silently mishandle. Gemma
+        // 4 head_dim ∈ {256, 512} → both power-of-two, safe.
+        if self.kv_dtype == KvDtype::Nvfp4 && !self.head_dim.is_power_of_two() {
+            return Err(mk_err(
+                "Gemma4LayerDims: head_dim must be a power of two with \
+                 NVFP4 KV (the Hadamard recursion only closes on \
+                 power-of-two D — 384 / 768 are rejected even though \
+                 they pass the size + multiple-of-16 checks)",
+            ));
+        }
+        if self.rotary_dim > self.head_dim {
+            return Err(mk_err("Gemma4LayerDims: rotary_dim > head_dim"));
+        }
+        if self.rotary_dim % 2 != 0 {
+            // RoPE pairs (cos, sin) over even/odd channel pairs.
+            return Err(mk_err("Gemma4LayerDims: rotary_dim must be even"));
+        }
+        if self.block_size == 0 || (self.block_size & (self.block_size - 1)) != 0 {
+            // Power-of-two block_size is what the page-table arithmetic
+            // assumes; non-PoT silently mis-indexes pages on long ctx.
+            return Err(mk_err(
+                "Gemma4LayerDims: block_size must be a non-zero power of two",
+            ));
+        }
+        if self.max_blocks_per_seq == 0 || self.num_blocks_total == 0 {
+            return Err(mk_err(
+                "Gemma4LayerDims: max_blocks_per_seq / num_blocks_total must be > 0",
+            ));
+        }
+        if let Some(cur) = self.current_max_context_len {
+            let bucket_max = (self.max_blocks_per_seq as u64)
+                .saturating_mul(self.block_size as u64);
+            if (cur as u64) > bucket_max {
+                // Decode reads block_tables[seq * max_blocks_per_seq +
+                // (cur-1)/block_size]. If cur exceeds the bucket,
+                // that's an OOB read on the page-table that would
+                // silently feed garbage block IDs to the kernel.
+                return Err(mk_err(
+                    "Gemma4LayerDims: current_max_context_len exceeds max_blocks_per_seq*block_size",
+                ));
+            }
+        }
+        if self.intermediate == 0 {
+            return Err(mk_err("Gemma4LayerDims: intermediate (MLP dim) == 0"));
+        }
+        if !self.attn_scale.is_finite() || self.attn_scale <= 0.0 {
+            return Err(mk_err("Gemma4LayerDims: attn_scale must be finite and > 0"));
+        }
+        if !self.rms_eps.is_finite() || self.rms_eps <= 0.0 {
+            return Err(mk_err("Gemma4LayerDims: rms_eps must be finite and > 0"));
+        }
+        // f16_kv must agree with kv_dtype — drift between these two
+        // routes the wrong RoPE kernel (rope_f16kv vs rope_fp8kv vs
+        // rope_nvfp4kv) and KV cache writes go to the wrong layout.
+        if self.f16_kv != self.kv_dtype.is_f16() {
+            return Err(mk_err(
+                "Gemma4LayerDims: f16_kv flag disagrees with kv_dtype.is_f16()",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -94,6 +443,70 @@ pub struct Gemma4LayerWeightPtrs {
     pub o_blockscale: u64,
     pub gate_up_blockscale: u64,
     pub down_blockscale: u64,
+    /// Cycle 45 step 4.5b: per-layer AWQ INT4 W4A16 weights. All-zero
+    /// fields = AWQ inactive for this linear, fall back to the FP8 path
+    /// using the `*_fp8` / `*_scale` / `*_blockscale` fields above.
+    /// Non-zero `*_packed` = AWQ active for that linear; the dispatch
+    /// in `exec_layer` reads `awq` and routes to `AwqInt4GemvF16Launch`
+    /// instead of `Fp8GemvF16InLaunch`.
+    ///
+    /// Compressed-tensors AWQ stores Q/K/V un-fused, so QKV is split
+    /// into three (q/k/v) independent launches that write into the
+    /// existing Q|K|V scratch buffer at q_dim / kv_dim offsets;
+    /// gate/up are similarly split into (gate, up). The down + o
+    /// projections stay 1-launch.
+    pub awq: Gemma4AwqLayerPtrs,
+}
+
+/// Per-layer AWQ device pointer set. All-zero `*_packed` = AWQ
+/// inactive for that linear; each tuple of (packed, scale, zero) for
+/// one linear must be all-zero or all-non-zero — partial fills are a
+/// programming error caught by `exec_layer`'s dispatch gate.
+///
+/// Layout matches what `compressed_tensors::upload_gemma4_awq_layer`
+/// produces (one `AwqLinearWeight` per of the seven Gemma 4 linears).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Gemma4AwqLayerPtrs {
+    pub q_packed: u64,    pub q_scale: u64,    pub q_zero: u64,
+    pub k_packed: u64,    pub k_scale: u64,    pub k_zero: u64,
+    pub v_packed: u64,    pub v_scale: u64,    pub v_zero: u64,
+    pub o_packed: u64,    pub o_scale: u64,    pub o_zero: u64,
+    pub gate_packed: u64, pub gate_scale: u64, pub gate_zero: u64,
+    pub up_packed: u64,   pub up_scale: u64,   pub up_zero: u64,
+    pub down_packed: u64, pub down_scale: u64, pub down_zero: u64,
+    /// AWQ block-scale group size along K. Typical 128. Same value
+    /// shared across every linear in the layer.
+    pub group_size: u32,
+}
+
+impl Gemma4AwqLayerPtrs {
+    /// `true` if any linear in this layer has AWQ weights bound.
+    pub fn any_active(&self) -> bool {
+        self.q_packed != 0 || self.k_packed != 0 || self.v_packed != 0
+            || self.o_packed != 0
+            || self.gate_packed != 0 || self.up_packed != 0
+            || self.down_packed != 0
+    }
+
+    /// `true` if this specific linear is AWQ-active (only the packed
+    /// pointer is checked — scale/zero must be set in tandem).
+    pub fn linear_active(&self, kind: AwqLinearKind) -> bool {
+        match kind {
+            AwqLinearKind::Q    => self.q_packed != 0,
+            AwqLinearKind::K    => self.k_packed != 0,
+            AwqLinearKind::V    => self.v_packed != 0,
+            AwqLinearKind::O    => self.o_packed != 0,
+            AwqLinearKind::Gate => self.gate_packed != 0,
+            AwqLinearKind::Up   => self.up_packed != 0,
+            AwqLinearKind::Down => self.down_packed != 0,
+        }
+    }
+}
+
+/// Identifies one of the seven AWQ-quantizable Gemma 4 linears.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum AwqLinearKind {
+    Q, K, V, O, Gate, Up, Down,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -114,6 +527,11 @@ pub struct Gemma4LayerScratch {
     pub q_fp8: u64,
     pub k_cache: u64,
     pub v_cache: u64,
+    /// NVFP4 scale regions. 0 when `kv_dtype != Nvfp4`. Sized at
+    /// `layer_elems / 16 * 1` bytes per layer; offsets mirror the
+    /// main `k_cache` / `v_cache` layer layout.
+    pub k_cache_scale: u64,
+    pub v_cache_scale: u64,
     pub q_scale_ptr: u64,
     pub kv_scale_ptr: u64,
     /// Per-slot-per-head f32 K scale cache, shape
@@ -141,10 +559,84 @@ pub struct Gemma4LayerScratch {
     pub mlp_out_fp8: u64,
     pub mlp_out_scale: u64,
     pub gemm_f32_tmp: u64,
+    /// Codex40-3: capacity of `gemm_f32_tmp` in bytes. Used by the
+    /// CUTLASS sm120 blockwise fastpath to refuse dispatch if its
+    /// SFA+SFB scale-prep regions wouldn't fit and fall through to
+    /// cuBLASLt instead of overlapping into adjacent scratch.
+    pub gemm_f32_tmp_bytes: usize,
     pub cutlass_workspace: u64,
     pub cutlass_workspace_bytes: usize,
     pub fa3_workspace: u64,
+    /// Capacity of `fa3_workspace` in bytes. Used by the split-decode
+    /// gate to refuse the split path when the per-call scratch
+    /// requirement exceeds the actual allocation. Previously the
+    /// gate hard-coded `16 * 1024 * 1024` regardless of which arena
+    /// was wired in — production `run_generate` allocates 128 MiB
+    /// while `run_bench` / `run_ppl` allocate 16 MiB, so the gate
+    /// was simultaneously too restrictive in production and exactly
+    /// right in the diagnostic paths.
+    pub fa3_workspace_bytes: u64,
+    // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+    // When non-zero on an NVFP4 layer in the instrumented set, the layer
+    // performs a pre-write `rope_f16kv` into these pointers BEFORE the
+    // primary `rope_nvfp4kv`. The shadow region is sized for f16 KV of
+    // that layer only; the primary NVFP4 write is untouched. 0 = no
+    // shadow for this layer. See `parse_shadow_layers` and
+    // `NvFp4ShadowDumper` in gemma4_bring_up.rs.
+    pub shadow_k_cache: u64,
+    pub shadow_v_cache: u64,
+    /// When non-zero, post-RoPE f16 Q snapshot dst (device buffer),
+    /// size `num_tokens * num_heads * head_dim * 2` bytes. Populated
+    /// on decode step 0 only; the Rust-side gate in `run_one_token`
+    /// zeros this for every other step. Snapshot is taken AFTER
+    /// `rope_f16kv_shadow` writes post-RoPE Q into `scratch.q_normed`
+    /// and BEFORE `rope_nvfp4kv` clobbers it with another RoPE pass.
+    pub shadow_q_cache: u64,
+    // === END NVFP4 SHADOW DIAGNOSTIC ===
+    // === HADAMARD ROTATION ===
+    /// Device pointer to this layer's ±1 sign vector (i8 storage,
+    /// length `head_dim`) used as `D` in the signed Walsh-Hadamard
+    /// rotation `R = H * diag(D)` applied to Q post-RoPE pre-FP8-
+    /// quantize. `0` when rotation is disabled
+    /// (`RVLLM_NVFP4_HADAMARD` unset or kv_dtype != Nvfp4). The
+    /// rope kernel treats either pointer being null as "disabled"
+    /// and runs byte-identical to the pre-Hadamard path.
+    pub hadamard_signs_q: u64,
+    /// Companion to `hadamard_signs_q` for K. Production paths set
+    /// both to the same per-layer vector — kept as separate fields
+    /// so future revisions can experiment with asymmetric Q/K
+    /// rotation structures without touching the kernel ABI again.
+    pub hadamard_signs_k: u64,
+    // === END HADAMARD ROTATION ===
 }
+
+// === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+/// Parse `RVLLM_NVFP4_SHADOW_LAYERS` (comma-separated layer indices).
+/// Returns `None` when the master gate `RVLLM_NVFP4_SHADOW_F16` is off
+/// or the list parses empty. Default set applied by caller when the
+/// gate is on but the list env var is unset.
+pub fn parse_shadow_layers() -> Option<Vec<u32>> {
+    let gate = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_SHADOW_F16")
+        .unwrap_or(false);
+    if !gate {
+        return None;
+    }
+    let default_set: Vec<u32> = vec![0, 10, 20, 30, 40, 50, 59];
+    let raw = match std::env::var("RVLLM_NVFP4_SHADOW_LAYERS") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return Some(default_set),
+    };
+    let parsed: Vec<u32> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u32>().ok())
+        .collect();
+    if parsed.is_empty() {
+        Some(default_set)
+    } else {
+        Some(parsed)
+    }
+}
+// === END NVFP4 SHADOW DIAGNOSTIC ===
 
 #[derive(Clone, Debug)]
 pub struct Gemma4GemmPlans {
@@ -169,7 +661,28 @@ pub struct Gemma4LayerKernels {
     pub fused_rmsnorm: KernelFn,
     pub fused_rmsnorm_fp8_quant: KernelFn,
     pub fused_qk_rmsnorm: KernelFn,
+    /// Cycle 55 step 5 (Phase B): bf16-typed sibling of
+    /// `fused_qk_rmsnorm`. Same launch ABI; only the dtype
+    /// interpretation of Q/K/gamma flips f16 → bf16. Selected when
+    /// the QKV chain is bf16-native (eventually the only path).
+    pub fused_qk_rmsnorm_bf16: KernelFn,
     pub fused_rope_partial_fp8kv: KernelFn,
+    /// Cycle 55 step 7 (Phase B): bf16-input sibling of
+    /// `fused_rope_partial_fp8kv`. Same launch ABI; Q/K/V inputs flip
+    /// f16 → bf16. cos/sin tables stay f16 (Phase D revisits).
+    pub fused_rope_partial_fp8kv_bf16in: KernelFn,
+    /// RoPE + NVFP4-packed KV write. `None` when the NVFP4 PTX
+    /// module isn't built into `$KERNELS_DIR` (pre-NVFP4 branches
+    /// or TPU-focused kernel trees). Populated iff
+    /// `Fa2PtxKernels::fn_rope_nvfp4kv` is `Some`. Layer-exec
+    /// dispatch guards on this when `kv_dtype == Nvfp4`.
+    pub fused_rope_partial_nvfp4kv: Option<KernelFn>,
+    /// Cycle 55 step 8 (Phase B): bf16-input sibling of
+    /// `fused_rope_partial_nvfp4kv`. Same launch ABI; Q/K/V activation
+    /// inputs flip f16 → bf16. cos/sin tables stay f16. Production
+    /// NVFP4 KV path; eventually selected when Phase B completes the
+    /// upstream bf16 chain.
+    pub fused_rope_partial_nvfp4kv_bf16in: Option<KernelFn>,
     pub fused_gelu_mul: KernelFn,
     pub quantize_fp8_per_token: KernelFn,
     pub residual_scale_f16: KernelFn,
@@ -188,8 +701,11 @@ pub struct Gemma4LayerKernels {
     /// kernel multiplies row m by `scale[m] / scale[0]` to recover
     /// the per-token scaling.
     pub scale_rows_f32_ratio: KernelFn,
-    pub compute_qkv_scales: KernelFn,
     pub fused_gelu_mul_f16: KernelFn,
+    /// Cycle 55 step 6 (Phase B): bf16 sibling of fused_gelu_mul_f16.
+    /// Same launch ABI; only the dtype interpretation of gate_up
+    /// input + output flips f16 → bf16.
+    pub fused_gelu_mul_bf16: KernelFn,
     pub fused_rope_partial_f16kv: KernelFn,
     pub fused_norm_add_residual: KernelFn,
     pub fused_norm_add_residual_f16: KernelFn,
@@ -200,7 +716,20 @@ pub struct Gemma4LayerKernels {
     /// fp8_gemv has already baked the per-channel weight scale into
     /// its output.
     pub fused_norm_add_residual_f16in: KernelFn,
+    // Cycle 54 Stage 1: BF16 residual chain. Mirror the f16 set; only
+    // the residual storage dtype differs (math stays f32 internally).
+    // Used when `dims.bf16_residual = true` (RVLLM_RESIDUAL_BF16=1).
+    pub f16_to_bf16: KernelFn,
+    pub fused_norm_add_residual_bf16: KernelFn,
+    pub fused_norm_add_residual_bf16_f16in: KernelFn,
+    /// Cycle 55 step 19: bf16-input + bf16-residual epilogue. Used
+    /// under FULL_CHAIN dispatch when GEMV upstream is bf16. Same
+    /// launch ABI as `_bf16_f16in`, just bf16 gemm_out.
+    pub fused_norm_add_residual_bf16_bf16in: KernelFn,
+    pub fused_rmsnorm_fp8_quant_bf16in: KernelFn,
     pub fused_qkv_rmsnorm: KernelFn,
+    /// Cycle 55 step 11 (Phase B): bf16 sibling of `fused_qkv_rmsnorm`.
+    pub fused_qkv_rmsnorm_bf16: KernelFn,
     pub scale_cols_f16: KernelFn,
     /// F16-input fp8_gemv kernel (`fp8_gemv_blockwise_wpr_native_f16in_kernel`).
     /// `None` on non-Blackwell targets — the kernel is gated on
@@ -209,6 +738,33 @@ pub struct Gemma4LayerKernels {
     /// activation FP8-quant step and runs this kernel directly on the
     /// f16 rmsnorm output.
     pub fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    /// Cycle 55 step 3 (Phase B): bf16-input sibling of the f16in
+    /// kernel above (`fp8_gemv_blockwise_wpr_native_bf16in_kernel`).
+    /// `None` on non-Blackwell targets. Used under bf16-native
+    /// dispatch (`dims.bf16_residual = true`, default since cycle 55
+    /// step 1) so QKV / gate_up M=1 fast paths consume bf16 input
+    /// directly instead of narrowing bf16→f16-sat at branch entry.
+    pub fp8_gemv_wpr_native_bf16in: Option<KernelFn>,
+    /// Cycle 45 step 4.5c: AWQ INT4 W4A16 GEMV kernel handle. `None`
+    /// when the PTX wasn't built into `$KERNELS_DIR`; the AWQ
+    /// dispatch path checks this and rejects load if an AwqConfig
+    /// is present without the kernel available. Companion to
+    /// `Gemma4AwqLayerPtrs` on `Gemma4LayerWeightPtrs`.
+    pub awq_int4_gemv_f16: Option<KernelFn>,
+    /// Cycle 51 step 10d.4: AWQ INT4 W4A16 GEMM kernel (M>1 prefill).
+    /// Companion to `awq_int4_gemv_f16` for prefill paths.
+    /// When `Some` and `dims.num_tokens > 1`, the AWQ dispatch sites
+    /// prefer this over the per-token GEMV loop. `None` falls back to
+    /// the loop (or `RVLLM_AWQ_PREFILL_LOOP=1` debug fallback).
+    pub awq_int4_gemm_sm120_wmma: Option<KernelFn>,
+    /// Companion to the V-rotation arm of the NVFP4 RoPE kernel.
+    /// When `RVLLM_NVFP4_HADAMARD_V=1` and the rope kernel rotated V
+    /// before NVFP4-packing it, this kernel right-multiplies the
+    /// attention output by R^T per (token, head) so the downstream
+    /// O-projection sees un-rotated P·V. `None` when the PTX wasn't
+    /// built into `$KERNELS_DIR`; dispatch site treats absent kernel
+    /// as "V rotation disabled" and runs unchanged.
+    pub hadamard_unrotate_f16: Option<KernelFn>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -256,14 +812,56 @@ pub unsafe fn gemma4_forward_phase(
 ) -> Result<()> {
     // Route O / gate_up / down through the f16-in GEMV fast path when
     // `num_tokens <= FAST_PATH_M_MAX`. That kernel is a per-row GEMV
-    // (grid.y = M, each block reloads the weight tile), so throughput
-    // plateaus quickly as M grows: on Gemma 4 31B at batch=128 it's
-    // ~35× slower than the cuBLASLt FP8-channelscale fallback. The
-    // fallback is numerically correct now (per-row `scale_rows_f32_ratio`
-    // correction landed in the prior commit), so for large M the
-    // fallback is the right choice on both precision and perf. 16 is
-    // generous for typical prefill prompts and avoids slowing bench.
-    const FAST_PATH_M_MAX: u32 = 16;
+    // (grid.y = M, each block reloads the weight tile) and preserves
+    // the full 2-D `[N/128, K/128]` weight blockscale.
+    //
+    // The other option — `fp8_gemm_channelscale_or_fallback` — routes
+    // M>=128 through CUTLASS SM120 (full blockscale preserved) and
+    // smaller M through a cuBLASLt-scalar + `scale_cols_f32` path
+    // that applies only the 1-D per-row `b_chscale` approximation.
+    // For Gemma 4 fp8-block weights, the K-axis blockscale has
+    // meaningful variation, so the 1-D approximation measurably
+    // degrades output (RVLLM_DIAG_COMPARE against the per-token
+    // decode reference: 38% row-0 / 93% row-(N-1) rel_err at
+    // prompt_len=18 on fp8-block weights over 60 layers).
+    //
+    // Cap at 127 so the bad zone (16 < M < 128, blockscale-present)
+    // takes the GEMV fast path instead of the lossy fallback.
+    // CUTLASS SM120 continues to cover M>=128.
+    const FAST_PATH_M_MAX: u32 = 127;
+    // Cycle 53 hardening: cross-cutting layer-dims invariants. Catches
+    // plumbing misuse (mis-sized buckets, dtype/flag drift, non-PoT
+    // block_size, OOB current_max_context_len) before any kernel
+    // launches consume the values. Errors out cleanly with a typed
+    // attention error pointing at the failing invariant. Called once
+    // per phase; cost is negligible.
+    dims.validate()?;
+    // Cycle 54 Stage 1: BF16 residual chain dispatch. When the engine
+    // sets `dims.bf16_residual = true` (RVLLM_RESIDUAL_BF16=1), every
+    // residual touchpoint reads/writes bf16 instead of f16. The bf16
+    // sibling kernels share the same launch ABI as their f16
+    // counterparts; only the storage dtype changes. Math stays f32.
+    let rmsnorm_quant_kernel = if dims.bf16_residual {
+        kernels.fused_rmsnorm_fp8_quant_bf16in
+    } else {
+        kernels.fused_rmsnorm_fp8_quant
+    };
+    let norm_add_residual_kernel = if dims.bf16_residual {
+        kernels.fused_norm_add_residual_bf16
+    } else {
+        kernels.fused_norm_add_residual
+    };
+    let norm_add_residual_f16in_kernel = if dims.bf16_residual {
+        kernels.fused_norm_add_residual_bf16_f16in
+    } else {
+        kernels.fused_norm_add_residual_f16in
+    };
+    // Cycle 55 step 19: norm_add_residual_full_chain_kernel removed
+    // after empirical evidence that wholesale FULL_CHAIN bf16 breaks
+    // even short context. The bf16-input epilogue kernel
+    // `fused_norm_add_residual_bf16_bf16in` stays loaded as
+    // infrastructure but is unused by current dispatch.
+    let _ = kernels.fused_norm_add_residual_bf16_bf16in;
     let q_dim = dims.num_heads * dims.head_dim;
     let _kv_dim = dims.num_kv_heads * dims.head_dim;
     let qkv_rows = (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim;
@@ -294,7 +892,10 @@ pub unsafe fn gemma4_forward_phase(
     #[cfg(feature = "cuda")]
     macro_rules! probe_f32 {
         ($label:expr, $ptr:expr) => {
-            if dbg_layer >= 0 {
+            // Cycle 49 step 8d: skip when ptr is null (AWQ-only layers
+            // have weights.qkv_scale / qkv_fp8 = 0 — copying from
+            // device address 0 is invalid).
+            if dbg_layer >= 0 && $ptr != 0 {
                 cudarc::driver::sys::cuStreamSynchronize(stream as _);
                 let mut v = [0.0f32; 1];
                 cudarc::driver::sys::cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut _, $ptr, 4);
@@ -315,11 +916,38 @@ pub unsafe fn gemma4_forward_phase(
     // which reads `scratch.hidden_fp8` and needs the quant to have
     // produced it. Dropping `blockscale != 0` here silently zeroed
     // `hidden_fp8` and propagated zero logits through the LM head.
+    // The gate must check the kernel that the dispatch below will
+    // ACTUALLY pick — the bf16-native fast-path branch (further
+    // down) selects `fp8_gemv_wpr_native_bf16in` when bf16 residual
+    // gates are on, while otherwise it picks `_f16in`. Previously
+    // this gate hard-coded `_f16in.is_some()`; if the bf16in kernel
+    // was missing while the f16in one was present and bf16-native
+    // was active, `skip_attn_quant=true` skipped the FP8 quant,
+    // the bf16in dispatch then fell through to
+    // `fp8_gemm_channelscale_or_fallback` which read uninitialised
+    // `scratch.hidden_fp8` / `scratch.hidden_scale` for the layer.
+    // Mirror the dispatch's selection here.
+    #[cfg(feature = "cuda")]
+    let bf16_native_qkv_gate = dims.bf16_residual
+        && (crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled()
+            || crate::gemma4_bring_up::bf16_native_full_chain_enabled());
+    #[cfg(feature = "cuda")]
+    let qkv_native_kernel_present = if bf16_native_qkv_gate {
+        kernels.fp8_gemv_wpr_native_bf16in.is_some()
+    } else {
+        kernels.fp8_gemv_wpr_native_f16in.is_some()
+    };
+    #[cfg(feature = "cuda")]
+    // Codex46-2: skip-gate must MATCH the fastpath dispatch gate at
+    // line 1220 (`qkv_blockscale != 0 && num_tokens == 1`). The
+    // fastpath kernel (`Fp8GemvF16InLaunch`) only reads the 2-D
+    // blockscale tensor — chscale is ignored. Requiring chscale != 0
+    // here was over-restrictive: blockscale-only weights would run
+    // the rmsnorm-quant prelude that the fastpath then ignores.
     let skip_attn_quant = dims.num_tokens == 1
-        && weights.qkv_chscale != 0
         && weights.qkv_blockscale != 0
         && weights.qkv_f16 == 0
-        && kernels.fp8_gemv_wpr_native_f16in.is_some();
+        && qkv_native_kernel_present;
     #[cfg(not(feature = "cuda"))]
     let skip_attn_quant = false;
     if !skip_attn_quant {
@@ -329,7 +957,7 @@ pub unsafe fn gemma4_forward_phase(
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_rmsnorm_fp8_quant,
+            rmsnorm_quant_kernel,
             scratch.hidden_fp8,
             scratch.hidden_scale,
             residual,
@@ -346,7 +974,9 @@ pub unsafe fn gemma4_forward_phase(
     probe_f32!("step1_qkv_wscale", weights.qkv_scale);
     #[cfg(feature = "cuda")]
     {
-        if dbg_layer >= 0 {
+        // Cycle 49 step 8d: AWQ-only layers have weights.qkv_scale = 0
+        // (FP8 path absent). Copying from null device addr is invalid.
+        if dbg_layer >= 0 && weights.qkv_scale != 0 && scratch.hidden_scale != 0 {
             cudarc::driver::sys::cuStreamSynchronize(stream as _);
             let mut hs = [0.0f32; 1];
             let mut ws = [0.0f32; 1];
@@ -368,7 +998,8 @@ pub unsafe fn gemma4_forward_phase(
 
     #[cfg(feature = "cuda")]
     {
-        if dbg_layer >= 0 {
+        // Same null-guard for the qkv_fp8 / hidden_fp8 byte probe.
+        if dbg_layer >= 0 && weights.qkv_fp8 != 0 && scratch.hidden_fp8 != 0 {
             cudarc::driver::sys::cuStreamSynchronize(stream as _);
             let mut wb = [0u8; 8];
             cudarc::driver::sys::cuMemcpyDtoH_v2(wb.as_mut_ptr() as *mut _, weights.qkv_fp8, 8);
@@ -384,14 +1015,184 @@ pub unsafe fn gemma4_forward_phase(
 
     // 2. Q||K||V projection
     #[cfg(feature = "cuda")]
-    if weights.qkv_f16 != 0 {
-        // F16 path: copy residual to delta_f16 scratch, apply rmsnorm in-place, use as GEMM input
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.delta_f16,
-            residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
+    if weights.awq.linear_active(AwqLinearKind::Q) {
+        // Cycle 46: AWQ INT4 W4A16 path. Three sequential GEMV launches
+        // (Q, K, V) compose into the existing Q|K|V scratch via offset
+        // pointer arithmetic — preserves the fused QKV RMSNorm /
+        // attention path that consumes that buffer downstream.
+        debug_assert!(
+            weights.awq.linear_active(AwqLinearKind::K)
+                && weights.awq.linear_active(AwqLinearKind::V),
+            "AWQ QKV must be all-or-nothing (Q/K/V flags inconsistent)"
         );
+        // Prefill (M>1) preference order:
+        //   1. WMMA AWQ GEMM kernel (cycle 51d) when its PTX is present.
+        //   2. Per-token GEMV loop opt-in via RVLLM_AWQ_PREFILL_LOOP=1
+        //      (debug fallback, ~50ms/token).
+        //   3. Otherwise FeatureNotAvailable — the kernel tree predates
+        //      the GEMM and the user hasn't opted into the slow loop.
+        let prefill_loop_enabled = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
+        let gemm_available = kernels.awq_int4_gemm_sm120_wmma.is_some();
+        if dims.num_tokens != 1 && !gemm_available && !prefill_loop_enabled {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq qkv prefill (M>1): GEMM kernel PTX absent and RVLLM_AWQ_PREFILL_LOOP not set",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "awq_qkv",
+                    stream,
+                    num_seqs: dims.num_tokens,
+                    head_dim: dims.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        // GEMV kernel handle — only required for M=1 decode or the
+        // M>1 loop fallback. Pure-GEMM-prefill builds can ship without
+        // the GEMV PTX (codex review of cycle 51d.4c flagged the
+        // earlier unconditional ok_or_else as forcing GEMV-presence).
+        let fn_awq_opt = kernels.awq_int4_gemv_f16;
+        let need_gemv = dims.num_tokens == 1
+            || (dims.num_tokens > 1 && (!gemm_available || prefill_loop_enabled));
+        if need_gemv && fn_awq_opt.is_none() {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq_int4_gemv_f16 PTX missing from $KERNELS_DIR",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "awq_qkv", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        // fn_awq is only consumed by GEMV branches (M=1 or loop fallback);
+        // need_gemv guarantees fn_awq_opt.is_some() in those branches.
+        let fn_awq = fn_awq_opt;
+
+        // Same prelude as the qkv_f16 branch: copy residual to delta
+        // scratch then in-place rmsnorm.
+        // Cycle 54 Stage 2.1: when the residual chain runs in bf16
+        // (RVLLM_RESIDUAL_BF16=1), narrow bf16→f16-sat into the scratch
+        // the f16-typed rmsnorm + downstream f16-input AWQ GEMV/GEMM
+        // expect; otherwise keep the byte-identical memcpy. Both leave
+        // f16 in `scratch.delta_f16`.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            ), "qkv_awq_input_memcpy", stream);
+        }
+        gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: dims.num_tokens,
+            hidden: dims.hidden,
+            eps: dims.rms_eps,
+        }
+        .launch(
+            kernels.fused_rmsnorm,
+            scratch.delta_f16,
+            weights.attn_norm_gamma,
+            stream,
+        )?;
+
+        let kv_dim = (dims.num_kv_heads * dims.head_dim) as u32;
+        let q_dim_u = q_dim as u32;
+        let g = weights.awq.group_size;
+        let k = dims.hidden as u32;
+        let qkv_rows_u = qkv_rows as u32;
+
+        // Composes Q/K/V into the contiguous Q|K|V scratch via offset
+        // pointers. For decode (M=1), three M=1 GEMV launches. For
+        // prefill (M>1), three per-token-loop launches with
+        // out_stride=qkv_rows so each token's output lands at the
+        // right row.
+        // Cycle 51d.4c: dispatch precedence is M=1 → GEMV; M>1 +
+        // GEMM-kernel-available + NOT loop-opt-out → GEMM (~6 TFLOPS,
+        // 30ms M=2048 vs 100s loop); else per-token GEMV loop fallback.
+        let force_loop = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
+        let use_gemm = dims.num_tokens > 1
+            && !force_loop
+            && kernels.awq_int4_gemm_sm120_wmma.is_some();
+        unsafe {
+            if dims.num_tokens == 1 {
+                gemma4_launcher::AwqInt4GemvF16Launch {
+                    n: q_dim_u, k, group_size: g,
+                }.launch(fn_awq.unwrap(), scratch.delta_f16,
+                    weights.awq.q_packed, weights.awq.q_scale, weights.awq.q_zero,
+                    scratch.q_out, stream)?;
+                gemma4_launcher::AwqInt4GemvF16Launch {
+                    n: kv_dim, k, group_size: g,
+                }.launch(fn_awq.unwrap(), scratch.delta_f16,
+                    weights.awq.k_packed, weights.awq.k_scale, weights.awq.k_zero,
+                    scratch.q_out + (q_dim_u as u64) * 2, stream)?;
+                gemma4_launcher::AwqInt4GemvF16Launch {
+                    n: kv_dim, k, group_size: g,
+                }.launch(fn_awq.unwrap(), scratch.delta_f16,
+                    weights.awq.v_packed, weights.awq.v_scale, weights.awq.v_zero,
+                    scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2, stream)?;
+            } else if use_gemm {
+                // Prefill via WMMA GEMM. 3 launches compose into one
+                // [num_tokens, qkv_rows] scratch via ld_d=qkv_rows +
+                // column-offset destination pointers.
+                let fn_gemm = kernels.awq_int4_gemm_sm120_wmma.unwrap();
+                let mk_gemm = |n: u32| gemma4_launcher::AwqInt4GemmSm120WmmaLaunch {
+                    m: dims.num_tokens, n, k, group_size: g, ld_d: qkv_rows_u,
+                };
+                mk_gemm(q_dim_u).launch(fn_gemm, scratch.q_out, scratch.delta_f16,
+                    weights.awq.q_packed, weights.awq.q_scale, weights.awq.q_zero,
+                    stream)?;
+                mk_gemm(kv_dim).launch(fn_gemm,
+                    scratch.q_out + (q_dim_u as u64) * 2, scratch.delta_f16,
+                    weights.awq.k_packed, weights.awq.k_scale, weights.awq.k_zero,
+                    stream)?;
+                mk_gemm(kv_dim).launch(fn_gemm,
+                    scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2, scratch.delta_f16,
+                    weights.awq.v_packed, weights.awq.v_scale, weights.awq.v_zero,
+                    stream)?;
+            } else {
+                // Per-token GEMV loop fallback (debug-only, slow).
+                let mk_loop = |n: u32| gemma4_launcher::AwqInt4GemvF16PrefillLoop {
+                    num_tokens: dims.num_tokens, n, k, group_size: g,
+                    in_stride_elems:  k,
+                    out_stride_elems: qkv_rows_u,
+                };
+                let f = fn_awq.unwrap();
+                mk_loop(q_dim_u).launch(f, scratch.delta_f16,
+                    weights.awq.q_packed, weights.awq.q_scale, weights.awq.q_zero,
+                    scratch.q_out, stream)?;
+                mk_loop(kv_dim).launch(f, scratch.delta_f16,
+                    weights.awq.k_packed, weights.awq.k_scale, weights.awq.k_zero,
+                    scratch.q_out + (q_dim_u as u64) * 2, stream)?;
+                mk_loop(kv_dim).launch(f, scratch.delta_f16,
+                    weights.awq.v_packed, weights.awq.v_scale, weights.awq.v_zero,
+                    scratch.q_out + ((q_dim_u + kv_dim) as u64) * 2, stream)?;
+            }
+        }
+    } else if weights.qkv_f16 != 0 {
+        // F16 path: copy residual to delta_f16 scratch, apply rmsnorm in-place, use as GEMM input
+        // Cycle 54 Stage 2.1: bf16-residual narrow at branch entry.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            ), "qkv_f16_input_memcpy", stream);
+        }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -421,44 +1222,88 @@ pub unsafe fn gemma4_forward_phase(
             scratch.gemm_f32_tmp,
             stream,
         )?;
-    } else if let (true, Some(fn_gemv)) = (
+    } else if let Some(fn_gemv) = if weights.qkv_blockscale != 0 && dims.num_tokens == 1 {
         // Blockscale gate: `Fp8GemvF16InLaunch` reads a 2-D
         // `[N/128, K/128]` tensor. Only enable it when the loader has
         // actually uploaded one (`*_blockscale != 0`). Weights whose
         // scale was per-row or synthesized have `blockscale == 0` and
         // stay on the channelscale-preserving fallback below.
-        weights.qkv_blockscale != 0 && dims.num_tokens == 1,
-        kernels.fp8_gemv_wpr_native_f16in,
-    ) {
+        // Cycle 55 step 13 (Phase B dispatch, gated): pick bf16-input
+        // GEMV when residual chain is bf16 AND the experimental fast
+        // path is enabled via RVLLM_BF16_NATIVE_QKV_FAST_PATH=1.
+        // Default-OFF — iteration 12 empirics showed long-context
+        // regression (gibberish on WHO@17k while short prompts work).
+        // Production stays on the cycle-54 stage-2.1 narrowing.
+        let gate = dims.bf16_residual
+            && (crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled()
+                || crate::gemma4_bring_up::bf16_native_full_chain_enabled());
+        if gate {
+            kernels.fp8_gemv_wpr_native_bf16in
+        } else {
+            kernels.fp8_gemv_wpr_native_f16in
+        }
+    } else {
+        None
+    } {
         // sm_121 fast path: skip the activation FP8-quant entirely
-        // and run `fp8_gemv_blockwise_wpr_native_f16in_kernel` directly
-        // against the f16 rmsnorm output. Wins over the
+        // and run `fp8_gemv_blockwise_wpr_native_{f16,bf16}in_kernel`
+        // directly against the rmsnorm output. Wins over the
         // `fp8_gemm_channelscale_or_fallback` path on two axes:
         //
         //   * Quality: preserves the per-channel weight block-scale that
         //     the cuBLASLt fallback drops (the cuBLASLt FP8 channelscale
         //     heuristic `LaunchFailed`s on Blackwell consumer, so the
         //     fallback currently collapses to a scalar weight scale).
-        //   * Speed: one kernel (f16 GEMV) instead of two (FP8 quant +
+        //   * Speed: one kernel (GEMV) instead of two (FP8 quant +
         //     cuBLASLt FP8 GEMM), no scratch round-trip through f32.
         //
-        // The extra memcpy + rmsnorm-inplace here duplicates the work
-        // already done by `fused_rmsnorm_fp8_quant` in step 1 — at M=1
-        // that's ~5 KiB of rmsnorm work against a >30 MiB weight GEMV,
-        // well below the noise floor.
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.delta_f16,
-            residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
-        );
+        // Cycle 55 step 13 dispatch table:
+        //   bf16_residual + RVLLM_BF16_NATIVE_QKV_FAST_PATH=1
+        //     → memcpy bf16 → rmsnorm_inplace_bf16 → Fp8GemvBf16In
+        //       → bf16→f16-sat narrow at GEMV output
+        //   bf16_residual (default, gate OFF)
+        //     → cycle-54 stage-2.1: bf16→f16-sat narrow at branch
+        //       entry → fused_rmsnorm → Fp8GemvF16In
+        //   !bf16_residual (legacy f16 path)
+        //     → memcpy f16 → fused_rmsnorm → Fp8GemvF16In
+        let bf16_native = dims.bf16_residual
+            && (crate::gemma4_bring_up::bf16_native_qkv_fast_path_enabled()
+                || crate::gemma4_bring_up::bf16_native_full_chain_enabled());
+        let full_chain = dims.bf16_residual
+            && crate::gemma4_bring_up::bf16_native_full_chain_enabled();
+        if bf16_native {
+            // bf16 → bf16 memcpy (same byte layout, no conversion)
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            ), "qkv_fast_path_input_memcpy_bf16", stream);
+        } else if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            ), "qkv_fast_path_input_memcpy_f16", stream);
+        }
+        let rmsnorm_kernel = if bf16_native {
+            kernels.rmsnorm_inplace_bf16
+        } else {
+            kernels.fused_rmsnorm
+        };
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_rmsnorm,
+            rmsnorm_kernel,
             scratch.delta_f16,
             weights.attn_norm_gamma,
             stream,
@@ -476,6 +1321,23 @@ pub unsafe fn gemma4_forward_phase(
             scratch.delta_f16,
             stream,
         )?;
+        // Cycle 55 step 13: when bf16-native fast path is enabled,
+        // GEMV produced bf16 q_out; narrow to f16 for downstream
+        // RoPE+attention which is still f16-typed. Net narrow count
+        // unchanged from cycle-54 stage-2.1 (now at output rather than
+        // input). Empirically REGRESSES long-context (iteration 12
+        // gibberish on WHO@17k) — env-gated default OFF until the
+        // mechanism is understood and addressed.
+        // Cycle 55 step 14: when full_chain ON, skip the output
+        // narrow — downstream qkv_rmsnorm dispatch will be bf16 too.
+        // When step-13-only (qkv_fast_path without full_chain),
+        // narrow back to f16 for legacy f16 RoPE/qkv_rmsnorm.
+        if bf16_native && !full_chain {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * qkv_rows,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.q_out, scratch.q_out, stream)?;
+        }
     } else if weights.qkv_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
             cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
@@ -483,6 +1345,7 @@ pub unsafe fn gemma4_forward_phase(
             scratch.hidden_scale, weights.qkv_chscale, weights.qkv_blockscale, weights.qkv_scale,
             dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
             scratch.gemm_f32_tmp,
+            scratch.gemm_f32_tmp_bytes,
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
             stream,
         )?;
@@ -527,6 +1390,18 @@ pub unsafe fn gemma4_forward_phase(
     // scratch buffers so the downstream rope kernel sees a uniform
     // `[num_tokens, n_heads, head_dim]` layout across all three.
     let qkv_rows = q_dim + 2 * dims.num_kv_heads * dims.head_dim;
+    // Cycle 55 step 14 (Phase B dispatch): pick bf16 sibling when full
+    // chain is enabled. Same launch ABI; only dtype interpretation
+    // changes. Q/K/V inputs are bf16 if upstream produced bf16 (step
+    // 14 QKV F16-in fast path with full_chain ON), gamma stays f16.
+    let qkv_rmsnorm_kernel = if dims.bf16_residual
+        && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
+        && !crate::gemma4_bring_up::bf16_disable_qkv_rmsnorm()
+    {
+        kernels.fused_qkv_rmsnorm_bf16
+    } else {
+        kernels.fused_qkv_rmsnorm
+    };
     gemma4_launcher::FusedQkvRmsnormLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
@@ -536,7 +1411,7 @@ pub unsafe fn gemma4_forward_phase(
         src_row_stride: qkv_rows,
     }
     .launch(
-        kernels.fused_qkv_rmsnorm,
+        qkv_rmsnorm_kernel,
         scratch.q_out,
         scratch.k_out,
         scratch.v_out,
@@ -577,44 +1452,419 @@ pub unsafe fn gemma4_forward_phase(
                 scale: dims.attn_scale,
                 window_size_left,
             };
-            if dims.f16_kv {
-                // F16 KV cache path: RoPE outputs F16 Q and F16 KV cache
-                rope_f16kv(dims, kernels, scratch, meta, stream)?;
-                let decode = rvllm_attention::PagedDecodeLauncher::new(attention);
-                decode.launch(
-                    decode_params,
-                    scratch.attn_out,
-                    scratch.q_normed,
-                    scratch.k_cache,
-                    scratch.v_cache,
-                    meta.block_tables,
-                    meta.context_lens,
-                    scratch.fa3_workspace,
-                    stream,
-                )?;
-            } else {
-                rope_fp8kv(dims, kernels, scratch, meta, stream)?;
-                let decode = PagedDecodeFp8Launcher::new(attention);
-                decode.launch(
-                    decode_params,
-                    scratch.attn_out,
-                    scratch.q_fp8,
-                    scratch.k_cache,
-                    scratch.v_cache,
-                    scratch.k_scale_cache,
-                    scratch.v_scale_cache,
-                    scratch.q_scale_cache,
-                    0, // k_descale_fallback (unused when per-slot populated)
-                    0, // v_descale_fallback
-                    meta.block_tables,
-                    meta.context_lens,
-                    scratch.fa3_workspace,
-                    scratch.q_scale_ptr,
-                    stream,
-                )?;
+            match dims.kv_dtype {
+                KvDtype::F16 => {
+                    // F16 KV cache path: RoPE outputs F16 Q and F16 KV cache.
+                    rope_f16kv(dims, kernels, scratch, meta, stream)?;
+                    let decode = rvllm_attention::PagedDecodeLauncher::new(attention);
+                    decode.launch(
+                        decode_params,
+                        scratch.attn_out,
+                        scratch.q_normed,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        meta.block_tables,
+                        meta.context_lens,
+                        scratch.fa3_workspace,
+                        stream,
+                    )?;
+                }
+                KvDtype::Fp8 => {
+                    // FP8 path with F-series per-slot scale signature.
+                    rope_fp8kv(dims, kernels, scratch, meta, stream)?;
+                    let decode = PagedDecodeFp8Launcher::new(attention);
+                    decode.launch(
+                        decode_params,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_scale_cache,
+                        scratch.v_scale_cache,
+                        scratch.q_scale_cache,
+                        0, // k_descale_fallback (unused when per-slot populated)
+                        0, // v_descale_fallback
+                        meta.block_tables,
+                        meta.context_lens,
+                        scratch.fa3_workspace,
+                        scratch.q_scale_ptr,
+                        stream,
+                    )?;
+                }
+                KvDtype::Nvfp4 => {
+                    // NVFP4 path: dedicated RoPE + dedicated decode launcher.
+                    // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                    // Shadow rope writes f16 K/V to `shadow_k_cache` /
+                    // `shadow_v_cache` and rotated Q to
+                    // `shadow_q_cache` (per-layer slot on step-0
+                    // capture, shared throwaway otherwise). Must NOT
+                    // touch `q_normed` — the primary rope below reads
+                    // it as pre-RoPE and rotates exactly once.
+                    if scratch.shadow_k_cache != 0 {
+                        rope_f16kv_shadow(dims, kernels, scratch, meta, stream)?;
+                    }
+                    // === END NVFP4 SHADOW DIAGNOSTIC ===
+                    rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
+                    let decode = rvllm_attention::PagedDecodeNvfp4Launcher::new(attention);
+
+                    // Split-KV decode (paged_attention_v2-style) —
+                    // default ON. Opt-out via `RVLLM_NVFP4_SPLIT_KV=0`
+                    // for A/B comparisons. Engages only when the split
+                    // kernels exist AND the context is long enough to
+                    // benefit (single-partition would waste phase-2
+                    // overhead).
+                    //
+                    // Measured +75% on 15k-ctx bs=1 decode vs the
+                    // single-CTA path (2.0 → 3.5 tok/s on GB10); was
+                    // the gating change that got zeroclaw's 14795-tok
+                    // prompt under the 600s gateway timeout.
+                    //
+                    // Partition size follows vLLM's default (512).
+                    // `max_num_parts` is sized for the engine's max
+                    // context window so the workspace layout is
+                    // stable across calls — running at a shorter ctx
+                    // just writes sentinels to the tail partitions.
+                    let split_env_on =
+                        crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_SPLIT_KV")
+                            .unwrap_or(true);
+                    // Cycle 23 sweep winner under OLD stack (4-cand MSE,
+                    // chunk=2048, no V-Hadamard): 1024 was the only
+                    // partition size with both (a) zero garbage on long-
+                    // ctx WEATHER cliff and (b) clean short-ctx tool
+                    // call. Cycle 56 step 28 lifted the noise floor
+                    // (6-cand MSE + V-Hadamard + chunk=128 → 30/30
+                    // smoke clean), so the partition-size constraint
+                    // may have slack now. Env-gated for A/B testing;
+                    // default 1024.
+                    // Single source of truth: shared with the
+                    // decode-graph eligibility check in
+                    // `run_generate` so the guard cannot disagree
+                    // with the kernel that actually runs.
+                    let partition_size_u32: u32 =
+                        crate::gemma4_bring_up::effective_partition_size();
+                    // Bucket max ctx = max_blocks_per_seq * block_size.
+                    // Workspace is sized off this so the layout is
+                    // stable across iterations regardless of current
+                    // context growth.
+                    let bucket_ctx = (dims.max_blocks_per_seq as u32)
+                        * (dims.block_size as u32);
+                    let max_num_parts = bucket_ctx.div_ceil(partition_size_u32).max(1);
+                    // Current-step max ctx — used only for the dispatch
+                    // gate, NOT for workspace sizing. Earlier revisions
+                    // used `bucket_ctx` here, which over-fired the split
+                    // path on short-context turns (each empty partition
+                    // still launches a CTA, just writing sentinels).
+                    // Fall back to bucket_ctx when caller didn't supply.
+                    let current_ctx = dims
+                        .current_max_context_len
+                        .unwrap_or(bucket_ctx);
+                    // Codex38-1: REVERT Codex37-1. Capping effective_ctx
+                    // at sliding_window produced a correctness bug —
+                    // the split kernel maps partition_id at context
+                    // START while sliding-window's relevant tokens
+                    // sit at the END. Launching only the first N
+                    // partitions left the reducer reading
+                    // unwritten slots. A proper sliding-skip needs
+                    // partition_offset support in the kernel; until
+                    // then we eat the wasted CTAs.
+                    let current_num_parts =
+                        current_ctx.div_ceil(partition_size_u32).max(1);
+                    // Skip split path if: env gate off, split kernels
+                    // missing, current ctx short enough that one CTA
+                    // per (seq, head) fits comfortably, or workspace
+                    // can't fit the scratch layout.
+                    let slots = (decode_params.num_seqs as u64)
+                        * (dims.num_heads as u64)
+                        * (max_num_parts as u64);
+                    // tmp_out widened to f32 in cycle21 (codex precision fix):
+                    // 4 bytes/elem instead of 2. Metadata still f32 (max_logits + exp_sums = 2*4 bytes/slot).
+                    let ws_need = slots * (dims.head_dim as u64) * 4
+                        + slots * 4 * 2;
+                    let use_split = split_env_on
+                        // Codex42-2: production gemma4 path always
+                        // launches the f16-out variant (cycle-55 bf16
+                        // wiring not flipped here). Probe matches.
+                        && decode.has_split_kernels(dims.head_dim, /*output_bf16=*/false)
+                        && current_num_parts > 1
+                        // Compare against the actual fa3_workspace
+                        // size (varies by caller: bench/ppl 16 MiB,
+                        // generate 128 MiB). Previously hard-coded
+                        // 16 MiB silently dropped to single-CTA in
+                        // generate where the larger alloc would
+                        // have admitted the split path.
+                        && ws_need <= scratch.fa3_workspace_bytes;
+                    // === DYNAMIC NVFP4 Q SCALE ===
+                    // When `RVLLM_PER_TOKEN_Q_SCALE=1`, pass the per-
+                    // (token, head) Q descale table populated by
+                    // `rope_nvfp4kv`. Required for `RVLLM_NVFP4_HADAMARD=1`
+                    // where rotated Q saturates the static scalar.
+                    let nvfp4_per_token_q =
+                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/true);
+                    let nvfp4_q_scale_cache: u64 =
+                        if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
+                    // === END DYNAMIC NVFP4 Q SCALE ===
+                    if use_split {
+                        decode.launch_split(
+                            decode_params,
+                            scratch.attn_out,
+                            scratch.q_fp8,
+                            scratch.k_cache,
+                            scratch.v_cache,
+                            scratch.k_cache_scale,
+                            scratch.v_cache_scale,
+                            // === DYNAMIC NVFP4 Q SCALE ===
+                            nvfp4_q_scale_cache,
+                            // === END DYNAMIC NVFP4 Q SCALE ===
+                            meta.block_tables,
+                            meta.context_lens,
+                            scratch.q_scale_ptr,
+                            scratch.fa3_workspace,
+                            partition_size_u32,
+                            max_num_parts,
+                            current_num_parts,
+                            // Codex41-2: for sliding layers we know
+                            // partitions before window_start are
+                            // entirely masked. Skip launching them
+                            // and pre-fill sentinels for the slots
+                            // the reducer still reads. Global layers
+                            // use offset=0 (full ctx attended).
+                            //
+                            // Codex48-1: guard the optimisation on
+                            // num_seqs == 1. partition_offset is one
+                            // value per launch, but the kernel reads
+                            // window_start from `context_lens[seq]`
+                            // per-sequence. With heterogeneous batches
+                            // (different ctx lengths per seq), a
+                            // shorter seq could need a SMALLER offset
+                            // than the batch-max-derived value — its
+                            // valid pre-window partitions would be
+                            // sentinel-stamped by the init kernel and
+                            // never launched, so the reducer would
+                            // read sentinels for that seq. Force
+                            // offset=0 + full-grid launch when
+                            // batched (extra CTAs but correct). The
+                            // production HTTP path runs num_seqs=1
+                            // so this gate only surfaces the issue
+                            // when batched decode lands.
+                            {
+                                let is_sliding = dims.layer_type
+                                    == rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention;
+                                if decode_params.num_seqs == 1
+                                    && is_sliding
+                                    && dims.sliding_window > 0
+                                {
+                                    let q_abs = current_ctx.saturating_sub(1);
+                                    let window_start = q_abs.saturating_sub(
+                                        dims.sliding_window.saturating_sub(1),
+                                    );
+                                    (window_start / partition_size_u32).min(current_num_parts.saturating_sub(1))
+                                } else {
+                                    0
+                                }
+                            },
+                            false,
+                            stream,
+                        )?;
+                    } else {
+                        decode.launch(
+                            decode_params,
+                            scratch.attn_out,
+                            scratch.q_fp8,
+                            scratch.k_cache,
+                            scratch.v_cache,
+                            scratch.k_cache_scale,
+                            scratch.v_cache_scale,
+                            // === DYNAMIC NVFP4 Q SCALE ===
+                            nvfp4_q_scale_cache,
+                            // === END DYNAMIC NVFP4 Q SCALE ===
+                            meta.block_tables,
+                            meta.context_lens,
+                            scratch.q_scale_ptr,
+                            stream,
+                        )?;
+                    }
+                    // Strip V's R rotation from attn_out before the
+                    // O-projection sees it. No-op unless RVLLM_NVFP4_HADAMARD_V=1.
+                    unrotate_attn_out_v_if_enabled(dims, kernels, scratch, stream)?;
+                }
             }
         }
-        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q: _, num_seqs: _ } => {
+        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q, num_seqs } => {
+            // NVFP4 prefill: dedicated RoPE + attention launcher. Must
+            // fall through to the shared post-attention block below
+            // (O proj + post-attn norm + residual add + MLP + post-FF
+            // norm + residual add), same as the FP8 path does after
+            // its unified/decode-per-qi attention. A previous revision
+            // `return Ok(())`'d here, which turned every NVFP4-prefill
+            // layer into a no-op on the residual — end-to-end output
+            // was the raw embedding, manifesting as word-salad tokens
+            // at the LM head regardless of prompt length.
+            if dims.kv_dtype == KvDtype::Nvfp4 {
+                // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                // Shadow rope writes f16 K/V + rotated Q to the
+                // shadow slots without touching q_normed; primary rope
+                // below gets clean pre-RoPE Q.
+                if scratch.shadow_k_cache != 0 {
+                    rope_f16kv_shadow(dims, kernels, scratch, meta, stream)?;
+                }
+                // === END NVFP4 SHADOW DIAGNOSTIC ===
+                rope_nvfp4kv(dims, kernels, scratch, meta, stream)?;
+                let prefill_params = rvllm_attention::PagedPrefillParams {
+                    num_tokens: dims.num_tokens,
+                    // Forwarded from the scheduler-supplied
+                    // Gemma4Phase::Prefill — matters for batched
+                    // prefill where the unified kernel recovers
+                    // `seq_idx` from `cu_seqlens_q` using this count.
+                    // Hard-coding `1` silently coalesced every
+                    // batched request into a single virtual sequence.
+                    num_seqs,
+                    num_heads: dims.num_heads,
+                    num_kv_heads: dims.num_kv_heads,
+                    head_dim: dims.head_dim,
+                    block_size: dims.block_size,
+                    max_blocks_per_seq: dims.max_blocks_per_seq,
+                    num_blocks_total: dims.num_blocks_total,
+                    scale: dims.attn_scale,
+                    window_size_left,
+                };
+                let prefill = rvllm_attention::PagedPrefillNvfp4Launcher::new(attention);
+
+                // Phase 2b of aa01001nvf4f16mma: route multi-query
+                // prefill through the f16-MMA unified kernel when it
+                // loaded into Fa2PtxKernels. Matches the FP8 unified
+                // dispatch gate above — opt-out via
+                // `RVLLM_UNIFIED_PREFILL=0` for bisect bisect/quality
+                // comparisons. Falls back to the per-qi dedicated
+                // kernel when the unified PTX is missing (old kernel
+                // trees) or disabled via env.
+                let unified_enabled_nvfp4 =
+                    crate::gemma4_bring_up::parse_truthy_env("RVLLM_UNIFIED_PREFILL")
+                        .unwrap_or(true);
+                let have_nvfp4_unified = match attention {
+                    rvllm_attention::AttentionBackend::Fa2Ptx(k)
+                        if k.has_unified_prefill_nvfp4() => true,
+                    _ => false,
+                };
+                if unified_enabled_nvfp4 && have_nvfp4_unified && dims.num_tokens > 1 {
+                    // Tile size matches the FP8 unified heuristic —
+                    // head_dim ≤ 256 gets tile_size=32 (sliding), else
+                    // 16 (global, smem-tight at head_dim=512).
+                    let tile_size = if dims.head_dim <= 256 { 32u32 } else { 16u32 };
+                    let num_queries_per_kv = dims.num_heads / dims.num_kv_heads;
+                    // Defensive clamp: integer division collapses to
+                    // 0 when num_queries_per_kv > UNIFIED_PREFILL_BLOCK_M
+                    // (e.g. extreme GQA / MQA). The kernel's grid
+                    // math divides by `block_q`, and the host's
+                    // `num_tokens.div_ceil(block_q)` would panic.
+                    // `UnifiedPrefillParams::validate()` rejects 0
+                    // explicitly; the `.max(1)` here keeps the most
+                    // useful behaviour (single-row blocks) for
+                    // configurations where the exact block-size
+                    // doesn't matter as much as launching at all.
+                    let block_q = (rvllm_attention::UNIFIED_PREFILL_BLOCK_M
+                        / num_queries_per_kv.max(1))
+                        .max(1);
+                    let unified = rvllm_attention::UnifiedPrefillParams {
+                        num_queries_per_kv,
+                        tile_size,
+                        block_q,
+                        use_mma: true,
+                    };
+                    // === DYNAMIC NVFP4 Q SCALE ===
+                    // When `RVLLM_PER_TOKEN_Q_SCALE=1`, rope_nvfp4kv
+                    // writes a fresh per-(token, head) FP8 scale into
+                    // scratch.q_scale_cache (mirroring the FP8 sibling).
+                    // Pass that cache through so the attention kernel
+                    // dequants Q with the same scale rope used at
+                    // quantize time. Required for RVLLM_NVFP4_HADAMARD
+                    // where rotated Q can saturate the static scalar.
+                    let nvfp4_per_token_q =
+                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/true);
+                    let nvfp4_q_scale_cache: u64 =
+                        if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
+                    // === END DYNAMIC NVFP4 Q SCALE ===
+                    prefill.launch_nvfp4kv_unified_sm121(
+                        prefill_params,
+                        unified,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_cache_scale,
+                        scratch.v_cache_scale,
+                        nvfp4_q_scale_cache,
+                        meta.block_tables,
+                        cu_seqlens_q,
+                        meta.context_lens,
+                        scratch.q_scale_ptr,
+                        // output_bf16: today's attn_out scratch is f16;
+                        // cycle 55 Stage 3 will flip this when the
+                        // bf16-out attention scratch is plumbed
+                        // through.
+                        false,
+                        stream,
+                    )?;
+                } else {
+                    // === DYNAMIC NVFP4 Q SCALE ===
+                    let nvfp4_per_token_q =
+                        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/true);
+                    let nvfp4_q_scale_cache: u64 =
+                        if nvfp4_per_token_q { scratch.q_scale_cache } else { 0 };
+                    // === END DYNAMIC NVFP4 Q SCALE ===
+                    prefill.launch(
+                        prefill_params,
+                        scratch.attn_out,
+                        scratch.q_fp8,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_cache_scale,
+                        scratch.v_cache_scale,
+                        // === DYNAMIC NVFP4 Q SCALE ===
+                        nvfp4_q_scale_cache,
+                        // === END DYNAMIC NVFP4 Q SCALE ===
+                        meta.block_tables,
+                        meta.context_lens,
+                        cu_seqlens_q,
+                        scratch.q_scale_ptr,
+                        max_seqlen_q,
+                        stream,
+                    )?;
+                }
+                // Strip V's R rotation from attn_out before O-proj sees it.
+                // No-op unless RVLLM_NVFP4_HADAMARD_V=1. Both prefill paths
+                // (unified + per-qi) above wrote into scratch.attn_out, so
+                // a single call here covers both.
+                unrotate_attn_out_v_if_enabled(dims, kernels, scratch, stream)?;
+            } else {
+            // Codex25-4: hard-fail at the layer-API boundary if the
+            // caller asks for F16 KV in the Prefill phase. This branch
+            // writes FP8 KV unconditionally (no F16 prefill kernel
+            // exists on sm_121), so a later decode that reads
+            // dims.kv_dtype == F16 would interpret the FP8 bytes as
+            // halves — silent numeric corruption. run_generate gates
+            // batch-prefill against f16_kv (gemma4_bring_up.rs:3506)
+            // already, but the lower-level Gemma4Phase::Prefill API
+            // is reachable from new call sites; refuse the
+            // configuration here so the contract is enforced at the
+            // single point that knows it.
+            if dims.f16_kv || dims.kv_dtype == KvDtype::F16 {
+                return Err(rvllm_core::RvllmError::Config {
+                    err: rvllm_core::ConfigError::InvalidField {
+                        name: "Gemma4Phase::Prefill",
+                        reason:
+                            "F16 KV is not supported in the Prefill phase: \
+                             no F16 prefill kernel exists on sm_121 and the \
+                             dispatch would write FP8 bytes that the matching \
+                             F16 decode path would later read as halves. Use \
+                             FP8 or NVFP4 KV, or run prefill via the \
+                             per-token decode loop."
+                            .into(),
+                    },
+                    field: "kv_dtype",
+                });
+            }
+            // FP8 / F16 prefill: share the FP8 write path (no F16 prefill
+            // kernel on sm_121). F-series unified-or-fallback structure:
             // Prefill always uses FP8 KV path (no F16 prefill kernel).
             rope_fp8kv(dims, kernels, scratch, meta, stream)?;
 
@@ -629,9 +1879,9 @@ pub unsafe fn gemma4_forward_phase(
             // Otherwise we fall back to the decode-per-qi loop below —
             // retained both as a bisect tool and as the reference path
             // rvllm-ppl validates bit-for-bit.
-            let unified_enabled = std::env::var_os("RVLLM_UNIFIED_PREFILL")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            let unified_enabled =
+                crate::gemma4_bring_up::parse_truthy_env("RVLLM_UNIFIED_PREFILL")
+                    .unwrap_or(true);
             let fa2_unified = if unified_enabled {
                 match attention {
                     rvllm_attention::AttentionBackend::Fa2Ptx(k) if k.has_unified_prefill() => true,
@@ -643,7 +1893,13 @@ pub unsafe fn gemma4_forward_phase(
             if fa2_unified && dims.num_tokens > 1 {
                 let prefill_params = rvllm_attention::PagedPrefillParams {
                     num_tokens: dims.num_tokens,
-                    num_seqs: 1,
+                    // Forwarded from the scheduler-supplied
+                    // Gemma4Phase::Prefill — matters for batched
+                    // prefill where the unified kernel recovers
+                    // `seq_idx` from `cu_seqlens_q` using this count.
+                    // Hard-coding `1` silently coalesced every
+                    // batched request into a single virtual sequence.
+                    num_seqs,
                     num_heads: dims.num_heads,
                     num_kv_heads: dims.num_kv_heads,
                     head_dim: dims.head_dim,
@@ -657,14 +1913,17 @@ pub unsafe fn gemma4_forward_phase(
                 // 99 KB opt-in cap (see UNIFIED_PREFILL_SPEC §params).
                 let tile_size = if dims.head_dim <= 256 { 32u32 } else { 16u32 };
                 let num_queries_per_kv = dims.num_heads / dims.num_kv_heads;
-                let block_q = rvllm_attention::UNIFIED_PREFILL_BLOCK_M / num_queries_per_kv.max(1);
+                // Defensive clamp — see twin site above.
+                let block_q = (rvllm_attention::UNIFIED_PREFILL_BLOCK_M
+                    / num_queries_per_kv.max(1))
+                    .max(1);
                 // Q·Kᵀ MMA is opt-in during bring-up (Phase F3).
                 // `RVLLM_UNIFIED_PREFILL_MMA=1` flips on the
                 // sm_121a `mma.sync.kind::f8f6f4` tensor-core path;
                 // unset / `0` keeps the scalar FMA reference.
-                let use_mma = std::env::var_os("RVLLM_UNIFIED_PREFILL_MMA")
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
+                let use_mma =
+                    crate::gemma4_bring_up::parse_truthy_env("RVLLM_UNIFIED_PREFILL_MMA")
+                        .unwrap_or(false);
                 let unified = rvllm_attention::UnifiedPrefillParams {
                     num_queries_per_kv,
                     tile_size,
@@ -739,11 +1998,23 @@ pub unsafe fn gemma4_forward_phase(
             // the unified attention replaces the FA2 prefill kernel.
             let ctx_host: Vec<i32> =
                 (1..=dims.num_tokens as i32).collect();
-            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                cu_seqlens_q,
-                ctx_host.as_ptr() as *const _,
-                (ctx_host.len() * 4) as _,
-                stream as _,
+            // Cycle 56-style cuda_check! guard — the HtoD that
+            // populates the per-QI context_lens MUST succeed or the
+            // following `decode.launch(...)` calls would run with
+            // stale / undefined pointer contents and silently produce
+            // wrong logits. Without the check the decode-per-QI
+            // fallback was the same anti-pattern as the unchecked
+            // host_sample_token DtoH (already fixed) on the input
+            // side.
+            cuda_check!(
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    cu_seqlens_q,
+                    ctx_host.as_ptr() as *const _,
+                    (ctx_host.len() * 4) as _,
+                    stream as _,
+                ),
+                "decode_per_qi_ctx_lens_htod",
+                stream
             );
 
             for qi in 0..dims.num_tokens {
@@ -773,6 +2044,7 @@ pub unsafe fn gemma4_forward_phase(
             // Ensure ctx_host lives until the stream has consumed it.
             std::hint::black_box(&ctx_host);
             } // end of decode-per-qi fallback
+            } // end of FP8/F16 prefill (else of NVFP4 branch)
         }
     }
     #[cfg(not(feature = "cuda"))]
@@ -785,9 +2057,10 @@ pub unsafe fn gemma4_forward_phase(
     // or when the Sm121 fast path will read `scratch.attn_out`
     // as f16 directly in step 7).
     #[cfg(feature = "cuda")]
+    // Codex46-2: align skip-gate with fastpath dispatch — chscale not
+    // required by `Fp8GemvF16InLaunch`.
     let skip_o_quant = dims.num_tokens <= FAST_PATH_M_MAX
         && weights.o_f16 == 0
-        && weights.o_chscale != 0
         && weights.o_blockscale != 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
@@ -808,25 +2081,105 @@ pub unsafe fn gemma4_forward_phase(
 
     // 7-8. O proj + channelscale + post_attn norm + residual add
     #[cfg(feature = "cuda")]
-    if weights.o_f16 != 0 {
+    if weights.awq.linear_active(AwqLinearKind::O) {
+        // Cycle 46 step 5b: AWQ O-proj. Reads f16 attn_out directly,
+        // writes f16 staging in gemm_f32_tmp, then the standard f16-in
+        // post-attn-norm + residual epilogue rolls it into `residual`.
+        let prefill_loop_enabled = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
+        let gemm_available = kernels.awq_int4_gemm_sm120_wmma.is_some();
+        if dims.num_tokens != 1 && !gemm_available && !prefill_loop_enabled {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq o_proj prefill (M>1): GEMM kernel PTX absent and RVLLM_AWQ_PREFILL_LOOP not set",
+                },
+                ctx: rvllm_core::AttnCtx {
+                    op: "awq_o", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        // O proj: GEMV needed only for decode or loop-fallback path.
+        let need_gemv = dims.num_tokens == 1
+            || (dims.num_tokens > 1 && (!gemm_available || prefill_loop_enabled));
+        if need_gemv && kernels.awq_int4_gemv_f16.is_none() {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16", op: "awq_int4_gemv_f16 PTX missing",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_o", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16;
+        let o_out_f16 = scratch.gemm_f32_tmp;
+        let use_gemm = dims.num_tokens > 1 && !prefill_loop_enabled && gemm_available;
+        unsafe {
+            if dims.num_tokens == 1 {
+                gemma4_launcher::AwqInt4GemvF16Launch {
+                    n: dims.hidden as u32,
+                    k: q_dim as u32,
+                    group_size: weights.awq.group_size,
+                }.launch(fn_awq.unwrap(), scratch.attn_out,
+                    weights.awq.o_packed, weights.awq.o_scale, weights.awq.o_zero,
+                    o_out_f16, stream)?;
+            } else if use_gemm {
+                // O proj prefill via GEMM: ld_d=hidden (output is
+                // [num_tokens, hidden] contiguous in gemm_f32_tmp).
+                gemma4_launcher::AwqInt4GemmSm120WmmaLaunch {
+                    m: dims.num_tokens,
+                    n: dims.hidden as u32,
+                    k: q_dim as u32,
+                    group_size: weights.awq.group_size,
+                    ld_d: dims.hidden as u32,
+                }.launch(kernels.awq_int4_gemm_sm120_wmma.unwrap(),
+                    o_out_f16, scratch.attn_out,
+                    weights.awq.o_packed, weights.awq.o_scale, weights.awq.o_zero,
+                    stream)?;
+            } else {
+                // O proj prefill loop fallback.
+                gemma4_launcher::AwqInt4GemvF16PrefillLoop {
+                    num_tokens: dims.num_tokens,
+                    n: dims.hidden as u32,
+                    k: q_dim as u32,
+                    group_size: weights.awq.group_size,
+                    in_stride_elems:  q_dim as u32,
+                    out_stride_elems: dims.hidden as u32,
+                }.launch(fn_awq.unwrap(), scratch.attn_out,
+                    weights.awq.o_packed, weights.awq.o_scale, weights.awq.o_zero,
+                    o_out_f16, stream)?;
+            }
+        }
+        gemma4_launcher::FusedNormAddResidualF16InLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(
+            norm_add_residual_f16in_kernel, o_out_f16,
+            weights.post_attn_norm_gamma, residual, 0, stream,
+        )?;
+    } else if weights.o_f16 != 0 {
         cublaslt.f16_gemm_f32(
             scratch.attn_out, weights.o_f16, scratch.gemm_f32_tmp,
             dims.num_tokens as i32, dims.hidden as i32, q_dim as i32, stream,
         )?;
         gemma4_launcher::FusedNormAddResidualLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
+        }.launch(norm_add_residual_kernel, scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
     } else if let (true, Some(fn_gemv)) = (
         weights.o_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
         // sm_121 fast path for O projection.
-        // `scratch.attn_out` is already f16 (attention output), no
-        // pre-rmsnorm needed — post-attn-norm runs in the epilogue via
-        // `fused_norm_add_residual_f16in`. We write the GEMV result
-        // into `gemm_f32_tmp` (reused as f16 scratch: we only need
-        // num_tokens*hidden*2 bytes, well under gemm_f32_tmp's capacity).
+        // O-proj input (`scratch.attn_out`) stays f16 even under
+        // FULL_CHAIN — attention dispatch is not yet flipped to
+        // bf16-out in this iteration. Therefore O-proj keeps the
+        // f16-input GEMV, output stays f16, and the epilogue uses
+        // `fused_norm_add_residual_bf16_f16in` (the existing cycle-54
+        // bridge kernel that takes f16 GEMV input + writes bf16
+        // residual). Future iteration: wire attention bf16out, then
+        // flip this site to bf16-in for true end-to-end bf16.
         gemma4_launcher::Fp8GemvF16InLaunch {
             m: dims.num_tokens,
             n: dims.hidden,
@@ -846,7 +2199,7 @@ pub unsafe fn gemma4_forward_phase(
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_norm_add_residual_f16in,
+            norm_add_residual_f16in_kernel,
             scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma,
             residual,
@@ -877,12 +2230,15 @@ pub unsafe fn gemma4_forward_phase(
             scratch.attn_out_scale, weights.o_chscale, weights.o_blockscale, weights.o_scale,
             dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
             scratch.gemm_f32_tmp + (dims.num_tokens * dims.hidden * 2) as u64,
+            // Codex40-3: tail of gemm_f32_tmp after the f16 staging.
+            scratch.gemm_f32_tmp_bytes
+                .saturating_sub((dims.num_tokens * dims.hidden * 2) as usize),
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
             stream,
         )?;
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual_f16in, o_out_f16,
+        }.launch(norm_add_residual_f16in_kernel, o_out_f16,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
     } else {
         cublaslt.fp8_gemm_f32(
@@ -892,7 +2248,7 @@ pub unsafe fn gemma4_forward_phase(
         )?;
         gemma4_launcher::FusedNormAddResidualLaunch {
             num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
+        }.launch(norm_add_residual_kernel, scratch.gemm_f32_tmp,
             weights.post_attn_norm_gamma, residual, 0, stream)?;
     }
 
@@ -904,8 +2260,9 @@ pub unsafe fn gemma4_forward_phase(
     // f16 rmsnorm into delta_f16, leaving hidden_fp8/hidden_scale
     // unused.
     #[cfg(feature = "cuda")]
+    // Codex46-2: align skip-gate with fastpath dispatch — chscale not
+    // required by `Fp8GemvF16InLaunch`.
     let skip_ff_quant = dims.num_tokens <= FAST_PATH_M_MAX
-        && weights.gate_up_chscale != 0
         && weights.gate_up_blockscale != 0
         && weights.gate_up_f16 == 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
@@ -918,7 +2275,7 @@ pub unsafe fn gemma4_forward_phase(
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_rmsnorm_fp8_quant,
+            rmsnorm_quant_kernel,
             scratch.hidden_fp8,
             scratch.hidden_scale,
             residual,
@@ -934,14 +2291,129 @@ pub unsafe fn gemma4_forward_phase(
 
     // 10. gate||up projection
     #[cfg(feature = "cuda")]
-    if weights.gate_up_f16 != 0 {
+    if weights.awq.linear_active(AwqLinearKind::Gate) {
+        // Cycle 46 step 5b: AWQ gate||up. Two sequential launches into
+        // scratch.gate_up_out at offsets 0 and `intermediate * 2`,
+        // composing the same fused [gate || up] layout downstream
+        // GELU-mul expects.
+        debug_assert!(weights.awq.linear_active(AwqLinearKind::Up),
+            "AWQ gate/up must be all-or-nothing");
+        let prefill_loop_enabled = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
+        let gemm_available = kernels.awq_int4_gemm_sm120_wmma.is_some();
+        if dims.num_tokens != 1 && !gemm_available && !prefill_loop_enabled {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq gate_up prefill (M>1): GEMM kernel PTX absent and RVLLM_AWQ_PREFILL_LOOP not set",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_gate_up", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let need_gemv = dims.num_tokens == 1
+            || (dims.num_tokens > 1 && (!gemm_available || prefill_loop_enabled));
+        if need_gemv && kernels.awq_int4_gemv_f16.is_none() {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16", op: "awq_int4_gemv_f16 PTX missing",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_gate_up", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16;
+        // Same prelude as gate_up FP8 fast path: residual → delta_f16 +
+        // pre-FF rmsnorm in place.
+        // Cycle 54 Stage 2.1: bf16-residual narrow at branch entry.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16, residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            ), "gate_up_awq_input_memcpy", stream);
+        }
+        gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(
+            kernels.fused_rmsnorm, scratch.delta_f16,
+            weights.pre_ff_norm_gamma, stream,
+        )?;
+        let inter = dims.intermediate as u32;
+        let k = dims.hidden as u32;
+        let g = weights.awq.group_size;
+        let use_gemm = dims.num_tokens > 1 && !prefill_loop_enabled && gemm_available;
+        unsafe {
+            if dims.num_tokens == 1 {
+                let f = fn_awq.unwrap();
+                // gate -> scratch.gate_up_out + 0
+                gemma4_launcher::AwqInt4GemvF16Launch { n: inter, k, group_size: g }
+                    .launch(f, scratch.delta_f16,
+                        weights.awq.gate_packed, weights.awq.gate_scale, weights.awq.gate_zero,
+                        scratch.gate_up_out, stream)?;
+                // up -> scratch.gate_up_out + intermediate*2 (f16 = 2B)
+                gemma4_launcher::AwqInt4GemvF16Launch { n: inter, k, group_size: g }
+                    .launch(f, scratch.delta_f16,
+                        weights.awq.up_packed, weights.awq.up_scale, weights.awq.up_zero,
+                        scratch.gate_up_out + (inter as u64) * 2, stream)?;
+            } else if use_gemm {
+                // gate||up prefill via GEMM: ld_d=2*intermediate
+                // (fused [gate || up] layout), 2 launches at column
+                // offsets 0 / intermediate.
+                let fn_gemm = kernels.awq_int4_gemm_sm120_wmma.unwrap();
+                let mk_gemm = || gemma4_launcher::AwqInt4GemmSm120WmmaLaunch {
+                    m: dims.num_tokens, n: inter, k, group_size: g,
+                    ld_d: 2 * inter,
+                };
+                mk_gemm().launch(fn_gemm, scratch.gate_up_out, scratch.delta_f16,
+                    weights.awq.gate_packed, weights.awq.gate_scale, weights.awq.gate_zero,
+                    stream)?;
+                mk_gemm().launch(fn_gemm,
+                    scratch.gate_up_out + (inter as u64) * 2, scratch.delta_f16,
+                    weights.awq.up_packed, weights.awq.up_scale, weights.awq.up_zero,
+                    stream)?;
+            } else {
+                // gate||up prefill loop fallback. in_stride=hidden,
+                // out_stride=2*intermediate (fused [gate || up] layout
+                // downstream GELU-mul expects).
+                let mk_loop = |n: u32| gemma4_launcher::AwqInt4GemvF16PrefillLoop {
+                    num_tokens: dims.num_tokens, n, k, group_size: g,
+                    in_stride_elems: k,
+                    out_stride_elems: 2 * inter,
+                };
+                let f = fn_awq.unwrap();
+                mk_loop(inter).launch(f, scratch.delta_f16,
+                    weights.awq.gate_packed, weights.awq.gate_scale, weights.awq.gate_zero,
+                    scratch.gate_up_out, stream)?;
+                mk_loop(inter).launch(f, scratch.delta_f16,
+                    weights.awq.up_packed, weights.awq.up_scale, weights.awq.up_zero,
+                    scratch.gate_up_out + (inter as u64) * 2, stream)?;
+            }
+        }
+    } else if weights.gate_up_f16 != 0 {
         // F16 path: norm residual into gate_up_out scratch, then F16 GEMM
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.gate_up_out,
-            residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
-        );
+        // Cycle 54 Stage 2.1: bf16-residual narrow at branch entry. Note
+        // the scratch here is `scratch.gate_up_out` (re-used as the
+        // pre-norm staging buffer for this branch), not `delta_f16`.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.gate_up_out, residual, stream)?;
+        } else {
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.gate_up_out,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            ), "gate_up_f16_input_memcpy", stream);
+        }
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -975,24 +2447,38 @@ pub unsafe fn gemma4_forward_phase(
         weights.gate_up_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
-        // sm_121 fast path for gate||up projection. Mirrors
-        // the QKV fast path: f16 rmsnorm into delta_f16 (pre-FF norm
-        // gamma this time), then f16-input fp8_gemv direct to
-        // gate_up_out. Downstream `fused_gelu_mul` reads gate_up_out
-        // as f16 so no epilogue change is needed.
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            scratch.delta_f16,
-            residual,
-            (dims.num_tokens * dims.hidden * 2) as _,
-            stream as _,
-        );
+        // sm_121 fast path for gate||up projection. Mirrors the QKV
+        // fast path. Downstream `fused_gelu_mul` reads gate_up_out as
+        // f16 so no epilogue change is needed.
+        // Cycle 55 step 19: gate-up F16-in fast path stays f16 in
+        // production. The wholesale extension to bf16 (commit drafted
+        // step 19 wholesale attempt) was manually reverted in-place
+        // because it broke even short context (mechanism: bf16-precision
+        // compounding through pre-FF rmsnorm + GEMV + bf16 gelu + ...
+        // produces NVFP4-incompatible quant grid downstream of FFN).
+        // Cycle-54 stage-2.1's bf16→f16 narrow at branch entry is the
+        // production-stable path and stays in place here.
+        if dims.bf16_residual {
+            gemma4_launcher::Bf16ToF16SatLaunch {
+                n: dims.num_tokens * dims.hidden,
+            }
+            .launch(kernels.bf16_to_f16_sat, scratch.delta_f16, residual, stream)?;
+        } else {
+            cuda_check!(cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                scratch.delta_f16,
+                residual,
+                (dims.num_tokens * dims.hidden * 2) as _,
+                stream as _,
+            ), "gate_up_fastpath_input_memcpy", stream);
+        }
+        let rmsnorm_kernel = kernels.fused_rmsnorm;
         gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_rmsnorm,
+            rmsnorm_kernel,
             scratch.delta_f16,
             weights.pre_ff_norm_gamma,
             stream,
@@ -1017,6 +2503,7 @@ pub unsafe fn gemma4_forward_phase(
             scratch.hidden_scale, weights.gate_up_chscale, weights.gate_up_blockscale, weights.gate_up_scale,
             dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
             scratch.gemm_f32_tmp,
+            scratch.gemm_f32_tmp_bytes,
             scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
             stream,
         )?;
@@ -1033,7 +2520,100 @@ pub unsafe fn gemma4_forward_phase(
 
     // 11-12. GELU*up + down_proj
     #[cfg(feature = "cuda")]
-    if weights.down_f16 != 0 {
+    if weights.awq.linear_active(AwqLinearKind::Down) {
+        // Cycle 46 step 5b: AWQ down. F16 GELU output staged into
+        // gate_up_fp8 (alias trick — same as the f16-weights and
+        // f16-gemv-fast-path branches), then 1 AWQ launch into
+        // gemm_f32_tmp (used as f16 staging), then the standard
+        // f16-in post-FF-norm + residual epilogue.
+        let prefill_loop_enabled = std::env::var("RVLLM_AWQ_PREFILL_LOOP").is_ok();
+        let gemm_available = kernels.awq_int4_gemm_sm120_wmma.is_some();
+        if dims.num_tokens != 1 && !gemm_available && !prefill_loop_enabled {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16",
+                    op: "awq down_proj prefill (M>1): GEMM kernel PTX absent and RVLLM_AWQ_PREFILL_LOOP not set",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_down", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let need_gemv = dims.num_tokens == 1
+            || (dims.num_tokens > 1 && (!gemm_available || prefill_loop_enabled));
+        if need_gemv && kernels.awq_int4_gemv_f16.is_none() {
+            return Err(rvllm_core::RvllmError::Attention {
+                err: rvllm_core::AttentionError::FeatureNotAvailable {
+                    backend: "AwqInt4GemvF16", op: "awq_int4_gemv_f16 PTX missing",
+                },
+                ctx: rvllm_core::AttnCtx { op: "awq_down", stream,
+                    num_seqs: dims.num_tokens, head_dim: dims.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let fn_awq = kernels.awq_int4_gemv_f16;
+        // f16 GELU(gate)*up into gate_up_fp8 alias.
+        {
+            let mut out = scratch.gate_up_fp8;
+            let mut inp = scratch.gate_up_out;
+            let mut inter = dims.intermediate as i32;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut inter) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block = (dims.intermediate.min(1024), 1, 1);
+            let grid = (dims.num_tokens, 1, 1);
+            rvllm_fused::launch_raw(kernels.fused_gelu_mul_f16, grid, block, 0, stream, &args)?;
+        }
+        let use_gemm = dims.num_tokens > 1 && !prefill_loop_enabled && gemm_available;
+        unsafe {
+            if dims.num_tokens == 1 {
+                gemma4_launcher::AwqInt4GemvF16Launch {
+                    n: dims.hidden as u32,
+                    k: dims.intermediate as u32,
+                    group_size: weights.awq.group_size,
+                }.launch(fn_awq.unwrap(), scratch.gate_up_fp8,
+                    weights.awq.down_packed, weights.awq.down_scale, weights.awq.down_zero,
+                    scratch.gemm_f32_tmp, stream)?;
+            } else if use_gemm {
+                // down prefill via GEMM: ld_d=hidden (output is
+                // [num_tokens, hidden] contiguous in gemm_f32_tmp).
+                gemma4_launcher::AwqInt4GemmSm120WmmaLaunch {
+                    m: dims.num_tokens,
+                    n: dims.hidden as u32,
+                    k: dims.intermediate as u32,
+                    group_size: weights.awq.group_size,
+                    ld_d: dims.hidden as u32,
+                }.launch(kernels.awq_int4_gemm_sm120_wmma.unwrap(),
+                    scratch.gemm_f32_tmp, scratch.gate_up_fp8,
+                    weights.awq.down_packed, weights.awq.down_scale, weights.awq.down_zero,
+                    stream)?;
+            } else {
+                // down prefill loop fallback. in_stride=intermediate
+                // (gate_up_fp8 alias holds [num_tokens, intermediate]
+                // f16 GELU output), out_stride=hidden (gemm_f32_tmp
+                // staged).
+                gemma4_launcher::AwqInt4GemvF16PrefillLoop {
+                    num_tokens: dims.num_tokens,
+                    n: dims.hidden as u32,
+                    k: dims.intermediate as u32,
+                    group_size: weights.awq.group_size,
+                    in_stride_elems:  dims.intermediate as u32,
+                    out_stride_elems: dims.hidden as u32,
+                }.launch(fn_awq.unwrap(), scratch.gate_up_fp8,
+                    weights.awq.down_packed, weights.awq.down_scale, weights.awq.down_zero,
+                    scratch.gemm_f32_tmp, stream)?;
+            }
+        }
+        gemma4_launcher::FusedNormAddResidualF16InLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(
+            norm_add_residual_f16in_kernel, scratch.gemm_f32_tmp,
+            weights.post_ff_norm_gamma, residual,
+            weights.layer_scalar_ptr, stream,
+        )?;
+    } else if weights.down_f16 != 0 {
         // F16 path: GELU output to separate buffer (can't alias gate_up_out)
         {
             let mut out = scratch.gate_up_fp8; // use gate_up_fp8 scratch as f16 gelu output
@@ -1058,17 +2638,25 @@ pub unsafe fn gemma4_forward_phase(
             dims.intermediate as i32,
             stream,
         )?;
+        // Codex35-1: post-FF residual epilog. Earlier this branch
+        // dropped through without writing the FFN output back to the
+        // residual stream — the down_f16 path silently ate the entire
+        // FFN block (and its layer_scalar). Mirrors the awq / fp8
+        // branches above and below.
+        gemma4_launcher::FusedNormAddResidualF16InLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(
+            norm_add_residual_f16in_kernel, scratch.gemm_f32_tmp,
+            weights.post_ff_norm_gamma, residual,
+            weights.layer_scalar_ptr, stream,
+        )?;
     } else if let (true, Some(fn_gemv)) = (
         weights.down_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
         kernels.fp8_gemv_wpr_native_f16in,
     ) {
-        // sm_121 fast path for down projection.
-        // Skip FP8 GELU-quant — run f16 GELU into `gate_up_fp8`
-        // scratch (same aliasing trick as the f16-weights branch),
-        // then f16-input fp8_gemv writes f16 directly to
-        // `gemm_f32_tmp` (reused as f16 scratch), and
-        // `fused_norm_add_residual_f16in` rolls the residual add +
-        // post-FF norm in one pass.
+        // sm_121 fast path for down projection. Manually reverted to
+        // f16 in cycle 55 step 19 after the wholesale-bf16 attempt
+        // broke even short context. Production stays on f16 here.
         {
             let mut out = scratch.gate_up_fp8;
             let mut inp = scratch.gate_up_out;
@@ -1101,7 +2689,7 @@ pub unsafe fn gemma4_forward_phase(
             eps: dims.rms_eps,
         }
         .launch(
-            kernels.fused_norm_add_residual_f16in,
+            norm_add_residual_f16in_kernel,
             scratch.gemm_f32_tmp,
             weights.post_ff_norm_gamma,
             residual,
@@ -1133,12 +2721,15 @@ pub unsafe fn gemma4_forward_phase(
                 scratch.mlp_out_scale, weights.down_chscale, weights.down_blockscale, weights.down_scale,
                 dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
                 scratch.gemm_f32_tmp + (dims.num_tokens * dims.hidden * 2) as u64,
+                // Codex40-3: tail of gemm_f32_tmp after the f16 staging.
+                scratch.gemm_f32_tmp_bytes
+                    .saturating_sub((dims.num_tokens * dims.hidden * 2) as usize),
                 scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
                 stream,
             )?;
             gemma4_launcher::FusedNormAddResidualF16InLaunch {
                 num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-            }.launch(kernels.fused_norm_add_residual_f16in, down_out_f16,
+            }.launch(norm_add_residual_f16in_kernel, down_out_f16,
                 weights.post_ff_norm_gamma, residual,
                 weights.layer_scalar_ptr, stream)?;
         } else {
@@ -1149,7 +2740,7 @@ pub unsafe fn gemma4_forward_phase(
             )?;
             gemma4_launcher::FusedNormAddResidualLaunch {
                 num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-            }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
+            }.launch(norm_add_residual_kernel, scratch.gemm_f32_tmp,
                 weights.post_ff_norm_gamma, residual,
                 weights.layer_scalar_ptr, stream)?;
         }
@@ -1260,6 +2851,7 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     n: i32,
     k: i32,
     scratch_f32: u64,
+    scratch_f32_bytes: usize,
     cutlass_workspace: u64,
     cutlass_workspace_bytes: usize,
     stream: u64,
@@ -1306,14 +2898,31 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     // exactly how aa01001pftrope0 manifested).
     let cutlass_sm120_enabled = m >= 128
         && b_blockscale != 0
-        && std::env::var("RVLLM_FP8_GEMM_CUTLASS_SM120").ok().as_deref() != Some("0");
+        && crate::gemma4_bring_up::parse_truthy_env("RVLLM_FP8_GEMM_CUTLASS_SM120")
+            .unwrap_or(true);
     if cutlass_sm120_enabled {
         if let CutlassBackend::SoSm120(lib) = cutlass {
             if lib.prep_sfa.is_some() && lib.prep_sfb.is_some() {
                 let sfa_bytes = lib.sfa_bytes(m, k);
-                let _sfb_bytes = lib.sfb_bytes(n, k);
+                let sfb_bytes = lib.sfb_bytes(n, k);
                 // 16-byte-align the SFB offset inside scratch_f32.
                 let sfa_aligned = (sfa_bytes + 15) & !15;
+                // Codex40-3: refuse the CUTLASS prep path if scratch_f32
+                // can't hold both SFA and SFB regions without overlap.
+                // Earlier the offsets were derived without checking
+                // scratch_f32_bytes — for current Gemma 4 shapes the
+                // gemm-scratch is large enough by accident, but a
+                // future shape/kernel change could overflow into the
+                // adjacent allocations silently. Falling through to
+                // cuBLASLt is a safe-but-slower outcome.
+                let need = sfa_aligned + sfb_bytes;
+                if need > scratch_f32_bytes {
+                    eprintln!(
+                        "[cutlass-sm120] scratch_f32 too small for prep \
+                         (need {need} bytes, have {scratch_f32_bytes}); \
+                         m={m} n={n} k={k} → falling back to cuBLASLt"
+                    );
+                } else {
                 let sfa_ptr = scratch_f32;
                 let sfb_ptr = scratch_f32 + sfa_aligned as u64;
                 lib.launch_prep_sfa(a_scale, sfa_ptr, m, k, stream)?;
@@ -1331,6 +2940,7 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
                     cutlass_workspace_bytes,
                     stream,
                 );
+                } // size-check else
             }
         }
     }
@@ -1401,6 +3011,18 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
         CutlassBackend::Absent => {
             if b_chscale != 0 {
                 fallback_f32_scale_cast()
+            } else if m > 1 {
+                // Codex48-2: cuBLASLt scalar `fp8_gemm` applies
+                // `a_scale[0]` uniformly to all M output rows. For
+                // M>1 with per-token activation scales rows 1..M-1
+                // are wrong by `a_scale[m] / a_scale[0]`. Route
+                // through the f32-scratch path so
+                // `scale_rows_f32_ratio` can recover the correct
+                // per-row scale before the f16 cast — same
+                // correction the b_chscale!=0 fallback already
+                // applies. M==1 stays on the direct cublaslt path
+                // (no row to correct, no extra kernel overhead).
+                fallback_f32_scale_cast()
             } else {
                 cublaslt.fp8_gemm(
                     a_fp8, b_fp8, output_f16,
@@ -1420,6 +3042,12 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
         // below that we land here.
         CutlassBackend::SoSm120(_) => {
             if b_chscale != 0 {
+                fallback_f32_scale_cast()
+            } else if m > 1 {
+                // Codex48-2: same per-row scale-correction need as
+                // the Absent arm above when b_chscale == 0 and the
+                // SM120 CUTLASS .so falls through to cublaslt
+                // scalar mode for M>1.
                 fallback_f32_scale_cast()
             } else {
                 cublaslt.fp8_gemm(
@@ -1492,6 +3120,70 @@ unsafe fn rope_f16kv(
     rvllm_fused::launch_raw(kernels.fused_rope_partial_f16kv, grid, block, 0, stream, &args)
 }
 
+// === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+/// Ground-truth f16 KV write for a shadow region. Identical to
+/// `rope_f16kv` except K/V pointers are overridden to the shadow
+/// region and Q output goes to `scratch.shadow_q_cache` (per-layer
+/// slot on step-0 capture, shared throwaway otherwise).
+///
+/// CRITICAL: `q_out` must NOT alias `scratch.q_normed`. An earlier
+/// revision aliased them, which caused the subsequent primary
+/// `rope_nvfp4kv` to apply RoPE a second time on an already-rotated
+/// Q. Result: `q_fp8` was double-RoPE'd and every forward pass
+/// silently produced wrong attention whenever the shadow gate was on.
+/// Caller must guarantee `scratch.shadow_q_cache` is non-zero and
+/// points to a valid f16 buffer of at least
+/// `num_tokens * num_heads * head_dim * 2` bytes.
+#[cfg(feature = "cuda")]
+unsafe fn rope_f16kv_shadow(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    scratch: &Gemma4LayerScratch,
+    meta: &Gemma4MetadataPtrs,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(scratch.shadow_q_cache != 0,
+        "rope_f16kv_shadow called with shadow_q_cache=0; caller must route to \
+         per-layer slot or throwaway to avoid aliasing q_normed");
+    let mut q_in = scratch.q_normed;
+    let mut k_in = scratch.k_normed;
+    let mut v_in = scratch.v_normed;
+    let mut q_out = scratch.shadow_q_cache;
+    let mut k_cache = scratch.shadow_k_cache;
+    let mut v_cache = scratch.shadow_v_cache;
+    let mut cos = meta.cos;
+    let mut sin = meta.sin;
+    let mut positions = meta.positions;
+    let mut slot_mapping = meta.slot_mapping;
+    let mut nt = dims.num_tokens as i32;
+    let mut nh = dims.num_heads as i32;
+    let mut nkvh = dims.num_kv_heads as i32;
+    let mut hd = dims.head_dim as i32;
+    let mut rd = dims.rotary_dim as i32;
+    let args = [
+        (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_cache) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_cache) as *mut u64 as *mut core::ffi::c_void,
+        (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+        (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+        (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+        (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let max_heads = dims.num_heads.max(dims.num_kv_heads);
+    let grid = (dims.num_tokens, max_heads, 1);
+    let block = ((dims.head_dim / 2).max(32), 1, 1);
+    rvllm_fused::launch_raw(kernels.fused_rope_partial_f16kv, grid, block, 0, stream, &args)
+}
+// === END NVFP4 SHADOW DIAGNOSTIC ===
+
 #[cfg(feature = "cuda")]
 unsafe fn rope_fp8kv(
     dims: Gemma4LayerDims,
@@ -1500,6 +3192,16 @@ unsafe fn rope_fp8kv(
     meta: &Gemma4MetadataPtrs,
     stream: u64,
 ) -> Result<()> {
+    // Cycle 55 step 14: pick bf16-input RoPE kernel when full chain
+    // is enabled. Same launch ABI; Q/K/V inputs flip f16 → bf16.
+    let rope_kernel = if dims.bf16_residual
+        && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
+        && !crate::gemma4_bring_up::bf16_disable_rope()
+    {
+        kernels.fused_rope_partial_fp8kv_bf16in
+    } else {
+        kernels.fused_rope_partial_fp8kv
+    };
     gemma4_launcher::FusedRopePartialFp8KvLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
@@ -1508,7 +3210,7 @@ unsafe fn rope_fp8kv(
         rotary_dim: dims.rotary_dim,
     }
     .launch(
-        kernels.fused_rope_partial_fp8kv,
+        rope_kernel,
         scratch.q_normed,
         scratch.k_normed,
         scratch.v_normed,
@@ -1527,6 +3229,333 @@ unsafe fn rope_fp8kv(
     )
 }
 
+/// RoPE + NVFP4 paged-KV write. Mirrors `rope_fp8kv` but writes the
+/// K/V cache as packed 4-bit bytes + per-16-element E4M3 microscale
+/// into the separate `k_cache_scale` / `v_cache_scale` regions. Q
+/// still lands in `q_fp8` per-tensor (the FA2 NVFP4 decode/prefill
+/// kernels read Q as FP8).
+#[cfg(feature = "cuda")]
+unsafe fn rope_nvfp4kv(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    scratch: &Gemma4LayerScratch,
+    meta: &Gemma4MetadataPtrs,
+    stream: u64,
+) -> Result<()> {
+    // `fused_rope_partial_nvfp4kv` is `None` when the NVFP4 PTX isn't
+    // built into $KERNELS_DIR. That means the operator asked for
+    // `RVLLM_NVFP4_KV=1` but their kernel tree predates the NVFP4
+    // branch — fail clean with a typed attention error (closest
+    // match in rvllm-core; we don't have a KernelError variant).
+    // Cycle 55 step 14: pick bf16-input NVFP4 RoPE kernel when full
+    // chain is enabled. Same launch ABI; Q/K/V inputs flip f16 → bf16.
+    // Codex20-1: when bf16 residual + FULL_CHAIN is on, Q/K/V come in
+    // as bf16. The bf16-in NVFP4 RoPE kernel reads bf16; the f16 kernel
+    // reads __half. Falling back to the f16 kernel (`.or(...)`) was
+    // silent numeric corruption — bf16 patterns reinterpreted as
+    // little-endian half. Hard-fail instead so the operator either
+    // unsets RVLLM_BF16_NATIVE_FULL_CHAIN or rebuilds kernels/.
+    let bf16_in_path = dims.bf16_residual
+        && crate::gemma4_bring_up::bf16_native_full_chain_enabled()
+        && !crate::gemma4_bring_up::bf16_disable_rope();
+    let kernel_opt = if bf16_in_path {
+        kernels.fused_rope_partial_nvfp4kv_bf16in
+    } else {
+        kernels.fused_rope_partial_nvfp4kv
+    };
+    let kernel = kernel_opt.ok_or_else(|| {
+        rvllm_core::RvllmError::Attention {
+            err: rvllm_core::AttentionError::FeatureNotAvailable {
+                backend: "Fa2Ptx",
+                op: if bf16_in_path {
+                    "rope_nvfp4kv (fused_rope_partial_nvfp4kv_bf16in.ptx missing — \
+                     RVLLM_BF16_NATIVE_FULL_CHAIN=1 requires the bf16-input NVFP4 \
+                     RoPE kernel; rebuild kernels/ or unset the env)"
+                } else {
+                    "rope_nvfp4kv (fused_rope_partial_nvfp4kv.ptx not in $KERNELS_DIR)"
+                },
+            },
+            ctx: rvllm_core::AttnCtx {
+                op: "rope_nvfp4kv",
+                stream,
+                num_seqs: dims.num_tokens,
+                head_dim: dims.head_dim,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        }
+    })?;
+    // Pre-launch null-pointer guard for the NVFP4 K/V scale arenas.
+    // The attention launchers downstream (`launch` / `launch_split`)
+    // already require_nonnull these, but rope_nvfp4kv runs FIRST and
+    // would write the new K/V row's scales into NULL if the layer's
+    // dtype/scratch wiring was misconfigured. NULL deref here is at
+    // best a clean segfault and at worst (if the page happens to be
+    // mapped) silent corruption of an unrelated arena slot. Catch
+    // before the kernel touches device memory.
+    if scratch.k_cache_scale == 0 || scratch.v_cache_scale == 0 {
+        return Err(rvllm_core::RvllmError::Attention {
+            err: rvllm_core::AttentionError::FeatureNotAvailable {
+                backend: "Fa2Ptx",
+                op: "rope_nvfp4kv — k_cache_scale / v_cache_scale must be \
+                     non-null before launching the rope kernel; the layer's \
+                     KV-dtype dispatch is wired wrong",
+            },
+            ctx: rvllm_core::AttnCtx {
+                op: "rope_nvfp4kv",
+                stream,
+                num_seqs: dims.num_tokens,
+                head_dim: dims.head_dim,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    let mut q_in = scratch.q_normed;
+    let mut k_in = scratch.k_normed;
+    // Gemma 4 applies a parameter-free v-norm BEFORE writing V to the
+    // KV cache — the FP8 rope reads `scratch.v_normed` for the same
+    // reason. Reading pre-norm `v_out` here put raw QKV-GEMM output
+    // into the NVFP4 V cache with a different magnitude distribution
+    // than the attention kernel expected; that's where the
+    // end-to-end PPL blow-up came from (71 FP8 → 6.4M NVFP4).
+    let mut v_in = scratch.v_normed;
+    let mut q_out = scratch.q_fp8;
+    let mut k_packed = scratch.k_cache;
+    let mut v_packed = scratch.v_cache;
+    let mut k_scale = scratch.k_cache_scale;
+    let mut v_scale = scratch.v_cache_scale;
+    let mut cos = meta.cos;
+    let mut sin = meta.sin;
+    let mut positions = meta.positions;
+    let mut slot_mapping = meta.slot_mapping;
+    let mut q_scale_ptr = scratch.q_scale_ptr;
+    // === DYNAMIC NVFP4 Q SCALE ===
+    // When `RVLLM_PER_TOKEN_Q_SCALE=1`, pass `scratch.q_scale_cache`
+    // so the rope kernel computes a fresh per-(token, head) FP8 Q
+    // scale. Required for `RVLLM_NVFP4_HADAMARD=1` because rotated Q
+    // values can saturate the static scalar (default 0.1). When 0,
+    // the kernel reads the static `q_scale_ptr` (pre-Hadamard
+    // behaviour, byte-identical to the prior path).
+    let per_token_q_scale =
+        crate::gemma4_bring_up::per_token_q_scale_enabled(/*default_on=*/true);
+    let mut q_scale_cache_arg: u64 =
+        if per_token_q_scale { scratch.q_scale_cache } else { 0 };
+    // === END DYNAMIC NVFP4 Q SCALE ===
+    // === HADAMARD ROTATION ===
+    // Per-layer ±1 sign vectors for signed Walsh-Hadamard rotation
+    // of Q and K post-RoPE (NVFP4 path only). Both are 0 when
+    // disabled (master env gate `RVLLM_NVFP4_HADAMARD` off, OR
+    // sign tables not allocated). Rope kernel's `hadamard_on`
+    // requires BOTH non-null, so passing 0 cleanly disables.
+    let mut hadamard_signs_q = scratch.hadamard_signs_q;
+    let mut hadamard_signs_k = scratch.hadamard_signs_k;
+    // V rotation gate (companion: post-attention hadamard_unrotate_f16
+    // multiplies attn_out by R^T before O-proj). Default OFF until the
+    // dispatch is wired AND quality-validated. RVLLM_NVFP4_HADAMARD_V=1
+    // turns it on. The rope kernel reads a separate i32 param so we
+    // can A/B without touching the Q+K rotation.
+    let mut rotate_v: i32 =
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
+            .unwrap_or(true) { 1 } else { 0 };
+    // === END HADAMARD ROTATION ===
+    // === CYCLE 28 PRE-QUANT K SIDECAR ===
+    // Reuse the shadow K region: when shadow is enabled, primary
+    // overwrites what rope_f16kv_shadow wrote with the EXACT f32 K
+    // value (cast to f16) the NVFP4 quantizer is about to consume,
+    // post-RoPE + post-optional-Hadamard. Layout matches
+    // (slot * num_kv_heads + head) * head_dim. Analyzer then compares
+    // this f16 prequant against its Python dequant of the packed
+    // nibbles + E4M3 scales — apples-to-apples within the same path.
+    // Layout is identical to shadow's so files dumped by ShadowDumper
+    // (`layer_{L}_k_shadow.bin`) now contain pre-quant K under this
+    // gate. Shadow K vs shadow comparison is lost in this mode but
+    // that comparison was uncorrelated anyway (codex review).
+    let mut debug_k_prequant: u64 = scratch.shadow_k_cache;
+    // === END CYCLE 28 ===
+    // === CYCLE 29 V PRE-QUANT SIDECAR ===
+    // Mirror the cycle-28 K patch for V. Reuses scratch.shadow_v_cache —
+    // shadow region holds primary's pre-quant V (post-optional-Hadamard,
+    // V never gets RoPE) instead of shadow_rope's f16 V output.
+    let mut debug_v_prequant: u64 = scratch.shadow_v_cache;
+    // === END CYCLE 29 ===
+    // === CYCLE 31 STOCHASTIC V ROUNDING ===
+    // Opt-in via RVLLM_NVFP4_STOCH_ROUND_V=1. Default OFF (deterministic
+    // round-to-nearest preserves byte-identical legacy behavior). Seed
+    // is per-(slot,head,lane) so prefix-cache reuse stays consistent.
+    let mut stoch_round_v: i32 =
+        if crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_STOCH_ROUND_V")
+            .unwrap_or(false) { 1 } else { 0 };
+    // === END CYCLE 31 ===
+    let mut nt = dims.num_tokens as i32;
+    let mut nh = dims.num_heads as i32;
+    let mut nkvh = dims.num_kv_heads as i32;
+    let mut hd = dims.head_dim as i32;
+    let mut rd = dims.rotary_dim as i32;
+    // NVFP4 scale policy — read env lazily. Stable across a run once
+    // chosen. `amax6` (0) = OCP baseline (range-preserving, outlier-
+    // insensitive — produces garbage on Gemma 4 at 15k). `mse` (1) =
+    // blockwise MSE search over 4 outlier-aware candidates (see
+    // fused_rope_partial_nvfp4kv.cu for the candidate set).
+    fn parse_policy(v: &str) -> Option<i32> {
+        match v {
+            "amax6" | "0" => Some(0),
+            "mse" | "1" => Some(1),
+            _ => None,
+        }
+    }
+    let global_policy: i32 = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
+        .ok()
+        .and_then(|s| parse_policy(&s))
+        .unwrap_or(0);
+    let mut scale_policy: i32 = std::env::var("RVLLM_NVFP4_K_SCALE_POLICY")
+        .ok()
+        .and_then(|s| parse_policy(&s))
+        .unwrap_or(global_policy);
+    let mut v_scale_policy: i32 = std::env::var("RVLLM_NVFP4_V_SCALE_POLICY")
+        .ok()
+        .and_then(|s| parse_policy(&s))
+        .unwrap_or(global_policy);
+    let args = [
+        (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
+        (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_packed) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_packed) as *mut u64 as *mut core::ffi::c_void,
+        (&mut k_scale) as *mut u64 as *mut core::ffi::c_void,
+        (&mut v_scale) as *mut u64 as *mut core::ffi::c_void,
+        (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+        (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+        (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+        (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+        (&mut q_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+        // === DYNAMIC NVFP4 Q SCALE ===
+        (&mut q_scale_cache_arg) as *mut u64 as *mut core::ffi::c_void,
+        // === END DYNAMIC NVFP4 Q SCALE ===
+        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+        (&mut scale_policy) as *mut i32 as *mut core::ffi::c_void,
+        (&mut v_scale_policy) as *mut i32 as *mut core::ffi::c_void,
+        // === HADAMARD ROTATION ===
+        (&mut hadamard_signs_q) as *mut u64 as *mut core::ffi::c_void,
+        (&mut hadamard_signs_k) as *mut u64 as *mut core::ffi::c_void,
+        (&mut rotate_v) as *mut i32 as *mut core::ffi::c_void,
+        // === END HADAMARD ROTATION ===
+        // === CYCLE 28 PRE-QUANT SIDECAR ===
+        (&mut debug_k_prequant) as *mut u64 as *mut core::ffi::c_void,
+        // === END CYCLE 28 ===
+        // === CYCLE 29 V PRE-QUANT SIDECAR ===
+        (&mut debug_v_prequant) as *mut u64 as *mut core::ffi::c_void,
+        // === END CYCLE 29 ===
+        // === CYCLE 31 STOCHASTIC V ROUNDING ===
+        (&mut stoch_round_v) as *mut i32 as *mut core::ffi::c_void,
+        // === END CYCLE 31 ===
+    ];
+    let max_heads = dims.num_heads.max(dims.num_kv_heads);
+    let grid = (dims.num_tokens, max_heads, 1);
+    let block = (dims.head_dim, 1, 1);
+    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
+}
+
+/// Apply R^T = diag(D)·H to attn_out per (token, head) in place. Companion
+/// to the V-rotation in `rope_nvfp4kv`: V_cache = V·R, attn_out = P·V·R,
+/// this strips the trailing R so the O-projection sees raw P·V.
+///
+/// No-op (returns Ok) when:
+///   * `RVLLM_NVFP4_HADAMARD_V` is not truthy, OR
+///   * the un-rotation kernel isn't loaded (PTX absent), OR
+///   * `hadamard_signs_k` is null (rotation tables not allocated).
+///
+/// Each branch must match the rope kernel's V-rotate gate or attn_out
+/// gets mangled. Reuses `signs_k` because rope's V-arm shares the same
+/// sign vector as K (single per-layer D, both Q and V/K share when
+/// rotate_v is on).
+#[cfg(feature = "cuda")]
+unsafe fn unrotate_attn_out_v_if_enabled(
+    dims: Gemma4LayerDims,
+    kernels: &Gemma4LayerKernels,
+    scratch: &Gemma4LayerScratch,
+    stream: u64,
+) -> Result<()> {
+    let rotate_v = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD_V")
+        .unwrap_or(true);
+    if !rotate_v { return Ok(()); }
+    // Codex18-3: kernel-side V-rotate gate is `hadamard_on && rotate_v`
+    // (fused_rope_partial_nvfp4kv.cu:475). If the master Hadamard flag
+    // is off, V was never rotated → no unrotate to do. Previously the
+    // host gated solely on RVLLM_NVFP4_HADAMARD_V, so a config
+    // typo (V flag set, master flag unset) hit the "missing signs"
+    // hard-fail below even though the kernel had correctly skipped
+    // V rotation. Match the gates so the host is a no-op in the
+    // same cases the kernel is.
+    let hadamard_on = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HADAMARD")
+        .unwrap_or(true);
+    if !hadamard_on {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[hadamard] RVLLM_NVFP4_HADAMARD_V=1 set without RVLLM_NVFP4_HADAMARD=1 — \
+                 kernel did not rotate V, so host-side unrotate is skipped (no-op)."
+            );
+        }
+        return Ok(());
+    }
+    // V was rotated by R inside the rope kernel; the O-projection
+    // expects unrotated `P·V`. If the unrotate kernel or sign
+    // vector are missing here, returning Ok(()) silently leaves
+    // attn_out as `P·V·R` and the rest of the layer math is
+    // mathematically wrong without any crash or log — the worst
+    // class of failure. Fail HARD when V rotation is requested
+    // but the companion can't run; the operator must either drop
+    // RVLLM_NVFP4_HADAMARD_V or rebuild the kernels module.
+    let kernel = kernels.hadamard_unrotate_f16.ok_or_else(|| {
+        rvllm_core::RvllmError::Config {
+            err: rvllm_core::ConfigError::InvalidField {
+                name: "RVLLM_NVFP4_HADAMARD_V",
+                reason:
+                    "V rotation is enabled but `hadamard_unrotate_f16` kernel \
+                     is missing from the loaded PTX module. attn_out would \
+                     stay rotated as P·V·R and the O-projection would see \
+                     wrong values silently. Rebuild kernels/ or unset \
+                     RVLLM_NVFP4_HADAMARD_V."
+                    .into(),
+            },
+            field: "RVLLM_NVFP4_HADAMARD_V",
+        }
+    })?;
+    if scratch.hadamard_signs_k == 0 {
+        return Err(rvllm_core::RvllmError::Config {
+            err: rvllm_core::ConfigError::InvalidField {
+                name: "RVLLM_NVFP4_HADAMARD_V",
+                reason:
+                    "V rotation is enabled but the per-layer sign vector \
+                     `hadamard_signs_k` is null. The unrotate kernel needs \
+                     the same signs the rope kernel used to rotate V; \
+                     proceeding without them leaves attn_out as P·V·R."
+                    .into(),
+            },
+            field: "RVLLM_NVFP4_HADAMARD_V",
+        });
+    }
+    let mut x = scratch.attn_out;
+    let mut signs = scratch.hadamard_signs_k;
+    let mut nt = dims.num_tokens as i32;
+    let mut nh = dims.num_heads as i32;
+    let mut hd = dims.head_dim as i32;
+    let args = [
+        (&mut x) as *mut u64 as *mut core::ffi::c_void,
+        (&mut signs) as *mut u64 as *mut core::ffi::c_void,
+        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+    ];
+    let grid = (dims.num_tokens, dims.num_heads, 1);
+    let block = (dims.head_dim, 1, 1);
+    rvllm_fused::launch_raw(kernel, grid, block, 0, stream, &args)
+}
+
 pub unsafe fn logit_softcap(
     kernel: KernelFn,
     logits_ptr: u64,
@@ -1541,4 +3570,227 @@ pub unsafe fn logit_softcap(
         cap,
     }
     .launch(kernel, logits_ptr, stream)
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn good() -> Gemma4LayerDims {
+        Gemma4LayerDims {
+            num_tokens: 1,
+            hidden: 5376,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 256,
+            rotary_dim: 256,
+            intermediate: 14336,
+            block_size: 16,
+            max_blocks_per_seq: 1024,
+            num_blocks_total: 1024,
+            current_max_context_len: Some(1024),
+            attn_scale: 0.0625,
+            rms_eps: 1e-6,
+            layer_type: Gemma4LayerType::SlidingAttention,
+            sliding_window: 1024,
+            f16_kv: false,
+            kv_dtype: KvDtype::Fp8,
+            // Cycle 55 step 1: bf16 is the production default; f16
+            // remains as an env-overridable diagnostic path.
+            bf16_residual: true,
+        }
+    }
+
+    #[test]
+    fn good_dims_pass() {
+        good().validate().unwrap();
+    }
+
+    /// Cycle 55 step 1: f16 residual is now the OPT-OUT path (env
+    /// override). Validate it still accepts so diagnostic bisects work.
+    #[test]
+    fn f16_residual_diagnostic_path_passes() {
+        let mut d = good();
+        d.bf16_residual = false;
+        d.validate().unwrap();
+    }
+
+    /// Heterogeneous-head sibling — Gemma 4 31B has 256/512 head arity;
+    /// the bf16 default dispatch under the global-attn 512-head shape
+    /// must also validate.
+    #[test]
+    fn bf16_residual_global_attn_dims_pass() {
+        let mut d = good();
+        // bf16_residual already true by default (cycle 55 step 1)
+        d.head_dim = 512;
+        d.rotary_dim = 512;
+        d.attn_scale = 1.0 / (512f32).sqrt();
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        d.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_num_tokens() {
+        let mut d = good(); d.num_tokens = 0;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_gqa_ratio_not_divisible() {
+        let mut d = good(); d.num_kv_heads = 5;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_rotary_dim_exceeds_head_dim() {
+        let mut d = good(); d.rotary_dim = 512;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_odd_rotary_dim() {
+        let mut d = good(); d.rotary_dim = 255;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_power_of_two_block_size() {
+        let mut d = good(); d.block_size = 12;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_block_size() {
+        let mut d = good(); d.block_size = 0;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_current_ctx_exceeding_bucket() {
+        let mut d = good();
+        // bucket_max = 1024 * 16 = 16384; one past = 16385
+        d.current_max_context_len = Some(16385);
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_current_ctx_at_bucket_boundary() {
+        let mut d = good();
+        d.current_max_context_len = Some(16384);
+        d.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_nonfinite_attn_scale() {
+        let mut d = good(); d.attn_scale = f32::NAN;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_attn_scale() {
+        let mut d = good(); d.attn_scale = 0.0;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_f16_flag_disagreeing_with_dtype() {
+        // Fp8 dtype but f16_kv=true → mismatch
+        let mut d = good(); d.f16_kv = true;
+        assert!(d.validate().is_err());
+        // Conversely: F16 dtype but f16_kv=false
+        let mut d = good();
+        d.kv_dtype = KvDtype::F16;
+        d.f16_kv = false;
+        assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_global_head_dim_512() {
+        let mut d = good();
+        d.head_dim = 512;
+        d.rotary_dim = 512;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        d.validate().unwrap();
+    }
+
+    /// NVFP4 RoPE+Hadamard kernel has a static `s_hadamard[512]`
+    /// shared-memory buffer. head_dim > 512 with NVFP4 KV would
+    /// silently overflow that buffer. Validator must reject the
+    /// shape before any allocation/launch reaches the kernel.
+    #[test]
+    fn rejects_nvfp4_head_dim_over_512() {
+        let mut d = good();
+        d.kv_dtype = KvDtype::Nvfp4;
+        d.f16_kv = false;
+        d.head_dim = 768; // > 512
+        d.rotary_dim = 512;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        let err = d.validate().expect_err("head_dim>512 + NVFP4 must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Hadamard") || msg.contains("s_hadamard"),
+            "wrong error variant: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_nvfp4_head_dim_512() {
+        // The exact ceiling — must still pass.
+        let mut d = good();
+        d.kv_dtype = KvDtype::Nvfp4;
+        d.f16_kv = false;
+        d.head_dim = 512;
+        d.rotary_dim = 512;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        d.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_nvfp4_head_dim_not_power_of_two() {
+        // 384 = 256 + 128: multiple of 16, ≤ 512, but not a power
+        // of two. The Hadamard recursion in kernels/hadamard.cuh
+        // only closes on power-of-two D; the validator must reject
+        // the shape before the kernel sees it.
+        let mut d = good();
+        d.kv_dtype = KvDtype::Nvfp4;
+        d.f16_kv = false;
+        d.head_dim = 384;
+        d.rotary_dim = 384;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        let err = d.validate().expect_err("head_dim=384 + NVFP4 must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("power of two"), "wrong error: {msg}");
+    }
+
+    #[test]
+    fn rejects_nvfp4_head_dim_not_multiple_of_16() {
+        // The microscale stride is `head_dim >> 4`; the packed-byte
+        // stride is `head_dim >> 1`. head_dim=72 (4.5 * 16) is not a
+        // multiple of 16 — `head_dim >> 4 = 4` truncates and the
+        // microscale array runs short. Validator must catch this
+        // before the kernel touches the KV cache.
+        let mut d = good();
+        d.kv_dtype = KvDtype::Nvfp4;
+        d.f16_kv = false;
+        d.head_dim = 72;
+        d.rotary_dim = 72;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        let err = d.validate().expect_err("head_dim=72 + NVFP4 must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("multiple of 16"), "wrong error: {msg}");
+    }
+
+    #[test]
+    fn accepts_non_nvfp4_head_dim_768() {
+        // Tighter cap is NVFP4-specific. Other KV dtypes still see
+        // the loose 1024 ceiling (FP8/F16 path has no 512-buffer
+        // dependency).
+        let mut d = good();
+        d.kv_dtype = KvDtype::Fp8;
+        d.f16_kv = false;
+        d.head_dim = 768;
+        d.rotary_dim = 256;
+        d.layer_type = Gemma4LayerType::GlobalAttention;
+        d.validate().unwrap();
+    }
 }

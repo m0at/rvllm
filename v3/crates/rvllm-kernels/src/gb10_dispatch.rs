@@ -44,6 +44,13 @@ pub enum Fp8GemvVariant {
     /// f16 activation + f16 output variant used by the Sm121
     /// decode fast path.
     WprNativeF16In,
+    /// `fp8_gemv_blockwise_wpr_native_bf16in_kernel`. sm_100+ only.
+    /// Cycle 55 step 3 (Phase B): bf16-input sibling of WprNativeF16In.
+    /// bf16 activation + bf16 output. Used under bf16-native dispatch
+    /// (default ON since cycle 55 step 1) so the M=1 decode QKV +
+    /// gate_up fast paths no longer narrow bf16→f16-sat at projection
+    /// entry.
+    WprNativeBf16In,
 }
 
 /// Logical PTX module name (stem as it appears in `manifest.json`).
@@ -62,6 +69,9 @@ impl Fp8GemvVariant {
             Fp8GemvVariant::WprNative => "fp8_gemv_blockwise_wpr_native_kernel",
             Fp8GemvVariant::WprNativeF16In => {
                 "fp8_gemv_blockwise_wpr_native_f16in_kernel"
+            }
+            Fp8GemvVariant::WprNativeBf16In => {
+                "fp8_gemv_blockwise_wpr_native_bf16in_kernel"
             }
         }
     }
@@ -85,6 +95,7 @@ impl Fp8GemvVariant {
             Fp8GemvVariant::WprLut => true,
             Fp8GemvVariant::WprNative => matches!(target, CompileTarget::Sm121),
             Fp8GemvVariant::WprNativeF16In => matches!(target, CompileTarget::Sm121),
+            Fp8GemvVariant::WprNativeBf16In => matches!(target, CompileTarget::Sm121),
         }
     }
 }

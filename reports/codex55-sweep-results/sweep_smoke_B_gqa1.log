@@ -1,0 +1,36 @@
+[clean-smoke] 20260501-210701  label=B_gqa1
+[clean-smoke] stopping zeroclaw + rvllm-serve...
+[clean-smoke] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[clean-smoke] wiped 2 zeroclaw sqlite files (memory/brain.db + sessions/sessions.db)
+[clean-smoke] starting rvllm-serve...
+[clean-smoke] rvllm-serve ready
+[clean-smoke] starting zeroclaw...
+[clean-smoke] warmup call (discarded)...
+[clean-smoke] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[clean-smoke] starting 30-prompt smoke...
+label=B_gqa1 ts=20260501-210900 profile_summary:
+RVLLM_NVFP4_SCALE_POLICY=mse
+RVLLM_PREFILL_CHUNK_SIZE=128
+RVLLM_REPETITION_PENALTY_WINDOW=64
+RVLLM_REPETITION_PENALTY_MIN_COUNT=2
+RVLLM_NVFP4_HADAMARD=1
+RVLLM_NVFP4_HADAMARD=1
+RVLLM_PER_TOKEN_Q_SCALE=1
+RVLLM_REPETITION_PENALTY=1.05
+RVLLM_NVFP4_HADAMARD_V=1
+RVLLM_NVFP4_HYBRID_GLOBAL_FP8=0
+RVLLM_NVFP4_K_SCALE_POLICY=amax6
+RVLLM_NVFP4_V_SCALE_POLICY=mse
+RVLLM_NVFP4_HYBRID_SLIDING_FP8=0
+RVLLM_NVFP4_PARTITION_SIZE=256
+RVLLM_NVFP4_DECODE_GQA=1
+---
+[harness] cold restart rvllm-serve...
+[harness] restart zeroclaw + warm-up...
+[harness] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[PASS]    wer bist du?                                       | Ich bin ein hilfreiches KI-Assistant. Mein Ton ist direkt und präzise, und ich unterstütze dich bei verschiedenen Aufgaben – ob es um Software-Engineering, Datenanalyse oder al
+[PASS]    was machst du gerade?                              | Ich stehe bereit und warte auf deine Anweisungen. Was kann ich für dich tun?
+[PASS]    wer ist dein lieblingsmensch?                      | Ich habe keine persönlichen Vorlieben oder Gefühle, daher gibt es keinen "Lieblingsmenschen". Wenn ich wählen müsste, wäre es wohl jeder, der mir eine interessante Herausforde
+[PASS]    stell dich kurz vor                                | Ich bin ein KI-Assistent. Meine Antworten sind meist kurz und direkt, und ich unterstütze dich bei technischen Aufgaben, Datenverwaltung oder allgemeinen Fragen.
+[PASS]    was ist deine philosophie?                         | Meine Philosophie ist es, hilfreich, präzise und direkt zu sein. Ich konzentriere mich auf Fakten und Effizienz, vermeide unnötiges Drumherum und unterstütze dich so konkret wie
+[PASS]    wie ist das wetter in bern?                        | In Bern ist es aktuell sonnig mit einer Temperatur von 20°C.

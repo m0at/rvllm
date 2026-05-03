@@ -131,33 +131,72 @@ impl Bringup {
         let kernels_dir = resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
         let manifest_path = kernels_dir.join("manifest.json");
         let manifest = KernelManifest::load_and_verify(&manifest_path)?;
+        // Codex29-1: assert manifest.arch matches the runtime arch.
+        // resolve_kernels_dir already picked by arch, but a stale /
+        // copied manifest from another arch is size+sha-consistent
+        // and would otherwise slip through to kernel-launch failures.
+        #[cfg(feature = "cuda")]
+        {
+            let (maj, min) = ctx.compute_capability();
+            if let Some(t) = rvllm_core::CompileTarget::from_compute_capability(maj, min) {
+                manifest.assert_arch(t.as_sm_str())?;
+            }
+        }
         let kernels = Arc::new(KernelLoader::new(manifest));
         let fused_modules = load_fused(&kernels)?;
 
         // 4. Attention backend.
-        //    Non-Gemma4 architectures currently always use the FA3 .so.
-        //    The Gemma4 bring-up branches on CompileTarget; if you add a
-        //    non-Gemma4 sm_121 model, wire the same branch here.
-        let fa3 = AttentionBackend::Fa3(Fa3Kernels::load(
-            paths.fa3_so.clone(),
-            arch.head_dim as u32,
-        )?);
+        //    Codex28-1: branch on CompileTarget so sm_121 (GB10) routes
+        //    through the PTX-launched Fa2Ptx backend. FA3 (.so, WGMMA +
+        //    TMA) cannot load on Blackwell consumer silicon — every
+        //    non-Gemma4 generic startup on sm_121 used to crash here
+        //    even with sm_121 PTX present. Mirrors the gemma4_bring_up
+        //    branching at gemma4_bring_up.rs:1152.
+        #[cfg(feature = "gb10")]
+        let target = rvllm_core::CompileTarget::from_compute_capability(
+            ctx.compute_capability().0,
+            ctx.compute_capability().1,
+        );
+        #[cfg(not(feature = "gb10"))]
+        let target: Option<rvllm_core::CompileTarget> = None;
+        let fa3 = if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
+            AttentionBackend::Fa2Ptx(rvllm_attention::Fa2PtxKernels::load(
+                &kernels,
+                arch.head_dim as u32,
+            )?)
+        } else {
+            AttentionBackend::Fa3(Fa3Kernels::load(
+                paths.fa3_so.clone(),
+                arch.head_dim as u32,
+            )?)
+        };
 
         // 5. Policy + CUTLASS .so (resolve every variant referenced in
         //    the policy).
-        let policy_bytes = std::fs::read(&paths.policy_json).map_err(|source| RvllmError::Io {
-            err: rvllm_core::IoError::from(&source),
-            path: paths.policy_json.clone(),
-            source,
-        })?;
-        let policy: Policy = serde_json::from_slice(&policy_bytes).map_err(|e| {
-            RvllmError::config(
-                ConfigError::Inconsistent {
-                    reasons: vec![format!("policy.json parse: {e}")],
-                },
-                "policy.json",
-            )
-        })?;
+        // Codex30-2: on sm_121 the CUTLASS backend lands on SoSm120 /
+        // Absent — neither path consumes policy.json. Skip the load so
+        // a generic sm_121 startup doesn't crash on a missing /
+        // /dev/null policy.json. Mirrors the sm_121 documentation in
+        // crates/rvllm-bench/src/main.rs (RVLLM_POLICY ignored).
+        let is_sm121 = matches!(target, Some(rvllm_core::CompileTarget::Sm121));
+        let policy: Policy = if is_sm121 {
+            Policy::default()
+        } else {
+            let policy_bytes = std::fs::read(&paths.policy_json)
+                .map_err(|source| RvllmError::Io {
+                    err: rvllm_core::IoError::from(&source),
+                    path: paths.policy_json.clone(),
+                    source,
+                })?;
+            serde_json::from_slice(&policy_bytes).map_err(|e| {
+                RvllmError::config(
+                    ConfigError::Inconsistent {
+                        reasons: vec![format!("policy.json parse: {e}")],
+                    },
+                    "policy.json",
+                )
+            })?
+        };
         // Pre-resolve a generous universe of variants so a bench sweep
         // can try any of them without re-bringup. If a symbol is
         // missing from the .so the load path returns typed err — that's
@@ -746,6 +785,9 @@ impl Bringup {
                     .map(|r| r.device_ptr())
                     .unwrap_or(0),
                 max_seqlen_q: prefill_len,
+                // Single-sequence bring-up smoke — bring_up only ever
+                // runs one prompt at a time through this path.
+                num_seqs: 1,
             };
             one_step(phase)?;
             // Reset metadata to decode shape for the follow-on decode loop
@@ -1506,6 +1548,12 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits((sign << 31) | (f32_exp << 23) | (mant << 13))
 }
 
+#[cfg(feature = "cuda")]
+#[inline(always)]
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let rmsnorm_mod = loader.load_ptx("fused_rmsnorm_fp8_quant")?;
     let rope_mod = loader.load_ptx("fused_rope_cache_fp8kv")?;
@@ -1588,7 +1636,20 @@ pub fn resolve_kernels_dir(
                 "compute_capability",
             )
         })?;
-        let sub = kernels_root.join(target.as_sm_str());
+        // Codex32-2: tolerate operators who pointed RVLLM_KERNELS_DIR
+        // directly at the per-arch dir (matches the user-facing doc
+        // in parameters_for_nvfp4_sm121.md). When the input already
+        // ends in the matching `sm_*` segment, treat it as the
+        // resolved dir instead of appending `sm_*` again — which
+        // produced `.../sm_121/sm_121` and a confusing
+        // "subdirectory does not exist" error. Mismatched suffix
+        // (e.g. RVLLM_KERNELS_DIR=.../sm_120 on a sm_121 host) still
+        // falls through to the normal append + is_dir check so
+        // wrong-arch dirs get caught.
+        let sub = match kernels_root.file_name().and_then(|s| s.to_str()) {
+            Some(name) if name == target.as_sm_str() => kernels_root.to_path_buf(),
+            _ => kernels_root.join(target.as_sm_str()),
+        };
         if !sub.is_dir() {
             return Err(RvllmError::config(
                 ConfigError::InvalidField {

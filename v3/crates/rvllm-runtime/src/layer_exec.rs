@@ -35,6 +35,14 @@ pub enum LayerPhase {
     Prefill {
         cu_seqlens_q: u64, // [batch+1] i32 prefix sum on device
         max_seqlen_q: u32, // longest Q seq length
+        /// Caller-supplied true batch size. Previously the prefill
+        /// path computed `num_tokens / max_seqlen_q`, which only
+        /// recovers the right value for uniform-length prompts —
+        /// heterogeneous batches like `[3, 5]` collapsed to a single
+        /// virtual sequence and the attention kernel read the wrong
+        /// regions. The scheduler always knows the real batch size
+        /// (it builds `cu_seqlens_q` from it), so we plumb it through.
+        num_seqs: u32,
     },
 }
 
@@ -359,17 +367,19 @@ pub unsafe fn forward_phase(
         LayerPhase::Prefill {
             cu_seqlens_q,
             max_seqlen_q,
+            num_seqs,
         } => {
             let prefill = PagedPrefillFp8Launcher::new(fa3);
             // num_tokens for prefill is total_q across the batch.
             let prefill_params = PagedPrefillParams {
                 num_tokens: dims.num_tokens,
-                // batch size: total_q / max_seqlen_q assuming uniform length
-                num_seqs: if max_seqlen_q == 0 {
-                    dims.num_tokens
-                } else {
-                    dims.num_tokens / max_seqlen_q
-                },
+                // Use the scheduler-supplied batch size. The previous
+                // `total_q / max_seqlen_q` reconstruction was only
+                // correct for uniform-length prompts; heterogeneous
+                // batches (e.g. lengths [3, 5]) collapsed to
+                // `num_seqs = 1` and the attention kernel read the
+                // wrong KV regions.
+                num_seqs,
                 num_heads: dims.num_heads,
                 num_kv_heads: dims.num_kv_heads,
                 head_dim: dims.head_dim,

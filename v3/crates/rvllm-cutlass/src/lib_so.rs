@@ -405,21 +405,26 @@ pub enum CutlassBackend {
 }
 
 /// Find the sm_120 `.so` via env override or the default location
-/// next to a sibling per-arch kernels dir. Returns `None` if neither
-/// candidate exists.
-fn resolve_sm120_so_path(sm90_hint: &std::path::Path) -> Option<PathBuf> {
+/// in the matching arch's kernels dir. Returns `None` if not found.
+fn resolve_sm120_so_path(
+    sm90_hint: &std::path::Path,
+    arch_name: &str,
+) -> Option<PathBuf> {
     if let Some(env) = std::env::var_os("RVLLM_CUTLASS_SM120_SO") {
         let p = PathBuf::from(env);
         if p.is_file() {
             return Some(p);
         }
     }
-    // `sm90_hint` is typically something like `.../kernels/<sm_xxx>/
-    // libcutlass_kernels.so` or the dummy-"unused" marker on sm_121.
-    // Look for `kernels/sm_120/libcutlass_sm120.so` relative to the
-    // hint's grandparent.
+    // Codex27-1: only the matching arch dir. Codex25-1's
+    // sm_121→sm_120→sm_122 fallback chain risked silently loading a
+    // .so that was built for a different Blackwell sub-arch (e.g.
+    // sm_120a on a sm_121a host); the cooperative kernel hits
+    // `CUTE_INVALID_CONTROL_PATH` because the family-conditional
+    // doesn't match. Operators with non-default layouts use the
+    // env override.
     if let Some(grandparent) = sm90_hint.parent().and_then(|p| p.parent()) {
-        let candidate = grandparent.join("sm_120").join("libcutlass_sm120.so");
+        let candidate = grandparent.join(arch_name).join("libcutlass_sm120.so");
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -699,13 +704,17 @@ impl CutlassBackend {
     /// Construct a backend per device `CompileTarget`. `path` and
     /// `policy_variants` are only consulted for the `So` path — when
     /// the live device is sm_121 we skip `.so` loading entirely.
-    /// On sm_121 we first look for a sm_120 `libcutlass_sm120.so`.
-    /// The file is resolved in this order:
+    /// On sm_121 we look for the matching `libcutlass_sm120.so` in
+    /// the runtime arch's directory (Codex27-1 tightened earlier
+    /// sm_120/sm_122 fallbacks to a single arch). The file is
+    /// resolved in this order:
     ///   1. env `RVLLM_CUTLASS_SM120_SO` (absolute path).
-    ///   2. `<path.parent()>/sm_120/libcutlass_sm120.so` — the layout
-    ///      produced by `kernels/build_cutlass_sm120_so.sh`, which
-    ///      makes "kernels_dir" a natural resolution root for
-    ///      `probe-gemma4-load` / `rvllm-server`.
+    ///   2. `<path.parent().parent()>/sm_121/libcutlass_sm120.so`
+    ///      — the layout produced by `kernels/build_cutlass_sm120_so.sh`
+    ///      (auto-detect picks `sm_121a` on GB10 hosts so the .so
+    ///      lands in `kernels/sm_121/`). Operators on RTX 5090 /
+    ///      RTX 6000 Blackwell (sm_120) or sm_122 use the env override
+    ///      since the resolver is locked to sm_121 here.
     /// If neither is present, fall through to `Absent` — previous
     /// behaviour, so a host without the library built keeps working
     /// via the PTX fallback.
@@ -716,7 +725,7 @@ impl CutlassBackend {
         policy_variants: &[VariantId],
     ) -> Result<Self> {
         if matches!(target, Some(rvllm_core::CompileTarget::Sm121)) {
-            if let Some(sm120_path) = resolve_sm120_so_path(&path) {
+            if let Some(sm120_path) = resolve_sm120_so_path(&path, "sm_121") {
                 return Ok(CutlassBackend::SoSm120(CutlassSm120Lib::load(sm120_path)?));
             }
             return Ok(CutlassBackend::Absent);

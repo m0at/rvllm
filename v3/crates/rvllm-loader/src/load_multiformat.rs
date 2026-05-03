@@ -241,6 +241,25 @@ fn build_tensor_index(
 /// Load the whole model into `arena`. CPU-path FP8 quantization; one
 /// sync cuMemcpyHtoD per tensor. Call once at engine init.
 pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Result<LoadedModel> {
+    // Cycle 47 step 6a parallel guard (codex review of e0cf73b).
+    if let Some(awq) = crate::compressed_tensors::read_awq_config_from_dir(model_dir)
+        .map_err(|e| RvllmError::Loader {
+            err: LoaderError::Corrupt { detail: format!("quantization_config: {e}") },
+            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        })?
+    {
+        return Err(RvllmError::Loader {
+            err: LoaderError::UnsupportedQuantization {
+                detail: format!(
+                    "AWQ {:?} W{} detected; load_multiformat::load_model does not implement AWQ — use load_gemma4_model after cycle 48 wiring.",
+                    awq.format, awq.scheme.num_bits
+                ),
+            },
+            ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: None },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
     let (shards, tensors) = build_tensor_index(model_dir)?;
 
     let wprefix: &str = if tensors.contains_key("model.embed_tokens.weight") {
@@ -589,8 +608,12 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
     }
     let s: u8 = if v.to_bits() >> 31 != 0 { 0x80 } else { 0 };
     let a = v.abs();
+    // Canonicalise signed zero: both +0.0 and -0.0 encode to 0x00. FP8
+    // E4M3FN technically has a -0 (0x80) but the quantiser treats zero
+    // as sign-less — downstream attention / GEMM paths hit a dequant
+    // "zero + tiny scale → subnormal f16" edge if -0 leaks through.
     if a == 0.0 {
-        return s;
+        return 0;
     }
     if a > FP8_E4M3_MAX {
         return s | 0x7e;

@@ -73,24 +73,55 @@ compile_kernel() {
     case "$base" in cutlass_*)
         if [ -z "$CUTLASS_FLAGS" ]; then
             echo "  SKIP: $base.cu (CUTLASS not found)"
+            # Codex23-1: drop any pre-existing .ptx for the skipped
+            # kernel. Otherwise an old artifact from a prior CUTLASS-
+            # capable build survives, gen_manifest.sh re-publishes it
+            # via its `find kernels/sm_*/*.ptx` walk, and the runtime
+            # loads stale code paired with new launch ABIs.
+            rm -f "$ptx"
             return 0
         fi
         extra_flags="$CUTLASS_FLAGS -std=c++17"
         ;;
     esac
     # FP8 / NVFP4 tensor-core MMA kernels need the arch-specific
-    # feature set (`sm_121a` / `sm_120a`) because `.kind::f8f6f4`
-    # and `mma.kind::*f8*` live in the CUDA family-specific PTX
-    # feature set. Plain `sm_121` rejects them at ptxas time even
-    # though nvcc -ptx emits the instruction successfully.
-    if grep -q 'kind::f8f6f4\|mma.sync.*e4m3\|mma.sync.*e2m1\|fp8_mma_frag_pack\|mma_m16n8k32' "$cu" 2>/dev/null; then
+    # feature set (`sm_121a` / `sm_120a`) because `.kind::f8f6f4`,
+    # `mma.kind::*f8*`, and the NVFP4 hardware dequant instructions
+    # (`cvt.rn.*.e2m1x2`) live in the CUDA family-specific PTX feature
+    # set. Plain `sm_121` rejects them at ptxas time even though nvcc
+    # -ptx emits the instruction successfully.
+    #
+    # Codex20-4: scan the .cu *and* its #include'd local headers. The
+    # actual NVFP4 dequant inline asm lives in `nvfp4_utils.cuh`
+    # (~line 291) and a kernel that simply `#include "nvfp4_utils.cuh"`
+    # without mentioning `e2m1` in its own source would otherwise miss
+    # the regex. Earlier .cu files relied on load-bearing comments
+    # containing `cvt.rn.f16x2.e2m1x2` to coerce the grep — that's
+    # hostile to maintenance. Now any kernel including the helper
+    # header (or that header chain) is auto-detected. Scope: only
+    # local quoted includes; system <...> headers stay out.
+    local sources="$cu"
+    while IFS= read -r inc; do
+        local hdr="${inc#*\"}"; hdr="${hdr%\"*}"
+        local hdr_path="$(dirname "$cu")/$hdr"
+        if [ -f "$hdr_path" ]; then
+            sources="$sources $hdr_path"
+        fi
+    done < <(grep -E '^#include[[:space:]]*"[^"]+"' "$cu" 2>/dev/null)
+    if grep -q 'kind::f8f6f4\|mma.sync.*e4m3\|mma.sync.*e2m1\|fp8_mma_frag_pack\|mma_m16n8k32\|cvt.rn.f16x2.e2m1x2\|cvt.rn.bf16x2.e2m1x2\|cvt.rn.e2m1x2' $sources 2>/dev/null; then
         case "$arch" in
             sm_120) arch="sm_120a" ;;
             sm_121) arch="sm_121a" ;;
             sm_122) arch="sm_122a" ;;
         esac
     fi
-    $NVCC -ptx -arch="$arch" -O3 $extra_flags -o "$ptx" "$cu" 2>/dev/null
+    # Cycle 52 step 11d: stop swallowing nvcc errors. The cycle-21
+    # NVFP4 split-decode tmp_out f16->f32 fix updated the main kernel
+    # but not the BC16 variant; the resulting type mismatch was
+    # silently dropped here for ~30 cycles, leaving a stale PTX in
+    # the manifest with the wrong ABI. Print stderr so the next such
+    # bug surfaces immediately.
+    $NVCC -ptx -arch="$arch" -O3 $extra_flags -o "$ptx" "$cu"
 }
 
 # Revision pinned into the generated manifest.json. Precedence:
@@ -118,14 +149,79 @@ for arch in $ARCHS; do
     OUTDIR="$DIR/$arch"
     mkdir -p "$OUTDIR"
 
+    # NVCC failures used to be swallowed with WARNING and the
+    # manifest re-published with stale PTX from a prior build. That
+    # is especially dangerous for ABI changes in the NVFP4 / FA2
+    # kernels — caller's Rust expects the new signature, PTX still
+    # has the old one → silent corruption or LaunchFailed at
+    # runtime. We can't hard-fail because some files (fa3_sm90,
+    # cutlass_*) legitimately don't build in every environment, but
+    # we DO delete the stale .ptx on failure so the manifest cannot
+    # pick up an old artifact and pretend the new source compiled.
+    #
+    # Codex30-3: distinguish required vs optional. The pre-fix script
+    # treated every kernel as best-effort, so a partial sm_121 build
+    # could succeed at script level but ship a manifest missing
+    # FA2/NVFP4/fused_* — runtime later failed as
+    # FeatureNotAvailable / LaunchFailed without pointing at the
+    # missing PTX. The required-list below is conservative: anything
+    # FA2-decode/prefill, NVFP4 rope/decode/prefill, fused_*,
+    # rope_partial_fp8kv, rmsnorm/qk_rmsnorm/argmax — drop one and
+    # the engine refuses to start. fa3_sm90_* and cutlass_* stay
+    # opt-in.
+    is_required_kernel() {
+        # Codex32-1: bare-name attention sources (`flash_attention`,
+        # `flash_attention_nvfp4kv`, `flash_attention_unified_prefill`)
+        # are hard-loaded by the sm_121 Fa2Ptx backend (lib.rs's
+        # load_ptx calls don't have a `_2_` infix). Earlier patterns
+        # only matched the prefixed sub-variants and missed the
+        # bare names — a compile failure on flash_attention.cu
+        # silently shipped a manifest without it, and bring-up
+        # exploded later. The patterns below mirror lib.rs's
+        # load_ptx calls 1:1 plus the fused/util kernels every
+        # gemma4 pass touches.
+        # Codex33-1 extends the list to cover the util/fused kernels
+        # gemma4 bring-up loads via KernelLoader::load_ptx (see
+        # gemma4_bring_up.rs:4911 and below). Each one will fail at
+        # bring-up if its PTX is missing; build.sh now treats that
+        # as a build error instead of silently shipping a partial
+        # manifest.
+        case "$1" in
+            flash_attention|\
+            flash_attention_2_decode_*|flash_attention_2_prefill_*|\
+            flash_attention_unified_prefill|flash_attention_unified_prefill_*|\
+            flash_attention_nvfp4kv|flash_attention_nvfp4kv_*|\
+            flash_attention_decode_nvfp4kv_*|flash_attention_split_decode_nvfp4kv|\
+            flash_attention_split_decode_nvfp4kv_*|\
+            paged_attention_v2_reduce_*|\
+            fused_rope_partial_fp8kv*|fused_rope_partial_nvfp4kv*|fused_rope_cache_fp8kv*|\
+            fused_rmsnorm_*|fused_qk_rmsnorm*|fused_qkv_rmsnorm*|\
+            fused_gelu_mul_fp8*|fused_gelu_mul_f16*|fused_gelu_mul_bf16*|\
+            fused_norm_add_residual|fused_norm_add_residual_f16|fused_norm_add_residual_bf16|\
+            fp8_gemv|fp8_gemv_*|\
+            logit_softcap|hadamard_unrotate_f16|\
+            scale_cols_f16|scale_cols_f32|scale_rows_f32_ratio|\
+            argmax|rmsnorm_inplace_*|residual_scale_f16|vnorm_f16|\
+            vector_add_*|f32_to_*|f16_to_*|bf16_to_*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    REQUIRED_FAILURES=0
+    record_failure() {
+        local label="$1" base="$2" ptx="$3"
+        echo "  WARNING: $label$base.cu failed for $arch — removing stale PTX (was: $ptx)" >&2
+        rm -f "$ptx"
+        if is_required_kernel "$base"; then
+            echo "  REQUIRED kernel $base failed — manifest would be incomplete" >&2
+            REQUIRED_FAILURES=$((REQUIRED_FAILURES + 1))
+        fi
+    }
     for cu in "$DIR"/*.cu; do
         [ -f "$cu" ] || continue
         base=$(basename "$cu" .cu)
         ptx="$OUTDIR/${base}.ptx"
         echo "  $base.cu -> $arch/$base.ptx"
-        compile_kernel "$cu" "$arch" "$ptx" || {
-            echo "  WARNING: $base.cu failed for $arch (may need newer CUDA toolkit)"
-        }
+        compile_kernel "$cu" "$arch" "$ptx" || record_failure "" "$base" "$ptx"
     done
 
     if [ -d "$V3_KERNELS_DIR" ]; then
@@ -134,14 +230,18 @@ for arch in $ARCHS; do
             base=$(basename "$cu" .cu)
             ptx="$OUTDIR/${base}.ptx"
             echo "  (v3) $base.cu -> $arch/$base.ptx"
-            compile_kernel "$cu" "$arch" "$ptx" || {
-                echo "  WARNING: v3/$base.cu failed for $arch (may need newer CUDA toolkit)"
-            }
+            compile_kernel "$cu" "$arch" "$ptx" || record_failure "v3/" "$base" "$ptx"
         done
     fi
 
+    if [ "$REQUIRED_FAILURES" -gt 0 ]; then
+        echo "  ERROR: $REQUIRED_FAILURES required kernel(s) failed for $arch — refusing to publish manifest" >&2
+        exit 1
+    fi
+
     "$DIR/gen_manifest.sh" "$OUTDIR" "$REVISION" || {
-        echo "  WARNING: manifest generation failed for $arch"
+        echo "  ERROR: manifest generation failed for $arch" >&2
+        exit 1
     }
 done
 

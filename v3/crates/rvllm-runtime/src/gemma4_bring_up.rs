@@ -19,6 +19,317 @@ use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
 use crate::gemma4_layer_exec::Gemma4LayerKernels;
 
+// Cycle 56 step 7: cuda_check! macro hoisted to crate root in lib.rs.
+
+/// Per-request sampling configuration handed to [`Gemma4Bringup::run_generate`].
+///
+/// `Greedy` is unconditional argmax — the runtime does NOT consult
+/// `RVLLM_SAMPLING_TEMPERATURE` / `_TOP_P` here. A previous iteration
+/// kept that env-var fallback as a "dev knob" for bench/probe, but it
+/// also fired for HTTP requests that explicitly sent `temperature: 0`
+/// and silently broke their determinism the moment the env var was
+/// exported on the box. Stochastic semantics live exclusively on
+/// `Stochastic`. Bench/probe binaries call `SamplingConfig::greedy()`
+/// and run argmax; if they ever want sampling, they should plumb
+/// their own CLI flags into `Stochastic`.
+#[derive(Debug, Clone, Copy)]
+pub enum SamplingConfig {
+    Greedy,
+    Stochastic {
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        seed: u64,
+    },
+}
+
+impl SamplingConfig {
+    /// Default for callers that do not opt into per-request sampling
+    /// (bench, probe). Always argmax — there is no env-var fallback.
+    pub fn greedy() -> Self {
+        SamplingConfig::Greedy
+    }
+}
+
+/// Resolve the effective NVFP4 attention partition size from the
+/// environment. Single source of truth — the attention-dispatch site
+/// in `gemma4_layer_exec.rs` and the decode-graph eligibility check
+/// in `run_generate` BOTH consult this so the eligibility guard
+/// can never disagree with the kernel that actually runs.
+///
+/// Default `1024` matches the dispatch-side default. Values that are
+/// not powers of two or smaller than 64 fall back to the default,
+/// mirroring the dispatch validator.
+pub fn effective_partition_size() -> u32 {
+    const DEFAULT: u32 = 1024;
+    let raw: u32 = std::env::var("RVLLM_NVFP4_PARTITION_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT);
+    if raw >= 64 && raw.is_power_of_two() {
+        raw
+    } else {
+        DEFAULT
+    }
+}
+
+/// Decide whether decode-graph capture is safe for a single generation.
+///
+/// The captured graph freezes the split-KV partition decision (single-
+/// CTA vs multi-partition attention dispatch). If `capture_ctx`
+/// (= `prompt_len + capture_decode_step + 1`) and
+/// `prompt_len + max_new` (the end of generation) fall on different
+/// sides of the `partition_size` threshold, replay would run the
+/// frozen kernel for an entire generation that grows past the
+/// capture-time decision. The kernel is still correct in that case
+/// but pays the wrong-path overhead, which negates the launch-overhead
+/// win that motivates capture in the first place.
+///
+/// `capture_decode_step` mirrors the `RVLLM_DECODE_GRAPH_CAPTURE_AT`
+/// runtime knob — operators who tune the capture point also shift the
+/// boundary at which this check evaluates.
+///
+/// Returns `true` when capture is safe. Codex36-1 tightened the
+/// rule: capture is safe only when the partition count is identical
+/// at capture and at end-of-generation. The earlier "both > 1"
+/// branch tolerated count drift across partition-size boundaries,
+/// but Codex35-2 made `gridDim.z = current_num_partitions` at
+/// launch time. Captured graphs freeze that gridDim, so once the
+/// live context crosses the next partition boundary the reducer
+/// (which still reads the live `context_lens`) reads from
+/// scratch slots no CTA wrote — silent stale-attention.
+/// Drift case → eager path, which re-launches with the correct
+/// per-step gridDim.z.
+pub fn decode_graph_eligible_for_generation(
+    prompt_len: u32,
+    max_new: u32,
+    partition_size: u32,
+    capture_decode_step: u32,
+    split_kv_active: bool,
+) -> bool {
+    if partition_size == 0 {
+        return false;
+    }
+    // Codex37-3: the parts-count drift check only matters when split-KV
+    // is actually used. With split-KV disabled (env=0, FP8/F16 KV, no
+    // split kernels loaded, or unsuitable layer mix), gridDim.z stays
+    // at 1 and the live `context_lens` read by the reducer can't read
+    // stale slots — capture is safe regardless of partition crossings.
+    // Earlier this function refused capture across partition boundaries
+    // unconditionally, costing decode-graph perf with no correctness
+    // gain.
+    // Codex51-2: the decode loop runs `0..max_new - 1`, so the
+    // largest decode_step ever reached is `max_new - 2`. If
+    // `capture_decode_step` lands at or beyond `max_new - 1`, the
+    // capture site is never executed and `RVLLM_DECODE_GRAPH=1`
+    // silently does nothing. Reject up front so the eager-fallback
+    // log line surfaces the misconfiguration. (max_new = 1 has zero
+    // decode-loop iterations; nothing to capture there either.)
+    if max_new < 2 || capture_decode_step >= max_new.saturating_sub(1) {
+        return false;
+    }
+    if !split_kv_active {
+        return true;
+    }
+    let capture_ctx = prompt_len
+        .saturating_add(capture_decode_step)
+        .saturating_add(1);
+    // Codex38-3: end_ctx = prompt_len + max_new - 1. The decode loop
+    // emits the first new token directly after prefill and runs the
+    // remaining `max_new - 1` forward passes; the last one sees
+    // context length `prompt_len + max_new - 1`. Using the old
+    // `prompt_len + max_new` upper-bound rejected requests that
+    // happened to land on a partition boundary just one token past
+    // their actual final ctx.
+    let end_ctx = prompt_len.saturating_add(max_new.saturating_sub(1)).max(1);
+    let parts_at_capture = capture_ctx.div_ceil(partition_size).max(1);
+    let parts_at_end = end_ctx.div_ceil(partition_size).max(1);
+    parts_at_capture == parts_at_end
+}
+
+#[cfg(test)]
+mod decode_graph_eligibility_tests {
+    use super::{decode_graph_eligible_for_generation, effective_partition_size};
+
+    #[test]
+    fn short_prompt_short_generation_eligible() {
+        // Capture at ctx=2, end at ctx=33, partition=256 → both <= 256.
+        assert!(decode_graph_eligible_for_generation(0, 33, 256, 1, true));
+    }
+
+    #[test]
+    fn long_prompt_inside_one_partition_eligible() {
+        // prompt_len=200, max_new=40, partition=256 → end_ctx=240 ≤ 256.
+        assert!(decode_graph_eligible_for_generation(200, 40, 256, 1, true));
+    }
+
+    #[test]
+    fn generation_crosses_partition_boundary_blocked() {
+        // prompt_len=200, max_new=200, end_ctx=400 → 400/256=2 parts,
+        // capture_ctx=202 → 1 part. Capture would freeze single-CTA
+        // path; replay the second half wrongly. Block capture.
+        assert!(!decode_graph_eligible_for_generation(200, 200, 256, 1, true));
+    }
+
+    #[test]
+    fn long_prompt_already_past_boundary_eligible() {
+        // prompt_len=2000, max_new=40 — capture_ctx and end_ctx both
+        // produce 8 partitions, so the split-path decision is stable.
+        assert!(decode_graph_eligible_for_generation(2000, 40, 256, 1, true));
+    }
+
+    #[test]
+    fn long_prompt_crossing_higher_boundary_blocked() {
+        // Codex36-1 regression test: parts_at_capture=8, parts_at_end=9
+        // (generation crosses one more partition boundary). The old
+        // "both > 1" rule incorrectly accepted this; with frozen
+        // gridDim.z and a live-context-driven reducer, partition slot
+        // 8 would be read but never written. New rule rejects.
+        // prompt_len=2000, max_new=300, partition=256
+        //   capture_ctx = 2002 → 8 parts
+        //   end_ctx     = 2300 → 9 parts
+        assert!(!decode_graph_eligible_for_generation(2000, 300, 256, 1, true));
+    }
+
+    #[test]
+    fn crossing_boundary_eligible_when_split_inactive() {
+        // Codex37-3 regression test: when split-KV is OFF, gridDim.z
+        // stays at 1 and the parts-count drift can't cause stale-slot
+        // reads. The same shape that Codex36-1 rejects (capture=8,
+        // end=9) is therefore safe to capture with split_kv_active=false.
+        assert!(decode_graph_eligible_for_generation(2000, 300, 256, 1, false));
+    }
+
+    #[test]
+    fn zero_partition_size_blocks() {
+        // Defensive: a misconfigured partition_size of 0 must not
+        // panic via div_ceil; the eligibility just becomes false.
+        assert!(!decode_graph_eligible_for_generation(100, 100, 0, 1, true));
+    }
+
+    /// Regression: the eligibility check used to default to 256 while
+    /// the attention dispatch defaulted to 1024. With 1024 the split-
+    /// path threshold lives further out, so a default-config request
+    /// of `prompt_len=900, max_new=200` (end_ctx=1100) crosses the
+    /// boundary at 1024 and must NOT be eligible. Pinning the
+    /// shared default catches a future drift loudly.
+    #[test]
+    fn shared_default_blocks_900_plus_200_request() {
+        let p = effective_partition_size();
+        assert_eq!(p, 1024, "shared default drifted away from dispatch site");
+        assert!(
+            !decode_graph_eligible_for_generation(900, 200, p, 1, true),
+            "default-config 900+200 should cross the 1024 partition boundary",
+        );
+    }
+
+    /// Honour `RVLLM_DECODE_GRAPH_CAPTURE_AT`. Operators tuning the
+    /// capture point (e.g. to capture later when prompt KV is more
+    /// settled) shift the boundary the eligibility check evaluates.
+    /// A capture deep into the partition-2 region must NOT be marked
+    /// eligible just because the early steps still fit in
+    /// partition-1 — otherwise the captured kernel freezes the
+    /// wrong path.
+    #[test]
+    fn capture_at_shifts_eligibility_boundary() {
+        // prompt_len=200, max_new=300, p=256, capture_at=1 →
+        // capture_ctx=202 (parts=1), end_ctx=500 (parts=2) → blocked.
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 1, true));
+        // Same prompt+gen, capture_at=200 → capture_ctx=401 (parts=2),
+        // end_ctx=500 (parts=2) → eligible (both =2, equal).
+        // Codex51-2: must stay below max_new-1 (the loop bound) for
+        // the capture step to actually be reached at runtime.
+        assert!(decode_graph_eligible_for_generation(200, 300, 256, 200, true));
+    }
+
+    /// Codex51-2: capture_decode_step >= max_new - 1 is unreachable
+    /// because the decode loop runs `0..max_new - 1`. Earlier this
+    /// returned eligible and silently produced a no-op graph
+    /// capture; now reject up front so the eager-fallback warn line
+    /// makes the misconfiguration visible.
+    #[test]
+    fn unreachable_capture_at_blocks() {
+        // capture_at == max_new - 1 → loop never executes step 299
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 299, true));
+        // capture_at > max_new - 1 → also unreachable
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 300, true));
+        // max_new = 1 → zero decode-loop iterations; nothing to capture
+        assert!(!decode_graph_eligible_for_generation(200, 1, 256, 0, true));
+        // max_new = 2 → loop runs step 0 only; capture_at = 0 should
+        // still be eligible if the parts check holds.
+        assert!(decode_graph_eligible_for_generation(0, 2, 256, 0, true));
+    }
+
+    /// Lock down the env-var resolver: invalid (non-power-of-two,
+    /// too small) values fall back to the dispatch-site default
+    /// rather than letting the eligibility check use a bogus value
+    /// the dispatch site rejects.
+    #[test]
+    fn effective_partition_size_rejects_invalid_env() {
+        // Save + restore prior value so we don't pollute other tests.
+        let prior = std::env::var_os("RVLLM_NVFP4_PARTITION_SIZE");
+        std::env::set_var("RVLLM_NVFP4_PARTITION_SIZE", "777"); // not pow2
+        assert_eq!(effective_partition_size(), 1024);
+        std::env::set_var("RVLLM_NVFP4_PARTITION_SIZE", "32"); // < 64
+        assert_eq!(effective_partition_size(), 1024);
+        std::env::set_var("RVLLM_NVFP4_PARTITION_SIZE", "256"); // valid
+        assert_eq!(effective_partition_size(), 256);
+        match prior {
+            Some(v) => std::env::set_var("RVLLM_NVFP4_PARTITION_SIZE", v),
+            None => std::env::remove_var("RVLLM_NVFP4_PARTITION_SIZE"),
+        }
+    }
+}
+
+/// Cycle 46 step 5c: convert the loader's optional per-layer AWQ weight
+/// table into the runtime's flat-pointer struct. Returns the all-zero
+/// default when no AWQ tensors were uploaded for this layer (every
+/// non-AWQ checkpoint), so the existing FP8 dispatch cascade runs.
+fn awq_layer_ptrs(
+    awq: Option<&rvllm_loader::AwqLayerWeights>,
+) -> crate::gemma4_layer_exec::Gemma4AwqLayerPtrs {
+    let Some(a) = awq else {
+        return Default::default();
+    };
+    // group_size is the same across all 7 linears (AwqConfig contract:
+    // one Linear config group). Pick from q_proj — any of them is
+    // identical by construction.
+    let group_size = a.q_proj.group_size;
+    debug_assert!(
+        a.k_proj.group_size    == group_size
+            && a.v_proj.group_size    == group_size
+            && a.o_proj.group_size    == group_size
+            && a.gate_proj.group_size == group_size
+            && a.up_proj.group_size   == group_size
+            && a.down_proj.group_size == group_size,
+        "AwqLayerWeights group_size must be uniform across linears"
+    );
+    crate::gemma4_layer_exec::Gemma4AwqLayerPtrs {
+        q_packed:    a.q_proj.packed_offset_bytes,
+        q_scale:     a.q_proj.scale_offset_bytes,
+        q_zero:      a.q_proj.zero_point_offset_bytes,
+        k_packed:    a.k_proj.packed_offset_bytes,
+        k_scale:     a.k_proj.scale_offset_bytes,
+        k_zero:      a.k_proj.zero_point_offset_bytes,
+        v_packed:    a.v_proj.packed_offset_bytes,
+        v_scale:     a.v_proj.scale_offset_bytes,
+        v_zero:      a.v_proj.zero_point_offset_bytes,
+        o_packed:    a.o_proj.packed_offset_bytes,
+        o_scale:     a.o_proj.scale_offset_bytes,
+        o_zero:      a.o_proj.zero_point_offset_bytes,
+        gate_packed: a.gate_proj.packed_offset_bytes,
+        gate_scale:  a.gate_proj.scale_offset_bytes,
+        gate_zero:   a.gate_proj.zero_point_offset_bytes,
+        up_packed:   a.up_proj.packed_offset_bytes,
+        up_scale:    a.up_proj.scale_offset_bytes,
+        up_zero:     a.up_proj.zero_point_offset_bytes,
+        down_packed: a.down_proj.packed_offset_bytes,
+        down_scale:  a.down_proj.scale_offset_bytes,
+        down_zero:   a.down_proj.zero_point_offset_bytes,
+        group_size,
+    }
+}
+
 pub use crate::bring_up::HbmArenaCheckpoint;
 
 /// Default per-tensor Q / KV scale for the FP8 E4M3 attention cache.
@@ -32,6 +343,28 @@ pub use crate::bring_up::HbmArenaCheckpoint;
 const DEFAULT_Q_SCALE: f32 = 0.1;
 const DEFAULT_KV_SCALE: f32 = 0.08;
 
+/// Cycle 56 step 2: parse a `f32` env var with explicit logging on
+/// malformed values. The earlier `.parse().ok().unwrap_or(default)`
+/// idiom silently swallowed parse failures — operator setting
+/// `RVLLM_Q_SCALE=invalid` got the default with no signal. With this
+/// helper, malformed values emit a stderr warning and fall back; the
+/// operator at least sees the misconfig in journalctl.
+fn parse_f32_env_or_default(name: &'static str, default: f32) -> f32 {
+    match std::env::var(name) {
+        Err(_) => default, // env unset is the silent-OK case
+        Ok(v) => match v.parse::<f32>() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!(
+                    "[rvllm] WARN: {name}={v:?} failed to parse as f32 ({e}); \
+                     falling back to default {default}",
+                );
+                default
+            }
+        },
+    }
+}
+
 pub struct Gemma4EnginePaths {
     pub model_dir: PathBuf,
     pub kernels_dir: PathBuf,
@@ -44,10 +377,17 @@ pub struct Gemma4FusedModules {
     pub rmsnorm_mod: LoadedModule,
     pub rmsnorm_inplace_mod: LoadedModule,
     pub rope_mod: LoadedModule,
+    /// Cycle 55 step 7 (Phase B): bf16-input sibling of rope_mod
+    /// (`fused_rope_partial_fp8kv_bf16in`).
+    pub rope_partial_fp8kv_bf16in_mod: LoadedModule,
     pub gelu_mod: LoadedModule,
     pub argmax_mod: LoadedModule,
     pub qk_norm_mod: LoadedModule,
+    /// Cycle 55 step 5 (Phase B): bf16-typed sibling of qk_norm_mod.
+    pub qk_norm_bf16_mod: LoadedModule,
     pub softcap_mod: LoadedModule,
+    /// Codex41-3: device-side repetition penalty PTX module.
+    pub repetition_penalty_mod: LoadedModule,
     pub residual_scale_mod: LoadedModule,
     pub vnorm_mod: LoadedModule,
     pub vector_add_mod: LoadedModule,
@@ -58,30 +398,61 @@ pub struct Gemma4FusedModules {
     pub f32_to_f16_sat_mod: LoadedModule,
     pub scale_cols_f32_mod: LoadedModule,
     pub scale_rows_f32_ratio_mod: LoadedModule,
-    pub compute_qkv_scales_mod: LoadedModule,
     pub fused_gelu_mul_f16_mod: LoadedModule,
+    /// Cycle 55 step 6 (Phase B): bf16 sibling of fused_gelu_mul_f16.
+    pub fused_gelu_mul_bf16_mod: LoadedModule,
     pub fused_rope_partial_f16kv_mod: LoadedModule,
     pub fused_norm_add_residual_mod: LoadedModule,
+    // Cycle 53+ Stage 1: BF16 residual chain modules.
+    pub f16_to_bf16_mod: LoadedModule,
+    pub fused_norm_add_residual_bf16_mod: LoadedModule,
+    pub fused_rmsnorm_fp8_quant_bf16in_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
     pub fn_rope_partial_fp8kv: KernelFn,
+    /// Cycle 55 step 7: bf16-input sibling of fn_rope_partial_fp8kv.
+    /// Same launch ABI; Q/K/V activation inputs flip f16 → bf16 while
+    /// FP8 KV cache write side stays unchanged (FP8 by design).
+    pub fn_rope_partial_fp8kv_bf16in: KernelFn,
     pub fn_gelu_mul: KernelFn,
     pub fn_argmax: KernelFn,
     pub fn_qk_rmsnorm: KernelFn,
+    /// Cycle 55 step 5: bf16 sibling of fn_qk_rmsnorm. Same launch
+    /// ABI; only the dtype interpretation of inputs/outputs/gamma
+    /// flips f16 → bf16.
+    pub fn_qk_rmsnorm_bf16: KernelFn,
     pub fn_softcap: KernelFn,
+    /// Codex40-2: f32 variant for the generate-path logit softcap.
+    /// generate samples directly from f32 logits (no f16 conversion);
+    /// PPL/bench convert through f16 and use `fn_softcap`.
+    pub fn_softcap_f32: KernelFn,
+    /// Codex41-3: GPU-side repetition penalty (replaces the host
+    /// DtoH-edit-HtoD path that cost ~7ms/decode-step).
+    pub fn_apply_repetition_penalty_f32: KernelFn,
     pub fn_residual_scale: KernelFn,
     pub fn_vnorm: KernelFn,
     pub fn_vector_add: KernelFn,
     pub fn_bf16_to_f16_sat: KernelFn,
     pub fn_rmsnorm_inplace_bf16: KernelFn,
     pub fn_vector_add_bf16_to_f16: KernelFn,
+    // Cycle 53+ Stage 1: BF16 residual chain function handles.
+    pub fn_f16_to_bf16: KernelFn,
+    pub fn_fused_norm_add_residual_bf16: KernelFn,
+    pub fn_fused_norm_add_residual_bf16_f16in: KernelFn,
+    /// Cycle 55 step 19 (Phase B): bf16-input + bf16-residual variant
+    /// for the FULL_CHAIN dispatch where Fp8GemvBf16In produces bf16
+    /// GEMV output directly. Eliminates the f16 narrow at the
+    /// epilogue boundary that the `_bf16_f16in` variant required.
+    pub fn_fused_norm_add_residual_bf16_bf16in: KernelFn,
+    pub fn_fused_rmsnorm_fp8_quant_bf16in: KernelFn,
     pub fn_f32_to_bf16: KernelFn,
     pub fn_f32_to_f16_sat: KernelFn,
     pub fn_scale_cols_f32: KernelFn,
     pub fn_scale_rows_f32_ratio: KernelFn,
-    pub fn_compute_qkv_scales: KernelFn,
     pub fn_fused_gelu_mul_f16: KernelFn,
+    /// Cycle 55 step 6: bf16 sibling of fn_fused_gelu_mul_f16.
+    pub fn_fused_gelu_mul_bf16: KernelFn,
     pub fn_fused_rope_partial_f16kv: KernelFn,
     pub fn_fused_norm_add_residual: KernelFn,
     pub fn_fused_norm_add_residual_f16: KernelFn,
@@ -91,7 +462,12 @@ pub struct Gemma4FusedModules {
     pub fn_fused_norm_add_residual_f16in: KernelFn,
     pub fused_norm_add_residual_f16_mod: LoadedModule,
     pub fn_fused_qkv_rmsnorm: KernelFn,
+    /// Cycle 55 step 11 (Phase B): bf16 sibling of fn_fused_qkv_rmsnorm.
+    /// Same launch ABI; Q/K/V/gamma all flip f16 → bf16.
+    pub fn_fused_qkv_rmsnorm_bf16: KernelFn,
     pub fused_qkv_rmsnorm_mod: LoadedModule,
+    /// Cycle 55 step 11 (Phase B): bf16-typed sibling of fused_qkv_rmsnorm_mod.
+    pub fused_qkv_rmsnorm_bf16_mod: LoadedModule,
     pub fn_scale_cols_f16: KernelFn,
     pub scale_cols_f16_mod: LoadedModule,
 
@@ -111,6 +487,188 @@ pub struct Gemma4FusedModules {
     /// directly off f16 activations, skipping the FP8 activation-
     /// quant step that cuBLASLt requires.
     pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
+    /// Cycle 55 step 3 (Phase B): bf16-input sibling of the f16in fast
+    /// path above. Same kernel ABI (`Fp8GemvF16InLaunch` reuses), only
+    /// the dtype interpretation of input/output buffers differs. Used
+    /// when `dims.bf16_residual = true` (the default since cycle 55
+    /// step 1) so the M=1 decode QKV + gate_up fast paths don't narrow
+    /// bf16→f16-sat at projection entry.
+    pub fn_fp8_gemv_wpr_native_bf16in: Option<KernelFn>,
+    /// Companion to the V-rotation arm of the NVFP4 RoPE kernel: when
+    /// V is stored rotated (V_cache = V·R), attn_out = P·V·R, and we
+    /// need to right-multiply attn_out by R^T per (token, head) before
+    /// the O-projection. `None` on branches without the PTX or when
+    /// loading fails — the dispatch site falls back to "no V rotation"
+    /// in that case.
+    pub hadamard_unrotate_f16_mod: Option<LoadedModule>,
+    pub fn_hadamard_unrotate_f16: Option<KernelFn>,
+    /// AWQ INT4 W4A16 GEMV kernel (cycle 45 step 4.5c). PTX may be
+    /// absent on older kernel trees / non-Blackwell branches; fall
+    /// through to `None` and the dispatch site treats AWQ as
+    /// unavailable for any layer (load_gemma4_model rejects an
+    /// AwqConfig-bearing checkpoint when this is `None`).
+    pub awq_int4_gemv_f16_mod: Option<LoadedModule>,
+    pub fn_awq_int4_gemv_f16: Option<KernelFn>,
+    /// Cycle 51 step 10d.4: AWQ INT4 W4A16 GEMM kernel (M>1 prefill).
+    /// PTX may be absent on older kernel trees; the AWQ prefill
+    /// dispatch falls through to the per-token GEMV loop when this is
+    /// `None`.
+    pub awq_int4_gemm_sm120_wmma_mod: Option<LoadedModule>,
+    pub fn_awq_int4_gemm_sm120_wmma: Option<KernelFn>,
+}
+
+/// Session-level prefix cache state. Populated on first `run_generate`
+/// call; each subsequent call inspects `last_tokens` for a common
+/// prefix with the incoming prompt and, on hit, skips prefill for
+/// the matched prefix (the KV entries from the previous request
+/// remain valid in the persistent KV region because `kv_cache_ptr`
+/// points above the worker's scratch checkpoint).
+///
+/// MVP of vLLM's block-level prefix caching — no hashing, no
+/// reference counting, just a single "last request's prompt" slot.
+/// Covers the common zeroclaw pattern (identical 15k-token persona
+/// on every request) at a cost of ~100 LOC of plumbing. Full
+/// multi-sequence prefix caching is future work.
+pub struct PrefixCacheState {
+    pub last_tokens: Vec<u32>,
+    pub kv_cache_ptr: u64,
+    pub kv_cache_bytes: u64,
+    pub kv_scale_ptr: u64,
+    pub kv_scale_bytes: u64,
+    pub kv_dtype: crate::gemma4_layer_exec::KvDtype,
+    pub kv_layer_offsets: Vec<u64>,
+    pub kv_scale_layer_offsets: Vec<u64>,
+    pub num_blocks_total: u32,
+    pub block_size: u32,
+    /// Length (in tokens) of the prefix from `last_tokens` that
+    /// is SAFE to reuse across a subsequent request. Capped at
+    /// the last full prefill-chunk boundary so subsequent prompts
+    /// that match this prefix are guaranteed to find KV entries
+    /// written under the SAME chunk shape as the new request would
+    /// use for those positions.
+    ///
+    /// Without this cap, a short request (e.g. classifier, 3057
+    /// tokens prefilled in chunks 2048+1009) leaves slots
+    /// [2048..3057) populated under chunk_q=1009. A subsequent
+    /// long request (e.g. 15k tokens) would have written those
+    /// same slots inside its own first chunk_q=2048. Optimized
+    /// NVFP4 kernels are batch-variant; reusing classifier-shape
+    /// KV at slots [2048..2922) inside the 15k request produces
+    /// catastrophic garbage ("la la la × 1024" repetition collapse,
+    /// observed in production via zeroclaw classifier-then-persona
+    /// chains).
+    ///
+    /// Set to `floor(prompt_len / chunk_size) * chunk_size` after
+    /// each request completes (or `prompt_len` when chunk_size = 0,
+    /// i.e. no chunking).
+    pub committed_prefix_len: u32,
+    /// Provenance tuple. Cache is INVALIDATED on mismatch — KV
+    /// entries written under different policy configuration are
+    /// not generally reusable. Cheap to check; protects against
+    /// silent miscompare across env-var flips between requests.
+    pub provenance: PrefixProvenance,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PrefixProvenance {
+    pub chunk_size: u32,
+    pub kv_dtype: crate::gemma4_layer_exec::KvDtype,
+    pub hybrid_global_fp8: bool,
+    pub scale_policy: u32,        // 0 = amax6, 1 = mse, etc.
+    // K/V scale-policy split (each falls back to scale_policy when unset).
+    // Tracked here so the prefix cache invalidates if either side flips.
+    pub k_scale_policy: u32,
+    pub v_scale_policy: u32,
+    // NVFP4 quality knobs that change how K/Q-side state is interpreted.
+    pub hadamard: bool,
+    /// Whether V was Hadamard-rotated before NVFP4 packing. Cached V
+    /// bytes differ between rotated/unrotated, so flipping this gate
+    /// across requests on the same prefix-cache slot reuses
+    /// incompatible V data — must invalidate the cache.
+    pub hadamard_v: bool,
+    pub per_token_q_scale: bool,
+    pub batch_prefill: bool,
+    pub unified_prefill: bool,
+    /// Split-KV decode (paged_attention_v2 style). The split kernel
+    /// has documented quality issues on long-context tool-call
+    /// prompts even with Hadamard rotation; tracked here because
+    /// flipping it changes which kernel reads the V cache and a
+    /// silent flip mid-session could mask the failure mode.
+    pub split_kv: bool,
+    /// Inverse hybrid (cycle 25): all sliding layers FP8 KV when set.
+    /// Changes per-layer dtype dispatch so different bytes land in K/V
+    /// cache for sliding layers — must invalidate prefix cache on flip.
+    pub hybrid_sliding_fp8: bool,
+    /// Comma-separated layer-index list (cycle 24) forced to FP8 KV when
+    /// default is NVFP4. Stored as the raw env string so flipping any
+    /// element triggers invalidation; `String::new()` when unset.
+    pub fp8_kv_layers: String,
+    /// Cycle 31: stochastic-rounding gate for V. Changes packed V bytes
+    /// (different fp4_encode path) so flipping mid-session would silently
+    /// reuse incompatible V data on prefix-cache hits.
+    pub stoch_round_v: bool,
+    /// Codex17-2: NVFP4 split-decode partition size. Doesn't change KV
+    /// bytes, but changes which split-decode kernel + reducer shape runs
+    /// at decode time. Tracked here so the prefix cache invalidates on
+    /// partition-size flips between requests; otherwise reproducibility
+    /// across runs that share a cache slot is silently lost.
+    pub partition_size: u32,
+}
+
+impl PrefixProvenance {
+    /// Read current env into a provenance tuple.
+    pub fn from_env() -> Self {
+        let chunk_size: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
+        let hybrid_global_fp8 =
+            parse_truthy_env("RVLLM_NVFP4_HYBRID_GLOBAL_FP8").unwrap_or(false);
+        fn parse_policy(v: &str) -> Option<u32> {
+            match v {
+                "amax6" | "0" => Some(0),
+                "mse" | "1" => Some(1),
+                _ => None,
+            }
+        }
+        let scale_policy = std::env::var("RVLLM_NVFP4_SCALE_POLICY")
+            .ok().and_then(|s| parse_policy(&s)).unwrap_or(0);
+        let k_scale_policy = std::env::var("RVLLM_NVFP4_K_SCALE_POLICY")
+            .ok().and_then(|s| parse_policy(&s)).unwrap_or(scale_policy);
+        let v_scale_policy = std::env::var("RVLLM_NVFP4_V_SCALE_POLICY")
+            .ok().and_then(|s| parse_policy(&s)).unwrap_or(scale_policy);
+        // Codex56-default: A_prod sweep config (cycle 55) is the
+        // sweep-validated production target — flipping the unset
+        // defaults to ON means a fresh deployment with no profile
+        // env vars set still lands on production-quality config.
+        // Operators opt OUT explicitly via `=0` for diagnostics.
+        let hadamard = parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(true);
+        // Provenance tracks the NVFP4 path's effective gate. Per Codex10-2
+        // HADAMARD=1 auto-implies PER_TOKEN_Q_SCALE; the explicit default
+        // here matches that contract so unset-env behaviour stays clean.
+        let per_token_q_scale = parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(true);
+        let hadamard_v = parse_truthy_env("RVLLM_NVFP4_HADAMARD_V").unwrap_or(true);
+        let batch_prefill = parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false)
+            && kv_dtype != crate::gemma4_layer_exec::KvDtype::F16;
+        // Match the NVFP4/FP8 prefill dispatch gate: unified prefill is
+        // default-on and only explicit false-ish values disable it. Using
+        // mere env presence here made `RVLLM_UNIFIED_PREFILL=0` and `=1`
+        // look identical to the prefix cache even though they route through
+        // different attention kernels.
+        let unified_prefill = parse_truthy_env("RVLLM_UNIFIED_PREFILL").unwrap_or(true);
+        // Default ON in dispatch (gemma4_layer_exec.rs line ~870), opt-out via "0"/etc.
+        let split_kv = parse_truthy_env("RVLLM_NVFP4_SPLIT_KV").unwrap_or(true);
+        let hybrid_sliding_fp8 =
+            parse_truthy_env("RVLLM_NVFP4_HYBRID_SLIDING_FP8").unwrap_or(false);
+        let fp8_kv_layers = std::env::var("RVLLM_FP8_KV_LAYERS")
+            .unwrap_or_default();
+        let stoch_round_v = parse_truthy_env("RVLLM_NVFP4_STOCH_ROUND_V").unwrap_or(false);
+        let partition_size = effective_partition_size();
+        Self { chunk_size, kv_dtype, hybrid_global_fp8, scale_policy,
+               k_scale_policy, v_scale_policy, hadamard, hadamard_v,
+               per_token_q_scale, batch_prefill, unified_prefill, split_kv,
+               hybrid_sliding_fp8, fp8_kv_layers, stoch_round_v,
+               partition_size }
+    }
 }
 
 pub struct Gemma4Bringup {
@@ -127,10 +685,486 @@ pub struct Gemma4Bringup {
     pub stream: Stream,
     pub arena: HbmArena<'static>,
     pub ctx: Arc<CudaContextHandle>,
+    /// Session-level prefix cache. Populated lazily on first
+    /// `run_generate` call; kept across subsequent calls so the
+    /// KV cache survives the worker's scratch-checkpoint restore.
+    pub prefix_cache: std::sync::Mutex<Option<PrefixCacheState>>,
+    // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+    /// Ground-truth F16 shadow KV region for the instrumented layer set.
+    /// Populated on first run_generate when RVLLM_NVFP4_SHADOW_F16=1.
+    pub nvfp4_shadow: std::sync::Mutex<Option<NvFp4ShadowAlloc>>,
+    /// One-shot latch for first-token dump.
+    pub nvfp4_shadow_dumped: std::sync::atomic::AtomicBool,
+    // === END NVFP4 SHADOW DIAGNOSTIC ===
+    // === HADAMARD ROTATION ===
+    /// Per-layer ±1 sign vectors for signed Walsh-Hadamard rotation
+    /// of NVFP4 KV-cache K (and matching Q rotation pre-FP8). `None`
+    /// when `RVLLM_NVFP4_HADAMARD` is unset OR kv_dtype != Nvfp4.
+    /// Lazy-init on first `run_generate` (same pattern as
+    /// `nvfp4_shadow`); deterministic seed so the same run
+    /// reproduces identical R matrices across calls.
+    pub nvfp4_hadamard: std::sync::Mutex<Option<NvFp4HadamardAlloc>>,
+    // === END HADAMARD ROTATION ===
+}
+
+// === HADAMARD ROTATION ===
+/// Per-layer ±1 sign vectors. Total size = `num_layers * head_dim`
+/// bytes (i8 storage). Layer `l`'s slice begins at
+/// `base + l * head_dim` (head_dim is uniform across Gemma 4 layers
+/// at the rope-input level — both sliding and global use the same
+/// per-head dimension; `arch.max_head_dim()` covers both).
+pub struct NvFp4HadamardAlloc {
+    pub base_ptr: u64,
+    pub bytes: u64,
+    pub head_dim: u32,
+    pub num_layers: u32,
+}
+
+impl NvFp4HadamardAlloc {
+    /// Device pointer for layer `layer_idx`. Returns 0 when out of
+    /// range (caller should treat as "rotation disabled" — kernel's
+    /// nullptr check then bypasses).
+    pub fn layer_ptr(&self, layer_idx: u32) -> u64 {
+        if layer_idx >= self.num_layers {
+            return 0;
+        }
+        self.base_ptr + (layer_idx as u64) * (self.head_dim as u64)
+    }
+}
+
+/// Tri-state env truthiness parser used by every NVFP4/FP8 quality
+/// gate. Returns `Some(true)` for `"1"|"true"|"TRUE"|"yes"|"on"`,
+/// `Some(false)` for `"0"|"false"|"FALSE"|"no"|"off"|""`, and `None`
+/// for anything else so the caller falls back to a documented default.
+/// Centralised so a profile typo (e.g. `RVLLM_PER_TOKEN_Q_SCALE=yess`)
+/// behaves consistently across allocation, rope, decode, prefill, and
+/// the prefix-cache provenance check.
+pub(crate) fn parse_truthy_env(name: &str) -> Option<bool> {
+    let v = std::env::var(name).ok()?;
+    match v.as_str() {
+        "1" | "true" | "TRUE" | "yes" | "on" => Some(true),
+        "0" | "false" | "FALSE" | "no" | "off" | "" => Some(false),
+        _ => None,
+    }
+}
+
+/// Master env gate. Codex56-default: ON — sweep-validated A_prod
+/// config (cycle 55) is the production target; unset-env now lands
+/// on production-quality. Operator opts OUT via `=0` for diagnostics.
+pub fn nvfp4_hadamard_enabled() -> bool {
+    parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(true)
+}
+
+/// BF16 residual chain. Cycle 54 Stage 1 introduced this as an
+/// opt-in gate (RVLLM_RESIDUAL_BF16=1). Cycle 55 step 1 flips the
+/// **default to ON** because Gemma 4 was trained in bf16 and every
+/// modern foundation model trains in bf16; f16 storage is a
+/// distribution shift relative to training. The env still overrides
+/// to false for diagnostics / regression bisects.
+///
+/// This is Phase A of the cycle-55 "fully native bf16" effort. Phases
+/// B-G will progressively eliminate the f16↔bf16 conversions still
+/// happening at projection entry (the F16-in narrowing) and at
+/// embedding-gather / LM-head boundaries by building bf16-input
+/// kernel siblings, ultimately deleting the dead f16 kernels.
+pub fn bf16_residual_enabled() -> bool {
+    parse_truthy_env("RVLLM_RESIDUAL_BF16").unwrap_or(true)
+}
+
+/// Cycle 55 step 14 master gate: enable end-to-end bf16-native chain
+/// on the M=1 decode path. Implies `bf16_native_qkv_fast_path_enabled`
+/// + bf16 dispatch at fused_qkv_rmsnorm + fused_rope_partial + GeLU
+/// + gate_up/down F16-in fast paths + post-attn/FF epilogues. The
+/// attention kernel's output stays f16 (its bf16-out siblings exist
+/// from cycle 55 step 9 but are not yet dispatched in this gate; the
+/// O-projection consumes f16 attn_out and writes bf16 via
+/// `fused_norm_add_residual_bf16_f16in`'s built-in narrow).
+///
+/// Default OFF — empirical regression on long context (iteration 12
+/// WHO@17k) is unresolved. Per user directive cycle 55 step 14: wire
+/// the chain end-to-end accepting it may break short-term so we have
+/// the substrate for further investigation; production override
+/// keeps the f16 chain via `RVLLM_BF16_NATIVE_FULL_CHAIN=0`.
+pub fn bf16_native_full_chain_enabled() -> bool {
+    parse_truthy_env("RVLLM_BF16_NATIVE_FULL_CHAIN").unwrap_or(false)
+}
+
+/// Cycle 55 step 15 bisect overrides. When `RVLLM_BF16_NATIVE_FULL_CHAIN=1`
+/// is on, individual sub-dispatches default to bf16. Setting any of
+/// these env vars to 1 disables that one site (forces f16) while
+/// keeping the rest bf16. Use to localize which bf16 kernel introduces
+/// the empirical regression.
+pub fn bf16_disable_qkv_rmsnorm() -> bool {
+    parse_truthy_env("RVLLM_BF16_DISABLE_QKV_RMSNORM").unwrap_or(false)
+}
+pub fn bf16_disable_rope() -> bool {
+    parse_truthy_env("RVLLM_BF16_DISABLE_ROPE").unwrap_or(false)
+}
+
+/// Cycle 55 step 13/18: bf16-native dispatch on the M=1 decode QKV
+/// F16-in fast path (the production decode hot path). When ON, the
+/// residual is consumed as bf16 directly by `rmsnorm_inplace_bf16` +
+/// `Fp8GemvBf16In`, with a bf16→f16-sat narrow at the GEMV output to
+/// keep the downstream RoPE+attention chain on f16.
+///
+/// **Default OFF (reverted from step-19's brief flip-to-ON).**
+/// Iteration-16's "3/3 WHO@17k coherent" reading turned out to be
+/// non-reproducible under iteration-17's clean-restart + zeroclaw
+/// restart (3/3 garbage). Variance on this single prompt at
+/// long-context is wider than a 3-sample read can reliably detect;
+/// the cycle-54 stage-2.1 narrow path is more stable empirically.
+/// Step-13 stays in code as opt-in research substrate; production
+/// stays on cycle-54.
+pub fn bf16_native_qkv_fast_path_enabled() -> bool {
+    parse_truthy_env("RVLLM_BF16_NATIVE_QKV_FAST_PATH").unwrap_or(false)
+}
+
+// (Cycle 55 step 19 NOTE) The wholesale bf16 chain extension via
+// FULL_CHAIN is empirically null/regressive — bf16 mantissa loss
+// compounds through pre-FF rmsnorm + GEMV + bf16 gelu + ... producing
+// NVFP4-incompatible Q/K/V values downstream. Cycle-54 stage-2.1's
+// bf16→f16 narrow at projection input is the precision-bounding
+// shape that keeps the chain stable. The FULL_CHAIN gate stays in
+// code but the wholesale gate_up/down/gelu/epilogue extensions were
+// MANUALLY REVERTED back to f16 in `gemma4_layer_exec.rs` after the
+// iteration-17 wholesale flip empirically broke even short context.
+// What stays under FULL_CHAIN: QKV F16-in fast path bf16 (also
+// reachable via `RVLLM_BF16_NATIVE_QKV_FAST_PATH`) + fused_qkv_rmsnorm
+// _bf16 + RoPE bf16in dispatch — these stay wired as a research
+// substrate even though FULL_CHAIN itself remains empirically
+// regressive (use it only for diagnostic experiments).
+
+/// Per-token Q scale gate.
+/// * For the FP8-KV path the scratch allocation defaults ON because
+///   per-token Q materially helps PPL on prose (memory aa010018 in the
+///   rvllm-coder scenario). Operator opts out via
+///   `RVLLM_PER_TOKEN_Q_SCALE=0`.
+/// * For the NVFP4-KV path the rope launcher gates separately and
+///   defaults OFF; operator opts in via `RVLLM_PER_TOKEN_Q_SCALE=1`.
+///
+/// **Hadamard auto-implies per-token Q-scale.** When
+/// `RVLLM_NVFP4_HADAMARD=1` is set, the rotated Q saturates the static
+/// scalar Q-scale (rotation amax shifts so the fixed scalar can no
+/// longer cover the post-rotation range). The rope kernel comment
+/// pins this requirement explicitly. The two env vars used to be
+/// independent — operators who set `HADAMARD=1` without
+/// `PER_TOKEN_Q_SCALE=1` would silently get saturated Q values and
+/// numerically wrong attention. We now force per-token Q-scale ON
+/// whenever Hadamard is requested, with a one-shot warn so the
+/// operator sees the auto-enable in journalctl. An explicit
+/// `RVLLM_PER_TOKEN_Q_SCALE=0` together with `HADAMARD=1` is treated
+/// as a contradiction the operator clearly meant by accident — the
+/// auto-enable wins, but the warn line names it.
+pub(crate) fn per_token_q_scale_enabled(default_on: bool) -> bool {
+    static HADAMARD_OVERRIDE_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let raw = parse_truthy_env("RVLLM_PER_TOKEN_Q_SCALE").unwrap_or(default_on);
+    let hadamard = parse_truthy_env("RVLLM_NVFP4_HADAMARD").unwrap_or(true);
+    if hadamard && !raw {
+        HADAMARD_OVERRIDE_WARNED.get_or_init(|| {
+            tracing::warn!(
+                "RVLLM_NVFP4_HADAMARD=1 requires per-token Q-scale to keep \
+                 rotated Q below the static-scalar saturation threshold; \
+                 auto-enabling RVLLM_PER_TOKEN_Q_SCALE for this process \
+                 (set both to 1 explicitly to silence this warning)"
+            );
+        });
+        return true;
+    }
+    raw
+}
+
+/// Generate a deterministic ±1 sign byte from
+/// (layer_idx, channel_idx). Uses SplitMix32 (Java SplittableRandom
+/// finalizer) for full 32-bit avalanche — an earlier FNV-1a + `(h&1)`
+/// extractor here collapsed to a degenerate stride-2 pattern
+/// `[1,-1,1,-1,...]` for adjacent channels because the prime
+/// multiplier (0x01000193) preserves LSB parity, so the extracted
+/// bit was effectively `channel_idx mod 2`. That broke the
+/// rotation: R = H · diag(stride-2-±1) is structurally equivalent
+/// to a Walsh-Hadamard variant of half the rank, not a random
+/// orthogonal rotation.
+///
+/// SplitMix32: any single extracted bit is uncorrelated with
+/// channel_idx LSB. Same seed → same chain → reproducible across
+/// runs.
+fn sign_byte_for(layer_idx: u32, channel_idx: u32) -> i8 {
+    let seed = 0x9E3779B1u32
+        .wrapping_mul(layer_idx.wrapping_add(0xC2B2AE35))
+        .wrapping_add(channel_idx);
+    let mut h = seed;
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85EBCA6B);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xC2B2AE35);
+    h ^= h >> 16;
+    if (h & 1) == 0 { 1 } else { -1 }
+}
+
+/// Build the i8 sign-vector buffer host-side and upload to device.
+/// Returns `None` when `RVLLM_NVFP4_HADAMARD` is off.
+///
+/// `Region` is not `Drop`, so the bytes returned by `arena.region(...)`
+/// stay reserved as soon as the bump pointer has advanced — letting the
+/// `Region` handle fall out of scope here is enough; no `mem::forget`
+/// dance is required. This buffer must be allocated BEFORE the cuda
+/// worker takes its scratch checkpoint, so subsequent
+/// `arena.restore(scratch_ck)` calls don't rewind past it.
+#[cfg(feature = "cuda")]
+pub fn build_nvfp4_hadamard_signs(
+    num_layers: u32,
+    head_dim: u32,
+    arena: &HbmArena<'_>,
+) -> Result<Option<NvFp4HadamardAlloc>> {
+    if !nvfp4_hadamard_enabled() {
+        return Ok(None);
+    }
+    let bytes = (num_layers as u64) * (head_dim as u64);
+    let mut host: Vec<i8> = Vec::with_capacity(bytes as usize);
+    for l in 0..num_layers {
+        for c in 0..head_dim {
+            host.push(sign_byte_for(l, c));
+        }
+    }
+    let region = arena.region("nvfp4_hadamard_signs", bytes as usize, 16)?;
+    let base_ptr = region.device_ptr();
+    unsafe {
+        let r = cudarc::driver::sys::cuMemcpyHtoD_v2(
+            base_ptr,
+            host.as_ptr() as *const _,
+            bytes as usize,
+        );
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::Cuda {
+                kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                op: "cuMemcpyHtoD nvfp4_hadamard_signs",
+                ctx: rvllm_core::CudaCtx {
+                    stream: 0,
+                    kernel: "nvfp4_hadamard_signs_upload",
+                    launch: None,
+                    device: 0,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+    }
+    eprintln!(
+        "[hadamard] uploaded {} layers × {} signs ({} bytes) to {:#x}",
+        num_layers, head_dim, bytes, base_ptr
+    );
+    Ok(Some(NvFp4HadamardAlloc {
+        base_ptr,
+        bytes,
+        head_dim,
+        num_layers,
+    }))
+}
+// === END HADAMARD ROTATION ===
+
+/// Allocate the NVFP4 shadow KV / Q / Q-throwaway regions for the
+/// layers named in `RVLLM_NVFP4_SHADOW_LAYERS`. Returns `Ok(None)`
+/// when the env is unset (no shadow path active).
+///
+/// Same lifetime-correctness contract as `build_nvfp4_hadamard_signs`:
+/// the bytes returned by `arena.region(...)` stay reserved as soon as
+/// the bump pointer has advanced, but the regions MUST be allocated
+/// BEFORE the cuda worker takes its scratch checkpoint — otherwise
+/// `arena.restore(scratch_ck)` between requests rewinds the bump
+/// pointer past them and the persistent pointer in
+/// `Gemma4Bringup::nvfp4_shadow` aliases freshly-overwritten scratch.
+/// The previous lazy-allocation site inside `run_generate` had this
+/// exact bug (Codex14 / Codex16 #2): silent corruption from request
+/// 2 onward. The cuda worker now calls this at startup, before the
+/// checkpoint; `run_generate` re-resolves the same allocation through
+/// `self.nvfp4_shadow.lock()` and never re-allocates.
+#[cfg(feature = "cuda")]
+pub fn build_nvfp4_shadow_alloc(
+    arch: &rvllm_loader::gemma4_arch::Gemma4Arch,
+    num_blocks_total: u32,
+    sliding_blocks: u32,
+    block_size: u32,
+    arena: &HbmArena<'_>,
+) -> Result<Option<NvFp4ShadowAlloc>> {
+    let shadow_set = match crate::gemma4_layer_exec::parse_shadow_layers() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    if shadow_set.is_empty() {
+        return Ok(None);
+    }
+    let mut layer_offsets: Vec<u64> = vec![u64::MAX; arch.num_hidden_layers];
+    let mut shadow_total_bytes: u64 = 0;
+    {
+        let mut cursor: u64 = 0;
+        for l in 0..arch.num_hidden_layers {
+            if !shadow_set.contains(&(l as u32)) {
+                continue;
+            }
+            layer_offsets[l] = cursor;
+            let is_global = arch.layer_types[l]
+                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+            let hd = arch.head_dim_for_layer(l) as u32;
+            let layer_bytes = 2u64 * (layer_blocks as u64) * (block_size as u64)
+                * (nkvh as u64) * (hd as u64) * 2;
+            cursor += layer_bytes;
+            shadow_total_bytes += layer_bytes;
+        }
+    }
+    let shadow_q_per_layer_bytes: u64 =
+        2u64 * (arch.num_attention_heads as u64) * (arch.max_head_dim() as u64);
+    let shadow_q_throwaway_bytes: u64 =
+        (num_blocks_total as u64) * (block_size as u64) * shadow_q_per_layer_bytes;
+    let shadow_q_total_bytes: u64 = shadow_q_per_layer_bytes * (shadow_set.len() as u64);
+
+    let shadow_kv_bytes_alloc = shadow_total_bytes.max(16) as usize;
+    let shadow_q_bytes_alloc = shadow_q_total_bytes.max(16) as usize;
+    let shadow_throwaway_alloc = shadow_q_throwaway_bytes.max(16) as usize;
+
+    let region = arena.region("nvfp4_shadow_kv", shadow_kv_bytes_alloc, 256)?;
+    let q_region = arena.region("nvfp4_shadow_q", shadow_q_bytes_alloc, 256)?;
+    let throwaway_region = arena.region(
+        "nvfp4_shadow_q_throwaway",
+        shadow_throwaway_alloc,
+        256,
+    )?;
+    // Codex27-4: shadow init memsets used to drop their CUresult.
+    // Diagnostic output is the whole point of this path; partially
+    // uninitialised shadow regions would silently corrupt the dump.
+    unsafe {
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            region.device_ptr(), 0, shadow_kv_bytes_alloc),
+            "nvfp4_shadow_alloc_kv_zero", 0u64);
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            q_region.device_ptr(), 0, shadow_q_bytes_alloc),
+            "nvfp4_shadow_alloc_q_zero", 0u64);
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            throwaway_region.device_ptr(), 0, shadow_throwaway_alloc),
+            "nvfp4_shadow_alloc_throwaway_zero", 0u64);
+    }
+    eprintln!(
+        "[nvfp4-shadow] allocated {} MiB f16 shadow KV + {} KiB per-layer Q for {} layers \
+         (above scratch checkpoint, persistent across requests): {:?}",
+        shadow_total_bytes / (1024 * 1024),
+        shadow_q_total_bytes / 1024,
+        shadow_set.len(),
+        shadow_set,
+    );
+    Ok(Some(NvFp4ShadowAlloc {
+        shadow_ptr: region.device_ptr(),
+        shadow_bytes: shadow_total_bytes,
+        layer_offsets,
+        layer_indices: shadow_set,
+        shadow_q_ptr: q_region.device_ptr(),
+        shadow_q_total_bytes,
+        shadow_q_per_layer_bytes,
+        shadow_q_throwaway_ptr: throwaway_region.device_ptr(),
+    }))
+}
+
+// === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+/// Parallel to the main KV region but: (a) only the instrumented
+/// layers have a slot; (b) every instrumented layer is stored as F16
+/// regardless of the primary KV dtype. No scale region needed.
+pub struct NvFp4ShadowAlloc {
+    pub shadow_ptr: u64,
+    pub shadow_bytes: u64,
+    /// Per-layer byte offset into `shadow_ptr`. `u64::MAX` sentinel
+    /// for layers NOT in the instrumented set.
+    pub layer_offsets: Vec<u64>,
+    pub layer_indices: Vec<u32>,
+    /// Per-instrumented-layer Q snapshot region. Sized for
+    /// `num_shadow_layers * num_attention_heads * max_head_dim * 2`
+    /// bytes (f16). Populated on decode step 0 only, AFTER the shadow
+    /// f16 RoPE (which writes post-RoPE Q into `scratch.q_normed`)
+    /// and BEFORE the primary NVFP4 RoPE clobbers it. Per-layer slot
+    /// size is uniform (`q_per_layer_bytes`) even when the layer's
+    /// head_dim is smaller than max_head_dim — the tail of the slot
+    /// is then zero and the Python analyzer truncates using
+    /// `head_dim` from meta.json.
+    pub shadow_q_ptr: u64,
+    pub shadow_q_total_bytes: u64,
+    pub shadow_q_per_layer_bytes: u64,
+    /// Q throwaway scratch — a single-slot f16 buffer (same size as
+    /// one per-layer Q slot) that `rope_f16kv_shadow` targets when we
+    /// are NOT capturing (prefill steps, decode step > 0). Keeps
+    /// `scratch.q_normed` untouched so the subsequent primary
+    /// `rope_nvfp4kv` rotates Q exactly once. Without this, shadow
+    /// rope's q_out=q_normed caused double-RoPE on q_fp8 and
+    /// corrupted live inference whenever shadow was on.
+    pub shadow_q_throwaway_ptr: u64,
+}
+// === END NVFP4 SHADOW DIAGNOSTIC ===
+
+/// Defensive presence check used by `Gemma4Bringup::layer_kernels`.
+///
+/// `Gemma4LayerKernels` is a per-bringup struct shared across both
+/// sliding and global layers, so it can hold only one symbol per
+/// kernel slot. The current loader instantiates two `Fa2PtxKernels`
+/// (one per attention backend) from the SAME NVFP4 RoPE PTX source,
+/// so the symbols are functionally identical even though the raw
+/// `KernelFn` pointers differ (two `cuModuleLoad` calls produce two
+/// distinct handles into the same code). What matters structurally
+/// is presence symmetry: if sliding has the kernel loaded but
+/// global doesn't (or vice versa), pulling from `sliding_attention`
+/// here would silently feed sliding's RoPE into global layers, or
+/// global's `None` would mask a partial-build problem. We panic
+/// loudly on the asymmetric case so a partial PTX rebuild surfaces
+/// here instead of as wrong attention 60 layers later. Pointer
+/// equality is NOT asserted because it's not the property the
+/// downstream code relies on.
+#[cfg(feature = "cuda")]
+fn assert_rope_kernels_match(
+    label: &'static str,
+    sliding: Option<rvllm_kernels::KernelFn>,
+    global: Option<rvllm_kernels::KernelFn>,
+) -> Result<()> {
+    // Codex26-2: a partial PTX/manifest state used to panic the
+    // server here. Return a typed config error instead so the bring-
+    // up failure surfaces as a request-level 500 (or shutdown path)
+    // rather than aborting the whole process. Operators rebuild
+    // kernels/ and retry.
+    match (sliding.is_some(), global.is_some()) {
+        (true, true) | (false, false) => Ok(()),
+        _ => Err(rvllm_core::RvllmError::Config {
+            err: rvllm_core::ConfigError::Inconsistent {
+                reasons: vec![format!(
+                    "{label}: sliding/global Fa2PtxKernels disagree on whether \
+                     this NVFP4 RoPE kernel is loaded (sliding={}, global={}). \
+                     Symptomatic of a partial PTX build; rebuild kernels/.",
+                    sliding.is_some(),
+                    global.is_some(),
+                )],
+            },
+            field: "Fa2PtxKernels.rope_nvfp4kv",
+        }),
+    }
 }
 
 impl Gemma4Bringup {
     pub fn load(paths: Gemma4EnginePaths, arena_bytes: usize) -> Result<Self> {
+        // Codex48-3: surface the unvalidated-tuning-knob status of
+        // RVLLM_NVFP4_SPLIT_GQA at startup. The kernel ships in PTX
+        // and `has_split_kernels` reports it as available when the
+        // env is set, so dispatch + decode-graph eligibility treat
+        // it as production-ready. The kernel header itself flags
+        // "not yet validated end-to-end" — operators should know
+        // they're enabling that path on the live binary, not just
+        // a behind-the-scenes optimization.
+        if std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
+            .map(|v| v == "1" || v == "true" || v == "TRUE")
+            .unwrap_or(false)
+        {
+            tracing::warn!(
+                "RVLLM_NVFP4_SPLIT_GQA=1 is set: env-gated GQA-shared NVFP4 \
+                 split-decode is dispatch-eligible and reported by \
+                 has_split_kernels(). The kernel is marked \
+                 'not yet validated end-to-end' (see \
+                 kernels/flash_attention_split_decode_nvfp4kv.cu header) \
+                 — production traffic on this knob is at-your-own-risk \
+                 until the kv_policy_matrix.sh harness signs off."
+            );
+        }
         let ctx = Arc::new(CudaContextHandle::init(0)?);
         // Resolve the compile target once per bring-up and thread it
         // through — every call to `ctx.compute_capability()` + the
@@ -211,6 +1245,20 @@ impl Gemma4Bringup {
         let kernels_dir = crate::bring_up::resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
         let manifest_path = kernels_dir.join("manifest.json");
         let manifest = rvllm_kernels::manifest::KernelManifest::load_and_verify(&manifest_path)?;
+        // Codex29-1: hard-fail if manifest.arch != runtime arch. The
+        // kernels_dir was picked by arch already, but a stale / copied
+        // manifest from another arch can be size+sha-consistent and
+        // would otherwise slip through.
+        if let Some(t) = compile_target {
+            manifest.assert_arch(t.as_sm_str())?;
+        }
+        // Codex23-2: warn (not fail) on manifest-vs-binary revision drift.
+        // The kernels crate's build.rs bakes `RVLLM_BUILD_REVISION` from
+        // git short HEAD; the manifest carries the same field per
+        // kernels/build.sh. A self-consistent stale manifest passing
+        // load_and_verify (size + sha match each other) but pairing
+        // with a binary that has a newer launch ABI shows up here.
+        manifest.warn_if_revision_drift(rvllm_kernels::manifest::VerifiedManifest::BUILD_REVISION);
         let kernels = Arc::new(KernelLoader::new(manifest));
 
         // Attention backend selection. On SM80/SM89/SM90 we stick with
@@ -298,6 +1346,79 @@ impl Gemma4Bringup {
         let cutlass =
             CutlassBackend::load_for(compile_target, paths.cutlass_so.clone(), &variants)?;
 
+        // Codex51-3: surface the SM121 fast-path status so operators
+        // can see at a glance whether `RVLLM_FP8_GEMM_CUTLASS_SM120`
+        // is wired correctly. Single-token decode (M=1) uses the
+        // native GEMV fastpath regardless; the CUTLASS SoSm120 path
+        // matters for batched decode and prefill (M>=128). Without
+        // explicit logging, a missing .so or unset env silently
+        // routes M>=128 traffic onto cuBLASLt scalar mode, costing
+        // significant prefill TTFT on sm_121.
+        {
+            // Codex53-3: dispatch gate is `parse_truthy_env(...)
+            // .unwrap_or(true)` at gemma4_layer_exec.rs:2902 — env
+            // unset DEFAULTS TO ENABLED. The Codex51-3 startup log
+            // had this inverted (claimed unset → fallback) which
+            // would have led operators to set the env unnecessarily
+            // and possibly miss the real "opt-out" semantics
+            // (`RVLLM_FP8_GEMM_CUTLASS_SM120=0`). Three states to
+            // surface:
+            //   .so loaded + env != "0"  → fast path active (default
+            //                              when env is unset)
+            //   .so loaded + env  = "0"  → operator opt-out (regression
+            //                              diagnosis per the
+            //                              gemma4_layer_exec.rs comment)
+            //   .so missing              → fallback (warn if env != "0",
+            //                              info otherwise)
+            let env_raw = std::env::var("RVLLM_FP8_GEMM_CUTLASS_SM120").ok();
+            let env_off = matches!(env_raw.as_deref(), Some("0") | Some("false") | Some("FALSE"));
+            let backend_name = match &cutlass {
+                CutlassBackend::SoSm120(_) => "SoSm120",
+                CutlassBackend::So(_) => "So",
+                CutlassBackend::Absent => "Absent",
+                _ => "Other",
+            };
+            if matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121)) {
+                if matches!(cutlass, CutlassBackend::SoSm120(_)) {
+                    if env_off {
+                        tracing::warn!(
+                            backend = backend_name,
+                            env = env_raw.as_deref().unwrap_or(""),
+                            "[cutlass-sm120] SoSm120 .so loaded but \
+                             RVLLM_FP8_GEMM_CUTLASS_SM120=0 — M>=128 GEMM \
+                             routed to cuBLASLt scalar (operator opt-out, \
+                             regression-diagnosis mode). Unset the env or \
+                             set =1 to re-enable the fast path."
+                        );
+                    } else {
+                        tracing::info!(
+                            backend = backend_name,
+                            env = env_raw.as_deref().unwrap_or("(unset, default-on)"),
+                            "[cutlass-sm120] SoSm120 .so loaded — M>=128 GEMM \
+                             takes the CUTLASS blockwise fast path."
+                        );
+                    }
+                } else if !env_off {
+                    tracing::warn!(
+                        backend = backend_name,
+                        "[cutlass-sm120] CUTLASS .so not loaded \
+                         (backend = {backend_name}); M>=128 paths run on \
+                         cuBLASLt scalar. Build via \
+                         kernels/build_cutlass_sm120_so.sh and verify \
+                         kernels/sm_121/libcutlass_sm120.so is present \
+                         to recover the prefill TTFT.",
+                    );
+                } else {
+                    tracing::info!(
+                        backend = backend_name,
+                        "[cutlass-sm120] CUTLASS .so not loaded and \
+                         RVLLM_FP8_GEMM_CUTLASS_SM120=0 — operator-disabled, \
+                         M>=128 paths use cuBLASLt scalar."
+                    );
+                }
+            }
+        }
+
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
         let cublaslt_ws_region = arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;
         let cublaslt = CublasLt::new(cublaslt_ws_region.device_ptr(), cublaslt_ws_bytes)?;
@@ -326,7 +1447,119 @@ impl Gemma4Bringup {
             global_attention,
             policy,
             fused,
+            prefix_cache: std::sync::Mutex::new(None),
+            // NVFP4 shadow diagnostic state (lazy-init in run_generate).
+            nvfp4_shadow: std::sync::Mutex::new(None),
+            nvfp4_shadow_dumped: std::sync::atomic::AtomicBool::new(false),
+            // === HADAMARD ROTATION ===
+            // Lazy-init in `run_generate` once we know the head_dim
+            // and num_layers (mirroring nvfp4_shadow's lazy alloc).
+            nvfp4_hadamard: std::sync::Mutex::new(None),
+            // === END HADAMARD ROTATION ===
         })
+    }
+
+    /// Allocate the session-level prefix cache's KV cache region.
+    /// Must be called BEFORE the cuda worker takes its scratch
+    /// checkpoint — the region's device pointer is captured as a
+    /// raw u64 and the arena's bump pointer is advanced past it,
+    /// so subsequent `arena.restore(scratch_ck)` calls won't clobber
+    /// the persistent KV data.
+    ///
+    /// Safe to call multiple times; becomes a no-op after the first
+    /// successful init.
+    pub fn init_prefix_cache(&self) -> Result<()> {
+        let mut guard = self.prefix_cache.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
+        let arch = &self.arch;
+        let block_size: u32 = 32;
+        let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let sliding_blocks = num_blocks_total;
+        let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
+
+        let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_total_bytes: u64 = 0;
+        let mut kv_scale_total_bytes: u64 = 0;
+        let mut kv_dtype_per_layer: Vec<crate::gemma4_layer_exec::KvDtype> =
+            Vec::with_capacity(arch.num_hidden_layers);
+        for l in 0..arch.num_hidden_layers {
+            kv_layer_offsets.push(kv_total_bytes);
+            kv_scale_layer_offsets.push(kv_scale_total_bytes);
+            let is_global = arch.layer_types[l]
+                == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+            let hd = arch.head_dim_for_layer(l) as u32;
+            let layer_elems =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+            let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                arch.layer_types[l], l, false);
+            kv_dtype_per_layer.push(kv_dtype_l);
+            kv_total_bytes += match kv_dtype_l {
+                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
+            };
+            let layer_scale_slots =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
+            kv_scale_total_bytes += match kv_dtype_l {
+                crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
+            };
+        }
+
+        let kv_region = self.arena.region("persistent_kv", kv_total_bytes as usize, 256)?;
+        let kv_cache_ptr = kv_region.device_ptr();
+        let kv_scale_bytes_alloc = kv_scale_total_bytes.max(16) as usize;
+        let kv_scale_region =
+            self.arena.region("persistent_kv_scale", kv_scale_bytes_alloc, 16)?;
+        let kv_scale_ptr = kv_scale_region.device_ptr();
+
+        // `Region` isn't `Drop`, so dropping the wrappers here just
+        // discards the handles — the arena's bump pointer has already
+        // advanced past both regions, so their bytes stay reserved
+        // for the lifetime of `self.arena`. The cuda worker takes its
+        // `scratch_ck` checkpoint AFTER this call, so its later
+        // `arena.restore(scratch_ck)` cannot rewind past these bytes.
+
+        // Cycle 56 step 4 (bug-audit finding #2 — HIGH): check
+        // CUresult on prefix-cache init memset. Failure here corrupts
+        // ALL subsequent decode requests for this service lifetime;
+        // surfacing it as a typed RvllmError lets the operator see
+        // the OOM / ECC at startup instead of silent garbage decode
+        // hours later.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            cuda_check!(
+                cudarc::driver::sys::cuMemsetD8_v2(kv_cache_ptr, 0, kv_total_bytes as usize),
+                "init_prefix_cache_kv_zero", 0u64);
+            cuda_check!(
+                cudarc::driver::sys::cuMemsetD8_v2(kv_scale_ptr, 0, kv_scale_bytes_alloc),
+                "init_prefix_cache_kv_scale_zero", 0u64);
+        }
+
+        *guard = Some(PrefixCacheState {
+            last_tokens: Vec::new(),
+            kv_cache_ptr,
+            kv_cache_bytes: kv_total_bytes,
+            kv_scale_ptr,
+            kv_scale_bytes: kv_scale_total_bytes,
+            kv_dtype,
+            kv_layer_offsets,
+            kv_scale_layer_offsets,
+            num_blocks_total,
+            block_size,
+            committed_prefix_len: 0,
+            provenance: PrefixProvenance::from_env(),
+        });
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
@@ -339,7 +1572,7 @@ impl Gemma4Bringup {
         use crate::gemma4_layer_exec::*;
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
-        let f16_only = false; // bench path always FP8
+        let _f16_only = false; // bench path always FP8 (documentation only; unused)
         let arch = &self.arch;
         let hidden = arch.hidden_size as u32;
         let max_hd = arch.max_head_dim() as u32;
@@ -413,19 +1646,29 @@ impl Gemma4Bringup {
             .region("gemm_f32_tmp", (num_seqs * gemm_f32_max_n * 4) as usize, 16)
             .unwrap();
 
-        let kv_bytes_per_elem: u32 = 1; // bench path always FP8
-        // aa01001pftrope0 cliff-fix: sliding layers need `slot_mapping[t] < sliding_blocks*block_size`
-        // at every t the rope writes; the old cap sliding_blocks = sliding_window/block_size = 32
-        // (= 1024 slots for Gemma 4) broke at prompt_len > sliding_window because slot_mapping
-        // is linear 0..prompt_len-1 and index 1024+ ran off the end of the sliding KV region.
-        // Proper fix is a per-sliding-layer ring buffer (slot = t mod sliding_window) but that
-        // needs rope + attention kernel cooperation. For now give sliding layers the full pool —
-        // ~10 GiB extra at num_blocks_total=1024, fits in the 50 GiB arena with Gemma 4 31B fp8.
+        // Bench path KV dtype — Codex44-3: matches run_generate's
+        // per-layer dispatch via `KvDtype::for_layer_index_or_env(l)`
+        // so hybrid configs (`RVLLM_NVFP4_HYBRID_GLOBAL_FP8`,
+        // `RVLLM_NVFP4_HYBRID_SLIDING_FP8`, `RVLLM_FP8_KV_LAYERS`)
+        // measure the same dispatch shape the live server runs.
+        // The earlier uniform `from_env(false)` made bench numbers
+        // diverge silently from prod whenever a per-layer override
+        // was active — wrong target for tuning. Per-layer sizing +
+        // dispatch reads `kv_dtype_per_layer[layer_idx]` everywhere.
+        let mut kv_dtype_per_layer: Vec<crate::gemma4_layer_exec::KvDtype> =
+            Vec::with_capacity(arch.num_hidden_layers);
+        // aa01001pftrope0 cliff-fix (F-series): sliding layers need
+        // `slot_mapping[t] < sliding_blocks * block_size` at every rope
+        // write. The old cap `sliding_window/block_size` broke at
+        // prompt_len > sliding_window because slot_mapping is linear
+        // 0..prompt_len-1 and ran off the end. Give sliding layers the
+        // full pool — ~10 GiB extra at num_blocks_total=1024, fits in
+        // the 50+ GiB arena.
         let sliding_blocks = num_blocks_total;
 
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
-        let mut kv_total_bytes: u64 = 0;
         let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_total_bytes: u64 = 0;
         let mut kv_scale_total_bytes: u64 = 0;
         for l in 0..arch.num_hidden_layers {
             kv_layer_offsets.push(kv_total_bytes);
@@ -434,49 +1677,99 @@ impl Gemma4Bringup {
             let nkvh_l = arch.num_kv_heads_for_layer(l) as u32;
             let hd_l = arch.head_dim_for_layer(l) as u32;
             let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh_l as u64 * hd_l as u64;
-            kv_total_bytes += layer_elems * kv_bytes_per_elem as u64;
-            let layer_scale_slots = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh_l as u64;
-            kv_scale_total_bytes += layer_scale_slots * 4;
+            // Codex44-3: per-layer dtype matches run_generate (line 1373).
+            let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                arch.layer_types[l], l, false);
+            kv_dtype_per_layer.push(kv_dtype_l);
+            kv_total_bytes += match kv_dtype_l {
+                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2, // 2 elems/byte
+            };
+            // FP8 path: per-slot f32 K/V scales (F-series — one scale per
+            // (block, tok, head) for both K and V). NVFP4 path: one E4M3
+            // scale per 16 elems. F16 self-scaled so 0 bytes.
+            let layer_scale_slots =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh_l as u64;
+            kv_scale_total_bytes += match kv_dtype_l {
+                crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
+            };
         }
         let kv_cache = arena.region("kv_cache", kv_total_bytes as usize, 256).unwrap();
         let kv_scale_cache = arena.region(
             "kv_scale_cache", kv_scale_total_bytes as usize, 16).unwrap();
-        // Per-(seq, head) Q scale scratch, written fresh by rope each
+        // Per-(token, head) Q scale scratch, written fresh by rope each
         // forward and consumed by the same step's attention.
+        // Codex21: rope writes `[token_idx, head]` for token_idx in
+        // 0..num_tokens. Bench dispatches every layer with
+        // `num_tokens: num_seqs` (single-token decode), so the alloc
+        // upper-bound is num_seqs. If bench is ever extended to a
+        // multi-token-per-seq prefill path, `max_tokens_per_step` must
+        // grow accordingly or rope OOB-writes q_scale_cache.
+        let max_tokens_per_step: u32 = num_seqs;
         let q_scale_scratch_bytes =
-            (num_seqs as u64) * (arch.num_attention_heads as u64) * 4;
+            (max_tokens_per_step as u64) * (arch.num_attention_heads as u64) * 4;
         let q_scale_scratch = arena.region(
             "q_scale_scratch", q_scale_scratch_bytes as usize, 16).unwrap();
         // Opt-out for A/B testing: RVLLM_PER_TOKEN_Q_SCALE=0 falls back to
         // the scalar q_scale_ptr (pre-c69f641 behaviour) so PPL can be
         // compared across the two calibration strategies without a rebuild.
         let q_scale_cache_ptr: u64 =
-            if std::env::var("RVLLM_PER_TOKEN_Q_SCALE").ok().as_deref() == Some("0") {
-                0
-            } else {
+            if per_token_q_scale_enabled(/*default_on=*/true) {
                 q_scale_scratch.device_ptr()
+            } else {
+                0
             };
+        // Codex26-4: previously the bench-init memsets dropped their
+        // CUresult. On OOM / ECC / invalid-pointer the path kept
+        // running with uninitialised KV / scale state and produced
+        // misleading bench numbers. run_bench returns BenchResult
+        // (no Result<>), so the cuda_check! macro can't be used
+        // directly; panic with context so bench failures surface
+        // immediately instead of contaminating the published numbers.
         #[cfg(feature = "cuda")]
         {
-            cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
-            cudarc::driver::sys::cuMemsetD8_v2(
-                kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
-            cudarc::driver::sys::cuMemsetD8_v2(
-                q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
+            let memset_check = |r: cudarc::driver::sys::CUresult, what: &str| {
+                if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    panic!("bench: cuMemsetD8_v2 {what} failed: {:?}", r);
+                }
+            };
+            memset_check(
+                cudarc::driver::sys::cuMemsetD8_v2(
+                    kv_cache.device_ptr(), 0, kv_total_bytes as usize),
+                "kv_cache");
+            memset_check(
+                cudarc::driver::sys::cuMemsetD8_v2(
+                    kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize),
+                "kv_scale_cache");
+            memset_check(
+                cudarc::driver::sys::cuMemsetD8_v2(
+                    q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize),
+                "q_scale_scratch");
         }
+        // Codex20-3: previously bench allocated a second NVFP4 scale
+        // region ("kv_cache_scale") of the same size as kv_scale_cache
+        // and held it RAII for the bench duration even though no
+        // launcher pointed at it. That was redundant — kv_scale_cache
+        // above already covers all NVFP4 scale slots; the duplicate
+        // just ate VRAM and pushed long bench runs closer to OOM.
+        // Removed. F16 / FP8 paths leave kv_scale_cache zero-sized
+        // (kv_scale_total_bytes==0 on F16); kernels that don't read
+        // scales pass 0 already.
 
         let q_scale_region = arena.region("q_scale", 4, 4).unwrap();
         let kv_scale_region = arena.region("kv_scale", 4, 4).unwrap();
         {
-            let q_s: f32 = std::env::var("RVLLM_Q_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_Q_SCALE);
-            let kv_s: f32 = std::env::var("RVLLM_KV_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_KV_SCALE);
+            let q_s = parse_f32_env_or_default("RVLLM_Q_SCALE", DEFAULT_Q_SCALE);
+            let kv_s = parse_f32_env_or_default("RVLLM_KV_SCALE", DEFAULT_KV_SCALE);
             q_scale_region.copy_from_host(&q_s.to_le_bytes()).unwrap();
             kv_scale_region.copy_from_host(&kv_s.to_le_bytes()).unwrap();
         }
 
-        let fa3_ws = arena.region("fa3_ws", 16 * 1024 * 1024, 256).unwrap();
+        const FA3_WS_BYTES: usize = 16 * 1024 * 1024;
+        let fa3_ws = arena.region("fa3_ws", FA3_WS_BYTES, 256).unwrap();
         let residual = arena
             .region("residual", (num_seqs * hidden * 2) as usize, 16)
             .unwrap();
@@ -534,7 +1827,10 @@ impl Gemma4Bringup {
             .region("cutlass_ws_gemma4", cutlass_ws_bytes, 256)
             .unwrap();
         let residual_ptr = residual.device_ptr();
-        let kernels = self.layer_kernels();
+        // Codex26-2: bench is dev-only and has no Result return path,
+        // so unwrap with a clear panic message.
+        let kernels = self.layer_kernels()
+            .expect("bench: layer_kernels — partial PTX/manifest state, rebuild kernels/");
 
         // GEMM plans — uniform shapes across all layers (the sliding/global
         // distinction is a runtime head reshape, weight dims are identical).
@@ -603,7 +1899,11 @@ impl Gemma4Bringup {
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
                     sliding_window: arch.sliding_window_size as u32,
-                    f16_kv: f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0"),
+                    // Codex44-3: per-layer dtype, matches run_generate.
+                    f16_kv: kv_dtype_per_layer[layer_idx].is_f16(),
+                    kv_dtype: kv_dtype_per_layer[layer_idx],
+                    bf16_residual: bf16_residual_enabled(),
+                    current_max_context_len: None,
                 };
 
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
@@ -614,12 +1914,31 @@ impl Gemma4Bringup {
                 let is_global = lt == Gemma4LayerType::GlobalAttention;
                 let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-                let kv_layer_bytes = layer_kv_elems * kv_bytes_per_elem as u64;
+                // Codex44-3: per-layer dtype determines per-layer KV bytes.
+                let layer_kv_dtype = kv_dtype_per_layer[layer_idx];
+                let kv_layer_bytes = match layer_kv_dtype {
+                    crate::gemma4_layer_exec::KvDtype::F16 => layer_kv_elems * 2,
+                    crate::gemma4_layer_exec::KvDtype::Fp8 => layer_kv_elems,
+                    crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_kv_elems / 2,
+                };
                 let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
+                // FP8 path (F-series): per-slot f32 K/V scales, always
+                // allocated in `kv_scale_cache` (kv_scale_total_bytes=0 on F16).
                 let layer_kv_scale_base =
                     kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
+                // NVFP4 path: K gets the first half of the layer's scale
+                // slab, V the second half. layer_kv_elems covers K+V so
+                // each half is `layer_kv_elems / 32` bytes (`/2/16`).
+                let (k_cache_scale, v_cache_scale) = if layer_kv_dtype
+                    == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                {
+                    let k_scale_bytes = layer_kv_elems / 32;
+                    (layer_kv_scale_base, layer_kv_scale_base + k_scale_bytes)
+                } else {
+                    (0u64, 0u64)
+                };
 
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (
@@ -639,27 +1958,28 @@ impl Gemma4Bringup {
                     post_ff_norm_gamma: layer.post_feedforward_layernorm.offset_bytes,
                     q_norm_gamma: layer.q_norm.offset_bytes,
                     k_norm_gamma: layer.k_norm.offset_bytes,
-                    qkv_fp8: layer.qkv.offset_bytes,
-                    qkv_scale: layer.qkv.scale_ptr,
-                    o_fp8: layer.o_proj.offset_bytes,
-                    o_scale: layer.o_proj.scale_ptr,
-                    gate_up_fp8: layer.gate_up.offset_bytes,
-                    gate_up_scale: layer.gate_up.scale_ptr,
-                    down_fp8: layer.down_proj.offset_bytes,
-                    down_scale: layer.down_proj.scale_ptr,
+                    qkv_fp8: layer.qkv.as_ref().map_or(0, |w| w.offset_bytes),
+                    qkv_scale: layer.qkv.as_ref().map_or(0, |w| w.scale_ptr),
+                    o_fp8: layer.o_proj.as_ref().map_or(0, |w| w.offset_bytes),
+                    o_scale: layer.o_proj.as_ref().map_or(0, |w| w.scale_ptr),
+                    gate_up_fp8: layer.gate_up.as_ref().map_or(0, |w| w.offset_bytes),
+                    gate_up_scale: layer.gate_up.as_ref().map_or(0, |w| w.scale_ptr),
+                    down_fp8: layer.down_proj.as_ref().map_or(0, |w| w.offset_bytes),
+                    down_scale: layer.down_proj.as_ref().map_or(0, |w| w.scale_ptr),
                     layer_scalar_ptr: layer.layer_scalar.offset_bytes,
                     qkv_f16: layer.qkv_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     o_f16: layer.o_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     gate_up_f16: layer.gate_up_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     down_f16: layer.down_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
-                    qkv_chscale: layer.qkv.channelscale_ptr.unwrap_or(0),
-                    o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
-                    gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
-                    down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
-                    qkv_blockscale: layer.qkv.blockscale_ptr.unwrap_or(0),
-                    o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
-                    gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
-                    down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    qkv_chscale: layer.qkv.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    o_chscale: layer.o_proj.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    gate_up_chscale: layer.gate_up.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    down_chscale: layer.down_proj.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    qkv_blockscale: layer.qkv.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    o_blockscale: layer.o_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    gate_up_blockscale: layer.gate_up.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    down_blockscale: layer.down_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    awq: awq_layer_ptrs(layer.awq.as_ref()),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -677,6 +1997,8 @@ impl Gemma4Bringup {
                     k_scale_cache: layer_kv_scale_base,
                     v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
                     q_scale_cache: q_scale_cache_ptr,
+                    k_cache_scale,
+                    v_cache_scale,
                     q_scale_ptr: q_scale_region.device_ptr(),
                     kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
@@ -689,9 +2011,27 @@ impl Gemma4Bringup {
                     mlp_out_fp8: mlp_out_fp8.device_ptr(),
                     mlp_out_scale: mlp_out_scale.device_ptr(),
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
+                    gemm_f32_tmp_bytes: (num_seqs * gemm_f32_max_n * 4) as usize,
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    fa3_workspace_bytes: FA3_WS_BYTES as u64,
+                    // NVFP4 shadow diagnostic: default 0 (no shadow).
+                    // Overridden in the run_generate decode path when
+                    // RVLLM_NVFP4_SHADOW_F16 is on.
+                    shadow_k_cache: 0,
+                    shadow_v_cache: 0,
+                    shadow_q_cache: 0,
+                    // === HADAMARD ROTATION ===
+                    // Probe / profile paths don't use rotation; the
+                    // rope kernel treats nullptr (=0) as "rotation
+                    // off" and runs byte-identical to the pre-Hadamard
+                    // path. Live decode/prefill paths below compute
+                    // the per-layer pointer from
+                    // `self.nvfp4_hadamard`.
+                    hadamard_signs_q: 0,
+                    hadamard_signs_k: 0,
+                    // === END HADAMARD ROTATION ===
                 };
 
                 let meta = Gemma4MetadataPtrs {
@@ -881,8 +2221,24 @@ impl Gemma4Bringup {
         )?;
 
         let f16_only = std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1");
-        let use_f16_kv = f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0");
-        let kv_bytes_per_elem: u32 = if use_f16_kv { 2 } else { 1 };
+        // Codex47-1: mirror Codex44-3's per-layer KV-dtype plumbing so
+        // run_ppl validates the same hybrid configs (HYBRID_GLOBAL_FP8,
+        // HYBRID_SLIDING_FP8, RVLLM_FP8_KV_LAYERS) that run_generate
+        // honours. RVLLM_F16_ONLY still forces every layer to F16 via
+        // the f16_only flag threaded into for_layer_index_or_env. Used
+        // for the per-layer scratch sizing below + the dispatch site
+        // (~line 2299) — both consume kv_dtype_per_layer[layer_idx].
+        // The single `kv_dtype` snapshot stays for the bytes-per-elem
+        // log line (PPL header) — uses from_env baseline as the
+        // reporting value.
+        let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(f16_only);
+        let kv_bytes_per_elem_log: u32 = match kv_dtype {
+            crate::gemma4_layer_exec::KvDtype::F16 => 2,
+            crate::gemma4_layer_exec::KvDtype::Fp8 => 1,
+            crate::gemma4_layer_exec::KvDtype::Nvfp4 => 0, // logging placeholder
+        };
+        let mut kv_dtype_per_layer: Vec<crate::gemma4_layer_exec::KvDtype> =
+            Vec::with_capacity(arch.num_hidden_layers);
 
         // Per-layer KV budget: sliding layers cap at sliding_window/block_size blocks,
         // global layers use full num_blocks_total. Saves ~5x KV memory for long context.
@@ -895,10 +2251,9 @@ impl Gemma4Bringup {
         // ~10 GiB extra at num_blocks_total=1024, fits in the 50 GiB arena with Gemma 4 31B fp8.
         let sliding_blocks = num_blocks_total;
 
-
         let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
-        let mut kv_total_bytes: u64 = 0;
         let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+        let mut kv_total_bytes: u64 = 0;
         let mut kv_scale_total_bytes: u64 = 0;
         for l in 0..arch.num_hidden_layers {
             kv_layer_offsets.push(kv_total_bytes);
@@ -908,45 +2263,73 @@ impl Gemma4Bringup {
             let nkvh = arch.num_kv_heads_for_layer(l) as u32;
             let hd = arch.head_dim_for_layer(l) as u32;
             let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-            kv_total_bytes += layer_elems * kv_bytes_per_elem as u64;
-            let layer_scale_slots = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
-            kv_scale_total_bytes += layer_scale_slots * 4;
+            // Codex47-1: per-layer dtype matches run_generate / run_bench.
+            let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                arch.layer_types[l], l, f16_only);
+            kv_dtype_per_layer.push(kv_dtype_l);
+            kv_total_bytes += match kv_dtype_l {
+                crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
+            };
+            // FP8 path: per-slot f32 K/V scales. NVFP4 path: one E4M3
+            // scale per 16 elems. F16: self-scaled (0 bytes).
+            let layer_scale_slots =
+                2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
+            kv_scale_total_bytes += match kv_dtype_l {
+                crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
+                crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
+            };
         }
-        eprintln!("[ppl] KV cache: {:.1} MB (sliding={} blocks, global={} blocks, {} bytes/elem)",
-            kv_total_bytes as f64 / 1e6, sliding_blocks, num_blocks_total, kv_bytes_per_elem);
+        eprintln!("[ppl] KV cache: {:.1} MB ({:?}, sliding={} blocks, global={} blocks, {} bytes/elem main)",
+            kv_total_bytes as f64 / 1e6, kv_dtype, sliding_blocks, num_blocks_total, kv_bytes_per_elem_log);
 
         let kv_cache = arena.region("kv_cache", kv_total_bytes as usize, 256)?;
-        cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
+        // Codex26-4: wrap PPL memsets with cuda_check (run_ppl returns Result<>).
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            kv_cache.device_ptr(), 0, kv_total_bytes as usize),
+            "ppl_kv_cache_zero", stream);
+        // Scale cache shared across FP8 (F-series per-slot f32 scales)
+        // and NVFP4 (per-16-elem E4M3 scales). F16 path has 0 scale bytes
+        // but we still allocate a placeholder region so region indexing
+        // stays uniform.
         let kv_scale_cache =
-            arena.region("kv_scale_cache", kv_scale_total_bytes as usize, 16)?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
+            arena.region("kv_scale_cache", kv_scale_total_bytes.max(16) as usize, 16)?;
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize),
+            "ppl_kv_scale_cache_zero", stream);
+        // Codex21: PPL also dispatches with num_tokens==num_seqs today.
+        // If the path grows to multi-token-per-seq prefill,
+        // max_tokens_per_step must track the new upper bound; otherwise
+        // rope OOB-writes q_scale_cache at `[tok * heads + head]`.
+        let max_tokens_per_step: u32 = num_seqs;
         let q_scale_scratch_bytes =
-            (num_seqs as u64) * (arch.num_attention_heads as u64) * 4;
+            (max_tokens_per_step as u64) * (arch.num_attention_heads as u64) * 4;
         let q_scale_scratch = arena.region(
             "q_scale_scratch", q_scale_scratch_bytes as usize, 16)?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
+        cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+            q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize),
+            "ppl_q_scale_scratch_zero", stream);
         // See run_bench: RVLLM_PER_TOKEN_Q_SCALE=0 opts out.
         let q_scale_cache_ptr: u64 =
-            if std::env::var("RVLLM_PER_TOKEN_Q_SCALE").ok().as_deref() == Some("0") {
-                0
-            } else {
+            if per_token_q_scale_enabled(/*default_on=*/true) {
                 q_scale_scratch.device_ptr()
+            } else {
+                0
             };
 
         let q_scale_region = arena.region("q_scale", 4, 4)?;
         let kv_scale_region = arena.region("kv_scale", 4, 4)?;
         {
-            let q_s: f32 = std::env::var("RVLLM_Q_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_Q_SCALE);
-            let kv_s: f32 = std::env::var("RVLLM_KV_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_KV_SCALE);
+            let q_s = parse_f32_env_or_default("RVLLM_Q_SCALE", DEFAULT_Q_SCALE);
+            let kv_s = parse_f32_env_or_default("RVLLM_KV_SCALE", DEFAULT_KV_SCALE);
             q_scale_region.copy_from_host(&q_s.to_le_bytes())?;
             kv_scale_region.copy_from_host(&kv_s.to_le_bytes())?;
         }
 
-        let fa3_ws = arena.region("fa3_ws", 16 * 1024 * 1024, 256)?;
+        const FA3_WS_BYTES: usize = 16 * 1024 * 1024;
+        let fa3_ws = arena.region("fa3_ws", FA3_WS_BYTES, 256)?;
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
         let cutlass_ws = arena.region("cutlass_ws_ppl", cutlass_ws_bytes, 256)?;
 
@@ -959,9 +2342,22 @@ impl Gemma4Bringup {
             16,
         )?;
         {
-            let mut bt: Vec<i32> = Vec::with_capacity(max_blocks_per_seq as usize);
-            for b in 0..max_blocks_per_seq as i32 {
-                bt.push(b);
+            // Codex22-1: NVFP4 attention kernels read
+            // `block_tables[seq_idx * max_blocks_per_seq + page_idx]`,
+            // so the table must hold `num_seqs * max_blocks_per_seq`
+            // entries. The previous init wrote only the first row
+            // (max_blocks_per_seq entries); for num_seqs > 1 every
+            // sequence past row 0 read uninitialised page IDs →
+            // either OOB-access into KV or cross-seq KV aliasing.
+            // Tile the page-id sequence per row so each sequence
+            // sees its own contiguous block range, mirroring how
+            // run_bench / run_generate lay out their tables.
+            let total_entries = (num_seqs as usize) * (max_blocks_per_seq as usize);
+            let mut bt: Vec<i32> = Vec::with_capacity(total_entries);
+            for s in 0..num_seqs as i32 {
+                for b in 0..max_blocks_per_seq as i32 {
+                    bt.push(s * max_blocks_per_seq as i32 + b);
+                }
             }
             block_tables.copy_from_host(bytemuck_cast_i32(&bt))?;
         }
@@ -971,7 +2367,7 @@ impl Gemma4Bringup {
         let logits_f32 = arena.region("logits_f32_ppl", (num_seqs * vocab * 4) as usize, 16)?;
         let token_ids_region = arena.region("token_ids_ppl", (num_seqs * 4) as usize, 16)?;
         let residual_ptr = residual.device_ptr();
-        let kernels = self.layer_kernels();
+        let kernels = self.layer_kernels()?;
 
         let q_dim_s = (arch.num_attention_heads * arch.head_dim_sliding) as u32;
         let kv_dim_s = (arch.num_kv_heads_sliding * arch.head_dim_sliding) as u32;
@@ -1036,7 +2432,11 @@ impl Gemma4Bringup {
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
                     sliding_window: arch.sliding_window_size as u32,
-                    f16_kv: f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0"),
+                    // Codex47-1: per-layer dtype matches run_generate.
+                    f16_kv: kv_dtype_per_layer[layer_idx].is_f16(),
+                    kv_dtype: kv_dtype_per_layer[layer_idx],
+                    bf16_residual: bf16_residual_enabled(),
+                    current_max_context_len: None,
                 };
 
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
@@ -1047,12 +2447,25 @@ impl Gemma4Bringup {
                 let is_global = lt == Gemma4LayerType::GlobalAttention;
                 let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
                 let layer_kv_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-                let kv_layer_bytes = layer_kv_elems * kv_bytes_per_elem as u64;
+                // Codex47-1: per-layer dtype determines per-layer KV bytes.
+                let layer_kv_dtype = kv_dtype_per_layer[layer_idx];
+                let kv_layer_bytes = match layer_kv_dtype {
+                    crate::gemma4_layer_exec::KvDtype::F16 => layer_kv_elems * 2,
+                    crate::gemma4_layer_exec::KvDtype::Fp8 => layer_kv_elems,
+                    crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_kv_elems / 2,
+                };
                 let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[layer_idx];
                 let layer_kv_scale_base =
                     kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
+                let (k_cache_scale, v_cache_scale) = if layer_kv_dtype
+                    == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                {
+                    (layer_kv_scale_base, layer_kv_scale_base + layer_kv_elems / 32)
+                } else {
+                    (0u64, 0u64)
+                };
                 let (cos, sin) = match lt {
                     Gemma4LayerType::SlidingAttention => (
                         self.model.rope_cos_sliding.offset_bytes,
@@ -1071,27 +2484,28 @@ impl Gemma4Bringup {
                     post_ff_norm_gamma: layer.post_feedforward_layernorm.offset_bytes,
                     q_norm_gamma: layer.q_norm.offset_bytes,
                     k_norm_gamma: layer.k_norm.offset_bytes,
-                    qkv_fp8: layer.qkv.offset_bytes,
-                    qkv_scale: layer.qkv.scale_ptr,
-                    o_fp8: layer.o_proj.offset_bytes,
-                    o_scale: layer.o_proj.scale_ptr,
-                    gate_up_fp8: layer.gate_up.offset_bytes,
-                    gate_up_scale: layer.gate_up.scale_ptr,
-                    down_fp8: layer.down_proj.offset_bytes,
-                    down_scale: layer.down_proj.scale_ptr,
+                    qkv_fp8: layer.qkv.as_ref().map_or(0, |w| w.offset_bytes),
+                    qkv_scale: layer.qkv.as_ref().map_or(0, |w| w.scale_ptr),
+                    o_fp8: layer.o_proj.as_ref().map_or(0, |w| w.offset_bytes),
+                    o_scale: layer.o_proj.as_ref().map_or(0, |w| w.scale_ptr),
+                    gate_up_fp8: layer.gate_up.as_ref().map_or(0, |w| w.offset_bytes),
+                    gate_up_scale: layer.gate_up.as_ref().map_or(0, |w| w.scale_ptr),
+                    down_fp8: layer.down_proj.as_ref().map_or(0, |w| w.offset_bytes),
+                    down_scale: layer.down_proj.as_ref().map_or(0, |w| w.scale_ptr),
                     layer_scalar_ptr: layer.layer_scalar.offset_bytes,
                     qkv_f16: layer.qkv_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     o_f16: layer.o_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     gate_up_f16: layer.gate_up_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     down_f16: layer.down_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
-                    qkv_chscale: layer.qkv.channelscale_ptr.unwrap_or(0),
-                    o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
-                    gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
-                    down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
-                    qkv_blockscale: layer.qkv.blockscale_ptr.unwrap_or(0),
-                    o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
-                    gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
-                    down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    qkv_chscale: layer.qkv.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    o_chscale: layer.o_proj.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    gate_up_chscale: layer.gate_up.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    down_chscale: layer.down_proj.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    qkv_blockscale: layer.qkv.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    o_blockscale: layer.o_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    gate_up_blockscale: layer.gate_up.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    down_blockscale: layer.down_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    awq: awq_layer_ptrs(layer.awq.as_ref()),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -1109,6 +2523,8 @@ impl Gemma4Bringup {
                     k_scale_cache: layer_kv_scale_base,
                     v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
                     q_scale_cache: q_scale_cache_ptr,
+                    k_cache_scale,
+                    v_cache_scale,
                     q_scale_ptr: q_scale_region.device_ptr(),
                     kv_scale_ptr: kv_scale_region.device_ptr(),
                     attn_out: attn_out.device_ptr(),
@@ -1121,9 +2537,27 @@ impl Gemma4Bringup {
                     mlp_out_fp8: mlp_out_fp8.device_ptr(),
                     mlp_out_scale: mlp_out_scale.device_ptr(),
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
+                    gemm_f32_tmp_bytes: (num_seqs * gemm_f32_max_n * 4) as usize,
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    fa3_workspace_bytes: FA3_WS_BYTES as u64,
+                    // NVFP4 shadow diagnostic: default 0 (no shadow).
+                    // Overridden in the run_generate decode path when
+                    // RVLLM_NVFP4_SHADOW_F16 is on.
+                    shadow_k_cache: 0,
+                    shadow_v_cache: 0,
+                    shadow_q_cache: 0,
+                    // === HADAMARD ROTATION ===
+                    // Probe / profile paths don't use rotation; the
+                    // rope kernel treats nullptr (=0) as "rotation
+                    // off" and runs byte-identical to the pre-Hadamard
+                    // path. Live decode/prefill paths below compute
+                    // the per-layer pointer from
+                    // `self.nvfp4_hadamard`.
+                    hadamard_signs_q: 0,
+                    hadamard_signs_k: 0,
+                    // === END HADAMARD ROTATION ===
                 };
 
                 let meta = Gemma4MetadataPtrs {
@@ -1421,11 +2855,218 @@ impl Gemma4Bringup {
         prompt_ids: &[u32],
         max_new: usize,
         eos_ids: &[u32],
+        // === NVFP4 SHADOW DIAGNOSTIC === per-request opt-in. When
+        // false, the shadow allocator and dump hook do nothing
+        // regardless of env settings. Gates the feature at the
+        // request boundary so upstream-client scaffold calls
+        // (zeroclaw classifier, internal probes) cannot accidentally
+        // burn the one-shot latch.
+        shadow_requested: bool,
+        // Per-request sampling decision. `Greedy` keeps the legacy
+        // argmax path; `Stochastic` activates host-side temperature +
+        // top-p sampling with the supplied seed.
+        sampling: SamplingConfig,
+        // Optional cancellation signal. The decode loop checks this
+        // flag at the top of every step and returns the tokens
+        // produced so far if it transitions to `true`. Without this,
+        // an HTTP-layer timeout / client disconnect would 504 the
+        // request but the worker thread would stay blocked in
+        // `run_generate` until natural completion, monopolising the
+        // GPU and starving subsequent requests. Pass `None` from
+        // bench / probe binaries that have no cancellation source.
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        // Optional per-token emission callback. Called from the
+        // worker thread immediately after each token (prefill's
+        // first token + every decode-loop token, in order) is
+        // produced. Returning `false` is interpreted as "stop the
+        // stream" — the decode loop breaks. Default `None` keeps
+        // the legacy "all tokens returned at end" semantics so
+        // bench / probe / ppl callers are unaffected. The HTTP
+        // worker plumbs in a closure that does
+        // `events_tx.blocking_send(GenerateEvent::Token { ... })`
+        // for true tokenwise SSE delivery and to feed the handler-
+        // side stop-string detector incrementally.
+        mut on_token: Option<&mut dyn FnMut(u32) -> bool>,
     ) -> Result<Vec<u32>> {
+        // Cycle 37 P2 (codex audit): max_new=0 used to underflow at
+        // `0..max_new - 1`. Caller (handlers.rs::resolve_max_new) already
+        // rejects 0 at the HTTP layer, but defend the runtime entry too
+        // so internal callers (probes, future schedulers) cannot trip it.
+        if max_new == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "max_new",
+                    reason: "must be >= 1; max_new=0 underflows the decode loop"
+                        .into(),
+                },
+                field: "max_new",
+            });
+        }
         let arch = &self.arch;
         let hidden = arch.hidden_size as u32;
         let vocab = arch.vocab_size as u32;
         let stream = self.stream.raw();
+
+        // === HOST-SIDE TEMPERATURE SAMPLING ===
+        // Greedy argmax at razor-thin margins (~0.1-0.5 logit units)
+        // makes long-context tool-call generation produce confident
+        // garbage. Sampling at temp>0 lets the model explore
+        // alternative continuations when the top-1 winner is
+        // questionable.
+        //
+        // `SamplingConfig::Greedy` is UNCONDITIONAL argmax. We do NOT
+        // read `RVLLM_SAMPLING_TEMPERATURE` / `_TOP_P` here. The
+        // previous fallback meant a stray env var on the production
+        // box silently broke deterministic `temperature: 0` API
+        // requests. Stochastic decode requires an explicit
+        // `SamplingConfig::Stochastic` from the caller — there is no
+        // "ambient" sampling state.
+        let (sampling_temp, sampling_top_p, sampling_top_k, mut rng_state): (f32, f32, Option<u32>, u64) = match sampling {
+            SamplingConfig::Stochastic { temperature, top_p, top_k, seed } => {
+                (temperature, top_p, top_k, seed)
+            }
+            // Hard zero. The host-side sampler below is gated on
+            // `sampling_temp > 0.0`, so the inert tuple here just
+            // routes through the existing `ArgmaxLaunch` path
+            // without ever entering `host_sample_token`.
+            SamplingConfig::Greedy => (0.0, 1.0, None, 0),
+        };
+        let mut next_rand_f32 = || -> f32 {
+            // 64-bit LCG (Knuth) — bit-for-bit compatible with the
+            // pre-SamplingConfig path. Replaceable by Philox-4×32 if
+            // cross-engine reproducibility against vLLM ever matters;
+            // for now LCG + caller-supplied seed is enough for
+            // request-level determinism (same seed → same output).
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((rng_state >> 40) as f32) / (1u32 << 24) as f32
+        };
+        let host_sample_token = |logits_dev_ptr: u64,
+                                 vocab: u32,
+                                 temp: f32,
+                                 top_p: f32,
+                                 top_k: Option<u32>,
+                                 rng_f32: &mut dyn FnMut() -> f32|
+            -> Result<u32> {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let mut host_logits = vec![0f32; vocab as usize];
+                // Check the cuMemcpyDtoH return — a silently-failing
+                // copy left `host_logits` all-zeros, every entry tied,
+                // and lex-tiebreak picked token-id 0 deterministically.
+                // The caller saw "successful" generation of <pad>/<bos>
+                // sequences while a real CUDA fault sat masked under
+                // it. Now we propagate the error and the request ends
+                // with a clear `RvllmError::Cuda { kind: MemcpyFailed,
+                // op: "host_sample_token_dtoh", … }`.
+                let r = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    host_logits.as_mut_ptr() as *mut _,
+                    logits_dev_ptr,
+                    (vocab as usize) * 4,
+                );
+                if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::Cuda {
+                        kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                        op: "host_sample_token_dtoh",
+                        ctx: rvllm_core::CudaCtx {
+                            stream: stream as u64,
+                            kernel: "",
+                            launch: None,
+                            device: 0,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+                // Apply temperature: divide by temp (clamped to >=1e-3 to
+                // avoid div-by-zero on sloppy callers).
+                let inv_temp = 1.0f32 / temp.max(1e-3);
+                let mut scaled: Vec<(u32, f32)> = host_logits.iter().enumerate()
+                    .map(|(i, &v)| (i as u32, v * inv_temp)).collect();
+                // Sort by scaled logit desc; lex-tiebreak on token id so
+                // ties are deterministic (caller-supplied `seed` then
+                // fully reproduces a request).
+                scaled.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.cmp(&b.0))
+                });
+                // top_k: if set, drop everything past rank K before the
+                // softmax. Avoids wasted exp() on the long tail and is
+                // the canonical OpenAI ordering (top_k, then top_p).
+                let mut effective_len = scaled.len();
+                if let Some(k) = top_k {
+                    effective_len = effective_len.min(k as usize).max(1);
+                }
+                // Softmax-stabilise on the kept slice (avoids overflow
+                // on huge logits — Gemma 4 sees 60+).
+                let max_l = scaled[0].1;
+                let mut probs: Vec<f32> = scaled[..effective_len].iter()
+                    .map(|&(_, l)| (l - max_l).exp())
+                    .collect();
+                let z: f32 = probs.iter().sum();
+                if z > 0.0 { for p in &mut probs { *p /= z; } }
+                // top_p: keep tokens until cumulative >= top_p, drop rest.
+                let mut cum = 0.0f32;
+                let mut cutoff = probs.len();
+                for (i, &p) in probs.iter().enumerate() {
+                    cum += p;
+                    if cum >= top_p { cutoff = i + 1; break; }
+                }
+                // Re-normalize over the top_p window
+                let z2: f32 = probs[..cutoff].iter().sum();
+                if z2 > 0.0 { for p in &mut probs[..cutoff] { *p /= z2; } }
+                // Sample
+                let r = rng_f32();
+                let mut acc = 0.0f32;
+                for (i, &p) in probs[..cutoff].iter().enumerate() {
+                    acc += p;
+                    if r < acc { return Ok(scaled[i].0); }
+                }
+                Ok(scaled[cutoff - 1].0)
+            }
+            #[cfg(not(feature = "cuda"))]
+            { let _ = (logits_dev_ptr, vocab, temp, top_p, top_k, rng_f32); Ok(0u32) }
+        };
+        // === END HOST-SIDE TEMPERATURE SAMPLING ===
+
+        // === REPETITION PENALTY ===
+        // Greedy-compatible logits processor. When set, divides the
+        // logit of any token in `recent_ids` by `penalty` (positive
+        // logits get smaller, negative logits get pushed further
+        // negative — standard HF transformers convention).
+        //
+        // RVLLM_REPETITION_PENALTY        f32, default 1.0 (= disabled)
+        // RVLLM_REPETITION_PENALTY_WINDOW usize, default 64 (look-back
+        //                                  window size in decoded tokens)
+        //
+        // Applied between `f16_gemm_f32` and `ArgmaxLaunch` so argmax
+        // picks from penalized logits. Defends against single-token
+        // attractor locks (e.g. "la la la" on pure NVFP4 tool-call
+        // collapse) that the basic repetition guard only catches
+        // post-hoc after 20 identical tokens.
+        //
+        // Cost: one DtoH + one HtoD of the full vocab f32 logits per
+        // decode step (~2.1 MiB total round-trip for Gemma 4 vocab=
+        // 263168). ~7 ms/step on GB10 unified memory; for a 1024-token
+        // decode that's ~7 s extra wall time. Acceptable diagnostic
+        // overhead; if needed in production, replace with a tiny CUDA
+        // kernel.
+        let rep_penalty: f32 = std::env::var("RVLLM_REPETITION_PENALTY")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let rep_window: usize = std::env::var("RVLLM_REPETITION_PENALTY_WINDOW")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+        // Frequency gate. Default 1 = penalize on first occurrence
+        // (HuggingFace transformers behavior). Raise to 2 or 3 to
+        // ONLY penalize tokens that appeared multiple times — keeps
+        // common German function words / subwords intact while still
+        // breaking lock attractors. Per GPT-5.5 review of pure-NVFP4
+        // multilingual leakage at moderate margins (e.g. step 86 of
+        // R2 emitting Italian " facendo"), the un-gated penalty is
+        // too blunt for greedy decode; min_count=2 + penalty=1.05
+        // is recommended starting point.
+        let rep_min_count: u32 = std::env::var("RVLLM_REPETITION_PENALTY_MIN_COUNT")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let rep_active = rep_penalty > 1.0 + f32::EPSILON;
+        // === END REPETITION PENALTY ===
 
         let block_size: u32 = 32;
         let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
@@ -1463,68 +3104,209 @@ impl Gemma4Bringup {
         let gemm_f32_max_n = std::cmp::max(max_qkv_rows, 2 * inter);
         let gemm_f32_tmp = arena.region("gen_gemm_f32", (max_tokens * gemm_f32_max_n * 4) as usize, 16)?;
 
-        // aa01001pftrope0 cliff-fix: sliding layers need `slot_mapping[t] < sliding_blocks*block_size`
-        // at every t the rope writes; the old cap sliding_blocks = sliding_window/block_size = 32
-        // (= 1024 slots for Gemma 4) broke at prompt_len > sliding_window because slot_mapping
-        // is linear 0..prompt_len-1 and index 1024+ ran off the end of the sliding KV region.
-        // Proper fix is a per-sliding-layer ring buffer (slot = t mod sliding_window) but that
-        // needs rope + attention kernel cooperation. For now give sliding layers the full pool —
-        // ~10 GiB extra at num_blocks_total=1024, fits in the 50 GiB arena with Gemma 4 31B fp8.
+        // Prefix cache: use the persistent KV region allocated by
+        // `init_prefix_cache`. If the cache wasn't pre-initialised
+        // (old callers, rvllm-bench / probe), fall back to per-call
+        // arena allocation — no cache hit available in that case.
         let sliding_blocks = num_blocks_total;
-        let use_f16_kv = std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0");
-        let kv_bytes_per_elem: u32 = if use_f16_kv { 2 } else { 1 };
-        let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
-        let mut kv_total_bytes: u64 = 0;
-        // Per-slot-per-head K/V scale cache offsets (f32 per entry).
-        // One entry per (slot, kv_head) — factor `head_dim` smaller
-        // than the FP8 KV cache region.
-        let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
-        let mut kv_scale_total_bytes: u64 = 0;
-        for l in 0..arch.num_hidden_layers {
-            kv_layer_offsets.push(kv_total_bytes);
-            kv_scale_layer_offsets.push(kv_scale_total_bytes);
-            let is_global = arch.layer_types[l] == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
-            let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
-            let nkvh = arch.num_kv_heads_for_layer(l) as u32;
-            let hd = arch.head_dim_for_layer(l) as u32;
-            let layer_elems = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
-            kv_total_bytes += layer_elems * kv_bytes_per_elem as u64;
-            // Scale storage: [2 (K+V)] × num_slots × num_kv_heads × f32.
-            let layer_scale_slots = 2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
-            kv_scale_total_bytes += layer_scale_slots * 4;
+        let kv_dtype = crate::gemma4_layer_exec::KvDtype::from_env(false);
+        let (kv_cache_ptr, kv_scale_ptr, kv_layer_offsets, kv_scale_layer_offsets,
+             kv_total_bytes, kv_scale_total_bytes, common_prefix_len_raw) = {
+            let guard = self.prefix_cache.lock().unwrap();
+            match &*guard {
+                Some(pc) => {
+                    // Cache hit path: compute the longest common
+                    // prefix in raw token ids.
+                    let mut prefix = 0usize;
+                    while prefix < pc.last_tokens.len()
+                        && prefix < prompt_ids.len()
+                        && pc.last_tokens[prefix] == prompt_ids[prefix]
+                    {
+                        prefix += 1;
+                    }
+                    // Provenance check: invalidate cache entirely
+                    // when batch shape / dtype / hybrid / scale
+                    // policy / prefill mode differs from when the
+                    // KV was written. Optimized NVFP4 kernels are
+                    // batch-variant; reusing KV across mismatched
+                    // policies produces silent miscompare.
+                    let cur_prov = PrefixProvenance::from_env();
+                    if cur_prov != pc.provenance {
+                        eprintln!(
+                            "[prefix-cache] provenance mismatch — invalidating \
+                             (was {:?}, now {:?})",
+                            pc.provenance, cur_prov
+                        );
+                        prefix = 0;
+                        // Codex20-2: layout-relevant flags that affect
+                        // per-layer KV byte-stride (HYBRID_GLOBAL_FP8,
+                        // HYBRID_SLIDING_FP8, FP8_KV_LAYERS) should never
+                        // change at runtime — env is read once at startup
+                        // and the persistent KV allocation +
+                        // kv_layer_offsets are sized for that snapshot.
+                        // We continue to reuse pc.kv_layer_offsets here
+                        // (computed at first run_generate); a runtime flip
+                        // of those flags would write the new layout into
+                        // offsets sized for the old layout. Out of scope:
+                        // rvllm-serve has no env-reload mechanism, the
+                        // service is restarted between configurations
+                        // (see kv_policy_matrix.sh), so this path is not
+                        // reachable in production. If env-reload ever
+                        // lands, this branch must also re-allocate
+                        // pc.kv_cache_ptr / pc.kv_scale_ptr or refuse
+                        // the request.
+                    } else {
+                        // Chunk-shape cap: only reuse up to the last
+                        // FULLY-WRITTEN chunk boundary of the
+                        // previous request. Slots written by a
+                        // shorter trailing chunk are unsafe to reuse
+                        // because they were quantized under a
+                        // different batch shape. Fixes "la la la"
+                        // garbage on classifier-then-persona chains.
+                        let cap = pc.committed_prefix_len as usize;
+                        if cap < prefix {
+                            eprintln!(
+                                "[prefix-cache] capping reuse {}→{} \
+                                 (last committed chunk boundary)",
+                                prefix, cap
+                            );
+                            prefix = cap;
+                        }
+                    }
+                    // Leave at least one token for the prefill to
+                    // process (otherwise there's nothing to decode
+                    // the last hidden state from).
+                    if prefix >= prompt_ids.len() {
+                        prefix = prompt_ids.len().saturating_sub(1);
+                    }
+                    (
+                        pc.kv_cache_ptr,
+                        pc.kv_scale_ptr,
+                        pc.kv_layer_offsets.clone(),
+                        pc.kv_scale_layer_offsets.clone(),
+                        pc.kv_cache_bytes,
+                        pc.kv_scale_bytes,
+                        prefix as u32,
+                    )
+                }
+                None => (0, 0, Vec::new(), Vec::new(), 0, 0, 0),
+            }
+        };
+
+        let use_prefix_cache = kv_cache_ptr != 0;
+        // Per-call fallback when cache wasn't initialised.
+        let _kv_cache_region;
+        let _kv_scale_region;
+        // Cycle 56 step 1: `_kv_scale_total_bytes` prefix silences
+        // the unused-variable warning — the value is computed in the
+        // else branch (and used there for the local memset), but the
+        // outer destructure binding is never read further.
+        let (kv_cache_ptr, kv_scale_ptr,
+             kv_layer_offsets, kv_scale_layer_offsets,
+             kv_total_bytes, _kv_scale_total_bytes) = if use_prefix_cache {
+            (kv_cache_ptr, kv_scale_ptr,
+             kv_layer_offsets, kv_scale_layer_offsets,
+             kv_total_bytes, kv_scale_total_bytes)
+        } else {
+            let mut kv_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+            let mut kv_scale_layer_offsets: Vec<u64> = Vec::with_capacity(arch.num_hidden_layers);
+            let mut kv_total_bytes: u64 = 0;
+            let mut kv_scale_total_bytes: u64 = 0;
+            for l in 0..arch.num_hidden_layers {
+                kv_layer_offsets.push(kv_total_bytes);
+                kv_scale_layer_offsets.push(kv_scale_total_bytes);
+                let is_global = arch.layer_types[l]
+                    == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+                let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+                let hd = arch.head_dim_for_layer(l) as u32;
+                let layer_elems =
+                    2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64 * hd as u64;
+                let kv_dtype_l = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(
+                    arch.layer_types[l], l, false);
+                kv_total_bytes += match kv_dtype_l {
+                    crate::gemma4_layer_exec::KvDtype::F16 => layer_elems * 2,
+                    crate::gemma4_layer_exec::KvDtype::Fp8 => layer_elems,
+                    crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 2,
+                };
+                let layer_scale_slots =
+                    2u64 * layer_blocks as u64 * block_size as u64 * nkvh as u64;
+                kv_scale_total_bytes += match kv_dtype_l {
+                    crate::gemma4_layer_exec::KvDtype::F16 => 0,
+                    crate::gemma4_layer_exec::KvDtype::Fp8 => layer_scale_slots * 4,
+                    crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_elems / 16,
+                };
+            }
+            let kvr = arena.region("gen_kv", kv_total_bytes as usize, 256)?;
+            // Cycle 56 step 4 (bug-audit #6): check CUresult on
+            // per-request scratch zeroing — failure here would leave
+            // KV cache + scale region with arbitrary bytes from the
+            // previous request and corrupt this request's decode.
+            cuda_check!(
+                cudarc::driver::sys::cuMemsetD8_v2(kvr.device_ptr(), 0, kv_total_bytes as usize),
+                "run_generate_kv_zero", 0u64);
+            let kvs = arena.region(
+                "gen_kv_scale_cache", kv_scale_total_bytes.max(16) as usize, 16)?;
+            cuda_check!(
+                cudarc::driver::sys::cuMemsetD8_v2(
+                    kvs.device_ptr(), 0, kv_scale_total_bytes as usize),
+                "run_generate_kv_scale_zero", 0u64);
+            let kc_ptr = kvr.device_ptr();
+            let ks_ptr = kvs.device_ptr();
+            _kv_cache_region = kvr;
+            _kv_scale_region = kvs;
+            (kc_ptr, ks_ptr, kv_layer_offsets, kv_scale_layer_offsets,
+             kv_total_bytes, kv_scale_total_bytes)
+        };
+
+        // Clamp the prefix-match to the actual KV region size.
+        let common_prefix_len: u32 = if use_prefix_cache {
+            common_prefix_len_raw
+        } else {
+            0
+        };
+        if common_prefix_len > 0 {
+            eprintln!(
+                "[prefix-cache] hit: reusing {} of {} prompt tokens",
+                common_prefix_len, prompt_len
+            );
         }
-        let kv_cache = arena.region("gen_kv", kv_total_bytes as usize, 256)?;
-        cudarc::driver::sys::cuMemsetD8_v2(kv_cache.device_ptr(), 0, kv_total_bytes as usize);
-        let kv_scale_cache =
-            arena.region("gen_kv_scale_cache", kv_scale_total_bytes as usize, 16)?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            kv_scale_cache.device_ptr(), 0, kv_scale_total_bytes as usize);
+        // Wrap the raw pointers so downstream `.device_ptr()` calls
+        // stay source-identical across the cache-hit and fallback
+        // paths. This is a 16-byte local, zero runtime cost.
+        struct KvHandle(u64);
+        impl KvHandle {
+            fn device_ptr(&self) -> u64 { self.0 }
+        }
+        let kv_cache = KvHandle(kv_cache_ptr);
+        let kv_scale_cache = KvHandle(kv_scale_ptr);
         let q_scale_scratch_bytes =
             (max_tokens as u64) * (arch.num_attention_heads as u64) * 4;
         let q_scale_scratch = arena.region(
             "gen_q_scale_scratch", q_scale_scratch_bytes as usize, 16)?;
-        cudarc::driver::sys::cuMemsetD8_v2(
-            q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize);
+        cuda_check!(
+            cudarc::driver::sys::cuMemsetD8_v2(
+                q_scale_scratch.device_ptr(), 0, q_scale_scratch_bytes as usize),
+            "run_generate_q_scale_scratch_zero", 0u64);
         // See run_bench: RVLLM_PER_TOKEN_Q_SCALE=0 opts out.
         let q_scale_cache_ptr: u64 =
-            if std::env::var("RVLLM_PER_TOKEN_Q_SCALE").ok().as_deref() == Some("0") {
-                0
-            } else {
+            if per_token_q_scale_enabled(/*default_on=*/true) {
                 q_scale_scratch.device_ptr()
+            } else {
+                0
             };
 
         let q_scale_region = arena.region("gen_q_scale", 4, 4)?;
         let kv_scale_region = arena.region("gen_kv_scale", 4, 4)?;
         {
-            let q_s: f32 = std::env::var("RVLLM_Q_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_Q_SCALE);
-            let kv_s: f32 = std::env::var("RVLLM_KV_SCALE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_KV_SCALE);
+            let q_s = parse_f32_env_or_default("RVLLM_Q_SCALE", DEFAULT_Q_SCALE);
+            let kv_s = parse_f32_env_or_default("RVLLM_KV_SCALE", DEFAULT_KV_SCALE);
             q_scale_region.copy_from_host(&q_s.to_le_bytes())?;
             kv_scale_region.copy_from_host(&kv_s.to_le_bytes())?;
         }
 
-        let fa3_ws = arena.region("gen_fa3_ws", 128 * 1024 * 1024, 256)?;
+        const FA3_WS_BYTES: usize = 128 * 1024 * 1024;
+        let fa3_ws = arena.region("gen_fa3_ws", FA3_WS_BYTES, 256)?;
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
         let cutlass_ws = arena.region("gen_cutlass_ws", cutlass_ws_bytes, 256)?;
 
@@ -1537,7 +3319,15 @@ impl Gemma4Bringup {
         // and indexes it by `qi * 4`. With only 8 bytes (old FA2
         // prefill layout) writing beyond entry 1 corrupted adjacent
         // arena regions and degenerated generation quality.
-        let cu_seqlens_q = arena.region("gen_cu_seqlens", (max_tokens * 4) as usize, 16)?;
+        // Codex26-3: prefix-sum holds at least `[0, chunk_q]` = 2 i32
+        // entries even when max_tokens=1 (RVLLM_DIAG_SKIP_DECODE +
+        // single-token prompt). The previous `max_tokens*4` produced
+        // a 4-byte region, so the 8-byte copy_from_host below failed.
+        let cu_seqlens_q = arena.region(
+            "gen_cu_seqlens",
+            ((max_tokens.max(1) + 1) * 4) as usize,
+            16,
+        )?;
         let block_tables = arena.region("gen_bt", (max_blocks_per_seq * 4) as usize, 16)?;
         {
             let bt: Vec<i32> = (0..max_blocks_per_seq as i32).collect();
@@ -1546,29 +3336,228 @@ impl Gemma4Bringup {
 
         let residual = arena.region("gen_residual", (max_tokens * hidden * 2) as usize, 16)?;
         let logits_f32 = arena.region("gen_logits_f32", (vocab * 4) as usize, 16)?;
+        // Codex41-3: device-side scratch for the recent-IDs list the
+        // GPU repetition-penalty kernel reads. 1024 i32 = 4 KB —
+        // covers any reasonable rep-window without bouncing the full
+        // vocab through host memory.
+        let rep_ids_dev = arena.region("gen_rep_ids", 1024 * 4, 16)?;
         let token_ids_region = arena.region("gen_tok_ids", (max_tokens * 4) as usize, 16)?;
         let sampled = arena.region("gen_sampled", 4, 16)?;
         let residual_ptr = residual.device_ptr();
-        let kernels = self.layer_kernels();
+        let kernels = self.layer_kernels()?;
 
         use rvllm_loader::gemma4_arch::Gemma4LayerType;
         let max_layers = std::env::var("RVLLM_MAX_LAYERS")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(arch.num_hidden_layers);
 
+        // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+        // Build (or re-use) the f16 shadow KV region for the instrumented
+        // layers. Pure diagnostic — the allocation mirrors the primary
+        // allocator but forces F16 for every instrumented layer so the
+        // cache is ground-truth. Same layer-blocks / nkvh / hd sizing as
+        // the primary path; no scale region (f16 self-scaled).
+        // Per-request gate: even with RVLLM_NVFP4_SHADOW_F16=1 in env,
+        // skip shadow path unless the operator explicitly opted THIS
+        // request in via `X-Rvllm-Shadow: 1`. Closes the
+        // upstream-client-scaffold-burns-latch hole.
+        let shadow_set: Option<Vec<u32>> = if shadow_requested {
+            crate::gemma4_layer_exec::parse_shadow_layers()
+        } else {
+            None
+        };
+        // Compute per-layer shadow offsets (populated only for layers
+        // in the shadow set; sentinel u64::MAX otherwise). Needed both
+        // when we have to allocate the region now AND on subsequent
+        // calls when it already exists — cheap to recompute every call.
+        let shadow_layer_offsets: Vec<u64> = if let Some(ref lset) = shadow_set {
+            let mut offs = vec![u64::MAX; arch.num_hidden_layers];
+            let mut cursor: u64 = 0;
+            for l in 0..arch.num_hidden_layers {
+                if !lset.contains(&(l as u32)) { continue; }
+                offs[l] = cursor;
+                let is_global = arch.layer_types[l]
+                    == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+                let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+                let hd = arch.head_dim_for_layer(l) as u32;
+                // f16 = 2 bytes/elem; 2× for K and V.
+                let layer_bytes =
+                    2u64 * (layer_blocks as u64) * (block_size as u64)
+                        * (nkvh as u64) * (hd as u64) * 2;
+                cursor += layer_bytes;
+            }
+            offs
+        } else {
+            Vec::new()
+        };
+        let shadow_total_bytes: u64 = if let Some(ref lset) = shadow_set {
+            let mut sum: u64 = 0;
+            for l in 0..arch.num_hidden_layers {
+                if !lset.contains(&(l as u32)) { continue; }
+                let is_global = arch.layer_types[l]
+                    == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+                let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+                let hd = arch.head_dim_for_layer(l) as u32;
+                sum += 2u64 * (layer_blocks as u64) * (block_size as u64)
+                    * (nkvh as u64) * (hd as u64) * 2;
+            }
+            sum
+        } else { 0 };
+        // Per-layer Q slot size: num_attention_heads * max_head_dim * 2 (f16).
+        // Uniform across layers so indexing is a simple multiply. We dump
+        // exactly ONE Q row per layer (decode step 0's Q). Slot is fixed
+        // at single-token size regardless of how many tokens prefill
+        // wrote — the per-layer slot is only ever populated on decode
+        // step 0, when num_tokens == 1.
+        let shadow_q_per_layer_bytes: u64 = if shadow_set.is_some() {
+            2u64 * (arch.num_attention_heads as u64) * (arch.max_head_dim() as u64)
+        } else {
+            0
+        };
+        // Throwaway scratch — must hold the largest single
+        // rope_f16kv_shadow Q-output. Decode = 1 token; batch prefill
+        // = up to chunk_q tokens (bounded by num_blocks_total *
+        // block_size). Size for the prefill upper bound so batch
+        // prefill scratch construction can route shadow Q here
+        // safely. ~1 GiB worst case on Gemma 4 31B (32768 * 32 *
+        // 512 * 2). Trivial vs 128 GiB unified.
+        let shadow_q_throwaway_bytes: u64 = if shadow_set.is_some() {
+            (num_blocks_total as u64) * (block_size as u64) * shadow_q_per_layer_bytes
+        } else {
+            0
+        };
+        let shadow_q_total_bytes: u64 = if let Some(ref lset) = shadow_set {
+            shadow_q_per_layer_bytes * (lset.len() as u64)
+        } else {
+            0
+        };
+        let (shadow_ptr, shadow_q_ptr, shadow_q_throwaway_ptr): (u64, u64, u64) =
+            if let Some(ref lset) = shadow_set {
+            let mut guard = self.nvfp4_shadow.lock().unwrap();
+            if let Some(ref existing) = *guard {
+                (existing.shadow_ptr, existing.shadow_q_ptr, existing.shadow_q_throwaway_ptr)
+            } else {
+                // `Region` isn't `Drop`; the bump-pointer state held
+                // by `arena` is what keeps these allocations alive
+                // past the wrapper falling out of scope below.
+                let bytes = shadow_total_bytes.max(16) as usize;
+                let region = arena.region("nvfp4_shadow_kv", bytes, 256)?;
+                // Codex26-4: NVFP4 shadow diagnostic memsets — wrap with
+                // cuda_check so OOM / ECC during shadow init surfaces
+                // as a typed error instead of producing misleading
+                // shadow snapshots.
+                cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+                    region.device_ptr(), 0, bytes),
+                    "nvfp4_shadow_kv_zero", stream);
+                let ptr = region.device_ptr();
+                // Per-layer Q snapshot region.
+                let q_bytes = shadow_q_total_bytes.max(16) as usize;
+                let q_region = arena.region("nvfp4_shadow_q", q_bytes, 256)?;
+                cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+                    q_region.device_ptr(), 0, q_bytes),
+                    "nvfp4_shadow_q_zero", stream);
+                let q_ptr = q_region.device_ptr();
+                // Q throwaway scratch: one slot. Shadow rope targets
+                // this when we're not capturing, so q_normed stays
+                // untouched and the subsequent primary nvfp4 rope
+                // gets pristine pre-RoPE Q as input (exactly-one-RoPE
+                // invariant restored).
+                let throwaway_bytes = shadow_q_throwaway_bytes.max(16) as usize;
+                let throwaway_region = arena.region(
+                    "nvfp4_shadow_q_throwaway", throwaway_bytes, 256)?;
+                cuda_check!(cudarc::driver::sys::cuMemsetD8_v2(
+                    throwaway_region.device_ptr(), 0, throwaway_bytes),
+                    "nvfp4_shadow_q_throwaway_zero", stream);
+                let throwaway_ptr = throwaway_region.device_ptr();
+                *guard = Some(NvFp4ShadowAlloc {
+                    shadow_ptr: ptr,
+                    shadow_bytes: shadow_total_bytes,
+                    layer_offsets: shadow_layer_offsets.clone(),
+                    layer_indices: lset.clone(),
+                    shadow_q_ptr: q_ptr,
+                    shadow_q_total_bytes,
+                    shadow_q_per_layer_bytes,
+                    shadow_q_throwaway_ptr: throwaway_ptr,
+                });
+                eprintln!(
+                    "[nvfp4-shadow] allocated {} MiB f16 shadow KV + {} KiB per-layer Q for {} layers: {:?}",
+                    shadow_total_bytes / (1024 * 1024),
+                    shadow_q_total_bytes / 1024,
+                    lset.len(),
+                    lset,
+                );
+                (ptr, q_ptr, throwaway_ptr)
+            }
+        } else { (0, 0, 0) };
+        // === END NVFP4 SHADOW DIAGNOSTIC ===
+
+        // === HADAMARD ROTATION ===
+        // Lazy-init the per-layer Hadamard sign vectors on first run
+        // (gated by env). All layers share the same head_dim at the
+        // rope-input level (Gemma 4: sliding heads use head_dim=256,
+        // global heads use head_dim=512 — but rotation buffer is
+        // sized to `arch.max_head_dim()` so both fit; sliding layers
+        // use the leading head_dim bytes of their slot).
+        let hadamard_base_ptr: u64 = if nvfp4_hadamard_enabled() {
+            let mut guard = self.nvfp4_hadamard.lock().unwrap();
+            if guard.is_none() {
+                let max_hd = arch.max_head_dim() as u32;
+                let nl = arch.num_hidden_layers as u32;
+                *guard = build_nvfp4_hadamard_signs(nl, max_hd, arena)?;
+            }
+            guard.as_ref().map(|a| a.base_ptr).unwrap_or(0)
+        } else {
+            0
+        };
+        let hadamard_head_dim_stride: u32 =
+            if hadamard_base_ptr != 0 { arch.max_head_dim() as u32 } else { 0 };
+        // === END HADAMARD ROTATION ===
+
         // Helper: run one token through all layers (decode path)
-        let run_one_token = |tok_id: u32, step: usize| -> Result<()> {
+        // === CUDA-graph-capturable factoring (cycle 60+) ===
+        //
+        // Original `run_one_token` interleaved host→device input copies
+        // (token id, positions, slot_mapping, context_lens) with the
+        // pure-device kernel chain. CUDA Graph capture cannot replay
+        // HtoD copies whose source pointers are stack-local — they go
+        // out of scope after the capture closure returns. The PPL path
+        // (line ~2099) already factors the same way; we mirror it here
+        // for the decode hot path.
+        //
+        //   * `prepare_decode_inputs(tok_id, step)` — host-side HtoDs,
+        //     ALWAYS runs eagerly between graph replays.
+        //   * `decode_forward()` — pure device kernel chain (embedding
+        //     gather + optional f16→bf16 widen + 60-layer body).
+        //     Capturable into a CUDA graph; replayable any number of
+        //     times as long as the device-side input buffers are
+        //     refreshed via `prepare_decode_inputs` between replays.
+        //
+        // `run_one_token` keeps its existing signature for the prefill
+        // (line ~3012) and diagnostic (line ~3044) call sites; it just
+        // calls the two helpers in sequence.
+        let prepare_decode_inputs = |tok_id: u32, step: usize| -> Result<()> {
             let tok_i32 = [tok_id as i32];
             token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_i32))?;
-            rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
-                .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
-                    token_ids_region.device_ptr(), stream)?;
-
             let pos = [step as i32];
             let slot = [step as i32];
             let ctx = [step as i32 + 1];
             positions.copy_from_host(bytemuck_cast_i32(&pos))?;
             slot_mapping.copy_from_host(bytemuck_cast_i32(&slot))?;
             context_lens.copy_from_host(bytemuck_cast_i32(&ctx))?;
+            Ok(())
+        };
+        let decode_forward = |step: usize| -> Result<()> {
+            rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
+                .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
+                    token_ids_region.device_ptr(), stream)?;
+            // Cycle 54 Stage 1: BF16 residual chain entry. Embedding
+            // gather writes f16; widen to bf16 in-place so subsequent
+            // layers operate on bf16 storage.
+            if bf16_residual_enabled() {
+                rvllm_fused::gemma4_launcher::F16ToBf16Launch { n: hidden }
+                    .launch(kernels.f16_to_bf16, residual_ptr, residual_ptr, stream)?;
+            }
 
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
                 if layer_idx >= max_layers { break; }
@@ -1584,6 +3573,19 @@ impl Gemma4Bringup {
                     kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
+                // Per-layer dtype: hybrid mode swaps global layers to FP8,
+                // sliding layers stay on env default. Cycle 24: pass
+                // layer_idx so RVLLM_FP8_KV_LAYERS list env is honored
+                // (must match the allocation-side decision in load_gemma4_fused
+                // — layer 709 — or the cache layout disagrees with dispatch).
+                let kv_dtype = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(lt, layer_idx, false);
+                let (k_cache_scale, v_cache_scale) = if kv_dtype
+                    == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                {
+                    (layer_kv_scale_base, layer_kv_scale_base + layer_kv_elems / 32)
+                } else {
+                    (0u64, 0u64)
+                };
 
                 let dims = crate::gemma4_layer_exec::Gemma4LayerDims {
                     num_tokens: 1, hidden,
@@ -1593,7 +3595,15 @@ impl Gemma4Bringup {
                     max_blocks_per_seq: layer_blocks, num_blocks_total: layer_blocks,
                     attn_scale: 1.0, rms_eps: arch.rms_norm_eps,
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
-                    f16_kv: use_f16_kv,
+                    f16_kv: kv_dtype.is_f16(),
+                    kv_dtype,
+                    bf16_residual: bf16_residual_enabled(),
+                    // Decode step knows its own ctx CPU-side — `ctx = [step + 1]`
+                    // was computed at line ~1843. Pass it so the split-KV
+                    // dispatch gates on the current ctx length instead of
+                    // the bucket max (avoids dispatching split on short
+                    // early-generation turns where one-CTA decode wins).
+                    current_max_context_len: Some((step as u32) + 1),
                 };
                 let w = crate::gemma4_layer_exec::Gemma4LayerWeightPtrs {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
@@ -1602,23 +3612,24 @@ impl Gemma4Bringup {
                     post_ff_norm_gamma: layer.post_feedforward_layernorm.offset_bytes,
                     q_norm_gamma: layer.q_norm.offset_bytes,
                     k_norm_gamma: layer.k_norm.offset_bytes,
-                    qkv_fp8: layer.qkv.offset_bytes, qkv_scale: layer.qkv.scale_ptr,
-                    o_fp8: layer.o_proj.offset_bytes, o_scale: layer.o_proj.scale_ptr,
-                    gate_up_fp8: layer.gate_up.offset_bytes, gate_up_scale: layer.gate_up.scale_ptr,
-                    down_fp8: layer.down_proj.offset_bytes, down_scale: layer.down_proj.scale_ptr,
+                    qkv_fp8: layer.qkv.as_ref().map_or(0, |w| w.offset_bytes), qkv_scale: layer.qkv.as_ref().map_or(0, |w| w.scale_ptr),
+                    o_fp8: layer.o_proj.as_ref().map_or(0, |w| w.offset_bytes), o_scale: layer.o_proj.as_ref().map_or(0, |w| w.scale_ptr),
+                    gate_up_fp8: layer.gate_up.as_ref().map_or(0, |w| w.offset_bytes), gate_up_scale: layer.gate_up.as_ref().map_or(0, |w| w.scale_ptr),
+                    down_fp8: layer.down_proj.as_ref().map_or(0, |w| w.offset_bytes), down_scale: layer.down_proj.as_ref().map_or(0, |w| w.scale_ptr),
                     layer_scalar_ptr: layer.layer_scalar.offset_bytes,
                     qkv_f16: layer.qkv_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     o_f16: layer.o_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     gate_up_f16: layer.gate_up_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     down_f16: layer.down_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
-                    qkv_chscale: layer.qkv.channelscale_ptr.unwrap_or(0),
-                    o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
-                    gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
-                    down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
-                    qkv_blockscale: layer.qkv.blockscale_ptr.unwrap_or(0),
-                    o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
-                    gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
-                    down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    qkv_chscale: layer.qkv.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    o_chscale: layer.o_proj.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    gate_up_chscale: layer.gate_up.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    down_chscale: layer.down_proj.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    qkv_blockscale: layer.qkv.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    o_blockscale: layer.o_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    gate_up_blockscale: layer.gate_up.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    down_blockscale: layer.down_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    awq: awq_layer_ptrs(layer.awq.as_ref()),
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;
@@ -1626,6 +3637,71 @@ impl Gemma4Bringup {
                     Gemma4LayerType::SlidingAttention => (self.model.rope_cos_sliding.offset_bytes, self.model.rope_sin_sliding.offset_bytes),
                     Gemma4LayerType::GlobalAttention => (self.model.rope_cos_global.offset_bytes, self.model.rope_sin_global.offset_bytes),
                 };
+                let bytes_per_half_kv = match kv_dtype {
+                    crate::gemma4_layer_exec::KvDtype::F16 => layer_kv_elems,
+                    crate::gemma4_layer_exec::KvDtype::Fp8 => layer_kv_elems / 2,
+                    crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_kv_elems / 4,
+                };
+                // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                // Populate shadow pointers only for instrumented NVFP4 layers.
+                let is_shadow_layer = shadow_ptr != 0
+                    && kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                    && layer_idx < shadow_layer_offsets.len()
+                    && shadow_layer_offsets[layer_idx] != u64::MAX;
+                let (shadow_k, shadow_v) = if is_shadow_layer {
+                    let base = shadow_ptr + shadow_layer_offsets[layer_idx];
+                    // f16 K/V: each is layer_kv_elems/2 elements × 2 bytes = layer_kv_elems bytes.
+                    (base, base + layer_kv_elems)
+                } else {
+                    (0u64, 0u64)
+                };
+                // Shadow Q target. Two roles:
+                //   (a) When the layer is instrumented AND this is the
+                //       first decode step (step 0 after prompt), point
+                //       at the per-layer Q slot so the Python analyzer
+                //       gets post-RoPE f16 Q for logit_err / topk /
+                //       out_err.
+                //   (b) When the layer is instrumented at any OTHER
+                //       step (all prefill steps + decode step >0),
+                //       point at the shared throwaway so shadow rope
+                //       has a valid q_out target WITHOUT clobbering
+                //       `scratch.q_normed`. This is load-bearing: if
+                //       q_normed is clobbered, the subsequent primary
+                //       rope_nvfp4kv rotates it a second time and
+                //       every forward pass is wrong.
+                //   (c) When the layer is NOT instrumented, 0 — shadow
+                //       rope doesn't run at all.
+                let shadow_q = if is_shadow_layer {
+                    if step == prompt_ids.len() && shadow_q_ptr != 0 {
+                        let pos_in_set = shadow_set
+                            .as_ref()
+                            .and_then(|s| s.iter().position(|&l| l as usize == layer_idx));
+                        match pos_in_set {
+                            Some(i) => shadow_q_ptr + (i as u64) * shadow_q_per_layer_bytes,
+                            None => shadow_q_throwaway_ptr,
+                        }
+                    } else {
+                        shadow_q_throwaway_ptr
+                    }
+                } else {
+                    0
+                };
+                // === END NVFP4 SHADOW DIAGNOSTIC ===
+                // === HADAMARD ROTATION ===
+                // Per-layer pointer into the sign-vector base buffer.
+                // Only enabled on NVFP4 layers (other dtypes' rope
+                // launchers don't read these fields). Both Q and K
+                // share the same per-layer vector — see comment on
+                // the field declaration.
+                let hadamard_layer_ptr: u64 = if hadamard_base_ptr != 0
+                    && kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                {
+                    hadamard_base_ptr
+                        + (layer_idx as u64) * (hadamard_head_dim_stride as u64)
+                } else {
+                    0
+                };
+                // === END HADAMARD ROTATION ===
                 let scratch = crate::gemma4_layer_exec::Gemma4LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(), hidden_scale: hidden_scale.device_ptr(),
                     q_out: q_base, k_out, v_out,
@@ -1633,7 +3709,9 @@ impl Gemma4Bringup {
                     v_normed: v_normed.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
-                    v_cache: layer_kv_base + (layer_kv_elems / 2) * kv_bytes_per_elem as u64,
+                    v_cache: layer_kv_base + bytes_per_half_kv,
+                    k_cache_scale,
+                    v_cache_scale,
                     q_scale_ptr: q_scale_region.device_ptr(), kv_scale_ptr: kv_scale_region.device_ptr(),
                     k_scale_cache: layer_kv_scale_base,
                     v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
@@ -1644,8 +3722,19 @@ impl Gemma4Bringup {
                     gate_up_scale: gate_up_scale.device_ptr(),
                     mlp_out_fp8: mlp_out_fp8.device_ptr(), mlp_out_scale: mlp_out_scale.device_ptr(),
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
+                    // Codex40-3: run_generate alloc uses `max_tokens`,
+                    // not num_seqs.
+                    gemm_f32_tmp_bytes: (max_tokens * gemm_f32_max_n * 4) as usize,
                     cutlass_workspace: cutlass_ws.device_ptr(), cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    fa3_workspace_bytes: FA3_WS_BYTES as u64,
+                    shadow_k_cache: shadow_k,
+                    shadow_v_cache: shadow_v,
+                    shadow_q_cache: shadow_q,
+                    // === HADAMARD ROTATION ===
+                    hadamard_signs_q: hadamard_layer_ptr,
+                    hadamard_signs_k: hadamard_layer_ptr,
+                    // === END HADAMARD ROTATION ===
                 };
                 let meta = crate::gemma4_layer_exec::Gemma4MetadataPtrs {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
@@ -1659,6 +3748,10 @@ impl Gemma4Bringup {
                 )?;
             }
             Ok(())
+        };
+        let run_one_token = |tok_id: u32, step: usize| -> Result<()> {
+            prepare_decode_inputs(tok_id, step)?;
+            decode_forward(step)
         };
 
         let t0 = std::time::Instant::now();
@@ -1690,10 +3783,54 @@ impl Gemma4Bringup {
         // batch path (diagnostic: verifies CUTLASS >=128 correctness,
         // or measures the collapsed-scalar quality floor at <128).
         let skip_decode = std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
-        let use_batch_prefill = std::env::var_os("RVLLM_BATCH_PREFILL").is_some();
-        if !skip_decode && !use_batch_prefill {
-            for (i, &tok) in prompt_ids.iter().enumerate() {
-                run_one_token(tok, i)?;
+        let requested_batch_prefill = parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false);
+        let use_batch_prefill =
+            requested_batch_prefill && kv_dtype != crate::gemma4_layer_exec::KvDtype::F16;
+        if requested_batch_prefill && !use_batch_prefill {
+            eprintln!(
+                "[prefill] RVLLM_BATCH_PREFILL=1 ignored for F16 KV; \
+                 using per-token path to keep KV dtype consistent"
+            );
+        }
+        // Edge cases the batch-prefill block at line ~3420 cannot
+        // service correctly:
+        //   * prompt_len <= 1 — the gate further down uses
+        //     `prompt_len > 1` so the batch block never runs, and
+        //     without the per-token fallback below `residual_ptr`
+        //     would stay stale and the LM head would read garbage.
+        //   * total_new_q == 0 (full prefix-cache hit) — the chunk
+        //     loop never iterates, `new_q` stays 0, and the diag
+        //     capture below uses `new_q - 1` which underflows
+        //     usize and reads from invalid memory.
+        // Both collapse to "no real work for batch-prefill" → fall
+        // through to the per-token path which handles them.
+        let total_new_q_for_gate = prompt_len.saturating_sub(common_prefix_len);
+        let use_batch_path =
+            use_batch_prefill && prompt_len > 1 && total_new_q_for_gate > 0;
+        if !skip_decode && !use_batch_path {
+            // Prefix-cache fast path: if common_prefix_len > 0, the
+            // persistent KV region already holds valid entries for
+            // slots [0..common_prefix_len). Skip those tokens; the
+            // per-token loop picks up at the first new token, attention
+            // reads the cached KV for context. Batch-prefill path
+            // below doesn't use this shortcut yet (unified kernel
+            // would need partial-query support wired through).
+            let start = common_prefix_len as usize;
+            if start >= prompt_len as usize && prompt_len > 0 {
+                // Full prefix-cache hit: every prompt token's KV is
+                // already cached, but `residual_ptr` is empty for THIS
+                // request. Recompute the last token's residual through
+                // the per-layer loop so the LM head has something to
+                // consume. The KV write at slot `prompt_len-1`
+                // overwrites cached value with the same bits
+                // (idempotent given identical prompt), so cache state
+                // stays consistent for subsequent requests.
+                let last_idx = (prompt_len - 1) as usize;
+                run_one_token(prompt_ids[last_idx], last_idx)?;
+            } else {
+                for (i, &tok) in prompt_ids.iter().enumerate().skip(start) {
+                    run_one_token(tok, i)?;
+                }
             }
         }
 
@@ -1739,62 +3876,132 @@ impl Gemma4Bringup {
             self.stream.fence()?;
         }
 
-        // Dead prefill block retained behind `if false`; flip to the
-        // diag gate to re-run the prompt through batch prefill
-        // (correctness is still broken — this path is instrumentation,
-        // not production). `skip_decode` takes the prefill path
-        // standalone so the existing DBG probes fire on prefill's
-        // layer 0 / layer 1 for direct comparison against a normal
-        // decode-only run.
-        if (diag_compare && prompt_len > 1) || skip_decode || (use_batch_prefill && prompt_len > 1) {
-            let tok_ids: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-            token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
-            // Readback sanity-check: confirm the device buffer actually
-            // holds the full prompt before the gather kernel runs.
-            self.stream.fence()?;
-            let mut readback = vec![0i32; prompt_len as usize];
-            cudarc::driver::sys::cuMemcpyDtoH_v2(
-                readback.as_mut_ptr() as *mut _,
-                token_ids_region.device_ptr(),
-                (prompt_len * 4) as _,
-            );
-            eprintln!("[DIAG] token_ids_region readback = {:?}", readback);
-            rvllm_fused::EmbeddingGatherLaunch { num_tokens: prompt_len, hidden, vocab }
-                .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
-                    token_ids_region.device_ptr(), stream)?;
-            // Also read back rows 0 and N-1 of residual IMMEDIATELY
-            // after the gather, BEFORE any layers run.
-            self.stream.fence()?;
-            let mut r0 = vec![0u16; 4];
-            let mut r_n_minus_1 = vec![0u16; 4];
-            cudarc::driver::sys::cuMemcpyDtoH_v2(r0.as_mut_ptr() as *mut _, residual_ptr, 8);
-            cudarc::driver::sys::cuMemcpyDtoH_v2(
-                r_n_minus_1.as_mut_ptr() as *mut _,
-                residual_ptr + ((prompt_len - 1) as u64 * hidden as u64 * 2),
-                8,
-            );
-            eprintln!(
-                "[DIAG] post-gather row0[..4]={:?} rowN-1[..4]={:?}",
-                r0.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
-                r_n_minus_1.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
-            );
-
-            let pos: Vec<i32> = (0..prompt_len as i32).collect();
-            let slot: Vec<i32> = (0..prompt_len as i32).collect();
-            let ctx = [prompt_len as i32];
-            let cu_seq = [0i32, prompt_len as i32];
-            positions.copy_from_host(bytemuck_cast_i32(&pos))?;
-            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot))?;
-            context_lens.copy_from_host(bytemuck_cast_i32(&ctx))?;
-            cu_seqlens_q.copy_from_host(bytemuck_cast_i32(&cu_seq))?;
-
-            let phase = crate::gemma4_layer_exec::Gemma4Phase::Prefill {
-                cu_seqlens_q: cu_seqlens_q.device_ptr(),
-                max_seqlen_q: prompt_len,
-                num_seqs: 1,
+        // Batch-prefill path. Originally retained as instrumentation
+        // (see commit history for the diag-only days), now also the
+        // production path on sm_121/NVFP4 when RVLLM_BATCH_PREFILL=1
+        // — the parameters_for_nvfp4_sm121.md profile recommends it
+        // and Cortex production runs with this flag set. The earlier
+        // "correctness is still broken" comment was stale.
+        //
+        // Two edge cases route AWAY from this block via the gate
+        // above: prompt_len ≤ 1 (single-token prompts have no
+        // batched work) and total_new_q == 0 (full prefix-cache
+        // hit, no NEW tokens to prefill). Per-token fallback handles
+        // both. With those guarded, the chunk loop below always
+        // sees total_new_q ≥ 1 and `new_q ≥ 1` after the first
+        // iteration, so `new_q - 1` arithmetic is safe.
+        if (diag_compare && prompt_len > 1) || skip_decode || use_batch_path {
+            // Prefix-cache aware batch prefill, OPTIONALLY chunked.
+            //
+            // When `use_prefix_cache` reports a common prefix of length
+            // L, we skip prefill for slots [0..L). The remaining
+            // `prompt_len - L` new tokens get processed in chunks of
+            // `RVLLM_PREFILL_CHUNK_SIZE` (0 = single chunk / all new
+            // tokens at once, matching the pre-chunked path).
+            //
+            // Each chunk is a "partial query with full-prefix KV
+            // history" — the unified kernel handles this natively via
+            // `context_lens = chunk_end, cu_seqlens_q = [0, chunk_q],
+            // positions = [chunk_start..chunk_end)`. After the chunk
+            // runs, its KV is in the persistent cache for the next
+            // chunk's attention reads.
+            //
+            // Diag mode forces L=0 + single chunk so the row-0 /
+            // row-(N-1) rel_err comparison stays meaningful.
+            let prefix_skip = if diag_compare { 0 } else { common_prefix_len };
+            let total_new_q = prompt_len - prefix_skip;
+            let chunk_env: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let chunk_size_max: u32 = if diag_compare || chunk_env == 0 {
+                total_new_q
+            } else {
+                chunk_env
             };
 
-            for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+            if chunk_size_max < total_new_q {
+                eprintln!(
+                    "[prefill-chunk] total_new_q={} chunk_size_max={} num_chunks={}",
+                    total_new_q, chunk_size_max,
+                    (total_new_q + chunk_size_max - 1) / chunk_size_max
+                );
+            }
+
+            // Outer chunk loop. `new_q` at end-of-block holds the LAST
+            // chunk's Q length so the downstream last-token-residual
+            // extract picks the right row.
+            let mut chunk_start_abs: u32 = prefix_skip;
+            let mut new_q: u32 = 0;
+            let mut chunk_idx: u32 = 0;
+            while chunk_start_abs < prompt_len {
+                let chunk_end_abs = std::cmp::min(
+                    chunk_start_abs + chunk_size_max,
+                    prompt_len,
+                );
+                let chunk_q = chunk_end_abs - chunk_start_abs;
+                new_q = chunk_q;
+                let tok_ids: Vec<i32> = prompt_ids[
+                    chunk_start_abs as usize .. chunk_end_abs as usize
+                ].iter().map(|&t| t as i32).collect();
+                token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
+                if chunk_idx == 0 {
+                    self.stream.fence()?;
+                    let mut readback = vec![0i32; chunk_q as usize];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        readback.as_mut_ptr() as *mut _,
+                        token_ids_region.device_ptr(),
+                        (chunk_q * 4) as _,
+                    );
+                    eprintln!(
+                        "[DIAG] batch-prefill prefix_skip={} chunk0_q={} readback[..min(8)]={:?}",
+                        prefix_skip, chunk_q, &readback[..readback.len().min(8)]
+                    );
+                }
+                rvllm_fused::EmbeddingGatherLaunch { num_tokens: chunk_q, hidden, vocab }
+                    .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
+                        token_ids_region.device_ptr(), stream)?;
+                // Cycle 54 Stage 1: widen embedding-gather output (f16)
+                // to bf16 in-place so the chunked-prefill residual chain
+                // operates on bf16 between layers.
+                if bf16_residual_enabled() {
+                    rvllm_fused::gemma4_launcher::F16ToBf16Launch {
+                        n: chunk_q * hidden,
+                    }.launch(kernels.f16_to_bf16, residual_ptr, residual_ptr, stream)?;
+                }
+                if chunk_idx == 0 {
+                    self.stream.fence()?;
+                    let mut r0 = vec![0u16; 4];
+                    let mut r_n_minus_1 = vec![0u16; 4];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(r0.as_mut_ptr() as *mut _, residual_ptr, 8);
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        r_n_minus_1.as_mut_ptr() as *mut _,
+                        residual_ptr + ((chunk_q - 1) as u64 * hidden as u64 * 2),
+                        8,
+                    );
+                    eprintln!(
+                        "[DIAG] post-gather row0[..4]={:?} rowN-1[..4]={:?}",
+                        r0.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
+                        r_n_minus_1.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect::<Vec<_>>(),
+                    );
+                }
+
+                // positions / slot_mapping for THIS chunk; cu_seq + ctx
+                // frame the partial query within the full sequence.
+                let pos: Vec<i32> = (chunk_start_abs as i32 .. chunk_end_abs as i32).collect();
+                let slot: Vec<i32> = (chunk_start_abs as i32 .. chunk_end_abs as i32).collect();
+                let ctx = [chunk_end_abs as i32];
+                let cu_seq = [0i32, chunk_q as i32];
+                positions.copy_from_host(bytemuck_cast_i32(&pos))?;
+                slot_mapping.copy_from_host(bytemuck_cast_i32(&slot))?;
+                context_lens.copy_from_host(bytemuck_cast_i32(&ctx))?;
+                cu_seqlens_q.copy_from_host(bytemuck_cast_i32(&cu_seq))?;
+
+                let phase = crate::gemma4_layer_exec::Gemma4Phase::Prefill {
+                    cu_seqlens_q: cu_seqlens_q.device_ptr(),
+                    max_seqlen_q: chunk_q,
+                    num_seqs: 1,
+                };
+
+                for (layer_idx, layer) in self.model.layers.iter().enumerate() {
                 if layer_idx >= max_layers { break; }
                 let lt = arch.layer_types[layer_idx];
                 let hd = arch.head_dim_for_layer(layer_idx) as u32;
@@ -1808,9 +4015,26 @@ impl Gemma4Bringup {
                     kv_scale_cache.device_ptr() + kv_scale_layer_offsets[layer_idx];
                 let layer_kv_scale_slots_half =
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
+                // Per-layer dtype: hybrid swaps global to FP8 (sliding stays env default).
+                // Cycle 24: pass layer_idx for RVLLM_FP8_KV_LAYERS list env.
+                let kv_dtype = crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(lt, layer_idx, false);
+                // Prefill uses FP8 KV when the ambient dtype is F16
+                // (no F16 prefill kernel exists); NVFP4 prefill stays on NVFP4.
+                let prefill_kv_dtype = if kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4 {
+                    crate::gemma4_layer_exec::KvDtype::Nvfp4
+                } else {
+                    crate::gemma4_layer_exec::KvDtype::Fp8
+                };
+                let (k_cache_scale, v_cache_scale) = if prefill_kv_dtype
+                    == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                {
+                    (layer_kv_scale_base, layer_kv_scale_base + layer_kv_elems / 32)
+                } else {
+                    (0u64, 0u64)
+                };
 
                 let dims = crate::gemma4_layer_exec::Gemma4LayerDims {
-                    num_tokens: prompt_len, hidden,
+                    num_tokens: new_q, hidden,
                     num_heads: arch.num_attention_heads as u32, num_kv_heads: nkvh, head_dim: hd,
                     rotary_dim: arch.rotary_dim_for_layer(layer_idx) as u32,
                     intermediate: inter, block_size,
@@ -1818,6 +4042,14 @@ impl Gemma4Bringup {
                     attn_scale: 1.0, rms_eps: arch.rms_norm_eps,
                     layer_type: lt, sliding_window: arch.sliding_window_size as u32,
                     f16_kv: false, // prefill uses FP8 KV (no F16 prefill kernel)
+                    kv_dtype: prefill_kv_dtype,
+                    bf16_residual: bf16_residual_enabled(),
+                    // Codex17-1: batch-prefill writes context_lens=chunk_end_abs and
+                    // the unified-prefill kernel uses it to index block_tables. Pass
+                    // it to the validator so OOB reads on long prompts/chunks past
+                    // max_blocks_per_seq*block_size are caught at validate() time
+                    // instead of becoming a silent garbage-block-ID kernel read.
+                    current_max_context_len: Some(chunk_end_abs as u32),
                 };
                 let w = crate::gemma4_layer_exec::Gemma4LayerWeightPtrs {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
@@ -1826,23 +4058,24 @@ impl Gemma4Bringup {
                     post_ff_norm_gamma: layer.post_feedforward_layernorm.offset_bytes,
                     q_norm_gamma: layer.q_norm.offset_bytes,
                     k_norm_gamma: layer.k_norm.offset_bytes,
-                    qkv_fp8: layer.qkv.offset_bytes, qkv_scale: layer.qkv.scale_ptr,
-                    o_fp8: layer.o_proj.offset_bytes, o_scale: layer.o_proj.scale_ptr,
-                    gate_up_fp8: layer.gate_up.offset_bytes, gate_up_scale: layer.gate_up.scale_ptr,
-                    down_fp8: layer.down_proj.offset_bytes, down_scale: layer.down_proj.scale_ptr,
+                    qkv_fp8: layer.qkv.as_ref().map_or(0, |w| w.offset_bytes), qkv_scale: layer.qkv.as_ref().map_or(0, |w| w.scale_ptr),
+                    o_fp8: layer.o_proj.as_ref().map_or(0, |w| w.offset_bytes), o_scale: layer.o_proj.as_ref().map_or(0, |w| w.scale_ptr),
+                    gate_up_fp8: layer.gate_up.as_ref().map_or(0, |w| w.offset_bytes), gate_up_scale: layer.gate_up.as_ref().map_or(0, |w| w.scale_ptr),
+                    down_fp8: layer.down_proj.as_ref().map_or(0, |w| w.offset_bytes), down_scale: layer.down_proj.as_ref().map_or(0, |w| w.scale_ptr),
                     layer_scalar_ptr: layer.layer_scalar.offset_bytes,
                     qkv_f16: layer.qkv_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     o_f16: layer.o_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     gate_up_f16: layer.gate_up_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     down_f16: layer.down_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
-                    qkv_chscale: layer.qkv.channelscale_ptr.unwrap_or(0),
-                    o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
-                    gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
-                    down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
-                    qkv_blockscale: layer.qkv.blockscale_ptr.unwrap_or(0),
-                    o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
-                    gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
-                    down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    qkv_chscale: layer.qkv.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    o_chscale: layer.o_proj.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    gate_up_chscale: layer.gate_up.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    down_chscale: layer.down_proj.as_ref().and_then(|w| w.channelscale_ptr).unwrap_or(0),
+                    qkv_blockscale: layer.qkv.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    o_blockscale: layer.o_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    gate_up_blockscale: layer.gate_up.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    down_blockscale: layer.down_proj.as_ref().and_then(|w| w.blockscale_ptr).unwrap_or(0),
+                    awq: awq_layer_ptrs(layer.awq.as_ref()),
                 };
                 // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
                 // point at row 0's K / V sub-slice. The rmsnorm kernel
@@ -1856,6 +4089,46 @@ impl Gemma4Bringup {
                     Gemma4LayerType::SlidingAttention => (self.model.rope_cos_sliding.offset_bytes, self.model.rope_sin_sliding.offset_bytes),
                     Gemma4LayerType::GlobalAttention => (self.model.rope_cos_global.offset_bytes, self.model.rope_sin_global.offset_bytes),
                 };
+                let bytes_per_half_kv = match prefill_kv_dtype {
+                    crate::gemma4_layer_exec::KvDtype::F16 => layer_kv_elems,
+                    crate::gemma4_layer_exec::KvDtype::Fp8 => layer_kv_elems / 2,
+                    crate::gemma4_layer_exec::KvDtype::Nvfp4 => layer_kv_elems / 4,
+                };
+                // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+                // Mirror the decode-path scratch population so batch
+                // prefill ALSO writes f16 shadow K/V for the prompt
+                // tokens. Without this, prefill silently bypasses the
+                // shadow hook and the dump on decode step 0 only sees
+                // the single new-token write — useless for analysis.
+                // Q always routes to the shared throwaway during
+                // prefill (we only capture per-layer Q on decode
+                // step 0, which goes through run_one_token, not here).
+                let prefill_is_shadow_layer = shadow_ptr != 0
+                    && prefill_kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                    && layer_idx < shadow_layer_offsets.len()
+                    && shadow_layer_offsets[layer_idx] != u64::MAX;
+                let (prefill_shadow_k, prefill_shadow_v) = if prefill_is_shadow_layer {
+                    let base = shadow_ptr + shadow_layer_offsets[layer_idx];
+                    (base, base + layer_kv_elems)
+                } else {
+                    (0u64, 0u64)
+                };
+                let prefill_shadow_q = if prefill_is_shadow_layer {
+                    shadow_q_throwaway_ptr
+                } else {
+                    0
+                };
+                // === END NVFP4 SHADOW DIAGNOSTIC ===
+                // === HADAMARD ROTATION ===
+                let prefill_hadamard_layer_ptr: u64 = if hadamard_base_ptr != 0
+                    && prefill_kv_dtype == crate::gemma4_layer_exec::KvDtype::Nvfp4
+                {
+                    hadamard_base_ptr
+                        + (layer_idx as u64) * (hadamard_head_dim_stride as u64)
+                } else {
+                    0
+                };
+                // === END HADAMARD ROTATION ===
                 let scratch = crate::gemma4_layer_exec::Gemma4LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(), hidden_scale: hidden_scale.device_ptr(),
                     q_out: q_base, k_out, v_out,
@@ -1863,7 +4136,9 @@ impl Gemma4Bringup {
                     v_normed: v_normed.device_ptr(),
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
-                    v_cache: layer_kv_base + (layer_kv_elems / 2) * kv_bytes_per_elem as u64,
+                    v_cache: layer_kv_base + bytes_per_half_kv,
+                    k_cache_scale,
+                    v_cache_scale,
                     q_scale_ptr: q_scale_region.device_ptr(), kv_scale_ptr: kv_scale_region.device_ptr(),
                     k_scale_cache: layer_kv_scale_base,
                     v_scale_cache: layer_kv_scale_base + layer_kv_scale_slots_half * 4,
@@ -1874,8 +4149,19 @@ impl Gemma4Bringup {
                     gate_up_scale: gate_up_scale.device_ptr(),
                     mlp_out_fp8: mlp_out_fp8.device_ptr(), mlp_out_scale: mlp_out_scale.device_ptr(),
                     gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
+                    // Codex40-3: run_generate alloc uses `max_tokens`,
+                    // not num_seqs.
+                    gemm_f32_tmp_bytes: (max_tokens * gemm_f32_max_n * 4) as usize,
                     cutlass_workspace: cutlass_ws.device_ptr(), cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
+                    fa3_workspace_bytes: FA3_WS_BYTES as u64,
+                    shadow_k_cache: prefill_shadow_k,
+                    shadow_v_cache: prefill_shadow_v,
+                    shadow_q_cache: prefill_shadow_q,
+                    // === HADAMARD ROTATION ===
+                    hadamard_signs_q: prefill_hadamard_layer_ptr,
+                    hadamard_signs_k: prefill_hadamard_layer_ptr,
+                    // === END HADAMARD ROTATION ===
                 };
                 let meta = crate::gemma4_layer_exec::Gemma4MetadataPtrs {
                     positions: positions.device_ptr(), slot_mapping: slot_mapping.device_ptr(),
@@ -1887,14 +4173,74 @@ impl Gemma4Bringup {
                     &self.cublaslt, &self.cutlass, &self.sliding_attention, &self.global_attention,
                     residual_ptr, stream, phase,
                 )?;
+                // Cycle 53 step 4: per-layer residual L2-norm dump for the
+                // last chunk's last few rows. Gated by
+                // RVLLM_DUMP_RESIDUAL_NORMS=1. Only dumps for the final
+                // chunk (where the last token is what the LM head will
+                // consume). Goal: localize the layer where residual
+                // magnitude collapses on long-ctx WEATHER vs stays sane
+                // on long-ctx WHO.
+                if std::env::var("RVLLM_DUMP_RESIDUAL_NORMS").is_ok()
+                    && chunk_end_abs == prompt_len
+                    && chunk_q > 0
+                {
+                    self.stream.fence()?;
+                    let n_rows: u32 = chunk_q.min(5);
+                    let row0 = (chunk_q - n_rows) as u64;
+                    let bytes_per_row = (hidden as u64) * 2;
+                    let mut buf = vec![0u16; (n_rows as usize) * (hidden as usize)];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr() as *mut _,
+                        residual_ptr + row0 * bytes_per_row,
+                        ((n_rows as u64) * bytes_per_row) as usize,
+                    );
+                    // Cycle 54 step 4: bf16-aware decode. When the residual
+                    // chain is bf16 (RVLLM_RESIDUAL_BF16=1), reinterpret
+                    // the same u16 buffer through the bf16 unpacker so the
+                    // dump shows real magnitudes. Single env probe per dump
+                    // batch — cheap.
+                    let to_f32: fn(u16) -> f32 = if bf16_residual_enabled() {
+                        crate::bring_up::bf16_to_f32
+                    } else {
+                        crate::bring_up::f16_to_f32
+                    };
+                    let dt_tag = if bf16_residual_enabled() { "bf16" } else { "f16" };
+                    let mut norms = String::new();
+                    let mut nan_or_inf = false;
+                    for r in 0..n_rows as usize {
+                        let mut sum_sq = 0.0f64;
+                        let mut amax = 0.0f32;
+                        for c in 0..hidden as usize {
+                            let f = to_f32(buf[r * hidden as usize + c]);
+                            if !f.is_finite() { nan_or_inf = true; }
+                            sum_sq += (f as f64) * (f as f64);
+                            if f.abs() > amax { amax = f.abs(); }
+                        }
+                        let l2 = (sum_sq / hidden as f64).sqrt();
+                        norms.push_str(&format!(" r{}={:.3e}/amax={:.3e}", r, l2, amax));
+                    }
+                    let last_row_off = (n_rows as usize - 1) * hidden as usize;
+                    let last4: Vec<f32> = (hidden as usize - 4..hidden as usize)
+                        .map(|i| to_f32(buf[last_row_off + i])).collect();
+                    eprintln!(
+                        "[res-norm/{}] L{} chunk{}{}{} last4={:?}",
+                        dt_tag, layer_idx, chunk_idx,
+                        if nan_or_inf { " NAN/INF" } else { "" },
+                        norms, last4,
+                    );
+                }
             }
+                chunk_start_abs = chunk_end_abs;
+                chunk_idx += 1;
+            } // end chunk loop
 
             // Diag capture BEFORE the extract-last memcpy: row 0 is
             // the first-token output (no prior context); row
-            // prompt_len-1 is the last-token output the LM head
-            // consumes. Without this ordering, the memcpy below
-            // would clobber row 0 with row N-1 and the row-0
-            // comparison would falsely report a bug.
+            // new_q-1 is the last-token output the LM head consumes.
+            // With chunking, row 0 = first row of the LAST chunk (a
+            // mid-prompt position), so the row-0 diag semantics only
+            // match the decode reference when diag_compare forces a
+            // single chunk.
             self.stream.fence()?;
             let mut prefill_first = vec![0u16; hidden as usize];
             cudarc::driver::sys::cuMemcpyDtoH_v2(
@@ -1902,8 +4248,12 @@ impl Gemma4Bringup {
                 residual_ptr,
                 (hidden * 2) as _,
             );
+            // The residual buffer holds `new_q` rows after the layer
+            // loop (the prefix-cached slots are not re-prefilled).
+            // Row `new_q - 1` is the last prompt token regardless of
+            // how many tokens were cached.
             let mut prefill_last = vec![0u16; hidden as usize];
-            let last_off_diag = (prompt_len - 1) as u64 * hidden as u64 * 2;
+            let last_off_diag = (new_q - 1) as u64 * hidden as u64 * 2;
             cudarc::driver::sys::cuMemcpyDtoH_v2(
                 prefill_last.as_mut_ptr() as *mut _,
                 residual_ptr + last_off_diag,
@@ -1911,8 +4261,8 @@ impl Gemma4Bringup {
             );
 
             // Extract last token's residual for decode
-            if prompt_len > 1 {
-                let last_offset = (prompt_len - 1) as u64 * hidden as u64 * 2;
+            if new_q > 1 {
+                let last_offset = (new_q - 1) as u64 * hidden as u64 * 2;
                 cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                     residual_ptr, residual_ptr + last_offset, (hidden * 2) as usize, stream as _,
                 );
@@ -1951,61 +4301,890 @@ impl Gemma4Bringup {
             }
         }
 
-        // LM head on last prompt token
+        // LM head on last prompt token.
+        // Cycle 54 Stage 1: when bf16 residual is active, run the bf16
+        // rmsnorm sibling (math is identical, both use f32 accumulator
+        // internally) and then narrow bf16→f16 in-place before the
+        // existing f16 LM head GEMM consumes it.
+        let lm_head_bf16 = bf16_residual_enabled();
+        let lm_head_norm_kernel = if lm_head_bf16 {
+            kernels.rmsnorm_inplace_bf16
+        } else {
+            kernels.fused_rmsnorm
+        };
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: 1, hidden, eps: arch.rms_norm_eps,
-        }.launch(kernels.fused_rmsnorm, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
+        }.launch(lm_head_norm_kernel, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
+        if lm_head_bf16 {
+            rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }
+                .launch(kernels.bf16_to_f16_sat, residual_ptr, residual_ptr, stream)?;
+        }
         self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
             logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
-        rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
-            .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
-
-        self.stream.fence()?;
+        // Codex40-2: apply Gemma final logit softcap before bias /
+        // sampling. Bench + PPL paths apply this; generate previously
+        // skipped it so greedy/top-p decisions could flip on
+        // ungated large logits, and tool-call bias landed on
+        // pre-softcap values that don't match training-time
+        // distribution. f32 variant matches the f32 logits dtype.
+        if arch.logit_softcap > 0.0 {
+            rvllm_fused::gemma4_launcher::LogitSoftcapLaunch {
+                num_tokens: 1,
+                vocab,
+                cap: arch.logit_softcap,
+            }
+            .launch(self.fused.fn_softcap_f32, logits_f32.device_ptr(), stream)?;
+        }
+        // === TOOL-CALL OPEN-TAG BIAS (cycle 14 pragmatic fix) ===
+        // Cumulative quantization noise over 60 layers gives ~1.5 logit
+        // units of consistent bias toward token 49 ("<tool_call|>",
+        // close-tag) over token 48 ("<|tool_call>", open-tag) at
+        // decode-step 0 of long-context tool-eligible prompts. The
+        // model gets razor-thin margins (0.27 vs 17+ in clean WHO)
+        // and greedy lands on the wrong special token, which has no
+        // valid training continuation → garbage spiral.
+        // Apply a small positive bias to token 48 to nudge the choice
+        // toward the training-shape canonical open-tag. Env-gated so
+        // it can be A/B'd. Default OFF for safety.
+        let tool_call_bias = std::env::var("RVLLM_TOOL_CALL_OPEN_BIAS")
+            .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        if tool_call_bias != 0.0 {
+            // Token 48 = `<|tool_call>` (training-shape open). Add the
+            // bias to its logit position.
+            let mut logit_48: f32 = 0.0;
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                &mut logit_48 as *mut _ as *mut _,
+                logits_f32.device_ptr() + 48 * 4,
+                4,
+            );
+            let new_logit = logit_48 + tool_call_bias;
+            cudarc::driver::sys::cuMemcpyHtoD_v2(
+                logits_f32.device_ptr() + 48 * 4,
+                &new_logit as *const _ as *const _,
+                4,
+            );
+        }
+        // === END TOOL-CALL OPEN-TAG BIAS ===
         let mut host_tok = [0i32; 1];
-        cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
+        if sampling_temp > 0.0 {
+            // Host-side temperature sampling
+            self.stream.fence()?;
+            host_tok[0] = host_sample_token(
+                logits_f32.device_ptr(), vocab, sampling_temp, sampling_top_p, sampling_top_k,
+                &mut next_rand_f32,
+            )? as i32;
+        } else {
+            rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
+                .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
+            self.stream.fence()?;
+            // Same anti-pattern as the host_sample_token DtoH already
+            // fixed in Codex3: a silently-failing greedy-argmax DtoH
+            // would leave host_tok[0] == 0 (or a stale value from a
+            // prior step) and the server would emit token-0 as if the
+            // greedy decode succeeded. CUDA faults must surface as
+            // 500s, not as wrong tokens that look like model
+            // hallucinations.
+            cuda_check!(
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    host_tok.as_mut_ptr() as *mut _,
+                    sampled.device_ptr(),
+                    4,
+                ),
+                "argmax_sample_token_dtoh_decode",
+                stream
+            );
+        }
+        // Cycle 53 step 5: top-K logit dump at first decode step. Gated by
+        // RVLLM_DUMP_TOPK_LOGITS=1. Cost: 1 MiB DtoH + partial-sort vocab
+        // entries (host-side). Compares logit distribution shape across
+        // prompts: a sharp top-1 (margin >> 1.0 over top-2) means the
+        // model is decisive; a flat top-K (margin < 0.5) means
+        // cumulative quantization noise has overwhelmed signal — the
+        // canonical long-ctx failure mode documented above
+        // (RVLLM_TOOL_CALL_OPEN_BIAS rationale).
+        if std::env::var("RVLLM_DUMP_TOPK_LOGITS").is_ok() {
+            self.stream.fence()?;
+            let mut logits_host = vec![0.0f32; vocab as usize];
+            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                logits_host.as_mut_ptr() as *mut _,
+                logits_f32.device_ptr(),
+                (vocab as usize * 4) as _,
+            );
+            let mut idx: Vec<usize> = (0..vocab as usize).collect();
+            // Partial sort: select top-10 by logit
+            idx.sort_by(|&a, &b| logits_host[b].partial_cmp(&logits_host[a]).unwrap_or(std::cmp::Ordering::Equal));
+            let top: Vec<(usize, f32)> = idx.iter().take(10)
+                .map(|&i| (i, logits_host[i])).collect();
+            let mean = logits_host.iter().sum::<f32>() / vocab as f32;
+            let mut sum_sq = 0.0f64;
+            let mut amax = f32::NEG_INFINITY;
+            let mut amin = f32::INFINITY;
+            for &v in &logits_host {
+                let d = (v - mean) as f64;
+                sum_sq += d * d;
+                if v > amax { amax = v; }
+                if v < amin { amin = v; }
+            }
+            let std = (sum_sq / vocab as f64).sqrt();
+            let margin_1_2 = top[0].1 - top[1].1;
+            eprintln!(
+                "[topk-logits] mean={:.3} std={:.3} amax={:.3} amin={:.3} margin(1-2)={:.3} top10={:?}",
+                mean, std, amax, amin, margin_1_2, top,
+            );
+        }
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[prefill] {} tokens in {:.1}ms (TTFT={:.1}ms)",
             prompt_ids.len(), prefill_ms, prefill_ms);
 
         let mut output_ids: Vec<u32> = Vec::with_capacity(max_new);
-        output_ids.push(host_tok[0] as u32);
-        if eos_ids.contains(&(host_tok[0] as u32)) {
+        let first_tok = host_tok[0] as u32;
+        output_ids.push(first_tok);
+        // Per-token emission for true streaming. The callback runs
+        // synchronously on the worker thread; if it returns false
+        // (channel closed / client disconnected), we treat that as
+        // a cancel signal and return the partial output.
+        if let Some(cb) = on_token.as_mut() {
+            if !cb(first_tok) {
+                return Ok(output_ids);
+            }
+        }
+        if eos_ids.contains(&first_tok) {
             return Ok(output_ids);
         }
 
         // Phase 2: Decode new tokens
+        //
+        // === CUDA Graph capture (cycle 60 step Y, RVLLM_DECODE_GRAPH=1) ===
+        // The 60-layer-per-token kernel chain is ~660 cuLaunchKernel
+        // calls per decode step. Eliminating per-step launch overhead
+        // via CUDA Graph replay is the largest perf lever after the
+        // partition-size win. We capture once on the second decode
+        // step (decode_step == 1) — after eager warmup at step=0
+        // populates KV[prompt_len] AND past the once-per-generate
+        // shadow_q diagnostic gate. From then on, replay the graph
+        // for every subsequent decode step. Per-step host work
+        // (prepare_decode_inputs HtoDs, post-graph LM head, sampling,
+        // rep-penalty) stays eager outside the graph.
+        //
+        // ## Known limitation: split-KV partition decision is frozen
+        //
+        // `decode_forward(step)` sets
+        // `current_max_context_len = Some(step+1)`, and the attention
+        // dispatch in `gemma4_layer_exec.rs` uses that to pick between
+        // `decode.launch_split` (multi-partition) and `decode.launch`
+        // (single CTA per seq/head). The captured graph records ONE
+        // of those kernel calls. Replay then runs that kernel for
+        // every later step regardless of how the partition count
+        // would have evolved.
+        //
+        // This is a PERFORMANCE bug, not a correctness bug: the
+        // non-split kernel handles long contexts correctly (it just
+        // loops serially within one CTA), and the split kernel sizes
+        // its workspace from `bucket_ctx = max_blocks_per_seq *
+        // block_size` so it can run at any step's actual ctx.
+        //
+        // To minimise the perf hit, we delay capture until a
+        // representative decode step — `RVLLM_DECODE_GRAPH_CAPTURE_AT`
+        // (default 1) — and we ABORT capture eligibility when the
+        // partition decision at the capture step would differ from
+        // the decision at the GENERATION END (`prompt_len + max_new`).
+        // In that case we silently fall through to eager
+        // `run_one_token` for the whole generation and emit a one-
+        // shot tracing::warn so the operator sees why the graph
+        // didn't fire. A future cycle can capture multiple graphs
+        // (one per partition-decision range) and replay the
+        // appropriate one — out of scope here.
+        let use_decode_graph = std::env::var("RVLLM_DECODE_GRAPH")
+            .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false);
+        // `RVLLM_DECODE_GRAPH_CAPTURE_AT` controls which decode_step
+        // is used as the capture body. Default 1 — first step beyond
+        // the eager warmup (decode_step==0 populates KV[prompt_len]
+        // and runs the once-per-generate shadow_q diagnostic). The
+        // floor of 1 is a hard requirement; values < 1 collapse to 1.
+        let decode_graph_capture_at: usize = std::env::var("RVLLM_DECODE_GRAPH_CAPTURE_AT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1usize)
+            .max(1);
+        // Eligibility check: would the partition decision at capture
+        // time still hold at the end of generation? If not, fall back
+        // to eager; the captured-but-wrong-path replay would just be
+        // a slow no-op compared to eager. Crucially, the partition
+        // size queried here MUST match the value the attention
+        // dispatch in `gemma4_layer_exec.rs` will use — both sites
+        // call `effective_partition_size()` so a future change to
+        // the default cannot silently desync the guard. (A previous
+        // iteration hardcoded `256` here while the dispatch defaulted
+        // to `1024`; the guard let plain-default requests through
+        // and the captured graph froze a single-CTA branch that
+        // flipped to split-KV mid-generation.)
+        let partition_size_for_graph = effective_partition_size();
+        // Codex37-3: only the split-KV path freezes a context-dependent
+        // gridDim.z into the captured graph. With split-KV disabled
+        // (env off, FP8/F16 KV) the parts-count drift can't poison
+        // the reducer, so we can capture across partition boundaries.
+        // Codex38-2: also gate on actual split-kernel availability.
+        // Earlier the predicate trusted env+kv_dtype only; a kernels
+        // tree without the split symbols (or running a head_dim
+        // variant the build doesn't ship) used to reject graph
+        // capture at partition boundaries even though decode never
+        // actually launched split kernels.
+        let split_decode_for_graph =
+            rvllm_attention::PagedDecodeNvfp4Launcher::new(&self.sliding_attention);
+        let global_split_decode_for_graph =
+            rvllm_attention::PagedDecodeNvfp4Launcher::new(&self.global_attention);
+        // Codex39-5: per-layer overrides (RVLLM_FP8_KV_LAYERS,
+        // HYBRID_GLOBAL_FP8, HYBRID_SLIDING_FP8) can pull every layer
+        // off NVFP4 even when the env-default is Nvfp4. If no layer
+        // actually runs NVFP4 split, the parts-boundary check costs
+        // graph capture for nothing. Walk all layers once at startup
+        // and require at least one to land on Nvfp4 KV before
+        // treating split-KV as active for the graph predicate.
+        let any_layer_nvfp4 = (0..arch.num_hidden_layers).any(|li| {
+            let lt = arch.layer_types[li];
+            crate::gemma4_layer_exec::KvDtype::for_layer_index_or_env(lt, li, false)
+                == crate::gemma4_layer_exec::KvDtype::Nvfp4
+        });
+        // Codex45-1: also mirror the runtime workspace gate at
+        // gemma4_layer_exec.rs:1578 (`ws_need <= fa3_workspace_bytes`).
+        // If the worst-case split scratch can't fit in the live FA3
+        // workspace, the runtime path will never dispatch the split
+        // kernel — the parts-boundary check would then refuse graph
+        // capture for nothing. Compute the same `ws_need` formula the
+        // dispatch site uses, against the upper-bound bucket context
+        // (max_blocks_per_seq * block_size) and the worst-case
+        // head_dim across layer types.
+        let max_num_parts_for_graph: u64 = ((max_blocks_per_seq as u64) * (block_size as u64))
+            .div_ceil(partition_size_for_graph.max(1) as u64)
+            .max(1);
+        let max_hd_for_graph: u64 = arch
+            .head_dim_sliding
+            .max(arch.head_dim_global) as u64;
+        let split_slots: u64 = 1u64 // num_seqs in run_generate
+            * (arch.num_attention_heads as u64)
+            * max_num_parts_for_graph;
+        // tmp_out f32 (codex cycle21 widening) + max_logits f32 + exp_sums f32.
+        let split_ws_need: u64 = split_slots * max_hd_for_graph * 4
+            + split_slots * 4 * 2;
+        const FA3_WS_BYTES_FOR_GRAPH: u64 = 128 * 1024 * 1024;
+        let workspace_can_fit_split = split_ws_need <= FA3_WS_BYTES_FOR_GRAPH;
+        let split_kv_active_for_graph = parse_truthy_env("RVLLM_NVFP4_SPLIT_KV")
+            .unwrap_or(true)
+            && any_layer_nvfp4
+            && workspace_can_fit_split
+            && (split_decode_for_graph.has_split_kernels(arch.head_dim_sliding as u32, false)
+                || global_split_decode_for_graph
+                    .has_split_kernels(arch.head_dim_global as u32, false));
+        let decode_graph_eligible = use_decode_graph
+            && decode_graph_eligible_for_generation(
+                prompt_ids.len() as u32,
+                max_new as u32,
+                partition_size_for_graph,
+                decode_graph_capture_at as u32,
+                split_kv_active_for_graph,
+            );
+        if use_decode_graph && !decode_graph_eligible {
+            tracing::warn!(
+                prompt_len = prompt_ids.len(),
+                max_new,
+                partition_size = partition_size_for_graph,
+                "RVLLM_DECODE_GRAPH=1 but partition decision would change \
+                 mid-generation; falling back to eager decode for this \
+                 request to avoid replaying a frozen split-KV branch"
+            );
+        }
+        let use_decode_graph = decode_graph_eligible;
+        let mut decode_graph: Option<rvllm_graph::CapturedGraph> = None;
         for decode_step in 0..max_new - 1 {
+            // Early-out on caller-side cancellation. Checked once per
+            // step (cheap atomic load) so the worker thread releases
+            // its monopoly on the GPU within ~one decode latency
+            // (~270 ms on Gemma 4 31B / GB10) of a client timeout
+            // rather than running to completion in the background.
+            if let Some(c) = cancel {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        decode_step,
+                        max_new,
+                        "run_generate cancelled by caller — returning partial output",
+                    );
+                    break;
+                }
+            }
             let tok_id = *output_ids.last().unwrap();
-            run_one_token(tok_id, prompt_ids.len() + decode_step)?;
+            let step = prompt_ids.len() + decode_step;
+            if use_decode_graph && decode_step >= decode_graph_capture_at {
+                // Post-warmup path: prepare inputs eagerly, then either
+                // capture (first time) or replay the captured graph.
+                prepare_decode_inputs(tok_id, step)?;
+                if decode_graph.is_none() {
+                    // Capture body: kernels are RECORDED into the graph,
+                    // not executed. So we still need an eager run BEFORE
+                    // capture to populate KV[step]; the capture body is
+                    // a second invocation that records but does not run.
+                    decode_forward(step)?;
+                    self.stream.fence()?;
+                    let g = rvllm_graph::CapturedGraph::capture(
+                        1u32,
+                        max_blocks_per_seq as u32,
+                        rvllm_metadata::MetadataLayout::compute(
+                            1u32, max_blocks_per_seq as u32).hash(),
+                        rvllm_graph::GraphFingerprint([0u8; 32]),
+                        stream,
+                        || decode_forward(step),
+                    )?;
+                    self.stream.fence()?;
+                    eprintln!("[decode-graph] captured at decode_step={} step={}",
+                        decode_step, step);
+                    decode_graph = Some(g);
+                } else {
+                    decode_graph.as_ref().unwrap().replay(stream)?;
+                }
+            } else {
+                run_one_token(tok_id, step)?;
+            }
 
+            // === NVFP4 SHADOW DIAGNOSTIC (remove after collapse locator confirmed) ===
+            // First-token dump: runs exactly once on decode_step == 0
+            // when the shadow region is live. After this the latch is
+            // set and every subsequent decode step is a no-op.
+            if decode_step == 0
+                && shadow_ptr != 0
+                && !self.nvfp4_shadow_dumped.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.stream.fence()?;
+                let dump_dir = std::env::var("RVLLM_NVFP4_SHADOW_DUMP_DIR")
+                    .unwrap_or_else(|_| "/tmp/nvfp4_shadow".to_string());
+                let _ = std::fs::create_dir_all(&dump_dir);
+                let _ctx_now = (prompt_ids.len() + 1) as u32;
+                let lset = shadow_set.as_ref().unwrap();
+                let first_tok = output_ids[0];
+                let bt_entries = max_blocks_per_seq as usize;
+                // Host staging for block_tables / context_lens / slot_mapping.
+                let mut bt_host = vec![0i32; bt_entries];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    bt_host.as_mut_ptr() as *mut _,
+                    block_tables.device_ptr(),
+                    (bt_entries * 4) as usize,
+                );
+                let mut ctx_host = [0i32; 1];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    ctx_host.as_mut_ptr() as *mut _,
+                    context_lens.device_ptr(),
+                    4,
+                );
+                let mut slot_host = [0i32; 1];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    slot_host.as_mut_ptr() as *mut _,
+                    slot_mapping.device_ptr(),
+                    4,
+                );
+                // Build per-layer metadata + dump bin files.
+                let mut layer_meta_json = String::new();
+                for &l in lset.iter() {
+                    let l = l as usize;
+                    if l >= arch.num_hidden_layers { continue; }
+                    if l >= shadow_layer_offsets.len() { continue; }
+                    if shadow_layer_offsets[l] == u64::MAX { continue; }
+                    let lt = arch.layer_types[l];
+                    let is_global = lt == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention;
+                    let layer_blocks = if is_global { num_blocks_total } else { sliding_blocks };
+                    let nkvh = arch.num_kv_heads_for_layer(l) as u32;
+                    let hd = arch.head_dim_for_layer(l) as u32;
+                    let layer_elems = 2u64 * (layer_blocks as u64) * (block_size as u64)
+                        * (nkvh as u64) * (hd as u64);
+                    // Shadow region: f16, layer_elems bytes for K then layer_elems bytes for V.
+                    let shadow_base = shadow_ptr + shadow_layer_offsets[l];
+                    let shadow_half_bytes = layer_elems; // f16 half-size per K or V
+                    let mut k_shadow_host = vec![0u8; shadow_half_bytes as usize];
+                    let mut v_shadow_host = vec![0u8; shadow_half_bytes as usize];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        k_shadow_host.as_mut_ptr() as *mut _,
+                        shadow_base,
+                        shadow_half_bytes as usize,
+                    );
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        v_shadow_host.as_mut_ptr() as *mut _,
+                        shadow_base + shadow_half_bytes,
+                        shadow_half_bytes as usize,
+                    );
+                    let _ = std::fs::write(
+                        format!("{}/layer_{}_k_shadow.bin", dump_dir, l),
+                        &k_shadow_host,
+                    );
+                    let _ = std::fs::write(
+                        format!("{}/layer_{}_v_shadow.bin", dump_dir, l),
+                        &v_shadow_host,
+                    );
+                    // Primary NVFP4 K/V (packed bytes). The total NVFP4
+                    // allocation per layer is `layer_elems / 2` bytes
+                    // (because `layer_elems = 2 * X` already counts K+V
+                    // and NVFP4 packs 2 elems/byte). Each of K and V is
+                    // therefore `layer_elems / 4` bytes within the
+                    // layer, matching `bytes_per_half_kv = layer_kv_elems / 4`
+                    // used by the rope launcher's `v_cache` offset.
+                    // An earlier revision of this dump used
+                    // `layer_elems / 2` for the per-side size, which
+                    // (a) read past the layer's allocation for V
+                    // and (b) made the dumped V file actually contain
+                    // the NEXT layer's K data — producing apparent
+                    // 100%+ V rel_err in the analyzer when in fact V
+                    // was never read from the right offset.
+                    let layer_kv_base = kv_cache.device_ptr() + kv_layer_offsets[l];
+                    let primary_half_bytes = layer_elems / 4; // K-or-V bytes
+                    let mut k_host = vec![0u8; primary_half_bytes as usize];
+                    let mut v_host = vec![0u8; primary_half_bytes as usize];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        k_host.as_mut_ptr() as *mut _,
+                        layer_kv_base,
+                        primary_half_bytes as usize,
+                    );
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        v_host.as_mut_ptr() as *mut _,
+                        layer_kv_base + primary_half_bytes,
+                        primary_half_bytes as usize,
+                    );
+                    let _ = std::fs::write(format!("{}/layer_{}_k.bin", dump_dir, l), &k_host);
+                    let _ = std::fs::write(format!("{}/layer_{}_v.bin", dump_dir, l), &v_host);
+                    // NVFP4 scale region: E4M3, layer_elems/16 bytes total; first
+                    // half for K, second half for V.
+                    let layer_kv_scale_base =
+                        kv_scale_cache.device_ptr() + kv_scale_layer_offsets[l];
+                    let scale_half_bytes = layer_elems / 32; // each of K,V = /32
+                    let mut k_scale_host = vec![0u8; scale_half_bytes as usize];
+                    let mut v_scale_host = vec![0u8; scale_half_bytes as usize];
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        k_scale_host.as_mut_ptr() as *mut _,
+                        layer_kv_scale_base,
+                        scale_half_bytes as usize,
+                    );
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        v_scale_host.as_mut_ptr() as *mut _,
+                        layer_kv_scale_base + scale_half_bytes,
+                        scale_half_bytes as usize,
+                    );
+                    let _ = std::fs::write(
+                        format!("{}/layer_{}_k_scale.bin", dump_dir, l),
+                        &k_scale_host,
+                    );
+                    let _ = std::fs::write(
+                        format!("{}/layer_{}_v_scale.bin", dump_dir, l),
+                        &v_scale_host,
+                    );
+                    // Per-layer Q dump (f16, post-RoPE). Snapshot written by
+                    // `rope_f16kv_shadow` → memcpy hook in layer_exec.rs on
+                    // decode step 0 into a dedicated per-layer slot of size
+                    // `shadow_q_per_layer_bytes = num_attention_heads *
+                    // max_head_dim * 2`. Tail may be zero when this layer's
+                    // head_dim < max_head_dim; Python analyzer truncates
+                    // using `head_dim` from meta.json.
+                    let pos_in_set = lset.iter().position(|&li| li as usize == l);
+                    if let Some(pi) = pos_in_set {
+                        if shadow_q_ptr != 0 {
+                            let q_slot_base =
+                                shadow_q_ptr + (pi as u64) * shadow_q_per_layer_bytes;
+                            let mut q_host = vec![0u8; shadow_q_per_layer_bytes as usize];
+                            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                                q_host.as_mut_ptr() as *mut _,
+                                q_slot_base,
+                                shadow_q_per_layer_bytes as usize,
+                            );
+                            let _ = std::fs::write(
+                                format!("{}/layer_{}_q.bin", dump_dir, l),
+                                &q_host,
+                            );
+                        }
+                    }
+                    if !layer_meta_json.is_empty() {
+                        layer_meta_json.push_str(",\n");
+                    }
+                    layer_meta_json.push_str(&format!(
+                        "    {{\"layer\": {}, \"layer_type\": \"{:?}\", \"head_dim\": {}, \"num_kv_heads\": {}, \"num_blocks\": {}}}",
+                        l, lt, hd, nkvh, layer_blocks,
+                    ));
+                }
+                // Keep legacy single-layer Q dump (last executed layer, FP8)
+                // for backward compat with older analyzer runs; per-layer
+                // f16 Q files (layer_{L}_q.bin) are the canonical source.
+                let q_bytes = (arch.num_attention_heads as u64) * (arch.max_head_dim() as u64);
+                let mut q_host = vec![0u8; q_bytes as usize];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    q_host.as_mut_ptr() as *mut _,
+                    q_fp8.device_ptr(),
+                    q_bytes as usize,
+                );
+                let _ = std::fs::write(format!("{}/q_last_layer.bin", dump_dir), &q_host);
+                // meta.json
+                let max_head_dim = arch.max_head_dim();
+                let meta_json = format!(
+                    "{{\n  \"prompt_len\": {},\n  \"num_layers\": {},\n  \"block_size\": {},\n  \"num_heads\": {},\n  \"max_head_dim\": {},\n  \"q_dtype\": \"f16\",\n  \"q_per_layer_bytes\": {},\n  \"context_len\": {},\n  \"slot_mapping\": {},\n  \"first_token_id\": {},\n  \"shadow_layer_indices\": {:?},\n  \"block_table\": {:?},\n  \"layers\": [\n{}\n  ]\n}}\n",
+                    prompt_ids.len(),
+                    arch.num_hidden_layers,
+                    block_size,
+                    arch.num_attention_heads,
+                    max_head_dim,
+                    shadow_q_per_layer_bytes,
+                    ctx_host[0],
+                    slot_host[0],
+                    first_tok,
+                    lset,
+                    bt_host,
+                    layer_meta_json,
+                );
+                let _ = std::fs::write(format!("{}/meta.json", dump_dir), &meta_json);
+                eprintln!(
+                    "[nvfp4-shadow] dumped {} instrumented layers to {} (ctx={}, first_tok={})",
+                    lset.len(), dump_dir, ctx_host[0], first_tok,
+                );
+            }
+            // === END NVFP4 SHADOW DIAGNOSTIC ===
+
+            // Cycle 54 Stage 1: same bf16 LM-head dispatch as the post-prefill site.
+            let lm_head_bf16 = bf16_residual_enabled();
+            let lm_head_norm_kernel = if lm_head_bf16 {
+                kernels.rmsnorm_inplace_bf16
+            } else {
+                kernels.fused_rmsnorm
+            };
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: 1, hidden, eps: arch.rms_norm_eps,
-            }.launch(kernels.fused_rmsnorm, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
+            }.launch(lm_head_norm_kernel, residual_ptr, self.model.final_norm.offset_bytes, stream)?;
+            if lm_head_bf16 {
+                rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: hidden }
+                    .launch(kernels.bf16_to_f16_sat, residual_ptr, residual_ptr, stream)?;
+            }
             self.cublaslt.f16_gemm_f32(residual_ptr, self.model.lm_head_f16.offset_bytes,
                 logits_f32.device_ptr(), 1, vocab as i32, hidden as i32, stream)?;
-            rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
-                .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
-
-            self.stream.fence()?;
-            cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
+            // Codex41-1: apply Gemma final logit_softcap on EVERY
+            // decode step. Codex40-2 only patched the prefill-site
+            // softcap; the decode loop runs its own LM-head GEMM and
+            // was sampling from un-capped logits for tokens 2..N,
+            // diverging from PPL/bench and from the trained-output
+            // distribution.
+            if arch.logit_softcap > 0.0 {
+                rvllm_fused::gemma4_launcher::LogitSoftcapLaunch {
+                    num_tokens: 1,
+                    vocab,
+                    cap: arch.logit_softcap,
+                }
+                .launch(self.fused.fn_softcap_f32, logits_f32.device_ptr(), stream)?;
+            }
+            // Codex41-4: tool_call_open_bias also belongs on every
+            // decode step. The first-token site (line ~4196) had it;
+            // later tokens were missing the bias, so the sampler's
+            // open-tag preference was inconsistent across the
+            // generation. Mirror the bias write here.
+            if tool_call_bias != 0.0 {
+                let mut logit_48: f32 = 0.0;
+                cuda_check!(cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    &mut logit_48 as *mut _ as *mut _,
+                    logits_f32.device_ptr() + 48 * 4,
+                    4,
+                ), "tool_bias_logit48_dtoh_decode", stream);
+                let new_logit = logit_48 + tool_call_bias;
+                cuda_check!(cudarc::driver::sys::cuMemcpyHtoD_v2(
+                    logits_f32.device_ptr() + 48 * 4,
+                    &new_logit as *const _ as *const _,
+                    4,
+                ), "tool_bias_logit48_htod_decode", stream);
+            }
+            // === REPETITION PENALTY (decode-loop site) — Codex41-3 ===
+            // Earlier this synchronised the stream and bounced the
+            // entire 262k-vocab logits through host memory every step
+            // (~7ms/token). Now we collect the recent-id set on the
+            // host, HtoD-copy just that small list (≤ rep_window i32),
+            // and invoke `apply_repetition_penalty_f32_kernel` to
+            // mutate the f32 logits in place — no DtoH, no fence.
+            if rep_active && !output_ids.is_empty() {
+                let start_idx = output_ids.len().saturating_sub(rep_window);
+                let mut counts: std::collections::HashMap<u32, u32> =
+                    std::collections::HashMap::new();
+                for &id in &output_ids[start_idx..] {
+                    *counts.entry(id).or_insert(0) += 1;
+                }
+                let mut recent: std::collections::HashSet<u32> = counts
+                    .iter()
+                    .filter(|(_, &c)| c >= rep_min_count)
+                    .map(|(&id, _)| id)
+                    .collect();
+                // Don't penalize EOS / stop tokens — let them fire when
+                // the model wants to terminate.
+                for sid in eos_ids { recent.remove(sid); }
+                if !recent.is_empty() {
+                    let cap = 1024usize; // device buffer capacity
+                    let ids_vec: Vec<i32> = recent.iter()
+                        .take(cap)
+                        .map(|&id| id as i32)
+                        .collect();
+                    cuda_check!(cudarc::driver::sys::cuMemcpyHtoD_v2(
+                        rep_ids_dev.device_ptr(),
+                        ids_vec.as_ptr() as *const _,
+                        ids_vec.len() * 4,
+                    ), "rep_penalty_ids_htod", stream);
+                    rvllm_fused::gemma4_launcher::ApplyRepetitionPenaltyLaunch {
+                        num_ids: ids_vec.len() as u32,
+                        vocab,
+                        penalty: rep_penalty,
+                    }.launch(
+                        self.fused.fn_apply_repetition_penalty_f32,
+                        logits_f32.device_ptr(),
+                        rep_ids_dev.device_ptr(),
+                        stream,
+                    )?;
+                }
+            }
+            // === END REPETITION PENALTY ===
+            if sampling_temp > 0.0 {
+                self.stream.fence()?;
+                host_tok[0] = host_sample_token(
+                    logits_f32.device_ptr(), vocab, sampling_temp, sampling_top_p, sampling_top_k,
+                    &mut next_rand_f32,
+                )? as i32;
+            } else {
+                rvllm_fused::ArgmaxLaunch { num_tokens: 1, vocab }
+                    .launch(fn_argmax, logits_f32.device_ptr(), sampled.device_ptr(), stream)?;
+                self.stream.fence()?;
+                // See twin site at the prefill argmax above: a silent
+                // DtoH failure left host_tok[0] at its prior value
+                // and the loop emitted that token as the next one,
+                // masking CUDA faults as model hallucinations.
+                cuda_check!(
+                    cudarc::driver::sys::cuMemcpyDtoH_v2(
+                        host_tok.as_mut_ptr() as *mut _,
+                        sampled.device_ptr(),
+                        4,
+                    ),
+                    "argmax_sample_token_dtoh_decode_loop",
+                    stream
+                );
+            }
             let next_id = host_tok[0] as u32;
             output_ids.push(next_id);
+            // True-streaming hook: emit each token to the worker's
+            // event channel before checking EOS / repetition guards.
+            // A `false` return means the consumer is gone (closed
+            // channel) — treat as cancel and stop decoding.
+            if let Some(cb) = on_token.as_mut() {
+                if !cb(next_id) {
+                    break;
+                }
+            }
             if eos_ids.contains(&next_id) { break; }
+            // Cycle 33 fix (codex bug #5): tool-call close `<tool_call|>`
+            // (token 49) was not a generation stop. After a valid tool
+            // call closed, the model kept emitting hallucinated prose
+            // (`<|tool_response>` text, "The weather in Zurich is 12°C..."
+            // narration, multiple redundant tool calls). With this guard,
+            // once token 48 (`<|tool_call>`) has been seen in the output
+            // and we then emit token 49, treat it as a structural stop.
+            // Standalone token 49 without prior 48 is not a stop (the
+            // tag could appear in fragmented form during partial
+            // streaming reuse — preserve previous behavior there).
+            if next_id == 49u32 && output_ids.iter().rev().any(|&t| t == 48u32) {
+                break;
+            }
+
+            // Repetition guard. When a low-precision KV path (e.g.
+            // pure NVFP4) lands in a near-tied logit state — typically
+            // inside tool-call markup or an unfamiliar prompt
+            // continuation — the model can lock into a single-token
+            // attractor and emit the same token thousands of times,
+            // wasting GPU and producing empty visible content (when
+            // the locked token sits inside markup that
+            // `strip_tool_markup` removes).
+            //
+            // Bound cost via `RVLLM_REPETITION_GUARD_N` (default 20,
+            // set 0 to disable). If the last N decoded tokens are
+            // all the same id, abort cleanly: callers see a normal
+            // stream end with whatever was produced so far. The
+            // guard only fires after at least N decode steps; short
+            // legitimate completions (e.g. classifier "REPLY")
+            // never trigger it.
+            let guard_n: usize = std::env::var("RVLLM_REPETITION_GUARD_N")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+            if guard_n >= 2 && output_ids.len() >= guard_n {
+                let tail = &output_ids[output_ids.len() - guard_n..];
+                if tail.iter().all(|&id| id == tail[0]) {
+                    eprintln!(
+                        "[repetition-guard] same token {} repeated {} times — \
+                         aborting decode at step {}",
+                        tail[0], guard_n, decode_step + 1
+                    );
+                    break;
+                }
+            }
+            // Cycle-aware guard: catches multi-token attractors where
+            // a small set of tokens cycles (e.g. Korean lock observed
+            // 2026-04-25 with token 237372='서' alternating with
+            // 7246='으로', 237490='도', etc. — no token reaches
+            // `guard_n` consecutive but a 32-token window contains
+            // only 5-8 distinct ids, with one dominating ~50%+).
+            //
+            // Triggers when EITHER:
+            //   (a) some token covers >= MAX_FRAC of last K decoded
+            //       tokens (default K=32, MAX_FRAC=0.5 → 16/32);
+            //   (b) the last K tokens contain <= MAX_UNIQUE distinct
+            //       ids (default 5).
+            //
+            // RVLLM_REPETITION_CYCLE_K          window (default 32, 0=disabled)
+            // RVLLM_REPETITION_CYCLE_MAX_FRAC   ratio (default 0.5)
+            // RVLLM_REPETITION_CYCLE_MAX_UNIQUE distinct count (default 5)
+            let cycle_k: usize = std::env::var("RVLLM_REPETITION_CYCLE_K")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+            if cycle_k >= 8 && output_ids.len() >= cycle_k {
+                let cycle_frac: f32 = std::env::var("RVLLM_REPETITION_CYCLE_MAX_FRAC")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+                let cycle_max_unique: usize = std::env::var("RVLLM_REPETITION_CYCLE_MAX_UNIQUE")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+                let win = &output_ids[output_ids.len() - cycle_k..];
+                let mut counts: std::collections::HashMap<u32, u32> =
+                    std::collections::HashMap::new();
+                for &id in win { *counts.entry(id).or_insert(0) += 1; }
+                let unique_count = counts.len();
+                let max_count = counts.values().copied().max().unwrap_or(0);
+                let max_frac = (max_count as f32) / (cycle_k as f32);
+                if unique_count <= cycle_max_unique || max_frac >= cycle_frac {
+                    let dom_id = counts.iter().max_by_key(|(_, &c)| c)
+                        .map(|(id, _)| *id).unwrap_or(0);
+                    eprintln!(
+                        "[repetition-guard] cycle detected — last {} tokens \
+                         have {} unique ids (max id {} = {:.0}%) — aborting \
+                         decode at step {}",
+                        cycle_k, unique_count, dom_id,
+                        max_frac * 100.0, decode_step + 1
+                    );
+                    break;
+                }
+            }
         }
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let decode_ms = total_ms - prefill_ms;
+
         eprintln!("[generate] {} tokens decoded in {:.1}ms ({:.1} tok/s)",
             output_ids.len(), decode_ms, output_ids.len() as f64 / (decode_ms / 1000.0));
+
+        // Update the prefix cache with this request's prompt so the
+        // next request can benefit from a cache hit. We cache ONLY
+        // the prompt tokens (not the generated output) — the
+        // generated tokens' KV entries are in slots [prompt_len..]
+        // and are indeed valid, but zeroclaw typically includes
+        // prior assistant responses in the NEXT prompt's history
+        // anyway, so persisting generated-token KV here adds
+        // complexity without extra benefit.
+        if use_prefix_cache {
+            if let Ok(mut guard) = self.prefix_cache.lock() {
+                if let Some(pc) = guard.as_mut() {
+                    pc.last_tokens.clear();
+                    pc.last_tokens.extend_from_slice(prompt_ids);
+                    // Cap committed prefix at the last full chunk
+                    // boundary. Slots written by a trailing partial
+                    // chunk are unsafe to reuse — see
+                    // PrefixCacheState::committed_prefix_len doc.
+                    let chunk_size: u32 = std::env::var("RVLLM_PREFILL_CHUNK_SIZE")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let batch_prefill =
+                        parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false);
+                    let prompt_len_u32 = prompt_ids.len() as u32;
+                    pc.committed_prefix_len = if batch_prefill && chunk_size == 0 {
+                        // One-shot batch prefill is batch-shape dependent:
+                        // slots written for a 3k-token request are not
+                        // guaranteed equivalent to the same positions inside
+                        // a later 15k-token request. Fixed chunks give stable
+                        // chunk shapes; without them, keep the cache metadata
+                        // for diagnostics but do not reuse it.
+                        0
+                    } else if batch_prefill && chunk_size > 0 {
+                        // Codex26-1: chunked batch-prefill commits ONLY full
+                        // chunks. A short prompt (prompt_len < chunk_size)
+                        // ran as a single sub-chunk under batch shape
+                        // (1, prompt_len), which is NOT the same shape a
+                        // later longer request's first chunk sees — sm121
+                        // small-batch GEMM paths aren't bit-identical, so
+                        // reusing those KV bytes can poison the next
+                        // request. Strict floor commits 0 in that case.
+                        (prompt_len_u32 / chunk_size) * chunk_size
+                    } else {
+                        // Per-token decode prefill is shape-stable, so the
+                        // whole prompt is safe to reuse.
+                        prompt_len_u32
+                    };
+                    // Refresh provenance so subsequent provenance
+                    // checks compare against the env that ACTUALLY
+                    // wrote this KV state.
+                    pc.provenance = PrefixProvenance::from_env();
+                }
+            }
+        }
         Ok(output_ids)
     }
 
-    pub fn layer_kernels(&self) -> Gemma4LayerKernels {
-        Gemma4LayerKernels {
+    pub fn layer_kernels(&self) -> Result<Gemma4LayerKernels> {
+        // (helper defined just above) — see assert_rope_kernels_match
+        // NVFP4 RoPE kernel handle — `None` on branches without the
+        // NVFP4 PTX built into $KERNELS_DIR. Lives on Fa2PtxKernels
+        // so the module lifetime outlives the fn handle; extracting
+        // via `match` here instead of a helper method to avoid
+        // enlarging the AttentionBackend API for a single field.
+        //
+        // Sliding and global attention each own their own
+        // Fa2PtxKernels; both currently load the SAME PTX file for
+        // RoPE (`fused_rope_partial_nvfp4kv.ptx`) so the function
+        // pointers are identical. We pull from `sliding_attention`
+        // to feed `Gemma4LayerKernels` (struct is per-bringup, not
+        // per-layer) and assert symmetry at runtime so any future
+        // refactor that loads different RoPE modules for global vs
+        // sliding fails LOUDLY here instead of silently feeding
+        // sliding's RoPE into global layers (or vice versa).
+        #[cfg(feature = "cuda")]
+        let fused_rope_partial_nvfp4kv = {
+            let sliding = match &self.sliding_attention {
+                rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv,
+                _ => None,
+            };
+            let global = match &self.global_attention {
+                rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv,
+                _ => None,
+            };
+            assert_rope_kernels_match(
+                "fn_rope_nvfp4kv",
+                sliding,
+                global,
+            )?;
+            sliding
+        };
+        #[cfg(feature = "cuda")]
+        let fused_rope_partial_nvfp4kv_bf16in = {
+            let sliding = match &self.sliding_attention {
+                rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv_bf16in,
+                _ => None,
+            };
+            let global = match &self.global_attention {
+                rvllm_attention::AttentionBackend::Fa2Ptx(fa2) => fa2.fn_rope_nvfp4kv_bf16in,
+                _ => None,
+            };
+            assert_rope_kernels_match(
+                "fn_rope_nvfp4kv_bf16in",
+                sliding,
+                global,
+            )?;
+            sliding
+        };
+        #[cfg(not(feature = "cuda"))]
+        let fused_rope_partial_nvfp4kv = None;
+        #[cfg(not(feature = "cuda"))]
+        let fused_rope_partial_nvfp4kv_bf16in = None;
+
+        Ok(Gemma4LayerKernels {
             fused_rmsnorm: self.fused.fn_rmsnorm,
             fused_rmsnorm_fp8_quant: self.fused.fn_rmsnorm_fp8_quant,
             fused_qk_rmsnorm: self.fused.fn_qk_rmsnorm,
+            fused_qk_rmsnorm_bf16: self.fused.fn_qk_rmsnorm_bf16,
             fused_rope_partial_fp8kv: self.fused.fn_rope_partial_fp8kv,
+            fused_rope_partial_fp8kv_bf16in: self.fused.fn_rope_partial_fp8kv_bf16in,
+            fused_rope_partial_nvfp4kv,
+            fused_rope_partial_nvfp4kv_bf16in,
             fused_gelu_mul: self.fused.fn_gelu_mul,
             quantize_fp8_per_token: self.fused.fn_quantize,
             residual_scale_f16: self.fused.fn_residual_scale,
@@ -2018,16 +5197,27 @@ impl Gemma4Bringup {
             f32_to_f16_sat: self.fused.fn_f32_to_f16_sat,
             scale_cols_f32: self.fused.fn_scale_cols_f32,
             scale_rows_f32_ratio: self.fused.fn_scale_rows_f32_ratio,
-            compute_qkv_scales: self.fused.fn_compute_qkv_scales,
             fused_gelu_mul_f16: self.fused.fn_fused_gelu_mul_f16,
+            fused_gelu_mul_bf16: self.fused.fn_fused_gelu_mul_bf16,
             fused_rope_partial_f16kv: self.fused.fn_fused_rope_partial_f16kv,
             fused_norm_add_residual: self.fused.fn_fused_norm_add_residual,
             fused_norm_add_residual_f16: self.fused.fn_fused_norm_add_residual_f16,
             fused_norm_add_residual_f16in: self.fused.fn_fused_norm_add_residual_f16in,
+            // Cycle 54 Stage 1: BF16 residual chain handles.
+            f16_to_bf16: self.fused.fn_f16_to_bf16,
+            fused_norm_add_residual_bf16: self.fused.fn_fused_norm_add_residual_bf16,
+            fused_norm_add_residual_bf16_f16in: self.fused.fn_fused_norm_add_residual_bf16_f16in,
+            fused_norm_add_residual_bf16_bf16in: self.fused.fn_fused_norm_add_residual_bf16_bf16in,
+            fused_rmsnorm_fp8_quant_bf16in: self.fused.fn_fused_rmsnorm_fp8_quant_bf16in,
             fused_qkv_rmsnorm: self.fused.fn_fused_qkv_rmsnorm,
+            fused_qkv_rmsnorm_bf16: self.fused.fn_fused_qkv_rmsnorm_bf16,
             scale_cols_f16: self.fused.fn_scale_cols_f16,
             fp8_gemv_wpr_native_f16in: self.fused.fn_fp8_gemv_wpr_native_f16in,
-        }
+            fp8_gemv_wpr_native_bf16in: self.fused.fn_fp8_gemv_wpr_native_bf16in,
+            hadamard_unrotate_f16: self.fused.fn_hadamard_unrotate_f16,
+            awq_int4_gemv_f16: self.fused.fn_awq_int4_gemv_f16,
+            awq_int4_gemm_sm120_wmma: self.fused.fn_awq_int4_gemm_sm120_wmma,
+        })
     }
 }
 
@@ -2041,9 +5231,11 @@ fn load_gemma4_fused(
 ) -> Result<Gemma4FusedModules> {
     let rmsnorm_mod = loader.load_ptx("fused_rmsnorm_fp8_quant")?;
     let rope_mod = loader.load_ptx("fused_rope_partial_fp8kv")?;
+    let rope_partial_fp8kv_bf16in_mod = loader.load_ptx("fused_rope_partial_fp8kv_bf16in")?;
     let gelu_mod = loader.load_ptx("fused_gelu_mul_fp8_quant")?;
     let argmax_mod = loader.load_ptx("argmax")?;
     let qk_norm_mod = loader.load_ptx("fused_qk_rmsnorm")?;
+    let qk_norm_bf16_mod = loader.load_ptx("fused_qk_rmsnorm_bf16")?;
     let softcap_mod = loader.load_ptx("logit_softcap")?;
     let residual_scale_mod = loader.load_ptx("residual_scale_f16")?;
     let vnorm_mod = loader.load_ptx("vnorm_f16")?;
@@ -2053,16 +5245,30 @@ fn load_gemma4_fused(
     let vector_add_bf16_to_f16_mod = loader.load_ptx("vector_add_bf16_to_f16")?;
     let f32_to_bf16_mod = loader.load_ptx("f32_to_bf16")?;
     let f32_to_f16_sat_mod = loader.load_ptx("f32_to_f16_sat")?;
+    // Cycle 53+ Stage 1: BF16 residual chain.
+    let f16_to_bf16_mod = loader.load_ptx("f16_to_bf16")?;
+    let fused_norm_add_residual_bf16_mod =
+        loader.load_ptx("fused_norm_add_residual_bf16")?;
+    let fused_rmsnorm_fp8_quant_bf16in_mod =
+        loader.load_ptx("fused_rmsnorm_fp8_quant_bf16in")?;
 
     let rmsnorm_inplace_mod = loader.load_ptx("rmsnorm_inplace_f16")?;
     let fn_rmsnorm = rmsnorm_inplace_mod.get_function("rmsnorm_inplace_f16_kernel")?;
     let fn_rmsnorm_fp8_quant = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_quantize = rmsnorm_mod.get_function("quantize_fp8_per_token_kernel")?;
     let fn_rope_partial_fp8kv = rope_mod.get_function("fused_rope_partial_fp8kv_kernel")?;
+    let fn_rope_partial_fp8kv_bf16in = rope_partial_fp8kv_bf16in_mod
+        .get_function("fused_rope_partial_fp8kv_bf16in_kernel")?;
     let fn_gelu_mul = gelu_mod.get_function("fused_gelu_mul_fp8_quant_kernel")?;
     let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
     let fn_qk_rmsnorm = qk_norm_mod.get_function("fused_qk_rmsnorm_kernel")?;
+    let fn_qk_rmsnorm_bf16 = qk_norm_bf16_mod.get_function("fused_qk_rmsnorm_bf16_kernel")?;
     let fn_softcap = softcap_mod.get_function("logit_softcap_kernel")?;
+    let fn_softcap_f32 = softcap_mod.get_function("logit_softcap_f32_kernel")?;
+    // Codex41-3: GPU repetition penalty.
+    let repetition_penalty_mod = loader.load_ptx("repetition_penalty")?;
+    let fn_apply_repetition_penalty_f32 =
+        repetition_penalty_mod.get_function("apply_repetition_penalty_f32_kernel")?;
     let fn_residual_scale = residual_scale_mod.get_function("residual_scale_f16_kernel")?;
     let fn_vnorm = vnorm_mod.get_function("vnorm_f16_kernel")?;
     let fn_vector_add = vector_add_mod.get_function("vector_add_f16_kernel")?;
@@ -2073,6 +5279,16 @@ fn load_gemma4_fused(
         vector_add_bf16_to_f16_mod.get_function("vector_add_bf16_to_f16_kernel")?;
     let fn_f32_to_bf16 = f32_to_bf16_mod.get_function("f32_to_bf16_kernel")?;
     let fn_f32_to_f16_sat = f32_to_f16_sat_mod.get_function("f32_to_f16_sat_kernel")?;
+    // Cycle 53+ Stage 1: BF16 residual chain function handles.
+    let fn_f16_to_bf16 = f16_to_bf16_mod.get_function("f16_to_bf16_kernel")?;
+    let fn_fused_norm_add_residual_bf16 =
+        fused_norm_add_residual_bf16_mod.get_function("fused_norm_add_residual_bf16_kernel")?;
+    let fn_fused_norm_add_residual_bf16_f16in =
+        fused_norm_add_residual_bf16_mod.get_function("fused_norm_add_residual_bf16_f16in_kernel")?;
+    let fn_fused_norm_add_residual_bf16_bf16in =
+        fused_norm_add_residual_bf16_mod.get_function("fused_norm_add_residual_bf16_bf16in_kernel")?;
+    let fn_fused_rmsnorm_fp8_quant_bf16in =
+        fused_rmsnorm_fp8_quant_bf16in_mod.get_function("fused_rmsnorm_fp8_quant_bf16in_kernel")?;
 
     let scale_cols_f32_mod = loader.load_ptx("scale_cols_f32")?;
     let fn_scale_cols_f32 = scale_cols_f32_mod.get_function("scale_cols_f32_kernel")?;
@@ -2080,11 +5296,10 @@ fn load_gemma4_fused(
     let fn_scale_rows_f32_ratio =
         scale_rows_f32_ratio_mod.get_function("scale_rows_f32_ratio_kernel")?;
 
-    let compute_qkv_scales_mod = loader.load_ptx("compute_qkv_scales")?;
-    let fn_compute_qkv_scales = compute_qkv_scales_mod.get_function("compute_qkv_scales_kernel")?;
-
     let fused_gelu_mul_f16_mod = loader.load_ptx("fused_gelu_mul_f16")?;
     let fn_fused_gelu_mul_f16 = fused_gelu_mul_f16_mod.get_function("fused_gelu_mul_f16_kernel")?;
+    let fused_gelu_mul_bf16_mod = loader.load_ptx("fused_gelu_mul_bf16")?;
+    let fn_fused_gelu_mul_bf16 = fused_gelu_mul_bf16_mod.get_function("fused_gelu_mul_bf16_kernel")?;
 
     let fused_rope_partial_f16kv_mod = loader.load_ptx("fused_rope_partial_f16kv")?;
     let fn_fused_rope_partial_f16kv =
@@ -2102,6 +5317,13 @@ fn load_gemma4_fused(
         ),
         _ => None,
     };
+    let fn_fp8_gemv_wpr_native_bf16in = match target {
+        Some(t) if rvllm_kernels::Fp8GemvVariant::WprNativeBf16In.available_for(t) => Some(
+            fp8_gemv_mod
+                .get_function(rvllm_kernels::Fp8GemvVariant::WprNativeBf16In.entry_point())?,
+        ),
+        _ => None,
+    };
 
     let fused_norm_add_residual_mod = loader.load_ptx("fused_norm_add_residual")?;
     let fn_fused_norm_add_residual =
@@ -2116,18 +5338,47 @@ fn load_gemma4_fused(
     let fused_qkv_rmsnorm_mod = loader.load_ptx("fused_qkv_rmsnorm")?;
     let fn_fused_qkv_rmsnorm =
         fused_qkv_rmsnorm_mod.get_function("fused_qkv_rmsnorm_kernel")?;
+    let fused_qkv_rmsnorm_bf16_mod = loader.load_ptx("fused_qkv_rmsnorm_bf16")?;
+    let fn_fused_qkv_rmsnorm_bf16 =
+        fused_qkv_rmsnorm_bf16_mod.get_function("fused_qkv_rmsnorm_bf16_kernel")?;
 
     let scale_cols_f16_mod = loader.load_ptx("scale_cols_f16")?;
     let fn_scale_cols_f16 = scale_cols_f16_mod.get_function("scale_cols_f16_kernel")?;
+
+    // NVFP4 V-rotation companion (fwht then signs). PTX may be absent
+    // on older kernel trees; fall through to None and the dispatch
+    // site behaves as if RVLLM_NVFP4_HADAMARD_V is off.
+    let hadamard_unrotate_f16_mod = loader.load_ptx("hadamard_unrotate_f16").ok();
+    let fn_hadamard_unrotate_f16 = hadamard_unrotate_f16_mod
+        .as_ref()
+        .and_then(|m| m.get_function("hadamard_unrotate_f16_kernel").ok());
+
+    // Cycle 45 step 4.5c: AWQ INT4 W4A16 GEMV. Optional — `None` is fine
+    // and silently disables the AWQ load path. load_gemma4_model rejects
+    // an AwqConfig-bearing checkpoint when this is `None`.
+    let awq_int4_gemv_f16_mod = loader.load_ptx("awq_int4_gemv_f16").ok();
+    let fn_awq_int4_gemv_f16 = awq_int4_gemv_f16_mod
+        .as_ref()
+        .and_then(|m| m.get_function("awq_int4_gemv_f16_kernel").ok());
+
+    // Cycle 51 step 10d.4: AWQ INT4 W4A16 GEMM (WMMA, M>1 prefill).
+    // Optional — None falls through to per-token GEMV loop fallback.
+    let awq_int4_gemm_sm120_wmma_mod = loader.load_ptx("awq_int4_gemm_sm120_wmma").ok();
+    let fn_awq_int4_gemm_sm120_wmma = awq_int4_gemm_sm120_wmma_mod
+        .as_ref()
+        .and_then(|m| m.get_function("awq_int4_gemm_sm120_wmma_kernel").ok());
 
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
         rmsnorm_inplace_mod,
         rope_mod,
+        rope_partial_fp8kv_bf16in_mod,
         gelu_mod,
         argmax_mod,
         qk_norm_mod,
+        qk_norm_bf16_mod,
         softcap_mod,
+        repetition_penalty_mod,
         residual_scale_mod,
         vnorm_mod,
         vector_add_mod,
@@ -2138,40 +5389,63 @@ fn load_gemma4_fused(
         f32_to_f16_sat_mod,
         scale_cols_f32_mod,
         scale_rows_f32_ratio_mod,
-        compute_qkv_scales_mod,
         fused_gelu_mul_f16_mod,
+        fused_gelu_mul_bf16_mod,
         fused_rope_partial_f16kv_mod,
         fused_norm_add_residual_mod,
+        // Cycle 53+ Stage 1: BF16 residual chain.
+        f16_to_bf16_mod,
+        fused_norm_add_residual_bf16_mod,
+        fused_rmsnorm_fp8_quant_bf16in_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
         fn_rope_partial_fp8kv,
+        fn_rope_partial_fp8kv_bf16in,
         fn_gelu_mul,
         fn_argmax,
         fn_qk_rmsnorm,
+        fn_qk_rmsnorm_bf16,
         fn_softcap,
+        fn_softcap_f32,
+        fn_apply_repetition_penalty_f32,
         fn_residual_scale,
         fn_vnorm,
         fn_vector_add,
         fn_bf16_to_f16_sat,
         fn_rmsnorm_inplace_bf16,
         fn_vector_add_bf16_to_f16,
+        // Cycle 53+ Stage 1: BF16 residual chain function handles.
+        fn_f16_to_bf16,
+        fn_fused_norm_add_residual_bf16,
+        fn_fused_norm_add_residual_bf16_f16in,
+        fn_fused_norm_add_residual_bf16_bf16in,
+        fn_fused_rmsnorm_fp8_quant_bf16in,
         fn_f32_to_bf16,
         fn_f32_to_f16_sat,
         fn_scale_cols_f32,
         fn_scale_rows_f32_ratio,
-        fn_compute_qkv_scales,
         fn_fused_gelu_mul_f16,
+        fn_fused_gelu_mul_bf16,
         fn_fused_rope_partial_f16kv,
         fn_fused_norm_add_residual,
         fn_fused_norm_add_residual_f16,
         fn_fused_norm_add_residual_f16in,
         fused_norm_add_residual_f16_mod,
         fn_fused_qkv_rmsnorm,
+        fn_fused_qkv_rmsnorm_bf16,
         fused_qkv_rmsnorm_mod,
+        fused_qkv_rmsnorm_bf16_mod,
         fn_scale_cols_f16,
         scale_cols_f16_mod,
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_native_f16in,
+        fn_fp8_gemv_wpr_native_bf16in,
+        hadamard_unrotate_f16_mod,
+        fn_hadamard_unrotate_f16,
+        awq_int4_gemv_f16_mod,
+        fn_awq_int4_gemv_f16,
+        awq_int4_gemm_sm120_wmma_mod,
+        fn_awq_int4_gemm_sm120_wmma,
     })
 }

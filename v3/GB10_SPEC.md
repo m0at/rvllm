@@ -341,6 +341,82 @@ a scalar weight scale.
   `CudaContextHandle::init` — same primary-context-retain fix as
   in `rvllm-mem::context`.
 
+## NVFP4 KV cache (rusty_sm121_nvfp4 branch)
+
+Branched 2026-04-21 from `rusty_sm121`. Adds NVFP4 (1-sign-2-exp-1-mantissa
++ per-16-element E4M3 microscale, ~4.5 effective bits per element) as a
+third KV-cache dtype alongside F16 and FP8 E4M3. Blackwell consumer
+(sm_120/121) has native `mma.sync.m16n8k32.e2m1.e2m1.f32` tensor-core
+MMA support; this branch first lands the **dequant-in-smem path** (4-bit
+storage, dequant to FP8 inside the kernel, reuse the existing
+`m16n8k32.e4m3.e4m3.f32` path) and keeps native `e2m1` MMA as a
+follow-up once the storage/plumbing layer is proven.
+
+### Motivation
+- KV memory halves vs FP8 (~5 GiB freed for Gemma 4 31B at 4096 ctx).
+- KV read bandwidth on the decode hot path halves → expected
+  +15–25% tok/s at batch≥128 (attention-bound).
+- PPL cost: literature puts NVFP4 KV at 0.3–0.5 ppl on LLMs with
+  per-16 microscale; acceptable for decode / not acceptable for
+  prefill-heavy PPL benches (gate with env).
+
+### ABI & layout
+- Storage: packed 4-bit values, 2 per byte, row-major over the
+  (block, token, head, dim) hierarchy of the FP8 path. Each 16-element
+  vector along the innermost dim shares one `cutlass::float_e4m3_t`
+  scale stored in a sibling tensor.
+- Scale metadata: `kv_scale[num_blocks, block_size, num_kv_heads,
+  head_dim / 16]` f8_e4m3, total `num_elements / 16 · 1 byte`.
+  Effective KV bits/elem = 4 + 8/16 = **4.5**.
+- Separate scale region in the arena so the main cache stays
+  byte-aligned for packed 4-bit loads.
+
+### Runtime opt-in
+- `RVLLM_NVFP4_KV=1` env. Mutually exclusive with `RVLLM_F16_KV=0/1`
+  — only one KV dtype active per engine load. Bringup fails clean if
+  both are set.
+
+### Kernels to add (`kernels/flash_attention.cu`)
+- `flash_attention_2_decode_nvfp4kv_kernel` (BC=32 for head_dim≤256)
+- `flash_attention_2_decode_nvfp4kv_bc16_kernel` (BC=16 for head_dim=512)
+- `flash_attention_2_prefill_nvfp4kv_kernel` (BC=32)
+- `flash_attention_2_prefill_nvfp4kv_bc16_kernel` (BC=16)
+- `fused_rope_cache_nvfp4kv_kernel` (RoPE + quantise + pack write
+  for the decode append path)
+
+Dequant-in-smem: each warp-group, on its BC loop iteration, does
+(a) load 64 packed bytes → 128 4-bit values, (b) per-16 group
+multiply by E4M3 scale (LUT or `__nv_cvt_e4m3_to_fp32`), (c)
+quantise back to FP8 with the kernel's working scale, (d) feed into
+the existing `m16n8k32.e4m3.e4m3.f32` MMA. Bandwidth-optimal once
+the dequant/quantise fuses into a single pass over smem.
+
+### Rust plumbing
+- `rvllm-attention::Fa2PtxKernels`: add 4 NVFP4 kernel handles +
+  `fn_rope_cache_nvfp4kv` field, load-time resolution.
+- `rvllm-attention::PagedDecode`: a third launcher variant
+  `PagedDecodeNvfp4Launcher` that takes per-block scale pointers
+  instead of per-tensor descales.
+- `rvllm-runtime::gemma4_bring_up`: `use_nvfp4_kv` gate, arena-sizing
+  switches to `kv_bits_per_elem = 4` + separate scale region, KV
+  pointer threading gets a second pointer (`kv_cache_scale`).
+- `rvllm-runtime::gemma4_layer_exec`: new `rope_nvfp4kv` path that
+  calls the fused RoPE+quantise+pack kernel; attention dispatch gates
+  on `dims.kv_dtype` enum instead of `f16_kv: bool`.
+
+### Validation
+- `v3/tools/fa2_nvfp4_precision_check.py`: fp64 ref vs kernel,
+  gate `scale_rel.max ≤ 1e-2` on ~5 Gemma 4 shapes.
+- `rvllm-eval --kv-dtype nvfp4` → PPL vs FP8 on WikiText slice.
+- `rvllm-bench` sweep: batch ∈ {1, 32, 128, 256} with
+  RVLLM_NVFP4_KV=1 and =0, report tok/s delta.
+
+### Effort
+~800–1000 LOC total, 7–10 day estimate. Scope matches the original
+FP8-KV landing that already sits in `rusty_sm121`. Native `e2m1` MMA
+path is a separate follow-up on top of this branch once the
+storage+plumbing layer is proven.
+
 ## Non-goals (explicitly not in this branch)
 
 - **No cudarc downgrade.** PR #28 rolled back 0.19 → 0.12 as a

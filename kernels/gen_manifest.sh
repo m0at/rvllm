@@ -27,14 +27,25 @@ OUT="$ARCH_DIR/manifest.json"
 python3 - "$ARCH_DIR" "$ARCH_NAME" "$REVISION" "$OUT" <<'PY'
 import hashlib, json, os, sys
 arch_dir, arch_name, revision, out = sys.argv[1:5]
+# Codex25-2: include .so artifacts (e.g. libcutlass_sm120.so) so they
+# also get SHA-pinned. Earlier this scan was .ptx-only, leaving the
+# CUTLASS .so bypassing the documented "every kernel artifact is
+# SHA-pinned" invariant. Logical name keeps a `lib*.so` prefix to
+# disambiguate from PTX symbols of the same stem.
 entries = {}
+EXTS = (".ptx", ".so")
 for fn in sorted(os.listdir(arch_dir)):
-    if not fn.endswith(".ptx"):
+    if not fn.endswith(EXTS):
         continue
     path = os.path.join(arch_dir, fn)
     with open(path, "rb") as f:
         data = f.read()
-    stem = fn[:-len(".ptx")]
+    if fn.endswith(".ptx"):
+        stem = fn[:-len(".ptx")]
+    else:
+        # `libcutlass_sm120.so` → `libcutlass_sm120` (full filename
+        # without extension keeps .so-vs-.ptx ambiguity impossible).
+        stem = fn[:-len(".so")]
     entries[stem] = {
         "path": fn,
         "sha256": hashlib.sha256(data).hexdigest(),

@@ -159,7 +159,10 @@ fn run() -> Result<(), String> {
 
         let t_gen = Instant::now();
         let output_ids = unsafe {
-            g4.run_generate(fn_embed, fn_argmax, &prompt_with_bos, max_new as usize, &eos_ids)
+            g4.run_generate(fn_embed, fn_argmax, &prompt_with_bos, max_new as usize, &eos_ids, false,
+                rvllm_runtime::gemma4_bring_up::SamplingConfig::greedy(),
+                None /* no cancellation source in bench */,
+                None /* no per-token streaming sink in bench */)
         }.map_err(|e| format!("gemma4 generate: {e}"))?;
 
         let elapsed = t_gen.elapsed();
@@ -506,6 +509,8 @@ unsafe fn generate(
     let prefill_phase = layer_exec::LayerPhase::Prefill {
         cu_seqlens_q: cu_seqlens_q.device_ptr(),
         max_seqlen_q: prompt_len,
+        // Single-sequence bench — one prompt per run.
+        num_seqs: 1,
     };
     run_forward(prefill_phase, &plans_prefill, prompt_len, k_base_prefill, v_base_prefill)?;
     br.stream.fence().map_err(|e| e.to_string())?;

@@ -40,6 +40,26 @@ impl FusedGeluMulFp8QuantLaunch {
         if self.num_tokens == 0 {
             return Err(invalid("num_tokens", "must be > 0"));
         }
+        // Per-thread register-cache cap. The kernel sizes
+        // `cached[MAX_VECS_PER_THREAD * VEC_SIZE]` to 32 elements
+        // and writes `cached[vec_idx * 8 + j]` per loop iteration
+        // (see kernels/fused_gelu_mul_fp8_quant.cu:18,89). With a
+        // block of 1024 threads each handling one vec, the kernel
+        // covers `intermediate <= MAX_VECS_PER_THREAD * VEC_SIZE *
+        // 1024 = 32768`. Above this the per-thread loop walks past
+        // the array bound (silent corruption — register array OOB
+        // is undefined behaviour, not a CUDA fault). Reject the
+        // shape host-side rather than relying on compile-time
+        // assertions inside the kernel.
+        const MAX_INTERMEDIATE: u32 = 32_768;
+        if self.intermediate > MAX_INTERMEDIATE {
+            return Err(invalid(
+                "intermediate",
+                "fused_gelu_mul_fp8 caches MAX_VECS_PER_THREAD*VEC_SIZE=32 \
+                 elements per thread (block=1024); intermediate > 32768 \
+                 would overflow the register cache",
+            ));
+        }
         Ok(())
     }
 
@@ -241,6 +261,25 @@ impl FusedRopePartialFp8KvLaunch {
             return Err(invalid(
                 "num_heads/num_kv_heads",
                 "num_heads must be a multiple of num_kv_heads",
+            ));
+        }
+        // Kernel-side barrier hazard: the rope kernel exits threads
+        // with `tid >= half_head` early and then calls block-wide
+        // `block_max_abs(...)` which contains `__syncthreads()`. CUDA
+        // requires every thread of a block to reach a barrier
+        // (otherwise: deadlock or undefined behaviour). The launcher
+        // uses `block = max(head_dim/2, 32)`, so when half_head < 32
+        // (head_dim < 64) the upper threads return before the
+        // barrier — UB. Gemma 4 head_dim ∈ {256, 512} is unaffected;
+        // reject smaller dims so the kernel is honest about its
+        // contract.
+        if self.head_dim < 64 {
+            return Err(invalid(
+                "head_dim",
+                "fused_rope_partial_fp8kv requires head_dim >= 64; \
+                 below this the early-exit on `tid >= head_dim/2` \
+                 leaves half the warp before block_max_abs's \
+                 __syncthreads() and the launch is UB",
             ));
         }
         Ok(())
@@ -623,6 +662,44 @@ impl Fp8GemvF16InLaunch {
         input_f16: u64,
         stream: u64,
     ) -> Result<()> {
+        // Codex53-4: kernels/fp8_gemv.cu loads FP8 weights via
+        // 64-bit reinterpret_cast (8 bytes = 8 e4m3 elements per
+        // load) and F16 input via 32-bit reads (2 halves). Both row
+        // strides == K, so K must be divisible by 8 for the FP8
+        // load and by 2 for the F16 load. K=8 alignment subsumes
+        // both. Gemma 4 dims (head_dim=256/512, hidden=5376) all
+        // satisfy this; reject at the launcher boundary so a future
+        // odd projection size doesn't silently miscompile.
+        if self.k % 8 != 0 {
+            return Err(rvllm_core::RvllmError::config(
+                rvllm_core::ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "Fp8GemvF16InLaunch requires K % 8 == 0 \
+                         (FP8 64-bit reinterpret_cast load); got K={}",
+                        self.k
+                    )],
+                },
+                "Fp8GemvF16InLaunch.k",
+            ));
+        }
+        // The block-scale layout is [ceil(N/128), ceil(K/128)] —
+        // see kernels/fp8_gemv.cu's `scale_row = n >> 7` indexing.
+        // The loader-side validator at gemma4_load.rs already
+        // guards the shape (Codex52-3); this is a defensive sanity
+        // check on the dispatch dims themselves so a stub blockscale
+        // pointer cannot be paired with degenerate N=0 or K=0.
+        if self.n == 0 || self.k == 0 || self.m == 0 {
+            return Err(rvllm_core::RvllmError::config(
+                rvllm_core::ConfigError::Inconsistent {
+                    reasons: vec![format!(
+                        "Fp8GemvF16InLaunch rejects zero-size dims \
+                         (m={}, n={}, k={})",
+                        self.m, self.n, self.k
+                    )],
+                },
+                "Fp8GemvF16InLaunch.dims",
+            ));
+        }
         let mut output = output_f16;
         let mut weight = weight_fp8;
         let mut scale = b_chscale;
@@ -718,9 +795,89 @@ impl Bf16ToF16SatLaunch {
     }
 }
 
+// Cycle 54 Stage 1: f16 -> bf16 conversion (residual chain entry).
+// Mirrors Bf16ToF16SatLaunch — same ABI, opposite direction. Safe for
+// in-place use (dst == src) thanks to the no-restrict kernel signature.
+pub struct F16ToBf16Launch {
+    pub n: u32,
+}
+
+impl F16ToBf16Launch {
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        dst: u64,
+        src: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut dst = dst;
+        let mut src = src;
+        let mut n = self.n as i32;
+        let args = [
+            (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+            (&mut src) as *mut u64 as *mut core::ffi::c_void,
+            (&mut n) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block = (256u32, 1, 1);
+        let grid = ((self.n + 255) / 256, 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // logit_softcap
 // ---------------------------------------------------------------------------
+
+// Codex41-3: GPU-side repetition penalty.
+// Kernel sig: `(logits_f32, ids_i32, num_ids, vocab, penalty)`
+pub struct ApplyRepetitionPenaltyLaunch {
+    pub num_ids: u32,
+    pub vocab: u32,
+    pub penalty: f32,
+}
+
+impl ApplyRepetitionPenaltyLaunch {
+    pub fn validate(&self) -> Result<()> {
+        if self.vocab == 0 {
+            return Err(invalid("repetition_penalty.vocab", "0"));
+        }
+        if self.penalty <= 0.0 {
+            return Err(invalid("repetition_penalty.penalty", "must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// Caller owns pointers. `ids_dev` must be a device pointer to
+    /// `num_ids` i32 entries; `logits_dev` to `vocab` f32 entries.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        logits_dev: u64,
+        ids_dev: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        // No-op when nothing to penalize. Saves a launch.
+        if self.num_ids == 0 {
+            return Ok(());
+        }
+        let mut logits = logits_dev;
+        let mut ids = ids_dev;
+        let mut n = self.num_ids as i32;
+        let mut vocab = self.vocab as i32;
+        let mut pen = self.penalty;
+        let args = [
+            (&mut logits) as *mut u64 as *mut core::ffi::c_void,
+            (&mut ids) as *mut u64 as *mut core::ffi::c_void,
+            (&mut n) as *mut i32 as *mut core::ffi::c_void,
+            (&mut vocab) as *mut i32 as *mut core::ffi::c_void,
+            (&mut pen) as *mut f32 as *mut core::ffi::c_void,
+        ];
+        let block_w = self.num_ids.min(1024).max(1);
+        launch_raw(kernel, (1, 1, 1), (block_w, 1, 1), 0, stream, &args)
+    }
+}
 
 pub struct LogitSoftcapLaunch {
     pub num_tokens: u32,
@@ -765,6 +922,276 @@ impl LogitSoftcapLaunch {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cycle 45 step 4.5a: AWQ INT4 W4A16 GEMV (compressed-tensors layout).
+//
+// Kernel: `awq_int4_gemv_f16_kernel` (kernels/awq_int4_gemv_f16.cu).
+// One block per output row, 32 threads (one warp), warp-shuffle reduce.
+//
+// Q|K|V scratch composition: caller can pass an offset device pointer
+// in `output_f16` so three sequential launches (Q, K, V) write into one
+// contiguous Q|K|V scratch buffer at the right offsets — this preserves
+// the fused QKV RMSNorm/attention path that consumes that buffer
+// (gemma4_layer_exec.rs:789). The kernel itself writes `output[n]` for
+// `n ∈ [0, N)`; pointer arithmetic at the call site does the rest.
+// No kernel modification needed.
+// ---------------------------------------------------------------------------
+
+pub struct AwqInt4GemvF16Launch {
+    pub n: u32,
+    pub k: u32,
+    pub group_size: u32,
+}
+
+impl AwqInt4GemvF16Launch {
+    /// # Safety
+    /// All device pointers must be valid for the kernel's duration.
+    /// `weight_packed` is `[N, K/8]` int32; `weight_scale` is
+    /// `[N, K/group_size]` bf16; `weight_zero_point` is
+    /// `[N/8, K/group_size]` int32; `activation` is `[K]` f16;
+    /// `output_f16` writes `[N]` f16 — caller may pass a non-zero
+    /// offset into a larger Q|K|V scratch.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        activation: u64,
+        weight_packed: u64,
+        weight_scale: u64,
+        weight_zero_point: u64,
+        output_f16: u64,
+        stream: u64,
+    ) -> Result<()> {
+        // Validate before touching the kernel — the WMMA AWQ sibling
+        // launcher calls `self.validate()?` and the GEMV path is
+        // expected to have the same contract. Without this, a caller
+        // passing n=0 / k=0 / k % 8 != 0 / k % group_size != 0 lands
+        // inside the kernel where divisions by `group_size` and
+        // INT4-along-K layout assumptions silently corrupt or
+        // divide-by-zero (see kernels/awq_int4_gemv_f16.cu:61).
+        self.validate()?;
+        let mut act = activation;
+        let mut w   = weight_packed;
+        let mut s   = weight_scale;
+        let mut z   = weight_zero_point;
+        let mut out = output_f16;
+        let mut n_i = self.n as i32;
+        let mut k_i = self.k as i32;
+        let mut g_i = self.group_size as i32;
+        let args = [
+            (&mut act) as *mut u64 as *mut core::ffi::c_void,
+            (&mut w)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut s)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut z)   as *mut u64 as *mut core::ffi::c_void,
+            (&mut out) as *mut u64 as *mut core::ffi::c_void,
+            (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+            (&mut g_i) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        // gridDim.x = N (one block per row), blockDim.x = 32 (single warp).
+        let grid = (self.n, 1u32, 1u32);
+        let block = (32u32, 1u32, 1u32);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+
+    /// Validate launch geometry. K must be divisible by 8 (INT4 packing
+    /// along K) and by group_size. All dims > 0.
+    pub fn validate(&self) -> Result<()> {
+        if self.n == 0 { return Err(invalid("n", "must be > 0")); }
+        if self.k == 0 { return Err(invalid("k", "must be > 0")); }
+        if self.group_size == 0 { return Err(invalid("group_size", "must be > 0")); }
+        if self.k % 8 != 0 { return Err(invalid("k", "must be multiple of 8 (INT4 packing)")); }
+        if self.n % 8 != 0 {
+            // Defense-in-depth: AWQ zero_point is INT4-packed along N
+            // (`[N/8, K/g]` int32). The cycle 42 AwqExpectedShapes::from_dense
+            // already enforces this at load time, but assert it here too so
+            // the launcher itself never sees an invalid layout.
+            return Err(invalid("n", "must be multiple of 8 (INT4 zero_point packing along N)"));
+        }
+        if self.k % self.group_size != 0 {
+            return Err(invalid("k", "must be multiple of group_size"));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 51 step 10d.3: AWQ INT4 W4A16 GEMM (M>1 prefill) launcher.
+//
+// Wraps `awq_int4_gemm_sm120_wmma_kernel` (kernels/awq_int4_gemm_sm120_wmma.cu).
+// 1-warp/16x16-tile WMMA kernel — un-tuned but ~6 TFLOPS sustained on
+// canonical Gemma 4 prefill shapes (M=2048 q_proj = 30 ms vs the
+// per-token-loop's ~100 seconds → ~3000x speedup). Cycle 51d.2b will
+// tune to multi-warp / cp.async-pipelined for ~30 TFLOPS.
+//
+// Validated end-to-end against fp64 reference at M ∈ {8, 16, 128, 2048}
+// in v3/tools/awq_int4_gemm_check.py (cycle 51d.1b).
+// ---------------------------------------------------------------------------
+
+pub struct AwqInt4GemmSm120WmmaLaunch {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub group_size: u32,
+    /// f16 row stride of the output buffer D, in elements. Pass `n`
+    /// for contiguous `[M, N]` output. Pass a larger value when
+    /// composing into a wider scratch row (e.g. `qkv_rows` for QKV
+    /// composition where Q/K/V land at column offsets `0`,
+    /// `q_dim`, `q_dim + kv_dim`).
+    pub ld_d: u32,
+}
+
+impl AwqInt4GemmSm120WmmaLaunch {
+    pub fn validate(&self) -> Result<()> {
+        if self.m == 0 { return Err(invalid("m", "must be > 0")); }
+        if self.n == 0 { return Err(invalid("n", "must be > 0")); }
+        if self.k == 0 { return Err(invalid("k", "must be > 0")); }
+        if self.group_size == 0 { return Err(invalid("group_size", "must be > 0")); }
+        if self.k % 16 != 0 {
+            return Err(invalid("k", "must be multiple of 16 (WMMA K-step)"));
+        }
+        if self.k % self.group_size != 0 {
+            return Err(invalid("k", "must be multiple of group_size"));
+        }
+        if self.n % 8 != 0 {
+            return Err(invalid("n", "must be multiple of 8 (zero_point INT4-along-N packing)"));
+        }
+        if self.ld_d < self.n {
+            return Err(invalid("ld_d", "must be >= n (output row stride)"));
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// All device pointers must be valid for the kernel's duration.
+    /// Layout per the kernel header in awq_int4_gemm_sm120_wmma.cu:
+    ///   D:                  [M, N] f16 RowMajor
+    ///   A:                  [M, K] f16 RowMajor
+    ///   weight_packed:      [N, K/8] i32 RowMajor
+    ///   weight_scale:       [N, K/g] bf16 RowMajor
+    ///   weight_zero_point:  [N/8, K/g] i32 RowMajor
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        d_f16: u64,
+        a_f16: u64,
+        weight_packed: u64,
+        weight_scale: u64,
+        weight_zero_point: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut d   = d_f16;
+        let mut a   = a_f16;
+        let mut w   = weight_packed;
+        let mut s   = weight_scale;
+        let mut z   = weight_zero_point;
+        let mut m_i = self.m as i32;
+        let mut n_i = self.n as i32;
+        let mut k_i = self.k as i32;
+        let mut g_i = self.group_size as i32;
+        let mut ld_i = self.ld_d as i32;
+        let args = [
+            (&mut d)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut a)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut w)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut s)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut z)    as *mut u64 as *mut core::ffi::c_void,
+            (&mut m_i)  as *mut i32 as *mut core::ffi::c_void,
+            (&mut n_i)  as *mut i32 as *mut core::ffi::c_void,
+            (&mut k_i)  as *mut i32 as *mut core::ffi::c_void,
+            (&mut g_i)  as *mut i32 as *mut core::ffi::c_void,
+            (&mut ld_i) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        // Grid/block matches v2 32x32-tile / 128-thread kernel
+        // (cycle 51d.2b promoted v2 to production after 2x speedup).
+        let grid = ((self.n + 31) / 32, (self.m + 31) / 32, 1u32);
+        let block = (128u32, 1u32, 1u32);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 51 step 10b: AWQ INT4 W4A16 per-token prefill loop helper.
+//
+// The AWQ GEMV kernel is M=1 only. Until the CUTLASS SM120 AWQ GEMM
+// (cycle 51 c-d) lands, prefill paths can either fail loud
+// (FeatureNotAvailable, the cycle 46 default) or run a per-token loop
+// over the GEMV — slow because each token re-reads the full weight
+// matrix from HBM, but correct.
+//
+// Codex review (cycle 51 design consult): "(a) is only useful as a
+// correctness/debug path". Wrap accordingly: caller decides whether
+// to invoke this loop (env-gated in exec_layer dispatch) or fail.
+// Default exec_layer behavior stays at FeatureNotAvailable so users
+// don't get pathologically slow prefill silently.
+// ---------------------------------------------------------------------------
+
+pub struct AwqInt4GemvF16PrefillLoop {
+    /// Number of activation tokens (rows of A). Loop iterates this
+    /// many times calling the M=1 GEMV.
+    pub num_tokens: u32,
+    /// Per-row dims passed to each GEMV launch.
+    pub n: u32,
+    pub k: u32,
+    pub group_size: u32,
+    /// Activation row stride in f16 elements (typically `k`).
+    pub in_stride_elems: u32,
+    /// Output row stride in f16 elements. May differ from `n` when
+    /// the caller is composing into a larger Q|K|V or gate||up
+    /// scratch buffer (offset_within_row = caller-managed).
+    pub out_stride_elems: u32,
+}
+
+impl AwqInt4GemvF16PrefillLoop {
+    pub fn validate(&self) -> Result<()> {
+        AwqInt4GemvF16Launch {
+            n: self.n, k: self.k, group_size: self.group_size,
+        }.validate()?;
+        if self.num_tokens == 0 {
+            return Err(invalid("num_tokens", "must be > 0"));
+        }
+        if self.in_stride_elems == 0 || self.out_stride_elems == 0 {
+            return Err(invalid("stride", "must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// Caller owns all four device pointers + the output base for the
+    /// loop's duration. `out_base_f16` is the row-0 start of the
+    /// destination region (caller adds any intra-row offset already).
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        activation_base: u64,
+        weight_packed: u64,
+        weight_scale: u64,
+        weight_zero_point: u64,
+        out_base_f16: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let inner = AwqInt4GemvF16Launch {
+            n: self.n, k: self.k, group_size: self.group_size,
+        };
+        // 2 bytes per f16 element.
+        let in_row_bytes  = (self.in_stride_elems  as u64) * 2;
+        let out_row_bytes = (self.out_stride_elems as u64) * 2;
+        for t in 0..self.num_tokens {
+            inner.launch(
+                kernel,
+                activation_base + (t as u64) * in_row_bytes,
+                weight_packed,
+                weight_scale,
+                weight_zero_point,
+                out_base_f16 + (t as u64) * out_row_bytes,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +1212,35 @@ mod tests {
             intermediate: 21504,
         };
         assert!(l.validate().is_ok());
+    }
+
+    /// Per-thread register-cache size in the kernel
+    /// (`cached[MAX_VECS_PER_THREAD * VEC_SIZE = 32]`) caps the
+    /// intermediate dim at 32768. Anything above silently overruns
+    /// the array; the launcher must reject the shape so future
+    /// model adds (e.g. Mistral-Nemo's 32768 boundary, larger MoE
+    /// experts) hit a clean error instead of silent corruption.
+    #[test]
+    fn gelu_accepts_max_intermediate() {
+        let l = FusedGeluMulFp8QuantLaunch {
+            num_tokens: 32,
+            intermediate: 32_768,
+        };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn gelu_rejects_intermediate_above_register_cache() {
+        let l = FusedGeluMulFp8QuantLaunch {
+            num_tokens: 32,
+            intermediate: 32_776, // > 32768, multiple of 8
+        };
+        let err = l.validate().expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("intermediate") || msg.contains("register cache"),
+            "wrong field/error: {msg}"
+        );
     }
 
     #[test]
@@ -848,6 +1304,106 @@ mod tests {
             head_dim: 256,
             eps: 1e-6,
         };
+        assert!(l.validate().is_err());
+    }
+
+    // === Cycle 45 step 4.5a AWQ launcher tests ===
+
+    #[test]
+    fn awq_int4_gemv_accepts_canonical_gemma4_q_proj() {
+        // Real Gemma 4 31B q_proj: N=8192, K=5376, group_size=128.
+        let l = AwqInt4GemvF16Launch { n: 8192, k: 5376, group_size: 128 };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn awq_int4_gemv_rejects_k_not_multiple_of_8() {
+        let l = AwqInt4GemvF16Launch { n: 1024, k: 5377, group_size: 128 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_int4_gemv_rejects_k_not_multiple_of_group() {
+        let l = AwqInt4GemvF16Launch { n: 1024, k: 200, group_size: 128 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_int4_gemv_rejects_zero_dim() {
+        let l = AwqInt4GemvF16Launch { n: 0, k: 5376, group_size: 128 };
+        assert!(l.validate().is_err());
+    }
+
+    // === Cycle 51 step 10b prefill-loop tests ===
+
+    #[test]
+    fn awq_prefill_loop_accepts_canonical_q_proj() {
+        // 128-token prefill of Gemma 4 q_proj (N=8192, K=5376, g=128)
+        // with QKV scratch row stride = qkv_rows = 8192 + 2*1024 = 10240.
+        let l = AwqInt4GemvF16PrefillLoop {
+            num_tokens: 128, n: 8192, k: 5376, group_size: 128,
+            in_stride_elems: 5376, out_stride_elems: 10240,
+        };
+        assert!(l.validate().is_ok());
+    }
+
+    // === Cycle 51 step 10d.3 GEMM launcher tests ===
+
+    #[test]
+    fn awq_gemm_accepts_canonical_q_proj() {
+        // Gemma 4 31B q_proj prefill (M=2048): N=8192, K=5376, g=128.
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 2048, n: 8192, k: 5376, group_size: 128, ld_d: 8192 };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn awq_gemm_rejects_k_not_multiple_of_16() {
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 8192, k: 5384, group_size: 128, ld_d: 8192 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_gemm_rejects_n_not_multiple_of_8() {
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 1023, k: 5376, group_size: 128, ld_d: 1023 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_gemm_accepts_ld_d_greater_than_n() {
+        // QKV composition: Q has N=8192 but lands in qkv_rows=10240
+        // wide scratch.
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 8192, k: 5376, group_size: 128, ld_d: 10240 };
+        assert!(l.validate().is_ok());
+    }
+
+    #[test]
+    fn awq_gemm_rejects_ld_d_smaller_than_n() {
+        let l = AwqInt4GemmSm120WmmaLaunch { m: 128, n: 8192, k: 5376, group_size: 128, ld_d: 4096 };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_prefill_loop_rejects_zero_tokens() {
+        let l = AwqInt4GemvF16PrefillLoop {
+            num_tokens: 0, n: 8192, k: 5376, group_size: 128,
+            in_stride_elems: 5376, out_stride_elems: 10240,
+        };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_prefill_loop_rejects_zero_stride() {
+        let l = AwqInt4GemvF16PrefillLoop {
+            num_tokens: 1, n: 8192, k: 5376, group_size: 128,
+            in_stride_elems: 5376, out_stride_elems: 0,
+        };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn awq_int4_gemv_rejects_n_not_multiple_of_8() {
+        // INT4 zero_point packs 8-per-int32 along N; non-/8 N is invalid.
+        let l = AwqInt4GemvF16Launch { n: 1023, k: 5376, group_size: 128 };
         assert!(l.validate().is_err());
     }
 }

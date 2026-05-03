@@ -55,7 +55,21 @@ def precompute_rope(dim: int, max_seq: int, theta: float, scaling: dict,
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: int) -> torch.Tensor:
-    """x: [B, n_heads, rope_dim]"""
+    """x: [B, n_heads, rope_dim]
+
+    Indexing `cos[pos]` / `sin[pos]` directly used to IndexError silently
+    once `pos >= cos.shape[0]` (the precomputed RoPE table length, set
+    from `max_position_embeddings`). Raise a clear error pointing at the
+    table-size bound instead of letting a generic IndexError surface
+    deep inside the attention layer.
+    """
+    if pos >= cos.shape[0]:
+        raise ValueError(
+            f"K2 RoPE position {pos} exceeds precomputed table size "
+            f"{cos.shape[0]}. Increase `max_position_embeddings` in the "
+            f"model config (K2Model picks it up automatically) or cap "
+            f"the request prompt+generation length below the table size."
+        )
     B, nh, d = x.shape
     x = x.view(B, nh, d // 2, 2)
     c = cos[pos].unsqueeze(0).unsqueeze(0)
@@ -84,9 +98,17 @@ class K2Model:
         self.first_k_dense = weights.first_k_dense
         self.rms_norm_eps = weights.rms_norm_eps
 
+        # RoPE table size matches the model's declared
+        # max_position_embeddings (read from config in `K2Weights`).
+        # The previous `max_seq=8192` hard-coding silently truncated
+        # any model whose config declared a larger ceiling and made
+        # `apply_rope` IndexError above pos 8191 on long contexts.
+        self.max_position_embeddings = int(
+            getattr(weights, "max_position_embeddings", 8192)
+        )
         self.rope_cos, self.rope_sin = precompute_rope(
             self.qk_rope_head_dim,
-            max_seq=8192,
+            max_seq=self.max_position_embeddings,
             theta=weights.rope_theta,
             scaling=weights.rope_scaling,
             device=self.device,

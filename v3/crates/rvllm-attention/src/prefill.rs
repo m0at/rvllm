@@ -8,6 +8,57 @@ use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 
 const SUPPORTED_HEAD_DIMS: &[u32] = &[128, 256, 512];
 
+/// Cycle 52 step 11c (codex audit finding #3): assert backend
+/// head_dim matches params. See decode.rs for rationale.
+fn assert_head_dim_matches_backend(
+    backend: &super::AttentionBackend,
+    params_head_dim: u32,
+    op: &'static str,
+    stream: u64,
+    num_seqs: u32,
+) -> Result<()> {
+    let backend_hd = backend.head_dim();
+    if backend_hd != 0 && backend_hd != params_head_dim {
+        eprintln!(
+            "[attn] head_dim mismatch at {op}: params={params_head_dim}, backend={backend_hd}"
+        );
+        return Err(RvllmError::Attention {
+            err: AttentionError::FeatureNotAvailable {
+                backend: "head_dim-cross-check",
+                op,
+            },
+            ctx: AttnCtx { op, stream, num_seqs, head_dim: params_head_dim },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    Ok(())
+}
+
+/// Cycle 52 step 11b (codex audit finding #1): pre-launch null-pointer
+/// guard. See decode.rs::require_nonnull for rationale; same shape.
+fn require_nonnull(
+    ptrs: &[(&'static str, u64)],
+    op: &'static str,
+    stream: u64,
+    num_seqs: u32,
+    head_dim: u32,
+) -> Result<()> {
+    for (name, p) in ptrs {
+        if *p == 0 {
+            eprintln!("[attn] required device ptr {name:?} == 0 at {op}");
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op,
+                },
+                ctx: AttnCtx { op, stream, num_seqs, head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct PagedPrefillParams {
     pub num_tokens: u32,
@@ -50,6 +101,32 @@ impl PagedPrefillParams {
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
+        // Cycle 52 attention hardening (codex finding #2): prefill had
+        // NO num_tokens/num_seqs/scale/block_size guards. A zero in any
+        // of these causes the unified-prefill grid sizer to either
+        // panic on div_ceil(0) or launch a 0-grid kernel that
+        // silently writes garbage.
+        if self.num_tokens == 0 || self.num_seqs == 0 || self.num_heads == 0 {
+            return Err(RvllmError::Attention {
+                err: AttentionError::ContextExceedsBucket { context: 0, max: 0 },
+                ctx: ctx(),
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if self.block_size == 0 || self.num_blocks_total == 0 || self.max_blocks_per_seq == 0 {
+            return Err(RvllmError::Attention {
+                err: AttentionError::ContextExceedsBucket { context: 0, max: 0 },
+                ctx: ctx(),
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if !self.scale.is_finite() || self.scale <= 0.0 {
+            return Err(RvllmError::Attention {
+                err: AttentionError::ContextExceedsBucket { context: 0, max: 0 },
+                ctx: ctx(),
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
         Ok(())
     }
 }
@@ -76,10 +153,29 @@ impl<'a> PagedPrefillLauncher<'a> {
         _cu_seqlens_q_ptr: u64,
         _cu_seqlens_k_ptr: u64,
         _workspace_ptr: u64,
-        _stream: u64,
+        stream: u64,
     ) -> Result<()> {
+        // Previously this validated `params` and then returned `Ok(())`
+        // without launching a kernel — a silent no-op. Any future
+        // F16-prefill caller would see "successful" launches with
+        // unmodified output buffers (whatever stale bytes happened to
+        // sit there) and silently produce wrong logits. Surface the
+        // missing implementation explicitly so the caller chooses an
+        // implemented path or fails loudly.
         params.validate()?;
-        Ok(())
+        Err(rvllm_core::RvllmError::Attention {
+            err: rvllm_core::AttentionError::FeatureNotAvailable {
+                backend: "PagedPrefillLauncher (F16 prefill)",
+                op: "paged_prefill_f16",
+            },
+            ctx: rvllm_core::AttnCtx {
+                op: "paged_prefill_f16",
+                stream,
+                num_seqs: params.num_seqs,
+                head_dim: params.head_dim,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        })
     }
 }
 
@@ -108,6 +204,179 @@ pub struct UnifiedPrefillParams {
     /// engine selects this per-launch from `RVLLM_UNIFIED_PREFILL_MMA`
     /// so A/B bisects stay trivial.
     pub use_mma: bool,
+}
+
+impl UnifiedPrefillParams {
+    /// Reject configurations that would divide-by-zero either on the
+    /// host (`params.num_tokens.div_ceil(unified.block_q)`) or inside
+    /// the kernel (`flash_attention_unified_prefill.cu` divides the
+    /// per-row index by `block_q` to recover seq_idx). The previous
+    /// host code computed `block_q = UNIFIED_PREFILL_BLOCK_M /
+    /// num_queries_per_kv.max(1)` which collapses to 0 for GQA
+    /// ratios > 16 (Gemma 4 sits at 4, but checkpoints with extreme
+    /// GQA / MQA exist). Returning a clear error is preferable to
+    /// the host-side `attempt to divide by zero` panic.
+    pub fn validate(&self) -> Result<()> {
+        if self.block_q == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.block_q",
+                    reason:
+                        "block_q must be >= 1; a zero value indicates \
+                         GQA ratio > UNIFIED_PREFILL_BLOCK_M and would \
+                         divide-by-zero in the kernel grid math"
+                        .into(),
+                },
+                field: "block_q",
+            });
+        }
+        if self.num_queries_per_kv == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.num_queries_per_kv",
+                    reason: "num_queries_per_kv must be >= 1".into(),
+                },
+                field: "num_queries_per_kv",
+            });
+        }
+        // Codex24-2: kernel maps `q_head = kv_head*ratio + (m % ratio)`
+        // with `m` in `0..UNIFIED_PREFILL_BLOCK_M-1` (=0..15). For
+        // ratio > BLOCK_M, query heads `BLOCK_M..ratio-1` within each
+        // kv-group never get written — silent corruption. Gemma 4 sits
+        // at ratio=4 so this is theoretical for production, but
+        // extreme-GQA / MQA checkpoints exist and the launcher
+        // boundary must enforce the invariant. A larger BLOCK_M kernel
+        // variant would be a separate change; until then, reject.
+        if self.num_queries_per_kv > UNIFIED_PREFILL_BLOCK_M {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.num_queries_per_kv",
+                    reason:
+                        "num_queries_per_kv must be <= UNIFIED_PREFILL_BLOCK_M (16); \
+                         a larger ratio would leave query heads BLOCK_M..ratio-1 \
+                         unwritten in the kernel's per-row mapping"
+                        .into(),
+                },
+                field: "num_queries_per_kv",
+            });
+        }
+        if self.tile_size == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.tile_size",
+                    reason: "tile_size must be >= 1".into(),
+                },
+                field: "tile_size",
+            });
+        }
+        // QK-tile column count: the NVFP4 unified-prefill kernel only
+        // dispatches `n_tiles = ceil(tile_len/8)` MMA columns through
+        // warp IDs 0..3 (4 warps total). For `tile_size > 32` the
+        // host loop produces n_tiles > 4 and warp IDs 4+ never run,
+        // leaving scores uninitialised for the higher columns.
+        // Runtime callers pass 16 or 32 today, but the launcher
+        // boundary must enforce the assumption — silent
+        // uninitialised-score reads taint the softmax with whatever
+        // happened to be in shared memory.
+        if self.tile_size > 32 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.tile_size",
+                    reason:
+                        "tile_size > 32 is not covered by the kernel's \
+                         4-warp QK-tile dispatch (warps 0..3 only); \
+                         columns beyond would hold uninitialised scores"
+                        .into(),
+                },
+                field: "tile_size",
+            });
+        }
+        Ok(())
+    }
+
+    /// Codex17-3: cross-check the unified-prefill knobs against the
+    /// outer `PagedPrefillParams`. Standalone `validate()` only catches
+    /// internal contradictions; the public API is also easy to misuse
+    /// by passing `num_queries_per_kv` / `block_q` that disagree with
+    /// `num_heads` / `num_kv_heads`. The kernel assumes
+    /// `num_heads = num_kv_heads * num_queries_per_kv` and that
+    /// `block_q * num_queries_per_kv == UNIFIED_PREFILL_BLOCK_M`
+    /// (or `block_q == UNIFIED_PREFILL_BLOCK_M` when num_queries_per_kv
+    /// >= BLOCK_M, the GQA-clamp branch). A drifting caller would
+    /// otherwise get silently wrong head→KV mappings.
+    pub fn validate_against(&self, params: &PagedPrefillParams) -> Result<()> {
+        if params.num_kv_heads == 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "PagedPrefillParams.num_kv_heads",
+                    reason: "num_kv_heads must be >= 1".into(),
+                },
+                field: "num_kv_heads",
+            });
+        }
+        if params.num_heads % params.num_kv_heads != 0 {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "PagedPrefillParams.num_heads",
+                    reason: "num_heads must be a multiple of num_kv_heads (GQA grouping)".into(),
+                },
+                field: "num_heads",
+            });
+        }
+        let gqa_ratio = params.num_heads / params.num_kv_heads;
+        if gqa_ratio != self.num_queries_per_kv {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.num_queries_per_kv",
+                    reason:
+                        "num_queries_per_kv must equal num_heads / num_kv_heads; \
+                         a mismatch silently maps Q heads to wrong KV groups in \
+                         the kernel".into(),
+                },
+                field: "num_queries_per_kv",
+            });
+        }
+        // block_q derivation: BLOCK_M / max(1, num_queries_per_kv), clamped to >=1.
+        let expected_block_q = (UNIFIED_PREFILL_BLOCK_M / self.num_queries_per_kv.max(1)).max(1);
+        if self.block_q != expected_block_q {
+            return Err(rvllm_core::RvllmError::Config {
+                err: rvllm_core::ConfigError::InvalidField {
+                    name: "UnifiedPrefillParams.block_q",
+                    reason:
+                        "block_q must equal max(1, UNIFIED_PREFILL_BLOCK_M / num_queries_per_kv); \
+                         deviation breaks the kernel's per-row seq_idx recovery".into(),
+                },
+                field: "block_q",
+            });
+        }
+        // Codex34-1: continuous batching for unified prefill is not
+        // exercised by the test harness — the grid mapping
+        // `q_block_global = cu_seqlens_q[i] / block_q + i` produces
+        // intentional gap-CTAs that early-return for num_seqs > 1,
+        // and that branch is currently un-validated end-to-end. The
+        // earlier Codex33-2 reject was too strict: Gemma4Phase::Prefill
+        // propagates the scheduler's num_seqs straight through the
+        // public boundary, so a hard-fail here turned every batched
+        // prefill into a server 5xx instead of a slow fallback. Now
+        // emits a one-shot stderr warning and lets the launch
+        // proceed; the gemma4 caller still always passes num_seqs=1
+        // today (cu_seq=[0,chunk_q]), so this branch is normally
+        // silent. Remove once the harness lands a num_seqs>1 cell.
+        if params.num_seqs > 1 {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[prefill] WARN: unified prefill with num_seqs={} is not covered by \
+                     the test harness; running anyway. The kernel's q_block_global gap-CTA \
+                     mapping is unverified for continuous batching — watch for \
+                     wrong-attention regressions and land coverage before relying on it.",
+                    params.num_seqs
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'a> PagedPrefillFp8Launcher<'a> {
@@ -154,6 +423,62 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        unified.validate()?;
+        unified.validate_against(&params)?;
+        require_nonnull(
+            &[
+                ("o_f16",              o_f16),
+                ("q_fp8",              q_fp8),
+                ("k_cache_fp8",        k_cache_fp8),
+                ("v_cache_fp8",        v_cache_fp8),
+                // k_descale_fallback / v_descale_fallback NOT in
+                // require_nonnull — for hybrid (FP8 globals + NVFP4
+                // sliding) and pure-FP8 path the kernel can use
+                // either k_scale_cache (per-slot) OR the fallback
+                // (scalar). Cycle 52 step 12b: at least one of each
+                // must be non-zero (checked below); zero in both is
+                // the actual bug.
+                ("block_tables",       block_tables),
+                ("cu_seqlens_q",       cu_seqlens_q),
+                ("context_lens",       context_lens),
+                ("q_descale_fallback", q_descale_fallback),
+            ],
+            "paged_prefill_fp8_unified",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_prefill_fp8_unified", stream, params.num_seqs,
+        )?;
+        // Cycle 52 step 12b: K/V need at least one scale source.
+        // Hybrid path (NVFP4 sliding + FP8 globals) and pure-FP8 path
+        // pass k_scale_cache=0 + k_descale_fallback non-zero, or vice
+        // versa. The cycle-11b unconditional fallback-required check
+        // killed the hybrid global-FP8 cell of the kv_policy_matrix.
+        if k_scale_cache == 0 && k_descale_fallback == 0 {
+            eprintln!("[attn] FP8 unified prefill: both k_scale_cache and k_descale_fallback are 0");
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op: "paged_prefill_fp8_unified — K scale source missing",
+                },
+                ctx: AttnCtx { op: "paged_prefill_fp8_unified", stream,
+                    num_seqs: params.num_seqs, head_dim: params.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if v_scale_cache == 0 && v_descale_fallback == 0 {
+            eprintln!("[attn] FP8 unified prefill: both v_scale_cache and v_descale_fallback are 0");
+            return Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "host-validation",
+                    op: "paged_prefill_fp8_unified — V scale source missing",
+                },
+                ctx: AttnCtx { op: "paged_prefill_fp8_unified", stream,
+                    num_seqs: params.num_seqs, head_dim: params.head_dim },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
         #[cfg(feature = "cuda")]
         {
             let fa2 = match self.backend {
@@ -226,11 +551,14 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
                 + 128;
 
             if smem_bytes >= 48 * 1024 {
-                let _ = cuFuncSetAttribute(
+                crate::decode::set_max_dynamic_smem(
                     kernel_fn.raw() as CUfunction,
-                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     smem_bytes as i32,
-                );
+                    "paged_prefill_unified_dynsmem",
+                    stream,
+                    params.num_seqs,
+                    params.head_dim,
+                )?;
             }
 
             // Scalars must outlive cuLaunchKernel.
@@ -371,6 +699,27 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         stream: u64,
     ) -> Result<()> {
         params.validate()?;
+        require_nonnull(
+            &[
+                ("o_f16",         o_f16),
+                ("q_fp8",         q_fp8),
+                ("k_cache_fp8",   k_cache_fp8),
+                ("v_cache_fp8",   v_cache_fp8),
+                ("block_tables",  block_tables),
+                ("context_lens",  context_lens),
+                ("cu_seqlens_q",  cu_seqlens_q),
+                ("workspace",     workspace),
+                ("q_descale_ptr", q_descale_ptr),
+                ("k_descale_ptr", k_descale_ptr),
+                ("v_descale_ptr", v_descale_ptr),
+            ],
+            "paged_prefill (Fa3 FP8)",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_prefill (Fa3 FP8)", stream, params.num_seqs,
+        )?;
         #[cfg(feature = "cuda")]
         {
             let fa3 = match self.backend {
@@ -470,9 +819,537 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
     }
 }
 
+/// NVFP4 KV-cache paged-prefill launcher. Same shape as
+/// `PagedPrefillFp8Launcher` but threads per-block E4M3 microscale
+/// pointers and a packed 4-bit cache layout. Only `Fa2Ptx` implements
+/// it; FA3 returns `FeatureNotAvailable`.
+pub struct PagedPrefillNvfp4Launcher<'a> {
+    backend: &'a super::AttentionBackend,
+}
+
+impl<'a> PagedPrefillNvfp4Launcher<'a> {
+    pub fn new(backend: &'a super::AttentionBackend) -> Self {
+        Self { backend }
+    }
+
+    /// # Safety
+    /// Same invariants as the FP8 prefill launcher, plus:
+    ///   * `k_cache_packed` / `v_cache_packed`: 4-bit bytes.
+    ///   * `k_cache_scale` / `v_cache_scale`: per-16-element E4M3.
+    ///   * `q_descale_ptr`: single f32 scalar (Q stays FP8 per-tensor).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        params: PagedPrefillParams,
+        o_f16: u64,
+        q_fp8: u64,
+        k_cache_packed: u64,
+        v_cache_packed: u64,
+        k_cache_scale: u64,
+        v_cache_scale: u64,
+        // === DYNAMIC NVFP4 Q SCALE ===
+        q_scale_cache: u64,
+        // === END DYNAMIC NVFP4 Q SCALE ===
+        block_tables: u64,
+        context_lens: u64,
+        cu_seqlens_q: u64,
+        q_descale_ptr: u64,
+        max_seqlen_q: u32,
+        stream: u64,
+    ) -> Result<()> {
+        params.validate()?;
+        require_nonnull(
+            &[
+                ("o_f16",          o_f16),
+                ("q_fp8",          q_fp8),
+                ("k_cache_packed", k_cache_packed),
+                ("v_cache_packed", v_cache_packed),
+                ("k_cache_scale",  k_cache_scale),
+                ("v_cache_scale",  v_cache_scale),
+                ("block_tables",   block_tables),
+                ("context_lens",   context_lens),
+                ("cu_seqlens_q",   cu_seqlens_q),
+                ("q_descale_ptr",  q_descale_ptr),
+            ],
+            "paged_prefill (NVFP4 KV)",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_prefill (NVFP4 KV)", stream, params.num_seqs,
+        )?;
+        #[cfg(feature = "cuda")]
+        {
+            let fa2 = match self.backend {
+                super::AttentionBackend::Fa2Ptx(fa2) => fa2,
+                _ => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "non-Fa2Ptx",
+                            op: "paged_prefill_nvfp4",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_prefill_nvfp4",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            use cudarc::driver::sys::*;
+            const FA2_THREADS: i32 = 128;
+            let hd = params.head_dim as i32;
+            let (kernel_opt, fa2_bc) = if hd > 256 {
+                (fa2.fn_prefill_nvfp4kv_bc16, 16)
+            } else {
+                (fa2.fn_prefill_nvfp4kv, 32)
+            };
+            let kernel_fn = kernel_opt.ok_or_else(|| RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    backend: "Fa2Ptx",
+                    op: "paged_prefill_nvfp4 (kernel missing from PTX)",
+                },
+                ctx: AttnCtx {
+                    op: "paged_prefill_nvfp4",
+                    stream,
+                    num_seqs: params.num_seqs,
+                    head_dim: params.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })?;
+
+            // Phase 2a (aa01001nvf4f16mma): K/V dequant target is
+            // f16 smem (2 bytes/elem) — see the matching comment in
+            // decode.rs's PagedDecodeNvfp4Launcher.
+            let smem_bytes =
+                2 * fa2_bc * hd * 2 + fa2_bc * 4 + (FA2_THREADS / 32) * 4;
+            if smem_bytes as u32 >= 48 * 1024 {
+                crate::decode::set_max_dynamic_smem(
+                    kernel_fn.raw() as CUfunction,
+                    smem_bytes,
+                    "paged_prefill_nvfp4_dynsmem",
+                    stream,
+                    params.num_seqs,
+                    params.head_dim,
+                )?;
+            }
+
+            let scale = params.scale;
+            let num_heads = params.num_heads as i32;
+            let num_kv_heads = params.num_kv_heads as i32;
+            let head_dim = params.head_dim as i32;
+            let block_size = params.block_size as i32;
+            let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+            let window_size_left = params.window_size_left;
+
+            let mut arg_out = o_f16;
+            let mut arg_q = q_fp8;
+            let mut arg_kp = k_cache_packed;
+            let mut arg_vp = v_cache_packed;
+            let mut arg_ks = k_cache_scale;
+            let mut arg_vs = v_cache_scale;
+            // === DYNAMIC NVFP4 Q SCALE ===
+            let mut arg_qsc = q_scale_cache;
+            // === END DYNAMIC NVFP4 Q SCALE ===
+            let mut arg_bt = block_tables;
+            let mut arg_cl = context_lens;
+            let mut arg_cu = cu_seqlens_q;
+            let mut arg_qd = q_descale_ptr;
+            let _ = max_seqlen_q; // qi-loop drives over cu_seqlens_q
+
+            let args: [*mut core::ffi::c_void; 18] = [
+                &mut arg_out as *mut _ as *mut _,
+                &mut arg_q   as *mut _ as *mut _,
+                &mut arg_kp  as *mut _ as *mut _,
+                &mut arg_vp  as *mut _ as *mut _,
+                &mut arg_ks  as *mut _ as *mut _,
+                &mut arg_vs  as *mut _ as *mut _,
+                // === DYNAMIC NVFP4 Q SCALE ===
+                &mut arg_qsc as *mut _ as *mut _,
+                // === END DYNAMIC NVFP4 Q SCALE ===
+                &mut arg_bt  as *mut _ as *mut _,
+                &mut arg_cl  as *mut _ as *mut _,
+                &mut arg_cu  as *mut _ as *mut _,
+                &mut arg_qd  as *mut _ as *mut _,
+                &scale as *const _ as *mut _,
+                &num_heads as *const _ as *mut _,
+                &num_kv_heads as *const _ as *mut _,
+                &head_dim as *const _ as *mut _,
+                &block_size as *const _ as *mut _,
+                &max_blocks_per_seq as *const _ as *mut _,
+                &window_size_left as *const _ as *mut _,
+            ];
+
+            let rc = cuLaunchKernel(
+                kernel_fn.raw() as CUfunction,
+                params.num_seqs as u32,
+                params.num_heads as u32,
+                1,
+                FA2_THREADS as u32,
+                1,
+                1,
+                smem_bytes as u32,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_prefill_nvfp4 (Fa2Ptx)",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (o_f16, q_fp8, k_cache_packed, v_cache_packed,
+                     k_cache_scale, v_cache_scale, q_scale_cache,
+                     block_tables,
+                     context_lens, cu_seqlens_q, q_descale_ptr,
+                     max_seqlen_q, stream);
+        }
+        Ok(())
+    }
+}
+
+impl<'a> PagedPrefillNvfp4Launcher<'a> {
+    /// Multi-query NVFP4 prefill with `m16n8k16` f16 MMA inner loop
+    /// (task aa01001nvf4f16mma Phase 2b). Grid + smem layout mirrors
+    /// `launch_fp8kv_unified_sm121` but reads the KV cache as NVFP4
+    /// packed bytes + per-16-element E4M3 microscale, dequants to
+    /// f16 smem via `cvt.rn.f16x2.e2m1x2`, and drives the tensor
+    /// core through `f16_mma_frag_pack.cuh`.
+    ///
+    /// # Safety
+    /// Same invariants as the FP8 unified launcher. Additionally:
+    ///   * `k_cache_scale` / `v_cache_scale` must be
+    ///     `[num_blocks * block_size * num_kv_heads * head_dim/16]`
+    ///     E4M3 microscales.
+    ///   * `q_scale_cache` may be null; the kernel falls back to
+    ///     `*q_descale_fallback` per row in that case.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4kv_unified_sm121(
+        &self,
+        params: PagedPrefillParams,
+        unified: UnifiedPrefillParams,
+        o_f16: u64,
+        q_fp8: u64,
+        k_cache_packed: u64,
+        v_cache_packed: u64,
+        k_cache_scale: u64,
+        v_cache_scale: u64,
+        q_scale_cache: u64,
+        block_tables: u64,
+        cu_seqlens_q: u64,
+        context_lens: u64,
+        q_descale_fallback: u64,
+        // When `true`, dispatch the bf16-output variant of the
+        // unified prefill kernel (`fn_prefill_nvfp4kv_unified_bf16out`).
+        // The bf16-out kernel was loaded into Fa2PtxKernels but
+        // never selected — every call hard-coded the f16-out
+        // variant regardless of the caller's intent. Same dormant-
+        // wiring pattern that the cycle 55 bf16-everywhere PR will
+        // activate; making the parameter live now lets that PR
+        // simply flip a boolean rather than refactor the launcher.
+        // Today's gemma4 caller passes `false`.
+        output_bf16: bool,
+        stream: u64,
+    ) -> Result<()> {
+        params.validate()?;
+        unified.validate()?;
+        unified.validate_against(&params)?;
+        require_nonnull(
+            &[
+                ("o_f16",              o_f16),
+                ("q_fp8",              q_fp8),
+                ("k_cache_packed",     k_cache_packed),
+                ("v_cache_packed",     v_cache_packed),
+                ("k_cache_scale",      k_cache_scale),
+                ("v_cache_scale",      v_cache_scale),
+                ("block_tables",       block_tables),
+                ("cu_seqlens_q",       cu_seqlens_q),
+                ("context_lens",       context_lens),
+                ("q_descale_fallback", q_descale_fallback),
+            ],
+            "paged_prefill_nvfp4_unified",
+            stream, params.num_seqs, params.head_dim,
+        )?;
+        assert_head_dim_matches_backend(
+            self.backend, params.head_dim,
+            "paged_prefill_nvfp4_unified", stream, params.num_seqs,
+        )?;
+        #[cfg(feature = "cuda")]
+        {
+            let fa2 = match self.backend {
+                super::AttentionBackend::Fa2Ptx(fa2) => fa2,
+                _ => {
+                    return Err(RvllmError::Attention {
+                        err: AttentionError::FeatureNotAvailable {
+                            backend: "non-Fa2Ptx",
+                            op: "paged_prefill_nvfp4_unified",
+                        },
+                        ctx: AttnCtx {
+                            op: "paged_prefill_nvfp4_unified",
+                            stream,
+                            num_seqs: params.num_seqs,
+                            head_dim: params.head_dim,
+                        },
+                        bt: std::backtrace::Backtrace::capture(),
+                    });
+                }
+            };
+            use cudarc::driver::sys::*;
+            const FA2_THREADS: i32 = 128;
+            // Dispatch f16-out vs bf16-out variant. Closes the same
+            // dormant-wiring gap as the bf16 split-decode reducer
+            // (Codex9): both kernels are loaded by the loader, but
+            // the launcher previously always reached for the f16-out
+            // one. With output_bf16 plumb live, cycle 55 Stage 3
+            // can flip a flag at the caller instead of touching the
+            // launcher.
+            let kernel_handle = if output_bf16 {
+                fa2.fn_prefill_nvfp4kv_unified_bf16out
+            } else {
+                fa2.fn_prefill_nvfp4kv_unified
+            };
+            let kernel_fn = kernel_handle.ok_or_else(|| {
+                RvllmError::Attention {
+                    err: AttentionError::FeatureNotAvailable {
+                        backend: "Fa2Ptx",
+                        op: if output_bf16 {
+                            "paged_prefill_nvfp4_unified (bf16-out kernel missing from PTX)"
+                        } else {
+                            "paged_prefill_nvfp4_unified (kernel missing from PTX)"
+                        },
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_prefill_nvfp4_unified",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                }
+            })?;
+
+            // Smem layout must match `flash_attention_unified_prefill_nvfp4kv.cu`.
+            const MMA_K: u32 = 16;
+            let block_m: u32 = UNIFIED_PREFILL_BLOCK_M;
+            let hd = params.head_dim;
+            let ts = unified.tile_size;
+            let s_s_stride = ts.max(MMA_K);
+            let smem_bytes: u32 = block_m * hd * 2        // s_q_f16
+                + block_m * 4                              // s_q_scale
+                + ts * hd * 2                              // s_k_f16
+                + ts * hd * 2                              // s_v_f16
+                + MMA_K * hd * 2                           // s_v_f16_T
+                + block_m * s_s_stride * 4                 // s_s
+                + block_m * 4 * 3                          // s_m + s_l + s_alpha
+                + block_m * MMA_K * 2                      // s_p_f16
+                // s_p_scale removed (post-softmax P in [0,1] = identity scale)
+                + block_m * hd * 4                         // s_acc
+                + 256;                                     // alignment cushion
+
+            if smem_bytes >= 48 * 1024 {
+                crate::decode::set_max_dynamic_smem(
+                    kernel_fn.raw() as CUfunction,
+                    smem_bytes as i32,
+                    "paged_prefill_unified_dynsmem",
+                    stream,
+                    params.num_seqs,
+                    params.head_dim,
+                )?;
+            }
+
+            let scale = params.scale;
+            let num_heads = params.num_heads as i32;
+            let num_kv_heads = params.num_kv_heads as i32;
+            let head_dim = params.head_dim as i32;
+            let block_size = params.block_size as i32;
+            let max_blocks_per_seq = params.max_blocks_per_seq as i32;
+            let tile_size = unified.tile_size as i32;
+            let num_queries_per_kv = unified.num_queries_per_kv as i32;
+            let block_q = unified.block_q as i32;
+            let num_seqs = params.num_seqs as i32;
+            let window_size_left = params.window_size_left;
+
+            let mut arg_out  = o_f16;
+            let mut arg_q    = q_fp8;
+            let mut arg_kp   = k_cache_packed;
+            let mut arg_vp   = v_cache_packed;
+            let mut arg_ks   = k_cache_scale;
+            let mut arg_vs   = v_cache_scale;
+            let mut arg_qs   = q_scale_cache;
+            let mut arg_bt   = block_tables;
+            let mut arg_cu   = cu_seqlens_q;
+            let mut arg_cl   = context_lens;
+            let mut arg_qd   = q_descale_fallback;
+
+            let args: [*mut core::ffi::c_void; 22] = [
+                &mut arg_out as *mut _ as *mut _,
+                &mut arg_q   as *mut _ as *mut _,
+                &mut arg_kp  as *mut _ as *mut _,
+                &mut arg_vp  as *mut _ as *mut _,
+                &mut arg_ks  as *mut _ as *mut _,
+                &mut arg_vs  as *mut _ as *mut _,
+                &mut arg_qs  as *mut _ as *mut _,
+                &mut arg_bt  as *mut _ as *mut _,
+                &mut arg_cu  as *mut _ as *mut _,
+                &mut arg_cl  as *mut _ as *mut _,
+                &mut arg_qd  as *mut _ as *mut _,
+                &scale as *const _ as *mut _,
+                &num_heads as *const _ as *mut _,
+                &num_kv_heads as *const _ as *mut _,
+                &head_dim as *const _ as *mut _,
+                &block_size as *const _ as *mut _,
+                &max_blocks_per_seq as *const _ as *mut _,
+                &tile_size as *const _ as *mut _,
+                &num_queries_per_kv as *const _ as *mut _,
+                &block_q as *const _ as *mut _,
+                &num_seqs as *const _ as *mut _,
+                &window_size_left as *const _ as *mut _,
+            ];
+
+            // Grid: (total_num_q_blocks, num_kv_heads) — same shape as
+            // the FP8 unified launcher.
+            let total_num_q_blocks =
+                params.num_tokens.div_ceil(unified.block_q) + params.num_seqs;
+
+            let rc = cuLaunchKernel(
+                kernel_fn.raw() as CUfunction,
+                total_num_q_blocks,
+                params.num_kv_heads,
+                1,
+                FA2_THREADS as u32,
+                1,
+                1,
+                smem_bytes,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_prefill_nvfp4_unified (Fa2Ptx)",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (params, unified, o_f16, q_fp8, k_cache_packed, v_cache_packed,
+                     k_cache_scale, v_cache_scale, q_scale_cache,
+                     block_tables, cu_seqlens_q, context_lens,
+                     q_descale_fallback, stream);
+            Err(RvllmError::Attention {
+                err: AttentionError::FeatureNotAvailable {
+                    op: "paged_prefill_nvfp4_unified (non-cuda build)",
+                    backend: "mock",
+                },
+                ctx: AttnCtx {
+                    op: "launch_nvfp4kv_unified_sm121",
+                    stream,
+                    num_seqs: params.num_seqs,
+                    head_dim: params.head_dim,
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_prefill_rejects_zero_block_q() {
+        // Regression: GQA ratio > UNIFIED_PREFILL_BLOCK_M used to
+        // make `block_q = UNIFIED_PREFILL_BLOCK_M / ratio = 0`, the
+        // host then div_ceil-by-zero panicked or the kernel divided
+        // by zero in the grid math. Now `validate()` returns a clear
+        // ConfigError before either site is reached.
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 32,
+            tile_size: 16,
+            block_q: 0,
+            use_mma: false,
+        };
+        let err = u.validate().expect_err("block_q=0 must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("block_q"), "wrong field in error: {msg}");
+    }
+
+    #[test]
+    fn unified_prefill_accepts_valid_config() {
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 4,
+            tile_size: 16,
+            block_q: 4,
+            use_mma: false,
+        };
+        assert!(u.validate().is_ok());
+    }
+
+    #[test]
+    fn unified_prefill_rejects_tile_size_above_32() {
+        // 4-warp QK-tile dispatch caps tile_size at 32. Above this
+        // the kernel's `warp_id < n_tiles` gate leaves higher
+        // columns with uninitialised scores; the launcher must
+        // refuse the shape so a future caller doesn't trip silent
+        // softmax corruption.
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 4,
+            tile_size: 64,
+            block_q: 4,
+            use_mma: false,
+        };
+        let err = u.validate().expect_err("tile_size > 32 must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("tile_size"), "wrong field: {msg}");
+    }
+
+    #[test]
+    fn unified_prefill_accepts_tile_size_32() {
+        // 32 is exactly the upper bound — must still pass.
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 4,
+            tile_size: 32,
+            block_q: 4,
+            use_mma: false,
+        };
+        assert!(u.validate().is_ok());
+    }
+
+    #[test]
+    fn unified_prefill_rejects_zero_qpkv() {
+        let u = UnifiedPrefillParams {
+            num_queries_per_kv: 0,
+            tile_size: 16,
+            block_q: 16,
+            use_mma: false,
+        };
+        assert!(u.validate().is_err());
+    }
 
     #[test]
     fn prefill_validates_head_dim() {

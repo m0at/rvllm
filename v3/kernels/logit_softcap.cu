@@ -26,3 +26,24 @@ __global__ void logit_softcap_kernel(
         row_ptr[i] = __float2half(capped);
     }
 }
+
+// Codex40-2: f32 variant for the generate path, which samples directly
+// from f32 logits (no intermediate f16 conversion). PPL/bench convert
+// f32→f16 and use the f16 kernel above; generate previously skipped
+// the softcap entirely, drifting from the trained-token-distribution.
+extern "C"
+__global__ void logit_softcap_f32_kernel(
+    float* __restrict__ logits,     // [num_tokens, vocab]
+    int vocab,
+    float cap
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float inv_cap = 1.0f / cap;
+
+    float* row_ptr = logits + row * vocab;
+
+    for (int i = tid; i < vocab; i += blockDim.x) {
+        row_ptr[i] = cap * tanhf(row_ptr[i] * inv_cap);
+    }
+}

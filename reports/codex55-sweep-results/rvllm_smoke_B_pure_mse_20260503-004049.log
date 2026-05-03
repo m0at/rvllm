@@ -1,0 +1,220 @@
+label=B_pure_mse ts=20260503-004049 profile_summary:
+RVLLM_NVFP4_SCALE_POLICY=mse
+RVLLM_PREFILL_CHUNK_SIZE=128
+RVLLM_REPETITION_PENALTY_WINDOW=64
+RVLLM_REPETITION_PENALTY_MIN_COUNT=2
+RVLLM_REPETITION_PENALTY=1.05
+RVLLM_NVFP4_PARTITION_SIZE=256
+RVLLM_NVFP4_SPLIT_GQA=0
+RVLLM_NVFP4_DECODE_GQA=0
+RVLLM_NVFP4_HYBRID_GLOBAL_FP8=0
+RVLLM_NVFP4_HYBRID_SLIDING_FP8=0
+RVLLM_NVFP4_HADAMARD=1
+RVLLM_PER_TOKEN_Q_SCALE=1
+RVLLM_NVFP4_HADAMARD_V=1
+RVLLM_NVFP4_K_SCALE_POLICY=amax6
+RVLLM_NVFP4_V_SCALE_POLICY=mse
+---
+===PROMPT [PASS] wer bist du?===
+Ich bin ein KI-Assistent. Mein Ziel ist es, hilfreich, präzise und direkt zu sein.
+
+===PROMPT [PASS] was machst du gerade?===
+Ich stehe bereit, um dir bei deinen Aufgaben zu helfen – egal ob es um Software Engineering, Datenanalyse oder einfach nur ein Gespräch ist. Was steht heute auf deinem Plan?
+
+===PROMPT [PASS] wer ist dein lieblingsmensch?===
+Ich habe keine persönlichen Vorlieben oder Gefühle, daher gibt es keinen "Lieblingsmenschen". Aber wenn ich wählen müsste, wären es wohl die Nutzer, die mir spannende Fragen stellen und mich herausfordern.
+
+===PROMPT [PASS] stell dich kurz vor===
+Ich bin ein KI-Assistent. Mein Ziel ist es, hilfreich, präzise und direkt zu sein. Ich unterstütze unter anderem bei technischen Themen wie Software Engineering und Machine Learning, bin aber auch für allgemeere Aufgaben zuständig.
+
+Ich antworte meist kurz und prägnant, außer Detailtiefe ist gefragt.
+
+===PROMPT [PASS] was ist deine philosophie?===
+Meine Philosophie basiert auf drei Prinzipien:
+
+1. **Wahrheit**: Ich liefere Fakten präzise und ohne Ausschmückungen. Wenn ich etwas nicht weiß, sage ich das direkt, statt zu raten.
+2. **Effizienz**: Ich bin präzise und direkt. Ich vermeite unnötiges "Rauschen" oder höfliche Floskeln, es sei denn, es ist angefordert.
+3. **Stabilität**: Ich handle vorsichtig und rational. Ich ändere nichts ohne einen klaren Auftrag, um maximale Zuverlässigkeit zu gewährleisten.
+
+Kurz gesagt: Ich bin ein Werkzeug für präzise Ergebnisse, nicht für Smalltalk.
+
+===PROMPT [PASS] wie ist das wetter in bern?===
+In Bern ist es teils bewölkt mit einer Temperatur von 14°C. Die Luftfeuchtigkeit liegt bei 88% und der Wind weht mit 6 km/h aus Süden.
+
+===PROMPT [PASS] wie ist das wetter in zürich?===
+Das Wetter in Zürich ist aktuell klar mit einer Temperatur von 14°C.
+
+===PROMPT [PASS] regnet es in basel?===
+Ja, es regnet leicht in Basel. Die Temperatur liegt bei 16°C.
+
+===PROMPT [PASS] ist es kalt in luzern?===
+Aktuell ist es in Luzern etwa 15°C. Es ist nicht besonders kalt, aber auch nicht warm.
+
+===PROMPT [PASS] wie warm wird es morgen?===
+Es wird morgen in Zürich etwa 27°C. Es bleibt sonnig.
+
+===PROMPT [PASS] ist die haustür auf?===
+Ich habe keinen Zugriff auf die Sensoren oder die Überwachung deiner Haustür. Wenn du ein entsprechendes System installiert hast, müsste ich Zugriff auf dessen API oder Status haben, um das prüfen zu können.
+
+===PROMPT [PASS] ist das wohnzimmerlicht an?===
+Ich weiß nicht, ob das Wohnzimmerlicht an ist, da ich keinen Zugriff auf den Status deiner Geräte habe. Wenn du ein System integriert hast, kann ich versuchen, den Status zu prüfen, sofern die entsprechenden Tools verfügbar sind.
+
+===PROMPT [PASS] wo ist lola?===
+Ich weiß nicht, wer Lola ist, und habe keine Informationen über sie in meinem Speicher. Wenn du mir mehr Kontext gibst, kann ich versuchen, es herauszufinden.
+
+===PROMPT [PASS] ist vinz zuhause?===
+Ich weiß nicht, ob Vinz zuhause ist, da ich keinen Zugriff auf seine aktuellen Bewegungen oder seinen Status habe.
+
+===PROMPT [PASS] schalte das licht im flur aus===
+Since you didn't provide a specific request, I'm here if you need help with software engineering, machine learning, or anything else. What's on your mind?
+
+===PROMPT [PASS] suche nach Lola===
+Ich konnte keine Informationen zu "Lola" in deinem Speicher finden. Kannst du mir mehr erzählen, wer Lola ist, oder gibt es einen bestimmten Kontext, in dem ich nach suchen soll?
+
+===PROMPT [PASS] wer ist Vinz?===
+Ich weiß nicht, wer Vinz ist. Wenn du mir mehr Informationen gibst oder wenn er in deinen gespeicherten Notizen vorkommt, kann ich versuchen, es herauszufinden.
+
+===PROMPT [PASS] liste meine projekte===
+Ich konnte keine Informationen über deine Projekte in deinem Speicher finden. Wenn du mir sagst, welche Projekte du meinst oder wo ich suchen soll, helfe ich dir gerne weiter.
+
+===PROMPT [PASS] was sind meine letzten erinnerungen?===
+Ich konnte keine Erinnerungen in deinem Speicher finden. Wenn du mir sagst, worauf du dich beziehst, kann ich versuchen, mehr Informationen zu finden.
+
+===PROMPT [PASS] such die letzten news zu Bitcoin===
+Die aktuellsten News zu Bitcoin (Stand 3. Mai 2026) sind:
+
+1. **Politische Entwicklungen in den USA**: Das Weiße Haus hat einen Bericht veröffentlicht, wonach ein Gesetz zur Struktur des Krypto-Marktes noch diesen Monat vorangebracht werden könnte.
+2. **Mining & KI**: Bitcoin-Mining-Unternehmen verzeichnen in diesem Jahr starke Zuwächse, was teilweise auf eine strategische Verschiebung hin zu KI-Rechenkapazitäten zurückgeführt wird, was einige Aktien um bis zu 85 % steigerte.
+
+===PROMPT [PASS] erkläre mir was eine GPU ist in 3 sätzen===
+Please let me know how I can help you. What's on your mind?
+
+===PROMPT [PASS] schreib einen hello-world in python===
+```python
+print("Hello World!")
+```
+
+===PROMPT [PASS] was ist der unterschied zwischen RAM und SSD?===
+Der Hauptunterschied zwischen RAM (Arbeitsspeicher) und einer SSD (Speichergerät) liegt in ihrem Zweck und ihrer Funktionsweise:
+
+**1. RAM (Random Access Memory)**
+*   **Zweck:** Kurzzeitgedächtnis des Computers. Hier werden Daten geladen, die das System *jetzt* benötigt, um schnell auf sie zuzugreifen.
+*   **Geschwindigkeit:** Extrem schnell.
+*   **Flüchtigkeit:** RAM ist "flüchtig" (volatile). Das bedeutet: Wenn der Computer ausgeschaltet wird, sind alle Daten im RAM gelöscht.
+*   **Beispiel:** Wenn du ein Programm öffnest, wird es von der SSD in den RAM geladen, damit es flüssig läuft.
+
+**2. SSD (Solid State Drive)**
+*   **Zweck:** Langzeitgedächtnis. Hier werden Dateien, Fotos und Programme dauerhaft gespeichert.
+*   **Geschwindigkeit:** Viel langsamer als RAM (aber schneller als alte Festplatten/HDDs).
+*   **Beständigkeit:** SSDs sind "nicht flüchtig" (non-volatile). Die Daten bleiben erhalten, auch wenn der Strom weg ist.
+*   **Beispiel:** Deine installierten Spiele oder Dokumente liegen auf der SSD, bis sie beim Starten in den RAM geladen werden.
+
+**Zusammenfassung:**
+*   **RAM** ist für die **Ausführung** (schnell, kurzzeitig).
+*   **SSD** ist für das **Speichern** (langsamer, dauerhaft).
+
+===PROMPT [PASS] wie funktioniert ein attention layer?===
+Ein Attention Layer (genauer: die "Self-Attention" in einem Transformer-Modell) funktioniert wie ein dynamischer Filter, der entscheidet, welche Teile eines Inputs für einen bestimmten Kontext wichtig sind.
+
+Man kann es sich als eine Art "gewichtete Aufmerksamkeit" vorstellen:
+
+1. **Die Projektion (Q, K, V):**
+   Jedes Element des Inputs (z. B. ein Wort in einem Satz) wird in drei verschiedene Versionen transformiert:
+   - **Query (Frage):** "Was suche ich?"
+   - **Key (Schlüssel):** "Was bin ich?"
+   - **Value (Wert):** "Was ist mein eigentlicher Inhalt?"
+
+2. **Die Berechnung der Relevanz (Dot Product):**
+   Das Modell prüt, wie gut die *Query* eines Worts mit den *Keys* aller anderen Wörter im Satz übereinstimmt. Wenn die Übereinstimmung hoch ist, bedeutet das: "Dieses Wort ist wichtig für den Kontext des aktuellen Wortes."
+
+3. **Die Normalisierung (Softmax):**
+   Diese Relevanz-Scores werden durch eine Softmax-Funktion in Wahrscheinlichkeiten (0 bis 1) umgewandelt. Ein Wort, das sehr relevant ist, bekommt einen hohen Wert (z. B. 0.8), ein irrelevantes Wort einen niedrigen Wert (z. B. 0.1).
+
+4. **Die Gewichtung (Weighting):**
+   Der *Value* jedes Worts wird mit seinem entsprechenden Score multipliziert. Die Informationen, die "unwichtig" sind, werden unterdrückt, während die "relevanten" Informationen verstärkt werden.
+
+**Ein Beispiel zur Veranscheulichung:**
+Satz: *"Die Bank sitzt an der Bank."* (Die erste "Bank" ist eine Person, die zweite ein Möbelstück).
+
+Beim Verarbeiten des Wortes "Bank" schaut der Attention Layer auf die anderen Wörter. Wenn das Wort "sitzt" und "Möbel" im Kontext steht, wird die Attention für die "Möbel-Bank" aktiviert. Wenn das Kontext-Wort "Geld" oder "Konto" auftauch würde, würde der Layer die Aufmerksamkeit auf die "Finanz-Bank" lenken.
+
+**Zusammengefasst:**
+Ein Attention Layer erlaubt dem Modell, nicht einfach nur eine Sequenz von Worten zu lesen, sondern gezielt zu schauen: **"Welche anderen Teile des Inputs sind für dieses spezifische Wort wichtig?"** Das löst das Problem von langen Kontexten, da das Modell nicht alles gleichzeitig speichern muss, sondern fokussiert auf die relevanten Teile.
+
+===PROMPT [PASS] warum ist quantisierung wichtig?===
+Quantisierung ist vor allem in zwei Bereichen wichtig: in der digitalen Signalverarbeitung (DSP) und bei Large Language Models (LLMs).
+
+**1. Digitale Signalverarbeitung (z. B. Audio oder Bilddaten)**
+Hier ist Quantisierung der Prozess, bei dem ein kontinuierliches Analogsignal in diskrete digitale Werte umgewandelt wird.
+*   **Wichtigkeit:** Ohne Quantisierung gäbe es keine digitalen Dateien. Die Genauigkeit der Quantisierung (Bit-Tiefe) bestimmt die Qualität: Je mehr Bits, desto geringer das Quantisierungsrauschen und desto präziser die Darstellung des ursprünglichen Signals.
+
+**2. Large Language Models (LLMs)**
+Hier bezieht sich Quantisierung auf das Reduzieren der Präzision der Gewichte eines neuronalen Netzwerks (z. B. von FP32 $\rightarrow$ FP16 $\rightarrow$ Int8).
+*   **Speicherersparnis:** Ein Modell, das normalerweise 40 GB RAM benötigt, kann durch Quantisierung auf 10 GB reduziert werden, was die Nutzung auf Consumer-Hardware (GPUs) ermöglicht.
+*   **Geschwindigkeit:** Geringere Präzision bedeutet weniger Rechenaufwand pro Token, was die Antwortzeit (Latency) verkürzt.
+*   **Energie:** Es reduziert den Stromverbrauch, was besonders für mobile Geräte oder Server-Kosten entscheidend ist.
+
+**Fazit:**
+Quantisierung ist wichtig, weil sie die **Effizienz steigert** (weniger Speicher, schnellere Berechnung) und die **Zugänglichkeit erhöht**, während man versucht, den Qualitätsverlust (den "Fehler") so gering wie möglich zu halten.
+
+===PROMPT [PASS] erzähl mir einen kurzen witz===
+Ein Mann geht zum Arzt.
+„Doktor, ich habe ein Problem: Ich fühle mich wie ein Hund.“
+„Was für ein Hund?“
+„Ich weiß es nicht, ich fühle mich wie ein Hund.“
+
+===PROMPT [PASS] schreibe ein gedicht über katzen===
+Samtige Pfoten, ein leiser Schritt,
+Gehen durch das Haus, nehmen Träume mit.
+Ein Blick, so gold als die Sonne im Haar,
+Ein Wesen, so sanft, so wunderbar.
+
+Ein Schnurren, tief, ein beruhigendes Lied,
+Während die Welt draußen im Chaos fliesst.
+Auf dem Sofa, im Licht, in einem warmen Winkel,
+Hier ist ihr Reich, hier ist ihr Funkel.
+
+Ein Spiel mit dem Schatten, ein Sprung, ein Tanz,
+Ein Augenblick voller Glanz.
+Zwischen Stolz und Sanftmut, in einem Moment,
+Ist die Katze die Königin, die jeder kennt.
+
+===PROMPT [PASS] erfinde einen drachennamen===
+„Ignis-Schatten“ oder „Saphir-Hauch“.
+
+Wenn es spezifischer sein soll: Was für ein Drache ist es? (z.B. riesig und zerstörerisch oder eher elegant und weise).
+
+===PROMPT [PASS] denk dir eine kurze geschichte aus, 3 sätze===
+Ein kleiner Roboter namens Pip war so neugierig, dass er immer alles untersuchte. Ein Tag, er fand eine alte Uhr und wollte wissen, wie sie funktioniert. Beim Zerlegen der Uhr entdeckte er einen geheimen Mechanismus, der ihn in eine andere Dimension beförderte.
+
+===PROMPT [PASS] was sagt ein hund zu einer katze?===
+"Ich hab's nicht so!" (oder: "Ich hab's nicht so!")
+
+*Wait, that's not a joke. Let me try again:*
+
+"Wir sind uns eigentlich sehr ähnlich, wenn man die Ohren ignoriert." (No, that's not it).
+
+Actually, the classic punchline is:
+**"Hau ab, sonst beiße ich dich!"** (Slightly dry, but that's the spirit).
+
+===DIRECT [PASS] Hallo!===
+Hallo! Wie kann ich dir heute helfen?
+
+(Hello! How can I help you today?)
+
+===DIRECT [PASS] Was ist 2 plus 2?===
+2 plus 2 ist 4.
+
+===DIRECT [PASS] Schreib mir bitte das Wort Apfel.===
+Apfel
+
+===DIRECT [PASS] Welche Farbe hat Schnee?===
+Schnee ist **weiß**.
+
+Physikalisch gesehen ist Schnee jedoch transparent, aber weil die einzelnen Schnekriste das Licht aus allen Richtungen reflektieren und streuen, erscheint uns die Farbe als weiß.
+
+===DIRECT [PASS] Sag mir kurz, wer du bist.===
+Ich bin ein KI-Sprachmodell, entwickelt von Google. Du kannst mich als einen digitalen Assistenten betrachten, der darauf trainiert ist, Informationen zu verarbeiten, Texte zu schreiben und Fragen zu beantworten.
+
+Kurz gesagt: Ich bin ein Programm, das durch Daten lernt, um dir bei verschiedenen Aufgaben zu helfen – egal ob es um kreatives Schreiben, Programmieren oder
+
