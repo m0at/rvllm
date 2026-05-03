@@ -440,9 +440,10 @@ pub struct Fa2PtxKernels {
     pub fn_decode_nvfp4kv_split_bc16: Option<rvllm_kernels::KernelFn>,
     /// Codex36-3: `flash_attention_2_decode_nvfp4kv_split_gqa_kernel`
     /// — BC=32 GQA-shared split decode. Shares K/V dequant across
-    /// the GQA group (grid = num_kv_heads not num_heads). Opt-in
-    /// via `RVLLM_NVFP4_SPLIT_GQA=1`; default off until validated
-    /// via kv_policy_matrix.sh.
+    /// the GQA group (grid = num_kv_heads not num_heads).
+    /// `RVLLM_NVFP4_SPLIT_GQA` defaults to true (operator-validated
+    /// as the most stable production path on GB10/Gemma 4); set `=0`
+    /// to fall back to the per-Q split kernel for A/B comparisons.
     #[cfg(feature = "cuda")]
     pub fn_decode_nvfp4kv_split_gqa: Option<rvllm_kernels::KernelFn>,
     /// Codex41-2: pre-fills sentinel slots [0, partition_offset) so

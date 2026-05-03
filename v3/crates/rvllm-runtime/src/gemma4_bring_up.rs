@@ -1143,26 +1143,19 @@ fn assert_rope_kernels_match(
 
 impl Gemma4Bringup {
     pub fn load(paths: Gemma4EnginePaths, arena_bytes: usize) -> Result<Self> {
-        // Codex48-3: surface the unvalidated-tuning-knob status of
-        // RVLLM_NVFP4_SPLIT_GQA at startup. The kernel ships in PTX
-        // and `has_split_kernels` reports it as available when the
-        // env is set, so dispatch + decode-graph eligibility treat
-        // it as production-ready. The kernel header itself flags
-        // "not yet validated end-to-end" — operators should know
-        // they're enabling that path on the live binary, not just
-        // a behind-the-scenes optimization.
+        // RVLLM_NVFP4_SPLIT_GQA defaults to true (operator-validated
+        // as the most stable production path on GB10/Gemma 4); explicit
+        // `=0` opts out for diagnostic comparisons. Log only the opt-out
+        // case so production startups stay quiet.
         if std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
-            .map(|v| v == "1" || v == "true" || v == "TRUE")
+            .map(|v| v == "0" || v == "false" || v == "FALSE")
             .unwrap_or(false)
         {
             tracing::warn!(
-                "RVLLM_NVFP4_SPLIT_GQA=1 is set: env-gated GQA-shared NVFP4 \
-                 split-decode is dispatch-eligible and reported by \
-                 has_split_kernels(). The kernel is marked \
-                 'not yet validated end-to-end' (see \
-                 kernels/flash_attention_split_decode_nvfp4kv.cu header) \
-                 — production traffic on this knob is at-your-own-risk \
-                 until the kv_policy_matrix.sh harness signs off."
+                "RVLLM_NVFP4_SPLIT_GQA=0: opted out of GQA-shared NVFP4 \
+                 split-decode (production default). Per-Q split kernel \
+                 will be used instead — expect slightly more CTAs per \
+                 decode step. Set unset or =1 to restore the default."
             );
         }
         let ctx = Arc::new(CudaContextHandle::init(0)?);

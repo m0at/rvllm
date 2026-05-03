@@ -1217,7 +1217,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 && gqa_ratio <= MAX_GQA_SPLIT
                 && std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
                     .map(|v| v == "1" || v == "true" || v == "TRUE")
-                    .unwrap_or(false);
+                    .unwrap_or(true);
             let split_fn = if want_gqa_shared && fa2.fn_decode_nvfp4kv_split_gqa.is_some() {
                 fa2.fn_decode_nvfp4kv_split_gqa
             } else if output_bf16 {
@@ -1636,7 +1636,7 @@ impl<'a> PagedDecodeNvfp4Launcher<'a> {
                 // symbol).
                 let gqa_env_on = std::env::var_os("RVLLM_NVFP4_SPLIT_GQA")
                     .map(|v| v == "1" || v == "true" || v == "TRUE")
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 let split_for_hd = if head_dim > 256 {
                     fa2.fn_decode_nvfp4kv_split_bc16.is_some()
                 } else {
