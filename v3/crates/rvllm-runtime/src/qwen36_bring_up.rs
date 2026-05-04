@@ -96,6 +96,15 @@ pub struct Qwen36Bringup {
     pub rope_cos: u64,
     pub rope_sin: u64,
     pub rope_max_pos: u32,
+    /// Phase 4t: per-sequence linear-attn state buffer. Sized
+    /// `[num_linear_layers, num_heads, d_v, d_k]` f16. Lives ABOVE
+    /// the scratch checkpoint so `arena.restore()` between requests
+    /// doesn't reclaim it — state must persist across decode steps
+    /// for the recurrent Gated-DeltaNet path. Single-sequence pool
+    /// for now; multi-sequence batching is Phase 4v+.
+    pub linear_state_ptr: u64,
+    pub linear_state_bytes: usize,
+    pub linear_state_layer_bytes: usize,
 }
 
 impl Qwen36Bringup {
@@ -313,6 +322,51 @@ impl Qwen36Bringup {
             rope_table_bytes as f64 / 1024.0,
         );
 
+        // Phase 4t: per-sequence linear-attn state cache. Persists
+        // across decode steps in a single arena region above the
+        // scratch checkpoint. Single-sequence layout for now.
+        let n_linear_layers = arch
+            .base
+            .layer_types
+            .iter()
+            .filter(|t| matches!(t, rvllm_loader::LayerAttnType::Linear))
+            .count();
+        let num_ssm_heads: usize = 32;
+        let d_state: usize = 128;
+        let linear_state_layer_bytes =
+            num_ssm_heads * d_state * d_state * 2; // f16
+        let linear_state_bytes = n_linear_layers * linear_state_layer_bytes;
+        let linear_state_region =
+            arena.region("qwen36_linear_state", linear_state_bytes, 16)?;
+        // Zero the state at bring-up (analogous to a session-start
+        // reset). cuMemsetD8 is the fastest path; falls back to a
+        // host-side zero buffer if needed.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8_v2(
+                linear_state_region.device_ptr(),
+                0,
+                linear_state_bytes,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_linear_state cuMemsetD8",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let linear_state_ptr = linear_state_region.device_ptr();
+        eprintln!(
+            "[qwen36] linear-attn state cache allocated: {} layers × \
+             {:.1} MiB = {:.1} MiB total (zero-initialised, persists \
+             across decode steps).",
+            n_linear_layers,
+            linear_state_layer_bytes as f64 / (1024.0 * 1024.0),
+            linear_state_bytes as f64 / (1024.0 * 1024.0),
+        );
+
         let n_full = model.layers.iter().filter(|l| matches!(
             l.attn,
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(_)
@@ -322,7 +376,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4s bring-up complete: outside (incl. \
+            "[qwen36] Phase 4t bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -351,6 +405,9 @@ impl Qwen36Bringup {
             rope_cos,
             rope_sin,
             rope_max_pos,
+            linear_state_ptr,
+            linear_state_bytes,
+            linear_state_layer_bytes,
         };
         // Phase 3e smoke: actually launch embedding_gather against the
         // loaded weights. If this throws, the rest of the forward
@@ -417,12 +474,50 @@ impl Qwen36Bringup {
         bringup.forward_layer0_ssm_state_probe()?;
         // Phase 4s: chain everything for layer 0 linear-attn.
         bringup.forward_layer0_linear_chain_probe()?;
+        // Phase 4t: per-sequence state cache (zero-init + reset).
+        bringup.linear_state_cache_probe()?;
 
         Ok(bringup)
     }
 
     pub fn kernels_dir(&self) -> &PathBuf {
         &self.paths.kernels_dir
+    }
+
+    /// Phase 4t: zero out the per-sequence linear-attn state cache.
+    /// Called on session boundaries (`/new`, fresh request without
+    /// session continuity) so a stale state from a prior sequence
+    /// doesn't leak into the new one.
+    pub fn reset_linear_state(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8Async(
+                self.linear_state_ptr,
+                0,
+                self.linear_state_bytes,
+                self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 reset_linear_state",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 4t: device pointer for layer N's slice of the state cache.
+    /// Returns 0 if the layer index is out of bounds.
+    pub fn linear_state_layer_ptr(&self, layer_seq_idx: u32) -> u64 {
+        let off = (layer_seq_idx as usize)
+            .saturating_mul(self.linear_state_layer_bytes);
+        if off + self.linear_state_layer_bytes > self.linear_state_bytes {
+            return 0;
+        }
+        self.linear_state_ptr + off as u64
     }
 
     /// Phase 3e smoke test: launch the embedding-gather kernel against
@@ -2317,6 +2412,57 @@ impl Qwen36Bringup {
              Q·S readout → norm + sigmoid·z → out_proj → \
              out[0..4]=[{o0:.4}, {o1:.4}, {o2:.4}, {o3:.4}] \
              (full linear-attn block, single-step, state init=0)"
+        );
+        Ok(())
+    }
+
+    /// Phase 4t probe: verify the persistent linear-attn state cache
+    /// is zero-initialised + accessible. After bring-up the cache
+    /// must hold all zeros at every layer's slice.
+    pub fn linear_state_cache_probe(&self) -> Result<()> {
+        let mut probe = [0xFFu8; 16];
+        // Sample layer 0 + last linear layer's offsets.
+        let n_linear_layers = self.linear_state_bytes / self.linear_state_layer_bytes;
+        let last_layer = (n_linear_layers - 1) as u32;
+        let l0_ptr = self.linear_state_layer_ptr(0);
+        let ln_ptr = self.linear_state_layer_ptr(last_layer);
+        if l0_ptr == 0 || ln_ptr == 0 {
+            eprintln!("[qwen36] linear_state_cache_probe: pointers invalid, skipping");
+            return Ok(());
+        }
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(probe.as_mut_ptr() as *mut _, l0_ptr, 8);
+            let _ = cuMemcpyDtoH_v2(probe.as_mut_ptr().add(8) as *mut _, ln_ptr, 8);
+        }
+        let l0_zero = probe[0..8].iter().all(|b| *b == 0);
+        let ln_zero = probe[8..16].iter().all(|b| *b == 0);
+        eprintln!(
+            "[qwen36] linear_state_cache_probe: {n_linear_layers} layer slots, \
+             layer0 head8b zeroed={l0_zero}, layer{last_layer} head8b zeroed={ln_zero}, \
+             total={:.1} MiB persistent (above scratch checkpoint)",
+            self.linear_state_bytes as f64 / (1024.0 * 1024.0),
+        );
+        // Reset round-trip: dirty layer 0, reset, re-read.
+        let dirty: u8 = 0xAA;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemsetD8_v2(l0_ptr, dirty, 8);
+        }
+        self.reset_linear_state()?;
+        self.stream.fence()?;
+        let mut after = [0xFFu8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(after.as_mut_ptr() as *mut _, l0_ptr, 8);
+        }
+        let reset_ok = after.iter().all(|b| *b == 0);
+        eprintln!(
+            "[qwen36] linear_state_cache_probe: reset round-trip — \
+             dirty(0xAA) → reset_linear_state() → zeroed: {reset_ok}"
         );
         Ok(())
     }
