@@ -86,3 +86,69 @@ quality threshold for "model can read text in image".
 For now the f16-everywhere path is acceptable: model reads text
 correctly, residual cosine drift is well below the threshold where
 text-recognition tasks degrade.
+
+## Phase 3 status — bf16 vision path (in progress, currently disabled)
+
+Building blocks landed but the wiring exposed a bug I didn't manage
+to localise inside this session, so the production forward stays on
+the f16 + f32-pooler path.
+
+What's committed and verified to build:
+
+- bf16 sibling kernels (drop-in dtype swap of every f16 vision
+  kernel; same semantics):
+    - `vector_add_bf16`
+    - `vnorm_bf16`
+    - `softmax_row_f32_to_bf16`
+    - `vit_pos_emb_lookup_2d_bf16`
+    - `vit_rotary_gemma4_2d_bf16`
+    - `extract_head_bf16` / `scatter_head_bf16`
+    - `transpose_heads_v_bf16`
+    - `scatter_heads_bf16`
+    - `gelu_tanh_mul_bf16`
+    - `vit_avgpool_bf16_to_f32`
+    - `vit_standardize_f32_to_bf16`
+    - `rmsnorm_inplace_bf16_gbf16` (vision-specific because the text
+      path's `rmsnorm_inplace_bf16` takes f16 gamma; vision-bf16 keeps
+      gamma in its native bf16, so this kernel is the bf16-input /
+      bf16-gamma variant).
+- `CublasLt::bf16_gemm_f32_batched_strided` (sibling of the f16
+  batched-strided entry; same caller-vs-cuBLAS argument-swap convention).
+
+What stays on f16 in production:
+
+- `forward_gemma_vision` keeps using the f16 kernels and the f32
+  pooler bridge.
+- `load_gemma_vision` keeps uploading vision weights as f16.
+
+What broke when I switched the forward to bf16:
+
+- Patch_embed and posemb stages stayed cos=1.0000.
+- Block 0 output dropped to cos=0.7631 (vs 1.0000 in f16). That's a
+  large per-block jump; mean cos at blk26 fell to 0.5595 and
+  post_projection to 0.0950 — the model produced unrelated output
+  ('Word-Art with words in different languages' / Russian fragments).
+- Post-input-LN (start of block 0) inspected manually: looks
+  numerically reasonable (rms ≈ 0.83 per row, no inf/nan, sane
+  range).
+- I didn't isolate the per-step culprit before reverting. The most
+  likely candidates are one of:
+  - the q/k/v_proj `bf16_gemm_f32` linears (output f32 → cast to
+    bf16) producing a mis-strided layout,
+  - the `bf16_gemm_f32_batched_strided` lda/stride combination
+    interacting differently with cuBLAS bf16 algos than with f16,
+  - one of the per-head extract/scatter/transpose bf16 kernels
+    indexing wrong.
+
+Plan for the follow-up debug session:
+
+1. Reactivate the bf16 forward (revert this revert).
+2. Use the same env-gated `RVLLM_GEMMA4_VIT_DUMP_DIR` infrastructure
+   to dump after EACH per-block sub-step (input_LN, q_proj, q_norm,
+   rotary, attention, o_proj, post_attn_LN, FFN) and cosine-compare
+   to the HF reference at the same point. The block 0 sub-step where
+   cos drops first localises the buggy kernel within ~30 minutes
+   given the existing tooling.
+3. Fix the offending kernel (most likely a Rust-side launch
+   parameter mismatch since the kernel logic is mechanical bf16/half
+   substitution).

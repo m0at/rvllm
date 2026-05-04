@@ -46,6 +46,11 @@
       "path": "embedding_gather_f16.ptx",
       "sha256": "3b3270fc87b3aa3a268f960bcdf1785ecd19f3847fbf854fd1ce6e513211f0ea"
     },
+    "extract_head_bf16": {
+      "bytes": 2872,
+      "path": "extract_head_bf16.ptx",
+      "sha256": "762395a53d2713ae7a724168a4c3694714c4c13b066ec6367edab4dc6f92bcad"
+    },
     "extract_head_f16": {
       "bytes": 2848,
       "path": "extract_head_f16.ptx",
@@ -251,6 +256,11 @@
       "path": "gelu_tanh_f16.ptx",
       "sha256": "d20b2b6811351940b0c084430c6914013460e25e6a6a180b4fcf81e66a4c3ac2"
     },
+    "gelu_tanh_mul_bf16": {
+      "bytes": 2408,
+      "path": "gelu_tanh_mul_bf16.ptx",
+      "sha256": "7ef67202273a14e07ffb454b1be482f4cb3aba8a334b99fad7a83c16ca0aa828"
+    },
     "gelu_tanh_mul_f16": {
       "bytes": 2397,
       "path": "gelu_tanh_mul_f16.ptx",
@@ -326,6 +336,11 @@
       "path": "rmsnorm_inplace_bf16.ptx",
       "sha256": "5ded64589326ba8e929cbee0f1cc3443dd33d2e71c325e26931a3d2f3e39e95a"
     },
+    "rmsnorm_inplace_bf16_gbf16": {
+      "bytes": 8707,
+      "path": "rmsnorm_inplace_bf16_gbf16.ptx",
+      "sha256": "95116687755c7d621b787af32735636d1db5a53e2e39079ab2687e74da0b0547"
+    },
     "rmsnorm_inplace_f16": {
       "bytes": 8590,
       "path": "rmsnorm_inplace_f16.ptx",
@@ -356,6 +371,11 @@
       "path": "scale_rows_f32_ratio.ptx",
       "sha256": "a9a6f1907c0be8f1ed0d08cf958d626f21dc20b2004d912c31b7e1f35aa12c11"
     },
+    "scatter_heads_bf16": {
+      "bytes": 1616,
+      "path": "scatter_heads_bf16.ptx",
+      "sha256": "ac727cc494940613445b8f5fa0cdb4ddd6c01a4f2d30b339a4b17adbb16d4ad2"
+    },
     "scatter_heads_f16": {
       "bytes": 1604,
       "path": "scatter_heads_f16.ptx",
@@ -376,6 +396,11 @@
       "path": "softmax_row_f16.ptx",
       "sha256": "cdf83945b8c3ce00c723a991f345b197e80c7159d708042bc0585621fb50ed84"
     },
+    "softmax_row_f32_to_bf16": {
+      "bytes": 16609,
+      "path": "softmax_row_f32_to_bf16.ptx",
+      "sha256": "5b92e4b841aa732f36ff7ae04f326fd1839038a50cadbc7fba2986ddaddb21f0"
+    },
     "softmax_row_f32_to_f16": {
       "bytes": 16589,
       "path": "softmax_row_f32_to_f16.ptx",
@@ -386,10 +411,20 @@
       "path": "transpose_2d_f16.ptx",
       "sha256": "97504936faf40af4c4ecebbd9ae3066b2ce3e2edea7dea0d71728de8bb3b9fc0"
     },
+    "transpose_heads_v_bf16": {
+      "bytes": 1656,
+      "path": "transpose_heads_v_bf16.ptx",
+      "sha256": "f2092c0f7d2467c8e50574cbd3559a93949ad61fce094c8c5397058921525173"
+    },
     "transpose_heads_v_f16": {
       "bytes": 1644,
       "path": "transpose_heads_v_f16.ptx",
       "sha256": "53b09258351917862b5fff2bd5b99b5d5c8881f9af12245d3c3029129ad28bac"
+    },
+    "vector_add_bf16": {
+      "bytes": 1375,
+      "path": "vector_add_bf16.ptx",
+      "sha256": "e53fd228e6853325f22ff088c524db381487a9b121ca93b10803b8bf937ccf06"
     },
     "vector_add_bf16_to_f16": {
       "bytes": 1430,
@@ -401,6 +436,11 @@
       "path": "vector_add_f16.ptx",
       "sha256": "c4714ce4882aeb47e653d3b7b0c8b69535b5981531fb5ce1edd2d2b0114b94a5"
     },
+    "vit_avgpool_bf16_to_f32": {
+      "bytes": 9346,
+      "path": "vit_avgpool_bf16_to_f32.ptx",
+      "sha256": "3dc188ffce77bdfd07843f6724b44c0e4e347fbced03aeec01bf4df5142f3882"
+    },
     "vit_avgpool_f16": {
       "bytes": 9471,
       "path": "vit_avgpool_f16.ptx",
@@ -410,6 +450,11 @@
       "bytes": 9333,
       "path": "vit_avgpool_f16_to_f32.ptx",
       "sha256": "07ea791cc98b6092997d8c2a38dc213407e15074f172689a48a016fdda18ced7"
+    },
+    "vit_pos_emb_lookup_2d_bf16": {
+      "bytes": 2723,
+      "path": "vit_pos_emb_lookup_2d_bf16.ptx",
+      "sha256": "b44bad914749af694fa721e014e3b59a015bd80f00b3ed479cb8c215eecaaa74"
     },
     "vit_pos_emb_lookup_2d_f16": {
       "bytes": 2708,
@@ -426,6 +471,11 @@
       "path": "vit_rotary_2d_f16.ptx",
       "sha256": "97e4dcbb0816a8e355987d3522899d86be36c3d8e97207d9d35e6c892ffe89a6"
     },
+    "vit_rotary_gemma4_2d_bf16": {
+      "bytes": 4623,
+      "path": "vit_rotary_gemma4_2d_bf16.ptx",
+      "sha256": "aecdec8467a93a821047436a8ebf050cb3e8d80e8152316278dca3e1a00a2b49"
+    },
     "vit_rotary_gemma4_2d_f16": {
       "bytes": 4607,
       "path": "vit_rotary_gemma4_2d_f16.ptx",
@@ -436,10 +486,20 @@
       "path": "vit_standardize_f16.ptx",
       "sha256": "02df25cef0fbfd7a61bdf543a75607fb12afbfa0983e5a7db223c1f81582a18d"
     },
+    "vit_standardize_f32_to_bf16": {
+      "bytes": 2178,
+      "path": "vit_standardize_f32_to_bf16.ptx",
+      "sha256": "e382c49e4427c6b9c6bf9b2e35d192feb2c9b51965e7e8e8fb50efe4381c77e6"
+    },
     "vit_standardize_f32_to_f16": {
       "bytes": 2165,
       "path": "vit_standardize_f32_to_f16.ptx",
       "sha256": "7de5d1246d9be5d1007eac0b49e059ed35d20eaac9f22868e348566bab80cc90"
+    },
+    "vnorm_bf16": {
+      "bytes": 7207,
+      "path": "vnorm_bf16.ptx",
+      "sha256": "ebaa2c112f6cb5d8c4023af21c76ac3d1ba5c522120add294b7bf7337ae2a0e5"
     },
     "vnorm_f16": {
       "bytes": 7188,
@@ -447,5 +507,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "af3e5e8"
+  "revision": "b2969c6"
 }
