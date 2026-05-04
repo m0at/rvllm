@@ -119,8 +119,38 @@ impl<'a> LoadCtx<'a> {
     }
 
     fn upload_f16(&self, region_name: &'static str, hf_name: &str) -> Result<(F16Weight, u64)> {
+        self.upload_f16_with_bias(region_name, hf_name, 0.0)
+    }
+
+    /// Upload f16 weight, optionally adding `bias` to every element
+    /// before uploading. Used for Qwen 3.6 RMSNorm gammas which are
+    /// stored centered at 0 and apply as `out = x * rsqrt(...) *
+    /// (1.0 + gamma)` (Gemma-style RMSNorm via vLLM's GemmaRMSNorm
+    /// alias). Our kernel multiplies directly by gamma so we need to
+    /// add 1.0 at load time. Linear-attn `norm.weight` (RMSNormGated)
+    /// is centered at 1 already and uses bias=0.
+    fn upload_f16_with_bias(
+        &self,
+        region_name: &'static str,
+        hf_name: &str,
+        bias: f32,
+    ) -> Result<(F16Weight, u64)> {
         let (si, e) = self.must_get(hf_name)?;
-        let buf = tensor_to_f16_bytes(&e, self.bytes_of(si, &e), self.model_dir)?;
+        let mut buf = tensor_to_f16_bytes(&e, self.bytes_of(si, &e), self.model_dir)?;
+        if bias != 0.0 {
+            // f16 bytes; in-place add `bias` to every element.
+            let n = buf.len() / 2;
+            for i in 0..n {
+                let lo = buf[i * 2];
+                let hi = buf[i * 2 + 1];
+                let bits = u16::from_le_bytes([lo, hi]);
+                let v = f16::from_bits(bits).to_f32() + bias;
+                let new_bits = f16::from_f32(v).to_bits();
+                let nb = new_bits.to_le_bytes();
+                buf[i * 2] = nb[0];
+                buf[i * 2 + 1] = nb[1];
+            }
+        }
         let region = self.arena.region(region_name, buf.len(), 16)?;
         unsafe { region.copy_from_host(&buf)? };
         Ok((
@@ -472,7 +502,10 @@ fn load_outside_via_ctx(ctx: &LoadCtx) -> Result<Qwen36LoadedOutside> {
     let lm_head_name = "lm_head.weight";
 
     let (embed_tokens, embed_tokens_bytes) = ctx.upload_f16("qwen36_embedding", &embed_name)?;
-    let (final_norm, final_norm_bytes) = ctx.upload_f16("qwen36_final_norm", &norm_name)?;
+    // Qwen3-Next's final norm uses GemmaRMSNorm (out = x * rsqrt(...) *
+    // (1 + gamma)); checkpoint stores gamma centered at 0 → add +1.
+    let (final_norm, final_norm_bytes) =
+        ctx.upload_f16_with_bias("qwen36_final_norm", &norm_name, 1.0)?;
     let (lm_head, lm_head_bytes) = ctx.upload_f16("qwen36_lm_head", lm_head_name)?;
 
     // Phase 3d: CPU-quantize lm_head bf16 → FP8 per-tensor for the
@@ -515,9 +548,11 @@ fn load_outside_via_ctx(ctx: &LoadCtx) -> Result<Qwen36LoadedOutside> {
 fn load_linear_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen36LinearAttnLayer> {
     let ln = |s: &str| format!("{QWEN36_PREFIX}.layers.{layer_idx}.{s}");
 
-    let (input_layernorm, _) = ctx.upload_f16("qwen36_input_ln", &ln("input_layernorm.weight"))?;
-    let (post_attention_layernorm, _) =
-        ctx.upload_f16("qwen36_post_attn_ln", &ln("post_attention_layernorm.weight"))?;
+    // GemmaRMSNorm-style: gamma centered at 0, add +1 at load.
+    let (input_layernorm, _) = ctx.upload_f16_with_bias(
+        "qwen36_input_ln", &ln("input_layernorm.weight"), 1.0)?;
+    let (post_attention_layernorm, _) = ctx.upload_f16_with_bias(
+        "qwen36_post_attn_ln", &ln("post_attention_layernorm.weight"), 1.0)?;
     let (a_log, _) = ctx.upload_f16("qwen36_a_log", &ln("linear_attn.A_log"))?;
     let (dt_bias, _) = ctx.upload_f16("qwen36_dt_bias", &ln("linear_attn.dt_bias"))?;
     let (conv1d, _) = ctx.upload_f16("qwen36_conv1d", &ln("linear_attn.conv1d.weight"))?;
@@ -608,11 +643,15 @@ fn load_moe_block(ctx: &LoadCtx, layer_idx: usize, num_experts: usize) -> Result
 fn load_full_attn_layer(ctx: &LoadCtx, layer_idx: usize) -> Result<Qwen36FullAttnLayer> {
     let ln = |s: &str| format!("{QWEN36_PREFIX}.layers.{layer_idx}.{s}");
 
-    let (input_layernorm, _) = ctx.upload_f16("qwen36_input_ln", &ln("input_layernorm.weight"))?;
-    let (post_attention_layernorm, _) =
-        ctx.upload_f16("qwen36_post_attn_ln", &ln("post_attention_layernorm.weight"))?;
-    let (q_norm, _) = ctx.upload_f16("qwen36_q_norm", &ln("self_attn.q_norm.weight"))?;
-    let (k_norm, _) = ctx.upload_f16("qwen36_k_norm", &ln("self_attn.k_norm.weight"))?;
+    // All four are GemmaRMSNorm-style; gamma centered at 0, add +1.
+    let (input_layernorm, _) = ctx.upload_f16_with_bias(
+        "qwen36_input_ln", &ln("input_layernorm.weight"), 1.0)?;
+    let (post_attention_layernorm, _) = ctx.upload_f16_with_bias(
+        "qwen36_post_attn_ln", &ln("post_attention_layernorm.weight"), 1.0)?;
+    let (q_norm, _) = ctx.upload_f16_with_bias(
+        "qwen36_q_norm", &ln("self_attn.q_norm.weight"), 1.0)?;
+    let (k_norm, _) = ctx.upload_f16_with_bias(
+        "qwen36_k_norm", &ln("self_attn.k_norm.weight"), 1.0)?;
 
     let q_proj = ctx.upload_fp8_blockwise("qwen36_q_proj", &ln("self_attn.q_proj.weight"))?;
     let k_proj = ctx.upload_fp8_blockwise("qwen36_k_proj", &ln("self_attn.k_proj.weight"))?;
