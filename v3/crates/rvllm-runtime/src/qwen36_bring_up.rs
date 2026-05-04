@@ -322,7 +322,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4r bring-up complete: outside (incl. \
+            "[qwen36] Phase 4s bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -415,6 +415,8 @@ impl Qwen36Bringup {
         // Phase 4r: gated_delta_state_update_f16 — recurrent
         // state-space update, the heart of the linear-attn block.
         bringup.forward_layer0_ssm_state_probe()?;
+        // Phase 4s: chain everything for layer 0 linear-attn.
+        bringup.forward_layer0_linear_chain_probe()?;
 
         Ok(bringup)
     }
@@ -1897,6 +1899,424 @@ impl Qwen36Bringup {
              top_k={top_k}/{num_experts} → final[0..4]=[{:.3}, {:.3}, \
              {:.3}, {:.3}] (routed-weighted-sum + sigmoid·shared)",
             routed_sum[0], routed_sum[1], routed_sum[2], routed_sum[3],
+        );
+        Ok(())
+    }
+
+    /// Phase 4s probe: chain all linear-attn kernels end-to-end for
+    /// layer 0, single timestep. Order:
+    ///   1. in_proj_qkv f16 GEMV → conv_input [8192 = 4×2048]
+    ///   2. causal_conv1d_f16 (state-cache padded with zeros — no
+    ///      history yet, single-step)
+    ///   3. host SiLU + split into Q/K/V/extra streams [4 × 2048]
+    ///      (qwen3-next exact split is q=k=v=2048 + dt_input=2048
+    ///      per the reference; this probe uses that convention)
+    ///   4. host: dt = silu(conv_dt) + dt_bias, alpha = exp(-exp(A_log)·dt),
+    ///      beta = dt (Mamba-2-style decay+write derivation)
+    ///   5. gated_delta_state_update_f16 (state init = 0)
+    ///   6. host: read-out per head (Q · state → 32×128 = 4096 dim)
+    ///   7. in_proj_z FP8 GEMV → z_logits [4096], host sigmoid · readout
+    ///   8. out_proj FP8 GEMV → final delta [hidden=2048]
+    ///
+    /// Synthetic input. Math approximates qwen3-next without claiming
+    /// numerical match against the reference — that's Phase 4u where
+    /// a single-token comparison against vLLM nails down any
+    /// off-by-one in the dt/alpha/beta computation, the QKV split
+    /// order, or the post-SSM normalisation. Goal here: prove every
+    /// kernel + host glue step composes without ABI errors.
+    pub fn forward_layer0_linear_chain_probe(&self) -> Result<()> {
+        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
+            matches!(t, rvllm_loader::LayerAttnType::Linear)
+        }) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let la = match &self.model.layers[layer_idx].attn {
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(l) => l,
+            _ => return Ok(()),
+        };
+        let kernel_gemv = match self.outside_kernels.fn_fp8_gemv_wpr_native_f16in {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        let hidden = self.arch.base.hidden_size as u32;
+        let qkv_n = la.in_proj_qkv.shape[0] as u32; // 8192
+        let z_n = la.in_proj_z.shape[0] as u32; // 4096
+        let out_n = la.out_proj.shape[0] as u32; // 2048
+        let out_k = la.out_proj.shape[1] as u32; // 4096
+        let m: u32 = 1;
+        let num_heads: u32 = 32;
+        let d_state: u32 = 128;
+        let head_split: u32 = qkv_n / 4; // 2048 per stream
+
+        // Synthetic hidden input: small varied values.
+        let mut input_bytes = Vec::with_capacity((hidden as usize) * 2);
+        for i in 0..hidden as usize {
+            let v = ((i % 16) as f32) * 0.0625 - 0.5;
+            input_bytes.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+        }
+        let in_region = self.arena.region("qwen36_l0lc_in", input_bytes.len(), 16)?;
+        unsafe { in_region.copy_from_host(&input_bytes)? };
+
+        // 1. in_proj_qkv FP8 GEMV → qkv_concat [8192]
+        let qkv_bytes = (qkv_n as usize) * 2;
+        let qkv_region = self.arena.region("qwen36_l0lc_qkv", qkv_bytes, 16)?;
+        let qkv_bs = la.in_proj_qkv.blockscale_ptr.unwrap_or(0);
+        if qkv_bs == 0 {
+            return Ok(());
+        }
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m, n: qkv_n, k: hidden,
+            }.launch(
+                kernel_gemv,
+                qkv_region.device_ptr(),
+                la.in_proj_qkv.offset_bytes,
+                qkv_bs,
+                in_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // 2. causal_conv1d (state padded with zeros for single-step).
+        // conv1d expects [seq+ks-1, channels]. We pad with 3 zero
+        // timesteps + 1 real timestep = ks=4 input window.
+        let ks: u32 = 4;
+        let conv_in_elems = ((1 + ks - 1) as usize) * (qkv_n as usize);
+        let conv_in_bytes = conv_in_elems * 2;
+        let conv_in_region =
+            self.arena.region("qwen36_l0lc_cin", conv_in_bytes, 16)?;
+        let conv_out_region =
+            self.arena.region("qwen36_l0lc_cout", qkv_bytes, 16)?;
+        // Build conv input on host: 3 zero timesteps + qkv_concat.
+        let mut conv_in_host = vec![0u8; conv_in_bytes];
+        let mut qkv_host = vec![0u8; qkv_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                qkv_host.as_mut_ptr() as *mut _,
+                qkv_region.device_ptr(),
+                qkv_bytes,
+            );
+        }
+        // Place qkv_host at last (ks-1=3) timestep position. Earlier
+        // positions stay zero.
+        let last_off = ((ks - 1) as usize) * (qkv_n as usize) * 2;
+        conv_in_host[last_off..last_off + qkv_bytes].copy_from_slice(&qkv_host);
+        unsafe { conv_in_region.copy_from_host(&conv_in_host)? };
+
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut output = conv_out_region.device_ptr();
+            let mut input = conv_in_region.device_ptr();
+            let mut weight = la.conv1d.offset_bytes;
+            let mut sl: i32 = 1;
+            let mut ch = qkv_n as i32;
+            let mut k_arg = ks as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sl) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ch) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k_arg) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid_x = (qkv_n + block - 1) / block;
+            let _ = cuLaunchKernel(
+                self.outside_kernels.fn_causal_conv1d_f16.raw() as CUfunction,
+                grid_x, 1, 1,
+                block, 1, 1,
+                0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+
+        // 3. Host: read conv_out, SiLU, split into Q/K/V/dt streams.
+        let mut conv_out_host = vec![0u8; qkv_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                conv_out_host.as_mut_ptr() as *mut _,
+                conv_out_region.device_ptr(),
+                qkv_bytes,
+            );
+        }
+        let mut conv_silu_f32 = Vec::with_capacity(qkv_n as usize);
+        for i in 0..qkv_n as usize {
+            let bits = u16::from_le_bytes([conv_out_host[i * 2], conv_out_host[i * 2 + 1]]);
+            let v = f16_bits_to_f32(bits);
+            conv_silu_f32.push(v / (1.0f32 + (-v).exp()));
+        }
+        let q_off = 0usize;
+        let k_off = head_split as usize;
+        let v_off = (2 * head_split) as usize;
+        let dt_off = (3 * head_split) as usize;
+        let split_per = head_split as usize;
+
+        // 4. Host: alpha/beta from A_log + dt_bias + dt_input.
+        // dt_input is the 4th split = `conv_silu[dt_off..dt_off+split_per]`.
+        // For a smoke probe we average dt_input per head into a scalar.
+        let mut a_log_host = vec![0u8; (num_heads as usize) * 2];
+        let mut dt_bias_host = vec![0u8; (num_heads as usize) * 2];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                a_log_host.as_mut_ptr() as *mut _,
+                la.a_log.offset_bytes,
+                a_log_host.len(),
+            );
+            let _ = cuMemcpyDtoH_v2(
+                dt_bias_host.as_mut_ptr() as *mut _,
+                la.dt_bias.offset_bytes,
+                dt_bias_host.len(),
+            );
+        }
+        let per_head = (split_per / num_heads as usize) as usize;
+        let mut alpha_f32 = Vec::with_capacity(num_heads as usize);
+        let mut beta_f32 = Vec::with_capacity(num_heads as usize);
+        for h in 0..num_heads as usize {
+            // dt = softplus(dt_input_avg + dt_bias[h])
+            let mut dt_avg = 0.0f32;
+            for j in 0..per_head {
+                dt_avg += conv_silu_f32[dt_off + h * per_head + j];
+            }
+            dt_avg /= per_head as f32;
+            let bias =
+                f16_bits_to_f32(u16::from_le_bytes([dt_bias_host[h * 2], dt_bias_host[h * 2 + 1]]));
+            let dt = (1.0f32 + (dt_avg + bias).exp()).ln(); // softplus
+            let a_log = f16_bits_to_f32(u16::from_le_bytes([
+                a_log_host[h * 2], a_log_host[h * 2 + 1],
+            ]));
+            let a = (-(a_log.exp()) * dt).exp();
+            alpha_f32.push(a);
+            beta_f32.push(dt);
+        }
+
+        // 5. Pack Q/K/V f16 [num_heads, d_state=128] from the splits.
+        // (per_head should equal d_state=128 for qwen3-next 35B-A3B.)
+        let qkv_per_head_bytes = (num_heads as usize) * (d_state as usize) * 2;
+        let mut q_host = Vec::with_capacity(qkv_per_head_bytes);
+        let mut k_host = Vec::with_capacity(qkv_per_head_bytes);
+        let mut v_host = Vec::with_capacity(qkv_per_head_bytes);
+        for h in 0..num_heads as usize {
+            for d in 0..d_state as usize {
+                let q = conv_silu_f32[q_off + h * per_head + d];
+                let k = conv_silu_f32[k_off + h * per_head + d];
+                let v = conv_silu_f32[v_off + h * per_head + d];
+                q_host.extend_from_slice(&f32_to_f16_bits(q).to_le_bytes());
+                k_host.extend_from_slice(&f32_to_f16_bits(k).to_le_bytes());
+                v_host.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+            }
+        }
+
+        // 6. ssm state update.
+        let state_bytes =
+            (num_heads as usize) * (d_state as usize) * (d_state as usize) * 2;
+        let state_region = self.arena.region("qwen36_l0lc_state", state_bytes, 16)?;
+        let q_region = self.arena.region("qwen36_l0lc_q", q_host.len(), 16)?;
+        let k_region = self.arena.region("qwen36_l0lc_k", k_host.len(), 16)?;
+        let v_region = self.arena.region("qwen36_l0lc_v", v_host.len(), 16)?;
+        let alpha_bytes: Vec<u8> = alpha_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let beta_bytes: Vec<u8> = beta_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let alpha_region =
+            self.arena.region("qwen36_l0lc_alpha", alpha_bytes.len(), 16)?;
+        let beta_region =
+            self.arena.region("qwen36_l0lc_beta", beta_bytes.len(), 16)?;
+        let zero_state = vec![0u8; state_bytes];
+        unsafe {
+            state_region.copy_from_host(&zero_state)?;
+            q_region.copy_from_host(&q_host)?;
+            k_region.copy_from_host(&k_host)?;
+            v_region.copy_from_host(&v_host)?;
+            alpha_region.copy_from_host(&alpha_bytes)?;
+            beta_region.copy_from_host(&beta_bytes)?;
+        }
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut state = state_region.device_ptr();
+            let mut k = k_region.device_ptr();
+            let mut v = v_region.device_ptr();
+            let mut alpha = alpha_region.device_ptr();
+            let mut beta = beta_region.device_ptr();
+            let mut nh = num_heads as i32;
+            let mut dk = d_state as i32;
+            let mut dv = d_state as i32;
+            let args = [
+                (&mut state) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v) as *mut u64 as *mut core::ffi::c_void,
+                (&mut alpha) as *mut u64 as *mut core::ffi::c_void,
+                (&mut beta) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut dk) as *mut i32 as *mut core::ffi::c_void,
+                (&mut dv) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let _ = cuLaunchKernel(
+                self.outside_kernels.fn_gated_delta_state_update_f16.raw() as CUfunction,
+                num_heads, 1, 1,
+                16, 16, 1,
+                0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+
+        // 7. Host: read state, compute Q · S → readout [num_heads, d_state].
+        let mut state_host = vec![0u8; state_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                state_host.as_mut_ptr() as *mut _,
+                state_region.device_ptr(),
+                state_bytes,
+            );
+        }
+        let mut readout_f32 =
+            vec![0.0f32; (num_heads as usize) * (d_state as usize)];
+        for h in 0..num_heads as usize {
+            for v in 0..d_state as usize {
+                let mut acc = 0.0f32;
+                for k in 0..d_state as usize {
+                    let s_idx =
+                        h * (d_state as usize) * (d_state as usize) + v * (d_state as usize) + k;
+                    let s = f16_bits_to_f32(u16::from_le_bytes([
+                        state_host[s_idx * 2], state_host[s_idx * 2 + 1],
+                    ]));
+                    let q_idx = h * (d_state as usize) + k;
+                    let q = f16_bits_to_f32(u16::from_le_bytes([
+                        q_host[q_idx * 2], q_host[q_idx * 2 + 1],
+                    ]));
+                    acc += s * q;
+                }
+                readout_f32[h * (d_state as usize) + v] = acc;
+            }
+        }
+
+        // 8. in_proj_z FP8 GEMV → z_logits, host sigmoid · readout,
+        //    then host: per-head norm with linear_attn.norm.weight,
+        //    then out_proj FP8 GEMV.
+        let z_bytes_dev = (z_n as usize) * 2;
+        let z_region = self.arena.region("qwen36_l0lc_z", z_bytes_dev, 16)?;
+        let z_bs = la.in_proj_z.blockscale_ptr.unwrap_or(0);
+        if z_bs == 0 {
+            return Ok(());
+        }
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m, n: z_n, k: hidden,
+            }.launch(
+                kernel_gemv,
+                z_region.device_ptr(),
+                la.in_proj_z.offset_bytes,
+                z_bs,
+                in_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+        }
+        self.stream.fence()?;
+        let mut z_host_bytes = vec![0u8; z_bytes_dev];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                z_host_bytes.as_mut_ptr() as *mut _,
+                z_region.device_ptr(),
+                z_bytes_dev,
+            );
+        }
+        // Per-head RMSNorm on the readout (gamma = norm.weight [128]).
+        let mut norm_gamma = vec![0u8; (d_state as usize) * 2];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                norm_gamma.as_mut_ptr() as *mut _,
+                la.norm.offset_bytes,
+                norm_gamma.len(),
+            );
+        }
+        let mut gated_readout = vec![0u8; (num_heads as usize) * (d_state as usize) * 2];
+        for h in 0..num_heads as usize {
+            let mut sumsq = 0.0f32;
+            for d in 0..d_state as usize {
+                let v = readout_f32[h * (d_state as usize) + d];
+                sumsq += v * v;
+            }
+            let rms = (sumsq / d_state as f32 + 1e-6).sqrt();
+            for d in 0..d_state as usize {
+                let v = readout_f32[h * (d_state as usize) + d] / rms;
+                let g = f16_bits_to_f32(u16::from_le_bytes([
+                    norm_gamma[d * 2], norm_gamma[d * 2 + 1],
+                ]));
+                let z_logit = f16_bits_to_f32(u16::from_le_bytes([
+                    z_host_bytes[(h * (d_state as usize) + d) * 2],
+                    z_host_bytes[(h * (d_state as usize) + d) * 2 + 1],
+                ]));
+                let sigmoid_z = 1.0f32 / (1.0f32 + (-z_logit).exp());
+                let out = v * g * sigmoid_z;
+                let bytes = f32_to_f16_bits(out).to_le_bytes();
+                gated_readout[(h * (d_state as usize) + d) * 2] = bytes[0];
+                gated_readout[(h * (d_state as usize) + d) * 2 + 1] = bytes[1];
+            }
+        }
+        let gated_region =
+            self.arena.region("qwen36_l0lc_gated", gated_readout.len(), 16)?;
+        unsafe { gated_region.copy_from_host(&gated_readout)? };
+
+        // out_proj: [hidden, num_heads*d_state=4096] FP8 GEMV.
+        let out_bytes = (out_n as usize) * 2;
+        let out_region = self.arena.region("qwen36_l0lc_out", out_bytes, 16)?;
+        let out_bs = la.out_proj.blockscale_ptr.unwrap_or(0);
+        if out_bs == 0 {
+            return Ok(());
+        }
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m, n: out_n, k: out_k,
+            }.launch(
+                kernel_gemv,
+                out_region.device_ptr(),
+                la.out_proj.offset_bytes,
+                out_bs,
+                gated_region.device_ptr(),
+                self.stream.raw() as u64,
+            )?;
+        }
+        self.stream.fence()?;
+        let mut probe = [0u8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                out_region.device_ptr(),
+                probe.len(),
+            );
+        }
+        let o0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
+        let o1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+        let o2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
+        let o3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+        eprintln!(
+            "[qwen36] forward_layer0_linear_chain_probe: layer={layer_idx} \
+             chain in_proj_qkv → conv1d → silu+split → \
+             {{α,β from A_log+dt_bias+dt}} → ssm_state_update → \
+             Q·S readout → norm + sigmoid·z → out_proj → \
+             out[0..4]=[{o0:.4}, {o1:.4}, {o2:.4}, {o3:.4}] \
+             (full linear-attn block, single-step, state init=0)"
         );
         Ok(())
     }
