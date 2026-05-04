@@ -112,6 +112,11 @@ pub struct Qwen36OutsideKernels {
     /// 1/sqrt(head_dim) attention-score scale).
     pub scale_inplace_f16_mod: LoadedModule,
     pub fn_scale_inplace_f16: KernelFn,
+    /// Vision attention: transpose V from [N, head_dim] → [head_dim, N]
+    /// so the second GEMM (scores @ V) uses our `input @ weight^T`
+    /// helper without computing scores @ V^T by accident.
+    pub transpose_2d_f16_mod: LoadedModule,
+    pub fn_transpose_2d_f16: KernelFn,
     /// Vision helpers (also used elsewhere in the codebase): in-place
     /// per-row bias add (tensor[t,d] += bias[d]) and f32→f16 cast.
     pub add_bias_f16_mod: LoadedModule,
@@ -323,6 +328,9 @@ impl Qwen36Bringup {
         let scale_inplace_f16_mod = kernels.load_ptx("scale_inplace_f16")?;
         let fn_scale_inplace_f16 =
             scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
+        let transpose_2d_f16_mod = kernels.load_ptx("transpose_2d_f16")?;
+        let fn_transpose_2d_f16 =
+            transpose_2d_f16_mod.get_function("transpose_2d_f16_kernel")?;
         let add_bias_f16_mod = kernels.load_ptx("add_bias_f16")?;
         let fn_add_bias_f16 = add_bias_f16_mod.get_function("add_bias_f16_kernel")?;
         let cast_fp_mod = kernels.load_ptx("cast_fp")?;
@@ -364,6 +372,8 @@ impl Qwen36Bringup {
             fn_vit_pos_embed_interp_f16,
             scale_inplace_f16_mod,
             fn_scale_inplace_f16,
+            transpose_2d_f16_mod,
+            fn_transpose_2d_f16,
             add_bias_f16_mod,
             fn_add_bias_f16,
             cast_fp_mod,
@@ -3406,16 +3416,26 @@ impl Qwen36Bringup {
         }
 
         // ── Step 4: build per-token cos/sin tables for 2D rotary. ────
-        // Qwen3-VL uses partial_rotary_factor=0.5 → rotary_dim = head_dim/2.
-        // The cos/sin tables are [seq_len, rotary_dim] (NOT head_dim).
-        // Within rotary_dim:
-        //   cos[t, 0..rotary_dim/2]      = cos(h_pos[t] * inv_freq[k])
-        //   cos[t, rotary_dim/2..rot_dim]= cos(w_pos[t] * inv_freq[k])
-        // inv_freq has length rotary_dim/2 with theta=10000 over rotary_dim.
-        let rotary_dim = head_dim / 2;       // 36
-        let rope_dim_half = rotary_dim / 2;  // 18  (= inv_freq dim)
-        let inv_theta: Vec<f32> = (0..rope_dim_half)
-            .map(|k| 1.0 / 10_000.0_f32.powf(2.0 * k as f32 / rotary_dim as f32))
+        // Matches HF transformers Qwen3VLVisionModel:
+        //   freq_table = RotaryEmbedding(head_dim/2)(max_hw)   [max_hw, 18]
+        //   embeddings = freq_table[pos_ids]                   [N, 2, 18]
+        //   embeddings = embeddings.flatten(1)                 [N, 36]
+        //   emb = cat([embeddings, embeddings], dim=-1)        [N, 72] (DUPLICATED)
+        //   cos, sin = emb.cos(), emb.sin()                    [N, 72]
+        // Rotary then applies rotate_half on the FULL head_dim=72 with these
+        // tables. The "partial_rotary" interpretation from vLLM's get_rope
+        // call was misleading — the effective rotary_dim is head_dim, not
+        // head_dim/2. Within the [N, 72] cos table:
+        //   cos[t, 0..18]   = cos(h_pos[t] * inv_freq[k])
+        //   cos[t, 18..36]  = cos(w_pos[t] * inv_freq[k])
+        //   cos[t, 36..54]  = cos(h_pos[t] * inv_freq[k])  (mirror of 0..18)
+        //   cos[t, 54..72]  = cos(w_pos[t] * inv_freq[k])  (mirror of 18..36)
+        // inv_freq dim = 18, with theta=10000 over (head_dim/2).
+        let rotary_dim = head_dim;            // 72 (full head_dim — see HF cat-trick above)
+        let inv_freq_dim = head_dim / 4;      // 18
+        let inv_freq_dim_total = head_dim / 2; // 36 — pre-cat embedding width
+        let inv_theta: Vec<f32> = (0..inv_freq_dim)
+            .map(|k| 1.0 / 10_000.0_f32.powf(2.0 * k as f32 / inv_freq_dim_total as f32))
             .collect();
         let mut cos_table_host = vec![0u8; n_tokens * rotary_dim * 2];
         let mut sin_table_host = vec![0u8; n_tokens * rotary_dim * 2];
@@ -3441,24 +3461,28 @@ impl Qwen36Bringup {
                 }
             }
         }
+        // Build [N, 72] cos/sin tables matching HF cat-of-itself layout:
+        //   table[t, k]            = cos/sin(h_pos[t] * inv_freq[k])     for k ∈ [0, 18)
+        //   table[t, 18+k]         = cos/sin(w_pos[t] * inv_freq[k])
+        //   table[t, 36+k]         = same as table[t, k]                  (cat duplicate)
+        //   table[t, 54+k]         = same as table[t, 18+k]               (cat duplicate)
         for t in 0..n_tokens {
-            for k in 0..rope_dim_half {
+            for k in 0..inv_freq_dim {
                 let ah = (pos_h[t] as f32) * inv_theta[k];
                 let aw = (pos_w[t] as f32) * inv_theta[k];
-                let cos_h = ah.cos();
-                let sin_h = ah.sin();
-                let cos_w = aw.cos();
-                let sin_w = aw.sin();
-                let off = (t * rotary_dim + k) * 2;
-                let off_w = (t * rotary_dim + rope_dim_half + k) * 2;
-                let cos_h_b = half::f16::from_f32(cos_h).to_le_bytes();
-                let sin_h_b = half::f16::from_f32(sin_h).to_le_bytes();
-                let cos_w_b = half::f16::from_f32(cos_w).to_le_bytes();
-                let sin_w_b = half::f16::from_f32(sin_w).to_le_bytes();
-                cos_table_host[off] = cos_h_b[0]; cos_table_host[off + 1] = cos_h_b[1];
-                sin_table_host[off] = sin_h_b[0]; sin_table_host[off + 1] = sin_h_b[1];
-                cos_table_host[off_w] = cos_w_b[0]; cos_table_host[off_w + 1] = cos_w_b[1];
-                sin_table_host[off_w] = sin_w_b[0]; sin_table_host[off_w + 1] = sin_w_b[1];
+                let cos_h = half::f16::from_f32(ah.cos()).to_le_bytes();
+                let sin_h = half::f16::from_f32(ah.sin()).to_le_bytes();
+                let cos_w = half::f16::from_f32(aw.cos()).to_le_bytes();
+                let sin_w = half::f16::from_f32(aw.sin()).to_le_bytes();
+                let row_base = t * rotary_dim;
+                for &mirror in &[0, inv_freq_dim_total] {
+                    let off_h = (row_base + mirror + k) * 2;
+                    let off_w = (row_base + mirror + inv_freq_dim + k) * 2;
+                    cos_table_host[off_h] = cos_h[0]; cos_table_host[off_h + 1] = cos_h[1];
+                    sin_table_host[off_h] = sin_h[0]; sin_table_host[off_h + 1] = sin_h[1];
+                    cos_table_host[off_w] = cos_w[0]; cos_table_host[off_w + 1] = cos_w[1];
+                    sin_table_host[off_w] = sin_w[0]; sin_table_host[off_w + 1] = sin_w[1];
+                }
             }
         }
         let cos_region = self.arena.region("qvis_cos", cos_table_host.len(), 16)?;
@@ -3604,6 +3628,26 @@ impl Qwen36Bringup {
             }
             self.stream.fence()?;
 
+            // Block 0: dump Q + K post-rotary (full [N, hidden] f16).
+            if blk_idx == 0 {
+                if let Some(dir) = blk_dump_dir.as_deref() {
+                    let bytes = n_tokens * hidden * 2;
+                    let mut q_host = vec![0u8; bytes];
+                    let mut k_host = vec![0u8; bytes];
+                    let mut v_host = vec![0u8; bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(q_host.as_mut_ptr() as *mut _, q_buf.device_ptr(), bytes);
+                        let _ = cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, k_buf.device_ptr(), bytes);
+                        let _ = cuMemcpyDtoH_v2(v_host.as_mut_ptr() as *mut _, v_buf.device_ptr(), bytes);
+                    }
+                    let _ = std::fs::write(format!("{dir}/blk0_q_postrot.bin"), &q_host);
+                    let _ = std::fs::write(format!("{dir}/blk0_k_postrot.bin"), &k_host);
+                    let _ = std::fs::write(format!("{dir}/blk0_v.bin"), &v_host);
+                }
+            }
+
             // ─ Per-head attention: QK^T → softmax → @V. ─
             // Q, K, V layout is [N, num_heads*head_dim] = [N, 1152]
             // with each token's row containing all heads concatenated.
@@ -3616,6 +3660,7 @@ impl Qwen36Bringup {
             let q_h = self.arena.region("qvis_qh", n_tokens * head_dim * 2, 16)?;
             let k_h = self.arena.region("qvis_kh", n_tokens * head_dim * 2, 16)?;
             let v_h = self.arena.region("qvis_vh", n_tokens * head_dim * 2, 16)?;
+            let v_h_t = self.arena.region("qvis_vht", head_dim * n_tokens * 2, 16)?;
             let out_h = self.arena.region("qvis_oh", n_tokens * head_dim * 2, 16)?;
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             for h in 0..num_heads {
@@ -3734,11 +3779,39 @@ impl Qwen36Bringup {
                 }
                 self.stream.fence()?;
 
-                // scores @ V: [N, N] @ [N, head_dim] → [N, head_dim]
+                // scores @ V: [N, N] @ [N, head_dim] → [N, head_dim].
+                // f16_gemm_f32 always computes input @ weight^T, so we
+                // need V transposed [head_dim, N] for the call to give
+                // sum_j scores[r,j] * V[j,c] (instead of scores @ V^T).
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut out_p = v_h_t.device_ptr();
+                    let mut in_p = v_h.device_ptr();
+                    let mut rows = n_tokens as i32;
+                    let mut cols = head_dim as i32;
+                    let args = [
+                        (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut rows) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut cols) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let gx = ((cols as u32) + 15) / 16;
+                    let gy = ((rows as u32) + 15) / 16;
+                    let _ = cuLaunchKernel(
+                        self.outside_kernels.fn_transpose_2d_f16.raw() as CUfunction,
+                        gx, gy, 1,
+                        16, 16, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                self.stream.fence()?;
                 #[cfg(feature = "cuda")]
                 unsafe {
                     self.cublaslt.f16_gemm_f32(
-                        scores_buf.device_ptr(), v_h.device_ptr(),
+                        scores_buf.device_ptr(), v_h_t.device_ptr(),
                         scores_f32.device_ptr(),
                         n_tokens as i32, head_dim as i32, n_tokens as i32,
                         stream_raw,
@@ -3786,6 +3859,19 @@ impl Qwen36Bringup {
             }
 
             // ─ O proj + residual: hidden += proj(attn_out). ─
+            // Block 0 dump: attn output pre-O-proj.
+            if blk_idx == 0 {
+                if let Some(dir) = blk_dump_dir.as_deref() {
+                    let bytes = n_tokens * hidden * 2;
+                    let mut host = vec![0u8; bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, attn_out.device_ptr(), bytes);
+                    }
+                    let _ = std::fs::write(format!("{dir}/blk0_attn_pre_o_proj.bin"), &host);
+                }
+            }
             let proj_out = self.arena.region("qvis_proj_out", n_tokens * hidden * 2, 16)?;
             linear_with_bias(
                 attn_out.device_ptr(),
