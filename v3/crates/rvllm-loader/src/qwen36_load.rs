@@ -516,6 +516,9 @@ fn load_qwen36_vision(ctx: &LoadCtx) -> Result<Qwen36Vision> {
     let (proj_bias, _) = ctx.upload_f16("qwen36_vis_pe_b", &pe_b_name)?;
     let patch_embed = Qwen36VisionPatchEmbed { proj_weight, proj_bias };
 
+    let pos_embed_name = format!("{QWEN36_VISION_PREFIX}.pos_embed.weight");
+    let (pos_embed, _) = ctx.upload_f16("qwen36_vis_pos_embed", &pos_embed_name)?;
+
     let mut blocks = Vec::with_capacity(27);
     for i in 0..27 {
         let p = |s: &str| format!("{QWEN36_VISION_PREFIX}.blocks.{i}.{s}");
@@ -557,6 +560,7 @@ fn load_qwen36_vision(ctx: &LoadCtx) -> Result<Qwen36Vision> {
     );
     Ok(Qwen36Vision {
         patch_embed,
+        pos_embed,
         blocks,
         merger,
     })

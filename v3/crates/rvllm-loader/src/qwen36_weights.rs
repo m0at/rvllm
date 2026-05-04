@@ -173,6 +173,10 @@ pub struct Qwen36LoadedModel {
 #[derive(Debug)]
 pub struct Qwen36Vision {
     pub patch_embed: Qwen36VisionPatchEmbed,
+    /// Learned absolute position embedding `[num_position_embeddings=2304, hidden=1152]` f16.
+    /// Bilinearly interpolated to grid_h × grid_w and added to hidden_states
+    /// after patch_embed (vllm qwen3_vl.py:561 + :801).
+    pub pos_embed: F16Weight,
     pub blocks: Vec<Qwen36VisionBlock>,
     pub merger: Qwen36PatchMerger,
 }

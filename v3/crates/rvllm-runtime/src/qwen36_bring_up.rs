@@ -103,6 +103,11 @@ pub struct Qwen36OutsideKernels {
     /// Kernel: kernels/vit_avgpool_f16.cu.
     pub vit_avgpool_f16_mod: LoadedModule,
     pub fn_vit_avgpool_f16: KernelFn,
+    /// Vision Phase A2: bilinear interpolation of the learned absolute
+    /// pos_embed table (Qwen3-VL specific). Kernel:
+    /// kernels/vit_pos_embed_interp_f16.cu.
+    pub vit_pos_embed_interp_f16_mod: LoadedModule,
+    pub fn_vit_pos_embed_interp_f16: KernelFn,
     /// Vision helpers (also used elsewhere in the codebase): in-place
     /// per-row bias add (tensor[t,d] += bias[d]) and f32→f16 cast.
     pub add_bias_f16_mod: LoadedModule,
@@ -308,6 +313,9 @@ impl Qwen36Bringup {
             vit_rotary_2d_f16_mod.get_function("vit_rotary_2d_f16_kernel")?;
         let vit_avgpool_f16_mod = kernels.load_ptx("vit_avgpool_f16")?;
         let fn_vit_avgpool_f16 = vit_avgpool_f16_mod.get_function("vit_avgpool_f16_kernel")?;
+        let vit_pos_embed_interp_f16_mod = kernels.load_ptx("vit_pos_embed_interp_f16")?;
+        let fn_vit_pos_embed_interp_f16 = vit_pos_embed_interp_f16_mod
+            .get_function("vit_pos_embed_interp_f16_kernel")?;
         let add_bias_f16_mod = kernels.load_ptx("add_bias_f16")?;
         let fn_add_bias_f16 = add_bias_f16_mod.get_function("add_bias_f16_kernel")?;
         let cast_fp_mod = kernels.load_ptx("cast_fp")?;
@@ -345,6 +353,8 @@ impl Qwen36Bringup {
             fn_vit_rotary_2d_f16,
             vit_avgpool_f16_mod,
             fn_vit_avgpool_f16,
+            vit_pos_embed_interp_f16_mod,
+            fn_vit_pos_embed_interp_f16,
             add_bias_f16_mod,
             fn_add_bias_f16,
             cast_fp_mod,
@@ -3324,19 +3334,56 @@ impl Qwen36Bringup {
             n_tokens, hidden, patch_dim,
         )?;
 
+        // ── Step 3.5: add learned absolute pos_embed (bilinear-interp). ─
+        // vllm qwen3_vl.py:801: hidden_states += pos_embeds. The pos_embed
+        // table is `[2304, 1152]` (num_grid_per_side²); we interpolate it
+        // to `[grid_h * grid_w, 1152]` and add to hidden_region in place.
+        const QWEN_VIT_NUM_GRID: i32 = 48; // sqrt(num_position_embeddings=2304)
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut hs = hidden_region.device_ptr();
+            let mut tab = vision.pos_embed.offset_bytes;
+            let mut gh = grid_h as i32;
+            let mut gw = grid_w as i32;
+            let mut ng = QWEN_VIT_NUM_GRID;
+            let mut ms = merge as i32;
+            let mut hd = hidden as i32;
+            let args = [
+                (&mut hs) as *mut u64 as *mut core::ffi::c_void,
+                (&mut tab) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut gw) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ng) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ms) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let _ = cuLaunchKernel(
+                self.outside_kernels.fn_vit_pos_embed_interp_f16.raw() as CUfunction,
+                n_tokens as u32, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+
         // ── Step 4: build per-token cos/sin tables for 2D rotary. ────
-        // freq_table[max_hw, head_dim/2] = freq for each row OR column
-        // (Qwen ViT uses rotary_dim = head_dim/2 in the rotary embed).
-        // For each token at (h_pos, w_pos):
-        //   cos[t, 0..head_dim/2] = cos(h_pos * inv_freq[k])
-        //   cos[t, head_dim/2..] = cos(w_pos * inv_freq[k])
-        // sin same. Each row of the per-token table is head_dim wide.
-        let rope_dim_half = head_dim / 2; // 36
+        // Qwen3-VL uses partial_rotary_factor=0.5 → rotary_dim = head_dim/2.
+        // The cos/sin tables are [seq_len, rotary_dim] (NOT head_dim).
+        // Within rotary_dim:
+        //   cos[t, 0..rotary_dim/2]      = cos(h_pos[t] * inv_freq[k])
+        //   cos[t, rotary_dim/2..rot_dim]= cos(w_pos[t] * inv_freq[k])
+        // inv_freq has length rotary_dim/2 with theta=10000 over rotary_dim.
+        let rotary_dim = head_dim / 2;       // 36
+        let rope_dim_half = rotary_dim / 2;  // 18  (= inv_freq dim)
         let inv_theta: Vec<f32> = (0..rope_dim_half)
-            .map(|k| 1.0 / 10_000.0_f32.powf(2.0 * k as f32 / head_dim as f32))
+            .map(|k| 1.0 / 10_000.0_f32.powf(2.0 * k as f32 / rotary_dim as f32))
             .collect();
-        let mut cos_table_host = vec![0u8; n_tokens * head_dim * 2];
-        let mut sin_table_host = vec![0u8; n_tokens * head_dim * 2];
+        let mut cos_table_host = vec![0u8; n_tokens * rotary_dim * 2];
+        let mut sin_table_host = vec![0u8; n_tokens * rotary_dim * 2];
         // Determine per-token (h_pos, w_pos) following HF's rot_pos_emb
         // (block-internal merge-aware ordering).
         let mut pos_h = vec![0i32; n_tokens];
@@ -3367,8 +3414,8 @@ impl Qwen36Bringup {
                 let sin_h = ah.sin();
                 let cos_w = aw.cos();
                 let sin_w = aw.sin();
-                let off = (t * head_dim + k) * 2;
-                let off_w = (t * head_dim + rope_dim_half + k) * 2;
+                let off = (t * rotary_dim + k) * 2;
+                let off_w = (t * rotary_dim + rope_dim_half + k) * 2;
                 let cos_h_b = half::f16::from_f32(cos_h).to_le_bytes();
                 let sin_h_b = half::f16::from_f32(sin_h).to_le_bytes();
                 let cos_w_b = half::f16::from_f32(cos_w).to_le_bytes();
@@ -3486,17 +3533,19 @@ impl Qwen36Bringup {
                     let mut sin = sin_region.device_ptr();
                     let mut nh = num_heads as i32;
                     let mut hd_i = head_dim as i32;
+                    let mut rd_i = rotary_dim as i32;
                     let args = [
                         (&mut x) as *mut u64 as *mut core::ffi::c_void,
                         (&mut cos) as *mut u64 as *mut core::ffi::c_void,
                         (&mut sin) as *mut u64 as *mut core::ffi::c_void,
                         (&mut nh) as *mut i32 as *mut core::ffi::c_void,
                         (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut rd_i) as *mut i32 as *mut core::ffi::c_void,
                     ];
                     let _ = cuLaunchKernel(
                         self.outside_kernels.fn_vit_rotary_2d_f16.raw() as CUfunction,
                         n_tokens as u32, num_heads as u32, 1,
-                        (head_dim / 2) as u32, 1, 1,
+                        (rotary_dim / 2) as u32, 1, 1,
                         0, self.stream.raw() as CUstream,
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
