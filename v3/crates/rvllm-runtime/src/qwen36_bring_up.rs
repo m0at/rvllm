@@ -105,6 +105,17 @@ pub struct Qwen36Bringup {
     pub linear_state_ptr: u64,
     pub linear_state_bytes: usize,
     pub linear_state_layer_bytes: usize,
+    /// Phase 4u: paged f16 KV cache for the 10 full-attention
+    /// layers. Layout `[num_full_layers, 2 (K+V), num_blocks,
+    /// block_size, num_kv_heads, head_dim]` f16. Pre-allocated above
+    /// the scratch checkpoint so it survives `arena.restore()`
+    /// between requests. Reset alongside `reset_linear_state` on
+    /// fresh sessions.
+    pub kv_cache_ptr: u64,
+    pub kv_cache_bytes: usize,
+    pub kv_cache_layer_bytes: usize,
+    pub kv_cache_num_blocks: u32,
+    pub kv_cache_block_size: u32,
 }
 
 impl Qwen36Bringup {
@@ -367,6 +378,62 @@ impl Qwen36Bringup {
             linear_state_bytes as f64 / (1024.0 * 1024.0),
         );
 
+        // Phase 4u: paged f16 KV cache for full-attention layers.
+        // Sized for max_tokens_cap context (default 4096) at the
+        // current num_kv_heads / head_dim layout. block_size 16 is
+        // the standard rvllm paged-attn tile.
+        let n_full_layers = arch
+            .base
+            .layer_types
+            .iter()
+            .filter(|t| matches!(t, rvllm_loader::LayerAttnType::Full))
+            .count();
+        let kv_max_tokens = std::env::var("RVLLM_MAX_TOKENS_CAP")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4096);
+        let kv_cache_block_size: u32 = 16;
+        let kv_cache_num_blocks = kv_max_tokens.div_ceil(kv_cache_block_size);
+        let nkvh = arch.base.num_key_value_heads;
+        let hd = arch.base.head_dim;
+        // 2 = K + V. Each slot is f16 (2 bytes).
+        let kv_cache_layer_bytes = 2usize
+            * (kv_cache_num_blocks as usize)
+            * (kv_cache_block_size as usize)
+            * nkvh
+            * hd
+            * 2;
+        let kv_cache_bytes = n_full_layers * kv_cache_layer_bytes;
+        let kv_cache_region =
+            arena.region("qwen36_kv_cache", kv_cache_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8_v2(
+                kv_cache_region.device_ptr(),
+                0,
+                kv_cache_bytes,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_kv_cache cuMemsetD8",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let kv_cache_ptr = kv_cache_region.device_ptr();
+        eprintln!(
+            "[qwen36] paged KV cache allocated: {n_full_layers} full-attn \
+             layers × {:.1} MiB ({} blocks × {} tokens × 2 (K+V) × \
+             {nkvh} kv_heads × {hd} hd × f16) = {:.1} MiB total \
+             (zero-initialised).",
+            kv_cache_layer_bytes as f64 / (1024.0 * 1024.0),
+            kv_cache_num_blocks,
+            kv_cache_block_size,
+            kv_cache_bytes as f64 / (1024.0 * 1024.0),
+        );
+
         let n_full = model.layers.iter().filter(|l| matches!(
             l.attn,
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(_)
@@ -376,7 +443,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4t bring-up complete: outside (incl. \
+            "[qwen36] Phase 4u bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -408,6 +475,11 @@ impl Qwen36Bringup {
             linear_state_ptr,
             linear_state_bytes,
             linear_state_layer_bytes,
+            kv_cache_ptr,
+            kv_cache_bytes,
+            kv_cache_layer_bytes,
+            kv_cache_num_blocks,
+            kv_cache_block_size,
         };
         // Phase 3e smoke: actually launch embedding_gather against the
         // loaded weights. If this throws, the rest of the forward
@@ -476,12 +548,50 @@ impl Qwen36Bringup {
         bringup.forward_layer0_linear_chain_probe()?;
         // Phase 4t: per-sequence state cache (zero-init + reset).
         bringup.linear_state_cache_probe()?;
+        // Phase 4u: paged KV cache for full-attn layers.
+        bringup.kv_cache_probe()?;
 
         Ok(bringup)
     }
 
     pub fn kernels_dir(&self) -> &PathBuf {
         &self.paths.kernels_dir
+    }
+
+    /// Phase 4u: device pointer for full-attn layer's slice of the
+    /// paged KV cache. `layer_seq_idx` is the sequential index of
+    /// the full-attn layer (0..num_full_layers), NOT the absolute
+    /// model layer index — caller maps via the layer_types array.
+    pub fn kv_cache_layer_ptr(&self, layer_seq_idx: u32) -> u64 {
+        let off = (layer_seq_idx as usize)
+            .saturating_mul(self.kv_cache_layer_bytes);
+        if off + self.kv_cache_layer_bytes > self.kv_cache_bytes {
+            return 0;
+        }
+        self.kv_cache_ptr + off as u64
+    }
+
+    /// Phase 4u: zero out the paged KV cache (all full-attn layers).
+    /// Called on session boundaries alongside `reset_linear_state`.
+    pub fn reset_kv_cache(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8Async(
+                self.kv_cache_ptr,
+                0,
+                self.kv_cache_bytes,
+                self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 reset_kv_cache",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Phase 4t: zero out the per-sequence linear-attn state cache.
@@ -2412,6 +2522,33 @@ impl Qwen36Bringup {
              Q·S readout → norm + sigmoid·z → out_proj → \
              out[0..4]=[{o0:.4}, {o1:.4}, {o2:.4}, {o3:.4}] \
              (full linear-attn block, single-step, state init=0)"
+        );
+        Ok(())
+    }
+
+    /// Phase 4u probe: verify the paged KV cache is zero-initialised
+    /// + per-layer addressable + reset round-trips correctly.
+    pub fn kv_cache_probe(&self) -> Result<()> {
+        let n_full = self.kv_cache_bytes / self.kv_cache_layer_bytes;
+        let l0_ptr = self.kv_cache_layer_ptr(0);
+        let last_ptr = self.kv_cache_layer_ptr((n_full - 1) as u32);
+        if l0_ptr == 0 || last_ptr == 0 {
+            return Ok(());
+        }
+        let mut probe = [0xFFu8; 16];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(probe.as_mut_ptr() as *mut _, l0_ptr, 8);
+            let _ = cuMemcpyDtoH_v2(probe.as_mut_ptr().add(8) as *mut _, last_ptr, 8);
+        }
+        let l0_zero = probe[0..8].iter().all(|b| *b == 0);
+        let lN_zero = probe[8..16].iter().all(|b| *b == 0);
+        eprintln!(
+            "[qwen36] kv_cache_probe: {n_full} full-attn slots, \
+             layer0 head8b zeroed={l0_zero}, last_layer head8b zeroed={lN_zero}, \
+             total={:.1} MiB persistent",
+            self.kv_cache_bytes as f64 / (1024.0 * 1024.0),
         );
         Ok(())
     }

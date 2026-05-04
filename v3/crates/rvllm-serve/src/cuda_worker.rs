@@ -109,12 +109,14 @@ pub async fn spawn_cuda_worker(
                     // to Phase 4c+.
                     while let Some(req) = req_rx.blocking_recv() {
                         let prompt_len = req.prompt_ids.len() as u32;
-                        // Phase 4t: every fresh request starts with a
-                        // clean linear-attn state. Multi-step / session
-                        // continuity will skip this once a session-id
-                        // tracker lands (Phase 4v+); single-token
-                        // smoke can reset unconditionally.
+                        // Phase 4t/4u: every fresh request starts with
+                        // clean linear-attn state + clean KV cache.
+                        // Multi-step / session continuity will skip
+                        // these once a session-id tracker lands
+                        // (Phase 4v+); single-token smoke can reset
+                        // unconditionally.
                         let _ = qwen.reset_linear_state();
+                        let _ = qwen.reset_kv_cache();
                         if req.cancelled.load(Ordering::Relaxed) {
                             let _ = req.events_tx.blocking_send(GenerateEvent::Done {
                                 finish: FinishReason::Cancelled,
