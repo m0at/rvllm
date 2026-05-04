@@ -346,6 +346,11 @@
       "path": "scale_inplace_f16.ptx",
       "sha256": "6801b28976af498f695378b540d8447cd9a4c5f46d256e6fc5d5c7283c94287f"
     },
+    "scale_inplace_f32": {
+      "bytes": 1035,
+      "path": "scale_inplace_f32.ptx",
+      "sha256": "d99b0dea2e2feedf74c27c87ecb247312f3f713e7c1e484ca8dacc3f9c38085f"
+    },
     "scale_rows_f32_ratio": {
       "bytes": 1573,
       "path": "scale_rows_f32_ratio.ptx",
@@ -401,6 +406,11 @@
       "path": "vit_avgpool_f16.ptx",
       "sha256": "266adbda3aded7cd27a9d1e503b3a07cb5fa582ea7d6ec50d3fb612047bac924"
     },
+    "vit_avgpool_f16_to_f32": {
+      "bytes": 9333,
+      "path": "vit_avgpool_f16_to_f32.ptx",
+      "sha256": "07ea791cc98b6092997d8c2a38dc213407e15074f172689a48a016fdda18ced7"
+    },
     "vit_pos_emb_lookup_2d_f16": {
       "bytes": 2708,
       "path": "vit_pos_emb_lookup_2d_f16.ptx",
@@ -426,11 +436,16 @@
       "path": "vit_standardize_f16.ptx",
       "sha256": "02df25cef0fbfd7a61bdf543a75607fb12afbfa0983e5a7db223c1f81582a18d"
     },
+    "vit_standardize_f32_to_f16": {
+      "bytes": 2165,
+      "path": "vit_standardize_f32_to_f16.ptx",
+      "sha256": "7de5d1246d9be5d1007eac0b49e059ed35d20eaac9f22868e348566bab80cc90"
+    },
     "vnorm_f16": {
       "bytes": 7188,
       "path": "vnorm_f16.ptx",
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "f63d63f"
+  "revision": "af3e5e8"
 }

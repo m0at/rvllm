@@ -500,6 +500,18 @@ pub struct Gemma4FusedModules {
     pub fn_softmax_row_f32_to_f16: KernelFn,
     pub vit_standardize_f16_mod: LoadedModule,
     pub fn_vit_standardize_f16: KernelFn,
+    /// Vision Phase 5 audit follow-up (option 1 in
+    /// v3/GEMMA_VISION_AUDIT.md): keep the pooler→standardize span
+    /// in f32 to recover the 31/256 rows that overflow f16 after
+    /// `*= sqrt(hidden=1152) ≈ 33.94`. Narrows back to f16 only
+    /// after std_scale has divided magnitudes back into f16-safe
+    /// range.
+    pub vit_avgpool_f16_to_f32_mod: LoadedModule,
+    pub fn_vit_avgpool_f16_to_f32: KernelFn,
+    pub scale_inplace_f32_mod: LoadedModule,
+    pub fn_scale_inplace_f32: KernelFn,
+    pub vit_standardize_f32_to_f16_mod: LoadedModule,
+    pub fn_vit_standardize_f32_to_f16: KernelFn,
     pub extract_head_f16_mod: LoadedModule,
     pub fn_extract_head_f16: KernelFn,
     pub fn_scatter_head_f16: KernelFn,
@@ -6247,15 +6259,21 @@ impl Gemma4Bringup {
                 rvllm_core::CudaCtx::setup(),
             ));
         }
+        // f32 pooler buffer: stays in f32 across avg-pool → sqrt-scale →
+        // standardize. Narrowed back to f16 only at the very end of
+        // standardize (where std_scale has divided peak magnitudes back
+        // into f16-safe range). Audit option 1 in
+        // v3/GEMMA_VISION_AUDIT.md — recovers the 31/256 rows that
+        // overflowed f16 (became inf) when the post-encoder peak
+        // (~2752) was multiplied by sqrt(1152) ≈ 33.94.
+        let pooled_region_f32 =
+            self.arena.region("g4v_pooled_f32", n_pooled * HIDDEN * 4, 16)?;
         let pooled_region = self.arena.region("g4v_pooled", n_pooled * HIDDEN * 2, 16)?;
 
-        // Use vit_avgpool_f16: kernel signature
-        //   (out, in, in_grid_h, in_grid_w, hidden, kernel_size)
-        // Grid: (pooled_rows * pooled_cols, hidden), Block: 1 thread.
-        // We honour what the existing kernel actually expects.
+        // avg-pool (f16 in → f32 out)
         #[cfg(feature = "cuda")]
         unsafe {
-            let mut out = pooled_region.device_ptr();
+            let mut out = pooled_region_f32.device_ptr();
             let mut input = hidden_region.device_ptr();
             let mut gh = grid_rows as i32;
             let mut gw = grid_cols as i32;
@@ -6270,7 +6288,7 @@ impl Gemma4Bringup {
                 (&mut k) as *mut i32 as *mut core::ffi::c_void,
             ];
             let rc = cuLaunchKernel(
-                self.fused.fn_vit_avgpool_f16.raw() as CUfunction,
+                self.fused.fn_vit_avgpool_f16_to_f32.raw() as CUfunction,
                 n_pooled as u32, 1, 1,
                 256, 1, 1,
                 0, self.stream.raw() as CUstream,
@@ -6279,7 +6297,7 @@ impl Gemma4Bringup {
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "vision: vit_avgpool launch failed",
+                    "vision: vit_avgpool_f16_to_f32 launch failed",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
@@ -6288,11 +6306,11 @@ impl Gemma4Bringup {
         self.stream.fence()?;
 
 
-        // Multiply by sqrt(hidden_size) (Gemma scaling in pooler).
+        // sqrt(hidden_size) scale on the f32 buffer.
         let sqrt_h = (HIDDEN as f32).sqrt();
         #[cfg(feature = "cuda")]
         unsafe {
-            let mut x = pooled_region.device_ptr();
+            let mut x = pooled_region_f32.device_ptr();
             let mut s = sqrt_h;
             let mut nn = (n_pooled * HIDDEN) as i32;
             let args = [
@@ -6303,7 +6321,7 @@ impl Gemma4Bringup {
             let block: u32 = 256;
             let grid = ((nn as u32 + block - 1) / block, 1u32, 1u32);
             let rc = cuLaunchKernel(
-                self.fused.fn_scale_inplace_f16.raw() as CUfunction,
+                self.fused.fn_scale_inplace_f32.raw() as CUfunction,
                 grid.0, grid.1, grid.2,
                 block, 1, 1,
                 0, self.stream.raw() as CUstream,
@@ -6312,31 +6330,35 @@ impl Gemma4Bringup {
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "vision: scale_inplace (sqrt(hidden)) launch failed",
+                    "vision: scale_inplace_f32 (sqrt(hidden)) launch failed",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
         }
         self.stream.fence()?;
-        dump_stage("pooler_scaled", pooled_region.device_ptr(), n_pooled, HIDDEN)?;
 
 
-        // ── Step 6: Standardize — (x - std_bias) * std_scale. ───────
+        // ── Step 6: Standardize — (f32 - bias_f16) * scale_f16, output f16. ─
+        // The std_scale weights are <1.0 in this checkpoint (designed
+        // to bring the post-pool magnitudes back into a normalised
+        // range), so multiplying narrows everything safely into f16.
         #[cfg(feature = "cuda")]
         unsafe {
-            let mut x = pooled_region.device_ptr();
+            let mut out = pooled_region.device_ptr();
+            let mut x = pooled_region_f32.device_ptr();
             let mut bias = vision.std_bias.offset_bytes;
             let mut scale = vision.std_scale.offset_bytes;
             let mut hd = HIDDEN as i32;
             let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
                 (&mut x) as *mut u64 as *mut core::ffi::c_void,
                 (&mut bias) as *mut u64 as *mut core::ffi::c_void,
                 (&mut scale) as *mut u64 as *mut core::ffi::c_void,
                 (&mut hd) as *mut i32 as *mut core::ffi::c_void,
             ];
             let rc = cuLaunchKernel(
-                self.fused.fn_vit_standardize_f16.raw() as CUfunction,
+                self.fused.fn_vit_standardize_f32_to_f16.raw() as CUfunction,
                 n_pooled as u32, 1, 1,
                 256, 1, 1,
                 0, self.stream.raw() as CUstream,
@@ -6345,7 +6367,7 @@ impl Gemma4Bringup {
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "vision: vit_standardize launch failed",
+                    "vision: vit_standardize_f32_to_f16 launch failed",
                     rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
@@ -6559,6 +6581,15 @@ fn load_gemma4_fused(
     let vit_standardize_f16_mod = loader.load_ptx("vit_standardize_f16")?;
     let fn_vit_standardize_f16 =
         vit_standardize_f16_mod.get_function("vit_standardize_f16_kernel")?;
+    let vit_avgpool_f16_to_f32_mod = loader.load_ptx("vit_avgpool_f16_to_f32")?;
+    let fn_vit_avgpool_f16_to_f32 = vit_avgpool_f16_to_f32_mod
+        .get_function("vit_avgpool_f16_to_f32_kernel")?;
+    let scale_inplace_f32_mod = loader.load_ptx("scale_inplace_f32")?;
+    let fn_scale_inplace_f32 = scale_inplace_f32_mod
+        .get_function("scale_inplace_f32_kernel")?;
+    let vit_standardize_f32_to_f16_mod = loader.load_ptx("vit_standardize_f32_to_f16")?;
+    let fn_vit_standardize_f32_to_f16 = vit_standardize_f32_to_f16_mod
+        .get_function("vit_standardize_f32_to_f16_kernel")?;
     let extract_head_f16_mod = loader.load_ptx("extract_head_f16")?;
     let fn_extract_head_f16 =
         extract_head_f16_mod.get_function("extract_head_f16_kernel")?;
@@ -6692,6 +6723,12 @@ fn load_gemma4_fused(
         fn_softmax_row_f32_to_f16,
         vit_standardize_f16_mod,
         fn_vit_standardize_f16,
+        vit_avgpool_f16_to_f32_mod,
+        fn_vit_avgpool_f16_to_f32,
+        scale_inplace_f32_mod,
+        fn_scale_inplace_f32,
+        vit_standardize_f32_to_f16_mod,
+        fn_vit_standardize_f32_to_f16,
         extract_head_f16_mod,
         fn_extract_head_f16,
         fn_scatter_head_f16,
