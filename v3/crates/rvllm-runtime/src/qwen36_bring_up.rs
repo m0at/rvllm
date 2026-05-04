@@ -698,6 +698,35 @@ impl Qwen36Bringup {
              GQA-expanded K/Q for state update, per-v-head readout)"
         );
 
+        // Phase 2b-γ: vision smoke (gated by env). Reads a fixture
+        // image from RVLLM_QWEN36_VISION_PROBE_PATH and runs the full
+        // ViT forward, dumping output stats. Confirms the 27-block
+        // forward + PatchMerger compose without crash and produce
+        // sane f16 magnitudes. Quality vs HF reference is Phase 5.
+        if let Ok(path) = std::env::var("RVLLM_QWEN36_VISION_PROBE_PATH") {
+            match std::fs::read(&path) {
+                Ok(bytes) => match bringup.forward_qwen_vision(&bytes) {
+                    Ok(out) => {
+                        let f32s: Vec<f32> = out
+                            .data
+                            .chunks_exact(2)
+                            .map(|c| {
+                                f16_bits_to_f32(u16::from_le_bytes([c[0], c[1]]))
+                            })
+                            .collect();
+                        let l2 = f32s.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        let max = f32s.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+                        eprintln!(
+                            "[qwen36] vision probe: image={} → tokens={} hidden={} grid_thw={:?} L2={:.3} max={:.3}",
+                            path, out.num_tokens, out.hidden_dim, out.grid_thw, l2, max,
+                        );
+                    }
+                    Err(e) => eprintln!("[qwen36] vision probe failed: {e:?}"),
+                },
+                Err(e) => eprintln!("[qwen36] vision probe: cannot read {path}: {e}"),
+            }
+        }
+
         Ok(bringup)
     }
 
