@@ -128,6 +128,12 @@ pub struct Qwen36OutsideKernels {
     /// earlier DtoH-add-HtoD round-trip that synced 27× per image.
     pub vector_add_f16_mod: LoadedModule,
     pub fn_vector_add_f16: KernelFn,
+    /// Vision: per-head gather/scatter from `[N, num_heads*head_dim]`
+    /// in a single launch. Replaces the per-token DtoD loop that ran
+    /// `n_tokens × num_heads × {Q,K,V}` async memcpys per block.
+    pub extract_head_f16_mod: LoadedModule,
+    pub fn_extract_head_f16: KernelFn,
+    pub fn_scatter_head_f16: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -343,6 +349,11 @@ impl Qwen36Bringup {
         let vector_add_f16_mod = kernels.load_ptx("vector_add_f16")?;
         let fn_vector_add_f16 =
             vector_add_f16_mod.get_function("vector_add_f16_kernel")?;
+        let extract_head_f16_mod = kernels.load_ptx("extract_head_f16")?;
+        let fn_extract_head_f16 =
+            extract_head_f16_mod.get_function("extract_head_f16_kernel")?;
+        let fn_scatter_head_f16 =
+            extract_head_f16_mod.get_function("scatter_head_f16_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -388,6 +399,9 @@ impl Qwen36Bringup {
             fn_cast_f32_to_f16,
             vector_add_f16_mod,
             fn_vector_add_f16,
+            extract_head_f16_mod,
+            fn_extract_head_f16,
+            fn_scatter_head_f16,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
@@ -3673,32 +3687,83 @@ impl Qwen36Bringup {
             let v_h_t = self.arena.region("qvis_vht", head_dim * n_tokens * 2, 16)?;
             let out_h = self.arena.region("qvis_oh", n_tokens * head_dim * 2, 16)?;
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            for h in 0..num_heads {
-                // Gather head h from Q/K/V into contiguous buffers.
+            // Gather/scatter helpers shared with the per-head attention
+            // loop. Replaces the per-token DtoD memcpy schedule (~ N
+            // memcpys × 4 directions × num_heads × 27 blocks = O(106k)
+            // launches per image at N=196) with a single kernel
+            // launch per (head, direction). Codex review #C round 3.
+            let extract_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
                 #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
-                    let head_off = (h * head_dim * 2) as u64;
-                    let row_bytes = (hidden * 2) as u64;
-                    let head_bytes = (head_dim * 2) as u64;
-                    for t in 0..n_tokens {
-                        let _ = cuMemcpyDtoDAsync_v2(
-                            q_h.device_ptr() + (t as u64) * head_bytes,
-                            q_buf.device_ptr() + (t as u64) * row_bytes + head_off,
-                            head_bytes as usize, self.stream.raw() as _,
-                        );
-                        let _ = cuMemcpyDtoDAsync_v2(
-                            k_h.device_ptr() + (t as u64) * head_bytes,
-                            k_buf.device_ptr() + (t as u64) * row_bytes + head_off,
-                            head_bytes as usize, self.stream.raw() as _,
-                        );
-                        let _ = cuMemcpyDtoDAsync_v2(
-                            v_h.device_ptr() + (t as u64) * head_bytes,
-                            v_buf.device_ptr() + (t as u64) * row_bytes + head_off,
-                            head_bytes as usize, self.stream.raw() as _,
-                        );
+                    let mut o = dst;
+                    let mut i = src;
+                    let mut hi = head_idx as i32;
+                    let mut nh = num_heads as i32;
+                    let mut hd = head_dim as i32;
+                    let args = [
+                        (&mut o) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut i) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut hi) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_extract_head_f16.raw() as CUfunction,
+                        n_tokens as u32, 1, 1,
+                        head_dim as u32, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qvis: extract_head launch failed",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
                     }
                 }
+                Ok(())
+            };
+            let scatter_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut o = dst;
+                    let mut i = src;
+                    let mut hi = head_idx as i32;
+                    let mut nh = num_heads as i32;
+                    let mut hd = head_dim as i32;
+                    let args = [
+                        (&mut o) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut i) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut hi) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_scatter_head_f16.raw() as CUfunction,
+                        n_tokens as u32, 1, 1,
+                        head_dim as u32, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qvis: scatter_head launch failed",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                Ok(())
+            };
+            for h in 0..num_heads {
+                extract_head(q_h.device_ptr(), q_buf.device_ptr(), h)?;
+                extract_head(k_h.device_ptr(), k_buf.device_ptr(), h)?;
+                extract_head(v_h.device_ptr(), v_buf.device_ptr(), h)?;
                 self.stream.fence()?;
 
                 // QK^T: [N, head_dim] @ [N, head_dim]^T → [N, N] f32 → cast f16
@@ -3851,20 +3916,7 @@ impl Qwen36Bringup {
                 self.stream.fence()?;
 
                 // Scatter out_h back into attn_out at offset h*head_dim per row.
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    use cudarc::driver::sys::*;
-                    let head_off = (h * head_dim * 2) as u64;
-                    let row_bytes = (hidden * 2) as u64;
-                    let head_bytes = (head_dim * 2) as u64;
-                    for t in 0..n_tokens {
-                        let _ = cuMemcpyDtoDAsync_v2(
-                            attn_out.device_ptr() + (t as u64) * row_bytes + head_off,
-                            out_h.device_ptr() + (t as u64) * head_bytes,
-                            head_bytes as usize, self.stream.raw() as _,
-                        );
-                    }
-                }
+                scatter_head(attn_out.device_ptr(), out_h.device_ptr(), h)?;
                 self.stream.fence()?;
             }
 
