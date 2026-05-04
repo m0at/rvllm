@@ -65,6 +65,11 @@ pub struct Qwen36OutsideKernels {
     /// in this phase — kernels/sigmoid_mul_f16.cu.
     pub sigmoid_mul_f16_mod: LoadedModule,
     pub fn_sigmoid_mul_f16: KernelFn,
+    /// Phase 4q: depthwise causal 1D convolution for the
+    /// Gated-DeltaNet linear-attn block. New CUDA kernel —
+    /// kernels/causal_conv1d_f16.cu.
+    pub causal_conv1d_f16_mod: LoadedModule,
+    pub fn_causal_conv1d_f16: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -203,6 +208,9 @@ impl Qwen36Bringup {
         let sigmoid_mul_f16_mod = kernels.load_ptx("sigmoid_mul_f16")?;
         let fn_sigmoid_mul_f16 =
             sigmoid_mul_f16_mod.get_function("sigmoid_mul_f16_kernel")?;
+        let causal_conv1d_f16_mod = kernels.load_ptx("causal_conv1d_f16")?;
+        let fn_causal_conv1d_f16 =
+            causal_conv1d_f16_mod.get_function("causal_conv1d_f16_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -220,12 +228,15 @@ impl Qwen36Bringup {
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
             fn_sigmoid_mul_f16,
+            causal_conv1d_f16_mod,
+            fn_causal_conv1d_f16,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
              rmsnorm_inplace_f16, fp8_gemv (wpr_native_f16in: {}), \
              argmax, fused_rmsnorm_fp8_quant, fused_rope_partial_f16kv, \
-             flash_attention_2_decode_f16io, sigmoid_mul_f16.",
+             flash_attention_2_decode_f16io, sigmoid_mul_f16, \
+             causal_conv1d_f16.",
             outside_kernels.fn_fp8_gemv_wpr_native_f16in.is_some(),
         );
 
@@ -300,7 +311,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4p bring-up complete: outside (incl. \
+            "[qwen36] Phase 4q bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -386,6 +397,10 @@ impl Qwen36Bringup {
         // in_proj_z). Confirms the FP8 GEMV kernel works on
         // linear-attn weight shapes.
         bringup.forward_layer0_linear_in_proj_probe()?;
+        // Phase 4q: causal_conv1d_f16 — first piece of the
+        // Gated-DeltaNet ssm-scan, runs against real layer-0
+        // conv1d weights.
+        bringup.forward_layer0_conv1d_probe()?;
 
         Ok(bringup)
     }
@@ -1868,6 +1883,124 @@ impl Qwen36Bringup {
              top_k={top_k}/{num_experts} → final[0..4]=[{:.3}, {:.3}, \
              {:.3}, {:.3}] (routed-weighted-sum + sigmoid·shared)",
             routed_sum[0], routed_sum[1], routed_sum[2], routed_sum[3],
+        );
+        Ok(())
+    }
+
+    /// Phase 4q probe: launch the new `causal_conv1d_f16_kernel`
+    /// against linear-attn layer 0's `conv1d.weight [8192, 1, 4]`.
+    /// Synthetic input chosen so the expected output is closed-form:
+    /// input is all-ones in every channel, so out[t, c] = Σ_k w[c, 0, k]
+    /// — i.e. each output equals the sum of that channel's 4 conv1d
+    /// weight values. Probes the per-channel shape + ABI + first
+    /// channel's actual weight sum.
+    pub fn forward_layer0_conv1d_probe(&self) -> Result<()> {
+        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
+            matches!(t, rvllm_loader::LayerAttnType::Linear)
+        }) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let la = match &self.model.layers[layer_idx].attn {
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(l) => l,
+            _ => return Ok(()),
+        };
+        // conv1d.shape = [channels, 1, ks] = [8192, 1, 4]
+        let channels = la.conv1d.shape[0] as u32;
+        let ks = la.conv1d.shape[2] as u32;
+        let seq_len: u32 = 1;
+
+        // Input: (seq_len + ks - 1, channels) all-ones → each output
+        // channel = sum of its `ks` weight values.
+        let one_bits = 0x3c00u16.to_le_bytes();
+        let in_elems = ((seq_len + ks - 1) as usize) * (channels as usize);
+        let mut input_bytes = Vec::with_capacity(in_elems * 2);
+        for _ in 0..in_elems {
+            input_bytes.extend_from_slice(&one_bits);
+        }
+        let in_region =
+            self.arena.region("qwen36_l0c1_in", input_bytes.len(), 16)?;
+        unsafe { in_region.copy_from_host(&input_bytes)? };
+
+        let out_bytes = (seq_len as usize) * (channels as usize) * 2;
+        let out_region = self.arena.region("qwen36_l0c1_out", out_bytes, 16)?;
+
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut output = out_region.device_ptr();
+            let mut input = in_region.device_ptr();
+            let mut weight = la.conv1d.offset_bytes;
+            let mut sl = seq_len as i32;
+            let mut ch = channels as i32;
+            let mut k = ks as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sl) as *mut i32 as *mut core::ffi::c_void,
+                (&mut ch) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid_x = (channels + block - 1) / block;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_causal_conv1d_f16.raw() as CUfunction,
+                grid_x, seq_len, 1,
+                block, 1, 1,
+                0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_l0c1 causal_conv1d_f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        self.stream.fence()?;
+
+        // DtoH first 4 channels' output + the corresponding 4 weight
+        // values for cross-check.
+        let mut out_probe = [0u8; 8];
+        let mut w_probe = [0u8; (4 * 4) * 2]; // 4 channels × 4 ks × 2 bytes
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                out_probe.as_mut_ptr() as *mut _,
+                out_region.device_ptr(),
+                out_probe.len(),
+            );
+            let _ = cuMemcpyDtoH_v2(
+                w_probe.as_mut_ptr() as *mut _,
+                la.conv1d.offset_bytes,
+                w_probe.len(),
+            );
+        }
+        let o: [f32; 4] = [
+            f16_bits_to_f32(u16::from_le_bytes([out_probe[0], out_probe[1]])),
+            f16_bits_to_f32(u16::from_le_bytes([out_probe[2], out_probe[3]])),
+            f16_bits_to_f32(u16::from_le_bytes([out_probe[4], out_probe[5]])),
+            f16_bits_to_f32(u16::from_le_bytes([out_probe[6], out_probe[7]])),
+        ];
+        // Expected: out[c] = Σ_k w[c, 0, k] for c=0..3.
+        let mut expected = [0.0f32; 4];
+        for c in 0..4 {
+            let mut s = 0.0f32;
+            for k in 0..4 {
+                let off = (c * 4 + k) * 2;
+                s += f16_bits_to_f32(u16::from_le_bytes([w_probe[off], w_probe[off + 1]]));
+            }
+            expected[c] = s;
+        }
+        eprintln!(
+            "[qwen36] forward_layer0_conv1d_probe: layer={layer_idx} \
+             channels={channels} ks={ks} seq_len={seq_len} \
+             out[0..4]={o:?} expected={expected:?}"
         );
         Ok(())
     }

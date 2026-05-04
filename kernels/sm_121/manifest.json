@@ -31,6 +31,11 @@
       "path": "cast_fp.ptx",
       "sha256": "8048461d7eb765725a6c58f4f77df3511d0c9892a9a9162cc86898e1c28225fc"
     },
+    "causal_conv1d_f16": {
+      "bytes": 8232,
+      "path": "causal_conv1d_f16.ptx",
+      "sha256": "ac5ac20ae30468b48afee780c9e5839f7562ac06133d70e5a944ecfb87b7982f"
+    },
     "embedding_gather_bf16": {
       "bytes": 4561,
       "path": "embedding_gather_bf16.ptx",
@@ -332,5 +337,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "2b27771"
+  "revision": "e2acc2f"
 }
