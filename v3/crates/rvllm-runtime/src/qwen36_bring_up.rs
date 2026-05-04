@@ -443,7 +443,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4z bring-up complete: outside (incl. \
+            "[qwen36] Phase 5a bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -561,15 +561,14 @@ impl Qwen36Bringup {
         // (cuda_worker also resets on every request).
         bringup.reset_linear_state()?;
         bringup.reset_kv_cache()?;
-        let probe_4z = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000])?;
+        let probe_5a = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000])?;
         eprintln!(
-            "[qwen36] Phase 4z forward_qwen36_decode smoke: \
-             5-token input → argmax_token_id={probe_4z} (full 40-layer \
-             loop: 30× linear-attn Gated-DeltaNet + 10× full-attn \
-             [Q/K/V proj → host gate-deinterleave → q/k_norm → \
-             RoPE + KV-cache write → FA2 paged decode → \
-             attn_output_gate → o_proj]; output still garbage until \
-             5a lands MoE forward + 5b lands multi-token prefill)"
+            "[qwen36] Phase 5a forward_qwen36_decode smoke: \
+             5-token input → argmax_token_id={probe_5a} (full 40-layer \
+             loop: 30× linear-attn + 10× full-attn + 40× MoE block \
+             [post_attn_norm → router top-8 softmax → 8 routed FFNs \
+             + shared FFN with sigmoid gate]; output still last-token-only, \
+             multi-token prefill still TODO Phase 5b)"
         );
 
         Ok(bringup)
@@ -3081,19 +3080,22 @@ impl Qwen36Bringup {
         self.stream.fence()?;
 
         // 3. Per-layer loop. Linear-attn applies the full Gated-DeltaNet
-        //    chain (Phase 4w); full-attn applies the Q/K/V → q_norm/k_norm
-        //    → RoPE+KVcache → paged FA2 → attn_output_gate → o_proj
-        //    chain (Phase 4z). MoE per layer is still TODO (Phase 5a).
+        //    chain (Phase 4w); full-attn applies Q/K/V → q/k_norm →
+        //    RoPE+KVcache → paged FA2 → attn_output_gate → o_proj
+        //    (Phase 4z). After each attn block, the layer's MoE block
+        //    (post_attn_norm + 8 routed experts + shared expert) is
+        //    applied to the residual stream (Phase 5a).
         let mut linear_seq: u32 = 0;
         let mut full_seq: u32 = 0;
         for layer_idx in 0..self.model.layers.len() {
-            match &self.model.layers[layer_idx].attn {
+            let post_attn_norm_ptr = match &self.model.layers[layer_idx].attn {
                 rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(la) => {
                     self.apply_layer_linear_attn(
                         la, linear_seq, &last_hidden_region,
                         kernel_gemv, hidden, last_hidden_bytes,
                     )?;
                     linear_seq += 1;
+                    la.post_attention_layernorm.offset_bytes
                 }
                 rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(fl) => {
                     self.apply_layer_full_attn(
@@ -3101,8 +3103,17 @@ impl Qwen36Bringup {
                         kernel_gemv, hidden, last_hidden_bytes,
                     )?;
                     full_seq += 1;
+                    fl.post_attention_layernorm.offset_bytes
                 }
-            }
+            };
+            self.apply_layer_moe(
+                &self.model.layers[layer_idx].moe,
+                post_attn_norm_ptr,
+                &last_hidden_region,
+                kernel_gemv,
+                hidden,
+                last_hidden_bytes,
+            )?;
         }
 
         // 4. Sync last_hidden_region back to hidden_region's last-token
@@ -3916,6 +3927,273 @@ impl Qwen36Bringup {
                 out_host[i * 2], out_host[i * 2 + 1],
             ]));
             residual.extend_from_slice(&f32_to_f16_bits(h + o).to_le_bytes());
+        }
+        unsafe { last_hidden_region.copy_from_host(&residual)? };
+        self.stream.fence()?;
+        Ok(())
+    }
+
+    /// Phase 5a helper: per-layer MoE block forward.
+    /// Composes post_attention_layernorm → router top-k softmax →
+    /// 8 routed FFNs (gate/up FP8 → host silu·mul → down FP8) +
+    /// shared FFN scaled by sigmoid(shared_expert_gate_logit) →
+    /// host weighted sum → residual into last_hidden.
+    /// post_attn_norm_ptr is the layer's post_attention_layernorm
+    /// weight offset (lives on the attn struct, not the moe block).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_layer_moe(
+        &self,
+        moe: &rvllm_loader::qwen36_weights::Qwen36MoeBlock,
+        post_attn_norm_ptr: u64,
+        last_hidden_region: &rvllm_mem::Region<'_>,
+        kernel_gemv: rvllm_kernels::KernelFn,
+        hidden: u32,
+        last_hidden_bytes: usize,
+    ) -> Result<()> {
+        let stream_raw = self.stream.raw() as u64;
+        let n_int = moe.experts_gate_proj_fused.shape[1] as u32; // 512
+        let k_in = moe.experts_gate_proj_fused.shape[2] as u32; // 2048
+        let n_down = moe.experts_down_proj_fused.shape[1] as u32; // 2048
+        let k_down = moe.experts_down_proj_fused.shape[2] as u32; // 512
+        let num_experts = self.arch.num_experts;
+        let top_k = self.arch.num_experts_per_tok;
+        let m: u32 = 1;
+
+        // 1. post_attention_layernorm on copy of last_hidden.
+        let normed_region =
+            self.arena.region("qwen36_pm_normed", last_hidden_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoDAsync_v2(
+                normed_region.device_ptr(),
+                last_hidden_region.device_ptr(),
+                last_hidden_bytes,
+                self.stream.raw() as _,
+            );
+        }
+        let eps = self.arch.base.rms_norm_eps;
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps,
+            }.launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                normed_region.device_ptr(),
+                post_attn_norm_ptr,
+                stream_raw,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // 2. Router top-k. Read normed input + router weights, compute
+        //    logits on host, sort top-k, softmax-normalize.
+        let hidden_us = hidden as usize;
+        let mut input_host = vec![0u8; last_hidden_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                input_host.as_mut_ptr() as *mut _,
+                normed_region.device_ptr(),
+                last_hidden_bytes,
+            );
+        }
+        let mut input_f32 = vec![0.0f32; hidden_us];
+        for i in 0..hidden_us {
+            input_f32[i] = f16_bits_to_f32(u16::from_le_bytes([
+                input_host[i * 2], input_host[i * 2 + 1],
+            ]));
+        }
+        let router_bytes = num_experts * hidden_us * 2;
+        let mut router_host = vec![0u8; router_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                router_host.as_mut_ptr() as *mut _,
+                moe.router.offset_bytes,
+                router_bytes,
+            );
+        }
+        let mut logits = vec![0.0f32; num_experts];
+        for e in 0..num_experts {
+            let row = e * hidden_us * 2;
+            let mut acc = 0.0f32;
+            for k in 0..hidden_us {
+                let bits = u16::from_le_bytes([
+                    router_host[row + k * 2],
+                    router_host[row + k * 2 + 1],
+                ]);
+                acc += f16_bits_to_f32(bits) * input_f32[k];
+            }
+            logits[e] = acc;
+        }
+        let mut indexed: Vec<(usize, f32)> =
+            logits.iter().enumerate().map(|(i, &l)| (i, l)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top: Vec<(usize, f32)> = indexed.iter().take(top_k).copied().collect();
+        let max = top.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = top.iter().map(|(_, v)| (v - max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let weights: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+
+        // 3. Routed experts: each runs gate+up FP8 → silu·mul → down FP8.
+        let mid_bytes = (n_int as usize) * 2;
+        let down_bytes = (n_down as usize) * 2;
+        let gate_region = self.arena.region("qwen36_pm_g", mid_bytes, 16)?;
+        let up_region = self.arena.region("qwen36_pm_u", mid_bytes, 16)?;
+        let silu_region = self.arena.region("qwen36_pm_s", mid_bytes, 16)?;
+        let down_region = self.arena.region("qwen36_pm_d", down_bytes, 16)?;
+        let int_per_expert_w = (n_int as u64) * (k_in as u64);
+        let int_per_expert_bs =
+            ((n_int as u64) / 128) * ((k_in as u64) / 128) * 4;
+        let down_per_expert_w = (n_down as u64) * (k_down as u64);
+        let down_per_expert_bs =
+            ((n_down as u64) / 128) * ((k_down as u64) / 128) * 4;
+        let gate_bs = match moe.experts_gate_proj_fused.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let up_bs = match moe.experts_up_proj_fused.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let down_bs = match moe.experts_down_proj_fused.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let mut routed_sum = vec![0.0f32; n_down as usize];
+        for ((e_idx, _logit), w) in top.iter().zip(weights.iter()) {
+            let e = *e_idx as u64;
+            unsafe {
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_int, k: k_in }
+                    .launch(kernel_gemv, gate_region.device_ptr(),
+                        moe.experts_gate_proj_fused.offset_bytes + e * int_per_expert_w,
+                        gate_bs + e * int_per_expert_bs,
+                        normed_region.device_ptr(), stream_raw)?;
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_int, k: k_in }
+                    .launch(kernel_gemv, up_region.device_ptr(),
+                        moe.experts_up_proj_fused.offset_bytes + e * int_per_expert_w,
+                        up_bs + e * int_per_expert_bs,
+                        normed_region.device_ptr(), stream_raw)?;
+            }
+            self.stream.fence()?;
+            let mut g_host = vec![0u8; mid_bytes];
+            let mut u_host = vec![0u8; mid_bytes];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(g_host.as_mut_ptr() as *mut _,
+                    gate_region.device_ptr(), mid_bytes);
+                let _ = cuMemcpyDtoH_v2(u_host.as_mut_ptr() as *mut _,
+                    up_region.device_ptr(), mid_bytes);
+            }
+            let mut silu_host = vec![0u8; mid_bytes];
+            for i in 0..(n_int as usize) {
+                let g = f16_bits_to_f32(u16::from_le_bytes([g_host[i * 2], g_host[i * 2 + 1]]));
+                let u = f16_bits_to_f32(u16::from_le_bytes([u_host[i * 2], u_host[i * 2 + 1]]));
+                let s = g / (1.0f32 + (-g).exp());
+                let sb = f32_to_f16_bits(s * u).to_le_bytes();
+                silu_host[i * 2] = sb[0]; silu_host[i * 2 + 1] = sb[1];
+            }
+            unsafe { silu_region.copy_from_host(&silu_host)? };
+            unsafe {
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_down, k: k_down }
+                    .launch(kernel_gemv, down_region.device_ptr(),
+                        moe.experts_down_proj_fused.offset_bytes + e * down_per_expert_w,
+                        down_bs + e * down_per_expert_bs,
+                        silu_region.device_ptr(), stream_raw)?;
+            }
+            self.stream.fence()?;
+            let mut d_host = vec![0u8; down_bytes];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(d_host.as_mut_ptr() as *mut _,
+                    down_region.device_ptr(), down_bytes);
+            }
+            for i in 0..(n_down as usize) {
+                let v = f16_bits_to_f32(u16::from_le_bytes([d_host[i * 2], d_host[i * 2 + 1]]));
+                routed_sum[i] += v * w;
+            }
+        }
+
+        // 4. Shared expert FFN scaled by sigmoid(shared_expert_gate_logit).
+        let sh_gate_bs = moe.shared_expert_gate_proj.blockscale_ptr.unwrap_or(0);
+        let sh_up_bs = moe.shared_expert_up_proj.blockscale_ptr.unwrap_or(0);
+        let sh_down_bs = moe.shared_expert_down_proj.blockscale_ptr.unwrap_or(0);
+        if sh_gate_bs != 0 && sh_up_bs != 0 && sh_down_bs != 0 {
+            unsafe {
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_int, k: k_in }
+                    .launch(kernel_gemv, gate_region.device_ptr(),
+                        moe.shared_expert_gate_proj.offset_bytes, sh_gate_bs,
+                        normed_region.device_ptr(), stream_raw)?;
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_int, k: k_in }
+                    .launch(kernel_gemv, up_region.device_ptr(),
+                        moe.shared_expert_up_proj.offset_bytes, sh_up_bs,
+                        normed_region.device_ptr(), stream_raw)?;
+            }
+            self.stream.fence()?;
+            let mut g_host = vec![0u8; mid_bytes];
+            let mut u_host = vec![0u8; mid_bytes];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(g_host.as_mut_ptr() as *mut _,
+                    gate_region.device_ptr(), mid_bytes);
+                let _ = cuMemcpyDtoH_v2(u_host.as_mut_ptr() as *mut _,
+                    up_region.device_ptr(), mid_bytes);
+            }
+            let mut silu_host = vec![0u8; mid_bytes];
+            for i in 0..(n_int as usize) {
+                let g = f16_bits_to_f32(u16::from_le_bytes([g_host[i * 2], g_host[i * 2 + 1]]));
+                let u = f16_bits_to_f32(u16::from_le_bytes([u_host[i * 2], u_host[i * 2 + 1]]));
+                let s = g / (1.0f32 + (-g).exp());
+                let sb = f32_to_f16_bits(s * u).to_le_bytes();
+                silu_host[i * 2] = sb[0]; silu_host[i * 2 + 1] = sb[1];
+            }
+            unsafe { silu_region.copy_from_host(&silu_host)? };
+            unsafe {
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_down, k: k_down }
+                    .launch(kernel_gemv, down_region.device_ptr(),
+                        moe.shared_expert_down_proj.offset_bytes, sh_down_bs,
+                        silu_region.device_ptr(), stream_raw)?;
+            }
+            self.stream.fence()?;
+            let mut sh_host = vec![0u8; down_bytes];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(sh_host.as_mut_ptr() as *mut _,
+                    down_region.device_ptr(), down_bytes);
+            }
+            let mut sh_gate_host = [0u8; 2];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    sh_gate_host.as_mut_ptr() as *mut _,
+                    moe.shared_expert_gate_logit.offset_bytes,
+                    2,
+                );
+            }
+            let g_logit = f16_bits_to_f32(u16::from_le_bytes(sh_gate_host));
+            let g_sigmoid = 1.0f32 / (1.0f32 + (-g_logit).exp());
+            for i in 0..(n_down as usize) {
+                let v = f16_bits_to_f32(u16::from_le_bytes([sh_host[i * 2], sh_host[i * 2 + 1]]));
+                routed_sum[i] += v * g_sigmoid;
+            }
+        }
+
+        // 5. Residual sum: last_hidden_new = last_hidden + moe_out.
+        let mut last_hidden_host = vec![0u8; last_hidden_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                last_hidden_host.as_mut_ptr() as *mut _,
+                last_hidden_region.device_ptr(),
+                last_hidden_bytes,
+            );
+        }
+        let mut residual = Vec::with_capacity(last_hidden_bytes);
+        for i in 0..(hidden as usize) {
+            let h = f16_bits_to_f32(u16::from_le_bytes([
+                last_hidden_host[i * 2], last_hidden_host[i * 2 + 1],
+            ]));
+            let m = routed_sum[i];
+            residual.extend_from_slice(&f32_to_f16_bits(h + m).to_le_bytes());
         }
         unsafe { last_hidden_region.copy_from_host(&residual)? };
         self.stream.fence()?;

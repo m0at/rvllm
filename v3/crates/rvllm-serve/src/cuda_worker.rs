@@ -95,12 +95,11 @@ pub async fn spawn_cuda_worker(
                     };
                     let scratch_ck = qwen.arena.checkpoint();
                     tracing::info!(
-                        "qwen36 cuda worker ready (Phase 4z: 40-layer \
-                         loop — 30 linear-attn Gated-DeltaNet + 10 \
-                         full-attn [Q/K/V proj → q/k_norm → RoPE → \
-                         FA2 paged decode → attn_output_gate → \
-                         o_proj]; output still garbage until MoE \
-                         forward + multi-token prefill land)"
+                        "qwen36 cuda worker ready (Phase 5a: 40-layer \
+                         loop with attn (linear/full) + per-layer MoE \
+                         block (top-8 routed + shared expert); output \
+                         still last-token-only, multi-token prefill \
+                         lands in Phase 5b)"
                     );
                     let _ = ready_tx.send(Ok(()));
 
