@@ -123,6 +123,11 @@ pub struct Qwen36OutsideKernels {
     pub fn_add_bias_f16: KernelFn,
     pub cast_fp_mod: LoadedModule,
     pub fn_cast_f32_to_f16: KernelFn,
+    /// Vision: GPU residual add `dst[i] += src[i]` for the
+    /// pre/post-attn and pre/post-MLP residual paths. Replaces the
+    /// earlier DtoH-add-HtoD round-trip that synced 27× per image.
+    pub vector_add_f16_mod: LoadedModule,
+    pub fn_vector_add_f16: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -335,6 +340,9 @@ impl Qwen36Bringup {
         let fn_add_bias_f16 = add_bias_f16_mod.get_function("add_bias_f16_kernel")?;
         let cast_fp_mod = kernels.load_ptx("cast_fp")?;
         let fn_cast_f32_to_f16 = cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
+        let vector_add_f16_mod = kernels.load_ptx("vector_add_f16")?;
+        let fn_vector_add_f16 =
+            vector_add_f16_mod.get_function("vector_add_f16_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -378,6 +386,8 @@ impl Qwen36Bringup {
             fn_add_bias_f16,
             cast_fp_mod,
             fn_cast_f32_to_f16,
+            vector_add_f16_mod,
+            fn_vector_add_f16,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
@@ -3881,25 +3891,40 @@ impl Qwen36Bringup {
                 f32_scratch.device_ptr(),
                 n_tokens, hidden, hidden,
             )?;
-            // Residual: hidden += proj_out (host sum, simple).
-            {
-                let bytes = n_tokens * hidden * 2;
-                let mut h_host = vec![0u8; bytes];
-                let mut p_host = vec![0u8; bytes];
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    use cudarc::driver::sys::*;
-                    let _ = cuMemcpyDtoH_v2(h_host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
-                    let _ = cuMemcpyDtoH_v2(p_host.as_mut_ptr() as *mut _, proj_out.device_ptr(), bytes);
+            // Residual: hidden += proj_out via GPU vector_add_f16
+            // (replaces the earlier DtoH-add-HtoD round-trip per
+            // block — Codex review #3 round 4 follow-up).
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let n_elem = (n_tokens * hidden) as i32;
+                let mut d = hidden_region.device_ptr();
+                let mut s = proj_out.device_ptr();
+                let mut nn = n_elem;
+                let args = [
+                    (&mut d) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_vector_add_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: vector_add (attn residual) launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
                 }
-                for i in 0..(n_tokens * hidden) {
-                    let h = f16_bits_to_f32(u16::from_le_bytes([h_host[i*2], h_host[i*2+1]]));
-                    let p = f16_bits_to_f32(u16::from_le_bytes([p_host[i*2], p_host[i*2+1]]));
-                    let s = f32_to_f16_bits(h + p).to_le_bytes();
-                    h_host[i*2] = s[0]; h_host[i*2+1] = s[1];
-                }
-                unsafe { hidden_region.copy_from_host(&h_host)? };
             }
+            self.stream.fence()?;
 
             // Block 0 dump: after attention residual (= input + attn_out).
             if blk_idx == 0 {
@@ -3990,25 +4015,38 @@ impl Qwen36Bringup {
                 f32_scratch.device_ptr(),
                 n_tokens, hidden, intermediate,
             )?;
-            // Residual: hidden += mlp_out (host)
-            {
-                let bytes = n_tokens * hidden * 2;
-                let mut h_host = vec![0u8; bytes];
-                let mut m_host = vec![0u8; bytes];
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    use cudarc::driver::sys::*;
-                    let _ = cuMemcpyDtoH_v2(h_host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
-                    let _ = cuMemcpyDtoH_v2(m_host.as_mut_ptr() as *mut _, mlp_out.device_ptr(), bytes);
+            // Residual: hidden += mlp_out via GPU vector_add_f16.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let n_elem = (n_tokens * hidden) as i32;
+                let mut d = hidden_region.device_ptr();
+                let mut s = mlp_out.device_ptr();
+                let mut nn = n_elem;
+                let args = [
+                    (&mut d) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_vector_add_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: vector_add (mlp residual) launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
                 }
-                for i in 0..(n_tokens * hidden) {
-                    let h = f16_bits_to_f32(u16::from_le_bytes([h_host[i*2], h_host[i*2+1]]));
-                    let m = f16_bits_to_f32(u16::from_le_bytes([m_host[i*2], m_host[i*2+1]]));
-                    let s = f32_to_f16_bits(h + m).to_le_bytes();
-                    h_host[i*2] = s[0]; h_host[i*2+1] = s[1];
-                }
-                unsafe { hidden_region.copy_from_host(&h_host)? };
             }
+            self.stream.fence()?;
 
             // Block 0 sub-step dump (post-attn-residual, post-mlp-residual).
             if blk_idx == 0 {

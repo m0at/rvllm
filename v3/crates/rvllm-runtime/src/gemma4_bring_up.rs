@@ -5541,28 +5541,42 @@ impl Gemma4Bringup {
             Ok(())
         };
 
-        let host_residual_add = |dst: u64, src: u64| -> Result<()> {
-            // hidden = hidden + src (per-element). DtoH-add-HtoD; same
-            // pattern as forward_qwen_vision.
-            let bytes = n_tokens * HIDDEN * 2;
-            let mut h_host = vec![0u8; bytes];
-            let mut s_host = vec![0u8; bytes];
+        // GPU-side residual add: dst[i] += src[i] in f16. Replaces the
+        // earlier DtoH-add-HtoD pattern which round-tripped 2400×1152
+        // f16 (~5.5 MB) over UMA twice per residual (54× per image)
+        // and serialised the entire vision forward on the host. Codex
+        // review #3 round 4 follow-up.
+        let device_residual_add = |dst: u64, src: u64| -> Result<()> {
+            let n_elem = (n_tokens * HIDDEN) as i32;
             #[cfg(feature = "cuda")]
             unsafe {
-                let _ = cuMemcpyDtoH_v2(h_host.as_mut_ptr() as *mut _, dst, bytes);
-                let _ = cuMemcpyDtoH_v2(s_host.as_mut_ptr() as *mut _, src, bytes);
+                let mut d = dst;
+                let mut s = src;
+                let mut nn = n_elem;
+                let args = [
+                    (&mut d) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut s) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    self.fused.fn_vector_add.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: vector_add (residual) launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
-            for i in 0..(n_tokens * HIDDEN) {
-                let h = half::f16::from_bits(u16::from_le_bytes([h_host[i * 2], h_host[i * 2 + 1]])).to_f32();
-                let s = half::f16::from_bits(u16::from_le_bytes([s_host[i * 2], s_host[i * 2 + 1]])).to_f32();
-                let out = half::f16::from_f32(h + s).to_le_bytes();
-                h_host[i * 2] = out[0];
-                h_host[i * 2 + 1] = out[1];
-            }
-            #[cfg(feature = "cuda")]
-            unsafe {
-                let _ = cuMemcpyHtoD_v2(dst, h_host.as_ptr() as *const _, bytes);
-            }
+            self.stream.fence()?;
             Ok(())
         };
 
@@ -5971,7 +5985,7 @@ impl Gemma4Bringup {
                 n_tokens, HIDDEN)?;
 
             // hidden = hidden + proj_out (residual_attn).
-            host_residual_add(hidden_region.device_ptr(), proj_out.device_ptr())?;
+            device_residual_add(hidden_region.device_ptr(), proj_out.device_ptr())?;
 
             // === FFN sub-block (sandwich norm) ============================
             // residual_ffn = hidden;
@@ -6039,7 +6053,7 @@ impl Gemma4Bringup {
                 n_tokens, HIDDEN)?;
 
             // hidden = hidden + mlp_d (residual_ffn).
-            host_residual_add(hidden_region.device_ptr(), mlp_d.device_ptr())?;
+            device_residual_add(hidden_region.device_ptr(), mlp_d.device_ptr())?;
         }
 
 
