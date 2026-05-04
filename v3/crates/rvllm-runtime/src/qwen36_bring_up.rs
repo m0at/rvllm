@@ -443,7 +443,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4u bring-up complete: outside (incl. \
+            "[qwen36] Phase 4v bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -550,6 +550,20 @@ impl Qwen36Bringup {
         bringup.linear_state_cache_probe()?;
         // Phase 4u: paged KV cache for full-attn layers.
         bringup.kv_cache_probe()?;
+
+        // Phase 4v: end-to-end smoke that threads real hidden state
+        // through layer 0's linear-attn in/out projections + final
+        // norm + lm_head + argmax. Token output is garbage by design
+        // (degenerate composition between in_proj and out_proj), but
+        // proves per-layer FP8 kernels run on the production decode
+        // path's actual hidden buffer instead of synthetic inputs.
+        let probe_4v = bringup.forward_qwen36_layer0_real(&[1, 200, 2000, 20_000, 50_000])?;
+        eprintln!(
+            "[qwen36] Phase 4v forward_qwen36_layer0_real smoke: \
+             5-token input → argmax_token_id={probe_4v} (garbage by \
+             design — degenerate layer-0 composition, full 40-layer \
+             chain still TODO)"
+        );
 
         Ok(bringup)
     }
@@ -2961,6 +2975,414 @@ impl Qwen36Bringup {
             la.norm.shape, la.out_proj.shape,
         );
         Ok(())
+    }
+
+    /// Phase 4v: experimental forward path that threads the embedded
+    /// hidden state through ONE real linear-attn layer (layer 0)
+    /// before the lm_head closer. First time per-layer kernels run
+    /// against the production decode path's actual hidden state
+    /// (not synthetic probe input).
+    ///
+    /// Output is still expected to be wrong: the math approximation
+    /// in the linear-attn chain is unverified, only one layer fires
+    /// (39 layers skipped), positions aren't threaded, the
+    /// state-cache uses the persistent layer-0 slot but never
+    /// updates the per-token position. Phase 4w+ tightens against
+    /// vLLM. Goal here: prove the per-layer kernels can consume the
+    /// real hidden buffer that comes out of `embedding_gather` and
+    /// feed `fused_rmsnorm_fp8_quant + cublaslt.fp8_gemm + argmax`.
+    pub fn forward_qwen36_layer0_real(
+        &self,
+        token_ids: &[i32],
+    ) -> Result<i32> {
+        if token_ids.is_empty() {
+            return Err(rvllm_core::RvllmError::cuda(
+                "forward_qwen36_layer0_real: empty token_ids",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let hidden = self.arch.base.hidden_size as u32;
+        let vocab = self.arch.base.vocab_size as u32;
+        let num_tokens = token_ids.len() as u32;
+        let last_idx = (num_tokens - 1) as usize;
+        let stream_raw = self.stream.raw() as u64;
+
+        // 1. Token IDs + embed_gather → hidden_region [num_tokens, hidden] f16.
+        let mut tok_bytes = Vec::with_capacity(token_ids.len() * 4);
+        for t in token_ids {
+            tok_bytes.extend_from_slice(&t.to_le_bytes());
+        }
+        let tok_region =
+            self.arena.region("qwen36_pl_tok", tok_bytes.len(), 16)?;
+        unsafe { tok_region.copy_from_host(&tok_bytes)? };
+        let hidden_bytes = (num_tokens as usize) * (hidden as usize) * 2;
+        let hidden_region =
+            self.arena.region("qwen36_pl_hidden", hidden_bytes, 16)?;
+        unsafe {
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens,
+                hidden,
+                vocab,
+            }
+            .launch(
+                self.outside_kernels.fn_embedding_gather_f16,
+                hidden_region.device_ptr(),
+                self.model.outside.embed_tokens.offset_bytes,
+                tok_region.device_ptr(),
+                stream_raw,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // 2. Apply layer 0 (linear-attn) on the LAST token of the
+        //    embedded hidden state. We DtoH-read just the last token's
+        //    `hidden` f16 values, run them through the host-side
+        //    pieces of the linear-attn chain (Phase 4s logic) using
+        //    the real hidden as `in_region` for the FP8 GEMVs, and
+        //    DtoD-write the final out_proj output back over the last
+        //    token's slot in `hidden_region`. Residual is implicit
+        //    (we overwrite the slot with `embed + delta`-style sum
+        //    by host-summing before the writeback).
+        let layer_idx = 0usize;
+        let la = match &self.model.layers[layer_idx].attn {
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(l) => l,
+            _ => {
+                eprintln!("[qwen36] forward_qwen36_layer0_real: layer 0 not linear, skipping per-layer step");
+                // Fall through to outside-only closer.
+                return self.forward_qwen36_outside_closer(
+                    &hidden_region,
+                    num_tokens,
+                    hidden,
+                    vocab,
+                    last_idx,
+                );
+            }
+        };
+        let kernel_gemv = match self.outside_kernels.fn_fp8_gemv_wpr_native_f16in {
+            Some(k) => k,
+            None => {
+                return self.forward_qwen36_outside_closer(
+                    &hidden_region,
+                    num_tokens,
+                    hidden,
+                    vocab,
+                    last_idx,
+                );
+            }
+        };
+
+        // last-token hidden slice: a [hidden] f16 region we feed into
+        // the linear-attn chain.
+        let last_hidden_bytes = (hidden as usize) * 2;
+        let last_hidden_region =
+            self.arena.region("qwen36_pl_last", last_hidden_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let last_off = (last_idx as u64) * (last_hidden_bytes as u64);
+            let _ = cuMemcpyDtoDAsync_v2(
+                last_hidden_region.device_ptr(),
+                hidden_region.device_ptr() + last_off,
+                last_hidden_bytes,
+                self.stream.raw() as _,
+            );
+        }
+        self.stream.fence()?;
+
+        let qkv_n = la.in_proj_qkv.shape[0] as u32;
+        let z_n = la.in_proj_z.shape[0] as u32;
+        let out_n = la.out_proj.shape[0] as u32;
+        let out_k = la.out_proj.shape[1] as u32;
+        let m: u32 = 1;
+        let qkv_bs = match la.in_proj_qkv.blockscale_ptr {
+            Some(p) => p,
+            None => {
+                return self.forward_qwen36_outside_closer(
+                    &hidden_region,
+                    num_tokens,
+                    hidden,
+                    vocab,
+                    last_idx,
+                );
+            }
+        };
+        let z_bs = match la.in_proj_z.blockscale_ptr {
+            Some(p) => p,
+            None => {
+                return self.forward_qwen36_outside_closer(
+                    &hidden_region,
+                    num_tokens,
+                    hidden,
+                    vocab,
+                    last_idx,
+                );
+            }
+        };
+        let out_bs = match la.out_proj.blockscale_ptr {
+            Some(p) => p,
+            None => {
+                return self.forward_qwen36_outside_closer(
+                    &hidden_region,
+                    num_tokens,
+                    hidden,
+                    vocab,
+                    last_idx,
+                );
+            }
+        };
+
+        let qkv_region = self.arena.region(
+            "qwen36_pl_qkv",
+            (qkv_n as usize) * 2,
+            16,
+        )?;
+        let z_region = self.arena.region(
+            "qwen36_pl_z",
+            (z_n as usize) * 2,
+            16,
+        )?;
+        let out_region = self.arena.region(
+            "qwen36_pl_out",
+            (out_n as usize) * 2,
+            16,
+        )?;
+
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m,
+                n: qkv_n,
+                k: hidden,
+            }
+            .launch(
+                kernel_gemv,
+                qkv_region.device_ptr(),
+                la.in_proj_qkv.offset_bytes,
+                qkv_bs,
+                last_hidden_region.device_ptr(),
+                stream_raw,
+            )?;
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m,
+                n: z_n,
+                k: hidden,
+            }
+            .launch(
+                kernel_gemv,
+                z_region.device_ptr(),
+                la.in_proj_z.offset_bytes,
+                z_bs,
+                last_hidden_region.device_ptr(),
+                stream_raw,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // For the smoke we collapse the SSM scan into a no-op (state
+        // already zero-init from `reset_linear_state`, K=V from the
+        // current step → S = β·K·V, then readout = Q·S = Q·β·K·V).
+        // We just compute the post-norm + sigmoid·z chain via host
+        // and feed the gated readout into out_proj — this is the
+        // SAME chain Phase 4s ran, but with the input region
+        // replaced by `last_hidden_region` (real embed, not
+        // synthetic). Math correctness is approximate; goal is
+        // production-path coverage, not numerical match.
+        // For the closer, route the out_proj output as the last
+        // token's new hidden slot (residual sum on host).
+        let mut last_hidden_host = vec![0u8; last_hidden_bytes];
+        let mut out_host = vec![0u8; (out_n as usize) * 2];
+        // Take qkv host, run a degenerate "Q · K · V" → out_proj
+        // input by simply re-using qkv first 4096 bytes as the
+        // input to out_proj (out_k=4096). This is wrong math but
+        // exercises every step. Phase 4w+ replaces this with the
+        // real chain.
+        let mut qkv_host = vec![0u8; (qkv_n as usize) * 2];
+        let mut z_host = vec![0u8; (z_n as usize) * 2];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                qkv_host.as_mut_ptr() as *mut _,
+                qkv_region.device_ptr(),
+                qkv_host.len(),
+            );
+            let _ = cuMemcpyDtoH_v2(
+                z_host.as_mut_ptr() as *mut _,
+                z_region.device_ptr(),
+                z_host.len(),
+            );
+            let _ = cuMemcpyDtoH_v2(
+                last_hidden_host.as_mut_ptr() as *mut _,
+                last_hidden_region.device_ptr(),
+                last_hidden_bytes,
+            );
+        }
+        // Build out_proj input: silu(qkv[..4096]) · sigmoid(z[..4096])
+        // (degenerate; the real chain would route Q·S·norm·sigmoid(z)
+        // through out_proj). Phase 4w replaces this with the real
+        // ssm-scan + readout.
+        let out_in_n = out_k as usize; // 4096
+        let mut out_in = Vec::with_capacity(out_in_n * 2);
+        for i in 0..out_in_n {
+            let q = f16_bits_to_f32(u16::from_le_bytes([
+                qkv_host[i * 2],
+                qkv_host[i * 2 + 1],
+            ]));
+            let z = f16_bits_to_f32(u16::from_le_bytes([
+                z_host[i * 2],
+                z_host[i * 2 + 1],
+            ]));
+            let s = q / (1.0f32 + (-q).exp()); // silu(q)
+            let g = 1.0f32 / (1.0f32 + (-z).exp()); // sigmoid(z)
+            out_in.extend_from_slice(&f32_to_f16_bits(s * g).to_le_bytes());
+        }
+        let out_in_region =
+            self.arena.region("qwen36_pl_oi", out_in.len(), 16)?;
+        unsafe { out_in_region.copy_from_host(&out_in)? };
+        unsafe {
+            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                m,
+                n: out_n,
+                k: out_k,
+            }
+            .launch(
+                kernel_gemv,
+                out_region.device_ptr(),
+                la.out_proj.offset_bytes,
+                out_bs,
+                out_in_region.device_ptr(),
+                stream_raw,
+            )?;
+        }
+        self.stream.fence()?;
+
+        // Residual sum: last_hidden_new = last_hidden_old + out_proj_out.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                out_host.as_mut_ptr() as *mut _,
+                out_region.device_ptr(),
+                out_host.len(),
+            );
+        }
+        let mut residual = Vec::with_capacity(last_hidden_bytes);
+        for i in 0..(hidden as usize) {
+            let h = f16_bits_to_f32(u16::from_le_bytes([
+                last_hidden_host[i * 2],
+                last_hidden_host[i * 2 + 1],
+            ]));
+            let o = f16_bits_to_f32(u16::from_le_bytes([
+                out_host[i * 2],
+                out_host[i * 2 + 1],
+            ]));
+            residual.extend_from_slice(&f32_to_f16_bits(h + o).to_le_bytes());
+        }
+        // Write residual back into hidden_region's last-token slot.
+        unsafe { last_hidden_region.copy_from_host(&residual)? };
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let last_off = (last_idx as u64) * (last_hidden_bytes as u64);
+            let _ = cuMemcpyDtoDAsync_v2(
+                hidden_region.device_ptr() + last_off,
+                last_hidden_region.device_ptr(),
+                last_hidden_bytes,
+                self.stream.raw() as _,
+            );
+        }
+        self.stream.fence()?;
+
+        // 3. Final norm + lm_head + argmax (outside-only closer).
+        self.forward_qwen36_outside_closer(
+            &hidden_region,
+            num_tokens,
+            hidden,
+            vocab,
+            last_idx,
+        )
+    }
+
+    /// Helper: shared closer for `forward_outside_only` and the
+    /// Phase-4v experimental path. Takes a `hidden_region` already
+    /// populated with f16 hidden state and returns the argmax token
+    /// id over the last token's lm_head logits.
+    fn forward_qwen36_outside_closer(
+        &self,
+        hidden_region: &rvllm_mem::Region<'_>,
+        num_tokens: u32,
+        hidden: u32,
+        vocab: u32,
+        last_idx: usize,
+    ) -> Result<i32> {
+        let eps = self.arch.base.rms_norm_eps;
+        let hidden_fp8_bytes = (num_tokens as usize) * (hidden as usize);
+        let hidden_scale_bytes = (num_tokens as usize) * 4;
+        let logits_bytes = (num_tokens as usize) * (vocab as usize) * 2;
+        let hidden_fp8_region = self
+            .arena
+            .region("qwen36_pl_h_fp8", hidden_fp8_bytes, 16)?;
+        let hidden_scale_region = self
+            .arena
+            .region("qwen36_pl_h_scale", hidden_scale_bytes, 16)?;
+        let logits_region = self.arena.region("qwen36_pl_logits", logits_bytes, 16)?;
+        let stream_raw = self.stream.raw() as u64;
+        unsafe {
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_fused_rmsnorm_fp8_quant,
+                hidden_fp8_region.device_ptr(),
+                hidden_scale_region.device_ptr(),
+                hidden_region.device_ptr(),
+                self.model.outside.final_norm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+        #[cfg(feature = "cuda")]
+        unsafe {
+            self.cublaslt.fp8_gemm(
+                hidden_fp8_region.device_ptr(),
+                self.model.outside.lm_head_fp8.offset_bytes,
+                logits_region.device_ptr(),
+                num_tokens as i32,
+                vocab as i32,
+                hidden as i32,
+                hidden_scale_region.device_ptr(),
+                self.model.outside.lm_head_fp8.scale_ptr,
+                stream_raw,
+            )?;
+        }
+        self.stream.fence()?;
+        let logits_row_bytes = (vocab as usize) * 2;
+        let last_off = (last_idx as u64) * (logits_row_bytes as u64);
+        let mut logits_row_f16 = vec![0u8; logits_row_bytes];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                logits_row_f16.as_mut_ptr() as *mut _,
+                logits_region.device_ptr() + last_off,
+                logits_row_bytes,
+            );
+        }
+        let mut best_logit = f32::NEG_INFINITY;
+        let mut best_token: i32 = -1;
+        for v in 0..vocab as usize {
+            let bits = u16::from_le_bytes([
+                logits_row_f16[v * 2],
+                logits_row_f16[v * 2 + 1],
+            ]);
+            let l = f16_bits_to_f32(bits);
+            if l > best_logit {
+                best_logit = l;
+                best_token = v as i32;
+            }
+        }
+        Ok(best_token)
     }
 
     pub fn forward_outside_smoke(&self) -> Result<()> {

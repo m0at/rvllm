@@ -95,9 +95,11 @@ pub async fn spawn_cuda_worker(
                     };
                     let scratch_ck = qwen.arena.checkpoint();
                     tracing::info!(
-                        "qwen36 cuda worker ready (Phase 4b: outside-only \
-                         forward — output is garbage until Phase 4c lands \
-                         per-layer math)"
+                        "qwen36 cuda worker ready (Phase 4v: layer-0 \
+                         linear-attn in/out projections threaded through \
+                         real hidden state + final norm + lm_head — \
+                         output still garbage until full 40-layer chain \
+                         lands)"
                     );
                     let _ = ready_tx.send(Ok(()));
 
@@ -131,7 +133,7 @@ pub async fn spawn_cuda_worker(
                             .iter()
                             .map(|&t| t as i32)
                             .collect();
-                        match qwen.forward_outside_only(&i32_tokens) {
+                        match qwen.forward_qwen36_layer0_real(&i32_tokens) {
                             Ok(next_token) => {
                                 let id = if next_token < 0 { 0u32 } else { next_token as u32 };
                                 let _ = req.events_tx.blocking_send(GenerateEvent::Token {
@@ -146,7 +148,7 @@ pub async fn spawn_cuda_worker(
                             }
                             Err(e) => {
                                 let _ = req.events_tx.blocking_send(GenerateEvent::Error(
-                                    format!("qwen36 forward_outside_only: {e:?}"),
+                                    format!("qwen36 forward_qwen36_layer0_real: {e:?}"),
                                 ));
                             }
                         }
