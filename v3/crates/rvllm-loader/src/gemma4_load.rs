@@ -611,6 +611,36 @@ where
         })
     };
 
+    // GemmaRMSNorm convention: HF stores `weight` centered at 0 and the
+    // forward applies `_norm(x) * (1.0 + weight)`. Our rmsnorm_inplace
+    // kernel multiplies directly by gamma, so vision-side norm gammas
+    // need `+1` baked in at upload time. Codex review (#2) flagged the
+    // raw `upload` was wrong for these. The text-side path of *this*
+    // checkpoint happens to look pre-shifted in the FP8-block dump
+    // (mean ≈ 4.88), but the vision-side gammas in the same dump are
+    // not (mean ≈ 2.66, min ≈ -4.47) — i.e. centered around 0 with the
+    // shift not applied. Bake +1 here so the kernel sees `(1+gamma)`.
+    let upload_with_bias = |name: &'static str, hf_name: &str, bias: f32| -> Result<F16Weight> {
+        let (si, e) = must_get(hf_name)?;
+        let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        if bias != 0.0 {
+            let n = buf.len() / 2;
+            for i in 0..n {
+                let bits = u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
+                let v = half::f16::from_bits(bits).to_f32() + bias;
+                let out = half::f16::from_f32(v).to_le_bytes();
+                buf[2 * i] = out[0];
+                buf[2 * i + 1] = out[1];
+            }
+        }
+        let region = arena.region(name, buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        Ok(F16Weight {
+            offset_bytes: region.device_ptr(),
+            shape: e.shape.clone(),
+        })
+    };
+
     let started = std::time::Instant::now();
     let patch_embedder_input_proj = upload(
         "g4v_pe_proj",
@@ -630,6 +660,12 @@ where
     let mut blocks = Vec::with_capacity(27);
     for i in 0..27 {
         let p = |s: &str| format!("model.vision_tower.encoder.layers.{i}.{s}");
+        // NB: in this FP8-block dump the vision norm gammas are already
+        // pre-shifted (i.e. the stored value IS `1 + gamma_centered`),
+        // even though the negative min looks like centered-at-0 storage.
+        // Empirical test: switching these to upload_with_bias(.., 1.0)
+        // (Codex review #2) made the encoder output diverge so badly
+        // the model answered 'Ich sehe kein Bild'. Keep raw.
         let input_layernorm_w = upload("g4v_inln", &p("input_layernorm.weight"))?;
         let post_attention_layernorm_w =
             upload("g4v_paln", &p("post_attention_layernorm.weight"))?;
