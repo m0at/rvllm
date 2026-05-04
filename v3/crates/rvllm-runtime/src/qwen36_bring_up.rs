@@ -689,7 +689,7 @@ impl Qwen36Bringup {
         bringup.reset_linear_state()?;
         bringup.reset_kv_cache()?;
         bringup.reset_conv_state()?;
-        let probe_5d = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000], 0)?;
+        let probe_5d = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000], 0, &[])?;
         eprintln!(
             "[qwen36] Phase 5d forward_qwen36_decode smoke: 5-token \
              input → argmax_token_id={probe_5d} (linear-attn rewritten \
@@ -3919,6 +3919,7 @@ impl Qwen36Bringup {
         &self,
         token_ids: &[i32],
         start_position: u32,
+        vision_splice: &[(usize, &[u8])],
     ) -> Result<i32> {
         if token_ids.is_empty() {
             return Err(rvllm_core::RvllmError::cuda(
@@ -3960,6 +3961,39 @@ impl Qwen36Bringup {
             )?;
         }
         self.stream.fence()?;
+
+        // Phase 4d vision splice: overwrite the placeholder-token
+        // slots in hidden_region with the per-image vision-tower
+        // embeddings. Each entry: (token_start_in_prompt, raw f16
+        // bytes for [num_tokens, hidden_dim] = num_tokens * hidden * 2
+        // bytes). The token_start is in PROMPT coordinates; we splice
+        // only when start_position == 0 (i.e. prefill, when the full
+        // prompt is in this hidden_region).
+        if !vision_splice.is_empty() && start_position == 0 {
+            let row_bytes = (hidden as usize) * 2;
+            for (token_start, emb_bytes) in vision_splice {
+                let dst_off = (*token_start as u64) * (row_bytes as u64);
+                let len = emb_bytes.len();
+                if *token_start + len / row_bytes > num_tokens as usize {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision splice would overrun hidden_region",
+                        rvllm_core::CudaErrorKind::Other,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyHtoDAsync_v2(
+                        hidden_region.device_ptr() + dst_off,
+                        emb_bytes.as_ptr() as *const _,
+                        len,
+                        self.stream.raw() as _,
+                    );
+                }
+            }
+            self.stream.fence()?;
+        }
 
         // 2. Set up last_hidden_region (the only buffer the per-layer
         //    chain operates on). Each linear-attn layer reads from

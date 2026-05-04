@@ -182,6 +182,175 @@ impl TokenizerHandle {
         self.inner.bos_token_id
     }
 
+    /// Vision-aware variant of [`render_chat`]. For each image in
+    /// `vision_items` (in document order), replaces the chat-template's
+    /// single `<|image_pad|>` placeholder token with
+    /// `vision_items[i].num_tokens` copies, and returns the per-image
+    /// `(token_start, num_tokens)` slots so the caller can splice
+    /// vision-tower output into the post-embed hidden buffer.
+    ///
+    /// Qwen 3.6 specifically: image_pad token id = 248056. Gemma 4
+    /// uses a different placeholder; that path is added when Gemma
+    /// vision lands (Phase 3).
+    pub fn render_chat_with_vision(
+        &self,
+        messages: &[crate::openai::chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+        vision_items: &[crate::worker::VisionItem],
+    ) -> Result<(Vec<u32>, Vec<VisionSlot>), ApiError> {
+        // Render via the existing template path. Build per-message
+        // content as a typed list when image parts are present, so the
+        // Jinja `{%- if 'image' in item %}` branch fires and emits the
+        // `<|vision_start|><|image_pad|><|vision_end|>` tokens.
+        use crate::openai::chat::{ChatContent, ChatContentPart};
+
+        let mut env = Environment::new();
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_template("chat", &self.inner.chat_template)
+            .map_err(|e| ApiError::Tokenize(format!("chat template parse: {e}")))?;
+        let tpl = env
+            .get_template("chat")
+            .map_err(|e| ApiError::Internal(format!("get template: {e}")))?;
+
+        let normalized_tool_calls: Vec<Option<serde_json::Value>> = messages
+            .iter()
+            .map(|m| m.tool_calls.as_ref().map(normalize_tool_calls))
+            .collect();
+        // Per-message content: serde_json::Value carrying either a
+        // string (text-only) or a list of dicts (mixed).
+        let contents: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| match m.content.as_ref() {
+                None => serde_json::Value::String(String::new()),
+                Some(ChatContent::Text(s)) => serde_json::Value::String(s.clone()),
+                Some(ChatContent::Parts(parts)) => {
+                    if parts.iter().all(|p| matches!(p, ChatContentPart::Text { .. })) {
+                        serde_json::Value::String(m.content_text())
+                    } else {
+                        let arr: Vec<serde_json::Value> = parts
+                            .iter()
+                            .filter_map(|p| match p {
+                                ChatContentPart::Text { text } => Some(serde_json::json!({
+                                    "type": "text",
+                                    "text": text
+                                })),
+                                ChatContentPart::Image { image_url } => Some(serde_json::json!({
+                                    "type": "image",
+                                    "image": image_url.url,
+                                    "image_url": { "url": image_url.url }
+                                })),
+                                ChatContentPart::Other { .. } => None,
+                            })
+                            .collect();
+                        serde_json::Value::Array(arr)
+                    }
+                }
+            })
+            .collect();
+        let serde_msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .zip(contents.iter())
+            .zip(normalized_tool_calls.iter())
+            .map(|((m, content), tc)| {
+                let mut obj = serde_json::Map::new();
+                obj.insert(
+                    "role".into(),
+                    serde_json::Value::String(
+                        match m.role {
+                            Role::System => "system",
+                            Role::User => "user",
+                            Role::Assistant => "assistant",
+                            Role::Tool => "tool",
+                        }
+                        .into(),
+                    ),
+                );
+                obj.insert("content".into(), content.clone());
+                if let Some(tc) = tc.as_ref() {
+                    obj.insert("tool_calls".into(), tc.clone());
+                }
+                if let Some(tcid) = m.tool_call_id.as_deref() {
+                    obj.insert("tool_call_id".into(), serde_json::Value::String(tcid.into()));
+                }
+                if let Some(name) = m.name.as_deref() {
+                    obj.insert("name".into(), serde_json::Value::String(name.into()));
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+
+        let rendered = tpl
+            .render(context! {
+                messages => serde_msgs,
+                bos_token => self.inner.bos_token_str.as_deref().unwrap_or(""),
+                add_generation_prompt => true,
+                tools => tools,
+                enable_thinking => false,
+            })
+            .map_err(|e| ApiError::Tokenize(format!("chat template render: {e}")))?;
+
+        let enc = self
+            .inner
+            .tokenizer
+            .encode(rendered, true)
+            .map_err(|e| ApiError::Tokenize(format!("{e}")))?;
+        let raw_ids = enc.get_ids().to_vec();
+
+        // Locate each `<|image_pad|>` token (Qwen: 248056) and expand
+        // it to `vision_items[i].num_tokens` copies in document order.
+        const QWEN_IMAGE_PAD: u32 = 248056;
+        let mut expanded: Vec<u32> = Vec::with_capacity(
+            raw_ids.len()
+                + vision_items
+                    .iter()
+                    .map(|v| v.num_tokens.saturating_sub(1))
+                    .sum::<usize>(),
+        );
+        let mut slots: Vec<VisionSlot> = Vec::with_capacity(vision_items.len());
+        let mut next_image = 0usize;
+        for tok in &raw_ids {
+            if *tok == QWEN_IMAGE_PAD {
+                let item = vision_items.get(next_image).ok_or_else(|| {
+                    ApiError::Tokenize(format!(
+                        "more <|image_pad|> tokens in template than vision items \
+                         ({} found, {} provided)",
+                        next_image + 1,
+                        vision_items.len()
+                    ))
+                })?;
+                let n = item.num_tokens;
+                if n == 0 {
+                    return Err(ApiError::Tokenize(
+                        "vision item with num_tokens=0".into(),
+                    ));
+                }
+                let token_start = expanded.len();
+                expanded.extend(std::iter::repeat(QWEN_IMAGE_PAD).take(n));
+                slots.push(VisionSlot {
+                    token_start,
+                    num_tokens: n,
+                    vision_item_idx: next_image,
+                });
+                next_image += 1;
+            } else {
+                expanded.push(*tok);
+            }
+        }
+        if next_image != vision_items.len() {
+            return Err(ApiError::Tokenize(format!(
+                "fewer <|image_pad|> tokens in template ({}) than vision items ({})",
+                next_image,
+                vision_items.len()
+            )));
+        }
+        tracing::debug!(
+            prompt_tokens = expanded.len(),
+            num_images = vision_items.len(),
+            "render_chat_with_vision: tokenized + expanded image placeholders"
+        );
+        Ok((expanded, slots))
+    }
+
     /// Render the chat template around `messages` and return prompt
     /// token IDs (BOS already included via the template).
     pub fn render_chat(
@@ -374,6 +543,16 @@ struct TemplateMsg<'a> {
     tool_call_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
+}
+
+/// One vision slot in the rendered prompt. Aligns to a contiguous run
+/// of `num_tokens` placeholder tokens that the cuda_worker overwrites
+/// with the vision-tower output for `vision_item_idx`.
+#[derive(Debug, Clone, Copy)]
+pub struct VisionSlot {
+    pub token_start: usize,
+    pub num_tokens: usize,
+    pub vision_item_idx: usize,
 }
 
 fn extract_token_str(cfg: &serde_json::Value, key: &str) -> Option<String> {

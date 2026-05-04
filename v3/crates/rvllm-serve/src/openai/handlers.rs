@@ -418,33 +418,48 @@ pub async fn chat_completions(
         ));
     }
 
-    let prompt_ids = state.tokenizer.render_chat(&req.messages, req.tools.as_ref())?;
+    // Phase 4c: walk messages for image_url parts, fetch + predict
+    // num_tokens. If any are present, render via the vision-aware
+    // path so placeholder tokens get expanded and slots tracked.
+    let vision_items = collect_vision_items(&req.messages)?;
+    let (prompt_ids, vision_slots) = if vision_items.is_empty() {
+        (
+            state.tokenizer.render_chat(&req.messages, req.tools.as_ref())?,
+            Vec::new(),
+        )
+    } else {
+        let (ids, slots) = state.tokenizer.render_chat_with_vision(
+            &req.messages,
+            req.tools.as_ref(),
+            &vision_items,
+        )?;
+        tracing::info!(
+            num_images = vision_items.len(),
+            total_vision_tokens = vision_items.iter().map(|v| v.num_tokens).sum::<usize>(),
+            prompt_tokens = ids.len(),
+            "vision: rendered chat with placeholder expansion"
+        );
+        (ids, slots)
+    };
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
 
-    // Dump prompt_tokens count + first 32 IDs for the request. The
-    // full prompt_ids are stored in the `_request.json` dump's
-    // `messages` array, reconstructable via `render_chat()`.
     dump_write(&request_id, "prompt_tokens", &serde_json::json!({
         "prompt_tokens": prompt_ids.len(),
         "first_32_prompt_ids": &prompt_ids[..prompt_ids.len().min(32)],
         "last_32_prompt_ids": &prompt_ids[prompt_ids.len().saturating_sub(32)..],
+        "num_images": vision_items.len(),
     }));
 
-    // Channel + cancellation. Buffer 64 tokens before worker blocks —
-    // enough to absorb a slow client without starving the GPU.
     let (events_tx, events_rx) = mpsc::channel::<GenerateEvent>(64);
     let cancelled = Arc::new(AtomicBool::new(false));
-    // Drop guard fires on any handler exit (normal, error, client
-    // disconnect mid-non-stream) and flips `cancelled`. SSE path
-    // has its own Ctx::Drop, so don't arm this one on the streaming
-    // branch.
     let gen_req = GenerateRequest {
         request_id,
         prompt_ids: prompt_ids.clone(),
         sampling,
         max_new_tokens: max_new,
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
-        vision_items: Vec::new(),
+        vision_items,
+        vision_slots,
         events_tx,
         cancelled: cancelled.clone(),
     };
@@ -1444,6 +1459,7 @@ pub async fn completions(
         max_new_tokens: max_new,
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         vision_items: Vec::new(),
+        vision_slots: Vec::new(),
         events_tx,
         cancelled: cancelled.clone(),
     };
@@ -1970,6 +1986,52 @@ fn resolve_max_new(requested: Option<u32>, cap: u32) -> ApiResult<u32> {
         ));
     }
     Ok(m)
+}
+
+/// Walk all chat messages, fetch every `image_url` content part via
+/// the vision_fetch helper, build a Vec<VisionItem> in document order.
+fn collect_vision_items(
+    messages: &[crate::openai::chat::ChatMessage],
+) -> ApiResult<Vec<crate::worker::VisionItem>> {
+    use crate::openai::vision_fetch::{fetch_image, predict_qwen_num_tokens, VisionError};
+    let mut items = Vec::new();
+    for (mi, m) in messages.iter().enumerate() {
+        let Some(content) = m.content.as_ref() else { continue };
+        for img in content.image_urls() {
+            let (bytes, w, h) = fetch_image(&img.url).map_err(|e| match e {
+                VisionError::FetchTimeout => ApiError::invalid_param(
+                    format!("messages[{mi}].image_url fetch timeout"),
+                    "messages",
+                    "image_fetch_timeout",
+                ),
+                VisionError::TooLarge(g, m) => ApiError::invalid_param(
+                    format!("messages[{mi}].image_url too large ({g}/{m} bytes)"),
+                    "messages",
+                    "image_too_large",
+                ),
+                other => ApiError::invalid_param(
+                    format!("messages[{mi}].image_url failed: {other}"),
+                    "messages",
+                    "image_fetch_failed",
+                ),
+            })?;
+            let num_tokens = predict_qwen_num_tokens(w, h);
+            tracing::info!(
+                msg_idx = mi,
+                width = w,
+                height = h,
+                num_tokens,
+                "vision: image fetched + tokens predicted"
+            );
+            items.push(crate::worker::VisionItem {
+                bytes,
+                width: w,
+                height: h,
+                num_tokens,
+            });
+        }
+    }
+    Ok(items)
 }
 
 fn reject_oversized_prompt(

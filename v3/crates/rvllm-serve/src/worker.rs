@@ -29,9 +29,13 @@ pub struct GenerateRequest {
     /// Vision attachments (one per `image_url` content part). Empty
     /// for text-only requests. The worker runs the native vision
     /// tower forward on each image's bytes, then splices the
-    /// resulting embeddings into the post-embed hidden buffer at
-    /// the `placeholder_token_start` slot.
+    /// resulting embeddings into the post-embed hidden buffer.
     pub vision_items: Vec<VisionItem>,
+    /// Per-image (token_start, num_tokens) slots in `prompt_ids`,
+    /// aligned to `vision_items` by index. The worker overwrites
+    /// `hidden_region[slot.token_start .. slot.token_start + slot.num_tokens]`
+    /// with the vision-tower output for `vision_items[slot.vision_item_idx]`.
+    pub vision_slots: Vec<crate::tokenize::VisionSlot>,
 }
 
 /// One image attached to a chat request.
@@ -39,16 +43,10 @@ pub struct VisionItem {
     pub bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    /// Number of placeholder tokens reserved in `prompt_ids` for this
-    /// image (= post-PatchMerger embedding count, predicted host-side
-    /// from image dims so the chat-template render knows how many
-    /// `<|image_pad|>` to emit).
+    /// Number of placeholder tokens this image takes in `prompt_ids`
+    /// (= post-PatchMerger embedding count, predicted host-side from
+    /// image dims). Actual splice slots live in `vision_slots`.
     pub num_tokens: usize,
-    /// Token offset (within `prompt_ids`) of the FIRST placeholder
-    /// token for this image. The worker overwrites
-    /// `hidden_region[token_start .. token_start + num_tokens]` with
-    /// the vision-tower output.
-    pub token_start: usize,
 }
 
 /// Events produced by the worker, consumed by the handler for
@@ -230,6 +228,7 @@ mod tests {
                 events_tx: tx,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 vision_items: Vec::new(),
+                vision_slots: Vec::new(),
             })
             .await
             .expect("submit");
@@ -271,6 +270,7 @@ mod tests {
                 events_tx: tx,
                 cancelled: cancel.clone(),
                 vision_items: Vec::new(),
+                vision_slots: Vec::new(),
             })
             .await
             .expect("submit");

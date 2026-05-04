@@ -131,9 +131,60 @@ pub async fn spawn_cuda_worker(
                             .map(|&t| t as i32)
                             .collect();
 
+                        // Vision pre-pass: run native ViT forward on
+                        // each image. Outputs accumulate per slot for
+                        // splicing during the prefill embed step.
+                        let mut vision_outputs: Vec<rvllm_runtime::qwen36_bring_up::VisionForwardOutput> =
+                            Vec::with_capacity(req.vision_items.len());
+                        let mut vision_failed = false;
+                        for (i, item) in req.vision_items.iter().enumerate() {
+                            match qwen.forward_qwen_vision(&item.bytes) {
+                                Ok(out) => {
+                                    if out.num_tokens != item.num_tokens {
+                                        let _ = req.events_tx.blocking_send(
+                                            GenerateEvent::Error(format!(
+                                                "vision tokens mismatch: predicted {} got {}",
+                                                item.num_tokens, out.num_tokens
+                                            )),
+                                        );
+                                        vision_failed = true;
+                                        break;
+                                    }
+                                    tracing::info!(
+                                        idx = i,
+                                        tokens = out.num_tokens,
+                                        hidden = out.hidden_dim,
+                                        "vision: ViT forward done"
+                                    );
+                                    vision_outputs.push(out);
+                                }
+                                Err(e) => {
+                                    let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                                        format!("vision forward: {e:?}"),
+                                    ));
+                                    vision_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if vision_failed {
+                            unsafe { qwen.arena.restore(scratch_ck); }
+                            continue;
+                        }
+
                         // Prefill: feed full prompt at start_position=0.
+                        // For each vision slot, build (token_start,
+                        // embedding bytes) tuple — the splice happens
+                        // inside forward_qwen36_decode after embed_gather.
+                        let vision_splice: Vec<(usize, &[u8])> = req
+                            .vision_slots
+                            .iter()
+                            .map(|s| {
+                                (s.token_start, vision_outputs[s.vision_item_idx].data.as_slice())
+                            })
+                            .collect();
                         let mut next_token = match qwen
-                            .forward_qwen36_decode(&prompt_i32, 0)
+                            .forward_qwen36_decode(&prompt_i32, 0, &vision_splice)
                         {
                             Ok(t) => t,
                             Err(e) => {
@@ -168,7 +219,7 @@ pub async fn spawn_cuda_worker(
                             // Decode step: feed just this token at
                             // start_position = prompt_len + step.
                             let pos = prompt_len + step;
-                            match qwen.forward_qwen36_decode(&[next_token], pos) {
+                            match qwen.forward_qwen36_decode(&[next_token], pos, &[]) {
                                 Ok(t) => next_token = t,
                                 Err(e) => {
                                     let _ = req.events_tx.blocking_send(GenerateEvent::Error(
