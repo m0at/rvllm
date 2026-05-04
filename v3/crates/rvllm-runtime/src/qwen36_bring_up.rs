@@ -108,6 +108,10 @@ pub struct Qwen36OutsideKernels {
     /// kernels/vit_pos_embed_interp_f16.cu.
     pub vit_pos_embed_interp_f16_mod: LoadedModule,
     pub fn_vit_pos_embed_interp_f16: KernelFn,
+    /// Vision: scalar in-place scale on f16 (used for the
+    /// 1/sqrt(head_dim) attention-score scale).
+    pub scale_inplace_f16_mod: LoadedModule,
+    pub fn_scale_inplace_f16: KernelFn,
     /// Vision helpers (also used elsewhere in the codebase): in-place
     /// per-row bias add (tensor[t,d] += bias[d]) and f32→f16 cast.
     pub add_bias_f16_mod: LoadedModule,
@@ -316,6 +320,9 @@ impl Qwen36Bringup {
         let vit_pos_embed_interp_f16_mod = kernels.load_ptx("vit_pos_embed_interp_f16")?;
         let fn_vit_pos_embed_interp_f16 = vit_pos_embed_interp_f16_mod
             .get_function("vit_pos_embed_interp_f16_kernel")?;
+        let scale_inplace_f16_mod = kernels.load_ptx("scale_inplace_f16")?;
+        let fn_scale_inplace_f16 =
+            scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
         let add_bias_f16_mod = kernels.load_ptx("add_bias_f16")?;
         let fn_add_bias_f16 = add_bias_f16_mod.get_function("add_bias_f16_kernel")?;
         let cast_fp_mod = kernels.load_ptx("cast_fp")?;
@@ -355,6 +362,8 @@ impl Qwen36Bringup {
             fn_vit_avgpool_f16,
             vit_pos_embed_interp_f16_mod,
             fn_vit_pos_embed_interp_f16,
+            scale_inplace_f16_mod,
+            fn_scale_inplace_f16,
             add_bias_f16_mod,
             fn_add_bias_f16,
             cast_fp_mod,
@@ -3633,13 +3642,34 @@ impl Qwen36Bringup {
                 }
                 self.stream.fence()?;
 
-                // Apply scale via scaling the f16 scores in-place (a
-                // small overhead we'll fold into Q-pre-scale next pass).
-                // For now: we trust that cos*Q and Q*scale commutes — but
-                // the simpler route is just to skip explicit scaling here
-                // and accept un-scaled scores. That breaks softmax. We'll
-                // do an explicit scale-and-softmax instead:
-                let _ = scale;
+                // Apply the standard 1/sqrt(head_dim) attention scale
+                // to the f16 scores in place before softmax. (Without
+                // this, softmax becomes degenerate — one token wins
+                // ~all attention — and patches stop mixing, which
+                // produces image-content-blind ViT output.)
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut x = scores_buf.device_ptr();
+                    let mut s = scale;
+                    let mut nn = (n_tokens * n_tokens) as i32;
+                    let args = [
+                        (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut s) as *mut f32 as *mut core::ffi::c_void,
+                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid = ((nn as u32 + block - 1) / block, 1u32, 1u32);
+                    let _ = cuLaunchKernel(
+                        self.outside_kernels.fn_scale_inplace_f16.raw() as CUfunction,
+                        grid.0, grid.1, grid.2,
+                        block, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                self.stream.fence()?;
 
                 // Softmax row-wise on scores [N, N]
                 #[cfg(feature = "cuda")]
