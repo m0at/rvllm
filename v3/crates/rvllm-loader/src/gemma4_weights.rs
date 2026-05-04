@@ -88,4 +88,59 @@ pub struct Gemma4LoadedModel {
     pub rope_cos_global: F16Weight,
     pub rope_sin_global: F16Weight,
     pub layers: Vec<Gemma4LayerWeights>,
+    /// Vision tower (SigLIP-style ViT) for Gemma 4 multimodal.
+    /// `None` for text-only checkpoints.
+    pub vision: Option<Gemma4Vision>,
+}
+
+// ─── Vision (Gemma 4 SigLIP-style ViT) ────────────────────────────────
+
+/// Geometry (verified via state-dict):
+/// - patch_embedder.input_proj.weight: [1152, 768] (16² * 3 → hidden=1152)
+/// - patch_embedder.position_embedding_table: [2, 10240, 1152] f16
+///   (axis 0 indexes row vs col, axis 1 picks position 0..10239)
+/// - 27 encoder layers, each carries:
+///     input_layernorm.weight (RMSNorm, Gemma-style +1 shift)
+///     post_attention_layernorm.weight
+///     pre_feedforward_layernorm.weight
+///     post_feedforward_layernorm.weight
+///     self_attn.q_proj.linear.weight [1152, 1152] (NO bias; attention_bias=False)
+///     self_attn.k_proj.linear.weight [1152, 1152]
+///     self_attn.v_proj.linear.weight [1152, 1152]
+///     self_attn.o_proj.linear.weight [1152, 1152]
+///     self_attn.q_norm.weight [72] (per-head RMSNorm, Gemma-style +1)
+///     self_attn.k_norm.weight [72]
+///     mlp.gate_proj.linear.weight [4304, 1152]
+///     mlp.up_proj.linear.weight   [4304, 1152]
+///     mlp.down_proj.linear.weight [1152, 4304]
+/// - std_bias, std_scale: [1152] applied after the encoder output,
+///   before the embed_vision projection (Gemma vision_config
+///   `standardize=True`).
+/// - embed_vision.embedding_projection.weight: [5376, 1152]
+///   post-pool linear from vision-hidden to text-hidden.
+#[derive(Debug)]
+pub struct Gemma4Vision {
+    pub patch_embedder_input_proj: F16Weight, // [1152, 768]
+    pub patch_embedder_pos_table: F16Weight,  // [2, 10240, 1152]
+    pub blocks: Vec<Gemma4VisionBlock>,
+    pub std_bias: F16Weight,                   // [1152]
+    pub std_scale: F16Weight,                  // [1152]
+    pub embed_vision_projection: F16Weight,    // [5376, 1152]
+}
+
+#[derive(Debug)]
+pub struct Gemma4VisionBlock {
+    pub input_layernorm_w: F16Weight,
+    pub post_attention_layernorm_w: F16Weight,
+    pub pre_feedforward_layernorm_w: F16Weight,
+    pub post_feedforward_layernorm_w: F16Weight,
+    pub q_proj_w: F16Weight,
+    pub k_proj_w: F16Weight,
+    pub v_proj_w: F16Weight,
+    pub o_proj_w: F16Weight,
+    pub q_norm_w: F16Weight, // [72]
+    pub k_norm_w: F16Weight, // [72]
+    pub gate_proj_w: F16Weight,
+    pub up_proj_w: F16Weight,
+    pub down_proj_w: F16Weight,
 }

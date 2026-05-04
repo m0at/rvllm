@@ -565,6 +565,15 @@ pub fn load_gemma4_model(
         });
     }
 
+    // Gemma 4 vision tower (SigLIP-style ViT). Optional: only loaded
+    // if `model.vision_tower.*` tensors exist in the checkpoint.
+    let vision = load_gemma_vision(arena, &must_get, &bytes_of, model_dir).ok();
+    if vision.is_some() {
+        eprintln!("[gemma4-loader] vision tower loaded (27 SigLIP-style blocks + patch_embedder + multimodal projector)");
+    } else {
+        eprintln!("[gemma4-loader] vision tower SKIPPED (no model.vision_tower.* tensors)");
+    }
+
     Ok(Gemma4LoadedModel {
         embedding,
         lm_head_fp8,
@@ -575,6 +584,97 @@ pub fn load_gemma4_model(
         rope_cos_global,
         rope_sin_global,
         layers,
+        vision,
+    })
+}
+
+fn load_gemma_vision<'a, F1, F2>(
+    arena: &HbmArena,
+    must_get: &F1,
+    bytes_of: &F2,
+    model_dir: &std::path::Path,
+) -> Result<crate::gemma4_weights::Gemma4Vision>
+where
+    F1: Fn(&str) -> Result<(usize, TensorEntry)>,
+    F2: Fn(usize, &TensorEntry) -> &'a [u8],
+{
+    use crate::gemma4_weights::{Gemma4Vision, Gemma4VisionBlock};
+
+    let upload = |name: &'static str, hf_name: &str| -> Result<F16Weight> {
+        let (si, e) = must_get(hf_name)?;
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let region = arena.region(name, buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        Ok(F16Weight {
+            offset_bytes: region.device_ptr(),
+            shape: e.shape.clone(),
+        })
+    };
+
+    let started = std::time::Instant::now();
+    let patch_embedder_input_proj = upload(
+        "g4v_pe_proj",
+        "model.vision_tower.patch_embedder.input_proj.weight",
+    )?;
+    let patch_embedder_pos_table = upload(
+        "g4v_pe_pos",
+        "model.vision_tower.patch_embedder.position_embedding_table",
+    )?;
+    let std_bias = upload("g4v_std_bias", "model.vision_tower.std_bias")?;
+    let std_scale = upload("g4v_std_scale", "model.vision_tower.std_scale")?;
+    let embed_vision_projection = upload(
+        "g4v_embed_proj",
+        "model.embed_vision.embedding_projection.weight",
+    )?;
+
+    let mut blocks = Vec::with_capacity(27);
+    for i in 0..27 {
+        let p = |s: &str| format!("model.vision_tower.encoder.layers.{i}.{s}");
+        let input_layernorm_w = upload("g4v_inln", &p("input_layernorm.weight"))?;
+        let post_attention_layernorm_w =
+            upload("g4v_paln", &p("post_attention_layernorm.weight"))?;
+        let pre_feedforward_layernorm_w =
+            upload("g4v_pffln", &p("pre_feedforward_layernorm.weight"))?;
+        let post_feedforward_layernorm_w =
+            upload("g4v_pofln", &p("post_feedforward_layernorm.weight"))?;
+        let q_proj_w = upload("g4v_q_w", &p("self_attn.q_proj.linear.weight"))?;
+        let k_proj_w = upload("g4v_k_w", &p("self_attn.k_proj.linear.weight"))?;
+        let v_proj_w = upload("g4v_v_w", &p("self_attn.v_proj.linear.weight"))?;
+        let o_proj_w = upload("g4v_o_w", &p("self_attn.o_proj.linear.weight"))?;
+        let q_norm_w = upload("g4v_qn", &p("self_attn.q_norm.weight"))?;
+        let k_norm_w = upload("g4v_kn", &p("self_attn.k_norm.weight"))?;
+        let gate_proj_w = upload("g4v_gp", &p("mlp.gate_proj.linear.weight"))?;
+        let up_proj_w = upload("g4v_up", &p("mlp.up_proj.linear.weight"))?;
+        let down_proj_w = upload("g4v_dp", &p("mlp.down_proj.linear.weight"))?;
+        blocks.push(Gemma4VisionBlock {
+            input_layernorm_w,
+            post_attention_layernorm_w,
+            pre_feedforward_layernorm_w,
+            post_feedforward_layernorm_w,
+            q_proj_w,
+            k_proj_w,
+            v_proj_w,
+            o_proj_w,
+            q_norm_w,
+            k_norm_w,
+            gate_proj_w,
+            up_proj_w,
+            down_proj_w,
+        });
+    }
+
+    eprintln!(
+        "[gemma4-loader] vision: 27 blocks + patch_embedder + std_scale/bias \
+         + embed_vision_projection in {:.1}s",
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(Gemma4Vision {
+        patch_embedder_input_proj,
+        patch_embedder_pos_table,
+        blocks,
+        std_bias,
+        std_scale,
+        embed_vision_projection,
     })
 }
 
@@ -1478,6 +1578,10 @@ fn load_gemma4_awq_model_inner(
         rope_cos_global,
         rope_sin_global,
         layers,
+        // AWQ path (Cycle 48): vision tower not loaded for AWQ
+        // checkpoints; vision is FP16/BF16 in the standard fp8-block
+        // checkpoint and currently unused on the AWQ path.
+        vision: None,
     })
 }
 
