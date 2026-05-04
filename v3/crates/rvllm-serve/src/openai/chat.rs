@@ -221,30 +221,17 @@ impl ChatContent {
     }
 
     /// Walk the parts array (if any) and return the first part type
-    /// we cannot render. Today: text + image_url are accepted; any
-    /// other type returns its kind string for a clean 400.
+    /// we cannot render as text. Used by the request validator to
+    /// 400 cleanly on `image_url` etc. Returns `None` for plain-string
+    /// content or all-text parts.
     pub fn first_unsupported_part_type(&self) -> Option<&str> {
         match self {
             ChatContent::Text(_) => None,
             ChatContent::Parts(parts) => parts.iter().find_map(|p| match p {
                 ChatContentPart::Text { .. } => None,
-                ChatContentPart::Image { .. } => None,
                 ChatContentPart::Other { kind } => Some(kind.as_str()),
             }),
         }
-    }
-
-    /// Iterate all `image_url` parts in order. Empty for plain-string
-    /// content or for parts arrays without any image.
-    pub fn image_urls(&self) -> impl Iterator<Item = &ImageUrl> {
-        let parts: &[ChatContentPart] = match self {
-            ChatContent::Text(_) => &[],
-            ChatContent::Parts(parts) => parts,
-        };
-        parts.iter().filter_map(|p| match p {
-            ChatContentPart::Image { image_url } => Some(image_url),
-            _ => None,
-        })
     }
 }
 
@@ -277,29 +264,17 @@ impl<'de> Deserialize<'de> for ChatContent {
     }
 }
 
-/// One element of a content-parts array. `text` is rendered into the
-/// chat template directly; `image_url` carries an image (data: URI or
-/// http(s) URL) that gets sent to the vision sidecar; any other type
-/// is captured as [`ChatContentPart::Other`] so the request validator
-/// can 400 with the actual unsupported type string.
+/// One element of a content-parts array. The `text` shape is the
+/// only one we render today; any other `type` is captured as
+/// [`ChatContentPart::Other`] so the request validator can 400 with
+/// the actual unsupported type string in the payload, rather than
+/// the request failing JSON-parse with a generic "unknown variant".
 #[derive(Debug)]
 pub enum ChatContentPart {
     /// `{"type":"text","text":"..."}`.
     Text { text: String },
-    /// `{"type":"image_url","image_url":{"url":"data:..."|"https://..."}}`.
-    /// OpenAI's `detail` field is parsed but currently ignored — sidecar
-    /// always runs the model's native processor (which sets resolution).
-    Image { image_url: ImageUrl },
     /// `{"type":"<anything>", ...}` — kind captured for validation.
     Other { kind: String },
-}
-
-/// `image_url` field of an `image_url` content part.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct ImageUrl {
-    pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
 }
 
 impl serde::Serialize for ChatContentPart {
@@ -310,12 +285,6 @@ impl serde::Serialize for ChatContentPart {
                 let mut m = s.serialize_map(Some(2))?;
                 m.serialize_entry("type", "text")?;
                 m.serialize_entry("text", text)?;
-                m.end()
-            }
-            ChatContentPart::Image { image_url } => {
-                let mut m = s.serialize_map(Some(2))?;
-                m.serialize_entry("type", "image_url")?;
-                m.serialize_entry("image_url", image_url)?;
                 m.end()
             }
             ChatContentPart::Other { kind } => {
@@ -344,14 +313,6 @@ impl<'de> Deserialize<'de> for ChatContentPart {
                     })?
                     .to_string();
                 Ok(ChatContentPart::Text { text })
-            }
-            "image_url" => {
-                let img = v.get("image_url").ok_or_else(|| {
-                    serde::de::Error::custom("image_url content part is missing `image_url`")
-                })?;
-                let image_url: ImageUrl =
-                    serde_json::from_value(img.clone()).map_err(serde::de::Error::custom)?;
-                Ok(ChatContentPart::Image { image_url })
             }
             other => Ok(ChatContentPart::Other { kind: other.to_string() }),
         }

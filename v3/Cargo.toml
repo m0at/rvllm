@@ -58,8 +58,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 bytes = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
-base64 = "0.22"
 
 [profile.release]
 lto = "fat"
