@@ -443,7 +443,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 5a bring-up complete: outside (incl. \
+            "[qwen36] Phase 5b bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -561,14 +561,14 @@ impl Qwen36Bringup {
         // (cuda_worker also resets on every request).
         bringup.reset_linear_state()?;
         bringup.reset_kv_cache()?;
-        let probe_5a = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000])?;
+        let probe_5b = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000])?;
         eprintln!(
-            "[qwen36] Phase 5a forward_qwen36_decode smoke: \
-             5-token input → argmax_token_id={probe_5a} (full 40-layer \
-             loop: 30× linear-attn + 10× full-attn + 40× MoE block \
-             [post_attn_norm → router top-8 softmax → 8 routed FFNs \
-             + shared FFN with sigmoid gate]; output still last-token-only, \
-             multi-token prefill still TODO Phase 5b)"
+            "[qwen36] Phase 5b forward_qwen36_decode smoke: \
+             5-token input → argmax_token_id={probe_5b} (full 40-layer \
+             loop now wrapped in outer per-token loop — model sees full \
+             prompt context: linear-attn state + KV cache accumulate \
+             monotonically across positions; multi-token decode loop + \
+             real sampling still TODO Phase 5c)"
         );
 
         Ok(bringup)
@@ -3066,71 +3066,78 @@ impl Qwen36Bringup {
 
         let last_hidden_region =
             self.arena.region("qwen36_pl_last", last_hidden_bytes, 16)?;
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let last_off = (last_idx as u64) * (last_hidden_bytes as u64);
-            let _ = cuMemcpyDtoDAsync_v2(
-                last_hidden_region.device_ptr(),
-                hidden_region.device_ptr() + last_off,
-                last_hidden_bytes,
-                self.stream.raw() as _,
-            );
-        }
-        self.stream.fence()?;
 
-        // 3. Per-layer loop. Linear-attn applies the full Gated-DeltaNet
-        //    chain (Phase 4w); full-attn applies Q/K/V → q/k_norm →
-        //    RoPE+KVcache → paged FA2 → attn_output_gate → o_proj
-        //    (Phase 4z). After each attn block, the layer's MoE block
-        //    (post_attn_norm + 8 routed experts + shared expert) is
-        //    applied to the residual stream (Phase 5a).
-        let mut linear_seq: u32 = 0;
-        let mut full_seq: u32 = 0;
-        for layer_idx in 0..self.model.layers.len() {
-            let post_attn_norm_ptr = match &self.model.layers[layer_idx].attn {
-                rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(la) => {
-                    self.apply_layer_linear_attn(
-                        la, linear_seq, &last_hidden_region,
-                        kernel_gemv, hidden, last_hidden_bytes,
-                    )?;
-                    linear_seq += 1;
-                    la.post_attention_layernorm.offset_bytes
-                }
-                rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(fl) => {
-                    self.apply_layer_full_attn(
-                        fl, full_seq, &last_hidden_region,
-                        kernel_gemv, hidden, last_hidden_bytes,
-                    )?;
-                    full_seq += 1;
-                    fl.post_attention_layernorm.offset_bytes
-                }
-            };
-            self.apply_layer_moe(
-                &self.model.layers[layer_idx].moe,
-                post_attn_norm_ptr,
-                &last_hidden_region,
-                kernel_gemv,
-                hidden,
-                last_hidden_bytes,
-            )?;
-        }
+        // Phase 5b: outer per-token loop. For each prompt token in
+        // order: extract its embed from hidden_region into
+        // last_hidden_region, run all 40 layers (linear-attn updates
+        // its persistent state, full-attn writes K/V at slot=position
+        // and attends causally over [0..position]), apply MoE, write
+        // updated hidden back to hidden_region's slot for the closer.
+        // The recurrent linear-attn state + monotonically-growing KV
+        // cache mean each token sees full prompt context by the time
+        // we hit the last position.
+        for tok_pos in 0..num_tokens {
+            // Extract token tok_pos's hidden into last_hidden_region.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let off = (tok_pos as u64) * (last_hidden_bytes as u64);
+                let _ = cuMemcpyDtoDAsync_v2(
+                    last_hidden_region.device_ptr(),
+                    hidden_region.device_ptr() + off,
+                    last_hidden_bytes,
+                    self.stream.raw() as _,
+                );
+            }
+            self.stream.fence()?;
 
-        // 4. Sync last_hidden_region back to hidden_region's last-token
-        //    slot so the closer's RMSNorm + lm_head sees the post-loop
-        //    hidden state.
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let last_off = (last_idx as u64) * (last_hidden_bytes as u64);
-            let _ = cuMemcpyDtoDAsync_v2(
-                hidden_region.device_ptr() + last_off,
-                last_hidden_region.device_ptr(),
-                last_hidden_bytes,
-                self.stream.raw() as _,
-            );
+            let mut linear_seq: u32 = 0;
+            let mut full_seq: u32 = 0;
+            for layer_idx in 0..self.model.layers.len() {
+                let post_attn_norm_ptr = match &self.model.layers[layer_idx].attn {
+                    rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(la) => {
+                        self.apply_layer_linear_attn(
+                            la, linear_seq, &last_hidden_region,
+                            kernel_gemv, hidden, last_hidden_bytes,
+                        )?;
+                        linear_seq += 1;
+                        la.post_attention_layernorm.offset_bytes
+                    }
+                    rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(fl) => {
+                        self.apply_layer_full_attn(
+                            fl, full_seq, tok_pos,
+                            &last_hidden_region,
+                            kernel_gemv, hidden, last_hidden_bytes,
+                        )?;
+                        full_seq += 1;
+                        fl.post_attention_layernorm.offset_bytes
+                    }
+                };
+                self.apply_layer_moe(
+                    &self.model.layers[layer_idx].moe,
+                    post_attn_norm_ptr,
+                    &last_hidden_region,
+                    kernel_gemv, hidden, last_hidden_bytes,
+                )?;
+            }
+
+            // Write this token's transformed hidden back to its slot
+            // in hidden_region. Only the last token's slot is read by
+            // the closer, but we write all so a future multi-token
+            // logit reader (training/eval path) just works.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let off = (tok_pos as u64) * (last_hidden_bytes as u64);
+                let _ = cuMemcpyDtoDAsync_v2(
+                    hidden_region.device_ptr() + off,
+                    last_hidden_region.device_ptr(),
+                    last_hidden_bytes,
+                    self.stream.raw() as _,
+                );
+            }
+            self.stream.fence()?;
         }
-        self.stream.fence()?;
 
         // 5. Final norm + lm_head + argmax (outside-only closer).
         self.forward_qwen36_outside_closer(
@@ -3597,17 +3604,18 @@ impl Qwen36Bringup {
         Ok(())
     }
 
-    /// Phase 4z helper: full-attention layer forward on last token.
-    /// Composes input_layernorm → q/k/v_proj → host-deinterleave Q+gate
-    /// → q/k_norm → RoPE + KV-cache write → paged FA2 decode →
-    /// sigmoid_mul gate → o_proj → residual sum into last_hidden.
-    /// Single-token (position 0, slot 0, context_len 1); multi-token
-    /// prefill is Phase 5b.
+    /// Phase 4z/5b helper: full-attention layer forward on a single
+    /// token at `position` (0-indexed). Composes input_layernorm →
+    /// q/k/v_proj → host-deinterleave Q+gate → q/k_norm → RoPE +
+    /// KV-cache write at slot=position → paged FA2 decode with
+    /// context_len=position+1 (causal) → sigmoid_mul gate → o_proj →
+    /// residual sum into last_hidden.
     #[allow(clippy::too_many_arguments)]
     fn apply_layer_full_attn(
         &self,
         fl: &rvllm_loader::qwen36_weights::Qwen36FullAttnLayer,
         full_seq_idx: u32,
+        position: u32,
         last_hidden_region: &rvllm_mem::Region<'_>,
         kernel_gemv: rvllm_kernels::KernelFn,
         hidden: u32,
@@ -3744,12 +3752,12 @@ impl Qwen36Bringup {
         let half = (self.kv_cache_layer_bytes / 2) as u64;
         let k_cache_layer_ptr = kv_layer_ptr;
         let v_cache_layer_ptr = kv_layer_ptr + half;
-        let zero_i32 = 0i32.to_le_bytes();
+        let pos_bytes = (position as i32).to_le_bytes();
         let pos_region = self.arena.region("qwen36_pf_pos", 4, 16)?;
         let slot_region = self.arena.region("qwen36_pf_slot", 4, 16)?;
         unsafe {
-            pos_region.copy_from_host(&zero_i32)?;
-            slot_region.copy_from_host(&zero_i32)?;
+            pos_region.copy_from_host(&pos_bytes)?;
+            slot_region.copy_from_host(&pos_bytes)?;
         }
         #[cfg(feature = "cuda")]
         unsafe {
@@ -3795,13 +3803,15 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
-        // 6. Paged FA2 decode. block_tables=[0], context_lens=[1].
+        // 6. Paged FA2 decode. block_tables=[block_idx for position],
+        //    context_lens=[position+1] (causal — attend to all prior).
+        let block_idx = (position / self.kv_cache_block_size) as i32;
+        let context_len = (position as i32) + 1;
         let bt_region = self.arena.region("qwen36_pf_bt", 4, 16)?;
         let cl_region = self.arena.region("qwen36_pf_cl", 4, 16)?;
-        let one_i32 = 1i32.to_le_bytes();
         unsafe {
-            bt_region.copy_from_host(&zero_i32)?;
-            cl_region.copy_from_host(&one_i32)?;
+            bt_region.copy_from_host(&block_idx.to_le_bytes())?;
+            cl_region.copy_from_host(&context_len.to_le_bytes())?;
         }
         let attn_out_region =
             self.arena.region("qwen36_pf_attn_out", q_size * 2, 16)?;

@@ -95,11 +95,12 @@ pub async fn spawn_cuda_worker(
                     };
                     let scratch_ck = qwen.arena.checkpoint();
                     tracing::info!(
-                        "qwen36 cuda worker ready (Phase 5a: 40-layer \
-                         loop with attn (linear/full) + per-layer MoE \
-                         block (top-8 routed + shared expert); output \
-                         still last-token-only, multi-token prefill \
-                         lands in Phase 5b)"
+                        "qwen36 cuda worker ready (Phase 5b: \
+                         multi-token prefill — model sees full prompt \
+                         context. Linear-attn state + KV cache \
+                         accumulate causally across all prompt \
+                         positions; multi-step decode + sampling are \
+                         Phase 5c)"
                     );
                     let _ = ready_tx.send(Ok(()));
 
