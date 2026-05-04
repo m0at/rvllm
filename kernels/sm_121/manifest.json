@@ -231,6 +231,11 @@
       "path": "fused_silu_fp8_quant.ptx",
       "sha256": "2595692666794dff86f5666ec520d1ff6e8bf2b4f1f2c5cd56c492e46e91749e"
     },
+    "gated_delta_state_update_f16": {
+      "bytes": 7864,
+      "path": "gated_delta_state_update_f16.ptx",
+      "sha256": "e2a0f2f1112912353f23f6d7e11a259da1a0150be67b4665fde5d80b004dbacc"
+    },
     "hadamard_unrotate_f16": {
       "bytes": 2818,
       "path": "hadamard_unrotate_f16.ptx",
@@ -337,5 +342,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "e2acc2f"
+  "revision": "c48d30e"
 }

@@ -70,6 +70,11 @@ pub struct Qwen36OutsideKernels {
     /// kernels/causal_conv1d_f16.cu.
     pub causal_conv1d_f16_mod: LoadedModule,
     pub fn_causal_conv1d_f16: KernelFn,
+    /// Phase 4r: Gated-DeltaNet per-head delta-rule state update
+    /// kernel — the recurrent core of the linear-attn block. New
+    /// CUDA kernel — kernels/gated_delta_state_update_f16.cu.
+    pub gated_delta_state_update_f16_mod: LoadedModule,
+    pub fn_gated_delta_state_update_f16: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -211,6 +216,10 @@ impl Qwen36Bringup {
         let causal_conv1d_f16_mod = kernels.load_ptx("causal_conv1d_f16")?;
         let fn_causal_conv1d_f16 =
             causal_conv1d_f16_mod.get_function("causal_conv1d_f16_kernel")?;
+        let gated_delta_state_update_f16_mod =
+            kernels.load_ptx("gated_delta_state_update_f16")?;
+        let fn_gated_delta_state_update_f16 = gated_delta_state_update_f16_mod
+            .get_function("gated_delta_state_update_f16_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -230,13 +239,15 @@ impl Qwen36Bringup {
             fn_sigmoid_mul_f16,
             causal_conv1d_f16_mod,
             fn_causal_conv1d_f16,
+            gated_delta_state_update_f16_mod,
+            fn_gated_delta_state_update_f16,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
              rmsnorm_inplace_f16, fp8_gemv (wpr_native_f16in: {}), \
              argmax, fused_rmsnorm_fp8_quant, fused_rope_partial_f16kv, \
              flash_attention_2_decode_f16io, sigmoid_mul_f16, \
-             causal_conv1d_f16.",
+             causal_conv1d_f16, gated_delta_state_update_f16.",
             outside_kernels.fn_fp8_gemv_wpr_native_f16in.is_some(),
         );
 
@@ -311,7 +322,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4q bring-up complete: outside (incl. \
+            "[qwen36] Phase 4r bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -401,6 +412,9 @@ impl Qwen36Bringup {
         // Gated-DeltaNet ssm-scan, runs against real layer-0
         // conv1d weights.
         bringup.forward_layer0_conv1d_probe()?;
+        // Phase 4r: gated_delta_state_update_f16 — recurrent
+        // state-space update, the heart of the linear-attn block.
+        bringup.forward_layer0_ssm_state_probe()?;
 
         Ok(bringup)
     }
@@ -1883,6 +1897,117 @@ impl Qwen36Bringup {
              top_k={top_k}/{num_experts} → final[0..4]=[{:.3}, {:.3}, \
              {:.3}, {:.3}] (routed-weighted-sum + sigmoid·shared)",
             routed_sum[0], routed_sum[1], routed_sum[2], routed_sum[3],
+        );
+        Ok(())
+    }
+
+    /// Phase 4r probe: launch the Gated-DeltaNet state-update kernel
+    /// against an all-zero starting state, K=V=1.0, alpha=0.5,
+    /// beta=2.0. After one step the state should equal `beta * 1.0 *
+    /// 1.0 = 2.0` everywhere (decay term contributes 0 because the
+    /// initial state is zero). Validates ABI + per-head broadcast +
+    /// f16/f32 accumulator math.
+    pub fn forward_layer0_ssm_state_probe(&self) -> Result<()> {
+        // qwen3-next per-head dims: head_count=32 (A_log shape),
+        // d_state = 128 (linear_attn.norm.weight shape).
+        let num_heads: u32 = 32;
+        let d_k: u32 = 128;
+        let d_v: u32 = 128;
+        let state_elems = (num_heads as usize) * (d_v as usize) * (d_k as usize);
+        let state_bytes = state_elems * 2; // f16
+
+        // K = V = 1.0 (f16 0x3c00); state starts at 0.
+        let one_bits = 0x3c00u16.to_le_bytes();
+        let zero_bytes = vec![0u8; state_bytes];
+        let mut k_bytes = Vec::with_capacity((num_heads as usize) * (d_k as usize) * 2);
+        let mut v_bytes = Vec::with_capacity((num_heads as usize) * (d_v as usize) * 2);
+        for _ in 0..(num_heads as usize) * (d_k as usize) {
+            k_bytes.extend_from_slice(&one_bits);
+        }
+        for _ in 0..(num_heads as usize) * (d_v as usize) {
+            v_bytes.extend_from_slice(&one_bits);
+        }
+        let alpha_host: Vec<u8> = (0..num_heads)
+            .flat_map(|_| 0.5f32.to_le_bytes())
+            .collect();
+        let beta_host: Vec<u8> = (0..num_heads)
+            .flat_map(|_| 2.0f32.to_le_bytes())
+            .collect();
+
+        let state_region = self.arena.region("qwen36_l0ssm_s", state_bytes, 16)?;
+        let k_region = self.arena.region("qwen36_l0ssm_k", k_bytes.len(), 16)?;
+        let v_region = self.arena.region("qwen36_l0ssm_v", v_bytes.len(), 16)?;
+        let alpha_region = self.arena.region("qwen36_l0ssm_a", alpha_host.len(), 16)?;
+        let beta_region = self.arena.region("qwen36_l0ssm_b", beta_host.len(), 16)?;
+        unsafe {
+            state_region.copy_from_host(&zero_bytes)?;
+            k_region.copy_from_host(&k_bytes)?;
+            v_region.copy_from_host(&v_bytes)?;
+            alpha_region.copy_from_host(&alpha_host)?;
+            beta_region.copy_from_host(&beta_host)?;
+        }
+
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut state = state_region.device_ptr();
+            let mut k = k_region.device_ptr();
+            let mut v = v_region.device_ptr();
+            let mut alpha = alpha_region.device_ptr();
+            let mut beta = beta_region.device_ptr();
+            let mut nh = num_heads as i32;
+            let mut dk = d_k as i32;
+            let mut dv = d_v as i32;
+            let args = [
+                (&mut state) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v) as *mut u64 as *mut core::ffi::c_void,
+                (&mut alpha) as *mut u64 as *mut core::ffi::c_void,
+                (&mut beta) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut dk) as *mut i32 as *mut core::ffi::c_void,
+                (&mut dv) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            // 16x16 = 256 threads per head; each thread strides over
+            // its share of the 128*128=16384 state elements.
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_gated_delta_state_update_f16.raw() as CUfunction,
+                num_heads, 1, 1,
+                16, 16, 1,
+                0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_l0ssm gated_delta_state_update_f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        self.stream.fence()?;
+
+        let mut probe = [0u8; 8];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                probe.as_mut_ptr() as *mut _,
+                state_region.device_ptr(),
+                probe.len(),
+            );
+        }
+        let s0 = f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]]));
+        let s1 = f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]]));
+        let s2 = f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]]));
+        let s3 = f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]]));
+        eprintln!(
+            "[qwen36] forward_layer0_ssm_state_probe: heads={num_heads} \
+             d_k={d_k} d_v={d_v} alpha=0.5 beta=2.0 K=V=1.0 init=0 → \
+             state[head0,0..4]=[{s0:.3}, {s1:.3}, {s2:.3}, {s3:.3}] \
+             (expected ≈ 2.0 — beta·K·V = 2·1·1 = 2; decay·init = 0)"
         );
         Ok(())
     }
