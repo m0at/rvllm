@@ -246,6 +246,11 @@
       "path": "gelu_tanh_f16.ptx",
       "sha256": "d20b2b6811351940b0c084430c6914013460e25e6a6a180b4fcf81e66a4c3ac2"
     },
+    "gelu_tanh_mul_f16": {
+      "bytes": 2397,
+      "path": "gelu_tanh_mul_f16.ptx",
+      "sha256": "8b92aac7b7f966562374d035f50bdaa4c4804eb2c63453bcbaee2ecceb89cc86"
+    },
     "hadamard_unrotate_f16": {
       "bytes": 2818,
       "path": "hadamard_unrotate_f16.ptx",
@@ -376,6 +381,11 @@
       "path": "vit_avgpool_f16.ptx",
       "sha256": "266adbda3aded7cd27a9d1e503b3a07cb5fa582ea7d6ec50d3fb612047bac924"
     },
+    "vit_pos_emb_lookup_2d_f16": {
+      "bytes": 2708,
+      "path": "vit_pos_emb_lookup_2d_f16.ptx",
+      "sha256": "409dce57279d599c7074fcbead673840b4e85c264a34060efad57fed99a11a2c"
+    },
     "vit_pos_embed_interp_f16": {
       "bytes": 4772,
       "path": "vit_pos_embed_interp_f16.ptx",
@@ -392,5 +402,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "39fe267"
+  "revision": "8603614"
 }
