@@ -103,6 +103,12 @@ pub struct Qwen36OutsideKernels {
     /// Kernel: kernels/vit_avgpool_f16.cu.
     pub vit_avgpool_f16_mod: LoadedModule,
     pub fn_vit_avgpool_f16: KernelFn,
+    /// Vision helpers (also used elsewhere in the codebase): in-place
+    /// per-row bias add (tensor[t,d] += bias[d]) and f32→f16 cast.
+    pub add_bias_f16_mod: LoadedModule,
+    pub fn_add_bias_f16: KernelFn,
+    pub cast_fp_mod: LoadedModule,
+    pub fn_cast_f32_to_f16: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -293,6 +299,10 @@ impl Qwen36Bringup {
             vit_rotary_2d_f16_mod.get_function("vit_rotary_2d_f16_kernel")?;
         let vit_avgpool_f16_mod = kernels.load_ptx("vit_avgpool_f16")?;
         let fn_vit_avgpool_f16 = vit_avgpool_f16_mod.get_function("vit_avgpool_f16_kernel")?;
+        let add_bias_f16_mod = kernels.load_ptx("add_bias_f16")?;
+        let fn_add_bias_f16 = add_bias_f16_mod.get_function("add_bias_f16_kernel")?;
+        let cast_fp_mod = kernels.load_ptx("cast_fp")?;
+        let fn_cast_f32_to_f16 = cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -326,6 +336,10 @@ impl Qwen36Bringup {
             fn_vit_rotary_2d_f16,
             vit_avgpool_f16_mod,
             fn_vit_avgpool_f16,
+            add_bias_f16_mod,
+            fn_add_bias_f16,
+            cast_fp_mod,
+            fn_cast_f32_to_f16,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
