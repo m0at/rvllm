@@ -135,10 +135,77 @@ pub struct Qwen36Layer {
 /// Phase 1: `outside` populated, `layers` empty.
 /// Phase 2b: `outside` + `layers` (all 40 slots, attn variant matches
 ///   `layer_types`, MoE block + 256 experts uploaded).
+/// Vision Phase 2 (rusty_sm121_vision branch): `vision` filled with
+/// patch_embed + 27 ViT blocks + PatchMerger. None for text-only loads.
 #[derive(Debug)]
 pub struct Qwen36LoadedModel {
     pub outside: Qwen36LoadedOutside,
     /// All 40 layers, fully populated in Phase 2b. Linear/full attn
     /// distinction lives inside the per-layer `attn` enum.
     pub layers: Vec<Qwen36Layer>,
+    /// Vision tower weights, populated when the checkpoint has
+    /// `model.visual.*` tensors and vision is enabled at load time.
+    /// `None` for text-only checkpoints or when the bring-up profile
+    /// has explicitly disabled vision.
+    pub vision: Option<Qwen36Vision>,
+}
+
+// ─── Vision (Qwen3-VL ViT) ────────────────────────────────────────────
+
+/// Qwen 3.6 vision tower weights (image-text path). Mirrors HF
+/// `transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLVisionModel`.
+///
+/// Geometry (verified against `model.visual.*` state-dict):
+/// - patch_embed.proj: 3D conv `[1152, 3, 2, 16, 16]` with bias `[1152]`,
+///   flattened-input GEMM treats it as `[1152, 1536]`.
+/// - 27 transformer blocks, each:
+///     norm1 (LayerNorm + bias, hidden=1152)
+///     attn.qkv: linear `[3456, 1152]` + bias `[3456]` (fused Q/K/V)
+///     attn.proj: linear `[1152, 1152]` + bias
+///     norm2 (LayerNorm + bias)
+///     mlp.linear_fc1: `[4304, 1152]` + bias
+///     mlp.linear_fc2: `[1152, 4304]` + bias
+/// - merger (PatchMerger):
+///     norm: LayerNorm + bias on hidden=1152 (applied to spatial-merged
+///           patches before fc1)
+///     linear_fc1: `[4608, 4608]` + bias  (4608 = 4·hidden, 4 = merge_size²)
+///     linear_fc2: `[2048, 4608]` + bias  (out_hidden_size = text hidden)
+#[derive(Debug)]
+pub struct Qwen36Vision {
+    pub patch_embed: Qwen36VisionPatchEmbed,
+    pub blocks: Vec<Qwen36VisionBlock>,
+    pub merger: Qwen36PatchMerger,
+}
+
+#[derive(Debug)]
+pub struct Qwen36VisionPatchEmbed {
+    /// Weight reshaped to `[out=1152, in=1536]` for the GEMM path.
+    pub proj_weight: F16Weight,
+    pub proj_bias: F16Weight,
+}
+
+#[derive(Debug)]
+pub struct Qwen36VisionBlock {
+    pub norm1_w: F16Weight,
+    pub norm1_b: F16Weight,
+    pub qkv_w: F16Weight, // [3456, 1152]
+    pub qkv_b: F16Weight, // [3456]
+    pub proj_w: F16Weight, // [1152, 1152]
+    pub proj_b: F16Weight,
+    pub norm2_w: F16Weight,
+    pub norm2_b: F16Weight,
+    pub fc1_w: F16Weight, // [4304, 1152]
+    pub fc1_b: F16Weight,
+    pub fc2_w: F16Weight, // [1152, 4304]
+    pub fc2_b: F16Weight,
+}
+
+#[derive(Debug)]
+pub struct Qwen36PatchMerger {
+    pub norm_w: F16Weight, // LayerNorm gamma/beta on hidden=1152
+    pub norm_b: F16Weight,
+    pub fc1_w: F16Weight, // [4608, 4608]
+    pub fc1_b: F16Weight,
+    pub fc2_w: F16Weight, // [2048, 4608]
+    pub fc2_b: F16Weight,
 }
