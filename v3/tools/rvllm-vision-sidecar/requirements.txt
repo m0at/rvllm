@@ -1,8 +1,0 @@
-fastapi>=0.110
-uvicorn[standard]>=0.27
-torch>=2.4
-transformers>=5.5
-pillow>=10
-numpy
-accelerate
-safetensors>=0.4
