@@ -289,11 +289,16 @@ pub async fn chat_completions(
         match m.role {
             Role::User | Role::System => {
                 let text = m.content_text();
-                if text.is_empty() {
+                let has_image = m
+                    .content
+                    .as_ref()
+                    .map(|c| c.image_urls().next().is_some())
+                    .unwrap_or(false);
+                if text.is_empty() && !has_image {
                     return Err(ApiError::invalid_param(
                         format!(
                             "messages[{i}] has role={:?} but no content; user and system messages \
-                             require a non-empty `content`",
+                             require a non-empty `content` (text or image)",
                             m.role
                         ),
                         "messages",
@@ -413,6 +418,12 @@ pub async fn chat_completions(
         ));
     }
 
+    // Phase 1 vision: walk messages, fetch image_url parts, call sidecar.
+    // Embeddings are attached to GenerateRequest; Phase 2 wires the
+    // chat template to emit placeholder token spans, Phase 3 splices
+    // into hidden_region post-embed.
+    let vision_embeddings = collect_vision_embeddings(&req.messages)?;
+
     let prompt_ids = state.tokenizer.render_chat(&req.messages, req.tools.as_ref())?;
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
 
@@ -441,6 +452,7 @@ pub async fn chat_completions(
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         events_tx,
         cancelled: cancelled.clone(),
+        vision_embeddings,
     };
     tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
@@ -1439,6 +1451,8 @@ pub async fn completions(
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
         events_tx,
         cancelled: cancelled.clone(),
+        // Legacy /v1/completions endpoint is text-only.
+        vision_embeddings: Vec::new(),
     };
     tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
@@ -1963,6 +1977,67 @@ fn resolve_max_new(requested: Option<u32>, cap: u32) -> ApiResult<u32> {
         ));
     }
     Ok(m)
+}
+
+/// Walk all chat messages, fetch every `image_url` content part via
+/// the vision sidecar, return embeddings in document-order.
+///
+/// Errors are mapped to ApiError so the client gets a structured
+/// 4xx/5xx instead of a worker error mid-decode.
+fn collect_vision_embeddings(
+    messages: &[crate::openai::chat::ChatMessage],
+) -> ApiResult<Vec<crate::openai::vision_fetch::VisionEmbedding>> {
+    use crate::openai::vision_fetch::{embed_via_sidecar, fetch_image_bytes, VisionError};
+    let mut out = Vec::new();
+    for (mi, m) in messages.iter().enumerate() {
+        let Some(content) = m.content.as_ref() else { continue };
+        for img in content.image_urls() {
+            let (bytes, mime) = fetch_image_bytes(&img.url).map_err(|e| match e {
+                VisionError::FetchTimeout => ApiError::invalid_param(
+                    format!("messages[{mi}].image_url fetch timed out"),
+                    "messages",
+                    "image_fetch_timeout",
+                ),
+                VisionError::TooLarge(got, max) => ApiError::invalid_param(
+                    format!(
+                        "messages[{mi}].image_url too large ({got} bytes, max {max})"
+                    ),
+                    "messages",
+                    "image_too_large",
+                ),
+                other => ApiError::invalid_param(
+                    format!("messages[{mi}].image_url failed: {other}"),
+                    "messages",
+                    "image_fetch_failed",
+                ),
+            })?;
+            let emb = embed_via_sidecar(&bytes, &mime).map_err(|e| match &e {
+                VisionError::SidecarUnreachable(msg) => ApiError::Internal(format!(
+                    "vision sidecar unreachable (RVLLM_VISION_SIDECAR_URL?): {msg}"
+                )),
+                VisionError::SidecarError { status, body } => ApiError::Internal(
+                    format!("vision sidecar returned {status}: {body}"),
+                ),
+                _ => ApiError::Internal(format!("vision sidecar: {e}")),
+            })?;
+            tracing::info!(
+                msg_idx = mi,
+                num_tokens = emb.num_tokens,
+                hidden_dim = emb.hidden_dim,
+                grid_thw = ?emb.grid_thw,
+                "vision: image embedded"
+            );
+            out.push(emb);
+        }
+    }
+    if !out.is_empty() {
+        tracing::info!(
+            count = out.len(),
+            total_tokens = out.iter().map(|e| e.num_tokens).sum::<usize>(),
+            "vision: all images embedded; splice path is unimplemented in phase 1"
+        );
+    }
+    Ok(out)
 }
 
 fn reject_oversized_prompt(

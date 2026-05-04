@@ -26,6 +26,12 @@ pub struct GenerateRequest {
     pub stop_token_ids: Vec<u32>,
     pub events_tx: mpsc::Sender<GenerateEvent>,
     pub cancelled: Arc<AtomicBool>,
+    /// Vision embeddings for any image parts in the request, in order
+    /// of appearance in the chat-message stream. Empty for text-only
+    /// requests. Phase 1 attaches these without splicing; Phase 2
+    /// adds the placeholder-token slots and Phase 3 splices into
+    /// hidden_region post-embed.
+    pub vision_embeddings: Vec<crate::openai::vision_fetch::VisionEmbedding>,
 }
 
 /// Events produced by the worker, consumed by the handler for
@@ -206,6 +212,7 @@ mod tests {
                 stop_token_ids: vec![],
                 events_tx: tx,
                 cancelled: Arc::new(AtomicBool::new(false)),
+                vision_embeddings: Vec::new(),
             })
             .await
             .expect("submit");
@@ -246,6 +253,7 @@ mod tests {
                 stop_token_ids: vec![],
                 events_tx: tx,
                 cancelled: cancel.clone(),
+                vision_embeddings: Vec::new(),
             })
             .await
             .expect("submit");

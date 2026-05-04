@@ -34,6 +34,9 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+half = { workspace = true }
 
 # Serde
 serde = { workspace = true }
