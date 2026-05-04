@@ -26,6 +26,29 @@ pub struct GenerateRequest {
     pub stop_token_ids: Vec<u32>,
     pub events_tx: mpsc::Sender<GenerateEvent>,
     pub cancelled: Arc<AtomicBool>,
+    /// Vision attachments (one per `image_url` content part). Empty
+    /// for text-only requests. The worker runs the native vision
+    /// tower forward on each image's bytes, then splices the
+    /// resulting embeddings into the post-embed hidden buffer at
+    /// the `placeholder_token_start` slot.
+    pub vision_items: Vec<VisionItem>,
+}
+
+/// One image attached to a chat request.
+pub struct VisionItem {
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// Number of placeholder tokens reserved in `prompt_ids` for this
+    /// image (= post-PatchMerger embedding count, predicted host-side
+    /// from image dims so the chat-template render knows how many
+    /// `<|image_pad|>` to emit).
+    pub num_tokens: usize,
+    /// Token offset (within `prompt_ids`) of the FIRST placeholder
+    /// token for this image. The worker overwrites
+    /// `hidden_region[token_start .. token_start + num_tokens]` with
+    /// the vision-tower output.
+    pub token_start: usize,
 }
 
 /// Events produced by the worker, consumed by the handler for
@@ -206,6 +229,7 @@ mod tests {
                 stop_token_ids: vec![],
                 events_tx: tx,
                 cancelled: Arc::new(AtomicBool::new(false)),
+                vision_items: Vec::new(),
             })
             .await
             .expect("submit");
@@ -246,6 +270,7 @@ mod tests {
                 stop_token_ids: vec![],
                 events_tx: tx,
                 cancelled: cancel.clone(),
+                vision_items: Vec::new(),
             })
             .await
             .expect("submit");

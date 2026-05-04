@@ -444,6 +444,7 @@ pub async fn chat_completions(
         sampling,
         max_new_tokens: max_new,
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
+        vision_items: Vec::new(),
         events_tx,
         cancelled: cancelled.clone(),
     };
@@ -1442,6 +1443,7 @@ pub async fn completions(
         sampling,
         max_new_tokens: max_new,
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
+        vision_items: Vec::new(),
         events_tx,
         cancelled: cancelled.clone(),
     };

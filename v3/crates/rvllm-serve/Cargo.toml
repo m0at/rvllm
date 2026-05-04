@@ -34,6 +34,9 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
+image = { workspace = true }
 
 # Serde
 serde = { workspace = true }
