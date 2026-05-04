@@ -443,7 +443,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 5b bring-up complete: outside (incl. \
+            "[qwen36] Phase 5c bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -561,7 +561,7 @@ impl Qwen36Bringup {
         // (cuda_worker also resets on every request).
         bringup.reset_linear_state()?;
         bringup.reset_kv_cache()?;
-        let probe_5b = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000])?;
+        let probe_5b = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000], 0)?;
         eprintln!(
             "[qwen36] Phase 5b forward_qwen36_decode smoke: \
              5-token input → argmax_token_id={probe_5b} (full 40-layer \
@@ -2997,14 +2997,20 @@ impl Qwen36Bringup {
     /// vLLM. Goal here: prove the per-layer kernels can consume the
     /// real hidden buffer that comes out of `embedding_gather` and
     /// feed `fused_rmsnorm_fp8_quant + cublaslt.fp8_gemm + argmax`.
-    /// Phase 4x: full 40-layer decode loop. Linear-attn layers run
-    /// the Phase-4w Gated-DeltaNet chain against the persistent
-    /// state cache; full-attn layers are residual passthrough until
-    /// 4z lands the FA2 paged-decode forward; MoE blocks land in 5a+.
-    /// Single-token (last-token-only) — multi-token prefill is 5b+.
+    /// Phase 4x/5b/5c: full 40-layer decode loop. Linear-attn runs
+    /// Gated-DeltaNet against the persistent state cache; full-attn
+    /// runs Q/K/V → q/k_norm → RoPE → FA2 paged decode →
+    /// attn_output_gate → o_proj; MoE applies after each attn block.
+    ///
+    /// `start_position` is the absolute position of token_ids[0] in
+    /// the sequence. For prefill: start_position=0, token_ids = full
+    /// prompt. For decode-step: start_position=prefill_len, token_ids
+    /// = single just-sampled token. State + KV cache are NEVER reset
+    /// inside this method — caller (cuda_worker) resets per request.
     pub fn forward_qwen36_decode(
         &self,
         token_ids: &[i32],
+        start_position: u32,
     ) -> Result<i32> {
         if token_ids.is_empty() {
             return Err(rvllm_core::RvllmError::cuda(
@@ -3076,12 +3082,13 @@ impl Qwen36Bringup {
         // The recurrent linear-attn state + monotonically-growing KV
         // cache mean each token sees full prompt context by the time
         // we hit the last position.
-        for tok_pos in 0..num_tokens {
-            // Extract token tok_pos's hidden into last_hidden_region.
+        for tok_local in 0..num_tokens {
+            let tok_pos = start_position + tok_local;
+            // Extract token tok_local's hidden into last_hidden_region.
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let off = (tok_pos as u64) * (last_hidden_bytes as u64);
+                let off = (tok_local as u64) * (last_hidden_bytes as u64);
                 let _ = cuMemcpyDtoDAsync_v2(
                     last_hidden_region.device_ptr(),
                     hidden_region.device_ptr() + off,
@@ -3128,7 +3135,7 @@ impl Qwen36Bringup {
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let off = (tok_pos as u64) * (last_hidden_bytes as u64);
+                let off = (tok_local as u64) * (last_hidden_bytes as u64);
                 let _ = cuMemcpyDtoDAsync_v2(
                     hidden_region.device_ptr() + off,
                     last_hidden_region.device_ptr(),

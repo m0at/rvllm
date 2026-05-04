@@ -95,29 +95,24 @@ pub async fn spawn_cuda_worker(
                     };
                     let scratch_ck = qwen.arena.checkpoint();
                     tracing::info!(
-                        "qwen36 cuda worker ready (Phase 5b: \
-                         multi-token prefill — model sees full prompt \
-                         context. Linear-attn state + KV cache \
-                         accumulate causally across all prompt \
-                         positions; multi-step decode + sampling are \
-                         Phase 5c)"
+                        "qwen36 cuda worker ready (Phase 5c: \
+                         multi-token prefill + step-by-step decode \
+                         loop with EOS/stop-token early exit; \
+                         numerical correctness audit vs vLLM is \
+                         Phase 5d)"
                     );
                     let _ = ready_tx.send(Ok(()));
 
-                    // Phase-4b request loop. One token per request:
-                    // forward_outside_only returns the argmax for the
-                    // last input position; we ship that as a single
-                    // Token event then Done (Stop). max_new_tokens > 1
-                    // would require KV cache + decode loop, deferred
-                    // to Phase 4c+.
+                    // Phase 5c request loop: prefill the prompt
+                    // (state + KV accumulate causally), then decode
+                    // step-by-step up to max_new_tokens, with EOS /
+                    // stop-token early-exit. arena.restore between
+                    // requests keeps memory bounded; the persistent
+                    // linear-state + KV cache regions live ABOVE the
+                    // scratch checkpoint so they survive that restore
+                    // and only get reset by the explicit calls below.
                     while let Some(req) = req_rx.blocking_recv() {
                         let prompt_len = req.prompt_ids.len() as u32;
-                        // Phase 4t/4u: every fresh request starts with
-                        // clean linear-attn state + clean KV cache.
-                        // Multi-step / session continuity will skip
-                        // these once a session-id tracker lands
-                        // (Phase 4v+); single-token smoke can reset
-                        // unconditionally.
                         let _ = qwen.reset_linear_state();
                         let _ = qwen.reset_kv_cache();
                         if req.cancelled.load(Ordering::Relaxed) {
@@ -129,30 +124,65 @@ pub async fn spawn_cuda_worker(
                             unsafe { qwen.arena.restore(scratch_ck); }
                             continue;
                         }
-                        let i32_tokens: Vec<i32> = req
+                        let prompt_i32: Vec<i32> = req
                             .prompt_ids
                             .iter()
                             .map(|&t| t as i32)
                             .collect();
-                        match qwen.forward_qwen36_decode(&i32_tokens) {
-                            Ok(next_token) => {
-                                let id = if next_token < 0 { 0u32 } else { next_token as u32 };
-                                let _ = req.events_tx.blocking_send(GenerateEvent::Token {
-                                    id,
-                                    position: prompt_len,
-                                });
-                                let _ = req.events_tx.blocking_send(GenerateEvent::Done {
-                                    finish: FinishReason::Stop,
-                                    prompt_tokens: prompt_len,
-                                    completion_tokens: 1,
-                                });
-                            }
+
+                        // Prefill: feed full prompt at start_position=0.
+                        let mut next_token = match qwen
+                            .forward_qwen36_decode(&prompt_i32, 0)
+                        {
+                            Ok(t) => t,
                             Err(e) => {
                                 let _ = req.events_tx.blocking_send(GenerateEvent::Error(
-                                    format!("qwen36 forward_qwen36_decode: {e:?}"),
+                                    format!("qwen36 prefill: {e:?}"),
                                 ));
+                                unsafe { qwen.arena.restore(scratch_ck); }
+                                continue;
+                            }
+                        };
+                        let mut completion_tokens: u32 = 0;
+                        let mut finish = FinishReason::Length;
+                        let max_new = req.max_new_tokens.max(1);
+                        for step in 0..max_new {
+                            let id = if next_token < 0 { 0u32 } else { next_token as u32 };
+                            let _ = req.events_tx.blocking_send(GenerateEvent::Token {
+                                id,
+                                position: prompt_len + step,
+                            });
+                            completion_tokens += 1;
+                            if req.stop_token_ids.contains(&id) {
+                                finish = FinishReason::Stop;
+                                break;
+                            }
+                            if req.cancelled.load(Ordering::Relaxed) {
+                                finish = FinishReason::Cancelled;
+                                break;
+                            }
+                            if step + 1 >= max_new {
+                                break;
+                            }
+                            // Decode step: feed just this token at
+                            // start_position = prompt_len + step.
+                            let pos = prompt_len + step;
+                            match qwen.forward_qwen36_decode(&[next_token], pos) {
+                                Ok(t) => next_token = t,
+                                Err(e) => {
+                                    let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                                        format!("qwen36 decode step {step}: {e:?}"),
+                                    ));
+                                    finish = FinishReason::Stop;
+                                    break;
+                                }
                             }
                         }
+                        let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+                            finish,
+                            prompt_tokens: prompt_len,
+                            completion_tokens,
+                        });
                         unsafe { qwen.arena.restore(scratch_ck); }
                     }
                     tracing::info!("qwen36 cuda worker queue closed, exiting");
