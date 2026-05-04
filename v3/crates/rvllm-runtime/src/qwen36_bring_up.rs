@@ -80,6 +80,29 @@ pub struct Qwen36OutsideKernels {
     /// Replaces the host-side delta-rule loop in apply_layer_linear_attn.
     pub gated_delta_rule_decode_f16_mod: LoadedModule,
     pub fn_gated_delta_rule_decode_f16: KernelFn,
+    /// Vision Phase 1: LayerNorm with bias for Qwen ViT (norm1, norm2,
+    /// merger.norm). Different from the GemmaRMSNorm-style RMSNorm
+    /// used on text-side (additive +1 shift). Kernel:
+    /// kernels/layernorm_inplace_f16.cu.
+    pub layernorm_inplace_f16_mod: LoadedModule,
+    pub fn_layernorm_inplace_f16: KernelFn,
+    /// Vision Phase 1: pointwise gelu_pytorch_tanh (Qwen ViT MLP +
+    /// Gemma ViT MLP). Kernel: kernels/gelu_tanh_f16.cu.
+    pub gelu_tanh_f16_mod: LoadedModule,
+    pub fn_gelu_tanh_f16: KernelFn,
+    /// Vision Phase 1: row-wise softmax for ViT attention scores.
+    /// Kernel: kernels/softmax_row_f16.cu.
+    pub softmax_row_f16_mod: LoadedModule,
+    pub fn_softmax_row_f16: KernelFn,
+    /// Vision Phase 1: 2D-rotary applying to Q/K with per-token
+    /// cos/sin tables encoding row+col axes. Kernel:
+    /// kernels/vit_rotary_2d_f16.cu.
+    pub vit_rotary_2d_f16_mod: LoadedModule,
+    pub fn_vit_rotary_2d_f16: KernelFn,
+    /// Vision Phase 1: 2D average pooling for Gemma vision tower.
+    /// Kernel: kernels/vit_avgpool_f16.cu.
+    pub vit_avgpool_f16_mod: LoadedModule,
+    pub fn_vit_avgpool_f16: KernelFn,
 }
 
 pub struct Qwen36Bringup {
@@ -257,6 +280,19 @@ impl Qwen36Bringup {
             kernels.load_ptx("gated_delta_rule_decode_f16")?;
         let fn_gated_delta_rule_decode_f16 = gated_delta_rule_decode_f16_mod
             .get_function("gated_delta_rule_decode_f16_kernel")?;
+        // Vision-tower kernels (Phase 1 .cu added on rusty_sm121_vision).
+        let layernorm_inplace_f16_mod = kernels.load_ptx("layernorm_inplace_f16")?;
+        let fn_layernorm_inplace_f16 =
+            layernorm_inplace_f16_mod.get_function("layernorm_inplace_f16_kernel")?;
+        let gelu_tanh_f16_mod = kernels.load_ptx("gelu_tanh_f16")?;
+        let fn_gelu_tanh_f16 = gelu_tanh_f16_mod.get_function("gelu_tanh_f16_kernel")?;
+        let softmax_row_f16_mod = kernels.load_ptx("softmax_row_f16")?;
+        let fn_softmax_row_f16 = softmax_row_f16_mod.get_function("softmax_row_f16_kernel")?;
+        let vit_rotary_2d_f16_mod = kernels.load_ptx("vit_rotary_2d_f16")?;
+        let fn_vit_rotary_2d_f16 =
+            vit_rotary_2d_f16_mod.get_function("vit_rotary_2d_f16_kernel")?;
+        let vit_avgpool_f16_mod = kernels.load_ptx("vit_avgpool_f16")?;
+        let fn_vit_avgpool_f16 = vit_avgpool_f16_mod.get_function("vit_avgpool_f16_kernel")?;
         let outside_kernels = Qwen36OutsideKernels {
             embedding_gather_f16_mod,
             fn_embedding_gather_f16,
@@ -280,6 +316,16 @@ impl Qwen36Bringup {
             fn_gated_delta_state_update_f16,
             gated_delta_rule_decode_f16_mod,
             fn_gated_delta_rule_decode_f16,
+            layernorm_inplace_f16_mod,
+            fn_layernorm_inplace_f16,
+            gelu_tanh_f16_mod,
+            fn_gelu_tanh_f16,
+            softmax_row_f16_mod,
+            fn_softmax_row_f16,
+            vit_rotary_2d_f16_mod,
+            fn_vit_rotary_2d_f16,
+            vit_avgpool_f16_mod,
+            fn_vit_avgpool_f16,
         };
         eprintln!(
             "[qwen36] outside kernels resolved: embedding_gather_f16, \
