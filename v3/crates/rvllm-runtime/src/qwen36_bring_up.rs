@@ -4030,14 +4030,22 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
-        // 6. Paged FA2 decode. block_tables=[block_idx for position],
-        //    context_lens=[position+1] (causal — attend to all prior).
-        let block_idx = (position / self.kv_cache_block_size) as i32;
+        // 6. Paged FA2 decode. block_tables=identity-mapping
+        //    [0, 1, 2, ..., max_blocks_per_seq-1] since each logical
+        //    block in our single-sequence cache maps to itself in
+        //    physical layout. context_lens=[position+1] (causal —
+        //    attend to all prior tokens).
         let context_len = (position as i32) + 1;
-        let bt_region = self.arena.region("qwen36_pf_bt", 4, 16)?;
+        let max_blocks = self.kv_cache_num_blocks as usize;
+        let bt_bytes = max_blocks * 4;
+        let bt_region = self.arena.region("qwen36_pf_bt", bt_bytes, 16)?;
         let cl_region = self.arena.region("qwen36_pf_cl", 4, 16)?;
+        let mut bt_host = Vec::with_capacity(bt_bytes);
+        for b in 0..max_blocks {
+            bt_host.extend_from_slice(&(b as i32).to_le_bytes());
+        }
         unsafe {
-            bt_region.copy_from_host(&block_idx.to_le_bytes())?;
+            bt_region.copy_from_host(&bt_host)?;
             cl_region.copy_from_host(&context_len.to_le_bytes())?;
         }
         let attn_out_region =
@@ -4398,17 +4406,29 @@ impl Qwen36Bringup {
                 let _ = cuMemcpyDtoH_v2(sh_host.as_mut_ptr() as *mut _,
                     down_region.device_ptr(), down_bytes);
             }
-            let mut sh_gate_host = [0u8; 2];
+            // shared_expert_gate is Linear(hidden→1) per vLLM
+            // qwen3_next.py:127-133: gate_logit = weight · normed_hidden
+            // (scalar per token), then sigmoid(gate_logit) scales the
+            // shared expert output. Earlier we read it as a single f16
+            // scalar — that was wrong; weight has shape [1, hidden].
+            let sg_bytes = hidden_us * 2;
+            let mut sg_w_host = vec![0u8; sg_bytes];
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let _ = cuMemcpyDtoH_v2(
-                    sh_gate_host.as_mut_ptr() as *mut _,
+                    sg_w_host.as_mut_ptr() as *mut _,
                     moe.shared_expert_gate_logit.offset_bytes,
-                    2,
+                    sg_bytes,
                 );
             }
-            let g_logit = f16_bits_to_f32(u16::from_le_bytes(sh_gate_host));
+            let mut g_logit = 0.0f32;
+            for k in 0..hidden_us {
+                let w = f16_bits_to_f32(u16::from_le_bytes([
+                    sg_w_host[k * 2], sg_w_host[k * 2 + 1],
+                ]));
+                g_logit += w * input_f32[k];
+            }
             let g_sigmoid = 1.0f32 / (1.0f32 + (-g_logit).exp());
             for i in 0..(n_down as usize) {
                 let v = f16_bits_to_f32(u16::from_le_bytes([sh_host[i * 2], sh_host[i * 2 + 1]]));
