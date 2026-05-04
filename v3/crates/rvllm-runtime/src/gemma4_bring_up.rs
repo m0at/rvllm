@@ -5332,11 +5332,16 @@ impl Gemma4Bringup {
         const RMS_EPS: f32 = 1e-6;
 
         // Determine n_tokens from preprocess output (count non-padding rows).
+        // preprocess_gemma writes per-patch position as (col, row) =
+        // (pw, ph) — see vision_preprocess.rs:370 — so position_ids[2*t]
+        // is the COLUMN index and [2*t+1] is the ROW index. Earlier
+        // reads had row/col swapped which made non-square images
+        // (NYT 42×57) pass the wrong axes to pos_emb_lookup and rotary.
         let total_rows = pp.pixel_values.len() / (3 * 16 * 16);
         let mut active_rows = 0usize;
         for t in 0..total_rows {
-            let r = pp.position_ids[2 * t];
-            let c = pp.position_ids[2 * t + 1];
+            let c = pp.position_ids[2 * t];
+            let r = pp.position_ids[2 * t + 1];
             if r >= 0 && c >= 0 {
                 active_rows += 1;
             }
@@ -5355,8 +5360,9 @@ impl Gemma4Bringup {
         let mut row_pos_i32 = Vec::with_capacity(n_tokens);
         let mut col_pos_i32 = Vec::with_capacity(n_tokens);
         for t in 0..total_rows {
-            let r = pp.position_ids[2 * t];
-            let c = pp.position_ids[2 * t + 1];
+            // (col, row) layout per preprocess_gemma — see comment above.
+            let c = pp.position_ids[2 * t];
+            let r = pp.position_ids[2 * t + 1];
             if r >= 0 && c >= 0 {
                 let off = t * patch_dim;
                 pixel_active.extend_from_slice(&pp.pixel_values[off..off + patch_dim]);
@@ -5430,7 +5436,7 @@ impl Gemma4Bringup {
                 ];
                 let block: u32 = 256;
                 let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.fused.fn_cast_f32_to_f16.raw() as CUfunction,
                     grid.0, grid.1, grid.2,
                     block, 1, 1,
@@ -5438,6 +5444,13 @@ impl Gemma4Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: cast_f32_to_f16 launch failed (linear_no_bias)",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             self.stream.fence()?;
             Ok(())
@@ -5457,7 +5470,7 @@ impl Gemma4Bringup {
                     (&mut d) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block: u32 = (dim as u32).min(1024);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.fused.fn_rmsnorm.raw() as CUfunction,
                     rows as u32, 1, 1,
                     block, 1, 1,
@@ -5465,22 +5478,38 @@ impl Gemma4Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: rmsnorm launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             self.stream.fence()?;
             Ok(())
         };
 
+        // vnorm_f16_kernel signature is (v, eps, head_dim) — three args,
+        // not two. Passing (v, dim) before silently put `eps` into the
+        // dim slot and read `head_dim` from stack garbage, producing an
+        // OOB sweep in the kernel's `for (i; i<head_dim; ...)` loop. The
+        // OOB faulted on Gemma vision under back-to-back launches and
+        // was the root cause of the "Out Of Range Address" Xid 13 we'd
+        // been masking with host-side eprintln tracepoints.
         let vnorm = |x: u64, rows: usize, dim: usize| -> Result<()> {
             #[cfg(feature = "cuda")]
             unsafe {
                 let mut x = x;
+                let mut eps = RMS_EPS;
                 let mut d = dim as i32;
                 let args = [
                     (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut eps) as *mut f32 as *mut core::ffi::c_void,
                     (&mut d) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block: u32 = (dim as u32).min(1024);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.fused.fn_vnorm.raw() as CUfunction,
                     rows as u32, 1, 1,
                     block, 1, 1,
@@ -5488,6 +5517,13 @@ impl Gemma4Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: vnorm launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             self.stream.fence()?;
             Ok(())
@@ -5518,14 +5554,7 @@ impl Gemma4Bringup {
             Ok(())
         };
 
-        // NOTE: the eprintln! tracepoints below are not just diagnostics —
-        // they also act as host-side sync points that prevent a CUDA
-        // out-of-range fault we otherwise hit on Gemma vision under
-        // back-to-back kernel launches with this large tensor count
-        // (n_tokens ~2400). Removing them re-introduces the segfault.
-        // Until that race is properly tracked down (likely a missing
         // fence inside one of the per-head/pooler closures), keep them.
-        eprintln!("[g4v] forward start: n_tokens={n_tokens}");
         // ── Step 1: patch_embed (linear, no bias) [N, 768] → [N, 1152] ─
         let hidden_bytes = n_tokens * HIDDEN * 2;
         let hidden_region = self.arena.region("g4v_hidden", hidden_bytes, 16)?;
@@ -5536,7 +5565,6 @@ impl Gemma4Bringup {
             n_tokens, HIDDEN, 768,
         )?;
 
-        eprintln!("[g4v] after patch_embed");
         // ── Step 2: 2D position embedding lookup + add. ─────────────
         #[cfg(feature = "cuda")]
         unsafe {
@@ -5566,7 +5594,6 @@ impl Gemma4Bringup {
         self.stream.fence()?;
 
 
-        eprintln!("[g4v] after pos_emb_lookup");
         // ── Step 3: build cos/sin tables for 2D rotary. ──────────────
         // Gemma vision rotary (modeling_gemma4.py:702): for each spatial
         // axis i ∈ {0, 1}, cos_i = cat([cos(pos*inv), cos(pos*inv)]).
@@ -5613,7 +5640,6 @@ impl Gemma4Bringup {
         }
 
 
-        eprintln!("[g4v] cos/sin tables built");
         // ── Step 4: 27-block sandwich-norm encoder loop. ─────────────
         let normed = self.arena.region("g4v_normed", n_tokens * HIDDEN * 2, 16)?;
         let q_buf = self.arena.region("g4v_q", n_tokens * HIDDEN * 2, 16)?;
@@ -5953,7 +5979,6 @@ impl Gemma4Bringup {
         }
 
 
-        eprintln!("[g4v] all blocks done, before pooler");
         // ── Step 5: Pooler — avg-pool kernel=3 + sqrt(hidden) scale. ─
         // n_tokens must be divisible by k². Output rows = n_tokens / k².
         // For the simple single-image case the preprocess returns
@@ -6012,7 +6037,6 @@ impl Gemma4Bringup {
         self.stream.fence()?;
 
 
-        eprintln!("[g4v] avgpool done, n_pooled={}", n_pooled);
         // Multiply by sqrt(hidden_size) (Gemma scaling in pooler).
         let sqrt_h = (HIDDEN as f32).sqrt();
         #[cfg(feature = "cuda")]
@@ -6039,7 +6063,6 @@ impl Gemma4Bringup {
         self.stream.fence()?;
 
 
-        eprintln!("[g4v] sqrt scale done");
         // ── Step 6: Standardize — (x - std_bias) * std_scale. ───────
         #[cfg(feature = "cuda")]
         unsafe {
@@ -6065,7 +6088,6 @@ impl Gemma4Bringup {
         self.stream.fence()?;
 
 
-        eprintln!("[g4v] standardize done");
         // ── Step 7: embed_vision = projection(parameter-free RMSNorm(x)) ─
         // First parameter-free RMSNorm in place on pooled_region.
         vnorm(pooled_region.device_ptr(), n_pooled, HIDDEN)?;
@@ -6080,7 +6102,6 @@ impl Gemma4Bringup {
         )?;
 
 
-        eprintln!("[g4v] embed projection done");
         // ── Step 8: DtoH the final embeddings. ──────────────────────
         // Explicit stream fence before DtoH: cuMemcpyDtoH_v2 blocks on
         // the host but does not implicitly synchronise a non-default
