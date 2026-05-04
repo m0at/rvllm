@@ -74,7 +74,13 @@ impl Default for QwenPreprocessConfig {
             patch_size: 16,
             temporal_patch_size: 2,
             merge_size: 2,
-            min_pixels: 65536,
+            // HF Qwen2VLImageProcessorFast does not enforce a lower bound
+            // on small images — feeding a 224×224 image keeps it at 224×224
+            // (grid 14×14). Earlier setting min_pixels=65536 (=256²)
+            // upsampled to 256×256 (grid 16×16) and broke pos_embed
+            // interpolation alignment. Setting to 0 disables the lower
+            // bound; max_pixels still caps at 16M to match HF.
+            min_pixels: 0,
             max_pixels: 16_777_216,
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
