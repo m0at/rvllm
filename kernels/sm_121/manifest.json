@@ -241,10 +241,20 @@
       "path": "gated_delta_state_update_f16.ptx",
       "sha256": "e2a0f2f1112912353f23f6d7e11a259da1a0150be67b4665fde5d80b004dbacc"
     },
+    "gelu_tanh_f16": {
+      "bytes": 1878,
+      "path": "gelu_tanh_f16.ptx",
+      "sha256": "d20b2b6811351940b0c084430c6914013460e25e6a6a180b4fcf81e66a4c3ac2"
+    },
     "hadamard_unrotate_f16": {
       "bytes": 2818,
       "path": "hadamard_unrotate_f16.ptx",
       "sha256": "31f1f25eaab5a900d48cd0ae58288bd22b553115d5802919b5dcccd53479c023"
+    },
+    "layernorm_inplace_f16": {
+      "bytes": 13646,
+      "path": "layernorm_inplace_f16.ptx",
+      "sha256": "f89dbbf5c83f8b13e074f9d34ba424783c68b424ef58fa8b9123891635378285"
     },
     "ldmatrix_probe": {
       "bytes": 2727,
@@ -331,6 +341,11 @@
       "path": "sigmoid_mul_f16.ptx",
       "sha256": "5cda217b5208b5ab4ba41d4a3c8a4e42c5c6aff5215b48ff2e934e0ba228aeea"
     },
+    "softmax_row_f16": {
+      "bytes": 15296,
+      "path": "softmax_row_f16.ptx",
+      "sha256": "cdf83945b8c3ce00c723a991f345b197e80c7159d708042bc0585621fb50ed84"
+    },
     "vector_add_bf16_to_f16": {
       "bytes": 1430,
       "path": "vector_add_bf16_to_f16.ptx",
@@ -341,11 +356,21 @@
       "path": "vector_add_f16.ptx",
       "sha256": "c4714ce4882aeb47e653d3b7b0c8b69535b5981531fb5ce1edd2d2b0114b94a5"
     },
+    "vit_avgpool_f16": {
+      "bytes": 9471,
+      "path": "vit_avgpool_f16.ptx",
+      "sha256": "266adbda3aded7cd27a9d1e503b3a07cb5fa582ea7d6ec50d3fb612047bac924"
+    },
+    "vit_rotary_2d_f16": {
+      "bytes": 4325,
+      "path": "vit_rotary_2d_f16.ptx",
+      "sha256": "dc758c4461833fc6a1a615fa42bd156d1b87449d3bc58306a2af18b77cd0347c"
+    },
     "vnorm_f16": {
       "bytes": 7188,
       "path": "vnorm_f16.ptx",
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "c178e2a"
+  "revision": "8a83134"
 }
