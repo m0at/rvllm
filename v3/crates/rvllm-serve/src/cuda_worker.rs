@@ -95,10 +95,11 @@ pub async fn spawn_cuda_worker(
                     };
                     let scratch_ck = qwen.arena.checkpoint();
                     tracing::info!(
-                        "qwen36 cuda worker ready (Phase 4x: 40-layer \
-                         loop — 30 linear-attn Gated-DeltaNet chains \
-                         + 10 full-attn passthrough; output still \
-                         garbage until full-attn forward + MoE land)"
+                        "qwen36 cuda worker ready (Phase 4y: 40-layer \
+                         loop with input_layernorm — 30 linear-attn \
+                         Gated-DeltaNet chains + 10 full-attn \
+                         passthrough; output still garbage until \
+                         full-attn forward + MoE land)"
                     );
                     let _ = ready_tx.send(Ok(()));
 

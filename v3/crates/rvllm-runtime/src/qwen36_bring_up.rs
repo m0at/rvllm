@@ -443,7 +443,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4x bring-up complete: outside (incl. \
+            "[qwen36] Phase 4y bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -560,14 +560,14 @@ impl Qwen36Bringup {
         // Reset state before this synthetic call so it starts clean
         // (cuda_worker also resets on every request).
         bringup.reset_linear_state()?;
-        let probe_4x = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000])?;
+        let probe_4y = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000])?;
         eprintln!(
-            "[qwen36] Phase 4x forward_qwen36_decode smoke: \
-             5-token input → argmax_token_id={probe_4x} (full 40-layer \
-             loop: 30× linear-attn Gated-DeltaNet chain against \
-             persistent state slices, 10× full-attn passthrough; \
-             output still garbage until 4z lands full-attn forward \
-             + 5a lands MoE forward)"
+            "[qwen36] Phase 4y forward_qwen36_decode smoke: \
+             5-token input → argmax_token_id={probe_4y} (full 40-layer \
+             loop: 30× linear-attn Gated-DeltaNet chain w/ \
+             input_layernorm + persistent state, 10× full-attn \
+             passthrough; output still garbage until 4z lands full-attn \
+             forward + 5a lands MoE forward)"
         );
 
         Ok(bringup)
@@ -3160,6 +3160,41 @@ impl Qwen36Bringup {
             None => return Ok(()),
         };
 
+        // Phase 4y: input_layernorm — apply RMSNorm to a COPY of
+        // last_hidden_region before in_proj. Residual sum at the end
+        // uses the un-normed last_hidden, matching the standard
+        // pre-norm transformer pattern.
+        let normed_region = self.arena.region(
+            "qwen36_pl_normed",
+            last_hidden_bytes,
+            16,
+        )?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoDAsync_v2(
+                normed_region.device_ptr(),
+                last_hidden_region.device_ptr(),
+                last_hidden_bytes,
+                self.stream.raw() as _,
+            );
+        }
+        let eps = self.arch.base.rms_norm_eps;
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1,
+                hidden,
+                eps,
+            }
+            .launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                normed_region.device_ptr(),
+                la.input_layernorm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+        self.stream.fence()?;
+
         let qkv_region = self.arena.region(
             "qwen36_pl_qkv",
             (qkv_n as usize) * 2,
@@ -3187,7 +3222,7 @@ impl Qwen36Bringup {
                 qkv_region.device_ptr(),
                 la.in_proj_qkv.offset_bytes,
                 qkv_bs,
-                last_hidden_region.device_ptr(),
+                normed_region.device_ptr(),
                 stream_raw,
             )?;
             rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
@@ -3200,7 +3235,7 @@ impl Qwen36Bringup {
                 z_region.device_ptr(),
                 la.in_proj_z.offset_bytes,
                 z_bs,
-                last_hidden_region.device_ptr(),
+                normed_region.device_ptr(),
                 stream_raw,
             )?;
         }
