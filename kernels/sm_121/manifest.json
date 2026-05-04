@@ -351,6 +351,11 @@
       "path": "scale_rows_f32_ratio.ptx",
       "sha256": "a9a6f1907c0be8f1ed0d08cf958d626f21dc20b2004d912c31b7e1f35aa12c11"
     },
+    "scatter_heads_f16": {
+      "bytes": 1604,
+      "path": "scatter_heads_f16.ptx",
+      "sha256": "037c45a1b28fc6764a00b2f3c83620c84e992f5907e17f60869c4445660c7dcb"
+    },
     "sigmoid_mul_f16": {
       "bytes": 2008,
       "path": "sigmoid_mul_f16.ptx",
@@ -375,6 +380,11 @@
       "bytes": 1536,
       "path": "transpose_2d_f16.ptx",
       "sha256": "97504936faf40af4c4ecebbd9ae3066b2ce3e2edea7dea0d71728de8bb3b9fc0"
+    },
+    "transpose_heads_v_f16": {
+      "bytes": 1644,
+      "path": "transpose_heads_v_f16.ptx",
+      "sha256": "53b09258351917862b5fff2bd5b99b5d5c8881f9af12245d3c3029129ad28bac"
     },
     "vector_add_bf16_to_f16": {
       "bytes": 1430,
@@ -422,5 +432,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "60ec8e4"
+  "revision": "f63d63f"
 }

@@ -503,6 +503,13 @@ pub struct Gemma4FusedModules {
     pub extract_head_f16_mod: LoadedModule,
     pub fn_extract_head_f16: KernelFn,
     pub fn_scatter_head_f16: KernelFn,
+    /// Vision attention batched-strided pipeline: per-block fuses 16
+    /// heads' QK^T and (scores @ V) into 2 cuBLASLt launches each
+    /// instead of 32 (Codex review #B round 3 / #4 round 4).
+    pub transpose_heads_v_f16_mod: LoadedModule,
+    pub fn_transpose_heads_v_f16: KernelFn,
+    pub scatter_heads_f16_mod: LoadedModule,
+    pub fn_scatter_heads_f16: KernelFn,
 
     // `fp8_gemv.ptx` — GB10 warp-per-row FP8 GEMV kernels. Loaded at
     // bringup so the Sm121 decode fast path (`launch_fp8_gemv_f16in`
@@ -5688,15 +5695,36 @@ impl Gemma4Bringup {
         let q_buf = self.arena.region("g4v_q", n_tokens * HIDDEN * 2, 16)?;
         let k_buf = self.arena.region("g4v_k", n_tokens * HIDDEN * 2, 16)?;
         let v_buf = self.arena.region("g4v_v", n_tokens * HIDDEN * 2, 16)?;
-        let q_h = self.arena.region("g4v_qh", n_tokens * HEAD_DIM * 2, 16)?;
-        let k_h = self.arena.region("g4v_kh", n_tokens * HEAD_DIM * 2, 16)?;
-        let v_h = self.arena.region("g4v_vh", n_tokens * HEAD_DIM * 2, 16)?;
-        let v_h_t = self.arena.region("g4v_vht", HEAD_DIM * n_tokens * 2, 16)?;
-        let out_h = self.arena.region("g4v_oh", n_tokens * HEAD_DIM * 2, 16)?;
         let attn_out = self.arena.region("g4v_attn_out", n_tokens * HIDDEN * 2, 16)?;
         let proj_out = self.arena.region("g4v_proj_out", n_tokens * HIDDEN * 2, 16)?;
-        let scores_buf = self.arena.region("g4v_scores", n_tokens * n_tokens * 2, 16)?;
-        let scores_f32 = self.arena.region("g4v_scores_f32", n_tokens * n_tokens * 4, 16)?;
+        // Batched-strided attention scratch (Codex review #B round 3 /
+        // #4 round 4 follow-up). One [H, N, N] / [H, N, D] / [H, D, N]
+        // slab each — heads packed contiguously so cuBLASLt can run the
+        // 16-head QK^T and (scores @ V) GEMMs as a single strided-batch
+        // launch each, instead of 32 launches per block.
+        // Memory per request at NYT-sized N≈2400:
+        //   scores_f32_all: 16 × N² × 4 ≈ 369 MiB
+        //   scores_buf_all: 16 × N² × 2 ≈ 184 MiB
+        //   v_t_all       : 16 × D × N × 2 ≈ 5.5 MiB
+        //   out_f32_all   : 16 × N × D × 4 ≈ 11 MiB
+        //   out_hmajor    : 16 × N × D × 2 ≈ 5.5 MiB
+        // Arena is 60 GiB so this fits comfortably; gets restored at
+        // the per-request scratch checkpoint.
+        let scores_buf_all = self
+            .arena
+            .region("g4v_scores_all", NUM_HEADS * n_tokens * n_tokens * 2, 16)?;
+        let scores_f32_all = self
+            .arena
+            .region("g4v_scores_f32_all", NUM_HEADS * n_tokens * n_tokens * 4, 16)?;
+        let v_t_all = self
+            .arena
+            .region("g4v_vt_all", NUM_HEADS * HEAD_DIM * n_tokens * 2, 16)?;
+        let out_f32_all = self
+            .arena
+            .region("g4v_out_f32_all", NUM_HEADS * n_tokens * HEAD_DIM * 4, 16)?;
+        let out_hmajor = self
+            .arena
+            .region("g4v_out_hmajor", NUM_HEADS * n_tokens * HEAD_DIM * 2, 16)?;
         let mlp_g = self.arena.region("g4v_mlp_g", n_tokens * INTERMEDIATE * 2, 16)?;
         let mlp_u = self.arena.region("g4v_mlp_u", n_tokens * INTERMEDIATE * 2, 16)?;
         let mlp_d = self.arena.region("g4v_mlp_d", n_tokens * HIDDEN * 2, 16)?;
@@ -5853,128 +5881,201 @@ impl Gemma4Bringup {
                 }
                 Ok(())
             };
-            for h in 0..NUM_HEADS {
-                extract_head(q_h.device_ptr(), q_buf.device_ptr(), h)?;
-                extract_head(k_h.device_ptr(), k_buf.device_ptr(), h)?;
-                extract_head(v_h.device_ptr(), v_buf.device_ptr(), h)?;
-                self.stream.fence()?;
+            // === Batched-strided attention pipeline ===================
+            // Replaces a 16-head Python-style loop (with 6 launches per
+            // head per block: extract×3, QK^T GEMM, softmax, V-transpose,
+            // (scores@V) GEMM, cast, scatter) with a constant number of
+            // launches per block:
+            //   1) batched QK^T            (1 cuBLASLt strided-batched call)
+            //   2) batched softmax-f32→f16 (1 kernel,  grid = N×H rows)
+            //   3) batched transpose V     (1 kernel,  grid = (N, H))
+            //   4) batched scores @ V^T    (1 cuBLASLt strided-batched call)
+            //   5) batched cast f32→f16    (1 kernel)
+            //   6) scatter all heads       (1 kernel,  grid = (N, H))
+            //
+            // Q/K are read directly from the [N, H*D] interleaved
+            // q_buf/k_buf via cuBLASLt's strided-batch view (lda = H*D,
+            // stride_a = D). V needs an actual transpose to [H, D, N]
+            // because the scores @ V step needs V_T per head contiguous.
 
-                // Q*K^T → scores_f32 [N, N] f32 → softmax in f32, narrow
-                // to f16 only at the output. Matches HF
-                // `softmax(..., dtype=torch.float32).to(query.dtype)`
-                // (modeling_gemma4.py:794–795). Earlier path cast to f16
-                // BEFORE softmax which lost precision on large attention
-                // matrices (N ≈ 2400 typical).  Codex review #3 (E).
-                // scaling=1.0 per Gemma config — no scale on scores.
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    self.cublaslt.f16_gemm_f32(
-                        q_h.device_ptr(), k_h.device_ptr(),
-                        scores_f32.device_ptr(),
-                        n_tokens as i32, n_tokens as i32, HEAD_DIM as i32,
-                        stream_raw,
-                    )?;
-                    let mut out = scores_buf.device_ptr();
-                    let mut input = scores_f32.device_ptr();
-                    let mut sl = n_tokens as i32;
-                    let args = [
-                        (&mut out) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut input) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut sl) as *mut i32 as *mut core::ffi::c_void,
-                    ];
-                    let block: u32 = (n_tokens as u32).min(1024);
-                    let rc = cuLaunchKernel(
-                        self.fused.fn_softmax_row_f32_to_f16.raw() as CUfunction,
-                        n_tokens as u32, 1, 1,
-                        block, 1, 1,
-                        0, self.stream.raw() as CUstream,
-                        args.as_ptr() as *mut *mut core::ffi::c_void,
-                        core::ptr::null_mut(),
-                    );
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "vision: softmax_row_f32_to_f16 launch failed",
-                            rvllm_core::CudaErrorKind::LaunchFailed,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
-                }
-                self.stream.fence()?;
-
-                // Transpose V: [N, head_dim] → [head_dim, N] for scores @ V
-                // (f16_gemm_f32 always computes input @ weight^T).
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    let mut out_p = v_h_t.device_ptr();
-                    let mut in_p = v_h.device_ptr();
-                    let mut rows = n_tokens as i32;
-                    let mut cols = HEAD_DIM as i32;
-                    let args = [
-                        (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut rows) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut cols) as *mut i32 as *mut core::ffi::c_void,
-                    ];
-                    let gx = ((cols as u32) + 15) / 16;
-                    let gy = ((rows as u32) + 15) / 16;
-                    let rc = cuLaunchKernel(
-                        self.fused.fn_transpose_2d_f16.raw() as CUfunction,
-                        gx, gy, 1,
-                        16, 16, 1,
-                        0, self.stream.raw() as CUstream,
-                        args.as_ptr() as *mut *mut core::ffi::c_void,
-                        core::ptr::null_mut(),
-                    );
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "vision: transpose_2d_f16 launch failed",
-                            rvllm_core::CudaErrorKind::LaunchFailed,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
-                }
-                self.stream.fence()?;
-
-                // scores @ V (V transposed).
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    self.cublaslt.f16_gemm_f32(
-                        scores_buf.device_ptr(), v_h_t.device_ptr(),
-                        scores_f32.device_ptr(),
-                        n_tokens as i32, HEAD_DIM as i32, n_tokens as i32,
-                        stream_raw,
-                    )?;
-                    let n_elem = (n_tokens * HEAD_DIM) as i32;
-                    let mut out = out_h.device_ptr();
-                    let mut input = scores_f32.device_ptr();
-                    let mut nn = n_elem;
-                    let args = [
-                        (&mut out) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut input) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
-                    ];
-                    let block: u32 = 256;
-                    let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
-                    let rc = cuLaunchKernel(
-                        self.fused.fn_cast_f32_to_f16.raw() as CUfunction,
-                        grid.0, grid.1, grid.2,
-                        block, 1, 1,
-                        0, self.stream.raw() as CUstream,
-                        args.as_ptr() as *mut *mut core::ffi::c_void,
-                        core::ptr::null_mut(),
-                    );
-                    if rc != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "vision: cast_f32_to_f16 launch failed (scores@V)",
-                            rvllm_core::CudaErrorKind::LaunchFailed,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
-                }
-                // Scatter out_h → attn_out at offset h*head_dim per row.
-                scatter_head(attn_out.device_ptr(), out_h.device_ptr(), h)?;
-                self.stream.fence()?;
+            // (1) batched QK^T → scores_f32_all [H, N, N]
+            #[cfg(feature = "cuda")]
+            unsafe {
+                self.cublaslt.f16_gemm_f32_batched_strided(
+                    q_buf.device_ptr(),
+                    k_buf.device_ptr(),
+                    scores_f32_all.device_ptr(),
+                    n_tokens as i32,                // m = N (Q rows)
+                    n_tokens as i32,                // n = N (K rows = scores cols)
+                    HEAD_DIM as i32,                // k = D
+                    NUM_HEADS as i32,               // batch = H
+                    (NUM_HEADS * HEAD_DIM) as i32,  // lda = H*D (interleaved)
+                    (NUM_HEADS * HEAD_DIM) as i32,  // ldb = H*D
+                    n_tokens as i32,                // ldd = N (head-major dense)
+                    HEAD_DIM as i64,                // stride_a = D between heads
+                    HEAD_DIM as i64,                // stride_b = D
+                    (n_tokens * n_tokens) as i64,   // stride_d = N*N
+                    stream_raw,
+                )?;
             }
+            self.stream.fence()?;
+
+            // (2) batched softmax f32→f16: scores_f32_all [H, N, N]
+            //     → scores_buf_all [H, N, N]. Launch with grid = N*H rows
+            //     so the existing per-row kernel handles all heads at once.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let mut out = scores_buf_all.device_ptr();
+                let mut input = scores_f32_all.device_ptr();
+                let mut sl = n_tokens as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sl) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = (n_tokens as u32).min(1024);
+                let rc = cuLaunchKernel(
+                    self.fused.fn_softmax_row_f32_to_f16.raw() as CUfunction,
+                    (n_tokens * NUM_HEADS) as u32, 1, 1,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: batched softmax launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            self.stream.fence()?;
+
+            // (3) transpose V from interleaved [N, H*D] to head-major
+            //     [H, D, N] via the dedicated transpose_heads_v kernel.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let mut out = v_t_all.device_ptr();
+                let mut in_p = v_buf.device_ptr();
+                let mut nh = NUM_HEADS as i32;
+                let mut hd = HEAD_DIM as i32;
+                let mut nt = n_tokens as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let rc = cuLaunchKernel(
+                    self.fused.fn_transpose_heads_v_f16.raw() as CUfunction,
+                    n_tokens as u32, NUM_HEADS as u32, 1,
+                    HEAD_DIM as u32, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: transpose_heads_v launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            self.stream.fence()?;
+
+            // (4) batched scores @ V^T → out_f32_all [H, N, D].
+            //     scores_buf_all per head [N, N] contiguous: lda = N,
+            //     stride_a = N². V_T per head [D, N] contiguous:
+            //     ldb = N, stride_b = D*N. Output per head [N, D]:
+            //     ldd = D, stride_d = N*D.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                self.cublaslt.f16_gemm_f32_batched_strided(
+                    scores_buf_all.device_ptr(),
+                    v_t_all.device_ptr(),
+                    out_f32_all.device_ptr(),
+                    n_tokens as i32,                // m = N
+                    HEAD_DIM as i32,                // n = D
+                    n_tokens as i32,                // k = N
+                    NUM_HEADS as i32,
+                    n_tokens as i32,                // lda = N
+                    n_tokens as i32,                // ldb = N
+                    HEAD_DIM as i32,                // ldd = D
+                    (n_tokens * n_tokens) as i64,   // stride_a = N²
+                    (HEAD_DIM * n_tokens) as i64,   // stride_b = D*N
+                    (n_tokens * HEAD_DIM) as i64,   // stride_d = N*D
+                    stream_raw,
+                )?;
+            }
+            self.stream.fence()?;
+
+            // (5) cast out_f32_all → out_hmajor (H × N × D elements).
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let n_elem = (NUM_HEADS * n_tokens * HEAD_DIM) as i32;
+                let mut out = out_hmajor.device_ptr();
+                let mut input = out_f32_all.device_ptr();
+                let mut nn = n_elem;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let rc = cuLaunchKernel(
+                    self.fused.fn_cast_f32_to_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: batched cast (scores@V) launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            self.stream.fence()?;
+
+            // (6) scatter out_hmajor [H, N, D] → attn_out [N, H*D].
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let mut out = attn_out.device_ptr();
+                let mut in_p = out_hmajor.device_ptr();
+                let mut nh = NUM_HEADS as i32;
+                let mut hd = HEAD_DIM as i32;
+                let mut nt = n_tokens as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let rc = cuLaunchKernel(
+                    self.fused.fn_scatter_heads_f16.raw() as CUfunction,
+                    n_tokens as u32, NUM_HEADS as u32, 1,
+                    HEAD_DIM as u32, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: scatter_heads launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            self.stream.fence()?;
 
             // o_proj (no bias).
             linear_no_bias(attn_out.device_ptr(), blk.o_proj_w.offset_bytes,
@@ -6409,6 +6510,12 @@ fn load_gemma4_fused(
         extract_head_f16_mod.get_function("extract_head_f16_kernel")?;
     let fn_scatter_head_f16 =
         extract_head_f16_mod.get_function("scatter_head_f16_kernel")?;
+    let transpose_heads_v_f16_mod = loader.load_ptx("transpose_heads_v_f16")?;
+    let fn_transpose_heads_v_f16 = transpose_heads_v_f16_mod
+        .get_function("transpose_heads_v_f16_kernel")?;
+    let scatter_heads_f16_mod = loader.load_ptx("scatter_heads_f16")?;
+    let fn_scatter_heads_f16 = scatter_heads_f16_mod
+        .get_function("scatter_heads_f16_kernel")?;
 
     // NVFP4 V-rotation companion (fwht then signs). PTX may be absent
     // on older kernel trees; fall through to None and the dispatch
@@ -6534,6 +6641,10 @@ fn load_gemma4_fused(
         extract_head_f16_mod,
         fn_extract_head_f16,
         fn_scatter_head_f16,
+        transpose_heads_v_f16_mod,
+        fn_transpose_heads_v_f16,
+        scatter_heads_f16_mod,
+        fn_scatter_heads_f16,
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_native_f16in,
         fn_fp8_gemv_wpr_native_bf16in,

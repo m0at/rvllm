@@ -235,6 +235,149 @@ impl CublasLt {
         Ok(())
     }
 
+    /// Strided-batched f16 × f16 GEMM with f32 output.
+    ///
+    /// Like `f16_gemm_f32` (which produces `D_f32 = A_f16 * B_f16^T`)
+    /// but runs `batch_count` independent GEMMs in a single cuBLASLt
+    /// call, with caller-supplied leading dims (so a head slice of a
+    /// `[N, H, D]` row-major buffer can be addressed as a strided
+    /// view: `lda = H*D`, `stride_a = D`) and per-batch strides.
+    ///
+    /// Used by the ViT vision tower to fuse the 16-head per-block
+    /// QK^T and (scores @ V) GEMMs into two cuBLASLt launches each
+    /// instead of 32 (16 × {QK^T, AV}).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f16_gemm_f32_batched_strided(
+        &self,
+        a_f16: u64,
+        b_f16: u64,
+        d_f32: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        batch_count: i32,
+        lda: i32,
+        ldb: i32,
+        ldd: i32,
+        stride_a: i64,
+        stride_b: i64,
+        stride_d: i64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
+        let rc = lt::cublasLtMatmulDescCreate(
+            &mut desc,
+            lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            lt::cudaDataType_t::CUDA_R_32F,
+        );
+        if rc != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("cublasLtMatmulDescCreate(f16-batched)"));
+        }
+        let transa: i32 = 1;
+        let transb: i32 = 0;
+        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+            &transa as *const _ as *const _, std::mem::size_of_val(&transa))?;
+        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+            &transb as *const _ as *const _, std::mem::size_of_val(&transb))?;
+
+        // Helper: set BATCH_COUNT + STRIDED_BATCH_OFFSET on a layout.
+        let set_batch = |layout: lt::cublasLtMatrixLayout_t, stride_elems: i64|
+            -> Result<()>
+        {
+            let bc: i32 = batch_count;
+            let r = lt::cublasLtMatrixLayoutSetAttribute(
+                layout,
+                lt::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                &bc as *const _ as *const _,
+                std::mem::size_of_val(&bc),
+            );
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(cublaslt_err("layout BATCH_COUNT(f16-batched)"));
+            }
+            let r = lt::cublasLtMatrixLayoutSetAttribute(
+                layout,
+                lt::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                &stride_elems as *const _ as *const _,
+                std::mem::size_of_val(&stride_elems),
+            );
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(cublaslt_err("layout STRIDED_BATCH_OFFSET(f16-batched)"));
+            }
+            Ok(())
+        };
+
+        let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut layout_d: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        // The cublasLtMatmul call below swaps the user's a_f16/b_f16
+        // arguments at the matmul site (b_f16 goes into the cuBLAS-A
+        // position with layout_a, a_f16 into the cuBLAS-B position with
+        // layout_b). We mirror that swap here so the CALLER'S
+        // `lda`/`stride_a` apply to the user's a_f16 buffer (= cuBLAS
+        // layout_b), and `ldb`/`stride_b` to b_f16 (= layout_a).
+        // Without this swap the QK^T call works (Q and K share the
+        // same stride) but scores @ V^T silently mis-strides V_T per
+        // head and produces complete garbage.
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_a,
+            lt::cudaDataType_t::CUDA_R_16F, k as u64, n as u64, ldb as i64);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout A(f16-batched)")); }
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_b,
+            lt::cudaDataType_t::CUDA_R_16F, k as u64, m as u64, lda as i64);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout B(f16-batched)")); }
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_d,
+            lt::cudaDataType_t::CUDA_R_32F, n as u64, m as u64, ldd as i64);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout D(f16-batched)")); }
+
+        set_batch(layout_a, stride_b)?;  // layout_a holds b_f16
+        set_batch(layout_b, stride_a)?;  // layout_b holds a_f16
+        set_batch(layout_d, stride_d)?;
+
+        let key = AlgoKey { m, n, k, kind: 22 };
+        let cached_algo = self.algo_cache.lock().ok().and_then(|c| c.get(&key).copied());
+        let algo = if let Some(a) = cached_algo { a } else {
+            let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+            lt::cublasLtMatmulPreferenceCreate(&mut pref);
+            let ws = self.workspace_bytes;
+            lt::cublasLtMatmulPreferenceSetAttribute(pref,
+                lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws as *const _ as *const _, std::mem::size_of::<usize>());
+            let mut heur: [lt::cublasLtMatmulHeuristicResult_t; 1] = std::mem::zeroed();
+            let mut ret: i32 = 0;
+            let r = lt::cublasLtMatmulAlgoGetHeuristic(
+                self.handle, desc, layout_a, layout_b, layout_d, layout_d,
+                pref, 1, heur.as_mut_ptr(), &mut ret);
+            lt::cublasLtMatmulPreferenceDestroy(pref);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
+                return Err(cublaslt_err("heuristic(f16-batched)"));
+            }
+            let best = heur[0].algo;
+            if let Ok(mut c) = self.algo_cache.lock() { c.insert(key, best); }
+            best
+        };
+
+        let one: f32 = 1.0;
+        let zero: f32 = 0.0;
+        let r = lt::cublasLtMatmul(
+            self.handle, desc,
+            &one as *const _ as *const _,
+            b_f16 as *const _, layout_a,
+            a_f16 as *const _, layout_b,
+            &zero as *const _ as *const _,
+            d_f32 as *const _, layout_d,
+            d_f32 as *mut _, layout_d,
+            &algo, self.workspace as *mut _, self.workspace_bytes, stream as _,
+        );
+        lt::cublasLtMatrixLayoutDestroy(layout_d);
+        lt::cublasLtMatrixLayoutDestroy(layout_b);
+        lt::cublasLtMatrixLayoutDestroy(layout_a);
+        lt::cublasLtMatmulDescDestroy(desc);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("cublasLtMatmul(f16-batched)"));
+        }
+        Ok(())
+    }
+
     /// BF16 x BF16 matmul with F32 output: D_f32 = A_bf16 * B_bf16^T.
     /// Cycle 55 step 2 (Phase B): bf16-input sibling of `f16_gemm_f32`.
     /// Same compute path (CUBLAS_COMPUTE_32F internally), only the
