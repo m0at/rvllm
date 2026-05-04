@@ -471,6 +471,28 @@ pub struct Gemma4FusedModules {
     pub fn_scale_cols_f16: KernelFn,
     pub scale_cols_f16_mod: LoadedModule,
 
+    // ── Vision (Phase 3b) — kernels for forward_gemma_vision. ─────────
+    pub layernorm_inplace_f16_mod: LoadedModule,
+    pub fn_layernorm_inplace_f16: KernelFn,
+    pub softmax_row_f16_mod: LoadedModule,
+    pub fn_softmax_row_f16: KernelFn,
+    pub gelu_tanh_f16_mod: LoadedModule,
+    pub fn_gelu_tanh_f16: KernelFn,
+    pub gelu_tanh_mul_f16_mod: LoadedModule,
+    pub fn_gelu_tanh_mul_f16: KernelFn,
+    pub vit_avgpool_f16_mod: LoadedModule,
+    pub fn_vit_avgpool_f16: KernelFn,
+    pub vit_pos_emb_lookup_2d_f16_mod: LoadedModule,
+    pub fn_vit_pos_emb_lookup_2d_f16: KernelFn,
+    pub transpose_2d_f16_mod: LoadedModule,
+    pub fn_transpose_2d_f16: KernelFn,
+    pub scale_inplace_f16_mod: LoadedModule,
+    pub fn_scale_inplace_f16: KernelFn,
+    pub add_bias_f16_mod: LoadedModule,
+    pub fn_add_bias_f16: KernelFn,
+    pub cast_fp_mod: LoadedModule,
+    pub fn_cast_f32_to_f16: KernelFn,
+
     // `fp8_gemv.ptx` — GB10 warp-per-row FP8 GEMV kernels. Loaded at
     // bringup so the Sm121 decode fast path (`launch_fp8_gemv_f16in`
     // in `gemma4_layer_exec.rs`) can call it without a per-step
@@ -5338,6 +5360,33 @@ fn load_gemma4_fused(
     let scale_cols_f16_mod = loader.load_ptx("scale_cols_f16")?;
     let fn_scale_cols_f16 = scale_cols_f16_mod.get_function("scale_cols_f16_kernel")?;
 
+    // Vision Phase 3b kernel modules.
+    let layernorm_inplace_f16_mod = loader.load_ptx("layernorm_inplace_f16")?;
+    let fn_layernorm_inplace_f16 =
+        layernorm_inplace_f16_mod.get_function("layernorm_inplace_f16_kernel")?;
+    let softmax_row_f16_mod = loader.load_ptx("softmax_row_f16")?;
+    let fn_softmax_row_f16 = softmax_row_f16_mod.get_function("softmax_row_f16_kernel")?;
+    let gelu_tanh_f16_mod = loader.load_ptx("gelu_tanh_f16")?;
+    let fn_gelu_tanh_f16 = gelu_tanh_f16_mod.get_function("gelu_tanh_f16_kernel")?;
+    let gelu_tanh_mul_f16_mod = loader.load_ptx("gelu_tanh_mul_f16")?;
+    let fn_gelu_tanh_mul_f16 =
+        gelu_tanh_mul_f16_mod.get_function("gelu_tanh_mul_f16_kernel")?;
+    let vit_avgpool_f16_mod = loader.load_ptx("vit_avgpool_f16")?;
+    let fn_vit_avgpool_f16 = vit_avgpool_f16_mod.get_function("vit_avgpool_f16_kernel")?;
+    let vit_pos_emb_lookup_2d_f16_mod = loader.load_ptx("vit_pos_emb_lookup_2d_f16")?;
+    let fn_vit_pos_emb_lookup_2d_f16 = vit_pos_emb_lookup_2d_f16_mod
+        .get_function("vit_pos_emb_lookup_2d_f16_kernel")?;
+    let transpose_2d_f16_mod = loader.load_ptx("transpose_2d_f16")?;
+    let fn_transpose_2d_f16 =
+        transpose_2d_f16_mod.get_function("transpose_2d_f16_kernel")?;
+    let scale_inplace_f16_mod = loader.load_ptx("scale_inplace_f16")?;
+    let fn_scale_inplace_f16 =
+        scale_inplace_f16_mod.get_function("scale_inplace_f16_kernel")?;
+    let add_bias_f16_mod = loader.load_ptx("add_bias_f16")?;
+    let fn_add_bias_f16 = add_bias_f16_mod.get_function("add_bias_f16_kernel")?;
+    let cast_fp_mod = loader.load_ptx("cast_fp")?;
+    let fn_cast_f32_to_f16 = cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
+
     // NVFP4 V-rotation companion (fwht then signs). PTX may be absent
     // on older kernel trees; fall through to None and the dispatch
     // site behaves as if RVLLM_NVFP4_HADAMARD_V is off.
@@ -5431,6 +5480,26 @@ fn load_gemma4_fused(
         fused_qkv_rmsnorm_bf16_mod,
         fn_scale_cols_f16,
         scale_cols_f16_mod,
+        layernorm_inplace_f16_mod,
+        fn_layernorm_inplace_f16,
+        softmax_row_f16_mod,
+        fn_softmax_row_f16,
+        gelu_tanh_f16_mod,
+        fn_gelu_tanh_f16,
+        gelu_tanh_mul_f16_mod,
+        fn_gelu_tanh_mul_f16,
+        vit_avgpool_f16_mod,
+        fn_vit_avgpool_f16,
+        vit_pos_emb_lookup_2d_f16_mod,
+        fn_vit_pos_emb_lookup_2d_f16,
+        transpose_2d_f16_mod,
+        fn_transpose_2d_f16,
+        scale_inplace_f16_mod,
+        fn_scale_inplace_f16,
+        add_bias_f16_mod,
+        fn_add_bias_f16,
+        cast_fp_mod,
+        fn_cast_f32_to_f16,
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_native_f16in,
         fn_fp8_gemv_wpr_native_bf16in,
