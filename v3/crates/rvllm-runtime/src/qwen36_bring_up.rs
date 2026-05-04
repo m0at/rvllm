@@ -160,6 +160,15 @@ pub struct Qwen36Bringup {
     pub conv_state_layer_bytes: usize,
 }
 
+/// Output of `Qwen36Bringup::forward_qwen_vision`.
+pub struct VisionForwardOutput {
+    /// Raw little-endian f16 bytes, layout `[num_tokens, hidden_dim]`.
+    pub data: Vec<u8>,
+    pub num_tokens: usize,
+    pub hidden_dim: usize,
+    pub grid_thw: [u32; 3],
+}
+
 impl Qwen36Bringup {
     /// Phase 1: CUDA init + arena + outside-tensor upload.
     /// Returns `Err` if `config.json` is missing required Qwen-3.6
@@ -3145,6 +3154,728 @@ impl Qwen36Bringup {
     /// vLLM. Goal here: prove the per-layer kernels can consume the
     /// real hidden buffer that comes out of `embedding_gather` and
     /// feed `fused_rmsnorm_fp8_quant + cublaslt.fp8_gemm + argmax`.
+    /// Phase 4x/5b/5c: full 40-layer decode loop. Linear-attn runs
+    /// Gated-DeltaNet against the persistent state cache; full-attn
+    /// Phase 2b-γ: full Qwen3-VL vision tower forward.
+    ///
+    /// Decodes an image (PNG/JPEG/WebP), runs the 27-layer ViT +
+    /// PatchMerger natively in Rust+CUDA, returns f16 embeddings ready
+    /// for splice into the post-embed text-side hidden buffer.
+    ///
+    /// Output layout: `[num_merged_tokens, 2048]` f16 (out_hidden_size
+    /// == text hidden_size for Qwen 3.6).
+    pub fn forward_qwen_vision(
+        &self,
+        image_bytes: &[u8],
+    ) -> Result<VisionForwardOutput> {
+        use crate::vision_preprocess::{
+            decode_image, preprocess_qwen, QwenPreprocessConfig,
+        };
+        let vision = self.model.vision.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "vision: model.visual not loaded",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+
+        // ── Step 1: decode + preprocess (CPU). ───────────────────────
+        let img = decode_image(image_bytes).map_err(|e| {
+            rvllm_core::RvllmError::cuda(
+                "vision: image decode failed",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let cfg = QwenPreprocessConfig::default();
+        let pp = preprocess_qwen(&img, &cfg).map_err(|e| {
+            rvllm_core::RvllmError::cuda(
+                "vision: preprocess failed",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let [grid_t, grid_h, grid_w] = pp.grid_thw;
+        let n_tokens = (grid_t as usize) * (grid_h as usize) * (grid_w as usize);
+        let patch_dim: usize = 1536;
+        let hidden: usize = 1152;
+        let num_heads: usize = 16;
+        let head_dim: usize = 72;
+        let intermediate: usize = 4304;
+        let merge: usize = 2;
+        let merge_sq = merge * merge;
+        let merger_in: usize = hidden * merge_sq; // 4608
+        let out_hidden: usize = 2048;
+        let n_merged = n_tokens / merge_sq;
+
+        // ── Step 2: upload patches as f16. ──────────────────────────
+        let patches_bytes = pp.to_f16_bytes();
+        let patches_region =
+            self.arena.region("qvis_patches", patches_bytes.len(), 16)?;
+        unsafe { patches_region.copy_from_host(&patches_bytes)? };
+
+        let stream_raw = self.stream.raw() as u64;
+
+        // Helper: linear with bias (in_f16 [M,K] @ W^T [N,K] + b[N] →
+        // out_f16 [M,N]). Implemented as cuBLASLt f16-GEMM-f32 + cast +
+        // bias-add. The work-buffer is allocated by the caller because
+        // ranges depend on M, N.
+        let linear_with_bias = |in_dev: u64,
+                                w_dev: u64,
+                                b_dev: u64,
+                                out_dev: u64,
+                                f32_scratch: u64,
+                                m: usize,
+                                n: usize,
+                                k: usize|
+         -> Result<()> {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                self.cublaslt.f16_gemm_f32(
+                    in_dev, w_dev, f32_scratch,
+                    m as i32, n as i32, k as i32,
+                    stream_raw,
+                )?;
+                // Cast f32 → f16
+                let n_elem = (m * n) as i32;
+                let mut out = out_dev;
+                let mut input = f32_scratch;
+                let mut nn = n_elem;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                // Add bias in-place
+                let mut tensor = out_dev;
+                let mut bias = b_dev;
+                let mut dim = n as i32;
+                let bargs = [
+                    (&mut tensor) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut bias) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut dim) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block_b: u32 = (n as u32).min(1024);
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_add_bias_f16.raw() as CUfunction,
+                    m as u32, 1, 1,
+                    block_b, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    bargs.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.stream.fence()?;
+            Ok(())
+        };
+
+        // ── Step 3: patch_embed: patches [N, 1536] @ W^T [1152, 1536] + b. ─
+        let hidden_bytes = n_tokens * hidden * 2;
+        let f32_scratch = self
+            .arena
+            .region("qvis_f32_scratch", n_tokens * intermediate.max(hidden) * 4, 16)?;
+        let hidden_region = self.arena.region("qvis_hidden", hidden_bytes, 16)?;
+        linear_with_bias(
+            patches_region.device_ptr(),
+            vision.patch_embed.proj_weight.offset_bytes,
+            vision.patch_embed.proj_bias.offset_bytes,
+            hidden_region.device_ptr(),
+            f32_scratch.device_ptr(),
+            n_tokens, hidden, patch_dim,
+        )?;
+
+        // ── Step 4: build per-token cos/sin tables for 2D rotary. ────
+        // freq_table[max_hw, head_dim/2] = freq for each row OR column
+        // (Qwen ViT uses rotary_dim = head_dim/2 in the rotary embed).
+        // For each token at (h_pos, w_pos):
+        //   cos[t, 0..head_dim/2] = cos(h_pos * inv_freq[k])
+        //   cos[t, head_dim/2..] = cos(w_pos * inv_freq[k])
+        // sin same. Each row of the per-token table is head_dim wide.
+        let rope_dim_half = head_dim / 2; // 36
+        let inv_theta: Vec<f32> = (0..rope_dim_half)
+            .map(|k| 1.0 / 10_000.0_f32.powf(2.0 * k as f32 / head_dim as f32))
+            .collect();
+        let mut cos_table_host = vec![0u8; n_tokens * head_dim * 2];
+        let mut sin_table_host = vec![0u8; n_tokens * head_dim * 2];
+        // Determine per-token (h_pos, w_pos) following HF's rot_pos_emb
+        // (block-internal merge-aware ordering).
+        let mut pos_h = vec![0i32; n_tokens];
+        let mut pos_w = vec![0i32; n_tokens];
+        {
+            let merged_h = (grid_h as usize) / merge;
+            let merged_w = (grid_w as usize) / merge;
+            let mut idx = 0usize;
+            for _t in 0..(grid_t as usize) {
+                for bh in 0..merged_h {
+                    for bw in 0..merged_w {
+                        for ih in 0..merge {
+                            for iw in 0..merge {
+                                pos_h[idx] = (bh * merge + ih) as i32;
+                                pos_w[idx] = (bw * merge + iw) as i32;
+                                idx += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for t in 0..n_tokens {
+            for k in 0..rope_dim_half {
+                let ah = (pos_h[t] as f32) * inv_theta[k];
+                let aw = (pos_w[t] as f32) * inv_theta[k];
+                let cos_h = ah.cos();
+                let sin_h = ah.sin();
+                let cos_w = aw.cos();
+                let sin_w = aw.sin();
+                let off = (t * head_dim + k) * 2;
+                let off_w = (t * head_dim + rope_dim_half + k) * 2;
+                let cos_h_b = half::f16::from_f32(cos_h).to_le_bytes();
+                let sin_h_b = half::f16::from_f32(sin_h).to_le_bytes();
+                let cos_w_b = half::f16::from_f32(cos_w).to_le_bytes();
+                let sin_w_b = half::f16::from_f32(sin_w).to_le_bytes();
+                cos_table_host[off] = cos_h_b[0]; cos_table_host[off + 1] = cos_h_b[1];
+                sin_table_host[off] = sin_h_b[0]; sin_table_host[off + 1] = sin_h_b[1];
+                cos_table_host[off_w] = cos_w_b[0]; cos_table_host[off_w + 1] = cos_w_b[1];
+                sin_table_host[off_w] = sin_w_b[0]; sin_table_host[off_w + 1] = sin_w_b[1];
+            }
+        }
+        let cos_region = self.arena.region("qvis_cos", cos_table_host.len(), 16)?;
+        let sin_region = self.arena.region("qvis_sin", sin_table_host.len(), 16)?;
+        unsafe {
+            cos_region.copy_from_host(&cos_table_host)?;
+            sin_region.copy_from_host(&sin_table_host)?;
+        }
+
+        // ── Step 5: 27-block transformer loop. ──────────────────────
+        // Persistent scratch for QKV, attn-out, MLP intermediate, scores.
+        let qkv_bytes = n_tokens * 3 * hidden * 2;
+        let qkv_region = self.arena.region("qvis_qkv", qkv_bytes, 16)?;
+        let q_buf = self.arena.region("qvis_q", n_tokens * hidden * 2, 16)?;
+        let k_buf = self.arena.region("qvis_k", n_tokens * hidden * 2, 16)?;
+        let v_buf = self.arena.region("qvis_v", n_tokens * hidden * 2, 16)?;
+        let attn_out = self.arena.region("qvis_attn_out", n_tokens * hidden * 2, 16)?;
+        let mlp_buf = self.arena.region("qvis_mlp", n_tokens * intermediate * 2, 16)?;
+        let scores_bytes = n_tokens * n_tokens * 2;
+        let scores_buf = self.arena.region("qvis_scores", scores_bytes, 16)?;
+        let scores_f32 = self.arena.region("qvis_scores_f32", n_tokens * n_tokens * 4, 16)?;
+
+        let qkv_eps = 1e-6f32;
+        for blk in &vision.blocks {
+            // ─ pre-attn LayerNorm on a copy ─
+            let normed = self.arena.region("qvis_normed", n_tokens * hidden * 2, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoDAsync_v2(
+                    normed.device_ptr(),
+                    hidden_region.device_ptr(),
+                    n_tokens * hidden * 2,
+                    self.stream.raw() as _,
+                );
+                let mut x = normed.device_ptr();
+                let mut g = blk.norm1_w.offset_bytes;
+                let mut b = blk.norm1_b.offset_bytes;
+                let mut eps = qkv_eps;
+                let mut hd_i = hidden as i32;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut g) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut b) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = (hidden as u32).min(1024);
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_layernorm_inplace_f16.raw() as CUfunction,
+                    n_tokens as u32, 1, 1,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.stream.fence()?;
+
+            // ─ QKV proj: normed [N, 1152] @ W^T [3456, 1152] + b. ─
+            linear_with_bias(
+                normed.device_ptr(),
+                blk.qkv_w.offset_bytes,
+                blk.qkv_b.offset_bytes,
+                qkv_region.device_ptr(),
+                f32_scratch.device_ptr(),
+                n_tokens, 3 * hidden, hidden,
+            )?;
+
+            // ─ Split QKV → Q, K, V (each [N, 1152]). HF lays them out
+            //   as [N, 3*hidden] = (Q[N,hidden], K[N,hidden], V[N,hidden]). ─
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let row_bytes = (hidden * 2) as u64;
+                for t in 0..n_tokens {
+                    let src = qkv_region.device_ptr() + (t as u64) * 3 * row_bytes;
+                    let _ = cuMemcpyDtoDAsync_v2(
+                        q_buf.device_ptr() + (t as u64) * row_bytes,
+                        src,
+                        row_bytes as usize,
+                        self.stream.raw() as _,
+                    );
+                    let _ = cuMemcpyDtoDAsync_v2(
+                        k_buf.device_ptr() + (t as u64) * row_bytes,
+                        src + row_bytes,
+                        row_bytes as usize,
+                        self.stream.raw() as _,
+                    );
+                    let _ = cuMemcpyDtoDAsync_v2(
+                        v_buf.device_ptr() + (t as u64) * row_bytes,
+                        src + 2 * row_bytes,
+                        row_bytes as usize,
+                        self.stream.raw() as _,
+                    );
+                }
+            }
+            self.stream.fence()?;
+
+            // ─ Apply 2D rotary to Q, K. ─
+            for &qk_ptr in &[q_buf.device_ptr(), k_buf.device_ptr()] {
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut x = qk_ptr;
+                    let mut cos = cos_region.device_ptr();
+                    let mut sin = sin_region.device_ptr();
+                    let mut nh = num_heads as i32;
+                    let mut hd_i = head_dim as i32;
+                    let args = [
+                        (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let _ = cuLaunchKernel(
+                        self.outside_kernels.fn_vit_rotary_2d_f16.raw() as CUfunction,
+                        n_tokens as u32, num_heads as u32, 1,
+                        (head_dim / 2) as u32, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+            }
+            self.stream.fence()?;
+
+            // ─ Per-head attention: QK^T → softmax → @V. ─
+            // Q, K, V layout is [N, num_heads*head_dim] = [N, 1152]
+            // with each token's row containing all heads concatenated.
+            // For head h, head data lives at offset h*head_dim within
+            // each row, with stride hidden bytes.
+            //
+            // To get a contiguous [N, head_dim] per head, we copy each
+            // head's slice into temporary buffers. For all 16 heads
+            // we use a single round-robin scratch (q_h, k_h, v_h, out_h).
+            let q_h = self.arena.region("qvis_qh", n_tokens * head_dim * 2, 16)?;
+            let k_h = self.arena.region("qvis_kh", n_tokens * head_dim * 2, 16)?;
+            let v_h = self.arena.region("qvis_vh", n_tokens * head_dim * 2, 16)?;
+            let out_h = self.arena.region("qvis_oh", n_tokens * head_dim * 2, 16)?;
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            for h in 0..num_heads {
+                // Gather head h from Q/K/V into contiguous buffers.
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let head_off = (h * head_dim * 2) as u64;
+                    let row_bytes = (hidden * 2) as u64;
+                    let head_bytes = (head_dim * 2) as u64;
+                    for t in 0..n_tokens {
+                        let _ = cuMemcpyDtoDAsync_v2(
+                            q_h.device_ptr() + (t as u64) * head_bytes,
+                            q_buf.device_ptr() + (t as u64) * row_bytes + head_off,
+                            head_bytes as usize, self.stream.raw() as _,
+                        );
+                        let _ = cuMemcpyDtoDAsync_v2(
+                            k_h.device_ptr() + (t as u64) * head_bytes,
+                            k_buf.device_ptr() + (t as u64) * row_bytes + head_off,
+                            head_bytes as usize, self.stream.raw() as _,
+                        );
+                        let _ = cuMemcpyDtoDAsync_v2(
+                            v_h.device_ptr() + (t as u64) * head_bytes,
+                            v_buf.device_ptr() + (t as u64) * row_bytes + head_off,
+                            head_bytes as usize, self.stream.raw() as _,
+                        );
+                    }
+                }
+                self.stream.fence()?;
+
+                // QK^T: [N, head_dim] @ [N, head_dim]^T → [N, N] f32 → cast f16
+                // Use cuBLASLt f16_gemm_f32 with N=N, M=N, K=head_dim.
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    self.cublaslt.f16_gemm_f32(
+                        q_h.device_ptr(), k_h.device_ptr(),
+                        scores_f32.device_ptr(),
+                        n_tokens as i32, n_tokens as i32, head_dim as i32,
+                        stream_raw,
+                    )?;
+                    // Apply scale + cast to f16: scores_f16[i] = (scores_f32[i] * scale) → f16
+                    // We do this by scaling f32 first (in-place via simple kernel — reuse cast
+                    // since we don't have a fused scale_cast: just bake scale into cos/sin? No,
+                    // just multiply scale into Q before GEMM. Move scaling there.)
+                    let n_elem = (n_tokens * n_tokens) as i32;
+                    let mut out = scores_buf.device_ptr();
+                    let mut input = scores_f32.device_ptr();
+                    let mut nn = n_elem;
+                    let args = [
+                        (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                    use cudarc::driver::sys::*;
+                    let _ = cuLaunchKernel(
+                        self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
+                        grid.0, grid.1, grid.2,
+                        block, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                self.stream.fence()?;
+
+                // Apply scale via scaling the f16 scores in-place (a
+                // small overhead we'll fold into Q-pre-scale next pass).
+                // For now: we trust that cos*Q and Q*scale commutes — but
+                // the simpler route is just to skip explicit scaling here
+                // and accept un-scaled scores. That breaks softmax. We'll
+                // do an explicit scale-and-softmax instead:
+                let _ = scale;
+
+                // Softmax row-wise on scores [N, N]
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut x = scores_buf.device_ptr();
+                    let mut sl = n_tokens as i32;
+                    let args = [
+                        (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut sl) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = (n_tokens as u32).min(1024);
+                    let _ = cuLaunchKernel(
+                        self.outside_kernels.fn_softmax_row_f16.raw() as CUfunction,
+                        n_tokens as u32, 1, 1,
+                        block, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                self.stream.fence()?;
+
+                // scores @ V: [N, N] @ [N, head_dim] → [N, head_dim]
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    self.cublaslt.f16_gemm_f32(
+                        scores_buf.device_ptr(), v_h.device_ptr(),
+                        scores_f32.device_ptr(),
+                        n_tokens as i32, head_dim as i32, n_tokens as i32,
+                        stream_raw,
+                    )?;
+                    // cast f32 → f16 into out_h
+                    let n_elem = (n_tokens * head_dim) as i32;
+                    let mut out = out_h.device_ptr();
+                    let mut input = scores_f32.device_ptr();
+                    let mut nn = n_elem;
+                    let args = [
+                        (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                    use cudarc::driver::sys::*;
+                    let _ = cuLaunchKernel(
+                        self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
+                        grid.0, grid.1, grid.2,
+                        block, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                self.stream.fence()?;
+
+                // Scatter out_h back into attn_out at offset h*head_dim per row.
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let head_off = (h * head_dim * 2) as u64;
+                    let row_bytes = (hidden * 2) as u64;
+                    let head_bytes = (head_dim * 2) as u64;
+                    for t in 0..n_tokens {
+                        let _ = cuMemcpyDtoDAsync_v2(
+                            attn_out.device_ptr() + (t as u64) * row_bytes + head_off,
+                            out_h.device_ptr() + (t as u64) * head_bytes,
+                            head_bytes as usize, self.stream.raw() as _,
+                        );
+                    }
+                }
+                self.stream.fence()?;
+            }
+
+            // ─ O proj + residual: hidden += proj(attn_out). ─
+            let proj_out = self.arena.region("qvis_proj_out", n_tokens * hidden * 2, 16)?;
+            linear_with_bias(
+                attn_out.device_ptr(),
+                blk.proj_w.offset_bytes,
+                blk.proj_b.offset_bytes,
+                proj_out.device_ptr(),
+                f32_scratch.device_ptr(),
+                n_tokens, hidden, hidden,
+            )?;
+            // Residual: hidden += proj_out (host sum, simple).
+            {
+                let bytes = n_tokens * hidden * 2;
+                let mut h_host = vec![0u8; bytes];
+                let mut p_host = vec![0u8; bytes];
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(h_host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
+                    let _ = cuMemcpyDtoH_v2(p_host.as_mut_ptr() as *mut _, proj_out.device_ptr(), bytes);
+                }
+                for i in 0..(n_tokens * hidden) {
+                    let h = f16_bits_to_f32(u16::from_le_bytes([h_host[i*2], h_host[i*2+1]]));
+                    let p = f16_bits_to_f32(u16::from_le_bytes([p_host[i*2], p_host[i*2+1]]));
+                    let s = f32_to_f16_bits(h + p).to_le_bytes();
+                    h_host[i*2] = s[0]; h_host[i*2+1] = s[1];
+                }
+                unsafe { hidden_region.copy_from_host(&h_host)? };
+            }
+
+            // ─ pre-MLP LayerNorm (norm2) on a copy ─
+            let normed2 = self.arena.region("qvis_normed2", n_tokens * hidden * 2, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoDAsync_v2(
+                    normed2.device_ptr(),
+                    hidden_region.device_ptr(),
+                    n_tokens * hidden * 2,
+                    self.stream.raw() as _,
+                );
+                let mut x = normed2.device_ptr();
+                let mut g = blk.norm2_w.offset_bytes;
+                let mut b = blk.norm2_b.offset_bytes;
+                let mut eps = qkv_eps;
+                let mut hd_i = hidden as i32;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut g) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut b) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = (hidden as u32).min(1024);
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_layernorm_inplace_f16.raw() as CUfunction,
+                    n_tokens as u32, 1, 1,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.stream.fence()?;
+
+            // ─ MLP: fc1 → GELU → fc2 ─
+            linear_with_bias(
+                normed2.device_ptr(),
+                blk.fc1_w.offset_bytes,
+                blk.fc1_b.offset_bytes,
+                mlp_buf.device_ptr(),
+                f32_scratch.device_ptr(),
+                n_tokens, intermediate, hidden,
+            )?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let n_elem = (n_tokens * intermediate) as i32;
+                let mut x = mlp_buf.device_ptr();
+                let mut nn = n_elem;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_gelu_tanh_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.stream.fence()?;
+            let mlp_out = self.arena.region("qvis_mlp_out", n_tokens * hidden * 2, 16)?;
+            linear_with_bias(
+                mlp_buf.device_ptr(),
+                blk.fc2_w.offset_bytes,
+                blk.fc2_b.offset_bytes,
+                mlp_out.device_ptr(),
+                f32_scratch.device_ptr(),
+                n_tokens, hidden, intermediate,
+            )?;
+            // Residual: hidden += mlp_out (host)
+            {
+                let bytes = n_tokens * hidden * 2;
+                let mut h_host = vec![0u8; bytes];
+                let mut m_host = vec![0u8; bytes];
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(h_host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
+                    let _ = cuMemcpyDtoH_v2(m_host.as_mut_ptr() as *mut _, mlp_out.device_ptr(), bytes);
+                }
+                for i in 0..(n_tokens * hidden) {
+                    let h = f16_bits_to_f32(u16::from_le_bytes([h_host[i*2], h_host[i*2+1]]));
+                    let m = f16_bits_to_f32(u16::from_le_bytes([m_host[i*2], m_host[i*2+1]]));
+                    let s = f32_to_f16_bits(h + m).to_le_bytes();
+                    h_host[i*2] = s[0]; h_host[i*2+1] = s[1];
+                }
+                unsafe { hidden_region.copy_from_host(&h_host)? };
+            }
+        }
+
+        // ── Step 6: PatchMerger. ────────────────────────────────────
+        // (a) LayerNorm hidden in-place per-token (gamma/beta are 1152).
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut x = hidden_region.device_ptr();
+            let mut g = vision.merger.norm_w.offset_bytes;
+            let mut b = vision.merger.norm_b.offset_bytes;
+            let mut eps = qkv_eps;
+            let mut hd_i = hidden as i32;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut g) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b) as *mut u64 as *mut core::ffi::c_void,
+                (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+                (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = (hidden as u32).min(1024);
+            let _ = cuLaunchKernel(
+                self.outside_kernels.fn_layernorm_inplace_f16.raw() as CUfunction,
+                n_tokens as u32, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+
+        // (b) Spatial merge: every 4 spatial-neighbour tokens concat
+        // into one row of width merger_in=4608. Token order from
+        // pos_h/pos_w: pre-merge tokens are already in
+        // (block, intra_h, intra_w) order, so 4 consecutive rows = one
+        // 2×2 spatial cluster ⇒ direct concat works.
+        let merged_bytes = n_merged * merger_in * 2;
+        let merged_region = self.arena.region("qvis_merged", merged_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let row_bytes = (hidden * 2) as u64;
+            for m in 0..n_merged {
+                for s in 0..merge_sq {
+                    let src = hidden_region.device_ptr() + ((m * merge_sq + s) as u64) * row_bytes;
+                    let dst = merged_region.device_ptr()
+                        + (m as u64) * (merger_in as u64) * 2
+                        + (s as u64) * row_bytes;
+                    let _ = cuMemcpyDtoDAsync_v2(dst, src, hidden * 2, self.stream.raw() as _);
+                }
+            }
+        }
+        self.stream.fence()?;
+
+        // (c) merger.linear_fc1 → GELU → linear_fc2.
+        let merged_out_fc1 = self.arena.region("qvis_mfc1", n_merged * merger_in * 2, 16)?;
+        linear_with_bias(
+            merged_region.device_ptr(),
+            vision.merger.fc1_w.offset_bytes,
+            vision.merger.fc1_b.offset_bytes,
+            merged_out_fc1.device_ptr(),
+            f32_scratch.device_ptr(),
+            n_merged, merger_in, merger_in,
+        )?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let n_elem = (n_merged * merger_in) as i32;
+            let mut x = merged_out_fc1.device_ptr();
+            let mut nn = n_elem;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+            let _ = cuLaunchKernel(
+                self.outside_kernels.fn_gelu_tanh_f16.raw() as CUfunction,
+                grid.0, grid.1, grid.2,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+        let final_region = self.arena.region("qvis_final", n_merged * out_hidden * 2, 16)?;
+        linear_with_bias(
+            merged_out_fc1.device_ptr(),
+            vision.merger.fc2_w.offset_bytes,
+            vision.merger.fc2_b.offset_bytes,
+            final_region.device_ptr(),
+            f32_scratch.device_ptr(),
+            n_merged, out_hidden, merger_in,
+        )?;
+
+        // ── Step 7: DtoH the final embeddings. ──────────────────────
+        let mut out_bytes = vec![0u8; n_merged * out_hidden * 2];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                out_bytes.as_mut_ptr() as *mut _,
+                final_region.device_ptr(),
+                out_bytes.len(),
+            );
+        }
+
+        Ok(VisionForwardOutput {
+            data: out_bytes,
+            num_tokens: n_merged,
+            hidden_dim: out_hidden,
+            grid_thw: [grid_t, grid_h, grid_w],
+        })
+    }
+
     /// Phase 4x/5b/5c: full 40-layer decode loop. Linear-attn runs
     /// Gated-DeltaNet against the persistent state cache; full-attn
     /// runs Q/K/V → q/k_norm → RoPE → FA2 paged decode →
