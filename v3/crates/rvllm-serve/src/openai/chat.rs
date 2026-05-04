@@ -139,7 +139,7 @@ impl StopField {
 /// full matrix. The previous struct required `content: String` and
 /// 422'd the moment zeroclaw replayed an assistant-with-tool-calls
 /// message on a follow-up turn.
-#[derive(Debug, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ChatMessage {
     pub role: Role,
     #[serde(default)]
@@ -169,7 +169,7 @@ impl ChatMessage {
 /// `text` part type only; other types (image_url, input_audio, …)
 /// are rejected at validation time so callers get a clear 400 rather
 /// than a silent semantic loss.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ChatContent {
     Text(String),
     Parts(Vec<ChatContentPart>),
@@ -281,7 +281,7 @@ impl<'de> Deserialize<'de> for ChatContent {
 /// chat template as-is; `image_url` carries an image (data: URI or
 /// http(s) URL) that gets routed to the native vision tower; any
 /// other type is captured as [`ChatContentPart::Other`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ChatContentPart {
     /// `{"type":"text","text":"..."}`.
     Text { text: String },

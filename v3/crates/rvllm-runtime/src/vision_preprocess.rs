@@ -146,6 +146,14 @@ pub fn qwen_smart_resize(
         h_bar = (((h as f32) * beta / f).ceil() * f) as u32;
         w_bar = (((w as f32) * beta / f).ceil() * f) as u32;
     }
+    // Clamp to at least one full patch on each side. With min_pixels=0
+    // (current default) a sub-`factor/2` input rounds down to 0 and
+    // produces a 0-token vision item that the splice path then rejects.
+    // Tiny icons / 1×1 pixels happen in real API traffic; treat them
+    // as a single minimal patch instead of an error. Codex review
+    // #6 (round 4).
+    if h_bar < factor { h_bar = factor; }
+    if w_bar < factor { w_bar = factor; }
     Ok((h_bar, w_bar))
 }
 
@@ -432,7 +440,20 @@ mod tests {
             return;
         }
         let img = decode_image(&std::fs::read(img_path).unwrap()).unwrap();
-        let cfg = QwenPreprocessConfig::default();
+        // The HF Qwen2VLImageProcessorFast reference fixture under
+        // tests/fixtures/qwen_test_224_pixel_values_f32.bin was
+        // captured BEFORE we dropped the min_pixels=65536 default
+        // (which used to upsample 224×224 → 256×256 / grid 16×16).
+        // The current default is min_pixels=0 → 224 stays 224, grid
+        // 14×14, num_patches=196 — matching HF stage-dump output we
+        // verified Qwen-vision against (cos=0.9999/layer).
+        // Re-run the explicit-cfg variant against the OLD reference
+        // so the test still gates the byte-faithful preprocess path
+        // rather than the operator default. Codex review #5 (round 4).
+        let cfg = QwenPreprocessConfig {
+            min_pixels: 65536,
+            ..QwenPreprocessConfig::default()
+        };
         let pp = preprocess_qwen(&img, &cfg).unwrap();
         assert_eq!(pp.grid_thw, [1, 16, 16]);
         assert_eq!(pp.num_patches(), 256);

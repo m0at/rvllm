@@ -34,6 +34,27 @@ pub struct AppState {
     /// Unix secs when the server started — used as the `created`
     /// timestamp on the `/v1/models` payload.
     pub started_at: u64,
+    /// Which vision-tower architecture is loaded. Detected from the
+    /// model dir's `config.json` at startup, NOT from the operator-
+    /// supplied `--model-id` (which might be a public alias). The
+    /// vision-token predictor and chat-template image-pad token
+    /// dispatch off this. Codex review #2 (round 4) caught the
+    /// model-id heuristic as a real correctness risk.
+    pub vision_arch: VisionArch,
+}
+
+/// Which vision tower the worker has loaded. Set once at startup
+/// from `config.json` inspection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisionArch {
+    /// Qwen 3.6 35B-A3B (Qwen3VL-style ViT, full-head rotary, Qwen
+    /// PatchMerger). `<|image_pad|>` = 248056, predictor =
+    /// `predict_qwen_num_tokens`.
+    Qwen36,
+    /// Gemma 4 31B (SigLIP-style ViT, multidimensional rotary,
+    /// `Gemma4MultimodalEmbedder`). `<|image|>` = 258880, predictor
+    /// = `predict_gemma_num_tokens`.
+    Gemma4,
 }
 
 /// Build the top-level router with all endpoints attached.

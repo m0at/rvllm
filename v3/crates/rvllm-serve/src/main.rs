@@ -125,7 +125,15 @@ async fn main() -> anyhow_compat::Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let state = AppState { config: config.clone(), tokenizer, worker, started_at };
+    // Detect vision-tower architecture from config.json (NOT from
+    // the operator-supplied model_id alias). Mirrors the same probe
+    // the cuda_worker uses to pick the bring-up path.
+    let vision_arch = match rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(&cli.model_dir) {
+        Ok(Some(_)) => rvllm_serve::router::VisionArch::Qwen36,
+        _ => rvllm_serve::router::VisionArch::Gemma4,
+    };
+    tracing::info!(?vision_arch, "vision arch resolved from config.json");
+    let state = AppState { config: config.clone(), tokenizer, worker, started_at, vision_arch };
     let router = build_router(state);
 
     tracing::info!(bind = %config.bind, model = %config.model_id, "rvllm-server listening");

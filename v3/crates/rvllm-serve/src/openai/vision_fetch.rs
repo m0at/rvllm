@@ -105,25 +105,45 @@ fn parse_data_uri(rest: &str) -> Result<Vec<u8>, VisionError> {
 }
 
 fn fetch_http(url: &str) -> Result<Vec<u8>, VisionError> {
+    use std::io::Read;
     let client = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
         .build()
         .map_err(|e| VisionError::FetchFailed(format!("client: {e}")))?;
-    let resp = client.get(url).send().map_err(|e| {
+    let mut resp = client.get(url).send().map_err(|e| {
         if e.is_timeout() {
             VisionError::FetchTimeout
         } else {
             VisionError::FetchFailed(format!("{e}"))
         }
     })?;
-    let bytes = resp
-        .bytes()
-        .map_err(|e| VisionError::FetchFailed(format!("body: {e}")))?
-        .to_vec();
-    if bytes.len() > MAX_IMAGE_BYTES {
-        return Err(VisionError::TooLarge(bytes.len(), MAX_IMAGE_BYTES));
+    // Early-reject by Content-Length BEFORE buffering any body
+    // (Codex review #1, round 4). The previous `resp.bytes()` call
+    // pulled the whole body into RAM and only then checked the cap,
+    // letting attackers / careless clients allocate hundreds of MB
+    // before getting a 400 back.
+    if let Some(len) = resp.content_length() {
+        if (len as usize) > MAX_IMAGE_BYTES {
+            return Err(VisionError::TooLarge(len as usize, MAX_IMAGE_BYTES));
+        }
     }
-    Ok(bytes)
+    // Stream-read with a hard cap. Servers omitting Content-Length
+    // (chunked transfer) still hit the limit at 1 byte over cap and
+    // return an error instead of growing the buffer further.
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let n = match resp.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return Err(VisionError::FetchFailed(format!("body: {e}"))),
+        };
+        if buf.len() + n > MAX_IMAGE_BYTES {
+            return Err(VisionError::TooLarge(buf.len() + n, MAX_IMAGE_BYTES));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
 }
 
 /// Predict vision-token count for Qwen 3.6 from image dims.
