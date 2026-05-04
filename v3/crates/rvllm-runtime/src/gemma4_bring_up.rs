@@ -494,6 +494,8 @@ pub struct Gemma4FusedModules {
     pub fn_cast_f32_to_f16: KernelFn,
     pub vit_rotary_2d_f16_mod: LoadedModule,
     pub fn_vit_rotary_2d_f16: KernelFn,
+    pub vit_rotary_gemma4_2d_f16_mod: LoadedModule,
+    pub fn_vit_rotary_gemma4_2d_f16: KernelFn,
     pub vit_standardize_f16_mod: LoadedModule,
     pub fn_vit_standardize_f16: KernelFn,
     pub extract_head_f16_mod: LoadedModule,
@@ -5382,11 +5384,19 @@ impl Gemma4Bringup {
             ));
         }
 
-        // Upload patches as f16. preprocess_gemma already produces values
-        // in [-1, 1] (i.e. 2*(p-0.5)) — see vision_preprocess.rs Gemma path.
+        // Upload patches as f16. preprocess_gemma produces values in
+        // [0, 1] (just /255, no centring). HF Gemma4VisionPatchEmbedder
+        // .forward then does `pixel_values = 2 * (pixel_values - 0.5)`
+        // (modeling_gemma4.py:566–568) BEFORE input_proj. We bake that
+        // 2*x - 1 transform here so we don't need a separate kernel.
+        // Codex review #1 caught this — the earlier comment claiming
+        // preprocess produced [-1, 1] was wrong, contrast / text-edge
+        // information was being attenuated which matches the observed
+        // 'Layout erkannt, Buchstaben nicht gelesen' behaviour.
         let mut patches_f16 = Vec::with_capacity(pixel_active.len() * 2);
         for &x in &pixel_active {
-            patches_f16.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
+            let y = 2.0 * x - 1.0;
+            patches_f16.extend_from_slice(&half::f16::from_f32(y).to_le_bytes());
         }
         let patches_region = self.arena.region("g4v_patches", patches_f16.len(), 16)?;
         unsafe { patches_region.copy_from_host(&patches_f16)? };
@@ -5568,21 +5578,25 @@ impl Gemma4Bringup {
         // ── Step 2: 2D position embedding lookup + add. ─────────────
         #[cfg(feature = "cuda")]
         unsafe {
+            // Per HF (modeling_gemma4.py:550), pixel_position_ids is
+            // (x, y) = (col, row), so position_table[0] is indexed by
+            // col and position_table[1] by row. Pass col_pos as axis_0
+            // and row_pos as axis_1. Codex review #2 caught the swap.
             let mut h = hidden_region.device_ptr();
             let mut tab = vision.patch_embedder_pos_table.offset_bytes;
-            let mut rp = row_pos_region.device_ptr();
-            let mut cp = col_pos_region.device_ptr();
+            let mut a0 = col_pos_region.device_ptr();
+            let mut a1 = row_pos_region.device_ptr();
             let mut np = NUM_POS as i32;
             let mut hd = HIDDEN as i32;
             let args = [
                 (&mut h) as *mut u64 as *mut core::ffi::c_void,
                 (&mut tab) as *mut u64 as *mut core::ffi::c_void,
-                (&mut rp) as *mut u64 as *mut core::ffi::c_void,
-                (&mut cp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a0) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a1) as *mut u64 as *mut core::ffi::c_void,
                 (&mut np) as *mut i32 as *mut core::ffi::c_void,
                 (&mut hd) as *mut i32 as *mut core::ffi::c_void,
             ];
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.fused.fn_vit_pos_emb_lookup_2d_f16.raw() as CUfunction,
                 n_tokens as u32, 1, 1,
                 256, 1, 1,
@@ -5590,19 +5604,30 @@ impl Gemma4Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "vision: pos_emb_lookup launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         self.stream.fence()?;
 
 
         // ── Step 3: build cos/sin tables for 2D rotary. ──────────────
-        // Gemma vision rotary (modeling_gemma4.py:702): for each spatial
-        // axis i ∈ {0, 1}, cos_i = cat([cos(pos*inv), cos(pos*inv)]).
-        // Final cos = cat([cos_0, cos_1], dim=-1) → [N, head_dim=72].
-        // Layout per token:
-        //   [0..18]   cos(h * inv[k])
-        //   [18..36]  cos(h * inv[k]) (mirror of 0..18)
-        //   [36..54]  cos(w * inv[k])
-        //   [54..72]  cos(w * inv[k]) (mirror of 36..54)
+        // Gemma 4 vision rotary (modeling_gemma4.py:705):
+        //   for axis i ∈ {0, 1}:
+        //       freqs_i = inv_freq * position_ids[..., i]
+        //       cos_i   = cat([freqs_i, freqs_i], dim=-1).cos()    [N, 36]
+        //   cos = cat([cos_0, cos_1], dim=-1)                      [N, 72]
+        // pixel_position_ids is (col, row), so axis 0 = COL, axis 1 = ROW.
+        // Final layout per token (Codex review #3):
+        //   [0..18]   cos(col * inv[k])
+        //   [18..36]  cos(col * inv[k])   (cat-of-itself mirror)
+        //   [36..54]  cos(row * inv[k])
+        //   [54..72]  cos(row * inv[k])   (cat-of-itself mirror)
+        // Earlier code had row,row,col,col — wrong axis assignment.
         let inv_freq_dim = HEAD_DIM / 4; // 18
         let inv_theta: Vec<f32> = (0..inv_freq_dim)
             .map(|k| 1.0 / ROPE_THETA.powf(2.0 * k as f32 / (HEAD_DIM as f32 / 2.0)))
@@ -5610,25 +5635,27 @@ impl Gemma4Bringup {
         let mut cos_host = vec![0u8; n_tokens * HEAD_DIM * 2];
         let mut sin_host = vec![0u8; n_tokens * HEAD_DIM * 2];
         for t in 0..n_tokens {
-            let r = row_pos_i32[t] as f32;
-            let c = col_pos_i32[t] as f32;
+            let row = row_pos_i32[t] as f32;
+            let col = col_pos_i32[t] as f32;
             for k in 0..inv_freq_dim {
-                let ah = r * inv_theta[k];
-                let aw = c * inv_theta[k];
-                let cos_h = half::f16::from_f32(ah.cos()).to_le_bytes();
-                let sin_h = half::f16::from_f32(ah.sin()).to_le_bytes();
-                let cos_w = half::f16::from_f32(aw.cos()).to_le_bytes();
-                let sin_w = half::f16::from_f32(aw.sin()).to_le_bytes();
+                let a_col = col * inv_theta[k];
+                let a_row = row * inv_theta[k];
+                let cos_col = half::f16::from_f32(a_col.cos()).to_le_bytes();
+                let sin_col = half::f16::from_f32(a_col.sin()).to_le_bytes();
+                let cos_row = half::f16::from_f32(a_row.cos()).to_le_bytes();
+                let sin_row = half::f16::from_f32(a_row.sin()).to_le_bytes();
                 let rb = t * HEAD_DIM;
+                // Chunk 0 (channels [0, 36)): col-axis, mirrored at offset 18.
                 for &mirror in &[0usize, inv_freq_dim] {
                     let off = (rb + mirror + k) * 2;
-                    cos_host[off] = cos_h[0]; cos_host[off + 1] = cos_h[1];
-                    sin_host[off] = sin_h[0]; sin_host[off + 1] = sin_h[1];
+                    cos_host[off] = cos_col[0]; cos_host[off + 1] = cos_col[1];
+                    sin_host[off] = sin_col[0]; sin_host[off + 1] = sin_col[1];
                 }
+                // Chunk 1 (channels [36, 72)): row-axis, mirrored at offset 54.
                 for &mirror in &[2 * inv_freq_dim, 3 * inv_freq_dim] {
                     let off = (rb + mirror + k) * 2;
-                    cos_host[off] = cos_w[0]; cos_host[off + 1] = cos_w[1];
-                    sin_host[off] = sin_w[0]; sin_host[off + 1] = sin_w[1];
+                    cos_host[off] = cos_row[0]; cos_host[off + 1] = cos_row[1];
+                    sin_host[off] = sin_row[0]; sin_host[off + 1] = sin_row[1];
                 }
             }
         }
@@ -5695,7 +5722,15 @@ impl Gemma4Bringup {
             // v_norm: parameter-free RMSNorm via fn_vnorm.
             vnorm(v_buf.device_ptr(), n_tokens * NUM_HEADS, HEAD_DIM)?;
 
-            // Apply rotary to Q and K.
+            // Apply Gemma 4 multidimensional rotary to Q and K.
+            // The Qwen-style vit_rotary_2d_f16 kernel (used in
+            // forward_qwen_vision) does ROTATE_HALF over the full
+            // head_dim (pairing 0..36 with 36..72 globally), which
+            // mixes the col-axis chunk with the row-axis chunk —
+            // wrong for Gemma. The dedicated vit_rotary_gemma4_2d_f16
+            // kernel rotates within each 36-channel chunk
+            // independently, matching HF apply_multidimensional_rope
+            // (Codex review #3).
             for &qk_ptr in &[q_buf.device_ptr(), k_buf.device_ptr()] {
                 #[cfg(feature = "cuda")]
                 unsafe {
@@ -5704,23 +5739,28 @@ impl Gemma4Bringup {
                     let mut sin = sin_region.device_ptr();
                     let mut nh = NUM_HEADS as i32;
                     let mut hd_i = HEAD_DIM as i32;
-                    let mut rd = HEAD_DIM as i32; // full head_dim rotated
                     let args = [
                         (&mut x) as *mut u64 as *mut core::ffi::c_void,
                         (&mut cos) as *mut u64 as *mut core::ffi::c_void,
                         (&mut sin) as *mut u64 as *mut core::ffi::c_void,
                         (&mut nh) as *mut i32 as *mut core::ffi::c_void,
                         (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
-                        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
                     ];
-                    let _ = cuLaunchKernel(
-                        self.fused.fn_vit_rotary_2d_f16.raw() as CUfunction,
+                    let rc = cuLaunchKernel(
+                        self.fused.fn_vit_rotary_gemma4_2d_f16.raw() as CUfunction,
                         n_tokens as u32, NUM_HEADS as u32, 1,
-                        (HEAD_DIM / 2) as u32, 1, 1,
+                        (HEAD_DIM / 4) as u32, 1, 1,   // 18 threads = chunk_size/2
                         0, self.stream.raw() as CUstream,
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "vision: gemma rotary launch failed",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
             }
             self.stream.fence()?;
@@ -6282,6 +6322,9 @@ fn load_gemma4_fused(
     let vit_rotary_2d_f16_mod = loader.load_ptx("vit_rotary_2d_f16")?;
     let fn_vit_rotary_2d_f16 =
         vit_rotary_2d_f16_mod.get_function("vit_rotary_2d_f16_kernel")?;
+    let vit_rotary_gemma4_2d_f16_mod = loader.load_ptx("vit_rotary_gemma4_2d_f16")?;
+    let fn_vit_rotary_gemma4_2d_f16 = vit_rotary_gemma4_2d_f16_mod
+        .get_function("vit_rotary_gemma4_2d_f16_kernel")?;
     let vit_standardize_f16_mod = loader.load_ptx("vit_standardize_f16")?;
     let fn_vit_standardize_f16 =
         vit_standardize_f16_mod.get_function("vit_standardize_f16_kernel")?;
@@ -6406,6 +6449,8 @@ fn load_gemma4_fused(
         fn_cast_f32_to_f16,
         vit_rotary_2d_f16_mod,
         fn_vit_rotary_2d_f16,
+        vit_rotary_gemma4_2d_f16_mod,
+        fn_vit_rotary_gemma4_2d_f16,
         vit_standardize_f16_mod,
         fn_vit_standardize_f16,
         extract_head_f16_mod,

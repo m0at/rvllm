@@ -401,6 +401,11 @@
       "path": "vit_rotary_2d_f16.ptx",
       "sha256": "97e4dcbb0816a8e355987d3522899d86be36c3d8e97207d9d35e6c892ffe89a6"
     },
+    "vit_rotary_gemma4_2d_f16": {
+      "bytes": 4607,
+      "path": "vit_rotary_gemma4_2d_f16.ptx",
+      "sha256": "44651371eacbb385bd6a75bc454a0e78e4b0e3908264cb707f9067579c6427d2"
+    },
     "vit_standardize_f16": {
       "bytes": 1932,
       "path": "vit_standardize_f16.ptx",
@@ -412,5 +417,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "8b059c0"
+  "revision": "75a2789"
 }
