@@ -3343,6 +3343,19 @@ impl Qwen36Bringup {
             n_tokens, hidden, patch_dim,
         )?;
 
+        // Stage dump: post patch_embed, pre pos_embed.
+        if let Ok(path) = std::env::var("RVLLM_QWEN36_VIT_PATCH_EMBED_DUMP") {
+            let bytes = n_tokens * hidden * 2;
+            let mut host = vec![0u8; bytes];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
+            }
+            let _ = std::fs::write(&path, &host);
+            eprintln!("[qwen36] vit patch_embed dump: {} bytes ([{},{}]) → {}", bytes, n_tokens, hidden, path);
+        }
+
         // ── Step 3.5: add learned absolute pos_embed (bilinear-interp). ─
         // vllm qwen3_vl.py:801: hidden_states += pos_embeds. The pos_embed
         // table is `[2304, 1152]` (num_grid_per_side²); we interpolate it
@@ -3378,6 +3391,19 @@ impl Qwen36Bringup {
             );
         }
         self.stream.fence()?;
+
+        // Stage dump: post pos_embed (before any block).
+        if let Ok(path) = std::env::var("RVLLM_QWEN36_VIT_POSEMB_DUMP") {
+            let bytes = n_tokens * hidden * 2;
+            let mut host = vec![0u8; bytes];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
+            }
+            let _ = std::fs::write(&path, &host);
+            eprintln!("[qwen36] vit posemb dump: {} bytes → {}", bytes, path);
+        }
 
         // ── Step 4: build per-token cos/sin tables for 2D rotary. ────
         // Qwen3-VL uses partial_rotary_factor=0.5 → rotary_dim = head_dim/2.
@@ -3456,7 +3482,8 @@ impl Qwen36Bringup {
         let scores_f32 = self.arena.region("qvis_scores_f32", n_tokens * n_tokens * 4, 16)?;
 
         let qkv_eps = 1e-6f32;
-        for blk in &vision.blocks {
+        let blk_dump_dir = std::env::var("RVLLM_QWEN36_VIT_BLK_DUMP_DIR").ok();
+        for (blk_idx, blk) in vision.blocks.iter().enumerate() {
             // ─ pre-attn LayerNorm on a copy ─
             let normed = self.arena.region("qvis_normed", n_tokens * hidden * 2, 16)?;
             #[cfg(feature = "cuda")]
@@ -3774,6 +3801,20 @@ impl Qwen36Bringup {
                 unsafe { hidden_region.copy_from_host(&h_host)? };
             }
 
+            // Block 0 dump: after attention residual (= input + attn_out).
+            if blk_idx == 0 {
+                if let Some(dir) = blk_dump_dir.as_deref() {
+                    let bytes = n_tokens * hidden * 2;
+                    let mut host = vec![0u8; bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
+                    }
+                    let _ = std::fs::write(format!("{dir}/blk0_post_attn.bin"), &host);
+                }
+            }
+
             // ─ pre-MLP LayerNorm (norm2) on a copy ─
             let normed2 = self.arena.region("qvis_normed2", n_tokens * hidden * 2, 16)?;
             #[cfg(feature = "cuda")]
@@ -3868,6 +3909,52 @@ impl Qwen36Bringup {
                 }
                 unsafe { hidden_region.copy_from_host(&h_host)? };
             }
+
+            // Block 0 sub-step dump (post-attn-residual, post-mlp-residual).
+            if blk_idx == 0 {
+                if let Some(dir) = blk_dump_dir.as_deref() {
+                    let bytes = n_tokens * hidden * 2;
+                    let mut host = vec![0u8; bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
+                    }
+                    let _ = std::fs::write(format!("{dir}/blk0_post_mlp.bin"), &host);
+                }
+            }
+
+            // Per-block dump (only blocks 0, 13, 26 to keep io light).
+            if let Some(dir) = blk_dump_dir.as_deref() {
+                if blk_idx == 0 || blk_idx == 13 || blk_idx == 26 {
+                    let bytes = n_tokens * hidden * 2;
+                    let mut host = vec![0u8; bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
+                    }
+                    let path = format!("{dir}/blk{blk_idx}.bin");
+                    let _ = std::fs::write(&path, &host);
+                    eprintln!("[qwen36] vit blk{blk_idx} dump → {path}");
+                }
+            }
+        }
+
+        // Env-gated pre-merger dump for HF reference comparison.
+        if let Ok(path) = std::env::var("RVLLM_QWEN36_VISION_PREMERGER_DUMP") {
+            let bytes = n_tokens * hidden * 2;
+            let mut host = vec![0u8; bytes];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, hidden_region.device_ptr(), bytes);
+            }
+            let _ = std::fs::write(&path, &host);
+            eprintln!(
+                "[qwen36] pre-merger dump: {} bytes ([{}, {}] f16) → {}",
+                bytes, n_tokens, hidden, path,
+            );
         }
 
         // ── Step 6: PatchMerger. ────────────────────────────────────
