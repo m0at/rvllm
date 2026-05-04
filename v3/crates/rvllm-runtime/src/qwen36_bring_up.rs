@@ -300,7 +300,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 4n+4o bring-up complete: outside (incl. \
+            "[qwen36] Phase 4p bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -382,6 +382,10 @@ impl Qwen36Bringup {
         // log. Recurrent kernel (Gated-DeltaNet ssm-scan) is real
         // CUDA work TBD.
         bringup.forward_layer0_linear_attn_probe()?;
+        // Phase 4p: linear-attn input projections (in_proj_qkv +
+        // in_proj_z). Confirms the FP8 GEMV kernel works on
+        // linear-attn weight shapes.
+        bringup.forward_layer0_linear_in_proj_probe()?;
 
         Ok(bringup)
     }
@@ -1864,6 +1868,104 @@ impl Qwen36Bringup {
              top_k={top_k}/{num_experts} → final[0..4]=[{:.3}, {:.3}, \
              {:.3}, {:.3}] (routed-weighted-sum + sigmoid·shared)",
             routed_sum[0], routed_sum[1], routed_sum[2], routed_sum[3],
+        );
+        Ok(())
+    }
+
+    /// Phase 4p probe: launch the two FP8 input projections of the
+    /// linear-attn block (in_proj_qkv + in_proj_z) against the first
+    /// linear-attention layer's weights. The blockwise FP8 GEMV
+    /// kernel (Phase 4c onwards) is model-agnostic — this probe
+    /// confirms it works for the linear-attn projection shapes
+    /// `[8192, hidden]` (qkv: 4 × 2048 = q/k/v/extra concat) and
+    /// `[4096, hidden]` (z gating stream) which differ from the
+    /// full-attention layer's projections.
+    ///
+    /// The recurrent ssm-scan + conv1d + per-sequence state cache
+    /// still need a custom kernel — this only exercises the FP8
+    /// matmul entry points to the linear-attn block.
+    pub fn forward_layer0_linear_in_proj_probe(&self) -> Result<()> {
+        let layer_idx = match self.arch.base.layer_types.iter().position(|t| {
+            matches!(t, rvllm_loader::LayerAttnType::Linear)
+        }) {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+        let la = match &self.model.layers[layer_idx].attn {
+            rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(l) => l,
+            _ => return Ok(()),
+        };
+        let kernel = match self.outside_kernels.fn_fp8_gemv_wpr_native_f16in {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        let hidden = self.arch.base.hidden_size as u32;
+        let m: u32 = 1;
+
+        // Synthetic f16 all-twos input, hidden-sized.
+        let two_bits = 0x4000u16.to_le_bytes();
+        let mut input_bytes = Vec::with_capacity((hidden as usize) * 2);
+        for _ in 0..hidden {
+            input_bytes.extend_from_slice(&two_bits);
+        }
+        let in_region =
+            self.arena.region("qwen36_l0lin_in", input_bytes.len(), 16)?;
+        unsafe { in_region.copy_from_host(&input_bytes)? };
+
+        // Closure to launch one FP8 projection role.
+        let project = |w: &rvllm_loader::weights::Fp8Weight,
+                       region_name: &'static str|
+         -> Result<[f32; 4]> {
+            let n = w.shape[0] as u32;
+            let k = w.shape[1] as u32;
+            let bs = match w.blockscale_ptr {
+                Some(p) => p,
+                None => {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36_l0lin missing blockscale",
+                        rvllm_core::CudaErrorKind::Other,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            };
+            let out_bytes = (m as usize) * (n as usize) * 2;
+            let out_region = self.arena.region(region_name, out_bytes, 16)?;
+            unsafe {
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
+                    kernel,
+                    out_region.device_ptr(),
+                    w.offset_bytes,
+                    bs,
+                    in_region.device_ptr(),
+                    self.stream.raw() as u64,
+                )?;
+            }
+            self.stream.fence()?;
+            let mut probe = [0u8; 8];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    probe.as_mut_ptr() as *mut _,
+                    out_region.device_ptr(),
+                    probe.len(),
+                );
+            }
+            Ok([
+                f16_bits_to_f32(u16::from_le_bytes([probe[0], probe[1]])),
+                f16_bits_to_f32(u16::from_le_bytes([probe[2], probe[3]])),
+                f16_bits_to_f32(u16::from_le_bytes([probe[4], probe[5]])),
+                f16_bits_to_f32(u16::from_le_bytes([probe[6], probe[7]])),
+            ])
+        };
+
+        let qkv = project(&la.in_proj_qkv, "qwen36_l0lin_qkv")?;
+        let z = project(&la.in_proj_z, "qwen36_l0lin_z")?;
+        eprintln!(
+            "[qwen36] forward_layer0_linear_in_proj_probe: layer={layer_idx} \
+             in_proj_qkv={:?} ({:?}) in_proj_z={:?} ({:?})",
+            qkv, la.in_proj_qkv.shape,
+            z, la.in_proj_z.shape,
         );
         Ok(())
     }
