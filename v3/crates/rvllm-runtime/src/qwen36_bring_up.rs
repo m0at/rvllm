@@ -3519,6 +3519,20 @@ impl Qwen36Bringup {
             }
             self.stream.fence()?;
 
+            // Block 0 dump: norm1 output (= input to QKV proj).
+            if blk_idx == 0 {
+                if let Some(dir) = blk_dump_dir.as_deref() {
+                    let bytes = n_tokens * hidden * 2;
+                    let mut host = vec![0u8; bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, normed.device_ptr(), bytes);
+                    }
+                    let _ = std::fs::write(format!("{dir}/blk0_norm1_out.bin"), &host);
+                }
+            }
+
             // ─ QKV proj: normed [N, 1152] @ W^T [3456, 1152] + b. ─
             linear_with_bias(
                 normed.device_ptr(),
