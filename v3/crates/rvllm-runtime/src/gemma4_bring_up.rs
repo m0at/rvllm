@@ -496,6 +496,8 @@ pub struct Gemma4FusedModules {
     pub fn_vit_rotary_2d_f16: KernelFn,
     pub vit_rotary_gemma4_2d_f16_mod: LoadedModule,
     pub fn_vit_rotary_gemma4_2d_f16: KernelFn,
+    pub softmax_row_f32_to_f16_mod: LoadedModule,
+    pub fn_softmax_row_f32_to_f16: KernelFn,
     pub vit_standardize_f16_mod: LoadedModule,
     pub fn_vit_standardize_f16: KernelFn,
     pub extract_head_f16_mod: LoadedModule,
@@ -5786,7 +5788,7 @@ impl Gemma4Bringup {
                         (&mut nh) as *mut i32 as *mut core::ffi::c_void,
                         (&mut hd) as *mut i32 as *mut core::ffi::c_void,
                     ];
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.fused.fn_extract_head_f16.raw() as CUfunction,
                         n_tokens as u32, 1, 1,
                         HEAD_DIM as u32, 1, 1,
@@ -5794,6 +5796,13 @@ impl Gemma4Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "vision: extract_head launch failed",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
                 Ok(())
             };
@@ -5812,7 +5821,7 @@ impl Gemma4Bringup {
                         (&mut nh) as *mut i32 as *mut core::ffi::c_void,
                         (&mut hd) as *mut i32 as *mut core::ffi::c_void,
                     ];
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.fused.fn_scatter_head_f16.raw() as CUfunction,
                         n_tokens as u32, 1, 1,
                         HEAD_DIM as u32, 1, 1,
@@ -5820,6 +5829,13 @@ impl Gemma4Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "vision: scatter_head launch failed",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
                 Ok(())
             };
@@ -5829,7 +5845,13 @@ impl Gemma4Bringup {
                 extract_head(v_h.device_ptr(), v_buf.device_ptr(), h)?;
                 self.stream.fence()?;
 
-                // Q*K^T → scores_f32 [N, N] f32 → cast to scores_buf f16.
+                // Q*K^T → scores_f32 [N, N] f32 → softmax in f32, narrow
+                // to f16 only at the output. Matches HF
+                // `softmax(..., dtype=torch.float32).to(query.dtype)`
+                // (modeling_gemma4.py:794–795). Earlier path cast to f16
+                // BEFORE softmax which lost precision on large attention
+                // matrices (N ≈ 2400 typical).  Codex review #3 (E).
+                // scaling=1.0 per Gemma config — no scale on scores.
                 #[cfg(feature = "cuda")]
                 unsafe {
                     self.cublaslt.f16_gemm_f32(
@@ -5838,48 +5860,30 @@ impl Gemma4Bringup {
                         n_tokens as i32, n_tokens as i32, HEAD_DIM as i32,
                         stream_raw,
                     )?;
-                    let n_elem = (n_tokens * n_tokens) as i32;
                     let mut out = scores_buf.device_ptr();
                     let mut input = scores_f32.device_ptr();
-                    let mut nn = n_elem;
+                    let mut sl = n_tokens as i32;
                     let args = [
                         (&mut out) as *mut u64 as *mut core::ffi::c_void,
                         (&mut input) as *mut u64 as *mut core::ffi::c_void,
-                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
-                    ];
-                    let block: u32 = 256;
-                    let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
-                    let _ = cuLaunchKernel(
-                        self.fused.fn_cast_f32_to_f16.raw() as CUfunction,
-                        grid.0, grid.1, grid.2,
-                        block, 1, 1,
-                        0, self.stream.raw() as CUstream,
-                        args.as_ptr() as *mut *mut core::ffi::c_void,
-                        core::ptr::null_mut(),
-                    );
-                }
-                self.stream.fence()?;
-
-                // scaling=1.0 per Gemma config — no scale_inplace_f16 here.
-
-                // Softmax row-wise.
-                #[cfg(feature = "cuda")]
-                unsafe {
-                    let mut x = scores_buf.device_ptr();
-                    let mut sl = n_tokens as i32;
-                    let args = [
-                        (&mut x) as *mut u64 as *mut core::ffi::c_void,
                         (&mut sl) as *mut i32 as *mut core::ffi::c_void,
                     ];
                     let block: u32 = (n_tokens as u32).min(1024);
-                    let _ = cuLaunchKernel(
-                        self.fused.fn_softmax_row_f16.raw() as CUfunction,
+                    let rc = cuLaunchKernel(
+                        self.fused.fn_softmax_row_f32_to_f16.raw() as CUfunction,
                         n_tokens as u32, 1, 1,
                         block, 1, 1,
                         0, self.stream.raw() as CUstream,
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "vision: softmax_row_f32_to_f16 launch failed",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
                 self.stream.fence()?;
 
@@ -5899,7 +5903,7 @@ impl Gemma4Bringup {
                     ];
                     let gx = ((cols as u32) + 15) / 16;
                     let gy = ((rows as u32) + 15) / 16;
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.fused.fn_transpose_2d_f16.raw() as CUfunction,
                         gx, gy, 1,
                         16, 16, 1,
@@ -5907,6 +5911,13 @@ impl Gemma4Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "vision: transpose_2d_f16 launch failed",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
                 self.stream.fence()?;
 
@@ -5930,7 +5941,7 @@ impl Gemma4Bringup {
                     ];
                     let block: u32 = 256;
                     let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.fused.fn_cast_f32_to_f16.raw() as CUfunction,
                         grid.0, grid.1, grid.2,
                         block, 1, 1,
@@ -5938,7 +5949,13 @@ impl Gemma4Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
-
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "vision: cast_f32_to_f16 launch failed (scores@V)",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
                 // Scatter out_h → attn_out at offset h*head_dim per row.
                 scatter_head(attn_out.device_ptr(), out_h.device_ptr(), h)?;
@@ -5996,7 +6013,7 @@ impl Gemma4Bringup {
                 ];
                 let block: u32 = 256;
                 let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.fused.fn_gelu_tanh_mul_f16.raw() as CUfunction,
                     grid.0, grid.1, grid.2,
                     block, 1, 1,
@@ -6004,6 +6021,13 @@ impl Gemma4Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "vision: gelu_tanh_mul launch failed",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             self.stream.fence()?;
 
@@ -6033,6 +6057,20 @@ impl Gemma4Bringup {
         }
         let grid_rows = (max_r as usize) + 1;
         let grid_cols = (max_c as usize) + 1;
+        // HF Gemma4VisionPooler asserts `k² * output_length == input_seq_len`
+        // (modeling_gemma4.py:592) and the resize math (gemma_aspect_resize_dims
+        // uses side_mult = patch_size * pool_k = 48) is supposed to guarantee
+        // both grid dims are multiples of POOL_K. Fail loudly if that ever
+        // breaks; the avg-pool kernel silently drops the trailing rows/cols
+        // and that drift is far more painful to diagnose later than a hard
+        // error here. (Codex review #3 PR-blocker.)
+        if grid_rows % POOL_K != 0 || grid_cols % POOL_K != 0 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "vision: pooled grid not divisible by POOL_K — preprocess invariant broken",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         let pooled_rows = grid_rows / POOL_K;
         let pooled_cols = grid_cols / POOL_K;
         let n_pooled = pooled_rows * pooled_cols;
@@ -6065,7 +6103,7 @@ impl Gemma4Bringup {
                 (&mut hd) as *mut i32 as *mut core::ffi::c_void,
                 (&mut k) as *mut i32 as *mut core::ffi::c_void,
             ];
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.fused.fn_vit_avgpool_f16.raw() as CUfunction,
                 n_pooled as u32, 1, 1,
                 256, 1, 1,
@@ -6073,6 +6111,13 @@ impl Gemma4Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "vision: vit_avgpool launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         self.stream.fence()?;
 
@@ -6091,7 +6136,7 @@ impl Gemma4Bringup {
             ];
             let block: u32 = 256;
             let grid = ((nn as u32 + block - 1) / block, 1u32, 1u32);
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.fused.fn_scale_inplace_f16.raw() as CUfunction,
                 grid.0, grid.1, grid.2,
                 block, 1, 1,
@@ -6099,6 +6144,13 @@ impl Gemma4Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "vision: scale_inplace (sqrt(hidden)) launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         self.stream.fence()?;
 
@@ -6116,7 +6168,7 @@ impl Gemma4Bringup {
                 (&mut scale) as *mut u64 as *mut core::ffi::c_void,
                 (&mut hd) as *mut i32 as *mut core::ffi::c_void,
             ];
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.fused.fn_vit_standardize_f16.raw() as CUfunction,
                 n_pooled as u32, 1, 1,
                 256, 1, 1,
@@ -6124,6 +6176,13 @@ impl Gemma4Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "vision: vit_standardize launch failed",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         self.stream.fence()?;
 
@@ -6325,6 +6384,9 @@ fn load_gemma4_fused(
     let vit_rotary_gemma4_2d_f16_mod = loader.load_ptx("vit_rotary_gemma4_2d_f16")?;
     let fn_vit_rotary_gemma4_2d_f16 = vit_rotary_gemma4_2d_f16_mod
         .get_function("vit_rotary_gemma4_2d_f16_kernel")?;
+    let softmax_row_f32_to_f16_mod = loader.load_ptx("softmax_row_f32_to_f16")?;
+    let fn_softmax_row_f32_to_f16 = softmax_row_f32_to_f16_mod
+        .get_function("softmax_row_f32_to_f16_kernel")?;
     let vit_standardize_f16_mod = loader.load_ptx("vit_standardize_f16")?;
     let fn_vit_standardize_f16 =
         vit_standardize_f16_mod.get_function("vit_standardize_f16_kernel")?;
@@ -6451,6 +6513,8 @@ fn load_gemma4_fused(
         fn_vit_rotary_2d_f16,
         vit_rotary_gemma4_2d_f16_mod,
         fn_vit_rotary_gemma4_2d_f16,
+        softmax_row_f32_to_f16_mod,
+        fn_softmax_row_f32_to_f16,
         vit_standardize_f16_mod,
         fn_vit_standardize_f16,
         extract_head_f16_mod,
