@@ -4171,6 +4171,9 @@ impl Qwen36Bringup {
                 routed_sum[i] += v * w;
             }
         }
+        let routed_only_l2: f32 = if std::env::var("RVLLM_QWEN36_DEBUG_MOE").is_ok() {
+            routed_sum.iter().map(|x| x*x).sum::<f32>().sqrt()
+        } else { 0.0 };
 
         // 4. Shared expert FFN scaled by sigmoid(shared_expert_gate_logit).
         let sh_gate_bs = moe.shared_expert_gate_proj.blockscale_ptr.unwrap_or(0);
@@ -4241,12 +4244,10 @@ impl Qwen36Bringup {
 
         // 5. Residual sum: last_hidden_new = last_hidden + moe_out.
         if std::env::var("RVLLM_QWEN36_DEBUG_MOE").is_ok() {
-            let routed_l2: f32 = routed_sum.iter().map(|x| x*x).sum::<f32>().sqrt();
-            let routed_max = routed_sum.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-            let max_w = top.iter().zip(weights.iter())
-                .max_by(|a,b| a.1.partial_cmp(b.1).unwrap()).map(|(_,w)| *w).unwrap_or(0.0);
-            let top_indices: Vec<usize> = top.iter().map(|(i,_)| *i).collect();
-            eprintln!("[moe] routed_sum L2={routed_l2:.3} max={routed_max:.3} top_w={max_w:.3} top8_idx={top_indices:?}");
+            let total_l2: f32 = routed_sum.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let shared_l2 = (total_l2*total_l2 - routed_only_l2*routed_only_l2).max(0.0).sqrt();
+            let normed_l2: f32 = input_f32.iter().map(|x| x*x).sum::<f32>().sqrt();
+            eprintln!("[moe] normed_L2={normed_l2:.2} routed_L2={routed_only_l2:.3} shared_L2~{shared_l2:.3} total_L2={total_l2:.3}");
         }
         let mut last_hidden_host = vec![0u8; last_hidden_bytes];
         #[cfg(feature = "cuda")]
