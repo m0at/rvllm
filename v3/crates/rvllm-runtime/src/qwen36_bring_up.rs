@@ -300,7 +300,13 @@ impl Qwen36Bringup {
             .min(262_144);
         let rope_theta = arch.base.rope_theta;
         let rope_head_dim = arch.base.head_dim as u32;
-        let half = (rope_head_dim / 2) as usize;
+        // Partial RoPE: rotary_dim = head_dim * 0.25 = 64 for Qwen 3.6.
+        // Tables must be stride [rotary_dim/2] per position (matches the
+        // fused_rope kernel's `pos * half_rotary + tid` indexing).
+        // Frequencies still use head_dim as divisor — proportional-RoPE
+        // convention shared with Gemma 4 (gemma4_load.rs:599-604).
+        let rotary_dim = (rope_head_dim as f32 * 0.25) as u32;
+        let half = (rotary_dim / 2) as usize;
         let inv_theta: Vec<f32> = (0..half)
             .map(|i| 1.0 / rope_theta.powf(2.0 * i as f32 / rope_head_dim as f32))
             .collect();
@@ -3795,13 +3801,18 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
-        // 5. RoPE on Q, K + write K, V into the persistent paged KV
-        //    cache for this full-attn layer. position=0, slot=0,
-        //    context_len=1 (single-token, fresh KV cache).
-        let rotary_dim = (head_dim as f32 * 0.25) as u32;
+        // 5. NeoX-style partial RoPE (host-side) + KV-cache write.
+        //
+        // The existing fused_rope_partial_f16kv kernel uses Gemma 4's
+        // split-half-head pairing (rotate dim[i] with dim[i+head_dim/2]).
+        // Qwen 3.6 uses NeoX-style: rotate dim[i] paired with
+        // dim[i+rotary_dim/2], inside the [0..rotary_dim) range only;
+        // dims [rotary_dim..head_dim) pass through unchanged. We do
+        // the rotation on host and write the rotated Q back to
+        // q_split_region, then call the kernel with rotary_dim=0 so
+        // it just performs the K/V → KV-cache write without rotation.
+        let rotary_dim = (head_dim as f32 * 0.25) as u32; // 64
         let kv_layer_ptr = self.kv_cache_layer_ptr(full_seq_idx);
-        // K cache for this layer is the first half of the slab; V the
-        // second. Each half has size: num_blocks*block_size*nkvh*hd*2.
         let half = (self.kv_cache_layer_bytes / 2) as u64;
         let k_cache_layer_ptr = kv_layer_ptr;
         let v_cache_layer_ptr = kv_layer_ptr + half;
@@ -3812,47 +3823,100 @@ impl Qwen36Bringup {
             pos_region.copy_from_host(&pos_bytes)?;
             slot_region.copy_from_host(&pos_bytes)?;
         }
+
+        // Read cos/sin for this position (kernel cos/sin layout:
+        // [seq_len, rotary_dim/2]).
+        let half_rot = (rotary_dim / 2) as usize;
+        let mut cos_host = vec![0u8; half_rot * 2];
+        let mut sin_host = vec![0u8; half_rot * 2];
         #[cfg(feature = "cuda")]
         unsafe {
-            let mut q_in = q_split_region.device_ptr();
-            let mut k_in = k_region.device_ptr();
-            let mut v_in = v_region.device_ptr();
-            let mut q_out = q_split_region.device_ptr();
-            let mut k_cache = k_cache_layer_ptr;
-            let mut v_cache = v_cache_layer_ptr;
-            let mut cos = self.rope_cos;
-            let mut sin = self.rope_sin;
-            let mut positions = pos_region.device_ptr();
-            let mut slot_mapping = slot_region.device_ptr();
-            let mut nt: i32 = 1;
-            let mut nh = num_heads as i32;
-            let mut nkvh = num_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut rd = rotary_dim as i32;
-            let args = [
-                (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
-                (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
-                (&mut v_in) as *mut u64 as *mut core::ffi::c_void,
-                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
-                (&mut k_cache) as *mut u64 as *mut core::ffi::c_void,
-                (&mut v_cache) as *mut u64 as *mut core::ffi::c_void,
-                (&mut cos) as *mut u64 as *mut core::ffi::c_void,
-                (&mut sin) as *mut u64 as *mut core::ffi::c_void,
-                (&mut positions) as *mut u64 as *mut core::ffi::c_void,
-                (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
-                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
-                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let max_heads = num_heads.max(num_kv_heads);
-            let grid = (1u32, max_heads, 1);
-            let block = ((head_dim / 2).max(32), 1, 1);
-            rvllm_fused::launch_raw(
-                self.outside_kernels.fn_fused_rope_partial_f16kv,
-                grid, block, 0, stream_raw, &args,
-            )?;
+            use cudarc::driver::sys::*;
+            let off = (position as u64) * (half_rot as u64) * 2;
+            let _ = cuMemcpyDtoH_v2(cos_host.as_mut_ptr() as *mut _,
+                self.rope_cos + off, cos_host.len());
+            let _ = cuMemcpyDtoH_v2(sin_host.as_mut_ptr() as *mut _,
+                self.rope_sin + off, sin_host.len());
+        }
+        let mut cos_f32 = vec![0.0f32; half_rot];
+        let mut sin_f32 = vec![0.0f32; half_rot];
+        for i in 0..half_rot {
+            cos_f32[i] = f16_bits_to_f32(u16::from_le_bytes([
+                cos_host[i*2], cos_host[i*2+1]]));
+            sin_f32[i] = f16_bits_to_f32(u16::from_le_bytes([
+                sin_host[i*2], sin_host[i*2+1]]));
+        }
+
+        // Apply NeoX RoPE to Q on host. Q layout: [num_heads, head_dim].
+        // For each head h, rotate (Q[h, i], Q[h, i+half_rot]) for
+        // i in 0..half_rot using cos/sin_f32[i]. Pass-through for
+        // i in [rotary_dim, head_dim).
+        let q_size_bytes = q_size * 2;
+        let mut q_host_buf = vec![0u8; q_size_bytes];
+        let mut k_host_buf = vec![0u8; (k_n as usize) * 2];
+        let mut v_host_buf = vec![0u8; (v_n as usize) * 2];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(q_host_buf.as_mut_ptr() as *mut _,
+                q_split_region.device_ptr(), q_size_bytes);
+            let _ = cuMemcpyDtoH_v2(k_host_buf.as_mut_ptr() as *mut _,
+                k_region.device_ptr(), k_host_buf.len());
+            let _ = cuMemcpyDtoH_v2(v_host_buf.as_mut_ptr() as *mut _,
+                v_region.device_ptr(), v_host_buf.len());
+        }
+        // Q rotation
+        for h in 0..num_heads as usize {
+            for i in 0..half_rot {
+                let lo_off = (h * hd + i) * 2;
+                let hi_off = (h * hd + i + half_rot) * 2;
+                let lo = f16_bits_to_f32(u16::from_le_bytes([q_host_buf[lo_off], q_host_buf[lo_off+1]]));
+                let hi = f16_bits_to_f32(u16::from_le_bytes([q_host_buf[hi_off], q_host_buf[hi_off+1]]));
+                let nlo = lo * cos_f32[i] - hi * sin_f32[i];
+                let nhi = lo * sin_f32[i] + hi * cos_f32[i];
+                let lb = f32_to_f16_bits(nlo).to_le_bytes();
+                let hb = f32_to_f16_bits(nhi).to_le_bytes();
+                q_host_buf[lo_off] = lb[0]; q_host_buf[lo_off+1] = lb[1];
+                q_host_buf[hi_off] = hb[0]; q_host_buf[hi_off+1] = hb[1];
+            }
+        }
+        // K rotation
+        for h in 0..num_kv_heads as usize {
+            for i in 0..half_rot {
+                let lo_off = (h * hd + i) * 2;
+                let hi_off = (h * hd + i + half_rot) * 2;
+                let lo = f16_bits_to_f32(u16::from_le_bytes([k_host_buf[lo_off], k_host_buf[lo_off+1]]));
+                let hi = f16_bits_to_f32(u16::from_le_bytes([k_host_buf[hi_off], k_host_buf[hi_off+1]]));
+                let nlo = lo * cos_f32[i] - hi * sin_f32[i];
+                let nhi = lo * sin_f32[i] + hi * cos_f32[i];
+                let lb = f32_to_f16_bits(nlo).to_le_bytes();
+                let hb = f32_to_f16_bits(nhi).to_le_bytes();
+                k_host_buf[lo_off] = lb[0]; k_host_buf[lo_off+1] = lb[1];
+                k_host_buf[hi_off] = hb[0]; k_host_buf[hi_off+1] = hb[1];
+            }
+        }
+        // Write rotated Q back to device.
+        unsafe { q_split_region.copy_from_host(&q_host_buf)? };
+        // K and V need to land in KV cache. Write K (rotated) and V to
+        // the right slot offsets directly host→device. Cache layout per
+        // kernel: cache[slot * num_kv_heads * head_dim + h*head_dim + d].
+        let slot = position as u64;
+        let slot_off_bytes = slot * (num_kv_heads as u64) * (head_dim as u64) * 2;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyHtoDAsync_v2(
+                k_cache_layer_ptr + slot_off_bytes,
+                k_host_buf.as_ptr() as *const _,
+                k_host_buf.len(),
+                self.stream.raw() as _,
+            );
+            let _ = cuMemcpyHtoDAsync_v2(
+                v_cache_layer_ptr + slot_off_bytes,
+                v_host_buf.as_ptr() as *const _,
+                v_host_buf.len(),
+                self.stream.raw() as _,
+            );
         }
         self.stream.fence()?;
 
