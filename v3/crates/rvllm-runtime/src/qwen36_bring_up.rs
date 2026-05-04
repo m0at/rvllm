@@ -116,6 +116,14 @@ pub struct Qwen36Bringup {
     pub kv_cache_layer_bytes: usize,
     pub kv_cache_num_blocks: u32,
     pub kv_cache_block_size: u32,
+    /// Phase 5f: persistent conv1d state cache for linear-attn layers.
+    /// `[num_linear_layers, conv_kernel-1=3, conv_dim=8192]` f16.
+    /// Holds the previous (kernel-1) conv-input timesteps so per-token
+    /// causal_conv1d can attend to actual prior tokens (not zeros).
+    /// Reset alongside reset_linear_state on session boundaries.
+    pub conv_state_ptr: u64,
+    pub conv_state_bytes: usize,
+    pub conv_state_layer_bytes: usize,
 }
 
 impl Qwen36Bringup {
@@ -440,6 +448,36 @@ impl Qwen36Bringup {
             kv_cache_bytes as f64 / (1024.0 * 1024.0),
         );
 
+        // Phase 5f: conv1d state cache. Each linear-attn layer keeps the
+        // previous (kernel-1=3) conv-input timesteps so per-token decode
+        // sees the real prior context. Layout per layer: [3, 8192] f16.
+        let conv_kernel_minus_1: usize = 3;
+        let conv_dim: usize = 8192;
+        let conv_state_layer_bytes = conv_kernel_minus_1 * conv_dim * 2;
+        let conv_state_bytes = n_linear_layers * conv_state_layer_bytes;
+        let conv_state_region =
+            arena.region("qwen36_conv_state", conv_state_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8_v2(conv_state_region.device_ptr(), 0, conv_state_bytes);
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36_conv_state cuMemsetD8",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let conv_state_ptr = conv_state_region.device_ptr();
+        eprintln!(
+            "[qwen36] conv1d state cache allocated: {n_linear_layers} \
+             linear-attn layers × {:.1} KiB ({conv_kernel_minus_1} \
+             timesteps × {conv_dim} channels × f16) = {:.1} MiB total.",
+            conv_state_layer_bytes as f64 / 1024.0,
+            conv_state_bytes as f64 / (1024.0 * 1024.0),
+        );
+
         let n_full = model.layers.iter().filter(|l| matches!(
             l.attn,
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(_)
@@ -449,7 +487,7 @@ impl Qwen36Bringup {
             rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(_)
         )).count();
         eprintln!(
-            "[qwen36] Phase 5d bring-up complete: outside (incl. \
+            "[qwen36] Phase 5f bring-up complete: outside (incl. \
              FP8-quantized lm_head) + {n_full} full-attention + \
              {n_linear} linear-attention + per-layer MoE blocks \
              ({} experts/layer) + KernelLoader + outside kernel \
@@ -486,6 +524,9 @@ impl Qwen36Bringup {
             kv_cache_layer_bytes,
             kv_cache_num_blocks,
             kv_cache_block_size,
+            conv_state_ptr,
+            conv_state_bytes,
+            conv_state_layer_bytes,
         };
         // Phase 3e smoke: actually launch embedding_gather against the
         // loaded weights. If this throws, the rest of the forward
@@ -567,6 +608,7 @@ impl Qwen36Bringup {
         // (cuda_worker also resets on every request).
         bringup.reset_linear_state()?;
         bringup.reset_kv_cache()?;
+        bringup.reset_conv_state()?;
         let probe_5d = bringup.forward_qwen36_decode(&[1, 200, 2000, 20_000, 50_000], 0)?;
         eprintln!(
             "[qwen36] Phase 5d forward_qwen36_decode smoke: 5-token \
@@ -642,6 +684,36 @@ impl Qwen36Bringup {
             }
         }
         Ok(())
+    }
+
+    /// Phase 5f: zero out the conv1d state cache.
+    pub fn reset_conv_state(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8Async(
+                self.conv_state_ptr, 0, self.conv_state_bytes,
+                self.stream.raw() as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 reset_conv_state",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 5f: device pointer for layer N's conv-state slice.
+    pub fn conv_state_layer_ptr(&self, layer_seq_idx: u32) -> u64 {
+        let off = (layer_seq_idx as usize)
+            .saturating_mul(self.conv_state_layer_bytes);
+        if off + self.conv_state_layer_bytes > self.conv_state_bytes {
+            return 0;
+        }
+        self.conv_state_ptr + off as u64
     }
 
     /// Phase 4t: device pointer for layer N's slice of the state cache.
@@ -3327,7 +3399,10 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
-        // 3. causal_conv1d. Single-step: prepend ks-1=3 zero timesteps.
+        // 3. causal_conv1d. Single-step: prepend the ks-1=3 previous
+        //    timesteps from the persistent conv-state cache, append
+        //    current qkv = 4 timesteps. After conv1d, update the cache
+        //    by shifting (drop oldest, append current).
         let ks: u32 = 4;
         let conv_in_bytes = ((ks as usize) * (qkv_n as usize)) * 2;
         let conv_in_region =
@@ -3344,11 +3419,46 @@ impl Qwen36Bringup {
                 qkv_bytes_dev,
             );
         }
+        // Read the 3 previous timesteps from this layer's conv_state.
+        let conv_state_ptr_layer = self.conv_state_layer_ptr(linear_seq_idx);
+        let conv_state_layer_bytes_v = self.conv_state_layer_bytes;
+        let mut conv_state_host = vec![0u8; conv_state_layer_bytes_v];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                conv_state_host.as_mut_ptr() as *mut _,
+                conv_state_ptr_layer,
+                conv_state_layer_bytes_v,
+            );
+        }
+        // Build conv_in: [state_t-3, state_t-2, state_t-1, current]
+        // Layout: [4, qkv_n] f16. state holds 3 timesteps × qkv_n f16.
         let mut conv_in_host = vec![0u8; conv_in_bytes];
-        let last_off_conv = ((ks - 1) as usize) * (qkv_n as usize) * 2;
-        conv_in_host[last_off_conv..last_off_conv + qkv_bytes_dev]
+        conv_in_host[..conv_state_layer_bytes_v]
+            .copy_from_slice(&conv_state_host);
+        let cur_off = conv_state_layer_bytes_v;
+        conv_in_host[cur_off..cur_off + qkv_bytes_dev]
             .copy_from_slice(&qkv_host_real);
         unsafe { conv_in_region.copy_from_host(&conv_in_host)? };
+        // Update conv_state: shift left by 1 timestep, append current.
+        // New state = [state_t-2, state_t-1, current].
+        let mut conv_state_new = vec![0u8; conv_state_layer_bytes_v];
+        let ts_bytes = qkv_n as usize * 2;
+        conv_state_new[..ts_bytes * 2]
+            .copy_from_slice(&conv_state_host[ts_bytes..ts_bytes * 3]);
+        conv_state_new[ts_bytes * 2..ts_bytes * 3]
+            .copy_from_slice(&qkv_host_real);
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyHtoDAsync_v2(
+                conv_state_ptr_layer,
+                conv_state_new.as_ptr() as *const _,
+                conv_state_layer_bytes_v,
+                self.stream.raw() as _,
+            );
+        }
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;

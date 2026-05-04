@@ -115,6 +115,7 @@ pub async fn spawn_cuda_worker(
                         let prompt_len = req.prompt_ids.len() as u32;
                         let _ = qwen.reset_linear_state();
                         let _ = qwen.reset_kv_cache();
+                        let _ = qwen.reset_conv_state();
                         if req.cancelled.load(Ordering::Relaxed) {
                             let _ = req.events_tx.blocking_send(GenerateEvent::Done {
                                 finish: FinishReason::Cancelled,
