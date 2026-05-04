@@ -46,6 +46,11 @@
       "path": "embedding_gather_f16.ptx",
       "sha256": "3b3270fc87b3aa3a268f960bcdf1785ecd19f3847fbf854fd1ce6e513211f0ea"
     },
+    "extract_head_f16": {
+      "bytes": 2848,
+      "path": "extract_head_f16.ptx",
+      "sha256": "c5a8482fac4fcc30bcc33870f4416b7d02316e8eb81bd8b34a471af53be49ab8"
+    },
     "f16_mma_probe": {
       "bytes": 3103,
       "path": "f16_mma_probe.ptx",
@@ -396,11 +401,16 @@
       "path": "vit_rotary_2d_f16.ptx",
       "sha256": "97e4dcbb0816a8e355987d3522899d86be36c3d8e97207d9d35e6c892ffe89a6"
     },
+    "vit_standardize_f16": {
+      "bytes": 1932,
+      "path": "vit_standardize_f16.ptx",
+      "sha256": "02df25cef0fbfd7a61bdf543a75607fb12afbfa0983e5a7db223c1f81582a18d"
+    },
     "vnorm_f16": {
       "bytes": 7188,
       "path": "vnorm_f16.ptx",
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "8603614"
+  "revision": "8b059c0"
 }

@@ -421,7 +421,7 @@ pub async fn chat_completions(
     // Phase 4c: walk messages for image_url parts, fetch + predict
     // num_tokens. If any are present, render via the vision-aware
     // path so placeholder tokens get expanded and slots tracked.
-    let vision_items = collect_vision_items(&req.messages)?;
+    let vision_items = collect_vision_items(&req.model, &req.messages)?;
     let (prompt_ids, vision_slots) = if vision_items.is_empty() {
         (
             state.tokenizer.render_chat(&req.messages, req.tools.as_ref())?,
@@ -1991,9 +1991,11 @@ fn resolve_max_new(requested: Option<u32>, cap: u32) -> ApiResult<u32> {
 /// Walk all chat messages, fetch every `image_url` content part via
 /// the vision_fetch helper, build a Vec<VisionItem> in document order.
 fn collect_vision_items(
+    model_id: &str,
     messages: &[crate::openai::chat::ChatMessage],
 ) -> ApiResult<Vec<crate::worker::VisionItem>> {
-    use crate::openai::vision_fetch::{fetch_image, predict_qwen_num_tokens, VisionError};
+    use crate::openai::vision_fetch::{fetch_image, predict_gemma_num_tokens, predict_qwen_num_tokens, VisionError};
+    let is_gemma = model_id.starts_with("gemma");
     let mut items = Vec::new();
     for (mi, m) in messages.iter().enumerate() {
         let Some(content) = m.content.as_ref() else { continue };
@@ -2015,7 +2017,11 @@ fn collect_vision_items(
                     "image_fetch_failed",
                 ),
             })?;
-            let num_tokens = predict_qwen_num_tokens(w, h);
+            let num_tokens = if is_gemma {
+                predict_gemma_num_tokens(w, h)
+            } else {
+                predict_qwen_num_tokens(w, h)
+            };
             tracing::info!(
                 msg_idx = mi,
                 width = w,

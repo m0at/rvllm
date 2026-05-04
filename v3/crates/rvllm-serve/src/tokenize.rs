@@ -296,9 +296,14 @@ impl TokenizerHandle {
             .map_err(|e| ApiError::Tokenize(format!("{e}")))?;
         let raw_ids = enc.get_ids().to_vec();
 
-        // Locate each `<|image_pad|>` token (Qwen: 248056) and expand
+        // Locate each model-specific image-placeholder token and expand
         // it to `vision_items[i].num_tokens` copies in document order.
+        //   Qwen 3.6:  `<|image_pad|>` = 248056
+        //   Gemma 4:   `<|image|>`     = 258880
+        // Whichever fires for the current template wins per request.
         const QWEN_IMAGE_PAD: u32 = 248056;
+        const GEMMA_IMAGE: u32 = 258880;
+        let is_image_token = |t: u32| -> bool { t == QWEN_IMAGE_PAD || t == GEMMA_IMAGE };
         let mut expanded: Vec<u32> = Vec::with_capacity(
             raw_ids.len()
                 + vision_items
@@ -309,10 +314,10 @@ impl TokenizerHandle {
         let mut slots: Vec<VisionSlot> = Vec::with_capacity(vision_items.len());
         let mut next_image = 0usize;
         for tok in &raw_ids {
-            if *tok == QWEN_IMAGE_PAD {
+            if is_image_token(*tok) {
                 let item = vision_items.get(next_image).ok_or_else(|| {
                     ApiError::Tokenize(format!(
-                        "more <|image_pad|> tokens in template than vision items \
+                        "more image-placeholder tokens in template than vision items \
                          ({} found, {} provided)",
                         next_image + 1,
                         vision_items.len()
@@ -325,7 +330,7 @@ impl TokenizerHandle {
                     ));
                 }
                 let token_start = expanded.len();
-                expanded.extend(std::iter::repeat(QWEN_IMAGE_PAD).take(n));
+                expanded.extend(std::iter::repeat(*tok).take(n));
                 slots.push(VisionSlot {
                     token_start,
                     num_tokens: n,
@@ -338,7 +343,7 @@ impl TokenizerHandle {
         }
         if next_image != vision_items.len() {
             return Err(ApiError::Tokenize(format!(
-                "fewer <|image_pad|> tokens in template ({}) than vision items ({})",
+                "fewer image-placeholder tokens in template ({}) than vision items ({})",
                 next_image,
                 vision_items.len()
             )));

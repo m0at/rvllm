@@ -492,6 +492,13 @@ pub struct Gemma4FusedModules {
     pub fn_add_bias_f16: KernelFn,
     pub cast_fp_mod: LoadedModule,
     pub fn_cast_f32_to_f16: KernelFn,
+    pub vit_rotary_2d_f16_mod: LoadedModule,
+    pub fn_vit_rotary_2d_f16: KernelFn,
+    pub vit_standardize_f16_mod: LoadedModule,
+    pub fn_vit_standardize_f16: KernelFn,
+    pub extract_head_f16_mod: LoadedModule,
+    pub fn_extract_head_f16: KernelFn,
+    pub fn_scatter_head_f16: KernelFn,
 
     // `fp8_gemv.ptx` — GB10 warp-per-row FP8 GEMV kernels. Loaded at
     // bringup so the Sm121 decode fast path (`launch_fp8_gemv_f16in`
@@ -2902,6 +2909,15 @@ impl Gemma4Bringup {
         // for true tokenwise SSE delivery and to feed the handler-
         // side stop-string detector incrementally.
         mut on_token: Option<&mut dyn FnMut(u32) -> bool>,
+        // Phase 3b vision: per-image (token_start_in_prompt, raw f16
+        // bytes for [num_tokens, hidden] embeddings) tuples. Empty for
+        // text-only requests. The splice fires inside the chunked
+        // prefill embedding-gather path: any chunk that overlaps a
+        // splice slot has its residual rows for that overlap overwritten
+        // with the corresponding embedding bytes BEFORE the optional
+        // bf16 widen, so all downstream layers see the vision rows
+        // through the same dtype path as text.
+        vision_splice: &[(usize, &[u8])],
     ) -> Result<Vec<u32>> {
         // Cycle 37 P2 (codex audit): max_new=0 used to underflow at
         // `0..max_new - 1`. Caller (handlers.rs::resolve_max_new) already
@@ -3974,6 +3990,35 @@ impl Gemma4Bringup {
                 rvllm_fused::EmbeddingGatherLaunch { num_tokens: chunk_q, hidden, vocab }
                     .launch(fn_embed, residual_ptr, self.model.embedding.offset_bytes,
                         token_ids_region.device_ptr(), stream)?;
+
+                // Phase 3b vision splice: overwrite residual rows for any
+                // image-soft-token positions that fall inside this chunk,
+                // BEFORE the optional bf16 widen so the rest of the chain
+                // is dtype-uniform.
+                if !vision_splice.is_empty() {
+                    self.stream.fence()?;
+                    let row_bytes = (hidden as usize) * 2;
+                    for (slot_start, emb_bytes) in vision_splice {
+                        let slot_n = emb_bytes.len() / row_bytes;
+                        let slot_end = slot_start + slot_n;
+                        let chunk_a = chunk_start_abs as usize;
+                        let chunk_b = chunk_end_abs as usize;
+                        let lo = std::cmp::max(*slot_start, chunk_a);
+                        let hi = std::cmp::min(slot_end, chunk_b);
+                        if hi <= lo { continue; }
+                        let n_rows = hi - lo;
+                        let dst_off = ((lo - chunk_a) * row_bytes) as u64;
+                        let src_off = ((lo - slot_start) * row_bytes) as usize;
+                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                            residual_ptr + dst_off,
+                            emb_bytes[src_off .. src_off + n_rows * row_bytes].as_ptr() as *const _,
+                            n_rows * row_bytes,
+                            self.stream.raw() as _,
+                        );
+                    }
+                    self.stream.fence()?;
+                }
+
                 // Cycle 54 Stage 1: widen embedding-gather output (f16)
                 // to bf16 in-place so the chunked-prefill residual chain
                 // operates on bf16 between layers.
@@ -5234,6 +5279,833 @@ impl Gemma4Bringup {
             awq_int4_gemm_sm120_wmma: self.fused.fn_awq_int4_gemm_sm120_wmma,
         })
     }
+
+    /// Phase 3b: Gemma 4 vision tower forward.
+    ///
+    /// Decodes an image, runs the 27-layer SigLIP-style ViT encoder
+    /// (sandwich-norm blocks), pooler (avg-pool to default_output_length
+    /// + sqrt(hidden) scaling), standardize (per-channel bias+scale),
+    /// and embed_vision projector (RMSNorm parameter-free + Linear
+    /// 1152→5376). Returns f16 embeddings of shape
+    /// `[num_pooled_tokens, 5376]` ready for splice into the post-embed
+    /// text-side hidden buffer.
+    pub fn forward_gemma_vision(
+        &self,
+        image_bytes: &[u8],
+    ) -> Result<crate::qwen36_bring_up::VisionForwardOutput> {
+        use crate::qwen36_bring_up::VisionForwardOutput;
+        use crate::vision_preprocess::{decode_image, preprocess_gemma, GemmaPreprocessConfig};
+        use cudarc::driver::sys::*;
+
+        let vision = self.model.vision.as_ref().ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "vision: model.vision_tower not loaded",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+
+        let img = decode_image(image_bytes).map_err(|_e| {
+            rvllm_core::RvllmError::cuda(
+                "vision: image decode failed",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+        let cfg = GemmaPreprocessConfig::default();
+        let pp = preprocess_gemma(&img, &cfg).map_err(|_e| {
+            rvllm_core::RvllmError::cuda(
+                "vision: preprocess failed",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
+
+        const HIDDEN: usize = 1152;
+        const INTERMEDIATE: usize = 4304;
+        const NUM_HEADS: usize = 16;
+        const HEAD_DIM: usize = 72;
+        const NUM_POS: usize = 10240;
+        const POOL_K: usize = 3;
+        const OUT_HIDDEN: usize = 5376;
+        const ROPE_THETA: f32 = 100.0;
+        const RMS_EPS: f32 = 1e-6;
+
+        // Determine n_tokens from preprocess output (count non-padding rows).
+        let total_rows = pp.pixel_values.len() / (3 * 16 * 16);
+        let mut active_rows = 0usize;
+        for t in 0..total_rows {
+            let r = pp.position_ids[2 * t];
+            let c = pp.position_ids[2 * t + 1];
+            if r >= 0 && c >= 0 {
+                active_rows += 1;
+            }
+        }
+        let n_tokens = active_rows;
+        if n_tokens == 0 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "vision: 0 active patches",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        // Trim padded rows from pixel_values so we work on n_tokens only.
+        let patch_dim = 3 * 16 * 16; // = 768
+        let mut pixel_active = Vec::with_capacity(n_tokens * patch_dim);
+        let mut row_pos_i32 = Vec::with_capacity(n_tokens);
+        let mut col_pos_i32 = Vec::with_capacity(n_tokens);
+        for t in 0..total_rows {
+            let r = pp.position_ids[2 * t];
+            let c = pp.position_ids[2 * t + 1];
+            if r >= 0 && c >= 0 {
+                let off = t * patch_dim;
+                pixel_active.extend_from_slice(&pp.pixel_values[off..off + patch_dim]);
+                row_pos_i32.push(r as i32);
+                col_pos_i32.push(c as i32);
+            }
+        }
+
+        // Output length: HF code uses pixel_values.shape[-2] // pool_k².
+        // For our active-only path that's n_tokens // (k²).
+        let n_pooled_max = n_tokens / (POOL_K * POOL_K);
+        if n_pooled_max == 0 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "vision: pool kernel too large for input (need k² ≤ n_tokens)",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+
+        // Upload patches as f16. preprocess_gemma already produces values
+        // in [-1, 1] (i.e. 2*(p-0.5)) — see vision_preprocess.rs Gemma path.
+        let mut patches_f16 = Vec::with_capacity(pixel_active.len() * 2);
+        for &x in &pixel_active {
+            patches_f16.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
+        }
+        let patches_region = self.arena.region("g4v_patches", patches_f16.len(), 16)?;
+        unsafe { patches_region.copy_from_host(&patches_f16)? };
+
+        let row_pos_bytes = unsafe {
+            std::slice::from_raw_parts(row_pos_i32.as_ptr() as *const u8, row_pos_i32.len() * 4)
+        };
+        let col_pos_bytes = unsafe {
+            std::slice::from_raw_parts(col_pos_i32.as_ptr() as *const u8, col_pos_i32.len() * 4)
+        };
+        let row_pos_region = self.arena.region("g4v_rowpos", n_tokens * 4, 16)?;
+        let col_pos_region = self.arena.region("g4v_colpos", n_tokens * 4, 16)?;
+        unsafe { row_pos_region.copy_from_host(row_pos_bytes)? };
+        unsafe { col_pos_region.copy_from_host(col_pos_bytes)? };
+
+        let stream_raw = self.stream.raw() as u64;
+
+        // ── Helpers (closures that fence after each launch) ──────────
+        let f32_scratch = self.arena.region(
+            "g4v_f32_scratch",
+            n_tokens * INTERMEDIATE.max(OUT_HIDDEN) * 4,
+            16,
+        )?;
+
+        let linear_no_bias = |in_dev: u64,
+                              w_dev: u64,
+                              out_dev: u64,
+                              m: usize,
+                              n: usize,
+                              k: usize|
+         -> Result<()> {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                self.cublaslt.f16_gemm_f32(
+                    in_dev, w_dev, f32_scratch.device_ptr(),
+                    m as i32, n as i32, k as i32,
+                    stream_raw,
+                )?;
+                let n_elem = (m * n) as i32;
+                let mut out = out_dev;
+                let mut input = f32_scratch.device_ptr();
+                let mut nn = n_elem;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let _ = cuLaunchKernel(
+                    self.fused.fn_cast_f32_to_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.stream.fence()?;
+            Ok(())
+        };
+
+        let rmsnorm = |x: u64, gamma: u64, rows: usize, dim: usize| -> Result<()> {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let mut x = x;
+                let mut g = gamma;
+                let mut eps = RMS_EPS;
+                let mut d = dim as i32;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut g) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut d) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = (dim as u32).min(1024);
+                let _ = cuLaunchKernel(
+                    self.fused.fn_rmsnorm.raw() as CUfunction,
+                    rows as u32, 1, 1,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.stream.fence()?;
+            Ok(())
+        };
+
+        let vnorm = |x: u64, rows: usize, dim: usize| -> Result<()> {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let mut x = x;
+                let mut d = dim as i32;
+                let args = [
+                    (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut d) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = (dim as u32).min(1024);
+                let _ = cuLaunchKernel(
+                    self.fused.fn_vnorm.raw() as CUfunction,
+                    rows as u32, 1, 1,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.stream.fence()?;
+            Ok(())
+        };
+
+        let host_residual_add = |dst: u64, src: u64| -> Result<()> {
+            // hidden = hidden + src (per-element). DtoH-add-HtoD; same
+            // pattern as forward_qwen_vision.
+            let bytes = n_tokens * HIDDEN * 2;
+            let mut h_host = vec![0u8; bytes];
+            let mut s_host = vec![0u8; bytes];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let _ = cuMemcpyDtoH_v2(h_host.as_mut_ptr() as *mut _, dst, bytes);
+                let _ = cuMemcpyDtoH_v2(s_host.as_mut_ptr() as *mut _, src, bytes);
+            }
+            for i in 0..(n_tokens * HIDDEN) {
+                let h = half::f16::from_bits(u16::from_le_bytes([h_host[i * 2], h_host[i * 2 + 1]])).to_f32();
+                let s = half::f16::from_bits(u16::from_le_bytes([s_host[i * 2], s_host[i * 2 + 1]])).to_f32();
+                let out = half::f16::from_f32(h + s).to_le_bytes();
+                h_host[i * 2] = out[0];
+                h_host[i * 2 + 1] = out[1];
+            }
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let _ = cuMemcpyHtoD_v2(dst, h_host.as_ptr() as *const _, bytes);
+            }
+            Ok(())
+        };
+
+        // NOTE: the eprintln! tracepoints below are not just diagnostics —
+        // they also act as host-side sync points that prevent a CUDA
+        // out-of-range fault we otherwise hit on Gemma vision under
+        // back-to-back kernel launches with this large tensor count
+        // (n_tokens ~2400). Removing them re-introduces the segfault.
+        // Until that race is properly tracked down (likely a missing
+        // fence inside one of the per-head/pooler closures), keep them.
+        eprintln!("[g4v] forward start: n_tokens={n_tokens}");
+        // ── Step 1: patch_embed (linear, no bias) [N, 768] → [N, 1152] ─
+        let hidden_bytes = n_tokens * HIDDEN * 2;
+        let hidden_region = self.arena.region("g4v_hidden", hidden_bytes, 16)?;
+        linear_no_bias(
+            patches_region.device_ptr(),
+            vision.patch_embedder_input_proj.offset_bytes,
+            hidden_region.device_ptr(),
+            n_tokens, HIDDEN, 768,
+        )?;
+
+        eprintln!("[g4v] after patch_embed");
+        // ── Step 2: 2D position embedding lookup + add. ─────────────
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let mut h = hidden_region.device_ptr();
+            let mut tab = vision.patch_embedder_pos_table.offset_bytes;
+            let mut rp = row_pos_region.device_ptr();
+            let mut cp = col_pos_region.device_ptr();
+            let mut np = NUM_POS as i32;
+            let mut hd = HIDDEN as i32;
+            let args = [
+                (&mut h) as *mut u64 as *mut core::ffi::c_void,
+                (&mut tab) as *mut u64 as *mut core::ffi::c_void,
+                (&mut rp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cp) as *mut u64 as *mut core::ffi::c_void,
+                (&mut np) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let _ = cuLaunchKernel(
+                self.fused.fn_vit_pos_emb_lookup_2d_f16.raw() as CUfunction,
+                n_tokens as u32, 1, 1,
+                256, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+
+
+        eprintln!("[g4v] after pos_emb_lookup");
+        // ── Step 3: build cos/sin tables for 2D rotary. ──────────────
+        // Gemma vision rotary (modeling_gemma4.py:702): for each spatial
+        // axis i ∈ {0, 1}, cos_i = cat([cos(pos*inv), cos(pos*inv)]).
+        // Final cos = cat([cos_0, cos_1], dim=-1) → [N, head_dim=72].
+        // Layout per token:
+        //   [0..18]   cos(h * inv[k])
+        //   [18..36]  cos(h * inv[k]) (mirror of 0..18)
+        //   [36..54]  cos(w * inv[k])
+        //   [54..72]  cos(w * inv[k]) (mirror of 36..54)
+        let inv_freq_dim = HEAD_DIM / 4; // 18
+        let inv_theta: Vec<f32> = (0..inv_freq_dim)
+            .map(|k| 1.0 / ROPE_THETA.powf(2.0 * k as f32 / (HEAD_DIM as f32 / 2.0)))
+            .collect();
+        let mut cos_host = vec![0u8; n_tokens * HEAD_DIM * 2];
+        let mut sin_host = vec![0u8; n_tokens * HEAD_DIM * 2];
+        for t in 0..n_tokens {
+            let r = row_pos_i32[t] as f32;
+            let c = col_pos_i32[t] as f32;
+            for k in 0..inv_freq_dim {
+                let ah = r * inv_theta[k];
+                let aw = c * inv_theta[k];
+                let cos_h = half::f16::from_f32(ah.cos()).to_le_bytes();
+                let sin_h = half::f16::from_f32(ah.sin()).to_le_bytes();
+                let cos_w = half::f16::from_f32(aw.cos()).to_le_bytes();
+                let sin_w = half::f16::from_f32(aw.sin()).to_le_bytes();
+                let rb = t * HEAD_DIM;
+                for &mirror in &[0usize, inv_freq_dim] {
+                    let off = (rb + mirror + k) * 2;
+                    cos_host[off] = cos_h[0]; cos_host[off + 1] = cos_h[1];
+                    sin_host[off] = sin_h[0]; sin_host[off + 1] = sin_h[1];
+                }
+                for &mirror in &[2 * inv_freq_dim, 3 * inv_freq_dim] {
+                    let off = (rb + mirror + k) * 2;
+                    cos_host[off] = cos_w[0]; cos_host[off + 1] = cos_w[1];
+                    sin_host[off] = sin_w[0]; sin_host[off + 1] = sin_w[1];
+                }
+            }
+        }
+        let cos_region = self.arena.region("g4v_cos", cos_host.len(), 16)?;
+        let sin_region = self.arena.region("g4v_sin", sin_host.len(), 16)?;
+        unsafe {
+            cos_region.copy_from_host(&cos_host)?;
+            sin_region.copy_from_host(&sin_host)?;
+        }
+
+
+        eprintln!("[g4v] cos/sin tables built");
+        // ── Step 4: 27-block sandwich-norm encoder loop. ─────────────
+        let normed = self.arena.region("g4v_normed", n_tokens * HIDDEN * 2, 16)?;
+        let q_buf = self.arena.region("g4v_q", n_tokens * HIDDEN * 2, 16)?;
+        let k_buf = self.arena.region("g4v_k", n_tokens * HIDDEN * 2, 16)?;
+        let v_buf = self.arena.region("g4v_v", n_tokens * HIDDEN * 2, 16)?;
+        let q_h = self.arena.region("g4v_qh", n_tokens * HEAD_DIM * 2, 16)?;
+        let k_h = self.arena.region("g4v_kh", n_tokens * HEAD_DIM * 2, 16)?;
+        let v_h = self.arena.region("g4v_vh", n_tokens * HEAD_DIM * 2, 16)?;
+        let v_h_t = self.arena.region("g4v_vht", HEAD_DIM * n_tokens * 2, 16)?;
+        let out_h = self.arena.region("g4v_oh", n_tokens * HEAD_DIM * 2, 16)?;
+        let attn_out = self.arena.region("g4v_attn_out", n_tokens * HIDDEN * 2, 16)?;
+        let proj_out = self.arena.region("g4v_proj_out", n_tokens * HIDDEN * 2, 16)?;
+        let scores_buf = self.arena.region("g4v_scores", n_tokens * n_tokens * 2, 16)?;
+        let scores_f32 = self.arena.region("g4v_scores_f32", n_tokens * n_tokens * 4, 16)?;
+        let mlp_g = self.arena.region("g4v_mlp_g", n_tokens * INTERMEDIATE * 2, 16)?;
+        let mlp_u = self.arena.region("g4v_mlp_u", n_tokens * INTERMEDIATE * 2, 16)?;
+        let mlp_d = self.arena.region("g4v_mlp_d", n_tokens * HIDDEN * 2, 16)?;
+
+        for blk in &vision.blocks {
+            // === ATTENTION sub-block (sandwich norm) =====================
+            // residual_attn = hidden;
+            // x = input_layernorm(hidden)
+            // x = self_attn(x)
+            // x = post_attention_layernorm(x)
+            // hidden = residual_attn + x
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let _ = cuMemcpyDtoDAsync_v2(
+                    normed.device_ptr(),
+                    hidden_region.device_ptr(),
+                    n_tokens * HIDDEN * 2,
+                    self.stream.raw() as _,
+                );
+            }
+            self.stream.fence()?;
+            rmsnorm(normed.device_ptr(), blk.input_layernorm_w.offset_bytes, n_tokens, HIDDEN)?;
+
+            // q/k/v projections (no bias).
+            linear_no_bias(normed.device_ptr(), blk.q_proj_w.offset_bytes,
+                q_buf.device_ptr(), n_tokens, HIDDEN, HIDDEN)?;
+            linear_no_bias(normed.device_ptr(), blk.k_proj_w.offset_bytes,
+                k_buf.device_ptr(), n_tokens, HIDDEN, HIDDEN)?;
+            linear_no_bias(normed.device_ptr(), blk.v_proj_w.offset_bytes,
+                v_buf.device_ptr(), n_tokens, HIDDEN, HIDDEN)?;
+
+            // q_norm / k_norm: per-head RMSNorm head_dim=72 (gammas
+            // pre-shifted in checkpoint). View Q/K as [N*num_heads, 72].
+            rmsnorm(q_buf.device_ptr(), blk.q_norm_w.offset_bytes,
+                n_tokens * NUM_HEADS, HEAD_DIM)?;
+            rmsnorm(k_buf.device_ptr(), blk.k_norm_w.offset_bytes,
+                n_tokens * NUM_HEADS, HEAD_DIM)?;
+
+            // v_norm: parameter-free RMSNorm via fn_vnorm.
+            vnorm(v_buf.device_ptr(), n_tokens * NUM_HEADS, HEAD_DIM)?;
+
+            // Apply rotary to Q and K.
+            for &qk_ptr in &[q_buf.device_ptr(), k_buf.device_ptr()] {
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    let mut x = qk_ptr;
+                    let mut cos = cos_region.device_ptr();
+                    let mut sin = sin_region.device_ptr();
+                    let mut nh = NUM_HEADS as i32;
+                    let mut hd_i = HEAD_DIM as i32;
+                    let mut rd = HEAD_DIM as i32; // full head_dim rotated
+                    let args = [
+                        (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let _ = cuLaunchKernel(
+                        self.fused.fn_vit_rotary_2d_f16.raw() as CUfunction,
+                        n_tokens as u32, NUM_HEADS as u32, 1,
+                        (HEAD_DIM / 2) as u32, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+            }
+            self.stream.fence()?;
+
+            // Per-head attention: Q*K^T → softmax → scores @ V.
+            // Gemma vision: scaling = 1.0 (no 1/sqrt(d)) — config says so.
+            // Use extract_head_f16 kernel for the gather (one launch per
+            // head) instead of N per-token DtoD calls. With 27 blocks ×
+            // 16 heads × N=2400 tokens, the per-token loop produced
+            // millions of tiny CUDA driver calls and froze for minutes.
+            let extract_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    let mut o = dst;
+                    let mut i = src;
+                    let mut hi = head_idx as i32;
+                    let mut nh = NUM_HEADS as i32;
+                    let mut hd = HEAD_DIM as i32;
+                    let args = [
+                        (&mut o) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut i) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut hi) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let _ = cuLaunchKernel(
+                        self.fused.fn_extract_head_f16.raw() as CUfunction,
+                        n_tokens as u32, 1, 1,
+                        HEAD_DIM as u32, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                Ok(())
+            };
+            let scatter_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    let mut o = dst;
+                    let mut i = src;
+                    let mut hi = head_idx as i32;
+                    let mut nh = NUM_HEADS as i32;
+                    let mut hd = HEAD_DIM as i32;
+                    let args = [
+                        (&mut o) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut i) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut hi) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let _ = cuLaunchKernel(
+                        self.fused.fn_scatter_head_f16.raw() as CUfunction,
+                        n_tokens as u32, 1, 1,
+                        HEAD_DIM as u32, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                Ok(())
+            };
+            for h in 0..NUM_HEADS {
+                extract_head(q_h.device_ptr(), q_buf.device_ptr(), h)?;
+                extract_head(k_h.device_ptr(), k_buf.device_ptr(), h)?;
+                extract_head(v_h.device_ptr(), v_buf.device_ptr(), h)?;
+                self.stream.fence()?;
+
+                // Q*K^T → scores_f32 [N, N] f32 → cast to scores_buf f16.
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    self.cublaslt.f16_gemm_f32(
+                        q_h.device_ptr(), k_h.device_ptr(),
+                        scores_f32.device_ptr(),
+                        n_tokens as i32, n_tokens as i32, HEAD_DIM as i32,
+                        stream_raw,
+                    )?;
+                    let n_elem = (n_tokens * n_tokens) as i32;
+                    let mut out = scores_buf.device_ptr();
+                    let mut input = scores_f32.device_ptr();
+                    let mut nn = n_elem;
+                    let args = [
+                        (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                    let _ = cuLaunchKernel(
+                        self.fused.fn_cast_f32_to_f16.raw() as CUfunction,
+                        grid.0, grid.1, grid.2,
+                        block, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                self.stream.fence()?;
+
+                // scaling=1.0 per Gemma config — no scale_inplace_f16 here.
+
+                // Softmax row-wise.
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    let mut x = scores_buf.device_ptr();
+                    let mut sl = n_tokens as i32;
+                    let args = [
+                        (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut sl) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = (n_tokens as u32).min(1024);
+                    let _ = cuLaunchKernel(
+                        self.fused.fn_softmax_row_f16.raw() as CUfunction,
+                        n_tokens as u32, 1, 1,
+                        block, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                self.stream.fence()?;
+
+                // Transpose V: [N, head_dim] → [head_dim, N] for scores @ V
+                // (f16_gemm_f32 always computes input @ weight^T).
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    let mut out_p = v_h_t.device_ptr();
+                    let mut in_p = v_h.device_ptr();
+                    let mut rows = n_tokens as i32;
+                    let mut cols = HEAD_DIM as i32;
+                    let args = [
+                        (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut rows) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut cols) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let gx = ((cols as u32) + 15) / 16;
+                    let gy = ((rows as u32) + 15) / 16;
+                    let _ = cuLaunchKernel(
+                        self.fused.fn_transpose_2d_f16.raw() as CUfunction,
+                        gx, gy, 1,
+                        16, 16, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                }
+                self.stream.fence()?;
+
+                // scores @ V (V transposed).
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    self.cublaslt.f16_gemm_f32(
+                        scores_buf.device_ptr(), v_h_t.device_ptr(),
+                        scores_f32.device_ptr(),
+                        n_tokens as i32, HEAD_DIM as i32, n_tokens as i32,
+                        stream_raw,
+                    )?;
+                    let n_elem = (n_tokens * HEAD_DIM) as i32;
+                    let mut out = out_h.device_ptr();
+                    let mut input = scores_f32.device_ptr();
+                    let mut nn = n_elem;
+                    let args = [
+                        (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                    let _ = cuLaunchKernel(
+                        self.fused.fn_cast_f32_to_f16.raw() as CUfunction,
+                        grid.0, grid.1, grid.2,
+                        block, 1, 1,
+                        0, self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+
+                }
+                // Scatter out_h → attn_out at offset h*head_dim per row.
+                scatter_head(attn_out.device_ptr(), out_h.device_ptr(), h)?;
+                self.stream.fence()?;
+            }
+
+            // o_proj (no bias).
+            linear_no_bias(attn_out.device_ptr(), blk.o_proj_w.offset_bytes,
+                proj_out.device_ptr(), n_tokens, HIDDEN, HIDDEN)?;
+
+            // post_attention_layernorm on proj_out.
+            rmsnorm(proj_out.device_ptr(), blk.post_attention_layernorm_w.offset_bytes,
+                n_tokens, HIDDEN)?;
+
+            // hidden = hidden + proj_out (residual_attn).
+            host_residual_add(hidden_region.device_ptr(), proj_out.device_ptr())?;
+
+            // === FFN sub-block (sandwich norm) ============================
+            // residual_ffn = hidden;
+            // x = pre_feedforward_layernorm(hidden)
+            // x = mlp(x) = down_proj(gelu_tanh(gate_proj(x)) * up_proj(x))
+            // x = post_feedforward_layernorm(x)
+            // hidden = residual_ffn + x
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let _ = cuMemcpyDtoDAsync_v2(
+                    normed.device_ptr(),
+                    hidden_region.device_ptr(),
+                    n_tokens * HIDDEN * 2,
+                    self.stream.raw() as _,
+                );
+            }
+            self.stream.fence()?;
+            rmsnorm(normed.device_ptr(), blk.pre_feedforward_layernorm_w.offset_bytes,
+                n_tokens, HIDDEN)?;
+
+            linear_no_bias(normed.device_ptr(), blk.gate_proj_w.offset_bytes,
+                mlp_g.device_ptr(), n_tokens, INTERMEDIATE, HIDDEN)?;
+            linear_no_bias(normed.device_ptr(), blk.up_proj_w.offset_bytes,
+                mlp_u.device_ptr(), n_tokens, INTERMEDIATE, HIDDEN)?;
+
+            // gelu_tanh(gate) * up → mlp_g (in-place).
+            #[cfg(feature = "cuda")]
+            unsafe {
+                let n_elem = (n_tokens * INTERMEDIATE) as i32;
+                let mut out = mlp_g.device_ptr();
+                let mut gate = mlp_g.device_ptr();
+                let mut up = mlp_u.device_ptr();
+                let mut nn = n_elem;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut gate) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut up) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
+                let _ = cuLaunchKernel(
+                    self.fused.fn_gelu_tanh_mul_f16.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block, 1, 1,
+                    0, self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.stream.fence()?;
+
+            linear_no_bias(mlp_g.device_ptr(), blk.down_proj_w.offset_bytes,
+                mlp_d.device_ptr(), n_tokens, HIDDEN, INTERMEDIATE)?;
+
+            // post_feedforward_layernorm on mlp_d.
+            rmsnorm(mlp_d.device_ptr(), blk.post_feedforward_layernorm_w.offset_bytes,
+                n_tokens, HIDDEN)?;
+
+            // hidden = hidden + mlp_d (residual_ffn).
+            host_residual_add(hidden_region.device_ptr(), mlp_d.device_ptr())?;
+        }
+
+
+        eprintln!("[g4v] all blocks done, before pooler");
+        // ── Step 5: Pooler — avg-pool kernel=3 + sqrt(hidden) scale. ─
+        // n_tokens must be divisible by k². Output rows = n_tokens / k².
+        // For the simple single-image case the preprocess returns
+        // patches arranged in row-major (row_pos=0..H, col_pos=0..W) so
+        // we can do a straightforward 2D avg-pool on a (max_x, max_y)
+        // grid. Compute max_x/y from the position arrays.
+        let mut max_r: i32 = 0;
+        let mut max_c: i32 = 0;
+        for t in 0..n_tokens {
+            if row_pos_i32[t] > max_r { max_r = row_pos_i32[t]; }
+            if col_pos_i32[t] > max_c { max_c = col_pos_i32[t]; }
+        }
+        let grid_rows = (max_r as usize) + 1;
+        let grid_cols = (max_c as usize) + 1;
+        let pooled_rows = grid_rows / POOL_K;
+        let pooled_cols = grid_cols / POOL_K;
+        let n_pooled = pooled_rows * pooled_cols;
+        if pooled_rows == 0 || pooled_cols == 0 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "vision: pooled grid is empty (POOL_K too large)",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        let pooled_region = self.arena.region("g4v_pooled", n_pooled * HIDDEN * 2, 16)?;
+
+        // Use vit_avgpool_f16: kernel signature
+        //   (out, in, in_grid_h, in_grid_w, hidden, kernel_size)
+        // Grid: (pooled_rows * pooled_cols, hidden), Block: 1 thread.
+        // We honour what the existing kernel actually expects.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let mut out = pooled_region.device_ptr();
+            let mut input = hidden_region.device_ptr();
+            let mut gh = grid_rows as i32;
+            let mut gw = grid_cols as i32;
+            let mut hd = HIDDEN as i32;
+            let mut k = POOL_K as i32;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut gw) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut k) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let _ = cuLaunchKernel(
+                self.fused.fn_vit_avgpool_f16.raw() as CUfunction,
+                n_pooled as u32, 1, 1,
+                256, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+
+
+        eprintln!("[g4v] avgpool done, n_pooled={}", n_pooled);
+        // Multiply by sqrt(hidden_size) (Gemma scaling in pooler).
+        let sqrt_h = (HIDDEN as f32).sqrt();
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let mut x = pooled_region.device_ptr();
+            let mut s = sqrt_h;
+            let mut nn = (n_pooled * HIDDEN) as i32;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut s) as *mut f32 as *mut core::ffi::c_void,
+                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid = ((nn as u32 + block - 1) / block, 1u32, 1u32);
+            let _ = cuLaunchKernel(
+                self.fused.fn_scale_inplace_f16.raw() as CUfunction,
+                grid.0, grid.1, grid.2,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+
+
+        eprintln!("[g4v] sqrt scale done");
+        // ── Step 6: Standardize — (x - std_bias) * std_scale. ───────
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let mut x = pooled_region.device_ptr();
+            let mut bias = vision.std_bias.offset_bytes;
+            let mut scale = vision.std_scale.offset_bytes;
+            let mut hd = HIDDEN as i32;
+            let args = [
+                (&mut x) as *mut u64 as *mut core::ffi::c_void,
+                (&mut bias) as *mut u64 as *mut core::ffi::c_void,
+                (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let _ = cuLaunchKernel(
+                self.fused.fn_vit_standardize_f16.raw() as CUfunction,
+                n_pooled as u32, 1, 1,
+                256, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+
+
+        eprintln!("[g4v] standardize done");
+        // ── Step 7: embed_vision = projection(parameter-free RMSNorm(x)) ─
+        // First parameter-free RMSNorm in place on pooled_region.
+        vnorm(pooled_region.device_ptr(), n_pooled, HIDDEN)?;
+
+        // Linear [HIDDEN → OUT_HIDDEN] no bias.
+        let final_region = self.arena.region("g4v_final", n_pooled * OUT_HIDDEN * 2, 16)?;
+        linear_no_bias(
+            pooled_region.device_ptr(),
+            vision.embed_vision_projection.offset_bytes,
+            final_region.device_ptr(),
+            n_pooled, OUT_HIDDEN, HIDDEN,
+        )?;
+
+
+        eprintln!("[g4v] embed projection done");
+        // ── Step 8: DtoH the final embeddings. ──────────────────────
+        // Explicit stream fence before DtoH: cuMemcpyDtoH_v2 blocks on
+        // the host but does not implicitly synchronise a non-default
+        // stream, so without this the linear projection / RMSNorm above
+        // could still be in flight when the DtoH kicks off, producing
+        // garbage / out-of-bounds reads.
+        self.stream.fence()?;
+        let out_bytes_count = n_pooled * OUT_HIDDEN * 2;
+        let mut out_bytes = vec![0u8; out_bytes_count];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let _ = cuMemcpyDtoH_v2(
+                out_bytes.as_mut_ptr() as *mut _,
+                final_region.device_ptr(),
+                out_bytes_count,
+            );
+        }
+
+        Ok(VisionForwardOutput {
+            data: out_bytes,
+            num_tokens: n_pooled,
+            hidden_dim: OUT_HIDDEN,
+            grid_thw: [1, pooled_rows as u32, pooled_cols as u32],
+        })
+    }
 }
 
 fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
@@ -5386,6 +6258,17 @@ fn load_gemma4_fused(
     let fn_add_bias_f16 = add_bias_f16_mod.get_function("add_bias_f16_kernel")?;
     let cast_fp_mod = loader.load_ptx("cast_fp")?;
     let fn_cast_f32_to_f16 = cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
+    let vit_rotary_2d_f16_mod = loader.load_ptx("vit_rotary_2d_f16")?;
+    let fn_vit_rotary_2d_f16 =
+        vit_rotary_2d_f16_mod.get_function("vit_rotary_2d_f16_kernel")?;
+    let vit_standardize_f16_mod = loader.load_ptx("vit_standardize_f16")?;
+    let fn_vit_standardize_f16 =
+        vit_standardize_f16_mod.get_function("vit_standardize_f16_kernel")?;
+    let extract_head_f16_mod = loader.load_ptx("extract_head_f16")?;
+    let fn_extract_head_f16 =
+        extract_head_f16_mod.get_function("extract_head_f16_kernel")?;
+    let fn_scatter_head_f16 =
+        extract_head_f16_mod.get_function("scatter_head_f16_kernel")?;
 
     // NVFP4 V-rotation companion (fwht then signs). PTX may be absent
     // on older kernel trees; fall through to None and the dispatch
@@ -5500,6 +6383,13 @@ fn load_gemma4_fused(
         fn_add_bias_f16,
         cast_fp_mod,
         fn_cast_f32_to_f16,
+        vit_rotary_2d_f16_mod,
+        fn_vit_rotary_2d_f16,
+        vit_standardize_f16_mod,
+        fn_vit_standardize_f16,
+        extract_head_f16_mod,
+        fn_extract_head_f16,
+        fn_scatter_head_f16,
         fp8_gemv_mod,
         fn_fp8_gemv_wpr_native_f16in,
         fn_fp8_gemv_wpr_native_bf16in,

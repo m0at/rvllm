@@ -510,6 +510,51 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         }
     };
 
+    // Phase 3b: Gemma vision pre-pass. Run the ViT forward for each
+    // image; collect device-side embeddings as raw f16 bytes for
+    // splice-during-prefill inside `run_generate`.
+    let mut vision_outputs: Vec<rvllm_runtime::qwen36_bring_up::VisionForwardOutput> =
+        Vec::with_capacity(req.vision_items.len());
+    let mut vision_failed_msg: Option<String> = None;
+    for (i, item) in req.vision_items.iter().enumerate() {
+        match bringup.forward_gemma_vision(&item.bytes) {
+            Ok(out) => {
+                tracing::info!(
+                    idx = i,
+                    tokens = out.num_tokens,
+                    hidden = out.hidden_dim,
+                    "vision: Gemma ViT forward done"
+                );
+                if out.num_tokens != item.num_tokens {
+                    vision_failed_msg = Some(format!(
+                        "vision tokens mismatch: predicted {} got {}",
+                        item.num_tokens, out.num_tokens
+                    ));
+                    break;
+                }
+                vision_outputs.push(out);
+            }
+            Err(e) => {
+                vision_failed_msg = Some(format!("gemma vision forward: {e:?}"));
+                break;
+            }
+        }
+    }
+    if let Some(msg) = vision_failed_msg {
+        let _ = req.events_tx.blocking_send(GenerateEvent::Error(msg));
+        let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+            finish: FinishReason::Stop,
+            prompt_tokens: prompt_len,
+            completion_tokens: 0,
+        });
+        return;
+    }
+    let vision_splice: Vec<(usize, &[u8])> = req
+        .vision_slots
+        .iter()
+        .map(|s| (s.token_start, vision_outputs[s.vision_item_idx].data.as_slice()))
+        .collect();
+
     let result = unsafe {
         bringup.run_generate(
             kernels.fn_embed,
@@ -529,6 +574,7 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             // blocked rendering tokens nobody will read.
             Some(req.cancelled.as_ref()),
             Some(&mut on_token),
+            &vision_splice,
         )
     };
 
