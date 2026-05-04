@@ -3097,6 +3097,37 @@ impl Qwen36Bringup {
             }
             self.stream.fence()?;
 
+            // Phase 5e: optional per-layer activation dump for
+            // numerical-correctness audit vs vLLM. Set
+            // RVLLM_QWEN36_DUMP_DIR to enable. Dumps last_hidden_region
+            // contents (f16, hidden=2048 elems → 4096 bytes) after each
+            // layer's attn block and after each layer's MoE block, but
+            // ONLY for the last prompt token (tok_local == num_tokens-1
+            // && start_position == 0) to avoid runaway disk usage on
+            // multi-step decode.
+            let dump_dir =
+                std::env::var("RVLLM_QWEN36_DUMP_DIR").ok();
+            let dump_this_token = dump_dir.is_some()
+                && tok_local + 1 == num_tokens
+                && start_position == 0;
+            if let Some(dir) = dump_dir.as_ref() {
+                if dump_this_token {
+                    let _ = std::fs::create_dir_all(dir);
+                    // Dump the embedding (input to layer 0) once.
+                    let mut buf = vec![0u8; last_hidden_bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut _,
+                            last_hidden_region.device_ptr(),
+                            last_hidden_bytes,
+                        );
+                    }
+                    let _ = std::fs::write(format!("{dir}/embed.f16"), &buf);
+                }
+            }
+
             let mut linear_seq: u32 = 0;
             let mut full_seq: u32 = 0;
             for layer_idx in 0..self.model.layers.len() {
@@ -3119,12 +3150,42 @@ impl Qwen36Bringup {
                         fl.post_attention_layernorm.offset_bytes
                     }
                 };
+                if dump_this_token {
+                    let dir = dump_dir.as_ref().unwrap();
+                    let mut buf = vec![0u8; last_hidden_bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut _,
+                            last_hidden_region.device_ptr(),
+                            last_hidden_bytes,
+                        );
+                    }
+                    let _ = std::fs::write(
+                        format!("{dir}/layer_{layer_idx:02}_attn.f16"), &buf);
+                }
                 self.apply_layer_moe(
                     &self.model.layers[layer_idx].moe,
                     post_attn_norm_ptr,
                     &last_hidden_region,
                     kernel_gemv, hidden, last_hidden_bytes,
                 )?;
+                if dump_this_token {
+                    let dir = dump_dir.as_ref().unwrap();
+                    let mut buf = vec![0u8; last_hidden_bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut _,
+                            last_hidden_region.device_ptr(),
+                            last_hidden_bytes,
+                        );
+                    }
+                    let _ = std::fs::write(
+                        format!("{dir}/layer_{layer_idx:02}_moe.f16"), &buf);
+                }
             }
 
             // Write this token's transformed hidden back to its slot
@@ -4179,6 +4240,14 @@ impl Qwen36Bringup {
         }
 
         // 5. Residual sum: last_hidden_new = last_hidden + moe_out.
+        if std::env::var("RVLLM_QWEN36_DEBUG_MOE").is_ok() {
+            let routed_l2: f32 = routed_sum.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let routed_max = routed_sum.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            let max_w = top.iter().zip(weights.iter())
+                .max_by(|a,b| a.1.partial_cmp(b.1).unwrap()).map(|(_,w)| *w).unwrap_or(0.0);
+            let top_indices: Vec<usize> = top.iter().map(|(i,_)| *i).collect();
+            eprintln!("[moe] routed_sum L2={routed_l2:.3} max={routed_max:.3} top_w={max_w:.3} top8_idx={top_indices:?}");
+        }
         let mut last_hidden_host = vec![0u8; last_hidden_bytes];
         #[cfg(feature = "cuda")]
         unsafe {
