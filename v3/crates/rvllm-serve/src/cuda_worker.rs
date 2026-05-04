@@ -95,11 +95,11 @@ pub async fn spawn_cuda_worker(
                     };
                     let scratch_ck = qwen.arena.checkpoint();
                     tracing::info!(
-                        "qwen36 cuda worker ready (Phase 5c: \
-                         multi-token prefill + step-by-step decode \
-                         loop with EOS/stop-token early exit; \
-                         numerical correctness audit vs vLLM is \
-                         Phase 5d)"
+                        "qwen36 cuda worker ready (Phase 5d: \
+                         linear-attn layout rewritten per vLLM \
+                         qwen3_next reference — Q[16,128]+K[16,128]+ \
+                         V[32,128] split, L2-norm on Q/K, in_proj_a/b \
+                         for α/β, GQA expansion for state update)"
                     );
                     let _ = ready_tx.send(Ok(()));
 
