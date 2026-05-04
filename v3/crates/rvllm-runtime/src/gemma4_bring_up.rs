@@ -5588,6 +5588,43 @@ impl Gemma4Bringup {
         };
 
         // fence inside one of the per-head/pooler closures), keep them.
+
+        // Phase 5 audit infrastructure: when RVLLM_GEMMA4_VIT_DUMP_DIR is
+        // set, write per-stage f16 buffers there for layer-by-layer
+        // cosine comparison against an HF Gemma4VisionModel reference.
+        // Mirrors the stage-dump pattern that landed Qwen vision at
+        // cos=0.9999/layer. Stages chosen from Codex review round 3 #A.
+        let dump_dir: Option<std::path::PathBuf> =
+            std::env::var("RVLLM_GEMMA4_VIT_DUMP_DIR").ok().map(Into::into);
+        let dump_stage =
+            |name: &str, dev_ptr: u64, n_rows: usize, ncols: usize| -> Result<()> {
+                if let Some(dir) = dump_dir.as_ref() {
+                    let bytes = n_rows * ncols * 2;
+                    let mut host = vec![0u8; bytes];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        // Sync first — most callers fence right after the
+                        // op of interest, but doing it here too is cheap
+                        // and prevents reading still-in-flight rows.
+                        let _ = self.stream.fence();
+                        let _ = cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            host.as_mut_ptr() as *mut _,
+                            dev_ptr,
+                            bytes,
+                        );
+                    }
+                    let path = dir.join(format!("g4v_{name}.bin"));
+                    if let Err(e) = std::fs::write(&path, &host) {
+                        eprintln!("[g4v-audit] write {path:?}: {e}");
+                    } else {
+                        eprintln!(
+                            "[g4v-audit] {name} → {path:?} ({n_rows}, {ncols}) f16",
+                        );
+                    }
+                }
+                Ok(())
+            };
+
         // ── Step 1: patch_embed (linear, no bias) [N, 768] → [N, 1152] ─
         let hidden_bytes = n_tokens * HIDDEN * 2;
         let hidden_region = self.arena.region("g4v_hidden", hidden_bytes, 16)?;
@@ -5597,6 +5634,7 @@ impl Gemma4Bringup {
             hidden_region.device_ptr(),
             n_tokens, HIDDEN, 768,
         )?;
+        dump_stage("patch_embed_linear", hidden_region.device_ptr(), n_tokens, HIDDEN)?;
 
         // ── Step 2: 2D position embedding lookup + add. ─────────────
         #[cfg(feature = "cuda")]
@@ -5636,6 +5674,7 @@ impl Gemma4Bringup {
             }
         }
         self.stream.fence()?;
+        dump_stage("posemb", hidden_region.device_ptr(), n_tokens, HIDDEN)?;
 
 
         // ── Step 3: build cos/sin tables for 2D rotary. ──────────────
@@ -5729,7 +5768,7 @@ impl Gemma4Bringup {
         let mlp_u = self.arena.region("g4v_mlp_u", n_tokens * INTERMEDIATE * 2, 16)?;
         let mlp_d = self.arena.region("g4v_mlp_d", n_tokens * HIDDEN * 2, 16)?;
 
-        for blk in &vision.blocks {
+        for (blk_idx, blk) in vision.blocks.iter().enumerate() {
             // === ATTENTION sub-block (sandwich norm) =====================
             // residual_attn = hidden;
             // x = input_layernorm(hidden)
@@ -6155,7 +6194,19 @@ impl Gemma4Bringup {
 
             // hidden = hidden + mlp_d (residual_ffn).
             device_residual_add(hidden_region.device_ptr(), mlp_d.device_ptr())?;
+
+            // Dump block output at strategic indices (Codex's first-pass
+            // audit set: 0, 13, 26 — front, middle, back).
+            if blk_idx == 0 || blk_idx == 13 || blk_idx == 26 {
+                dump_stage(
+                    &format!("blk{blk_idx}_out"),
+                    hidden_region.device_ptr(),
+                    n_tokens,
+                    HIDDEN,
+                )?;
+            }
         }
+        dump_stage("encoder_out_pre_pool", hidden_region.device_ptr(), n_tokens, HIDDEN)?;
 
 
         // ── Step 5: Pooler — avg-pool kernel=3 + sqrt(hidden) scale. ─
@@ -6268,6 +6319,7 @@ impl Gemma4Bringup {
             }
         }
         self.stream.fence()?;
+        dump_stage("pooler_scaled", pooled_region.device_ptr(), n_pooled, HIDDEN)?;
 
 
         // ── Step 6: Standardize — (x - std_bias) * std_scale. ───────
@@ -6300,6 +6352,7 @@ impl Gemma4Bringup {
             }
         }
         self.stream.fence()?;
+        dump_stage("standardized", pooled_region.device_ptr(), n_pooled, HIDDEN)?;
 
 
         // ── Step 7: embed_vision = projection(parameter-free RMSNorm(x)) ─
@@ -6314,6 +6367,7 @@ impl Gemma4Bringup {
             final_region.device_ptr(),
             n_pooled, OUT_HIDDEN, HIDDEN,
         )?;
+        dump_stage("post_projection", final_region.device_ptr(), n_pooled, OUT_HIDDEN)?;
 
 
         // ── Step 8: DtoH the final embeddings. ──────────────────────
