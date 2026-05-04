@@ -77,6 +77,7 @@ pub mod qwen36_bring_up;
 pub mod qwen36_layer_exec;
 pub mod qwen36_load;
 pub mod sched_state;
+pub mod vision_preprocess;
 pub mod scheduler;
 
 pub use bring_up::{Bringup, EnginePaths, FusedModules, PplResult};

@@ -58,6 +58,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 bytes = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [profile.release]
 lto = "fat"
