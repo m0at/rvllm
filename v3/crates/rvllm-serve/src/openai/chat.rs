@@ -229,9 +229,22 @@ impl ChatContent {
             ChatContent::Text(_) => None,
             ChatContent::Parts(parts) => parts.iter().find_map(|p| match p {
                 ChatContentPart::Text { .. } => None,
+                ChatContentPart::Image { .. } => None,
                 ChatContentPart::Other { kind } => Some(kind.as_str()),
             }),
         }
+    }
+
+    /// Iterate all `image_url` parts in document order.
+    pub fn image_urls(&self) -> impl Iterator<Item = &ImageUrl> {
+        let parts: &[ChatContentPart] = match self {
+            ChatContent::Text(_) => &[],
+            ChatContent::Parts(parts) => parts,
+        };
+        parts.iter().filter_map(|p| match p {
+            ChatContentPart::Image { image_url } => Some(image_url),
+            _ => None,
+        })
     }
 }
 
@@ -264,17 +277,26 @@ impl<'de> Deserialize<'de> for ChatContent {
     }
 }
 
-/// One element of a content-parts array. The `text` shape is the
-/// only one we render today; any other `type` is captured as
-/// [`ChatContentPart::Other`] so the request validator can 400 with
-/// the actual unsupported type string in the payload, rather than
-/// the request failing JSON-parse with a generic "unknown variant".
+/// One element of a content-parts array. `text` is rendered into the
+/// chat template as-is; `image_url` carries an image (data: URI or
+/// http(s) URL) that gets routed to the native vision tower; any
+/// other type is captured as [`ChatContentPart::Other`].
 #[derive(Debug)]
 pub enum ChatContentPart {
     /// `{"type":"text","text":"..."}`.
     Text { text: String },
+    /// `{"type":"image_url","image_url":{"url":"data:..."|"https://..."}}`.
+    Image { image_url: ImageUrl },
     /// `{"type":"<anything>", ...}` — kind captured for validation.
     Other { kind: String },
+}
+
+/// `image_url` field of an `image_url` content part.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ImageUrl {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl serde::Serialize for ChatContentPart {
@@ -285,6 +307,12 @@ impl serde::Serialize for ChatContentPart {
                 let mut m = s.serialize_map(Some(2))?;
                 m.serialize_entry("type", "text")?;
                 m.serialize_entry("text", text)?;
+                m.end()
+            }
+            ChatContentPart::Image { image_url } => {
+                let mut m = s.serialize_map(Some(2))?;
+                m.serialize_entry("type", "image_url")?;
+                m.serialize_entry("image_url", image_url)?;
                 m.end()
             }
             ChatContentPart::Other { kind } => {
@@ -313,6 +341,14 @@ impl<'de> Deserialize<'de> for ChatContentPart {
                     })?
                     .to_string();
                 Ok(ChatContentPart::Text { text })
+            }
+            "image_url" => {
+                let img = v.get("image_url").ok_or_else(|| {
+                    serde::de::Error::custom("image_url part missing `image_url`")
+                })?;
+                let image_url: ImageUrl =
+                    serde_json::from_value(img.clone()).map_err(serde::de::Error::custom)?;
+                Ok(ChatContentPart::Image { image_url })
             }
             other => Ok(ChatContentPart::Other { kind: other.to_string() }),
         }

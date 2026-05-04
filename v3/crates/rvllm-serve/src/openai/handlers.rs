@@ -289,11 +289,16 @@ pub async fn chat_completions(
         match m.role {
             Role::User | Role::System => {
                 let text = m.content_text();
-                if text.is_empty() {
+                let has_image = m
+                    .content
+                    .as_ref()
+                    .map(|c| c.image_urls().next().is_some())
+                    .unwrap_or(false);
+                if text.is_empty() && !has_image {
                     return Err(ApiError::invalid_param(
                         format!(
                             "messages[{i}] has role={:?} but no content; user and system messages \
-                             require a non-empty `content`",
+                             require a non-empty `content` (text or image)",
                             m.role
                         ),
                         "messages",
