@@ -79,6 +79,12 @@ pub struct Qwen36OutsideKernels {
     /// cost in `apply_layer_full_attn` (Phase 4b prep).
     pub fused_rope_qwen_partial_f16kv_mod: LoadedModule,
     pub fn_fused_rope_qwen_partial_f16kv: KernelFn,
+    /// Splits q_proj's interleaved `[num_heads, 2*head_dim]` output
+    /// into separate q `[num_heads, head_dim]` + gate
+    /// `[num_heads, head_dim]` regions. Replaces a host DtoH +
+    /// per-head copy_from_slice + HtoD round-trip per token.
+    pub split_q_gate_f16_mod: LoadedModule,
+    pub fn_split_q_gate_f16: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -347,6 +353,9 @@ impl Qwen36Bringup {
             kernels.load_ptx("fused_rope_qwen_partial_f16kv")?;
         let fn_fused_rope_qwen_partial_f16kv = fused_rope_qwen_partial_f16kv_mod
             .get_function("fused_rope_qwen_partial_f16kv_kernel")?;
+        let split_q_gate_f16_mod = kernels.load_ptx("split_q_gate_f16")?;
+        let fn_split_q_gate_f16 = split_q_gate_f16_mod
+            .get_function("split_q_gate_f16_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -418,6 +427,8 @@ impl Qwen36Bringup {
             fn_fused_rope_partial_f16kv,
             fused_rope_qwen_partial_f16kv_mod,
             fn_fused_rope_qwen_partial_f16kv,
+            split_q_gate_f16_mod,
+            fn_split_q_gate_f16,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -5218,39 +5229,46 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
-        // 3. Host-deinterleave q_proj output [16, 2*256] → q [16,256] +
-        //    gate [16,256], following vLLM's chunk(-1, 2) on the
-        //    last-dim-of-2*head_dim layout.
-        let q_gate_bytes = (q_n as usize) * 2;
-        let mut qg_host = vec![0u8; q_gate_bytes];
+        // 3. GPU split of q_proj output [num_tokens, num_heads, 2*head_dim]
+        //    into Q + gate [num_tokens, num_heads, head_dim] each.
+        //    Replaces a DtoH + CPU per-head copy_from_slice + HtoD
+        //    round-trip per token with one launch.
+        let q_size = (num_heads * head_dim) as usize; // 4096
+        let hd = head_dim as usize;
+        let q_split_region =
+            self.arena.region("qwen36_pf_qs", q_size * (m as usize) * 2, 16)?;
+        let gate_region =
+            self.arena.region("qwen36_pf_gt", q_size * (m as usize) * 2, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                qg_host.as_mut_ptr() as *mut _,
-                q_region.device_ptr(),
-                q_gate_bytes,
+            let mut qo = q_split_region.device_ptr();
+            let mut go = gate_region.device_ptr();
+            let mut qi = q_region.device_ptr();
+            let mut nh: i32 = num_heads as i32;
+            let mut hd_i: i32 = head_dim as i32;
+            let args = [
+                (&mut qo) as *mut u64 as *mut core::ffi::c_void,
+                (&mut go) as *mut u64 as *mut core::ffi::c_void,
+                (&mut qi) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_split_q_gate_f16.raw() as CUfunction,
+                num_heads, m, 1,
+                head_dim, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
             );
-        }
-        let q_size = (num_heads * head_dim) as usize; // 4096
-        let hd = head_dim as usize;
-        let mut q_host = vec![0u8; q_size * 2];
-        let mut gate_host = vec![0u8; q_size * 2];
-        for h in 0..num_heads as usize {
-            let head_base_in = h * 2 * hd * 2;       // bytes
-            let head_base_out = h * hd * 2;
-            q_host[head_base_out..head_base_out + hd * 2].copy_from_slice(
-                &qg_host[head_base_in..head_base_in + hd * 2]);
-            gate_host[head_base_out..head_base_out + hd * 2].copy_from_slice(
-                &qg_host[head_base_in + hd * 2..head_base_in + 2 * hd * 2]);
-        }
-        let q_split_region =
-            self.arena.region("qwen36_pf_qs", q_size * 2, 16)?;
-        let gate_region =
-            self.arena.region("qwen36_pf_gt", q_size * 2, 16)?;
-        unsafe {
-            q_split_region.copy_from_host(&q_host)?;
-            gate_region.copy_from_host(&gate_host)?;
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn split_q_gate launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
 
         // 4. q_norm + k_norm (per-head RMSNorm via rmsnorm_inplace
