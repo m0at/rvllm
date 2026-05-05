@@ -134,9 +134,18 @@ a/b inside `cublasLtMatmul`, so the wrappers apply caller
 versa — verified, **do not "fix" the swap**.
 
 bf16 sibling kernels + `rmsnorm_inplace_bf16_gbf16` are committed
-but NOT wired into the forward (Phase-3 attempt drifted at
-`blk0_out` cos = 0.76 and was reverted; building blocks kept for
-the next debug pass — see `v3/GEMMA_VISION_AUDIT.md`).
+but NOT wired into the forward — **Phase 3 is formally deferred**
+(2026-05-05). f16 path delivers correct vision output on real
+images for both models; bf16 marginal gain (~0.003 mean cos +
+1 outlier row) does not justify the debug cost.
+
+Per-sub-step debug tooling for any future bf16 attempt:
+- rvllm side: gate `RVLLM_GEMMA4_VIT_SUBSTEP_BLK=<idx>` (alongside
+  `RVLLM_GEMMA4_VIT_DUMP_DIR`) → dumps every sub-step in that
+  block as `g4v_blk{B}_{step}.bin`.
+- HF reference: `v3/tools/gemma_vision_substep_hf_dump.py`.
+- Diff harness: `v3/tools/cmp_g4v_substep.py` with first-divergence
+  pointer. Full replay recipe in `v3/GEMMA_VISION_AUDIT.md`.
 
 ### Correctness methodology
 

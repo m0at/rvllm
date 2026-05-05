@@ -87,10 +87,82 @@ For now the f16-everywhere path is acceptable: model reads text
 correctly, residual cosine drift is well below the threshold where
 text-recognition tasks degrade.
 
-## Phase 3 status — bf16 vision path (in progress, currently disabled)
+## Phase 3 status — bf16 vision path (FORMALLY DEFERRED, 2026-05-05)
 
-Building blocks landed but the wiring exposed a bug I didn't manage
-to localise inside this session, so the production forward stays on
+**Decision**: production runs on the f16 + f32-pooler path. bf16 is
+deferred indefinitely. Re-open only if a real quality regression
+appears that the f16 path can't service.
+
+### Justification
+- f16 path delivers correct vision output on real images for both
+  Qwen 3.6 and Gemma 4 31B (NYT-1969 photo headline + date,
+  /tmp/ball.png "orangefarbener Ball" plus the embedded "orange
+  ball" text overlay).
+- Layer-by-layer audit shows mean cos = 0.9974 at blk26 / 0.9969 at
+  post_projection — well above the threshold where text-recognition
+  degrades. Audit explicitly: "f16-everywhere path is acceptable".
+- bf16 gain is ~0.003 mean cos and ~1 outlier row. Cost is several
+  hours of debug, with a previous attempt failing at blk0_out
+  cos = 0.76 without localisation.
+
+### What stays committed (ready for the next attempt)
+- bf16 sibling kernels for every f16 vision kernel
+  (`vector_add_bf16`, `vnorm_bf16`, `softmax_row_f32_to_bf16`,
+  `vit_pos_emb_lookup_2d_bf16`, `vit_rotary_gemma4_2d_bf16`,
+  `extract_head_bf16` / `scatter_head_bf16`, `transpose_heads_v_bf16`,
+  `gelu_tanh_mul_bf16`, `vit_avgpool_bf16_to_f32`,
+  `vit_standardize_f32_to_bf16`, `rmsnorm_inplace_bf16_gbf16`).
+- `CublasLt::bf16_gemm_f32_batched_strided` (caller-vs-cuBLAS
+  argument-swap convention identical to the f16 sibling).
+
+### Per-sub-step debug tooling (NEW, landed alongside this deferral)
+
+When the next attempt happens, sub-step instrumentation is now
+already in place — the previous session was blocked by lacking it.
+
+1. **rvllm side**: `forward_gemma_vision` now writes per-sub-step
+   buffers in one configurable target block when both
+   `RVLLM_GEMMA4_VIT_DUMP_DIR` and
+   `RVLLM_GEMMA4_VIT_SUBSTEP_BLK=<idx>` are set. Sub-steps:
+   `input_ln`, `q_proj`, `k_proj`, `v_proj`, `q_norm`, `k_norm`,
+   `v_norm`, `q_rot`, `k_rot`, `attn_out`, `o_proj`,
+   `post_attn_ln`, `post_attn_resid`, `pre_ff_ln`, `gate_proj`,
+   `up_proj`, `gelu_mul`, `down_proj`, `post_ff_ln`. Files:
+   `g4v_blk{B}_{step}.bin`, f16 little-endian, `[N, D]` row-major.
+2. **HF reference**: `v3/tools/gemma_vision_substep_hf_dump.py`
+   monkey-patches one Gemma4VisionEncoderLayer to emit the same
+   sub-step set in the same naming convention.
+3. **Diff**: `v3/tools/cmp_g4v_substep.py` walks the SUBSTEPS list,
+   computes per-row cosine, prints a "first divergence" pointer
+   below a configurable threshold (default 0.99).
+
+### Replay recipe for the next bf16 attempt
+```bash
+# 1. Confirm f16 path is byte-faithful inside the target block
+RVLLM_GEMMA4_VIT_DUMP_DIR=/tmp/g4v_f16 \
+RVLLM_GEMMA4_VIT_SUBSTEP_BLK=0 \
+  curl -s http://127.0.0.1:8010/v1/chat/completions ...
+python3 v3/tools/gemma_vision_substep_hf_dump.py \
+  --image v3/crates/rvllm-runtime/tests/fixtures/test_224.png \
+  --block 0 --out /tmp/hf_g4v_blk0
+python3 v3/tools/cmp_g4v_substep.py \
+  --rvllm /tmp/g4v_f16 --hf /tmp/hf_g4v_blk0 --block 0
+# Expect cos≈1.0 at every step; this validates the harness.
+
+# 2. Wire bf16 forward (parallel function or generic-over-dtype).
+#    Re-run the same recipe with /tmp/g4v_bf16. Cosine drop
+#    pinpoints the offending kernel inside that one block —
+#    the previous session's blk0_out cos=0.76 mystery.
+
+# 3. Fix the offending kernel (most likely a Rust-side launch
+#    parameter mismatch — the kernel logic is mechanical
+#    bf16/half substitution).
+```
+
+### Original Phase-3 attempt notes (kept for context)
+
+Building blocks landed but the wiring exposed a bug we couldn't
+localise inside that session, so the production forward stays on
 the f16 + f32-pooler path.
 
 What's committed and verified to build:
