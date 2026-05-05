@@ -56,14 +56,17 @@ pub struct CudaWorkerConfig {
 pub async fn spawn_cuda_worker(
     cfg: CudaWorkerConfig,
 ) -> Result<(WorkerHandle, std::thread::JoinHandle<()>), ApiError> {
-    // `max_queue_depth` is documented as "in-flight + queued"; the
-    // worker pulls one request out of the channel and processes it
-    // synchronously, so the channel buffer should be sized for
-    // `queue_depth - 1` (queued) and the in-flight slot lives on the
-    // worker thread. Clamp to >= 1 because `mpsc::channel(0)`
-    // panics; depth=1 then accepts one in-flight + zero queued
-    // (effectively channel-of-1, matching the doc within ±0).
-    let channel_buf = cfg.queue_depth.saturating_sub(1).max(1);
+    // Channel buffer must equal admission-permit count. The earlier
+    // arithmetic (`queue_depth - 1` plus an "in-flight slot on the
+    // worker") was wrong: the worker only frees a buffer slot when
+    // it pulls from the channel, so until that recv returns, the
+    // buffer IS the cap. With `queue_depth` permits but a
+    // `queue_depth - 1` buffer, a cold-burst of `queue_depth`
+    // concurrent admissions could see one handler's `try_send` fail
+    // with Busy after fetch+tokenize work — violating the "permit
+    // reserves the lifecycle slot" contract. Clamp to >= 1 because
+    // `mpsc::channel(0)` panics.
+    let channel_buf = cfg.queue_depth.max(1);
     let (req_tx, mut req_rx) = mpsc::channel::<GenerateRequest>(channel_buf);
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 

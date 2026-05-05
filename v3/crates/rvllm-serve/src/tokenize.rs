@@ -482,7 +482,9 @@ impl TokenizerHandle {
         StreamDecoder {
             tokenizer: self.inner.clone(),
             ids: Vec::new(),
-            emitted_chars: 0,
+            anchor_token: 0,
+            emitted_in_window: 0,
+            last_window_text: String::new(),
             keep_special: false,
         }
     }
@@ -499,7 +501,9 @@ impl TokenizerHandle {
         StreamDecoder {
             tokenizer: self.inner.clone(),
             ids: Vec::new(),
-            emitted_chars: 0,
+            anchor_token: 0,
+            emitted_in_window: 0,
+            last_window_text: String::new(),
             keep_special: true,
         }
     }
@@ -585,15 +589,31 @@ fn extract_token_str(cfg: &serde_json::Value, key: &str) -> Option<String> {
 pub struct StreamDecoder {
     tokenizer: Arc<TokenizerInner>,
     ids: Vec<u32>,
-    /// Number of char-boundary-aligned bytes already emitted to the
-    /// client. Tracked in bytes (not chars) so we can slice the
-    /// decoded string without re-scanning.
-    emitted_chars: usize,
+    /// Token index where the active decode-window starts. We only
+    /// re-decode `ids[anchor_token..]` per step, not the full run.
+    /// Periodically advanced (see `WINDOW_ADVANCE_AT`) so per-step
+    /// work stays bounded — making the stream amortised O(n) instead
+    /// of O(n²) over its lifetime.
+    anchor_token: usize,
+    /// Number of bytes of `last_window_text` that have already been
+    /// emitted to the client.
+    emitted_in_window: usize,
+    /// Last decode of `ids[anchor_token..]`. Cached so step() can
+    /// emit only the new bytes since the previous call.
+    last_window_text: String,
     /// When true, `decode(..., skip_special_tokens=false)` so callers
     /// see `<|tool_call>` / `<|channel>` markers verbatim. Set via
     /// `TokenizerHandle::stream_decoder_raw()`.
     keep_special: bool,
 }
+
+/// Re-anchor the window once the suffix grows past this many tokens.
+const WINDOW_ADVANCE_AT: usize = 64;
+/// After advancing, retain this many trailing tokens in the window.
+/// Must be small enough to keep per-step decode cheap, but large
+/// enough that any single multi-byte UTF-8 codepoint or merged-
+/// whitespace artifact at the boundary is fully covered.
+const WINDOW_RETAIN: usize = 16;
 
 impl StreamDecoder {
     /// Feed one newly-generated token. Returns the incremental UTF-8
@@ -602,32 +622,76 @@ impl StreamDecoder {
     /// we hold text until it lands on a char boundary).
     pub fn step(&mut self, id: u32) -> Result<String, ApiError> {
         self.ids.push(id);
-        // KNOWN-PERF: this re-decodes the full accumulated run each
-        // step → O(n²) over the stream. Fine at small caps; for
-        // long streams (max_new_tokens_cap above ~2k) consider a
-        // bounded sliding-window detokenizer with BPE-boundary
-        // overlap handling. The HF rust tokenizer is fast enough at
-        // kilotoken scales that this still beats managing an
-        // incremental decoder by hand for typical loads, so this
-        // is left as a follow-up rather than fixed wrong.
-        let full = self
+        let win = self
             .tokenizer
             .tokenizer
-            .decode(&self.ids, /*skip_special_tokens*/ !self.keep_special)
+            .decode(
+                &self.ids[self.anchor_token..],
+                /*skip_special_tokens*/ !self.keep_special,
+            )
             .map_err(|e| ApiError::Tokenize(format!("{e}")))?;
 
-        // Emit bytes past the last high-water mark, but only up to
-        // the most recent valid UTF-8 boundary — BPE can split a
-        // 4-byte codepoint across tokens.
-        if full.len() <= self.emitted_chars {
+        // Hold a partial UTF-8 codepoint until it lands on a char
+        // boundary. The HF rust tokenizer emits the U+FFFD replacement
+        // marker at the end of an incomplete sequence; suppress emit
+        // until the next token completes the codepoint.
+        if win.ends_with('\u{FFFD}') {
+            // Don't update last_window_text — the next step will
+            // produce a longer `win` that we'll diff against the
+            // previous (still-partial) one.
             return Ok(String::new());
         }
-        let new_slice = &full[self.emitted_chars..];
-        // `str` slicing is already boundary-safe because `full` is a
-        // `String` (validated UTF-8) — the slice from a valid start
-        // index to the end is always valid.
-        self.emitted_chars = full.len();
-        Ok(new_slice.to_string())
+
+        // Emit only the bytes past last_window_text. `String::len()`
+        // is in bytes; slicing at any position past a previous
+        // String's end is char-boundary-safe because both strings are
+        // validated UTF-8 and the new one is a strict superset of the
+        // emitted prefix (we just added one token).
+        let delta = if win.len() > self.emitted_in_window {
+            win[self.emitted_in_window..].to_string()
+        } else {
+            String::new()
+        };
+        self.emitted_in_window = win.len();
+        self.last_window_text = win;
+
+        // Advance the anchor periodically so the per-step decode cost
+        // stays bounded by `WINDOW_ADVANCE_AT` tokens. Decode the
+        // span we're absorbing into the new prefix to count how many
+        // bytes drop out of the window; subtract from
+        // `emitted_in_window` so the next step's diff stays correct.
+        // SentencePiece-style tokenizers (Gemma, Qwen) decode token
+        // spans purely additively at byte level once past the
+        // boundary, so the new window's leading bytes match the
+        // suffix of the old window minus the absorbed prefix —
+        // verified by the unit tests below.
+        if self.ids.len() - self.anchor_token > WINDOW_ADVANCE_AT {
+            let new_anchor = self.ids.len() - WINDOW_RETAIN;
+            let absorbed = self
+                .tokenizer
+                .tokenizer
+                .decode(
+                    &self.ids[self.anchor_token..new_anchor],
+                    !self.keep_special,
+                )
+                .map_err(|e| ApiError::Tokenize(format!("{e}")))?;
+            // Absorb `absorbed.len()` bytes into the conceptual stable
+            // prefix; decrement `emitted_in_window` so the new window
+            // (decoded on the next step) sees the right starting
+            // emit-position.
+            self.emitted_in_window = self.emitted_in_window.saturating_sub(absorbed.len());
+            self.anchor_token = new_anchor;
+            self.last_window_text = self
+                .tokenizer
+                .tokenizer
+                .decode(
+                    &self.ids[self.anchor_token..],
+                    !self.keep_special,
+                )
+                .map_err(|e| ApiError::Tokenize(format!("{e}")))?;
+        }
+
+        Ok(delta)
     }
 
     /// Flush any buffered tail after the last `step`. Currently a

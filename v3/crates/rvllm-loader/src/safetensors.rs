@@ -91,16 +91,42 @@ impl ShardHeader {
                     offsets.len()
                 )));
             }
-            let start = offsets[0].as_u64().unwrap_or(0);
-            let end = offsets[1].as_u64().unwrap_or(0);
+            let start = offsets[0]
+                .as_u64()
+                .ok_or_else(|| loader_err(format!("{name}: bad data_offsets[0]")))?;
+            let end = offsets[1]
+                .as_u64()
+                .ok_or_else(|| loader_err(format!("{name}: bad data_offsets[1]")))?;
+            // Validate the offset triple before any arithmetic so a
+            // truncated or corrupt shard returns a clean LoaderError
+            // instead of panicking on subtraction underflow / index
+            // out-of-bounds in downstream slicing
+            // (load.rs:307, gemma4_load.rs:99, qwen36_load.rs:100).
+            if end < start {
+                return Err(loader_err(format!(
+                    "{name}: data_offsets out of order (end={end} < start={start})"
+                )));
+            }
             let nbytes = end - start;
-            // Cycle 39: dtype_storage_bytes handles sub-byte packed
-            // dtypes (U4Packed/I4Packed) which dtype_bytes returns 0 for.
             let n_elements = shape.iter().product::<usize>() as u64;
             let expected = dtype_storage_bytes(dtype, n_elements);
             if expected != nbytes {
                 return Err(loader_err(format!(
                     "{name}: offset range {nbytes} != dtype*shape {expected}"
+                )));
+            }
+            // payload_start + end must stay inside the mapped file
+            // — checked here so the slicing in load.rs stays panic-free.
+            let abs_end = payload_start.checked_add(end).ok_or_else(|| {
+                loader_err(format!(
+                    "{name}: data_offsets overflow (payload_start={payload_start} + end={end})"
+                ))
+            })?;
+            if (abs_end as usize) > file_bytes.len() {
+                return Err(loader_err(format!(
+                    "{name}: tensor extends past file end \
+                     (abs_end={abs_end} > file_bytes={})",
+                    file_bytes.len()
                 )));
             }
             let file_offset = payload_start + start;

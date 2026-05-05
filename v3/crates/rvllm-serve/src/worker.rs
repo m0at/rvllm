@@ -153,7 +153,7 @@ pub fn spawn_mock_worker(
     // thread = `queue_depth` total. Asymmetry between mock and CUDA
     // would let admission tests pass against the mock while failing
     // in production (one extra request slips through).
-    let (tx, mut rx) = mpsc::channel::<GenerateRequest>(queue_depth.saturating_sub(1).max(1));
+    let (tx, mut rx) = mpsc::channel::<GenerateRequest>(queue_depth.max(1));
     let join = std::thread::Builder::new()
         .name("rvllm-serve-mock-worker".into())
         .spawn(move || {
@@ -183,7 +183,7 @@ pub fn spawn_erroring_mock_worker(
     // thread = `queue_depth` total. Asymmetry between mock and CUDA
     // would let admission tests pass against the mock while failing
     // in production (one extra request slips through).
-    let (tx, mut rx) = mpsc::channel::<GenerateRequest>(queue_depth.saturating_sub(1).max(1));
+    let (tx, mut rx) = mpsc::channel::<GenerateRequest>(queue_depth.max(1));
     let msg = error_msg.into();
     let join = std::thread::Builder::new()
         .name("rvllm-serve-erroring-mock-worker".into())
