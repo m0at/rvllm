@@ -457,9 +457,26 @@ pub async fn chat_completions(
     let vision_items = {
         let arch = state.vision_arch;
         let messages = req.messages.clone();
-        tokio::task::spawn_blocking(move || collect_vision_items(arch, &messages))
-            .await
-            .map_err(|e| ApiError::Internal(format!("vision fetch joined: {e}")))??
+        // Bound vision fetch by the configured request_timeout so an
+        // admission slot can't be parked for ~N×5s of slow HTTP
+        // image fetches before request_timeout's deadline timer even
+        // starts at the worker-event drain. On timeout, we drop the
+        // permit and return 504-style.
+        let fetch_fut = tokio::task::spawn_blocking(
+            move || collect_vision_items(arch, &messages),
+        );
+        match tokio::time::timeout(state.config.request_timeout, fetch_fut).await {
+            Ok(joined) => joined
+                .map_err(|e| ApiError::Internal(format!("vision fetch joined: {e}")))??,
+            Err(_) => {
+                return Err(ApiError::invalid_param(
+                    "vision image fetch exceeded request_timeout — the \
+                     client image URL(s) did not resolve in time",
+                    "messages",
+                    "image_fetch_timeout",
+                ));
+            }
+        }
     };
     let (prompt_ids, vision_slots) = if vision_items.is_empty() {
         (
@@ -480,7 +497,7 @@ pub async fn chat_completions(
         );
         (ids, slots)
     };
-    reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
+    reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap, state.vision_arch)?;
 
     dump_write(&request_id, "prompt_tokens", &serde_json::json!({
         "prompt_tokens": prompt_ids.len(),
@@ -1512,7 +1529,7 @@ pub async fn completions(
     let _admission = state.worker.try_admit()?;
 
     let prompt_ids = state.tokenizer.encode(&prompt_text)?;
-    reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
+    reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap, state.vision_arch)?;
 
     let (events_tx, events_rx) = mpsc::channel::<GenerateEvent>(64);
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -2182,28 +2199,46 @@ fn reject_oversized_prompt(
     prompt_len: usize,
     max_new: u32,
     _cap: u32,
+    vision_arch: crate::router::VisionArch,
 ) -> ApiResult<()> {
-    // The runtime's KV cache holds `RVLLM_NUM_BLOCKS * block_size`
-    // token slots; anything beyond that fails inside the worker
-    // with an opaque allocation error. We derive the limit from
-    // the same env vars the runtime reads so HTTP admission stays
-    // in lockstep with actual capacity. Previously a hard 262_144
-    // ceiling let through requests up to 256k tokens that the
-    // default RVLLM_NUM_BLOCKS=1024 (= 32k slots) couldn't service.
-    const BLOCK_SIZE: u32 = 32;
-    let num_blocks: u32 = std::env::var("RVLLM_NUM_BLOCKS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1024);
-    let kv_capacity_tokens = num_blocks as u64 * BLOCK_SIZE as u64;
+    // The runtime's KV cache capacity depends on the model arch's
+    // bring-up. The two paths size their cache differently and the
+    // HTTP admission must mirror BOTH or a request can pass the
+    // check and OOB-write inside the worker:
+    //
+    //   * Gemma4Bringup: paged KV with `RVLLM_NUM_BLOCKS *
+    //     block_size(=32)` token slots — default 32 k.
+    //   * Qwen36Bringup (qwen36_bring_up.rs:538): KV sized from
+    //     `RVLLM_MAX_TOKENS_CAP` directly (default 4096), with
+    //     block_size 16. The full-attn path indexes by absolute
+    //     position into `slot_off_bytes` with no runtime bounds
+    //     check, so admitting a 32k prompt blows past the cache
+    //     and corrupts the arena.
+    let (kv_capacity_tokens, source) = match vision_arch {
+        crate::router::VisionArch::Qwen36 => {
+            let cap = std::env::var("RVLLM_MAX_TOKENS_CAP")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(4096);
+            (cap as u64, format!("RVLLM_MAX_TOKENS_CAP={cap}"))
+        }
+        crate::router::VisionArch::Gemma4 => {
+            const BLOCK_SIZE: u32 = 32;
+            let num_blocks: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1024);
+            let cap = num_blocks as u64 * BLOCK_SIZE as u64;
+            (cap, format!("RVLLM_NUM_BLOCKS={num_blocks} × block_size={BLOCK_SIZE}"))
+        }
+    };
     if prompt_len as u64 + max_new as u64 > kv_capacity_tokens {
         return Err(ApiError::invalid_param(
             format!(
                 "prompt + max_tokens ({} + {}) exceeds runtime KV capacity \
-                 of {} tokens (RVLLM_NUM_BLOCKS={} × block_size={}). \
-                 Either shorten the prompt, lower max_tokens, or raise \
-                 RVLLM_NUM_BLOCKS in the server profile.",
-                prompt_len, max_new, kv_capacity_tokens, num_blocks, BLOCK_SIZE
+                 of {} tokens ({}). Either shorten the prompt, lower \
+                 max_tokens, or raise the cap in the server profile.",
+                prompt_len, max_new, kv_capacity_tokens, source
             ),
             "max_tokens",
             "context_exceeds_kv_capacity",

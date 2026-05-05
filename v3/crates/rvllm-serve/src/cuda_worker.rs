@@ -130,9 +130,20 @@ pub async fn spawn_cuda_worker(
                             ));
                             continue;
                         }
-                        let _ = qwen.reset_linear_state();
-                        let _ = qwen.reset_kv_cache();
-                        let _ = qwen.reset_conv_state();
+                        // Reset per-request transient state. cuMemsetD8Async
+                        // can return real CUDA errors (e.g. context lost
+                        // after a kernel fault); silently swallowing them
+                        // would make the next request run on stale state.
+                        let reset_ok = qwen.reset_linear_state()
+                            .and_then(|_| qwen.reset_kv_cache())
+                            .and_then(|_| qwen.reset_conv_state());
+                        if let Err(e) = reset_ok {
+                            let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                                format!("qwen36 per-request reset: {e:?}"),
+                            ));
+                            unsafe { qwen.arena.restore(scratch_ck); }
+                            continue;
+                        }
                         if req.cancelled.load(Ordering::Relaxed) {
                             let _ = req.events_tx.blocking_send(GenerateEvent::Done {
                                 finish: FinishReason::Cancelled,
