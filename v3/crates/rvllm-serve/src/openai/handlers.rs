@@ -2205,6 +2205,24 @@ fn validate_stops(stops: &[String]) -> ApiResult<()> {
             "too_many_stops",
         ));
     }
+    // Cap each stop string by character length so the
+    // STOP_TAIL_WINDOW=64 sliding tail in the response collector
+    // is provably long enough to contain any match. 256 chars is
+    // a hard upper bound on byte-level expansion and well below
+    // 64 tokens for any realistic tokenizer.
+    const MAX_STOP_CHARS: usize = 256;
+    for (i, s) in stops.iter().enumerate() {
+        if s.chars().count() > MAX_STOP_CHARS {
+            return Err(ApiError::invalid_param(
+                format!(
+                    "stop[{i}] is {} chars; server cap MAX_STOP_CHARS={MAX_STOP_CHARS}",
+                    s.chars().count()
+                ),
+                "stop",
+                "stop_too_long",
+            ));
+        }
+    }
     Ok(())
 }
 

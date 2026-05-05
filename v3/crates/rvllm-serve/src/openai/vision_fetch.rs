@@ -15,6 +15,33 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use std::time::Duration;
 
+/// Decode `%xx` percent-encoding into raw bytes. Used for
+/// non-base64 data: URIs per RFC 2397 §3. Pulls in no external
+/// crate — the format is trivially small (two hex digits after
+/// every `%`).
+fn percent_decode(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        if b == b'%' {
+            if i + 2 >= input.len() {
+                return Err(format!("truncated %xx escape at offset {i}"));
+            }
+            let hi = (input[i + 1] as char).to_digit(16)
+                .ok_or_else(|| format!("bad hex {:?} at offset {}", input[i + 1] as char, i + 1))?;
+            let lo = (input[i + 2] as char).to_digit(16)
+                .ok_or_else(|| format!("bad hex {:?} at offset {}", input[i + 2] as char, i + 2))?;
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 pub enum VisionError {
     FetchTimeout,
@@ -98,7 +125,14 @@ fn parse_data_uri(rest: &str) -> Result<Vec<u8>, VisionError> {
         B64.decode(data.as_bytes())
             .map_err(|e| VisionError::BadDataUri(format!("base64: {e}")))?
     } else {
-        data.as_bytes().to_vec()
+        // RFC 2397 §3: non-base64 data: URIs carry their payload
+        // percent-encoded (URI character set). Decode `%xx` triples
+        // back to bytes; pass other bytes through untouched. Without
+        // this, a spec-compliant `data:image/png,%89PNG…` payload
+        // arrives at image::load with literal '%','8','9','P',… and
+        // fails header-decode.
+        percent_decode(data.as_bytes())
+            .map_err(|e| VisionError::BadDataUri(format!("percent-decode: {e}")))?
     };
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(VisionError::TooLarge(bytes.len(), MAX_IMAGE_BYTES));
@@ -183,4 +217,46 @@ pub fn predict_gemma_num_tokens(width: u32, height: u32) -> Result<usize, Vision
     let n_patches = (num_h * num_w) as usize;
     let k2 = (cfg.pooling_kernel_size * cfg.pooling_kernel_size) as usize;
     Ok(n_patches / k2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_passes_through_plain_ascii() {
+        assert_eq!(percent_decode(b"hello world").unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn percent_decode_handles_png_signature() {
+        // RFC 2397 spec example: PNG header bytes 89 50 4E 47 …
+        // arrive in a non-base64 data URI as "%89PNG%0D%0A%1A%0A".
+        let got = percent_decode(b"%89PNG%0D%0A%1A%0A").unwrap();
+        assert_eq!(got, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    }
+
+    #[test]
+    fn percent_decode_rejects_truncated_escape() {
+        assert!(percent_decode(b"abc%9").is_err());
+        assert!(percent_decode(b"abc%").is_err());
+    }
+
+    #[test]
+    fn percent_decode_rejects_bad_hex() {
+        assert!(percent_decode(b"abc%ZZ").is_err());
+    }
+
+    #[test]
+    fn parse_data_uri_base64_path() {
+        // base64('hello') = aGVsbG8=
+        let bytes = parse_data_uri("text/plain;base64,aGVsbG8=").unwrap();
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn parse_data_uri_percent_encoded_path() {
+        let bytes = parse_data_uri("image/png,%89PNG%0D%0A%1A%0A").unwrap();
+        assert_eq!(bytes, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    }
 }

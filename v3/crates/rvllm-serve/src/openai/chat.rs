@@ -95,9 +95,18 @@ impl Default for ChatCompletionRequest {
 
 impl ChatCompletionRequest {
     /// Extract validated sampling params. Reject v1-unsupported knobs.
+    ///
+    /// OpenAI's documented default for temperature is 1.0 — the
+    /// stochastic path. On rvllm that means a per-token
+    /// vocab-size DtoH copy + host-side sort + sample, which is
+    /// expensive at Gemma-4's 262k vocab. Operators running a
+    /// throughput benchmark or a deployment that doesn't need
+    /// temperature can flip the server-side default to greedy via
+    /// `RVLLM_DEFAULT_TEMPERATURE=0` (any f32 is accepted; 0 means
+    /// greedy). When unset we mirror OpenAI's 1.0 for compat.
     pub fn sampling_params(&self) -> SamplingParams {
         SamplingParams {
-            temperature: self.temperature.unwrap_or(1.0),
+            temperature: self.temperature.unwrap_or_else(super::default_temperature),
             top_p: self.top_p.unwrap_or(1.0),
             top_k: self.top_k,
             seed: self.seed,
