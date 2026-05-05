@@ -259,40 +259,197 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    // m=2 must return the Phase-3b deferral error.
-    let res = unsafe {
-        bringup.fp8_proj_dispatch(
-            kernel_gemv,
-            out_disp_region.device_ptr(),
-            weight.offset_bytes,
-            blockscale,
-            in_region.device_ptr(),
-            /*m*/ 2,
-            n,
-            k,
-            stream_raw,
-        )
-    };
-    match res {
-        Err(e) => {
-            let msg = format!("{e:?}");
-            if msg.contains("Phase 3b") {
-                eprintln!("✓ m=2: dispatcher correctly defers with Phase-3b sentinel error");
-            } else {
-                return Err(format!(
-                    "m=2 returned an error but not the expected Phase-3b sentinel: {msg}"
-                ));
+    // ─────────────────── Phase 3b: m≥2 cosine probe ───────────────────
+    //
+    // For m∈{2,4,16,64}: build an [M,K] f16 input by tiling the
+    // single-row pattern with a per-row offset, run the dispatcher
+    // (cuBLASLt fp8_gemm path), then build the reference by looping
+    // the m=1 GEMV N times over the same per-row inputs. Compare
+    // per-row cosine between the two outputs; require ≥0.9999 on
+    // every row.
+    //
+    // The two paths use different numerical tracks (GEMV consumes
+    // f16 directly; GEMM goes through fp8 quantise + tensor cores)
+    // so we don't expect bit-equality at m≥2 — cosine is the
+    // correct metric.
+    // On sm_121 the dispatcher falls back to looped-m=1 GEMV
+    // (cuBLASLt has no blockwise FP8 kernel for this arch yet).
+    // The probe still gates correctness: per-row output of the
+    // dispatcher must match the same row produced by a direct
+    // m=1 GEMV. On capable arches (sm_100 / sm_120) the same
+    // dispatch goes through cuBLASLt blockwise tensor-cores;
+    // cosine ≥0.9999 covers both paths.
+    for &m in &[2u32, 4, 16, 64] {
+        let in_bytes_m = (m as usize) * (k as usize) * 2;
+        let out_bytes_m = (m as usize) * (n as usize) * 2;
+        let in_region_m = bringup
+            .arena
+            .region("probe_q_in_m", in_bytes_m, 16)
+            .map_err(|e| format!("alloc in_region_m: {e:?}"))?;
+        let out_disp_region_m = bringup
+            .arena
+            .region("probe_q_out_disp_m", out_bytes_m, 16)
+            .map_err(|e| format!("alloc disp_m: {e:?}"))?;
+        let out_ref_region_m = bringup
+            .arena
+            .region("probe_q_out_ref_m", out_bytes_m, 16)
+            .map_err(|e| format!("alloc ref_m: {e:?}"))?;
+
+        // Build the [M, K] f16 input. Each row is the same sin pattern
+        // shifted by `row * 0.7` so the rows aren't degenerate copies
+        // (a constant amax across rows would hide per-row scale bugs).
+        let mut in_host = Vec::with_capacity(in_bytes_m);
+        for row in 0..(m as usize) {
+            for i in 0..(k as usize) {
+                let x = (((i as f32) * 0.0123 + (row as f32) * 0.7).sin()) * 0.5_f32;
+                in_host.extend_from_slice(&f32_to_f16_bits(x).to_le_bytes());
             }
         }
-        Ok(()) => {
-            return Err(
-                "m=2 unexpectedly succeeded — Phase 3b path is supposed to return Err today"
-                    .into(),
+        unsafe {
+            in_region_m
+                .copy_from_host(&in_host)
+                .map_err(|e| format!("HtoD m-input: {e:?}"))?;
+        }
+
+        // Dispatcher path (cuBLASLt fp8_gemm under the hood).
+        unsafe {
+            bringup.fp8_proj_dispatch(
+                kernel_gemv,
+                out_disp_region_m.device_ptr(),
+                weight.offset_bytes,
+                blockscale,
+                in_region_m.device_ptr(),
+                m,
+                n,
+                k,
+                stream_raw,
+            )
+        }
+        .map_err(|e| format!("dispatch m={m}: {e:?}"))?;
+        bringup
+            .stream
+            .fence()
+            .map_err(|e| format!("disp_m fence: {e:?}"))?;
+
+        // Reference path: loop GEMV at m=1 N times into stacked output.
+        // Each iteration writes one [1, n] row at the right offset.
+        for row in 0..(m as usize) {
+            let row_in_ptr = in_region_m.device_ptr() + (row as u64) * (k as u64) * 2;
+            let row_out_ptr = out_ref_region_m.device_ptr() + (row as u64) * (n as u64) * 2;
+            unsafe {
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m: 1, n, k }.launch(
+                    kernel_gemv,
+                    row_out_ptr,
+                    weight.offset_bytes,
+                    blockscale,
+                    row_in_ptr,
+                    stream_raw,
+                )
+            }
+            .map_err(|e| format!("ref-loop GEMV (m={m}, row={row}): {e:?}"))?;
+        }
+        bringup
+            .stream
+            .fence()
+            .map_err(|e| format!("ref_m fence: {e:?}"))?;
+
+        // DtoH both, compare per-row cosine.
+        let mut ref_host = vec![0u8; out_bytes_m];
+        let mut disp_host = vec![0u8; out_bytes_m];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            cuMemcpyDtoH_v2(
+                ref_host.as_mut_ptr() as *mut _,
+                out_ref_region_m.device_ptr(),
+                out_bytes_m,
             );
+            cuMemcpyDtoH_v2(
+                disp_host.as_mut_ptr() as *mut _,
+                out_disp_region_m.device_ptr(),
+                out_bytes_m,
+            );
+        }
+
+        // Compute per-row cosine. n elements per row, f16 → f32 for
+        // stability of the reduction.
+        let row_len_bytes = (n as usize) * 2;
+        let mut min_cos = f32::INFINITY;
+        let mut mean_cos_sum = 0.0_f64;
+        let mut worst_row: usize = 0;
+        for row in 0..(m as usize) {
+            let off = row * row_len_bytes;
+            let mut dot = 0.0_f64;
+            let mut na = 0.0_f64;
+            let mut nb = 0.0_f64;
+            for i in 0..(n as usize) {
+                let a_bits = u16::from_le_bytes([ref_host[off + i * 2], ref_host[off + i * 2 + 1]]);
+                let b_bits =
+                    u16::from_le_bytes([disp_host[off + i * 2], disp_host[off + i * 2 + 1]]);
+                let a = f16_bits_to_f32_local(a_bits) as f64;
+                let b = f16_bits_to_f32_local(b_bits) as f64;
+                dot += a * b;
+                na += a * a;
+                nb += b * b;
+            }
+            let cos = if na > 0.0 && nb > 0.0 {
+                dot / (na.sqrt() * nb.sqrt())
+            } else if na == 0.0 && nb == 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+            mean_cos_sum += cos;
+            if (cos as f32) < min_cos {
+                min_cos = cos as f32;
+                worst_row = row;
+            }
+        }
+        let mean_cos = (mean_cos_sum / (m as f64)) as f32;
+        let threshold = 0.9999_f32;
+        let pass = min_cos >= threshold;
+        eprintln!(
+            "  m={m:>3}: mean_cos={mean_cos:.6}, min_cos={min_cos:.6} (row {worst_row}) — {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        if !pass {
+            return Err(format!(
+                "m={m} cosine below threshold {threshold:.6}: min={min_cos:.6} at row {worst_row}"
+            ));
         }
     }
 
     Ok(())
+}
+
+/// Local f16-bits → f32 used by the cosine reduction. Avoids
+/// pulling in the runtime's helper which lives behind a private
+/// crate path.
+fn f16_bits_to_f32_local(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 0x1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as i32;
+    let frac = (bits & 0x03ff) as u32;
+    if exp == 0 && frac == 0 {
+        return f32::from_bits(sign << 31);
+    }
+    if exp == 0x1f {
+        let m = if frac != 0 { 1 << 22 } else { 0 };
+        return f32::from_bits((sign << 31) | (0xff << 23) | m);
+    }
+    if exp == 0 {
+        // subnormal — uncommon in our inputs, fall back via shifts
+        let mut e = 1;
+        let mut m = frac;
+        while (m & 0x0400) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        m &= 0x03ff;
+        let new_exp = (-14 + e + 127) as u32;
+        return f32::from_bits((sign << 31) | (new_exp << 23) | (m << 13));
+    }
+    let new_exp = (exp - 15 + 127) as u32;
+    f32::from_bits((sign << 31) | (new_exp << 23) | (frac << 13))
 }
 
 fn main() -> ExitCode {

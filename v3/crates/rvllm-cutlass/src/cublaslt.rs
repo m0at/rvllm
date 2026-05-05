@@ -156,6 +156,42 @@ impl CublasLt {
         self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, 0, stream, false, 2, Some(b_channelscale))
     }
 
+    /// Blockwise FP8 matmul: D_f16 = A_fp8 * B_fp8^T, with
+    /// activation scales per 128-K-block (mode VEC128_32F = 4) and
+    /// weight scales per 128×128 block (mode BLK128x128_32F = 5).
+    /// Used by Qwen 3.6's batched-prefill projections — the
+    /// activation gets quantised on the fly into [M, K/128] f32
+    /// scales by `fp8_quantize_per_token_f16`, and the weight ships
+    /// its existing `[N/128, K/128]` row-major blockscale tensor
+    /// untouched.
+    ///
+    /// Mirrors `fp8_gemm` end-to-end except for the two scale modes
+    /// it sets on the matmul descriptor.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fp8_gemm_blockwise(
+        &self,
+        a_fp8: u64,
+        b_fp8: u64,
+        d_f16: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_scale_vec128: u64,
+        b_scale_blk128x128: u64,
+        stream: u64,
+    ) -> Result<()> {
+        // Use the same fp8_gemm_inner as the scalar path, then patch
+        // the descriptor's scale modes by reusing the OUTER_VEC_32F
+        // attribute machinery. Easier: extend `fp8_gemm_inner` with a
+        // dedicated mode pair instead of trying to flip them after
+        // the fact.
+        self.fp8_gemm_inner_blockwise(
+            a_fp8, b_fp8, d_f16, m, n, k,
+            a_scale_vec128, b_scale_blk128x128, stream,
+        )
+    }
+
     /// F16 x F16 matmul with F32 output: D_f32 = A_f16 * B_f16^T.
     /// No FP8, no scale pointers. Used for lm_head where FP8 quantization
     /// destroys the weight distribution.
@@ -974,6 +1010,153 @@ impl CublasLt {
             }
         }
 
+        Ok(())
+    }
+
+    /// Blockwise sibling of `fp8_gemm_inner` — sets the FP8 scale
+    /// modes to `VEC128_32F` (A) and `BLK128x128_32F` (B). No
+    /// bias, no residual, f16 output. Used by Qwen 3.6's
+    /// batched-prefill projections; the activation-side scale is
+    /// produced by `fp8_quantize_per_token_f16` and the weight-side
+    /// scale is the existing `[N/128, K/128]` row-major blockscale
+    /// shipped with the checkpoint.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fp8_gemm_inner_blockwise(
+        &self,
+        a_fp8: u64,
+        b_fp8: u64,
+        d_f16: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_scale_vec128: u64,
+        b_scale_blk128x128: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
+        let rc = lt::cublasLtMatmulDescCreate(
+            &mut desc,
+            lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            lt::cudaDataType_t::CUDA_R_32F,
+        );
+        if rc != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("cublasLtMatmulDescCreate(blockwise)"));
+        }
+        let transa: i32 = 1; // T (cuBLAS A := our weight)
+        let transb: i32 = 0; // N (cuBLAS B := our activation)
+        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+            &transa as *const _ as *const _, std::mem::size_of_val(&transa))?;
+        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+            &transb as *const _ as *const _, std::mem::size_of_val(&transb))?;
+
+        // TN swap (matches `fp8_gemm_inner`):
+        //   cuBLAS A_SCALE_POINTER := our WEIGHT scale (b_scale_blk128x128)
+        //   cuBLAS B_SCALE_POINTER := our ACTIVATION scale (a_scale_vec128)
+        // Mode bytes:
+        //   A_SCALE_MODE = 5 (BLK128x128_32F) for the weight
+        //   B_SCALE_MODE = 4 (VEC128_32F)     for the activation
+        set_attr(desc,
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            &b_scale_blk128x128 as *const _ as *const _,
+            std::mem::size_of_val(&b_scale_blk128x128))?;
+        set_attr(desc,
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            &a_scale_vec128 as *const _ as *const _,
+            std::mem::size_of_val(&a_scale_vec128))?;
+
+        let attr_a_scale_mode: u32 = 31; // CUBLASLT_MATMUL_DESC_A_SCALE_MODE
+        let attr_b_scale_mode: u32 = 32; // CUBLASLT_MATMUL_DESC_B_SCALE_MODE
+        let mode_a: u32 = 5; // BLK128x128_32F
+        let mode_b: u32 = 4; // VEC128_32F
+        set_attr(
+            desc,
+            std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(attr_a_scale_mode),
+            &mode_a as *const _ as *const _,
+            std::mem::size_of_val(&mode_a),
+        )?;
+        set_attr(
+            desc,
+            std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(attr_b_scale_mode),
+            &mode_b as *const _ as *const _,
+            std::mem::size_of_val(&mode_b),
+        )?;
+
+        let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut layout_d: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_a,
+            lt::cudaDataType_t::CUDA_R_8F_E4M3, k as u64, n as u64, k as i64);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("layout A(blockwise)"));
+        }
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_b,
+            lt::cudaDataType_t::CUDA_R_8F_E4M3, k as u64, m as u64, k as i64);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("layout B(blockwise)"));
+        }
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_d,
+            lt::cudaDataType_t::CUDA_R_16F, n as u64, m as u64, n as i64);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("layout D(blockwise)"));
+        }
+
+        // Algo cache key — `kind=50 + scale_mode_combo` keeps the
+        // blockwise cache distinct from the scalar / channelscale
+        // entries.
+        let key = AlgoKey { m, n, k, kind: 50, ..Default::default() };
+        let cached_algo = self.algo_cache.lock().ok().and_then(|c| c.get(&key).copied());
+        let algo = if let Some(a) = cached_algo { a } else {
+            let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+            let r = lt::cublasLtMatmulPreferenceCreate(&mut pref);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(cublaslt_err("pref create(blockwise)"));
+            }
+            let ws_bytes = self.workspace_bytes;
+            lt::cublasLtMatmulPreferenceSetAttribute(pref,
+                lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws_bytes as *const _ as *const _, std::mem::size_of::<usize>());
+            let mut heur: [lt::cublasLtMatmulHeuristicResult_t; 1] = std::mem::zeroed();
+            let mut ret: i32 = 0;
+            let r = lt::cublasLtMatmulAlgoGetHeuristic(
+                self.handle, desc, layout_a, layout_b, layout_d, layout_d,
+                pref, 1, heur.as_mut_ptr(), &mut ret);
+            lt::cublasLtMatmulPreferenceDestroy(pref);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
+                return Err(cublaslt_err("heuristic(blockwise) — \
+                     cuBLASLt does not have a kernel for this (M,N,K) under \
+                     blockwise scale modes; fall back to looped m=1 GEMV"));
+            }
+            let best = heur[0].algo;
+            if let Ok(mut c) = self.algo_cache.lock() {
+                c.insert(key, best);
+            }
+            best
+        };
+
+        let one: f32 = 1.0;
+        let zero: f32 = 0.0;
+        let r = lt::cublasLtMatmul(
+            self.handle, desc,
+            &one as *const _ as *const _,
+            b_fp8 as *const _, layout_a,
+            a_fp8 as *const _, layout_b,
+            &zero as *const _ as *const _,
+            d_f16 as *const _, layout_d,
+            d_f16 as *mut _, layout_d,
+            &algo,
+            self.workspace as *mut _, self.workspace_bytes,
+            stream as _,
+        );
+
+        lt::cublasLtMatrixLayoutDestroy(layout_d);
+        lt::cublasLtMatrixLayoutDestroy(layout_b);
+        lt::cublasLtMatrixLayoutDestroy(layout_a);
+        lt::cublasLtMatmulDescDestroy(desc);
+
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("cublasLtMatmul(blockwise)"));
+        }
         Ok(())
     }
 }

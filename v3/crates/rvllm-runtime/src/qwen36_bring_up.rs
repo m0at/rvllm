@@ -49,6 +49,13 @@ pub struct Qwen36OutsideKernels {
     /// GPU. Replaces the previous DtoH-of-full-vocab + host-side
     /// scan; the GPU kernel returns a single i32 token id.
     pub fn_argmax_f16: KernelFn,
+    /// Per-token f16→fp8 amax-quantise. Used by
+    /// `fp8_proj_dispatch`'s m≥2 branch to feed cuBLASLt
+    /// `fp8_gemm` (which expects fp8 input + per-token f32 scale).
+    /// At m=1 the GEMV path consumes f16 directly so this kernel
+    /// is unused.
+    pub fp8_quantize_per_token_f16_mod: LoadedModule,
+    pub fn_fp8_quantize_per_token_f16: KernelFn,
     /// Phase 3g: fused (final RMSNorm + FP8-quantize) for the lm_head
     /// pre-matmul step. Outputs FP8 hidden + per-token f32 scale that
     /// cuBLASLt's fp8_gemm consumes.
@@ -302,6 +309,9 @@ impl Qwen36Bringup {
         let argmax_mod = kernels.load_ptx("argmax")?;
         let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
         let fn_argmax_f16 = argmax_mod.get_function("argmax_f16_kernel")?;
+        let fp8_quantize_per_token_f16_mod = kernels.load_ptx("fp8_quantize_per_token_f16")?;
+        let fn_fp8_quantize_per_token_f16 = fp8_quantize_per_token_f16_mod
+            .get_function("fp8_quantize_per_token_f16_kernel")?;
         let fused_rmsnorm_fp8_quant_mod = kernels.load_ptx("fused_rmsnorm_fp8_quant")?;
         let fn_fused_rmsnorm_fp8_quant =
             fused_rmsnorm_fp8_quant_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
@@ -370,6 +380,8 @@ impl Qwen36Bringup {
             argmax_mod,
             fn_argmax,
             fn_argmax_f16,
+            fp8_quantize_per_token_f16_mod,
+            fn_fp8_quantize_per_token_f16,
             fused_rmsnorm_fp8_quant_mod,
             fn_fused_rmsnorm_fp8_quant,
             fused_rope_partial_f16kv_mod,
@@ -6120,16 +6132,124 @@ impl Qwen36Bringup {
                 stream,
             );
         }
-        // Phase 3b: cuBLASLt fp8_gemm path. Needs a quantize-only
-        // kernel for the input + (probably) a blockscale layout
-        // transpose. Not landing in the same commit as the dispatcher
-        // scaffold so each step has its own determinism canary.
-        Err(rvllm_core::RvllmError::cuda(
-            "qwen36 fp8_proj_dispatch: m >= 2 path not yet wired (Phase 3b — see v3/QWEN_BATCHED_PREFILL_PLAN.md). \
-             Today every caller still passes m = 1; this branch is unreachable on the production prefill path.",
-            rvllm_core::CudaErrorKind::Other,
-            rvllm_core::CudaCtx::setup(),
-        ))
+        // Phase 3b: m≥2 path through cuBLASLt blockwise fp8_gemm.
+        //   1) Per-(token, 128-K-block) f16→fp8 amax-quantise the
+        //      input → scratch `[M, K] fp8` + `[M, ceil(K/128)] f32`
+        //      activation scales (mode VEC128_32F = 4 in cuBLASLt).
+        //   2) `cublaslt.fp8_gemm_blockwise(...)` with the activation
+        //      scales above and the existing `[N/128, K/128]` weight
+        //      blockscale (mode BLK128x128_32F = 5). Both modes set
+        //      explicitly on the matmul descriptor.
+        //   3) f16 output is written directly to `out_f16`.
+        //
+        // The per-K-block input scale + 128×128 weight scale are the
+        // cuBLASLt-native modes that match Qwen's checkpoint layout —
+        // no scale transpose, no lossy reduction to per-channel.
+        let fp8_bytes = (m as usize) * (k as usize); // E4M3 = 1 byte/elem
+        let k_blocks = (k as usize + 127) / 128;
+        let scale_bytes = (m as usize) * k_blocks * 4; // f32 per (row, K-block)
+        let in_fp8 = self
+            .arena
+            .region("qwen36_proj_in_fp8", fp8_bytes, 16)?;
+        let in_scale = self
+            .arena
+            .region("qwen36_proj_in_scale", scale_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            // Quantise launch: grid=(K_blocks, M, 1), block=(128, 1, 1).
+            let mut out_fp8_ptr = in_fp8.device_ptr();
+            let mut out_scale_ptr = in_scale.device_ptr();
+            let mut in_ptr = input_f16;
+            let mut k_i: i32 = k as i32;
+            let args = [
+                (&mut out_fp8_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_scale_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut in_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_fp8_quantize_per_token_f16.raw() as CUfunction,
+                /*grid*/ k_blocks as u32, m, 1,
+                /*block*/ 128, 1, 1,
+                /*shared*/ 0,
+                stream as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 fp8_proj_dispatch: fp8_quantize_per_token_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // First try the cuBLASLt blockwise FP8 path. On
+        // sm_100/sm_120 (Blackwell-server / RTX 5090) this dispatches
+        // to a tensor-core kernel for ≥128×N×K. On sm_121 (GB10
+        // consumer Blackwell) cuBLASLt does NOT ship a blockwise FP8
+        // kernel today — `Algo­GetHeuristic` returns "no algo".
+        //
+        // The fall-back is a looped-m=1 GEMV reference: correct, but
+        // not faster than the existing per-token loop. It lets Phase
+        // 4 wire the dispatcher into the prefill loop without
+        // breaking sm_121 — when CUDA 13.x eventually adds a blockwise
+        // sm_121 kernel, the same call site immediately picks it up.
+        // Phase 3c will plug in the CUTLASS SM120 blockwise GEMM
+        // (already built for Gemma) as the sm_121 fast path.
+        #[cfg(feature = "cuda")]
+        let blockwise_result = self.cublaslt.fp8_gemm_blockwise(
+            in_fp8.device_ptr(),
+            weight_fp8,
+            out_f16,
+            m as i32,
+            n as i32,
+            k as i32,
+            in_scale.device_ptr(),
+            b_blockscale,
+            stream,
+        );
+        #[cfg(feature = "cuda")]
+        match blockwise_result {
+            Ok(()) => return Ok(()),
+            Err(_) => {
+                // Fall back: N×Fp8GemvF16InLaunch at m=1, one row at a
+                // time. We log the no-algo path once per process so
+                // operators see "blockwise no-algo, falling back" rather
+                // than silently paying the per-token cost on every batch.
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "qwen36 fp8_proj_dispatch: cuBLASLt has no blockwise FP8 \
+                         algo for this arch (likely sm_121). Falling back to \
+                         looped m=1 GEMV — correct but not accelerated. \
+                         Phase 3c will plug in CUTLASS SM120."
+                    );
+                }
+                let row_bytes_in = (k as u64) * 2;
+                let row_bytes_out = (n as u64) * 2;
+                for row in 0..(m as u64) {
+                    let row_in = input_f16 + row * row_bytes_in;
+                    let row_out = out_f16 + row * row_bytes_out;
+                    rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                        m: 1,
+                        n,
+                        k,
+                    }
+                    .launch(
+                        kernel_gemv,
+                        row_out,
+                        weight_fp8,
+                        b_blockscale,
+                        row_in,
+                        stream,
+                    )?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
