@@ -4388,18 +4388,15 @@ impl Qwen36Bringup {
             self.stream.fence()?;
         }
 
-        // 2. Set up last_hidden_region (the only buffer the per-layer
-        //    chain operates on). Each linear-attn layer reads from
-        //    last_hidden_region and writes the residual back into it,
-        //    so layer N+1 sees layer N's output.
-        // Hard-fail when the FP8 GEMV kernel is missing. The previous
-        // silent fallback to `forward_qwen36_outside_closer` skipped
-        // ALL 40 transformer layers (only embed → final-norm → lm_head)
-        // and produced syntactically plausible but semantically garbage
-        // output, indistinguishable from a successful response on the
-        // wire. Hard erroring keeps the server honest: an operator with
-        // a broken kernel build sees the failure at the first request,
-        // not days later when "the model got dumber."
+        // 2. Resolve the FP8 GEMV kernel. Hard-fail when missing —
+        // the previous silent fallback to `forward_qwen36_outside_
+        // closer` skipped ALL 40 transformer layers (only embed →
+        // final-norm → lm_head) and produced syntactically plausible
+        // but semantically garbage output, indistinguishable from a
+        // successful response on the wire. Hard erroring keeps the
+        // server honest: an operator with a broken kernel build
+        // sees the failure at the first request, not days later
+        // when "the model got dumber."
         let kernel_gemv = self.outside_kernels.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| {
             rvllm_core::RvllmError::cuda(
                 "qwen36 forward: fn_fp8_gemv_wpr_native_f16in not loaded — \
@@ -4409,13 +4406,15 @@ impl Qwen36Bringup {
                 rvllm_core::CudaCtx::setup(),
             )
         })?;
-
-        let last_hidden_region =
-            self.arena.region("qwen36_pl_last", last_hidden_bytes, 16)?;
+        // Phase 1 of the batched-prefill plan: the per-token slot
+        // is now read/written through `tok_ptr = hidden_region +
+        // tok_local × hidden_bytes` directly. The previous
+        // `last_hidden_region` scratch buffer + DtoD shuttle in/out
+        // are gone; layer functions take `last_hidden_ptr: u64`.
 
         // Phase 5b: outer per-token loop. For each prompt token in
-        // order: extract its embed from hidden_region into
-        // last_hidden_region, run all 40 layers (linear-attn updates
+        // order: pass its slot pointer through all 40 layers
+        // (linear-attn updates
         // its persistent state, full-attn writes K/V at slot=position
         // and attends causally over [0..position]), apply MoE, write
         // updated hidden back to hidden_region's slot for the closer.
@@ -4435,32 +4434,14 @@ impl Qwen36Bringup {
         // refactor; tracked as Codex round 16 #2 follow-up.
         for tok_local in 0..num_tokens {
             let tok_pos = start_position + tok_local;
-            // Extract token tok_local's hidden into last_hidden_region.
-            // No fence needed after the DtoD enqueue — the layer
-            // chain below runs on the same CUDA stream and stream
-            // ordering guarantees the copy completes before any
-            // subsequent kernel observes the buffer. Pre-fix, every
-            // prefill token paid an extra host↔device round-trip
-            // for a stream.fence that wasn't actually synchronising
-            // anything cross-stream.
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let off = (tok_local as u64) * (last_hidden_bytes as u64);
-                let r = cuMemcpyDtoDAsync_v2(
-                    last_hidden_region.device_ptr(),
-                    hidden_region.device_ptr() + off,
-                    last_hidden_bytes,
-                    self.stream.raw() as _,
-                );
-                if r != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 per-token DtoDAsync (extract)",
-                        rvllm_core::CudaErrorKind::MemcpyFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
-                }
-            }
+            // Phase 1 of the Qwen batched-prefill plan: the layer
+            // functions now accept a raw device pointer to the
+            // per-token slot in `hidden_region`. The previous
+            // DtoD-extract (`hidden_region[off]` → `last_hidden_region`)
+            // and DtoD-writeback are gone — `apply_layer_*` reads and
+            // writes through `tok_ptr` directly, eliminating two
+            // launches per token.
+            let tok_ptr = hidden_region.device_ptr() + (tok_local as u64) * (last_hidden_bytes as u64);
 
             // Phase 5e: optional per-layer activation dump for
             // numerical-correctness audit vs vLLM. Set
@@ -4485,7 +4466,7 @@ impl Qwen36Bringup {
                         use cudarc::driver::sys::*;
                         let _ = cuMemcpyDtoH_v2(
                             buf.as_mut_ptr() as *mut _,
-                            last_hidden_region.device_ptr(),
+                            tok_ptr,
                             last_hidden_bytes,
                         );
                     }
@@ -4499,7 +4480,7 @@ impl Qwen36Bringup {
                 let post_attn_norm_ptr = match &self.model.layers[layer_idx].attn {
                     rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(la) => {
                         self.apply_layer_linear_attn(
-                            la, linear_seq, &last_hidden_region,
+                            la, linear_seq, tok_ptr,
                             kernel_gemv, hidden, last_hidden_bytes,
                         )?;
                         linear_seq += 1;
@@ -4508,7 +4489,7 @@ impl Qwen36Bringup {
                     rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(fl) => {
                         self.apply_layer_full_attn(
                             fl, full_seq, tok_pos,
-                            &last_hidden_region,
+                            tok_ptr,
                             kernel_gemv, hidden, last_hidden_bytes,
                         )?;
                         full_seq += 1;
@@ -4523,7 +4504,7 @@ impl Qwen36Bringup {
                         use cudarc::driver::sys::*;
                         let _ = cuMemcpyDtoH_v2(
                             buf.as_mut_ptr() as *mut _,
-                            last_hidden_region.device_ptr(),
+                            tok_ptr,
                             last_hidden_bytes,
                         );
                     }
@@ -4533,7 +4514,7 @@ impl Qwen36Bringup {
                 self.apply_layer_moe(
                     &self.model.layers[layer_idx].moe,
                     post_attn_norm_ptr,
-                    &last_hidden_region,
+                    tok_ptr,
                     kernel_gemv, hidden, last_hidden_bytes,
                 )?;
                 if dump_this_token {
@@ -4544,7 +4525,7 @@ impl Qwen36Bringup {
                         use cudarc::driver::sys::*;
                         let _ = cuMemcpyDtoH_v2(
                             buf.as_mut_ptr() as *mut _,
-                            last_hidden_region.device_ptr(),
+                            tok_ptr,
                             last_hidden_bytes,
                         );
                     }
@@ -4552,32 +4533,9 @@ impl Qwen36Bringup {
                         format!("{dir}/layer_{layer_idx:02}_moe.f16"), &buf);
                 }
             }
-
-            // Write this token's transformed hidden back to its slot
-            // in hidden_region. Only the last token's slot is read by
-            // the closer, but we write all so a future multi-token
-            // logit reader (training/eval path) just works.
-            // No fence — same-stream ordering guarantees the
-            // following iteration's DtoD-extract sees the final
-            // value.
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let off = (tok_local as u64) * (last_hidden_bytes as u64);
-                let r = cuMemcpyDtoDAsync_v2(
-                    hidden_region.device_ptr() + off,
-                    last_hidden_region.device_ptr(),
-                    last_hidden_bytes,
-                    self.stream.raw() as _,
-                );
-                if r != CUresult::CUDA_SUCCESS {
-                    return Err(rvllm_core::RvllmError::cuda(
-                        "qwen36 per-token DtoDAsync (writeback)",
-                        rvllm_core::CudaErrorKind::MemcpyFailed,
-                        rvllm_core::CudaCtx::setup(),
-                    ));
-                }
-            }
+            // No DtoD writeback needed: the layer functions wrote
+            // their final residual directly into `tok_ptr`, which
+            // already points at the destination slot in hidden_region.
         }
         // Single fence at end of prefill so the closer's read of the
         // last hidden slot sees finalised values (host probes /
@@ -4632,11 +4590,17 @@ impl Qwen36Bringup {
     ///  12. out_proj FP8 GEMV → o_buf [hidden]
     ///  13. Host residual sum → write back to last_hidden_region
     #[allow(clippy::too_many_arguments)]
+    /// `last_hidden_ptr`: device pointer to the (single-token, for now)
+    /// hidden slot this layer reads from and writes back into. Phase 1
+    /// (Qwen batched-prefill plan) replaced an `&Region` parameter
+    /// here so the prefill loop can pass an offset into the larger
+    /// `hidden_region` directly — no per-token DtoD shuttle. See
+    /// `v3/QWEN_BATCHED_PREFILL_PLAN.md`.
     fn apply_layer_linear_attn(
         &self,
         la: &rvllm_loader::qwen36_weights::Qwen36LinearAttnLayer,
         linear_seq_idx: u32,
-        last_hidden_region: &rvllm_mem::Region<'_>,
+        last_hidden_ptr: u64,
         kernel_gemv: rvllm_kernels::KernelFn,
         hidden: u32,
         last_hidden_bytes: usize,
@@ -4672,7 +4636,7 @@ impl Qwen36Bringup {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoDAsync_v2(
                 normed_region.device_ptr(),
-                last_hidden_region.device_ptr(),
+                last_hidden_ptr,
                 last_hidden_bytes,
                 self.stream.raw() as _,
             );
@@ -5076,7 +5040,7 @@ impl Qwen36Bringup {
         unsafe {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoH_v2(last_hidden_host.as_mut_ptr() as *mut _,
-                last_hidden_region.device_ptr(), last_hidden_bytes);
+                last_hidden_ptr, last_hidden_bytes);
             let _ = cuMemcpyDtoH_v2(out_host.as_mut_ptr() as *mut _,
                 out_region.device_ptr(), out_host.len());
         }
@@ -5090,7 +5054,26 @@ impl Qwen36Bringup {
             ]));
             residual.extend_from_slice(&f32_to_f16_bits(h + o).to_le_bytes());
         }
-        unsafe { last_hidden_region.copy_from_host(&residual)? };
+        // Was: `last_hidden_region.copy_from_host(&residual)` (sync
+        // HtoD via the Region method). We don't have an `&Region` any
+        // more — the prefill loop passes the per-token slot pointer
+        // directly — so issue the same sync HtoD by hand.
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyHtoD_v2(
+                last_hidden_ptr,
+                residual.as_ptr() as *const _,
+                residual.len(),
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 linear_attn residual writeback HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         self.stream.fence()?;
         Ok(())
     }
@@ -5102,12 +5085,14 @@ impl Qwen36Bringup {
     /// context_len=position+1 (causal) → sigmoid_mul gate → o_proj →
     /// residual sum into last_hidden.
     #[allow(clippy::too_many_arguments)]
+    /// `last_hidden_ptr`: see `apply_layer_linear_attn` doc — same
+    /// Phase-1 contract.
     fn apply_layer_full_attn(
         &self,
         fl: &rvllm_loader::qwen36_weights::Qwen36FullAttnLayer,
         full_seq_idx: u32,
         position: u32,
-        last_hidden_region: &rvllm_mem::Region<'_>,
+        last_hidden_ptr: u64,
         kernel_gemv: rvllm_kernels::KernelFn,
         hidden: u32,
         last_hidden_bytes: usize,
@@ -5135,7 +5120,7 @@ impl Qwen36Bringup {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoDAsync_v2(
                 normed_region.device_ptr(),
-                last_hidden_region.device_ptr(),
+                last_hidden_ptr,
                 last_hidden_bytes,
                 self.stream.raw() as _,
             );
@@ -5476,7 +5461,7 @@ impl Qwen36Bringup {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoH_v2(
                 last_hidden_host.as_mut_ptr() as *mut _,
-                last_hidden_region.device_ptr(),
+                last_hidden_ptr,
                 last_hidden_bytes,
             );
             let _ = cuMemcpyDtoH_v2(
@@ -5495,7 +5480,23 @@ impl Qwen36Bringup {
             ]));
             residual.extend_from_slice(&f32_to_f16_bits(h + o).to_le_bytes());
         }
-        unsafe { last_hidden_region.copy_from_host(&residual)? };
+        // Sync HtoD into the per-token slot (was Region::copy_from_host).
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyHtoD_v2(
+                last_hidden_ptr,
+                residual.as_ptr() as *const _,
+                residual.len(),
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn residual writeback HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         self.stream.fence()?;
         Ok(())
     }
@@ -5512,7 +5513,7 @@ impl Qwen36Bringup {
         &self,
         moe: &rvllm_loader::qwen36_weights::Qwen36MoeBlock,
         post_attn_norm_ptr: u64,
-        last_hidden_region: &rvllm_mem::Region<'_>,
+        last_hidden_ptr: u64,
         kernel_gemv: rvllm_kernels::KernelFn,
         hidden: u32,
         last_hidden_bytes: usize,
@@ -5534,7 +5535,7 @@ impl Qwen36Bringup {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoDAsync_v2(
                 normed_region.device_ptr(),
-                last_hidden_region.device_ptr(),
+                last_hidden_ptr,
                 last_hidden_bytes,
                 self.stream.raw() as _,
             );
@@ -5771,7 +5772,7 @@ impl Qwen36Bringup {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoH_v2(
                 last_hidden_host.as_mut_ptr() as *mut _,
-                last_hidden_region.device_ptr(),
+                last_hidden_ptr,
                 last_hidden_bytes,
             );
         }
@@ -5783,7 +5784,23 @@ impl Qwen36Bringup {
             let m = routed_sum[i];
             residual.extend_from_slice(&f32_to_f16_bits(h + m).to_le_bytes());
         }
-        unsafe { last_hidden_region.copy_from_host(&residual)? };
+        // Sync HtoD into the per-token slot (was Region::copy_from_host).
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyHtoD_v2(
+                last_hidden_ptr,
+                residual.as_ptr() as *const _,
+                residual.len(),
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 moe residual writeback HtoD",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         self.stream.fence()?;
         Ok(())
     }
