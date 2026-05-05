@@ -434,7 +434,7 @@ pub async fn spawn_cuda_worker(
         .map_err(|e| ApiError::Internal(format!("spawn cuda worker: {e}")))?;
 
     match ready_rx.await {
-        Ok(Ok(())) => Ok((WorkerHandle::new(req_tx), join)),
+        Ok(Ok(())) => Ok((WorkerHandle::new(req_tx, cfg.queue_depth.max(1)), join)),
         Ok(Err(msg)) => Err(ApiError::Internal(msg)),
         Err(_) => Err(ApiError::Internal(
             "cuda worker thread exited before signalling ready".into(),

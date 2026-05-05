@@ -445,11 +445,14 @@ pub async fn chat_completions(
     // Calling it on the axum executor would block one Tokio worker
     // thread per request and starve the rest of the server. Codex
     // review #1 (round 4) caught this.
-    // Cheap admission pre-flight: short-circuit before image fetch +
-    // template render if the worker queue is already full. Otherwise
-    // a saturating client can keep the blocking pool, network and
-    // memory busy producing 429-bound requests.
-    state.worker.check_admission()?;
+    // Reserve one in-flight slot BEFORE doing any per-request work
+    // (image fetch, chat-template render). The permit is held until
+    // the handler returns so the queue limit covers the full
+    // request lifecycle, not just the worker queue. A saturating
+    // client now gets 429 immediately instead of being able to keep
+    // the blocking pool, network and memory busy producing
+    // ultimately-doomed requests in parallel.
+    let _admission = state.worker.try_admit()?;
 
     let vision_items = {
         let arch = state.vision_arch;
@@ -508,6 +511,8 @@ pub async fn chat_completions(
 
     if req.stream {
         // Cycle 37: stream+stop rejection lifted to pre-tokenize above.
+        // Hand the admission permit to the stream so it lives as long
+        // as the SSE response, not just the handler scope.
         Ok(ChatCompletionsResponse::Stream(chat_stream_sse(
             model_id,
             tokenizer,
@@ -516,6 +521,7 @@ pub async fn chat_completions(
             state.config.sse_keepalive,
             request_timeout,
             request_id,
+            Some(_admission),
         )))
     } else {
         let _cancel_guard = CancelOnDrop(cancelled.clone());
@@ -805,6 +811,13 @@ fn chat_stream_sse(
     keepalive: std::time::Duration,
     request_timeout: std::time::Duration,
     request_id: Uuid,
+    // Held inside the stream so the worker admission slot is only
+    // released when the stream ends (Done, Error, client disconnect,
+    // or timeout). Dropping the permit early — e.g. the moment the
+    // handler returns the Sse response — would let new requests pass
+    // try_admit while the previous request is still actively running
+    // on the worker.
+    admission: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> axum::response::Response {
     let id = new_chat_completion_id();
     let created = unix_now_secs();
@@ -877,6 +890,10 @@ fn chat_stream_sse(
         cancelled: Arc<AtomicBool>,
         deadline: tokio::time::Instant,
         request_id: Uuid,
+        // Released on Drop together with the rest of the Ctx — i.e.
+        // when the stream ends or the client disconnects. Marked
+        // `_` because it is only here for its lifetime.
+        _admission: Option<tokio::sync::OwnedSemaphorePermit>,
     }
 
     impl Drop for Ctx {
@@ -903,6 +920,7 @@ fn chat_stream_sse(
         cancelled,
         deadline,
         request_id,
+        _admission: admission,
     };
     let _ = tokenizer; // keep for clone clarity
 
@@ -1490,8 +1508,8 @@ pub async fn completions(
         ));
     }
 
-    // Cheap admission pre-flight before tokenization (see chat handler).
-    state.worker.check_admission()?;
+    // Reserve one in-flight slot before tokenization (see chat handler).
+    let _admission = state.worker.try_admit()?;
 
     let prompt_ids = state.tokenizer.encode(&prompt_text)?;
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
@@ -1526,6 +1544,7 @@ pub async fn completions(
             cancelled,
             state.config.sse_keepalive,
             request_timeout,
+            Some(_admission),
         )))
     } else {
         let _cancel_guard = CancelOnDrop(cancelled.clone());
@@ -1650,6 +1669,9 @@ fn completion_stream_sse(
     cancelled: Arc<AtomicBool>,
     keepalive: std::time::Duration,
     request_timeout: std::time::Duration,
+    // See chat_stream_sse: the permit lives inside the stream so it
+    // is released only when the SSE response ends.
+    admission: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> axum::response::Response {
     let id = new_completion_id();
     let created = unix_now_secs();
@@ -1677,6 +1699,7 @@ fn completion_stream_sse(
         model: String,
         cancelled: Arc<AtomicBool>,
         deadline: tokio::time::Instant,
+        _admission: Option<tokio::sync::OwnedSemaphorePermit>,
     }
 
     impl Drop for Ctx {
@@ -1692,6 +1715,7 @@ fn completion_stream_sse(
         model: model_id,
         cancelled,
         deadline,
+        _admission: admission,
     };
 
     let stream = stream::unfold(ctx, |mut ctx| async move {

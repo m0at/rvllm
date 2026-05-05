@@ -31,12 +31,26 @@ pub struct BatchPlan<'s> {
 
 impl<'s> BatchPlan<'s> {
     /// Sanity-check that the plan fits the layout's bucket.
+    ///
+    /// Checks that `num_seqs` fits the bucket, that every per-seq
+    /// slice has exactly `num_seqs` elements, that the block table
+    /// has at least `num_seqs * max_blocks_input` entries (`upload`
+    /// will slice into it), that `seq_start_pos` has the expected
+    /// `num_seqs + 1` entries, and that `max_blocks_input` fits the
+    /// layout. Without the block-table-length and seq-start-pos
+    /// checks the slicing inside `upload` could panic on an
+    /// inconsistent internal plan instead of returning a typed
+    /// error to the caller.
     pub fn fits_layout(&self, layout: &crate::layout::MetadataLayout) -> bool {
+        let n = self.num_seqs as usize;
+        let needed_block_entries = n.saturating_mul(self.max_blocks_input as usize);
         self.num_seqs <= layout.bucket
-            && self.token_ids.len() == self.num_seqs as usize
-            && self.positions.len() == self.num_seqs as usize
-            && self.context_lens.len() == self.num_seqs as usize
-            && self.slot_mapping.len() == self.num_seqs as usize
+            && self.token_ids.len() == n
+            && self.positions.len() == n
+            && self.context_lens.len() == n
+            && self.slot_mapping.len() == n
+            && self.seq_start_pos.len() == n + 1
+            && self.block_tables_flat.len() >= needed_block_entries
             && self.max_blocks_input <= layout.max_blocks
     }
 }

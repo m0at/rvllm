@@ -62,17 +62,34 @@ pub enum GenerateEvent {
 }
 
 /// Handle held by the tokio side. Cheap to clone — just wraps an
-/// `mpsc::Sender`.
+/// `mpsc::Sender` and an admission semaphore.
 #[derive(Clone)]
 pub struct WorkerHandle {
     submit: mpsc::Sender<GenerateRequest>,
+    /// Bounds total in-flight requests across the entire request
+    /// lifecycle (image fetch + tokenize + queued + running). The
+    /// permit count equals the worker's queue depth. Handlers call
+    /// [`Self::try_admit`] BEFORE doing any expensive per-request
+    /// work and hold the returned permit for the rest of the
+    /// handler scope; the permit is released on Drop. Without this
+    /// reservation, a saturating client could pass a capacity-
+    /// only `check_admission` in parallel and burn the blocking
+    /// pool producing 429-bound requests before `submit` rejects.
+    admission: Arc<tokio::sync::Semaphore>,
 }
 
 impl WorkerHandle {
-    /// Construct from an already-created `mpsc::Sender`. Used by the
-    /// worker-spawn helpers (mock + cuda).
-    pub(crate) fn new(submit: mpsc::Sender<GenerateRequest>) -> Self {
-        Self { submit }
+    /// Construct from an already-created `mpsc::Sender` plus the
+    /// admission permit count. Used by the worker-spawn helpers
+    /// (mock + cuda).
+    pub(crate) fn new(
+        submit: mpsc::Sender<GenerateRequest>,
+        admission_permits: usize,
+    ) -> Self {
+        Self {
+            submit,
+            admission: Arc::new(tokio::sync::Semaphore::new(admission_permits)),
+        }
     }
 
     /// True if the worker thread is still alive (the receive side of
@@ -84,27 +101,25 @@ impl WorkerHandle {
         !self.submit.is_closed()
     }
 
-    /// Cheap pre-flight admission check. Returns `Err(Busy)` /
-    /// `Err(Unavailable)` if a `submit` would fail right now, without
-    /// actually enqueuing anything. Used by handlers to short-circuit
-    /// expensive work (image fetch, full chat-template render) when
-    /// the queue is already full so a saturating client can't keep
-    /// the blocking pool / network busy producing requests that will
-    /// 429 anyway.
+    /// Reserve one in-flight slot before doing any per-request
+    /// work. Returns an `OwnedSemaphorePermit` that releases the
+    /// slot on Drop, so the caller just keeps it in scope for the
+    /// handler's lifetime. Burst arrivals that would exceed the
+    /// admission permit count get `Err(Busy)` immediately,
+    /// without consuming the blocking pool or network.
     ///
-    /// Race-free w.r.t. the bounded `mpsc` channel's queue depth:
-    /// `capacity()` returns the number of free slots at the call
-    /// instant. A subsequent `submit` may still race with concurrent
-    /// arrivals and end up `Busy` — that's fine, the goal here is
-    /// only to reject the obviously-doomed cases early.
-    pub fn check_admission(&self) -> Result<(), ApiError> {
+    /// Replaces the older capacity-only `check_admission`, which
+    /// did not actually reserve anything — multiple concurrent
+    /// requests could pass the check and only race for failure
+    /// at `submit` time, after the expensive fetch/tokenize work.
+    pub fn try_admit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
         if self.submit.is_closed() {
             return Err(ApiError::Unavailable("worker shut down".into()));
         }
-        if self.submit.capacity() == 0 {
-            return Err(ApiError::Busy("worker queue is full".into()));
-        }
-        Ok(())
+        self.admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::Busy("worker queue is full".into()))
     }
 
     /// Try to enqueue a request. Returns [`ApiError::Busy`] if the
@@ -150,7 +165,7 @@ pub fn spawn_mock_worker(
         .unwrap_or_else(|e| {
             panic!("failed to spawn mock worker thread: {e}");
         });
-    (WorkerHandle { submit: tx }, join)
+    (WorkerHandle::new(tx, queue_depth.max(1)), join)
 }
 
 /// Test-only: spawn a worker that emits a single `GenerateEvent::Error`
@@ -186,7 +201,7 @@ pub fn spawn_erroring_mock_worker(
         .unwrap_or_else(|e| {
             panic!("failed to spawn erroring-mock worker thread: {e}");
         });
-    (WorkerHandle { submit: tx }, join)
+    (WorkerHandle::new(tx, queue_depth.max(1)), join)
 }
 
 fn mock_run(req: GenerateRequest) {

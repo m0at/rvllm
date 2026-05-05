@@ -47,6 +47,26 @@ struct StreamChunk {
     choices: Vec<StreamChoice>,
 }
 
+/// Shape rvllm-serve uses when an SSE stream errors mid-flight.
+/// The handler emits one `data: {"error": {...}}` line and then
+/// `data: [DONE]`. Without parsing this we'd silently treat the
+/// failed generation as a successful empty completion.
+#[derive(Debug, Clone, Deserialize)]
+struct StreamErrorEnvelope {
+    error: StreamErrorBody,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StreamErrorBody {
+    message: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    code: Option<String>,
+    #[serde(default, rename = "type")]
+    #[allow(dead_code)]
+    kind: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Token(String),
@@ -133,6 +153,17 @@ async fn stream_inner(
                         tokens: token_count,
                         elapsed_secs: elapsed,
                     });
+                    return Ok(());
+                }
+
+                // Server-side SSE error envelope. Try this BEFORE
+                // StreamChunk so a CUDA / tokenizer / timeout failure
+                // surfaces as Error in the UI instead of vanishing
+                // (StreamChunk would silently fail to deserialize and
+                // the loop would emit nothing until [DONE] flagged
+                // success).
+                if let Ok(env) = serde_json::from_str::<StreamErrorEnvelope>(data) {
+                    let _ = tx.send(StreamEvent::Error(env.error.message));
                     return Ok(());
                 }
 
