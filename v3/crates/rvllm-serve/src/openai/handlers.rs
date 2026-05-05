@@ -2081,7 +2081,14 @@ fn collect_vision_items(
                 predict_gemma_num_tokens(w, h)
             } else {
                 predict_qwen_num_tokens(w, h)
-            };
+            }
+            .map_err(|e| {
+                ApiError::invalid_param(
+                    format!("messages[{mi}].image_url: {e}"),
+                    "messages",
+                    "image_predict_failed",
+                )
+            })?;
             total_bytes = total_bytes.saturating_add(bytes.len() as u64);
             total_tokens = total_tokens.saturating_add(num_tokens);
             if total_bytes > max_total_bytes {

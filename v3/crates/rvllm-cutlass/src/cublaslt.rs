@@ -21,13 +21,23 @@ use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 /// Key for the per-shape algorithm cache. Distinguishes plain / bias /
 /// residual dispatch because the matmul descriptor differs and cuBLASLt's
 /// heuristic returns different algos.
+///
+/// `lda/ldb/ldd/batch_count` matter because cuBLASLt's heuristic
+/// returns different algos for different layouts/strides, even at the
+/// same (m,n,k). Non-batched callers leave them at 0; batched-strided
+/// callers populate them so a (72,72,72,kind=22) call cannot collide
+/// with a different-layout (72,72,72,kind=22) elsewhere.
 #[cfg(feature = "cuda")]
-#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Default)]
 struct AlgoKey {
     m: i32,
     n: i32,
     k: i32,
     kind: u8,
+    lda: i64,
+    ldb: i64,
+    ldd: i64,
+    batch_count: i32,
 }
 
 pub struct CublasLt {
@@ -190,7 +200,7 @@ impl CublasLt {
             lt::cudaDataType_t::CUDA_R_32F, n as u64, m as u64, n as i64);
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout D(f16)")); }
 
-        let key = AlgoKey { m, n, k, kind: 20 };
+        let key = AlgoKey { m, n, k, kind: 20, ..Default::default() };
         let cached_algo = self.algo_cache.lock().ok().and_then(|c| c.get(&key).copied());
         let algo = if let Some(a) = cached_algo { a } else {
             let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -333,7 +343,11 @@ impl CublasLt {
         set_batch(layout_b, stride_a)?;  // layout_b holds a_f16
         set_batch(layout_d, stride_d)?;
 
-        let key = AlgoKey { m, n, k, kind: 22 };
+        let key = AlgoKey {
+            m, n, k, kind: 22,
+            lda: lda as i64, ldb: ldb as i64, ldd: ldd as i64,
+            batch_count,
+        };
         let cached_algo = self.algo_cache.lock().ok().and_then(|c| c.get(&key).copied());
         let algo = if let Some(a) = cached_algo { a } else {
             let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -429,7 +443,7 @@ impl CublasLt {
             lt::cudaDataType_t::CUDA_R_32F, n as u64, m as u64, n as i64);
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout D(bf16)")); }
 
-        let key = AlgoKey { m, n, k, kind: 21 };
+        let key = AlgoKey { m, n, k, kind: 21, ..Default::default() };
         let cached_algo = self.algo_cache.lock().ok().and_then(|c| c.get(&key).copied());
         let algo = if let Some(a) = cached_algo { a } else {
             let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -558,7 +572,11 @@ impl CublasLt {
         set_batch(layout_b, stride_a)?;
         set_batch(layout_d, stride_d)?;
 
-        let key = AlgoKey { m, n, k, kind: 23 };
+        let key = AlgoKey {
+            m, n, k, kind: 23,
+            lda: lda as i64, ldb: ldb as i64, ldd: ldd as i64,
+            batch_count,
+        };
         let cached_algo = self.algo_cache.lock().ok().and_then(|c| c.get(&key).copied());
         let algo = if let Some(a) = cached_algo { a } else {
             let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -795,6 +813,7 @@ impl CublasLt {
                 (_, false, _, true) => 40 + d_out_type,
                 (_, false, _, false) => 10 + d_out_type,
             },
+            ..Default::default()
         };
         let cached_algo = self
             .algo_cache

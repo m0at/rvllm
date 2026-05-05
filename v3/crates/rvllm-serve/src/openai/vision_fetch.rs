@@ -22,6 +22,7 @@ pub enum VisionError {
     TooLarge(usize, usize),
     BadDataUri(String),
     Decode(String),
+    Predict(String),
 }
 
 impl std::fmt::Display for VisionError {
@@ -32,6 +33,7 @@ impl std::fmt::Display for VisionError {
             Self::TooLarge(g, m) => write!(f, "image too large: {g} bytes (max {m})"),
             Self::BadDataUri(s) => write!(f, "bad data uri: {s}"),
             Self::Decode(s) => write!(f, "image header decode failed: {s}"),
+            Self::Predict(s) => write!(f, "vision-token prediction failed: {s}"),
         }
     }
 }
@@ -149,7 +151,7 @@ fn fetch_http(url: &str) -> Result<Vec<u8>, VisionError> {
 /// Predict vision-token count for Qwen 3.6 from image dims.
 /// Mirrors the `vision_preprocess::qwen_smart_resize` formula but
 /// without doing the actual resize.
-pub fn predict_qwen_num_tokens(width: u32, height: u32) -> usize {
+pub fn predict_qwen_num_tokens(width: u32, height: u32) -> Result<usize, VisionError> {
     use rvllm_runtime::vision_preprocess::{qwen_smart_resize, QwenPreprocessConfig};
     let cfg = QwenPreprocessConfig::default();
     let factor = cfg.patch_size * cfg.merge_size; // 32
@@ -160,24 +162,25 @@ pub fn predict_qwen_num_tokens(width: u32, height: u32) -> usize {
         cfg.min_pixels,
         cfg.max_pixels,
     )
-    .unwrap_or((factor, factor)); // tiny fallback
+    .map_err(|e| VisionError::Predict(format!("qwen_smart_resize({width}x{height}): {e:?}")))?;
     let grid_h = h_bar / cfg.patch_size;
     let grid_w = w_bar / cfg.patch_size;
     let merge_sq = (cfg.merge_size * cfg.merge_size) as u32;
-    ((grid_h * grid_w) / merge_sq) as usize
+    Ok(((grid_h * grid_w) / merge_sq) as usize)
 }
 
 /// Predict vision-token count for Gemma 4 from image dims.
 /// Mirrors `vision_preprocess::gemma_aspect_resize_dims`.
-pub fn predict_gemma_num_tokens(width: u32, height: u32) -> usize {
+pub fn predict_gemma_num_tokens(width: u32, height: u32) -> Result<usize, VisionError> {
     use rvllm_runtime::vision_preprocess::{gemma_aspect_resize_dims, GemmaPreprocessConfig};
     let cfg = GemmaPreprocessConfig::default();
-    let (target_h, target_w) =
-        gemma_aspect_resize_dims(height, width, &cfg).unwrap_or((cfg.patch_size, cfg.patch_size));
+    let (target_h, target_w) = gemma_aspect_resize_dims(height, width, &cfg).map_err(|e| {
+        VisionError::Predict(format!("gemma_aspect_resize_dims({width}x{height}): {e:?}"))
+    })?;
     let p = cfg.patch_size;
     let num_h = target_h / p;
     let num_w = target_w / p;
     let n_patches = (num_h * num_w) as usize;
     let k2 = (cfg.pooling_kernel_size * cfg.pooling_kernel_size) as usize;
-    n_patches / k2
+    Ok(n_patches / k2)
 }
