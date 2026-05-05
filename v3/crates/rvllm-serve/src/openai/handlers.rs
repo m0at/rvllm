@@ -465,13 +465,22 @@ pub async fn chat_completions(
     let vision_items = {
         let arch = state.vision_arch;
         let messages = req.messages.clone();
+        // Cancellation flag the spawn_blocking fetch loop checks
+        // between images. tokio::time::timeout cancels only the
+        // await, not the blocking work itself; without this flag
+        // the loop would keep running and burning network +
+        // blocking-pool threads after we returned `image_fetch_
+        // timeout` to the client.
+        let fetch_cancel = Arc::new(AtomicBool::new(false));
+        let fetch_cancel_inner = fetch_cancel.clone();
         let fetch_fut = tokio::task::spawn_blocking(
-            move || collect_vision_items(arch, &messages),
+            move || collect_vision_items(arch, &messages, &fetch_cancel_inner),
         );
         match tokio::time::timeout_at(request_deadline, fetch_fut).await {
             Ok(joined) => joined
                 .map_err(|e| ApiError::Internal(format!("vision fetch joined: {e}")))??,
             Err(_) => {
+                fetch_cancel.store(true, Ordering::Relaxed);
                 return Err(ApiError::invalid_param(
                     "vision image fetch exceeded request_timeout — the \
                      client image URL(s) did not resolve in time",
@@ -553,7 +562,12 @@ pub async fn chat_completions(
 
     let model_id = state.config.model_id.clone();
     let tokenizer = state.tokenizer.clone();
-    let request_timeout = state.config.request_timeout;
+    // Compute the remaining budget from the SAME `request_deadline`
+    // started at admission. Previously the collectors got a fresh
+    // full `request_timeout`, so a request could legitimately run
+    // for `preprocess_time + request_timeout` total — admission
+    // and GPU were held longer than the configured budget.
+    let remaining = request_deadline.saturating_duration_since(tokio::time::Instant::now());
 
     if req.stream {
         // Cycle 37: stream+stop rejection lifted to pre-tokenize above.
@@ -565,14 +579,14 @@ pub async fn chat_completions(
             events_rx,
             cancelled,
             state.config.sse_keepalive,
-            request_timeout,
+            remaining,
             request_id,
             Some(_admission),
         )))
     } else {
         let _cancel_guard = CancelOnDrop(cancelled.clone());
         let body = chat_collect(
-            &model_id, &tokenizer, events_rx, cancelled, request_timeout,
+            &model_id, &tokenizer, events_rx, cancelled, remaining,
             request_id, &stop_text,
         )
         .await?;
@@ -1330,18 +1344,39 @@ pub(crate) fn detect_tool_call_latch(
     }
 }
 
-fn safe_content_emit_end(accum: &str, emitted: usize, in_tool: bool) -> usize {
+/// `raw_offset` is a byte index into the **raw** `accum` string.
+/// Importantly NOT the visible-text "emitted" byte count tracked
+/// in the streaming chat handler — those two coordinate systems
+/// diverge once any markup has been stripped (a thought-block
+/// before visible prose makes the raw offset run ahead of the
+/// visible offset). Callers MUST pass a raw-accum offset; today
+/// the only call site hardcodes 0. Mixing the two coordinates
+/// could cause `accum[raw_offset..]` to land mid-codepoint when
+/// stripped content contains non-ASCII (e.g. umlauts in a thought
+/// channel) and panic the SSE task.
+fn safe_content_emit_end(accum: &str, raw_offset: usize, in_tool: bool) -> usize {
     if in_tool {
-        return emitted;
+        return raw_offset;
     }
+    // Defensive guard: `accum.is_char_boundary` is the documented
+    // correct way to verify a byte index aligns with a UTF-8 char
+    // boundary. If a future change accidentally passes a visible-
+    // bytes count here, fall back to 0 instead of panicking on the
+    // first slice. This keeps the SSE path robust even if the
+    // "raw vs visible offset" invariant ever gets bent.
+    let raw_offset = if accum.is_char_boundary(raw_offset) {
+        raw_offset
+    } else {
+        0
+    };
     // Earliest anchored tier-2 marker in the unemitted region.
-    let tier2 = find_anchored_call(accum, emitted);
+    let tier2 = find_anchored_call(accum, raw_offset);
     // Earliest tier-1 wrapper start (tool-call opener — always hold,
     // even if the closer is already present, so we can detect it as a
     // real call at Done time and emit `tool_calls` instead of content).
-    let tier1 = accum[emitted..]
+    let tier1 = accum[raw_offset..]
         .find(TOOL_CALL_OPENER)
-        .map(|r| emitted + r);
+        .map(|r| raw_offset + r);
     // Earliest UNCLOSED thought-block opener. If the opener IS closed,
     // strip_tool_markup will collapse the whole block — safe to emit
     // through. If it's NOT closed, we must hold back until the closer
@@ -1349,7 +1384,7 @@ fn safe_content_emit_end(accum: &str, emitted: usize, in_tool: bool) -> usize {
     let thought = THOUGHT_BLOCK_OPENERS
         .iter()
         .filter_map(|&op| {
-            let pos = accum[emitted..].find(op).map(|r| emitted + r)?;
+            let pos = accum[raw_offset..].find(op).map(|r| raw_offset + r)?;
             let after_opener = pos + op.len();
             // Closer search: prefer `<channel|>`, accept `<turn|>` too
             // (matches strip_tool_markup behaviour).
@@ -1377,8 +1412,8 @@ fn safe_content_emit_end(accum: &str, emitted: usize, in_tool: bool) -> usize {
         Some(p) => p.min(ceiling_by_tail),
         None => ceiling_by_tail,
     };
-    if cand < emitted {
-        return emitted;
+    if cand < raw_offset {
+        return raw_offset;
     }
     // If `cand` falls INSIDE a closed thought block — opener arrived,
     // closer arrived, but `ceiling_by_tail` happens to cut between
@@ -1394,7 +1429,7 @@ fn safe_content_emit_end(accum: &str, emitted: usize, in_tool: bool) -> usize {
     //   "<|channel>thought\nIn Bern..." → strips opener only, leaks
     //   "thought\nIn Bern..." to user.
     for &op in THOUGHT_BLOCK_OPENERS {
-        let mut search_from = emitted;
+        let mut search_from = raw_offset;
         while let Some(rel) = accum[search_from..].find(op) {
             let opener_pos = search_from + rel;
             let after_opener = opener_pos + op.len();
@@ -1423,7 +1458,7 @@ fn safe_content_emit_end(accum: &str, emitted: usize, in_tool: bool) -> usize {
             }
         }
     }
-    while cand > emitted && !accum.is_char_boundary(cand) {
+    while cand > raw_offset && !accum.is_char_boundary(cand) {
         cand -= 1;
     }
     cand
@@ -1556,6 +1591,11 @@ pub async fn completions(
 
     // Reserve one in-flight slot before tokenization (see chat handler).
     let _admission = state.worker.try_admit()?;
+    // Single end-to-end deadline starting at admission, mirroring
+    // the chat handler. Prior code reset the budget for
+    // collect/stream so a request could legitimately run for
+    // `preprocess_time + request_timeout`.
+    let request_deadline = tokio::time::Instant::now() + state.config.request_timeout;
 
     let prompt_ids = state.tokenizer.encode(&prompt_text)?;
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap, state.vision_arch)?;
@@ -1579,7 +1619,8 @@ pub async fn completions(
 
     let model_id = state.config.model_id.clone();
     let tokenizer = state.tokenizer.clone();
-    let request_timeout = state.config.request_timeout;
+    // Remaining budget from the per-request deadline.
+    let remaining = request_deadline.saturating_duration_since(tokio::time::Instant::now());
 
     if req.stream {
         // Cycle 37: stream+stop rejection lifted to pre-tokenize above.
@@ -1589,7 +1630,7 @@ pub async fn completions(
             events_rx,
             cancelled,
             state.config.sse_keepalive,
-            request_timeout,
+            remaining,
             Some(_admission),
         )))
     } else {
@@ -1599,7 +1640,7 @@ pub async fn completions(
             &tokenizer,
             events_rx,
             cancelled,
-            request_timeout,
+            remaining,
             &stop_text,
         )
         .await?;
@@ -2114,9 +2155,19 @@ fn resolve_max_new(requested: Option<u32>, cap: u32) -> ApiResult<u32> {
 
 /// Walk all chat messages, fetch every `image_url` content part via
 /// the vision_fetch helper, build a Vec<VisionItem> in document order.
+///
+/// Checks `cancelled` between images so the surrounding
+/// `tokio::time::timeout_at` (which only aborts the await — the
+/// `spawn_blocking` work itself keeps running) can actually short-
+/// circuit slow image fetches: the deadline-handler flips the flag
+/// on its way out, and the next loop iteration bails out, freeing
+/// the blocking thread + network connection instead of completing
+/// the full `N * fetch_timeout` worth of work for a request the
+/// client has already given up on.
 fn collect_vision_items(
     vision_arch: crate::router::VisionArch,
     messages: &[crate::openai::chat::ChatMessage],
+    cancelled: &Arc<AtomicBool>,
 ) -> ApiResult<Vec<crate::worker::VisionItem>> {
     use crate::openai::vision_fetch::{fetch_image, predict_gemma_num_tokens, predict_qwen_num_tokens, VisionError};
     let is_gemma = matches!(vision_arch, crate::router::VisionArch::Gemma4);
@@ -2154,6 +2205,13 @@ fn collect_vision_items(
     for (mi, m) in messages.iter().enumerate() {
         let Some(content) = m.content.as_ref() else { continue };
         for img in content.image_urls() {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(ApiError::invalid_param(
+                    "vision image fetch cancelled (request deadline or client disconnect)",
+                    "messages",
+                    "image_fetch_cancelled",
+                ));
+            }
             let (bytes, w, h) = fetch_image(&img.url).map_err(|e| match e {
                 VisionError::FetchTimeout => ApiError::invalid_param(
                     format!("messages[{mi}].image_url fetch timeout"),
