@@ -602,9 +602,14 @@ impl StreamDecoder {
     /// we hold text until it lands on a char boundary).
     pub fn step(&mut self, id: u32) -> Result<String, ApiError> {
         self.ids.push(id);
-        // Decode the whole accumulated run each step. The HF rust
-        // tokenizer is fast enough at kilotoken scales that this
-        // beats managing a BPE-aware incremental decoder by hand.
+        // KNOWN-PERF: this re-decodes the full accumulated run each
+        // step → O(n²) over the stream. Fine at small caps; for
+        // long streams (max_new_tokens_cap above ~2k) consider a
+        // bounded sliding-window detokenizer with BPE-boundary
+        // overlap handling. The HF rust tokenizer is fast enough at
+        // kilotoken scales that this still beats managing an
+        // incremental decoder by hand for typical loads, so this
+        // is left as a follow-up rather than fixed wrong.
         let full = self
             .tokenizer
             .tokenizer

@@ -84,6 +84,29 @@ impl WorkerHandle {
         !self.submit.is_closed()
     }
 
+    /// Cheap pre-flight admission check. Returns `Err(Busy)` /
+    /// `Err(Unavailable)` if a `submit` would fail right now, without
+    /// actually enqueuing anything. Used by handlers to short-circuit
+    /// expensive work (image fetch, full chat-template render) when
+    /// the queue is already full so a saturating client can't keep
+    /// the blocking pool / network busy producing requests that will
+    /// 429 anyway.
+    ///
+    /// Race-free w.r.t. the bounded `mpsc` channel's queue depth:
+    /// `capacity()` returns the number of free slots at the call
+    /// instant. A subsequent `submit` may still race with concurrent
+    /// arrivals and end up `Busy` — that's fine, the goal here is
+    /// only to reject the obviously-doomed cases early.
+    pub fn check_admission(&self) -> Result<(), ApiError> {
+        if self.submit.is_closed() {
+            return Err(ApiError::Unavailable("worker shut down".into()));
+        }
+        if self.submit.capacity() == 0 {
+            return Err(ApiError::Busy("worker queue is full".into()));
+        }
+        Ok(())
+    }
+
     /// Try to enqueue a request. Returns [`ApiError::Busy`] if the
     /// worker's queue is full (bounded `mpsc::channel`).
     pub async fn submit(&self, req: GenerateRequest) -> Result<(), ApiError> {

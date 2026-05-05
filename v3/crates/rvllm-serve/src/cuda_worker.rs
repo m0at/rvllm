@@ -113,6 +113,23 @@ pub async fn spawn_cuda_worker(
                     // and only get reset by the explicit calls below.
                     while let Some(req) = req_rx.blocking_recv() {
                         let prompt_len = req.prompt_ids.len() as u32;
+                        // Qwen 3.6 path is greedy-only today: the
+                        // forward_qwen36_decode runtime samples internally
+                        // (returns the picked token, not logits). We reject
+                        // non-greedy sampling explicitly so callers can't
+                        // believe their `temperature`/`top_p`/`top_k`/`seed`
+                        // were honoured. Lift the rejection when Qwen's
+                        // bring-up grows a logits-out variant + sampler.
+                        if !req.sampling.is_greedy() {
+                            let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                                "qwen36 path: non-greedy sampling \
+                                 (temperature/top_p/top_k/seed) not yet \
+                                 supported — set temperature=0 or omit \
+                                 sampling params"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
                         let _ = qwen.reset_linear_state();
                         let _ = qwen.reset_kv_cache();
                         let _ = qwen.reset_conv_state();

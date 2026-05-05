@@ -445,6 +445,12 @@ pub async fn chat_completions(
     // Calling it on the axum executor would block one Tokio worker
     // thread per request and starve the rest of the server. Codex
     // review #1 (round 4) caught this.
+    // Cheap admission pre-flight: short-circuit before image fetch +
+    // template render if the worker queue is already full. Otherwise
+    // a saturating client can keep the blocking pool, network and
+    // memory busy producing 429-bound requests.
+    state.worker.check_admission()?;
+
     let vision_items = {
         let arch = state.vision_arch;
         let messages = req.messages.clone();
@@ -583,7 +589,15 @@ async fn chat_collect(
                     // signals `run_generate` to break out of its
                     // decode loop on the next step (Codex4-2).
                     if !stop_text.is_empty() && !cancelled.load(Ordering::Relaxed) {
-                        if let Ok(probe) = tokenizer.decode_raw(&token_ids) {
+                        // Decode only a sliding tail window instead of
+                        // the full accumulated `token_ids`, which would
+                        // be O(n²) over the stream. 64 tokens is well
+                        // beyond any reasonable stop-string boundary
+                        // (a stop pattern would have to BPE-tokenize
+                        // to >64 tokens to be missed).
+                        const STOP_TAIL_WINDOW: usize = 64;
+                        let from = token_ids.len().saturating_sub(STOP_TAIL_WINDOW);
+                        if let Ok(probe) = tokenizer.decode_raw(&token_ids[from..]) {
                             for s in stop_text {
                                 if probe.contains(s.as_str()) {
                                     cancelled.store(true, Ordering::Relaxed);
@@ -1476,6 +1490,9 @@ pub async fn completions(
         ));
     }
 
+    // Cheap admission pre-flight before tokenization (see chat handler).
+    state.worker.check_admission()?;
+
     let prompt_ids = state.tokenizer.encode(&prompt_text)?;
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap)?;
 
@@ -1573,7 +1590,15 @@ async fn completion_collect(
                     // cancel the GPU loop early instead of running
                     // to EOS and trimming post-hoc.
                     if !stop_text.is_empty() && !cancelled.load(Ordering::Relaxed) {
-                        if let Ok(probe) = tokenizer.decode_raw(&token_ids) {
+                        // Decode only a sliding tail window instead of
+                        // the full accumulated `token_ids`, which would
+                        // be O(n²) over the stream. 64 tokens is well
+                        // beyond any reasonable stop-string boundary
+                        // (a stop pattern would have to BPE-tokenize
+                        // to >64 tokens to be missed).
+                        const STOP_TAIL_WINDOW: usize = 64;
+                        let from = token_ids.len().saturating_sub(STOP_TAIL_WINDOW);
+                        if let Ok(probe) = tokenizer.decode_raw(&token_ids[from..]) {
                             for s in stop_text {
                                 if probe.contains(s.as_str()) {
                                     cancelled.store(true, Ordering::Relaxed);
