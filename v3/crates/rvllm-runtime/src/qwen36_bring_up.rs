@@ -44,6 +44,11 @@ pub struct Qwen36OutsideKernels {
     pub fn_fp8_gemv_wpr_native_f16in: Option<KernelFn>,
     pub argmax_mod: LoadedModule,
     pub fn_argmax: KernelFn,
+    /// f16-input sibling of `fn_argmax` — used by the Qwen36 closer
+    /// to argmax over the lm_head's f16 logits row directly on the
+    /// GPU. Replaces the previous DtoH-of-full-vocab + host-side
+    /// scan; the GPU kernel returns a single i32 token id.
+    pub fn_argmax_f16: KernelFn,
     /// Phase 3g: fused (final RMSNorm + FP8-quantize) for the lm_head
     /// pre-matmul step. Outputs FP8 hidden + per-token f32 scale that
     /// cuBLASLt's fp8_gemm consumes.
@@ -296,6 +301,7 @@ impl Qwen36Bringup {
         };
         let argmax_mod = kernels.load_ptx("argmax")?;
         let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
+        let fn_argmax_f16 = argmax_mod.get_function("argmax_f16_kernel")?;
         let fused_rmsnorm_fp8_quant_mod = kernels.load_ptx("fused_rmsnorm_fp8_quant")?;
         let fn_fused_rmsnorm_fp8_quant =
             fused_rmsnorm_fp8_quant_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
@@ -363,6 +369,7 @@ impl Qwen36Bringup {
             fn_fp8_gemv_wpr_native_f16in,
             argmax_mod,
             fn_argmax,
+            fn_argmax_f16,
             fused_rmsnorm_fp8_quant_mod,
             fn_fused_rmsnorm_fp8_quant,
             fused_rope_partial_f16kv_mod,
@@ -997,47 +1004,65 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
-        // KNOWN-PERF: this is the host-side argmax path. We DtoH the
-        // entire last logits row (~526 KB at vocab=263168) and walk
-        // it on the CPU. Functionally correct; on the throughput
-        // hot path a GPU `argmax` kernel + scalar DtoH (matching the
-        // Gemma path) is a real follow-up. See Codex round 16 #3.
-        // DtoH only the LAST token's logits row (the argmax output is
-        // the prediction for the next token).
+        // GPU-side argmax over the LAST token's logits row. The
+        // argmax_f16_kernel does one block-reduction per row and
+        // writes a single i32 — we DtoH 4 bytes instead of the full
+        // ~526 KB vocab f16 buffer the previous host-side scan
+        // pulled across PCIe every step. (Codex round 16 #3.)
         let logits_row_bytes = (vocab as usize) * 2;
         let last_offset = (last_idx as u64) * (logits_row_bytes as u64);
-        let mut logits_row_f16 = vec![0u8; logits_row_bytes];
+        let token_region = self.arena.region("qwen36_argmax_tok", 4, 4)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            // Launch with one block per row (here always 1) and up to
+            // 1024 threads collaborating on the reduction. Matches
+            // the kernel's documented launch config.
+            let block_dim: u32 = (vocab as u32).min(1024);
+            let mut row_ptr = logits_region.device_ptr() + last_offset;
+            let mut out_ptr = token_region.device_ptr();
+            let mut vsz: i32 = vocab as i32;
+            let args = [
+                (&mut row_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
+                /*grid*/ 1, 1, 1,
+                /*block*/ block_dim, 1, 1,
+                /*shared*/ 0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 argmax_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        self.stream.fence()?;
+        let mut tok_buf = [0u8; 4];
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let rc = cuMemcpyDtoH_v2(
-                logits_row_f16.as_mut_ptr() as *mut _,
-                logits_region.device_ptr() + last_offset,
-                logits_row_bytes,
+                tok_buf.as_mut_ptr() as *mut _,
+                token_region.device_ptr(),
+                4,
             );
             if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "forward_outside_only DtoH",
+                    "qwen36 argmax_f16 DtoH(token)",
                     rvllm_core::CudaErrorKind::MemcpyFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
         }
-
-        let mut best_logit = f32::NEG_INFINITY;
-        let mut best_token: i32 = -1;
-        for v in 0..vocab as usize {
-            let bits = u16::from_le_bytes([
-                logits_row_f16[v * 2],
-                logits_row_f16[v * 2 + 1],
-            ]);
-            let l = f16_bits_to_f32(bits);
-            if l > best_logit {
-                best_logit = l;
-                best_token = v as i32;
-            }
-        }
-        Ok(best_token)
+        Ok(i32::from_le_bytes(tok_buf))
     }
 
     /// Phase 4c/4d probe: chain Q + K + V projection launches against
@@ -4398,13 +4423,26 @@ impl Qwen36Bringup {
         // cache mean each token sees full prompt context by the time
         // we hit the last position.
         //
-        // KNOWN-PERF: prefill is O(prompt_tokens × layers) with one
-        // stream.fence() per token slot — Qwen36 has no batched-
-        // prefill / CUDA-graph path yet (Gemma does). Long prompts
-        // pay a structural TTFT penalty here. See Codex round 16 #2.
+        // KNOWN-PERF: prefill is O(prompt_tokens × layers). The two
+        // per-token DtoD-fences (extract + writeback) were dropped
+        // — same-stream ordering already guarantees what they were
+        // synchronising — but the structural batched-prefill /
+        // CUDA-graph path (matching Gemma's `unified_prefill`) is
+        // still missing. That requires per-layer kernels that
+        // accept a [N, D] hidden region rather than a single
+        // [1, D] slot, plus chunked-recurrent linear-attention
+        // and batched-causal full-attention variants. Substantial
+        // refactor; tracked as Codex round 16 #2 follow-up.
         for tok_local in 0..num_tokens {
             let tok_pos = start_position + tok_local;
             // Extract token tok_local's hidden into last_hidden_region.
+            // No fence needed after the DtoD enqueue — the layer
+            // chain below runs on the same CUDA stream and stream
+            // ordering guarantees the copy completes before any
+            // subsequent kernel observes the buffer. Pre-fix, every
+            // prefill token paid an extra host↔device round-trip
+            // for a stream.fence that wasn't actually synchronising
+            // anything cross-stream.
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
@@ -4423,7 +4461,6 @@ impl Qwen36Bringup {
                     ));
                 }
             }
-            self.stream.fence()?;
 
             // Phase 5e: optional per-layer activation dump for
             // numerical-correctness audit vs vLLM. Set
@@ -4520,6 +4557,9 @@ impl Qwen36Bringup {
             // in hidden_region. Only the last token's slot is read by
             // the closer, but we write all so a future multi-token
             // logit reader (training/eval path) just works.
+            // No fence — same-stream ordering guarantees the
+            // following iteration's DtoD-extract sees the final
+            // value.
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
@@ -4538,8 +4578,13 @@ impl Qwen36Bringup {
                     ));
                 }
             }
-            self.stream.fence()?;
         }
+        // Single fence at end of prefill so the closer's read of the
+        // last hidden slot sees finalised values (host probes /
+        // cublasLt handle synchronisation themselves, but this is
+        // the canonical sync point between the per-token chain and
+        // the lm_head / argmax stage).
+        self.stream.fence()?;
 
         // 5. Final norm + lm_head + argmax (outside-only closer).
         self.forward_qwen36_outside_closer(
