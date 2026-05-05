@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_core::Result;
-use rvllm_cutlass::CublasLt;
+use rvllm_cutlass::{CublasLt, CutlassBackend};
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_loader::qwen36_weights::Qwen36LoadedModel;
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
@@ -56,6 +56,12 @@ pub struct Qwen36OutsideKernels {
     /// is unused.
     pub fp8_quantize_per_token_f16_mod: LoadedModule,
     pub fn_fp8_quantize_per_token_f16: KernelFn,
+    /// Per-token-amax sibling of `fp8_quantize_per_token_f16` (one
+    /// f32 per row, vs per-K-block scales). Feeds CUTLASS SM120's
+    /// `prep_sfa` entry point on the m≥128 fast path; cuBLASLt
+    /// blockwise uses the per-K-block kernel above instead.
+    pub fp8_quantize_per_token_amax_f16_mod: LoadedModule,
+    pub fn_fp8_quantize_per_token_amax_f16: KernelFn,
     /// Phase 3g: fused (final RMSNorm + FP8-quantize) for the lm_head
     /// pre-matmul step. Outputs FP8 hidden + per-token f32 scale that
     /// cuBLASLt's fp8_gemm consumes.
@@ -159,6 +165,13 @@ pub struct Qwen36Bringup {
     pub kernels: Arc<KernelLoader>,
     pub outside_kernels: Qwen36OutsideKernels,
     pub cublaslt: CublasLt,
+    /// CUTLASS SM120 backend for blockwise FP8 GEMM at m≥128.
+    /// Loaded at bring-up; on sm_121 this resolves to
+    /// `CutlassBackend::SoSm120` when `libcutlass_sm120.so` is found
+    /// (the same .so Gemma uses for its lm_head fast path) and
+    /// `CutlassBackend::Absent` otherwise — in which case
+    /// `fp8_proj_dispatch` falls back to its looped-GEMV path.
+    pub cutlass: CutlassBackend,
     /// Phase 4f: precomputed RoPE cos/sin tables for Qwen 3.6
     /// (rope_theta=10M, head_dim=256). Single-axis tables uploaded
     /// at bring-up; MRoPE's section-aware position encoding
@@ -312,6 +325,10 @@ impl Qwen36Bringup {
         let fp8_quantize_per_token_f16_mod = kernels.load_ptx("fp8_quantize_per_token_f16")?;
         let fn_fp8_quantize_per_token_f16 = fp8_quantize_per_token_f16_mod
             .get_function("fp8_quantize_per_token_f16_kernel")?;
+        let fp8_quantize_per_token_amax_f16_mod =
+            kernels.load_ptx("fp8_quantize_per_token_amax_f16")?;
+        let fn_fp8_quantize_per_token_amax_f16 = fp8_quantize_per_token_amax_f16_mod
+            .get_function("fp8_quantize_per_token_amax_f16_kernel")?;
         let fused_rmsnorm_fp8_quant_mod = kernels.load_ptx("fused_rmsnorm_fp8_quant")?;
         let fn_fused_rmsnorm_fp8_quant =
             fused_rmsnorm_fp8_quant_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
@@ -382,6 +399,8 @@ impl Qwen36Bringup {
             fn_argmax_f16,
             fp8_quantize_per_token_f16_mod,
             fn_fp8_quantize_per_token_f16,
+            fp8_quantize_per_token_amax_f16_mod,
+            fn_fp8_quantize_per_token_amax_f16,
             fused_rmsnorm_fp8_quant_mod,
             fn_fused_rmsnorm_fp8_quant,
             fused_rope_partial_f16kv_mod,
@@ -439,6 +458,25 @@ impl Qwen36Bringup {
         eprintln!(
             "[qwen36] cuBLASLt initialized with {} MiB workspace.",
             cublaslt_ws_bytes / (1024 * 1024)
+        );
+
+        // CUTLASS SM120 backend for the m≥128 batched-prefill fast
+        // path on sm_121. Same .so Gemma loads. We don't need the
+        // policy variant table (sm_121 ships only the blockscale
+        // entry point), so pass an empty variants slice.
+        let cutlass = CutlassBackend::load_for(
+            compile_target,
+            paths.cutlass_so.clone(),
+            &[],
+        )?;
+        eprintln!(
+            "[qwen36] cutlass backend = {}",
+            match &cutlass {
+                CutlassBackend::SoSm120(_) => "SoSm120 (sm_121 fast path)",
+                CutlassBackend::So(_) => "So",
+                CutlassBackend::Absent => "Absent (m≥2 path → looped GEMV fallback)",
+                _ => "Other",
+            }
         );
 
         // Phase 4f: precompute single-axis RoPE cos/sin tables.
@@ -665,6 +703,7 @@ impl Qwen36Bringup {
             kernels,
             outside_kernels,
             cublaslt,
+            cutlass,
             rope_cos,
             rope_sin,
             rope_max_pos,
@@ -6132,6 +6171,94 @@ impl Qwen36Bringup {
                 stream,
             );
         }
+        // Phase 3c: when m ≥ 128 AND CutlassBackend::SoSm120 is loaded,
+        // dispatch through CUTLASS SM120's blockwise FP8 GEMM (the
+        // same .so Gemma uses at lm_head). This is the production
+        // fast path on sm_121 (GB10) — cuBLASLt has no blockwise
+        // FP8 kernel for that arch; CUTLASS SM120 hard-asserts
+        // M≥128 so smaller m falls through to Phase 3b's cuBLASLt
+        // try-then-looped-GEMV path.
+        #[cfg(feature = "cuda")]
+        if m >= 128 {
+            if let CutlassBackend::SoSm120(ref lib) = self.cutlass {
+                // Per-token amax quantise (CUTLASS prep_sfa expects [M] f32).
+                let fp8_bytes = (m as usize) * (k as usize);
+                let amax_bytes = (m as usize) * 4;
+                let in_fp8 = self
+                    .arena
+                    .region("qwen36_proj_in_fp8_cutlass", fp8_bytes, 16)?;
+                let in_amax = self
+                    .arena
+                    .region("qwen36_proj_in_amax", amax_bytes, 16)?;
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let block_dim: u32 = (k as u32).min(1024);
+                    let mut o_fp8 = in_fp8.device_ptr();
+                    let mut o_amax = in_amax.device_ptr();
+                    let mut i_ptr = input_f16;
+                    let mut k_i: i32 = k as i32;
+                    let args = [
+                        (&mut o_fp8) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut o_amax) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut i_ptr) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels.fn_fp8_quantize_per_token_amax_f16.raw() as CUfunction,
+                        m, 1, 1,
+                        block_dim, 1, 1,
+                        0,
+                        stream as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 fp8_proj_dispatch: amax-quantise launch (CUTLASS path)",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                // Allocate SFA / SFB / workspace per CUTLASS sizing.
+                let sfa_n = lib.sfa_bytes(m as i32, k as i32);
+                let sfb_n = lib.sfb_bytes(n as i32, k as i32);
+                let ws_n = lib.workspace_size(m as i32, n as i32, k as i32);
+                if sfa_n == 0 || sfb_n == 0 {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 fp8_proj_dispatch: CUTLASS SM120 reported \
+                         sfa_bytes/sfb_bytes==0 — legacy .so without these \
+                         helpers; rebuild kernels/build_cutlass_sm120_so.sh",
+                        rvllm_core::CudaErrorKind::Other,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+                let sfa = self.arena.region("qwen36_proj_sfa", sfa_n.max(4), 16)?;
+                let sfb = self.arena.region("qwen36_proj_sfb", sfb_n.max(4), 16)?;
+                let ws = self
+                    .arena
+                    .region("qwen36_proj_cutlass_ws", ws_n.max(16), 256)?;
+                unsafe {
+                    lib.launch_prep_sfa(in_amax.device_ptr(), sfa.device_ptr(), m as i32, k as i32, stream)?;
+                    lib.launch_prep_sfb(b_blockscale, sfb.device_ptr(), n as i32, k as i32, stream)?;
+                    lib.launch_fp8_gemm_blockscale(
+                        out_f16,
+                        in_fp8.device_ptr(),
+                        weight_fp8,
+                        sfa.device_ptr(),
+                        sfb.device_ptr(),
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        ws.device_ptr(),
+                        ws_n,
+                        stream,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
+
         // Phase 3b: m≥2 path through cuBLASLt blockwise fp8_gemm.
         //   1) Per-(token, 128-K-block) f16→fp8 amax-quantise the
         //      input → scratch `[M, K] fp8` + `[M, ceil(K/128)] f32`
@@ -6250,6 +6377,15 @@ impl Qwen36Bringup {
                 Ok(())
             }
         }
+        // Non-cuda build: the entire m≥2 path was cfg-gated out; we
+        // can't actually run anything, so signal a loud error rather
+        // than silently returning Ok().
+        #[cfg(not(feature = "cuda"))]
+        Err(rvllm_core::RvllmError::cuda(
+            "qwen36 fp8_proj_dispatch: m≥2 path requires `cuda` feature",
+            rvllm_core::CudaErrorKind::Other,
+            rvllm_core::CudaCtx::setup(),
+        ))
     }
 }
 

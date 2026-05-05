@@ -279,7 +279,15 @@ fn run() -> Result<(), String> {
     // m=1 GEMV. On capable arches (sm_100 / sm_120) the same
     // dispatch goes through cuBLASLt blockwise tensor-cores;
     // cosine ≥0.9999 covers both paths.
-    for &m in &[2u32, 4, 16, 64] {
+    // m=2..64: dispatcher uses Phase 3b cuBLASLt blockwise (or
+    //   on sm_121 falls back to looped m=1 GEMV — byte-identical
+    //   to the reference, cosine = 1.0).
+    // m=128..512: dispatcher uses Phase 3c CUTLASS SM120 path
+    //   (same .so as Gemma's lm_head). Numerically close to the
+    //   looped GEMV reference but not bit-identical (different
+    //   FP8 quantise + tensor-core accumulation order); cosine
+    //   ≥0.9999 expected.
+    for &m in &[2u32, 4, 16, 64, 128, 256] {
         let in_bytes_m = (m as usize) * (k as usize) * 2;
         let out_bytes_m = (m as usize) * (n as usize) * 2;
         let in_region_m = bringup
@@ -406,7 +414,12 @@ fn run() -> Result<(), String> {
             }
         }
         let mean_cos = (mean_cos_sum / (m as f64)) as f32;
-        let threshold = 0.9999_f32;
+        // m<128: dispatcher falls through to looped m=1 GEMV (bit-
+        //   identical to reference → cosine 1.0).
+        // m≥128: CUTLASS SM120 fast path with per-token amax vs the
+        //   reference's per-K-block scaling. Numerically close but
+        //   not bit-identical; threshold relaxed accordingly.
+        let threshold: f32 = if m >= 128 { 0.999_f32 } else { 0.9999_f32 };
         let pass = min_cos >= threshold;
         eprintln!(
             "  m={m:>3}: mean_cos={mean_cos:.6}, min_cos={min_cos:.6} (row {worst_row}) — {}",
