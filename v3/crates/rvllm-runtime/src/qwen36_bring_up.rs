@@ -4705,14 +4705,13 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
-        // 2. in_proj_qkv FP8 GEMV → conv-input.
+        // 2. in_proj_qkv FP8 GEMV → conv-input. (Phase 4a routing.)
         let qkv_bytes_dev = (qkv_n as usize) * 2;
         let qkv_region = self.arena.region("qwen36_pl_qkv", qkv_bytes_dev, 16)?;
         unsafe {
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: qkv_n, k: hidden }
-                .launch(kernel_gemv, qkv_region.device_ptr(),
-                    la.in_proj_qkv.offset_bytes, qkv_bs,
-                    normed_region.device_ptr(), stream_raw)?;
+            self.fp8_proj_dispatch(kernel_gemv, qkv_region.device_ptr(),
+                la.in_proj_qkv.offset_bytes, qkv_bs, normed_region.device_ptr(),
+                m, qkv_n, hidden, stream_raw)?;
         }
         self.stream.fence()?;
 
@@ -5015,10 +5014,9 @@ impl Qwen36Bringup {
         let z_bytes_dev = (z_n as usize) * 2;
         let z_region = self.arena.region("qwen36_pl_z", z_bytes_dev, 16)?;
         unsafe {
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: z_n, k: hidden }
-                .launch(kernel_gemv, z_region.device_ptr(),
-                    la.in_proj_z.offset_bytes, z_bs,
-                    normed_region.device_ptr(), stream_raw)?;
+            self.fp8_proj_dispatch(kernel_gemv, z_region.device_ptr(),
+                la.in_proj_z.offset_bytes, z_bs, normed_region.device_ptr(),
+                m, z_n, hidden, stream_raw)?;
         }
         self.stream.fence()?;
         let mut z_host_bytes = vec![0u8; z_bytes_dev];
@@ -5077,10 +5075,9 @@ impl Qwen36Bringup {
         // 12. out_proj FP8 GEMV → o_buf [hidden].
         let out_region = self.arena.region("qwen36_pl_out", (out_n as usize) * 2, 16)?;
         unsafe {
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: out_n, k: out_k }
-                .launch(kernel_gemv, out_region.device_ptr(),
-                    la.out_proj.offset_bytes, out_bs,
-                    gated_region.device_ptr(), stream_raw)?;
+            self.fp8_proj_dispatch(kernel_gemv, out_region.device_ptr(),
+                la.out_proj.offset_bytes, out_bs, gated_region.device_ptr(),
+                m, out_n, out_k, stream_raw)?;
         }
         self.stream.fence()?;
 
@@ -5196,19 +5193,22 @@ impl Qwen36Bringup {
             self.arena.region("qwen36_pf_k", (k_n as usize) * 2, 16)?;
         let v_region =
             self.arena.region("qwen36_pf_v", (v_n as usize) * 2, 16)?;
+        // Phase 4a: route projections through `fp8_proj_dispatch`.
+        // At m=1 (today's caller) this dispatches to the same
+        // Fp8GemvF16InLaunch byte-identically. Phase 4b/5/7 will
+        // flip m=1 → m=num_tokens and the dispatcher will pick up
+        // CUTLASS SM120 (m≥128) automatically — no further edits
+        // needed in this function.
         unsafe {
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: q_n, k: hidden }
-                .launch(kernel_gemv, q_region.device_ptr(),
-                    fl.q_proj.offset_bytes, q_bs,
-                    normed_region.device_ptr(), stream_raw)?;
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: k_n, k: hidden }
-                .launch(kernel_gemv, k_region.device_ptr(),
-                    fl.k_proj.offset_bytes, k_bs,
-                    normed_region.device_ptr(), stream_raw)?;
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: v_n, k: hidden }
-                .launch(kernel_gemv, v_region.device_ptr(),
-                    fl.v_proj.offset_bytes, v_bs,
-                    normed_region.device_ptr(), stream_raw)?;
+            self.fp8_proj_dispatch(kernel_gemv, q_region.device_ptr(),
+                fl.q_proj.offset_bytes, q_bs, normed_region.device_ptr(),
+                m, q_n, hidden, stream_raw)?;
+            self.fp8_proj_dispatch(kernel_gemv, k_region.device_ptr(),
+                fl.k_proj.offset_bytes, k_bs, normed_region.device_ptr(),
+                m, k_n, hidden, stream_raw)?;
+            self.fp8_proj_dispatch(kernel_gemv, v_region.device_ptr(),
+                fl.v_proj.offset_bytes, v_bs, normed_region.device_ptr(),
+                m, v_n, hidden, stream_raw)?;
         }
         self.stream.fence()?;
 
@@ -5493,14 +5493,13 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
-        // 8. o_proj FP8 GEMV → out_buf [hidden].
+        // 8. o_proj FP8 GEMV → out_buf [hidden]. (Phase 4a routing.)
         let out_region =
             self.arena.region("qwen36_pf_out", (o_n as usize) * 2, 16)?;
         unsafe {
-            rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: o_n, k: o_k }
-                .launch(kernel_gemv, out_region.device_ptr(),
-                    fl.o_proj.offset_bytes, o_bs,
-                    gated_region.device_ptr(), stream_raw)?;
+            self.fp8_proj_dispatch(kernel_gemv, out_region.device_ptr(),
+                fl.o_proj.offset_bytes, o_bs, gated_region.device_ptr(),
+                m, o_n, o_k, stream_raw)?;
         }
         self.stream.fence()?;
 
@@ -5676,16 +5675,16 @@ impl Qwen36Bringup {
         for ((e_idx, _logit), w) in top.iter().zip(weights.iter()) {
             let e = *e_idx as u64;
             unsafe {
-                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_int, k: k_in }
-                    .launch(kernel_gemv, gate_region.device_ptr(),
-                        moe.experts_gate_proj_fused.offset_bytes + e * int_per_expert_w,
-                        gate_bs + e * int_per_expert_bs,
-                        normed_region.device_ptr(), stream_raw)?;
-                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_int, k: k_in }
-                    .launch(kernel_gemv, up_region.device_ptr(),
-                        moe.experts_up_proj_fused.offset_bytes + e * int_per_expert_w,
-                        up_bs + e * int_per_expert_bs,
-                        normed_region.device_ptr(), stream_raw)?;
+                self.fp8_proj_dispatch(kernel_gemv, gate_region.device_ptr(),
+                    moe.experts_gate_proj_fused.offset_bytes + e * int_per_expert_w,
+                    gate_bs + e * int_per_expert_bs,
+                    normed_region.device_ptr(),
+                    m, n_int, k_in, stream_raw)?;
+                self.fp8_proj_dispatch(kernel_gemv, up_region.device_ptr(),
+                    moe.experts_up_proj_fused.offset_bytes + e * int_per_expert_w,
+                    up_bs + e * int_per_expert_bs,
+                    normed_region.device_ptr(),
+                    m, n_int, k_in, stream_raw)?;
             }
             self.stream.fence()?;
             let mut g_host = vec![0u8; mid_bytes];
@@ -5708,11 +5707,11 @@ impl Qwen36Bringup {
             }
             unsafe { silu_region.copy_from_host(&silu_host)? };
             unsafe {
-                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_down, k: k_down }
-                    .launch(kernel_gemv, down_region.device_ptr(),
-                        moe.experts_down_proj_fused.offset_bytes + e * down_per_expert_w,
-                        down_bs + e * down_per_expert_bs,
-                        silu_region.device_ptr(), stream_raw)?;
+                self.fp8_proj_dispatch(kernel_gemv, down_region.device_ptr(),
+                    moe.experts_down_proj_fused.offset_bytes + e * down_per_expert_w,
+                    down_bs + e * down_per_expert_bs,
+                    silu_region.device_ptr(),
+                    m, n_down, k_down, stream_raw)?;
             }
             self.stream.fence()?;
             let mut d_host = vec![0u8; down_bytes];
@@ -5737,14 +5736,14 @@ impl Qwen36Bringup {
         let sh_down_bs = moe.shared_expert_down_proj.blockscale_ptr.unwrap_or(0);
         if sh_gate_bs != 0 && sh_up_bs != 0 && sh_down_bs != 0 {
             unsafe {
-                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_int, k: k_in }
-                    .launch(kernel_gemv, gate_region.device_ptr(),
-                        moe.shared_expert_gate_proj.offset_bytes, sh_gate_bs,
-                        normed_region.device_ptr(), stream_raw)?;
-                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_int, k: k_in }
-                    .launch(kernel_gemv, up_region.device_ptr(),
-                        moe.shared_expert_up_proj.offset_bytes, sh_up_bs,
-                        normed_region.device_ptr(), stream_raw)?;
+                self.fp8_proj_dispatch(kernel_gemv, gate_region.device_ptr(),
+                    moe.shared_expert_gate_proj.offset_bytes, sh_gate_bs,
+                    normed_region.device_ptr(),
+                    m, n_int, k_in, stream_raw)?;
+                self.fp8_proj_dispatch(kernel_gemv, up_region.device_ptr(),
+                    moe.shared_expert_up_proj.offset_bytes, sh_up_bs,
+                    normed_region.device_ptr(),
+                    m, n_int, k_in, stream_raw)?;
             }
             self.stream.fence()?;
             let mut g_host = vec![0u8; mid_bytes];
@@ -5767,10 +5766,10 @@ impl Qwen36Bringup {
             }
             unsafe { silu_region.copy_from_host(&silu_host)? };
             unsafe {
-                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n: n_down, k: k_down }
-                    .launch(kernel_gemv, down_region.device_ptr(),
-                        moe.shared_expert_down_proj.offset_bytes, sh_down_bs,
-                        silu_region.device_ptr(), stream_raw)?;
+                self.fp8_proj_dispatch(kernel_gemv, down_region.device_ptr(),
+                    moe.shared_expert_down_proj.offset_bytes, sh_down_bs,
+                    silu_region.device_ptr(),
+                    m, n_down, k_down, stream_raw)?;
             }
             self.stream.fence()?;
             let mut sh_host = vec![0u8; down_bytes];
