@@ -159,12 +159,28 @@ fn parse_data_uri(rest: &str) -> Result<Vec<u8>, VisionError> {
     Ok(bytes)
 }
 
+/// Process-wide blocking HTTP client for vision-image fetches.
+/// One-time build at first use; reused for every image URL across
+/// every request. Without this each `fetch_http` call paid for a
+/// fresh DNS+TLS handshake — a request with N images and the next
+/// request with the same hosts both lost connection-pool benefits.
+fn http_client() -> &'static reqwest::blocking::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            // Sensible defaults for short-lived image fetches.
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(8)
+            .build()
+            .expect("build vision-fetch reqwest client")
+    })
+}
+
 fn fetch_http(url: &str) -> Result<Vec<u8>, VisionError> {
     use std::io::Read;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .map_err(|e| VisionError::FetchFailed(format!("client: {e}")))?;
+    let client = http_client();
     let mut resp = client.get(url).send().map_err(|e| {
         if e.is_timeout() {
             VisionError::FetchTimeout

@@ -997,6 +997,11 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
+        // KNOWN-PERF: this is the host-side argmax path. We DtoH the
+        // entire last logits row (~526 KB at vocab=263168) and walk
+        // it on the CPU. Functionally correct; on the throughput
+        // hot path a GPU `argmax` kernel + scalar DtoH (matching the
+        // Gemma path) is a real follow-up. See Codex round 16 #3.
         // DtoH only the LAST token's logits row (the argmax output is
         // the prediction for the next token).
         let logits_row_bytes = (vocab as usize) * 2;
@@ -4340,12 +4345,19 @@ impl Qwen36Bringup {
                 #[cfg(feature = "cuda")]
                 unsafe {
                     use cudarc::driver::sys::*;
-                    let _ = cuMemcpyHtoDAsync_v2(
+                    let r = cuMemcpyHtoDAsync_v2(
                         hidden_region.device_ptr() + dst_off,
                         emb_bytes.as_ptr() as *const _,
                         len,
                         self.stream.raw() as _,
                     );
+                    if r != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 vision splice HtoDAsync",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
                 }
             }
             self.stream.fence()?;
@@ -4355,18 +4367,23 @@ impl Qwen36Bringup {
         //    chain operates on). Each linear-attn layer reads from
         //    last_hidden_region and writes the residual back into it,
         //    so layer N+1 sees layer N's output.
-        let kernel_gemv = match self.outside_kernels.fn_fp8_gemv_wpr_native_f16in {
-            Some(k) => k,
-            None => {
-                return self.forward_qwen36_outside_closer(
-                    &hidden_region,
-                    num_tokens,
-                    hidden,
-                    vocab,
-                    last_idx,
-                );
-            }
-        };
+        // Hard-fail when the FP8 GEMV kernel is missing. The previous
+        // silent fallback to `forward_qwen36_outside_closer` skipped
+        // ALL 40 transformer layers (only embed → final-norm → lm_head)
+        // and produced syntactically plausible but semantically garbage
+        // output, indistinguishable from a successful response on the
+        // wire. Hard erroring keeps the server honest: an operator with
+        // a broken kernel build sees the failure at the first request,
+        // not days later when "the model got dumber."
+        let kernel_gemv = self.outside_kernels.fn_fp8_gemv_wpr_native_f16in.ok_or_else(|| {
+            rvllm_core::RvllmError::cuda(
+                "qwen36 forward: fn_fp8_gemv_wpr_native_f16in not loaded — \
+                 transformer layers cannot run; refusing to fall back to \
+                 embed/final-norm-only path which would produce garbage tokens",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            )
+        })?;
 
         let last_hidden_region =
             self.arena.region("qwen36_pl_last", last_hidden_bytes, 16)?;
@@ -4380,6 +4397,11 @@ impl Qwen36Bringup {
         // The recurrent linear-attn state + monotonically-growing KV
         // cache mean each token sees full prompt context by the time
         // we hit the last position.
+        //
+        // KNOWN-PERF: prefill is O(prompt_tokens × layers) with one
+        // stream.fence() per token slot — Qwen36 has no batched-
+        // prefill / CUDA-graph path yet (Gemma does). Long prompts
+        // pay a structural TTFT penalty here. See Codex round 16 #2.
         for tok_local in 0..num_tokens {
             let tok_pos = start_position + tok_local;
             // Extract token tok_local's hidden into last_hidden_region.
@@ -4387,12 +4409,19 @@ impl Qwen36Bringup {
             unsafe {
                 use cudarc::driver::sys::*;
                 let off = (tok_local as u64) * (last_hidden_bytes as u64);
-                let _ = cuMemcpyDtoDAsync_v2(
+                let r = cuMemcpyDtoDAsync_v2(
                     last_hidden_region.device_ptr(),
                     hidden_region.device_ptr() + off,
                     last_hidden_bytes,
                     self.stream.raw() as _,
                 );
+                if r != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 per-token DtoDAsync (extract)",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             self.stream.fence()?;
 
@@ -4495,12 +4524,19 @@ impl Qwen36Bringup {
             unsafe {
                 use cudarc::driver::sys::*;
                 let off = (tok_local as u64) * (last_hidden_bytes as u64);
-                let _ = cuMemcpyDtoDAsync_v2(
+                let r = cuMemcpyDtoDAsync_v2(
                     hidden_region.device_ptr() + off,
                     last_hidden_region.device_ptr(),
                     last_hidden_bytes,
                     self.stream.raw() as _,
                 );
+                if r != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 per-token DtoDAsync (writeback)",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
             self.stream.fence()?;
         }
