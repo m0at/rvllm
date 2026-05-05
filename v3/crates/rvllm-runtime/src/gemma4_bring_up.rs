@@ -3314,11 +3314,26 @@ impl Gemma4Bringup {
         };
 
         // Clamp the prefix-match to the actual KV region size.
-        let common_prefix_len: u32 = if use_prefix_cache {
+        let mut common_prefix_len: u32 = if use_prefix_cache {
             common_prefix_len_raw
         } else {
             0
         };
+        // Vision-splice cache-correctness gate (Codex review #2 round 5).
+        // The prefix cache only hashes prompt_ids, NOT the vision items
+        // / image bytes / spliced embeddings. Two requests with the
+        // same chat shape but different images produce identical
+        // image-pad token sequences and would silently reuse the OLD
+        // image's KV. Force a full prefill whenever the request brings
+        // vision data so the new embeddings actually get spliced.
+        if !vision_splice.is_empty() && common_prefix_len > 0 {
+            eprintln!(
+                "[prefix-cache] bypassed: request has {} vision splice slot(s); \
+                 forcing common_prefix_len=0 to avoid stale-vision KV reuse",
+                vision_splice.len()
+            );
+            common_prefix_len = 0;
+        }
         if common_prefix_len > 0 {
             eprintln!(
                 "[prefix-cache] hit: reusing {} of {} prompt tokens",
@@ -3838,9 +3853,33 @@ impl Gemma4Bringup {
         // or measures the collapsed-scalar quality floor at <128).
         let skip_decode = std::env::var_os("RVLLM_DIAG_SKIP_DECODE").is_some();
         let requested_batch_prefill = parse_truthy_env("RVLLM_BATCH_PREFILL").unwrap_or(false);
+        // Vision-splice availability gate (Codex review #1 round 5).
+        // The vision-embedding splice into residual_ptr lives ONLY in
+        // the batch-prefill code path (the post-EmbeddingGather hook
+        // ~line 4017). The per-token prefill path computes embeddings
+        // via the embedding-gather kernel directly and never sees
+        // the vision items. If this request brings vision data, force
+        // the batch path on regardless of the env flag — and refuse
+        // up front when the KV dtype rules out the batch path so the
+        // user gets a clean error instead of silently dropped images.
+        let needs_batch_for_vision = !vision_splice.is_empty();
+        if needs_batch_for_vision && kv_dtype == crate::gemma4_layer_exec::KvDtype::F16 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "vision: F16 KV cache cannot service vision splice — \
+                 the per-token prefill path the F16-KV setup uses doesn't \
+                 carry the splice. Set RVLLM_F16_KV=0 (or use NVFP4 KV) for \
+                 multimodal requests.",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         let use_batch_prefill =
-            requested_batch_prefill && kv_dtype != crate::gemma4_layer_exec::KvDtype::F16;
-        if requested_batch_prefill && !use_batch_prefill {
+            (requested_batch_prefill || needs_batch_for_vision)
+                && kv_dtype != crate::gemma4_layer_exec::KvDtype::F16;
+        if requested_batch_prefill
+            && !use_batch_prefill
+            && !needs_batch_for_vision
+        {
             eprintln!(
                 "[prefill] RVLLM_BATCH_PREFILL=1 ignored for F16 KV; \
                  using per-token path to keep KV dtype consistent"

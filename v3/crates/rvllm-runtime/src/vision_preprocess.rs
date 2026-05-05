@@ -79,9 +79,24 @@ impl Default for QwenPreprocessConfig {
             // (grid 14×14). Earlier setting min_pixels=65536 (=256²)
             // upsampled to 256×256 (grid 16×16) and broke pos_embed
             // interpolation alignment. Setting to 0 disables the lower
-            // bound; max_pixels still caps at 16M to match HF.
+            // bound.
             min_pixels: 0,
-            max_pixels: 16_777_216,
+            // Server-side cap on vision input size. HF would allow up to
+            // 16,777,216 pixels (≈ 65k patches before merge). Our naive
+            // ViT attention path allocates `n_tokens × n_tokens` f32
+            // scores per head per block — at 16 MP that's tens of GiB
+            // of scratch and minutes of GPU time per request, easy
+            // availability hazard from a single 20 MiB JPEG. Codex
+            // review #3 round 5 flagged this. 1024² = 1,048,576
+            // pixels ≈ 4096 ViT patches → 1024 merged tokens, so a
+            // single image fits in ~16 MiB of scores f32 per head and
+            // completes in ~1.5 s. The cap is configurable via
+            // `RVLLM_QWEN_VISION_MAX_PIXELS` for operators who know
+            // their hardware can take more.
+            max_pixels: std::env::var("RVLLM_QWEN_VISION_MAX_PIXELS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(1_048_576),
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
         }
