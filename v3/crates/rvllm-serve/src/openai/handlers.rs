@@ -421,6 +421,7 @@ pub async fn chat_completions(
     let max_new = resolve_max_new(effective_max_tokens, state.config.max_new_tokens_cap)?;
     let stop_text = req.stop.as_ref().map(|s| extract_stop(s)).unwrap_or_default();
     validate_stops(&stop_text)?;
+    validate_stops_against_tokenizer(&stop_text, &state.tokenizer)?;
     // Cycle 37 P1 (codex audit): cycle-36 reject of stream+stop fired
     // AFTER tokenization + worker submit, leaking GPU work for a
     // request we then 400. Lift the rejection above the tokenize/submit
@@ -453,19 +454,21 @@ pub async fn chat_completions(
     // the blocking pool, network and memory busy producing
     // ultimately-doomed requests in parallel.
     let _admission = state.worker.try_admit()?;
+    // Single end-to-end deadline starting at admission, so fetch +
+    // render + worker-submit + decode collectively respect
+    // request_timeout. Previously fetch had its own timeout and the
+    // worker drain had a separate one, with a gap in between
+    // (template render / tokenize on a 80 MiB body could pin an
+    // admission permit indefinitely).
+    let request_deadline = tokio::time::Instant::now() + state.config.request_timeout;
 
     let vision_items = {
         let arch = state.vision_arch;
         let messages = req.messages.clone();
-        // Bound vision fetch by the configured request_timeout so an
-        // admission slot can't be parked for ~N×5s of slow HTTP
-        // image fetches before request_timeout's deadline timer even
-        // starts at the worker-event drain. On timeout, we drop the
-        // permit and return 504-style.
         let fetch_fut = tokio::task::spawn_blocking(
             move || collect_vision_items(arch, &messages),
         );
-        match tokio::time::timeout(state.config.request_timeout, fetch_fut).await {
+        match tokio::time::timeout_at(request_deadline, fetch_fut).await {
             Ok(joined) => joined
                 .map_err(|e| ApiError::Internal(format!("vision fetch joined: {e}")))??,
             Err(_) => {
@@ -478,25 +481,51 @@ pub async fn chat_completions(
             }
         }
     };
-    let (prompt_ids, vision_slots) = if vision_items.is_empty() {
-        (
-            state.tokenizer.render_chat(&req.messages, req.tools.as_ref())?,
-            Vec::new(),
-        )
-    } else {
-        let (ids, slots) = state.tokenizer.render_chat_with_vision(
-            &req.messages,
-            req.tools.as_ref(),
-            &vision_items,
-        )?;
+    // Run template render on the blocking pool and bound it by the
+    // same deadline. Render is normally <1 ms but on a maximally
+    // large body it can become non-trivial; without this timeout
+    // the admission permit could be held arbitrarily long.
+    //
+    // Move vision_items INTO the closure (avoids cloning multi-MB
+    // image bytes) and return them back along with the rendered
+    // ids + slots so the rest of the handler still has them.
+    let render_messages = req.messages.clone();
+    let render_tools = req.tools.clone();
+    let render_tokenizer = state.tokenizer.clone();
+    type RenderOut = (Vec<u32>, Vec<crate::tokenize::VisionSlot>, Vec<crate::worker::VisionItem>);
+    let render_join = tokio::task::spawn_blocking(move || -> ApiResult<RenderOut> {
+        if vision_items.is_empty() {
+            Ok((render_tokenizer.render_chat(&render_messages, render_tools.as_ref())?,
+                Vec::new(),
+                vision_items))
+        } else {
+            let (ids, slots) = render_tokenizer.render_chat_with_vision(
+                &render_messages,
+                render_tools.as_ref(),
+                &vision_items,
+            )?;
+            Ok((ids, slots, vision_items))
+        }
+    });
+    let (prompt_ids, vision_slots, vision_items) = match tokio::time::timeout_at(request_deadline, render_join).await {
+        Ok(joined) => joined
+            .map_err(|e| ApiError::Internal(format!("template render joined: {e}")))??,
+        Err(_) => {
+            return Err(ApiError::invalid_param(
+                "chat template render exceeded request_timeout",
+                "messages",
+                "render_timeout",
+            ));
+        }
+    };
+    if !vision_items.is_empty() {
         tracing::info!(
             num_images = vision_items.len(),
             total_vision_tokens = vision_items.iter().map(|v| v.num_tokens).sum::<usize>(),
-            prompt_tokens = ids.len(),
+            prompt_tokens = prompt_ids.len(),
             "vision: rendered chat with placeholder expansion"
         );
-        (ids, slots)
-    };
+    }
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap, state.vision_arch)?;
 
     dump_write(&request_id, "prompt_tokens", &serde_json::json!({
@@ -618,7 +647,6 @@ async fn chat_collect(
                         // beyond any reasonable stop-string boundary
                         // (a stop pattern would have to BPE-tokenize
                         // to >64 tokens to be missed).
-                        const STOP_TAIL_WINDOW: usize = 64;
                         let from = token_ids.len().saturating_sub(STOP_TAIL_WINDOW);
                         if let Ok(probe) = tokenizer.decode_raw(&token_ids[from..]) {
                             for s in stop_text {
@@ -1513,6 +1541,7 @@ pub async fn completions(
     // Mirror chat-handler validation + post-decode truncation below.
     let stop_text = req.stop.as_ref().map(|s| extract_stop(s)).unwrap_or_default();
     validate_stops(&stop_text)?;
+    validate_stops_against_tokenizer(&stop_text, &state.tokenizer)?;
     // Cycle 37 P1 (codex audit): mirror the chat-handler fix — reject
     // stream+stop BEFORE tokenization so it's a zero-GPU-cost 400.
     if req.stream && !stop_text.is_empty() {
@@ -1632,7 +1661,6 @@ async fn completion_collect(
                         // beyond any reasonable stop-string boundary
                         // (a stop pattern would have to BPE-tokenize
                         // to >64 tokens to be missed).
-                        const STOP_TAIL_WINDOW: usize = 64;
                         let from = token_ids.len().saturating_sub(STOP_TAIL_WINDOW);
                         if let Ok(probe) = tokenizer.decode_raw(&token_ids[from..]) {
                             for s in stop_text {
@@ -2256,6 +2284,16 @@ fn extract_stop(s: &StopField) -> Vec<String> {
     }
 }
 
+/// Sliding-tail window size used by the response collectors to
+/// detect stop-string matches incrementally. Must be kept in sync
+/// with the constant inside both `chat_collect` and
+/// `completion_collect`.
+const STOP_TAIL_WINDOW: usize = 64;
+/// Maximum stop-string token length we accept. Smaller than
+/// STOP_TAIL_WINDOW so a stop straddling a window boundary still
+/// fully fits inside a single window evaluation.
+const STOP_MAX_TOKENS: usize = STOP_TAIL_WINDOW - 8;
+
 fn validate_stops(stops: &[String]) -> ApiResult<()> {
     if stops.len() > 4 {
         return Err(ApiError::invalid_param(
@@ -2264,11 +2302,9 @@ fn validate_stops(stops: &[String]) -> ApiResult<()> {
             "too_many_stops",
         ));
     }
-    // Cap each stop string by character length so the
-    // STOP_TAIL_WINDOW=64 sliding tail in the response collector
-    // is provably long enough to contain any match. 256 chars is
-    // a hard upper bound on byte-level expansion and well below
-    // 64 tokens for any realistic tokenizer.
+    // First-line defense: cap each stop string by character length
+    // so the per-request tokenizer probe below has a bounded input.
+    // 256 chars covers any realistic stop sequence in any tokenizer.
     const MAX_STOP_CHARS: usize = 256;
     for (i, s) in stops.iter().enumerate() {
         if s.chars().count() > MAX_STOP_CHARS {
@@ -2279,6 +2315,44 @@ fn validate_stops(stops: &[String]) -> ApiResult<()> {
                 ),
                 "stop",
                 "stop_too_long",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Per-request tokenizer-aware stop-string validation. The
+/// response collector matches stops only against the last
+/// STOP_TAIL_WINDOW tokens of generation; if a stop would tokenize
+/// to more than STOP_MAX_TOKENS, it could straddle the window
+/// boundary and be missed entirely, leaving the GPU running until
+/// EOS / max_tokens. Reject those at admission with the actual
+/// tokenizer instead of the previous "256 chars is provably less
+/// than 64 tokens" assumption that was tokenizer-dependent.
+fn validate_stops_against_tokenizer(
+    stops: &[String],
+    tokenizer: &crate::tokenize::TokenizerHandle,
+) -> ApiResult<()> {
+    for (i, s) in stops.iter().enumerate() {
+        let toks = tokenizer.encode(s).map_err(|e| {
+            ApiError::invalid_param(
+                format!("stop[{i}] failed to tokenize: {e:?}"),
+                "stop",
+                "stop_invalid",
+            )
+        })?;
+        if toks.len() > STOP_MAX_TOKENS {
+            return Err(ApiError::invalid_param(
+                format!(
+                    "stop[{i}] tokenizes to {} tokens; server limit \
+                     is {STOP_MAX_TOKENS} (STOP_TAIL_WINDOW={STOP_TAIL_WINDOW} \
+                     − slack). The incremental stop scanner only sees \
+                     the last STOP_TAIL_WINDOW tokens; a longer stop \
+                     could straddle the boundary and be missed.",
+                    toks.len()
+                ),
+                "stop",
+                "stop_too_many_tokens",
             ));
         }
     }

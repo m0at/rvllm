@@ -121,6 +121,25 @@ fn parse_data_uri(rest: &str) -> Result<Vec<u8>, VisionError> {
             is_base64 = true;
         }
     }
+    // Pre-check the encoded size before doing the actual decode so a
+    // 60 MiB base64 payload doesn't get fully decoded into a fresh
+    // ~45 MiB Vec just to be rejected at line below. base64 expands
+    // 3 → 4 bytes, so a decoded payload of `MAX_IMAGE_BYTES` cannot
+    // arrive in fewer than `MAX_IMAGE_BYTES * 4 / 3 + 4` encoded
+    // bytes (the +4 covers the optional padding pair). Percent-
+    // encoding is per-byte 1:1 (or 3:1 for escapes) so the encoded
+    // length is already a strict upper bound on the decoded length.
+    let max_encoded = if is_base64 {
+        // saturating_mul keeps the math safe for a hypothetical
+        // bumped MAX_IMAGE_BYTES; saturating_add adds the padding.
+        MAX_IMAGE_BYTES.saturating_mul(4) / 3 + 4
+    } else {
+        MAX_IMAGE_BYTES
+    };
+    if data.len() > max_encoded {
+        return Err(VisionError::TooLarge(data.len(), max_encoded));
+    }
+
     let bytes = if is_base64 {
         B64.decode(data.as_bytes())
             .map_err(|e| VisionError::BadDataUri(format!("base64: {e}")))?
