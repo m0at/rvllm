@@ -36,6 +36,15 @@ name = "probe-gemma4-load"
 path = "src/bin/probe_gemma4_load.rs"
 required-features = ["gb10"]
 
+# `bench-qwen-prefill` times the per-token Qwen 3.6 prefill loop at
+# several prompt-length buckets. Same gating reasoning as
+# probe-gemma4-load: needs a real GB10 + a Qwen3-VL fp8 checkpoint.
+# See v3/QWEN_BATCHED_PREFILL_PLAN.md (Phase 2).
+[[bin]]
+name = "bench-qwen-prefill"
+path = "src/bin/bench_qwen_prefill.rs"
+required-features = ["gb10"]
+
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
