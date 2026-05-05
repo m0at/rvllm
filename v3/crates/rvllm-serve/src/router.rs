@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Json, Router,
 };
@@ -100,6 +101,21 @@ pub fn build_router(state: AppState) -> Router {
         // out of scope for this server's current feature set.
         // Mark Responses-API tests as skipped or expected-501.
         .route("/v1/responses", post(responses_unsupported))
+        // Hard cap on request-body size before axum buffers the JSON
+        // into RAM. Without this a single client can post a 1 GiB
+        // data: URI and burn memory before any vision-admission
+        // limits kick in. 80 MiB matches the per-request multimodal
+        // ceiling (RVLLM_VISION_MAX_TOTAL_BYTES default 64 MiB +
+        // generous JSON overhead for base64-encoding + chat history)
+        // and is independently overridable via
+        // `RVLLM_HTTP_BODY_LIMIT_BYTES`. Returns 413 Payload Too Large.
+        .layer({
+            let limit_bytes: usize = std::env::var("RVLLM_HTTP_BODY_LIMIT_BYTES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(80 * 1024 * 1024);
+            DefaultBodyLimit::max(limit_bytes)
+        })
         .layer(trace)
         .with_state(state)
 }

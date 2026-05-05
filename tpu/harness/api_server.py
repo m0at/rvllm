@@ -95,12 +95,24 @@ def sample_token(logits, temperature):
 
 
 def generate(prompt_ids, max_tokens, temperature, stop_sequences):
-    """Token-by-token generation. Yields (token_id, token_text) pairs."""
+    """Token-by-token generation. Yields (token_id, token_text) pairs.
+
+    NOTE — current limitations of this experimental TPU API harness:
+    * `temperature > 0` is rejected at the HTTP layer because
+      `forward_step` argmaxes inside the JIT and discards logits.
+      A future logits-out variant + host-side `sample_token` would
+      lift this; the dead `sample_token` helper above is kept as a
+      reference implementation.
+    * Prompt prefill is token-at-a-time (one JIT call per prompt
+      token). This is a known TTFT bottleneck for long prompts;
+      a batched/scan'd prefill is the right fix and is out of
+      scope for this round.
+    """
     fwd_jit = jax.jit(forward_step)
     sl_caches, gl_caches = make_fresh_caches()
     num_prompt = len(prompt_ids)
 
-    # Prefill: feed prompt tokens one at a time
+    # Prefill: feed prompt tokens one at a time. See docstring.
     for step in range(num_prompt):
         tok_arr = jnp.array([prompt_ids[step]], dtype=jnp.int32)
         pos = jnp.int32(step)
@@ -116,17 +128,20 @@ def generate(prompt_ids, max_tokens, temperature, stop_sequences):
 
     for decode_step in range(max_tokens):
         token_text = TOKENIZER.decode([sampled])
+        # Stop-check BEFORE yielding so the stop sequence does not
+        # leak into the client's visible output. EOS is special-cased
+        # to also stop, but EOS is allowed in output so we still emit
+        # it before returning.
+        if stop_sequences:
+            tentative = accumulated + token_text
+            if any(ss in tentative for ss in stop_sequences):
+                return
         accumulated += token_text
         generated_count += 1
         yield sampled, token_text
 
         if sampled in EOS_TOKENS:
             return
-
-        if stop_sequences:
-            for ss in stop_sequences:
-                if ss in accumulated:
-                    return
 
         if num_prompt + decode_step + 1 >= MAX_CTX - 1:
             return
@@ -252,6 +267,18 @@ class APIHandler(BaseHTTPRequestHandler):
 
         max_tokens = body.get("max_tokens", 256)
         temperature = body.get("temperature", 0.0)
+        # `forward_step` argmaxes inside the JIT and discards logits,
+        # so non-greedy sampling cannot be honoured here. Reject
+        # explicitly so callers cannot believe their `temperature`
+        # was applied. Lift when a logits-out forward_step variant
+        # lands and `sample_token` is wired into the generate loop.
+        if temperature is not None and temperature > 0:
+            self._send_error(
+                400,
+                "temperature > 0 not supported on the TPU API harness "
+                "(forward_step is greedy). Set temperature=0 or omit it.",
+            )
+            return
         stream = body.get("stream", False)
         stop = body.get("stop")
         if isinstance(stop, str):
