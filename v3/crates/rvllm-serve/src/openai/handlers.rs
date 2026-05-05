@@ -285,6 +285,23 @@ pub async fn chat_completions(
                     "unsupported_content_part",
                 ));
             }
+            // Reject literal image-placeholder special-token markers in
+            // user/assistant text. These tokenize to the same IDs the
+            // post-render scan in tokenize.rs uses to splice vision
+            // embeddings — letting them through would let one text part
+            // consume a real image's vision slot.
+            for marker in ["<|image|>", "<|image_pad|>"] {
+                if c.text_contains(marker) {
+                    return Err(ApiError::invalid_param(
+                        format!(
+                            "messages[{i}].content contains reserved marker `{marker}`; \
+                             this string is not allowed in chat text"
+                        ),
+                        "messages",
+                        "reserved_marker_in_text",
+                    ));
+                }
+            }
         }
         match m.role {
             Role::User | Role::System => {
@@ -2009,7 +2026,37 @@ fn collect_vision_items(
 ) -> ApiResult<Vec<crate::worker::VisionItem>> {
     use crate::openai::vision_fetch::{fetch_image, predict_gemma_num_tokens, predict_qwen_num_tokens, VisionError};
     let is_gemma = matches!(vision_arch, crate::router::VisionArch::Gemma4);
+
+    // Cheap admission preflight: count image parts BEFORE fetching any
+    // bytes, so a request with hundreds of slow URLs can't tie up the
+    // handler for `N * fetch_timeout` before the queue/GPU layer ever
+    // sees it. The byte- and token-budgets are enforced incrementally
+    // inside the fetch loop below.
+    let max_images: usize = std::env::var("RVLLM_VISION_MAX_IMAGES")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let max_total_bytes: u64 = std::env::var("RVLLM_VISION_MAX_TOTAL_BYTES")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(64 * 1024 * 1024);
+    let max_total_tokens: usize = std::env::var("RVLLM_VISION_MAX_TOTAL_TOKENS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(8192);
+    let total_image_parts: usize = messages
+        .iter()
+        .filter_map(|m| m.content.as_ref())
+        .map(|c| c.image_urls().count())
+        .sum();
+    if total_image_parts > max_images {
+        return Err(ApiError::invalid_param(
+            format!(
+                "request has {total_image_parts} image parts; server cap \
+                 RVLLM_VISION_MAX_IMAGES={max_images}"
+            ),
+            "messages",
+            "too_many_images",
+        ));
+    }
+
     let mut items = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut total_tokens: usize = 0;
     for (mi, m) in messages.iter().enumerate() {
         let Some(content) = m.content.as_ref() else { continue };
         for img in content.image_urls() {
@@ -2035,6 +2082,28 @@ fn collect_vision_items(
             } else {
                 predict_qwen_num_tokens(w, h)
             };
+            total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+            total_tokens = total_tokens.saturating_add(num_tokens);
+            if total_bytes > max_total_bytes {
+                return Err(ApiError::invalid_param(
+                    format!(
+                        "aggregate image bytes {total_bytes} exceeds cap \
+                         RVLLM_VISION_MAX_TOTAL_BYTES={max_total_bytes}"
+                    ),
+                    "messages",
+                    "image_total_bytes_too_large",
+                ));
+            }
+            if total_tokens > max_total_tokens {
+                return Err(ApiError::invalid_param(
+                    format!(
+                        "aggregate predicted vision tokens {total_tokens} \
+                         exceeds cap RVLLM_VISION_MAX_TOTAL_TOKENS={max_total_tokens}"
+                    ),
+                    "messages",
+                    "image_total_tokens_too_large",
+                ));
+            }
             tracing::info!(
                 msg_idx = mi,
                 width = w,

@@ -235,6 +235,19 @@ impl ChatContent {
         }
     }
 
+    /// True if any text part (or text content) contains `needle`.
+    /// Used by request validation to reject literal image-placeholder
+    /// markers that would collide with the post-render token-id scan.
+    pub fn text_contains(&self, needle: &str) -> bool {
+        match self {
+            ChatContent::Text(s) => s.contains(needle),
+            ChatContent::Parts(parts) => parts.iter().any(|p| match p {
+                ChatContentPart::Text { text } => text.contains(needle),
+                _ => false,
+            }),
+        }
+    }
+
     /// Iterate all `image_url` parts in document order.
     pub fn image_urls(&self) -> impl Iterator<Item = &ImageUrl> {
         let parts: &[ChatContentPart] = match self {
@@ -533,7 +546,27 @@ mod tests {
     fn parses_unsupported_part_for_validator() {
         // Unknown part types must NOT fail JSON parse — the request
         // validator is responsible for emitting a clean 400 with the
-        // unsupported `type` name.
+        // unsupported `type` name. `image_url` is now a first-class
+        // supported part (vision input); use a genuinely unknown kind
+        // here to keep the validator-path test honest.
+        let body = r#"{
+            "model":"m",
+            "messages":[{
+                "role":"user",
+                "content":[{"type":"audio_url","audio_url":{"url":"http://example/x.wav"}}]
+            }]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(body).expect("parse");
+        let bad = req.messages[0]
+            .content
+            .as_ref()
+            .expect("content")
+            .first_unsupported_part_type();
+        assert_eq!(bad, Some("audio_url"));
+    }
+
+    #[test]
+    fn image_url_part_is_supported() {
         let body = r#"{
             "model":"m",
             "messages":[{
@@ -547,7 +580,7 @@ mod tests {
             .as_ref()
             .expect("content")
             .first_unsupported_part_type();
-        assert_eq!(bad, Some("image_url"));
+        assert_eq!(bad, None);
     }
 
     #[test]

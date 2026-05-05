@@ -5351,6 +5351,7 @@ impl Gemma4Bringup {
     /// 1152→5376). Returns f16 embeddings of shape
     /// `[num_pooled_tokens, 5376]` ready for splice into the post-embed
     /// text-side hidden buffer.
+    #[cfg(feature = "cuda")]
     pub fn forward_gemma_vision(
         &self,
         image_bytes: &[u8],

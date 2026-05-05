@@ -138,6 +138,10 @@ pub async fn spawn_cuda_worker(
                             Vec::with_capacity(req.vision_items.len());
                         let mut vision_failed = false;
                         for (i, item) in req.vision_items.iter().enumerate() {
+                            if req.cancelled.load(Ordering::Relaxed) {
+                                vision_failed = true;
+                                break;
+                            }
                             match qwen.forward_qwen_vision(&item.bytes) {
                                 Ok(out) => {
                                     if out.num_tokens != item.num_tokens {
@@ -517,6 +521,10 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         Vec::with_capacity(req.vision_items.len());
     let mut vision_failed_msg: Option<String> = None;
     for (i, item) in req.vision_items.iter().enumerate() {
+        if req.cancelled.load(Ordering::Relaxed) {
+            vision_failed_msg = Some("cancelled".to_string());
+            break;
+        }
         match bringup.forward_gemma_vision(&item.bytes) {
             Ok(out) => {
                 tracing::info!(
