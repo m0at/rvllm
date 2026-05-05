@@ -6054,6 +6054,83 @@ impl Qwen36Bringup {
     pub fn init_prefix_cache(&self) -> ! {
         unimplemented!("qwen36 phase 2 — prefix cache not yet ported");
     }
+
+    /// Phase 3a (Qwen batched-prefill plan): single dispatch point for
+    /// every per-layer projection in `apply_layer_*`. Today every
+    /// projection call site instantiates `Fp8GemvF16InLaunch { m, n, k }`
+    /// directly; routing them through this method is the prerequisite
+    /// for Phase 4, which will batch the per-token loop and pass
+    /// `m = num_tokens` instead of `m = 1`.
+    ///
+    /// Routing:
+    /// * **m = 1**: delegates byte-identically to
+    ///   `Fp8GemvF16InLaunch { m: 1, n, k }`. Existing tests +
+    ///   determinism canaries stay green.
+    /// * **m ≥ 2**: returns a typed error pointing at Phase 3b. The
+    ///   plan there is to:
+    ///     1. quantize the f16 input to fp8 + per-token f32 amax via
+    ///        a small `fp8_quantize_per_token_f16` kernel (new),
+    ///     2. either pass the existing `[N/128, K/128]` row-major
+    ///        weight blockscale straight into `cublaslt.fp8_gemm` (if
+    ///        the layout is acceptable to cuBLASLt) or transpose it
+    ///        into MN-major like Gemma does for the CUTLASS path,
+    ///     3. dispatch to `self.cublaslt.fp8_gemm` for tensor-core
+    ///        throughput at large m, then validate per-shape cosine
+    ///        ≥ 0.9999 against a reference implementation that loops
+    ///        the m=1 GEMV N times.
+    ///   The error message names Phase 3b explicitly so a future
+    ///   Phase 4 patch that flips the caller to m=N immediately
+    ///   surfaces "Phase 3b not done" instead of producing silently
+    ///   wrong tokens.
+    ///
+    /// `kernel_gemv` is the resolved
+    /// `fn_fp8_gemv_wpr_native_f16in` handle (the caller is expected
+    /// to have already failed-fast if it's not loaded — see
+    /// `forward_qwen36_decode`'s ok_or_else).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fp8_proj_dispatch(
+        &self,
+        kernel_gemv: rvllm_kernels::KernelFn,
+        out_f16: u64,
+        weight_fp8: u64,
+        b_blockscale: u64,
+        input_f16: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if m == 0 || n == 0 || k == 0 {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 fp8_proj_dispatch: zero-size dim",
+                rvllm_core::CudaErrorKind::Other,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
+        if m == 1 {
+            // SAFETY: caller-supplied pointers are already-validated
+            // device addresses; Fp8GemvF16InLaunch internally re-checks
+            // K%8 alignment.
+            return rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch { m, n, k }.launch(
+                kernel_gemv,
+                out_f16,
+                weight_fp8,
+                b_blockscale,
+                input_f16,
+                stream,
+            );
+        }
+        // Phase 3b: cuBLASLt fp8_gemm path. Needs a quantize-only
+        // kernel for the input + (probably) a blockscale layout
+        // transpose. Not landing in the same commit as the dispatcher
+        // scaffold so each step has its own determinism canary.
+        Err(rvllm_core::RvllmError::cuda(
+            "qwen36 fp8_proj_dispatch: m >= 2 path not yet wired (Phase 3b — see v3/QWEN_BATCHED_PREFILL_PLAN.md). \
+             Today every caller still passes m = 1; this branch is unreachable on the production prefill path.",
+            rvllm_core::CudaErrorKind::Other,
+            rvllm_core::CudaCtx::setup(),
+        ))
+    }
 }
 
 /// IEEE 754 f32 → f16 round-to-nearest-even encode without pulling

@@ -45,6 +45,15 @@ name = "bench-qwen-prefill"
 path = "src/bin/bench_qwen_prefill.rs"
 required-features = ["gb10"]
 
+# `probe-qwen-fp8-proj` validates the m=1 dispatcher path is byte-
+# identical to a direct Fp8GemvF16InLaunch call against the same
+# weight + input, plus that the m≥2 path returns the Phase-3b
+# deferral sentinel. See v3/QWEN_BATCHED_PREFILL_PLAN.md (Phase 3a).
+[[bin]]
+name = "probe-qwen-fp8-proj"
+path = "src/bin/probe_qwen_fp8_proj.rs"
+required-features = ["gb10"]
+
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
