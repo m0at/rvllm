@@ -175,6 +175,18 @@ pub struct Qwen36OutsideKernels {
     /// (Qwen 3.6 full-attn layers don't use sliding).
     pub flash_attention_mod: LoadedModule,
     pub fn_flash_attention_2_decode_f16io: KernelFn,
+    /// Phase Full / Round-26: F16-KV prefill kernel from
+    /// flash_attention.cu. Takes [num_tokens, num_heads, head_dim]
+    /// f32 query, produces f32 output, with causal mask + GQA support.
+    /// Used by `apply_layer_full_attn_batched` as the
+    /// one-launch-per-layer attention call (replacing N decode-kernel
+    /// launches in the per-token loop). The f16->f32 / f32->f16
+    /// converts around it use cast_fp kernels.
+    pub fn_flash_attention_2_f16kv: KernelFn,
+    /// Phase Full / Round-26: f16 -> f32 elementwise cast (used to
+    /// convert query rows for the f16kv prefill kernel which expects
+    /// f32 query).
+    pub fn_cast_f16_to_f32: KernelFn,
     /// Phase 4j: Qwen-specific element-wise `sigmoid(gate) * values`
     /// for the `attn_output_gate=true` path. New CUDA kernel added
     /// in this phase — kernels/sigmoid_mul_f16.cu.
@@ -564,6 +576,8 @@ impl Qwen36Bringup {
         let fn_fp8_gemv_indirect = fp8_gemv_indirect_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_indirect_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
+        let fn_flash_attention_2_f16kv = flash_attention_mod
+            .get_function("flash_attention_2_f16kv_kernel")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
         let sigmoid_mul_f16_mod = kernels.load_ptx("sigmoid_mul_f16")?;
@@ -619,6 +633,7 @@ impl Qwen36Bringup {
         let fn_add_bias_f16 = add_bias_f16_mod.get_function("add_bias_f16_kernel")?;
         let cast_fp_mod = kernels.load_ptx("cast_fp")?;
         let fn_cast_f32_to_f16 = cast_fp_mod.get_function("cast_f32_to_f16_kernel")?;
+        let fn_cast_f16_to_f32 = cast_fp_mod.get_function("cast_f16_to_f32_kernel")?;
         let vector_add_f16_mod = kernels.load_ptx("vector_add_f16")?;
         let fn_vector_add_f16 =
             vector_add_f16_mod.get_function("vector_add_f16_kernel")?;
@@ -681,6 +696,8 @@ impl Qwen36Bringup {
             fn_fp8_gemv_indirect,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
+            fn_flash_attention_2_f16kv,
+            fn_cast_f16_to_f32,
             sigmoid_mul_f16_mod,
             fn_sigmoid_mul_f16,
             causal_conv1d_f16_mod,
