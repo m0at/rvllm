@@ -4112,7 +4112,17 @@ impl Gemma4Bringup {
                     chunk_start_abs as usize .. chunk_end_abs as usize
                 ].iter().map(|&t| t as i32).collect();
                 token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_ids))?;
-                if chunk_idx == 0 {
+                // Round-19 P1: this readback was a hand-rolled diagnostic
+                // for verifying that `prefix_skip` slid the chunk window
+                // correctly during the batch-prefill bring-up. It used
+                // to fire unconditionally on every batch-prefill request
+                // — `self.stream.fence()` + `cuMemcpyDtoH_v2` over the
+                // whole chunk + synchronous `eprintln!` to stderr —
+                // serialising the GPU pipeline and disk-I/O-bottlenecking
+                // the worker per request. Now it's gated on the same
+                // `RVLLM_DIAG_COMPARE` flag the rest of the prefill
+                // diff harness uses.
+                if chunk_idx == 0 && diag_compare {
                     self.stream.fence()?;
                     let mut readback = vec![0i32; chunk_q as usize];
                     cudarc::driver::sys::cuMemcpyDtoH_v2(

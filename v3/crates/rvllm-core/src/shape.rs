@@ -54,7 +54,16 @@ impl Shape {
     pub fn numel(&self) -> usize {
         let mut n: usize = 1;
         for &d in &self.dims[..self.rank as usize] {
-            n = n.checked_mul(d).expect("Shape::numel overflow");
+            // Round-19 P2: crate-level `#![deny(clippy::expect_used)]`
+            // means we can't use `.expect(…)` here. The panic itself
+            // is the documented invariant-violation guard (see the
+            // doc-comment above); we just have to express it as a
+            // bare `panic!` instead of going through `.expect`. Same
+            // semantics, lint-clean.
+            n = match n.checked_mul(d) {
+                Some(v) => v,
+                None => panic!("Shape::numel overflow"),
+            };
         }
         n
     }

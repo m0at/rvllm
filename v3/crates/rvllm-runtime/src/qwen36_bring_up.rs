@@ -4810,15 +4810,35 @@ impl Qwen36Bringup {
         )?;
 
         // ── Step 7: DtoH the final embeddings. ──────────────────────
+        // Round-19 P1: previously the cuMemcpyDtoH return code was
+        // discarded with `let _ = …`. Any CUDA fault, lost context,
+        // or copy-size mismatch then handed an all-zero / stale
+        // `out_bytes` back to the caller, which spliced silently into
+        // the residual buffer and produced syntactically clean but
+        // meaningless vision output. Propagate the error so the
+        // request fails loudly.
         let mut out_bytes = vec![0u8; n_merged * out_hidden * 2];
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
+            let r = cuMemcpyDtoH_v2(
                 out_bytes.as_mut_ptr() as *mut _,
                 final_region.device_ptr(),
                 out_bytes.len(),
             );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::Cuda {
+                    kind: rvllm_core::CudaErrorKind::MemcpyFailed,
+                    op: "qwen_vision_output_dtoh",
+                    ctx: rvllm_core::CudaCtx {
+                        stream: 0,
+                        kernel: "",
+                        launch: None,
+                        device: 0,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
         }
 
         Ok(VisionForwardOutput {

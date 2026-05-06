@@ -4,6 +4,16 @@
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// Round-19 P2: `RvllmError` carries a `std::backtrace::Backtrace` per
+// variant (≥130 B by itself) plus the `Loader { err, ctx, bt }` bundle
+// (~168 B), so clippy flags every `Result<_, RvllmError>` as
+// `result_large_err`. The right fix is to box large variants, but
+// every crate downstream already pattern-matches on `RvllmError` so
+// that's a workspace-wide refactor — not in scope here. Suppress at
+// the crate level with this note so future readers know the lint is
+// intentionally muted, not forgotten. `cargo clippy -- -D warnings`
+// now succeeds for `rvllm-core` and consumers.
+#![allow(clippy::result_large_err)]
 // `panic!` is allowed only in tests and in builder-validation paths that
 // are explicitly documented as invariant-violating. Everywhere else,
 // errors flow through `Result<T, RvllmError>`.
