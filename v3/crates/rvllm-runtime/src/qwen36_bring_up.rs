@@ -5541,15 +5541,19 @@ impl Qwen36Bringup {
         let half = (self.kv_cache_layer_bytes / 2) as u64;
         let k_cache_layer_ptr = kv_layer_ptr;
         let v_cache_layer_ptr = kv_layer_ptr + half;
-        let pos_bytes = (position as i32).to_le_bytes();
-        // Phase 4b-prep iter24: pos_region and slot_region carried the
-        // same i32 `position` value via two separate 4-byte HtoDs per
-        // full-attn layer. Same value → share the device pointer; one
-        // HtoD per layer × 10 layers / token saved.
-        let pos_region = self.arena.region("qwen36_pf_pos", 4, 16)?;
+        // Phase 4b-prep iter26: pack `position` (used by RoPE as both
+        // pos and slot) AND `context_len = position + 1` (used by paged
+        // FA2) into ONE 8-byte HtoD per full-attn layer. Replaces two
+        // separate 4-byte HtoDs (pos_region + cl_region).
+        let context_len_for_pack = (position as i32) + 1;
+        let mut pos_cl_bytes = [0u8; 8];
+        pos_cl_bytes[..4].copy_from_slice(&(position as i32).to_le_bytes());
+        pos_cl_bytes[4..].copy_from_slice(&context_len_for_pack.to_le_bytes());
+        let pos_region = self.arena.region("qwen36_pf_pos_cl", 8, 16)?;
         let slot_dev_ptr = pos_region.device_ptr();
+        let cl_dev_ptr = pos_region.device_ptr() + 4;
         unsafe {
-            pos_region.copy_from_host(&pos_bytes)?;
+            pos_region.copy_from_host(&pos_cl_bytes)?;
         }
         #[cfg(feature = "cuda")]
         unsafe {
@@ -5617,14 +5621,9 @@ impl Qwen36Bringup {
         //    block in our single-sequence cache maps to itself in
         //    physical layout. context_lens=[position+1] (causal —
         //    attend to all prior tokens).
-        let context_len = (position as i32) + 1;
-        // Phase 4b-prep iter25: identity block table is constant —
-        // uploaded once at bring-up. Only context_len varies per
-        // token, so only one small HtoD per layer instead of two.
-        let cl_region = self.arena.region("qwen36_pf_cl", 4, 16)?;
-        unsafe {
-            cl_region.copy_from_host(&context_len.to_le_bytes())?;
-        }
+        // Phase 4b-prep iter25/26: identity block table is uploaded
+        // once at bring-up; `context_len` was packed with `position`
+        // into pos_region above (one combined HtoD per layer).
         let attn_out_region =
             self.arena.region("qwen36_pf_attn_out", q_size * 2, 16)?;
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -5647,7 +5646,7 @@ impl Qwen36Bringup {
             let mut key_cache = k_cache_layer_ptr;
             let mut value_cache = v_cache_layer_ptr;
             let mut block_tables = self.bt_persistent_ptr;
-            let mut context_lens = cl_region.device_ptr();
+            let mut context_lens = cl_dev_ptr;
             let mut scale_arg = scale;
             let mut nh = num_heads as i32;
             let mut nkvh = num_kv_heads as i32;
