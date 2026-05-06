@@ -4555,8 +4555,14 @@ impl Gemma4Bringup {
             );
         }
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[prefill] {} tokens in {:.1}ms (TTFT={:.1}ms)",
-            prompt_ids.len(), prefill_ms, prefill_ms);
+        // tracing::info! instead of unconditional eprintln! — operators
+        // can gate via RUST_LOG, no synchronous stderr write on every
+        // request.
+        tracing::info!(
+            tokens = prompt_ids.len(),
+            ttft_ms = prefill_ms,
+            "prefill complete"
+        );
 
         let mut output_ids: Vec<u32> = Vec::with_capacity(max_new);
         let first_tok = host_tok[0] as u32;
@@ -4616,6 +4622,19 @@ impl Gemma4Bringup {
         // didn't fire. A future cycle can capture multiple graphs
         // (one per partition-decision range) and replay the
         // appropriate one — out of scope here.
+        // Hoisted from inside the decode loop. Reading `std::env::var`
+        // is a syscall + alloc on every probe; doing it 4× per token
+        // adds up over long completions and is unobservable to the
+        // caller (env doesn't change mid-request).
+        let cfg_guard_n: usize = std::env::var("RVLLM_REPETITION_GUARD_N")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let cfg_cycle_k: usize = std::env::var("RVLLM_REPETITION_CYCLE_K")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        let cfg_cycle_frac: f32 = std::env::var("RVLLM_REPETITION_CYCLE_MAX_FRAC")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+        let cfg_cycle_max_unique: usize = std::env::var("RVLLM_REPETITION_CYCLE_MAX_UNIQUE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+
         let use_decode_graph = std::env::var("RVLLM_DECODE_GRAPH")
             .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
             .unwrap_or(false);
@@ -5123,8 +5142,7 @@ impl Gemma4Bringup {
             // guard only fires after at least N decode steps; short
             // legitimate completions (e.g. classifier "REPLY")
             // never trigger it.
-            let guard_n: usize = std::env::var("RVLLM_REPETITION_GUARD_N")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+            let guard_n = cfg_guard_n;
             if guard_n >= 2 && output_ids.len() >= guard_n {
                 let tail = &output_ids[output_ids.len() - guard_n..];
                 if tail.iter().all(|&id| id == tail[0]) {
@@ -5152,13 +5170,10 @@ impl Gemma4Bringup {
             // RVLLM_REPETITION_CYCLE_K          window (default 32, 0=disabled)
             // RVLLM_REPETITION_CYCLE_MAX_FRAC   ratio (default 0.5)
             // RVLLM_REPETITION_CYCLE_MAX_UNIQUE distinct count (default 5)
-            let cycle_k: usize = std::env::var("RVLLM_REPETITION_CYCLE_K")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+            let cycle_k = cfg_cycle_k;
             if cycle_k >= 8 && output_ids.len() >= cycle_k {
-                let cycle_frac: f32 = std::env::var("RVLLM_REPETITION_CYCLE_MAX_FRAC")
-                    .ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
-                let cycle_max_unique: usize = std::env::var("RVLLM_REPETITION_CYCLE_MAX_UNIQUE")
-                    .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+                let cycle_frac = cfg_cycle_frac;
+                let cycle_max_unique = cfg_cycle_max_unique;
                 let win = &output_ids[output_ids.len() - cycle_k..];
                 let mut counts: std::collections::HashMap<u32, u32> =
                     std::collections::HashMap::new();
@@ -5184,8 +5199,12 @@ impl Gemma4Bringup {
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let decode_ms = total_ms - prefill_ms;
 
-        eprintln!("[generate] {} tokens decoded in {:.1}ms ({:.1} tok/s)",
-            output_ids.len(), decode_ms, output_ids.len() as f64 / (decode_ms / 1000.0));
+        tracing::info!(
+            tokens = output_ids.len(),
+            decode_ms = decode_ms,
+            tok_per_s = output_ids.len() as f64 / (decode_ms / 1000.0),
+            "generate complete"
+        );
 
         // Update the prefix cache with this request's prompt so the
         // next request can benefit from a cache hit. We cache ONLY

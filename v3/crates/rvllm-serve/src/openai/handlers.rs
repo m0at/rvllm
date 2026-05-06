@@ -1597,7 +1597,26 @@ pub async fn completions(
     // `preprocess_time + request_timeout`.
     let request_deadline = tokio::time::Instant::now() + state.config.request_timeout;
 
-    let prompt_ids = state.tokenizer.encode(&prompt_text)?;
+    // Move tokenization off the async runtime: bodies up to 80 MiB
+    // (router default) can take O(prompt_chars) to encode and would
+    // block the Tokio worker. Bound by the same deadline as the rest
+    // of the request, mirroring the chat handler at L505+.
+    let encode_tokenizer = state.tokenizer.clone();
+    let encode_text = prompt_text;
+    let encode_join = tokio::task::spawn_blocking(move || -> ApiResult<Vec<u32>> {
+        encode_tokenizer.encode(&encode_text)
+    });
+    let prompt_ids = match tokio::time::timeout_at(request_deadline, encode_join).await {
+        Ok(joined) => joined
+            .map_err(|e| ApiError::Internal(format!("completions tokenize joined: {e}")))??,
+        Err(_) => {
+            return Err(ApiError::invalid_param(
+                "completions tokenize exceeded request_timeout",
+                "prompt",
+                "tokenize_timeout",
+            ));
+        }
+    };
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap, state.vision_arch)?;
 
     let (events_tx, events_rx) = mpsc::channel::<GenerateEvent>(64);
