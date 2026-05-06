@@ -192,6 +192,21 @@ impl TokenizerHandle {
         Ok(ids)
     }
 
+    /// Encode raw text WITHOUT prepending `<bos>`. Used by stop-string
+    /// admission validation: the runtime incremental stop scanner runs
+    /// over generated-token tails which never contain `<bos>`, so the
+    /// admission-side length check must mirror that or it will reject
+    /// stop strings whose token count plus 1-for-BOS just barely
+    /// exceeds `STOP_MAX_TOKENS` even though they fit at runtime.
+    pub fn encode_no_bos(&self, text: &str) -> Result<Vec<u32>, ApiError> {
+        let enc = self
+            .inner
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| ApiError::Tokenize(format!("{e}")))?;
+        Ok(enc.get_ids().to_vec())
+    }
+
     /// Token id of `<bos>` (if the tokenizer knows one).
     pub fn bos_token_id(&self) -> Option<u32> {
         self.inner.bos_token_id

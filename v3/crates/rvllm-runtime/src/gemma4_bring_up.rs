@@ -106,6 +106,7 @@ pub fn decode_graph_eligible_for_generation(
     partition_size: u32,
     capture_decode_step: u32,
     split_kv_active: bool,
+    allow_recapture: bool,
 ) -> bool {
     if partition_size == 0 {
         return false;
@@ -131,6 +132,20 @@ pub fn decode_graph_eligible_for_generation(
     if !split_kv_active {
         return true;
     }
+    // Round-18 finding #4: when split-KV is active but the parts count
+    // would change mid-generation, the caller can opt into re-capture
+    // (one captured graph per stable parts-range). The decode loop
+    // then drops the captured graph at each partition-boundary
+    // crossing and recaptures against the new gridDim.z. Replay is
+    // still O(launches/step) within each range — the only cost is a
+    // single eager warmup step + capture per crossing, which is
+    // sparse for realistic partition_sizes (≥ 256) on long contexts.
+    // Callers who want the strict pre-Codex36 "all-or-nothing"
+    // behaviour pass `allow_recapture=false`. The runtime caller
+    // resolves this from `RVLLM_DECODE_GRAPH_RECAPTURE` (default 1).
+    if allow_recapture {
+        return true;
+    }
     let capture_ctx = prompt_len
         .saturating_add(capture_decode_step)
         .saturating_add(1);
@@ -151,113 +166,112 @@ pub fn decode_graph_eligible_for_generation(
 mod decode_graph_eligibility_tests {
     use super::{decode_graph_eligible_for_generation, effective_partition_size};
 
+    // Strict mode = recapture disabled (round-18 finding #4 added the
+    // `allow_recapture` parameter). The pre-existing assertions all
+    // documented strict semantics, so we keep them under strict mode
+    // and add lenient-mode coverage below.
+    const STRICT: bool = false;
+    const LENIENT: bool = true;
+
     #[test]
     fn short_prompt_short_generation_eligible() {
         // Capture at ctx=2, end at ctx=33, partition=256 → both <= 256.
-        assert!(decode_graph_eligible_for_generation(0, 33, 256, 1, true));
+        assert!(decode_graph_eligible_for_generation(0, 33, 256, 1, true, STRICT));
     }
 
     #[test]
     fn long_prompt_inside_one_partition_eligible() {
         // prompt_len=200, max_new=40, partition=256 → end_ctx=240 ≤ 256.
-        assert!(decode_graph_eligible_for_generation(200, 40, 256, 1, true));
+        assert!(decode_graph_eligible_for_generation(200, 40, 256, 1, true, STRICT));
     }
 
     #[test]
-    fn generation_crosses_partition_boundary_blocked() {
+    fn generation_crosses_partition_boundary_blocked_in_strict_mode() {
         // prompt_len=200, max_new=200, end_ctx=400 → 400/256=2 parts,
         // capture_ctx=202 → 1 part. Capture would freeze single-CTA
         // path; replay the second half wrongly. Block capture.
-        assert!(!decode_graph_eligible_for_generation(200, 200, 256, 1, true));
+        assert!(!decode_graph_eligible_for_generation(200, 200, 256, 1, true, STRICT));
+        // Lenient mode allows this — the runtime re-captures at
+        // partition boundaries.
+        assert!(decode_graph_eligible_for_generation(200, 200, 256, 1, true, LENIENT));
     }
 
     #[test]
     fn long_prompt_already_past_boundary_eligible() {
         // prompt_len=2000, max_new=40 — capture_ctx and end_ctx both
         // produce 8 partitions, so the split-path decision is stable.
-        assert!(decode_graph_eligible_for_generation(2000, 40, 256, 1, true));
+        assert!(decode_graph_eligible_for_generation(2000, 40, 256, 1, true, STRICT));
     }
 
     #[test]
-    fn long_prompt_crossing_higher_boundary_blocked() {
-        // Codex36-1 regression test: parts_at_capture=8, parts_at_end=9
-        // (generation crosses one more partition boundary). The old
-        // "both > 1" rule incorrectly accepted this; with frozen
-        // gridDim.z and a live-context-driven reducer, partition slot
-        // 8 would be read but never written. New rule rejects.
-        // prompt_len=2000, max_new=300, partition=256
-        //   capture_ctx = 2002 → 8 parts
-        //   end_ctx     = 2300 → 9 parts
-        assert!(!decode_graph_eligible_for_generation(2000, 300, 256, 1, true));
+    fn long_prompt_crossing_higher_boundary_blocked_in_strict_mode() {
+        // Codex36-1 regression: parts_at_capture=8, parts_at_end=9
+        // (generation crosses one more partition boundary). Strict
+        // mode rejects to avoid replaying a frozen gridDim.z;
+        // lenient mode accepts because the decode loop will recapture
+        // at the boundary.
+        assert!(!decode_graph_eligible_for_generation(2000, 300, 256, 1, true, STRICT));
+        assert!(decode_graph_eligible_for_generation(2000, 300, 256, 1, true, LENIENT));
     }
 
     #[test]
     fn crossing_boundary_eligible_when_split_inactive() {
-        // Codex37-3 regression test: when split-KV is OFF, gridDim.z
-        // stays at 1 and the parts-count drift can't cause stale-slot
-        // reads. The same shape that Codex36-1 rejects (capture=8,
-        // end=9) is therefore safe to capture with split_kv_active=false.
-        assert!(decode_graph_eligible_for_generation(2000, 300, 256, 1, false));
+        // Codex37-3 regression: when split-KV is OFF, gridDim.z stays
+        // at 1 regardless of parts-count drift, so eligibility is
+        // independent of the strict/lenient flag.
+        assert!(decode_graph_eligible_for_generation(2000, 300, 256, 1, false, STRICT));
+        assert!(decode_graph_eligible_for_generation(2000, 300, 256, 1, false, LENIENT));
     }
 
     #[test]
     fn zero_partition_size_blocks() {
         // Defensive: a misconfigured partition_size of 0 must not
-        // panic via div_ceil; the eligibility just becomes false.
-        assert!(!decode_graph_eligible_for_generation(100, 100, 0, 1, true));
+        // panic via div_ceil; the eligibility just becomes false in
+        // both modes (the strict-mode parts-stable check would also
+        // div by zero, so we reject before the recapture branch).
+        assert!(!decode_graph_eligible_for_generation(100, 100, 0, 1, true, STRICT));
+        assert!(!decode_graph_eligible_for_generation(100, 100, 0, 1, true, LENIENT));
     }
 
     /// Regression: the eligibility check used to default to 256 while
     /// the attention dispatch defaulted to 1024. With 1024 the split-
     /// path threshold lives further out, so a default-config request
     /// of `prompt_len=900, max_new=200` (end_ctx=1100) crosses the
-    /// boundary at 1024 and must NOT be eligible. Pinning the
-    /// shared default catches a future drift loudly.
+    /// boundary at 1024 and is rejected by STRICT mode.
     #[test]
-    fn shared_default_blocks_900_plus_200_request() {
+    fn shared_default_blocks_900_plus_200_request_in_strict_mode() {
         let p = effective_partition_size();
         assert_eq!(p, 1024, "shared default drifted away from dispatch site");
         assert!(
-            !decode_graph_eligible_for_generation(900, 200, p, 1, true),
+            !decode_graph_eligible_for_generation(900, 200, p, 1, true, STRICT),
             "default-config 900+200 should cross the 1024 partition boundary",
         );
+        // Lenient mode accepts because the runtime re-captures.
+        assert!(decode_graph_eligible_for_generation(900, 200, p, 1, true, LENIENT));
     }
 
-    /// Honour `RVLLM_DECODE_GRAPH_CAPTURE_AT`. Operators tuning the
-    /// capture point (e.g. to capture later when prompt KV is more
-    /// settled) shift the boundary the eligibility check evaluates.
-    /// A capture deep into the partition-2 region must NOT be marked
-    /// eligible just because the early steps still fit in
-    /// partition-1 — otherwise the captured kernel freezes the
-    /// wrong path.
+    /// `RVLLM_DECODE_GRAPH_CAPTURE_AT` shifts which step the strict
+    /// parts-stability check evaluates. Lenient mode is unaffected
+    /// — re-capture handles whatever crossings occur.
     #[test]
     fn capture_at_shifts_eligibility_boundary() {
-        // prompt_len=200, max_new=300, p=256, capture_at=1 →
-        // capture_ctx=202 (parts=1), end_ctx=500 (parts=2) → blocked.
-        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 1, true));
-        // Same prompt+gen, capture_at=200 → capture_ctx=401 (parts=2),
-        // end_ctx=500 (parts=2) → eligible (both =2, equal).
-        // Codex51-2: must stay below max_new-1 (the loop bound) for
-        // the capture step to actually be reached at runtime.
-        assert!(decode_graph_eligible_for_generation(200, 300, 256, 200, true));
+        // capture_at=1, capture_ctx=202 (parts=1), end_ctx=500 (parts=2)
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 1, true, STRICT));
+        // capture_at=200, capture_ctx=401 (parts=2), end_ctx=500 (parts=2)
+        assert!(decode_graph_eligible_for_generation(200, 300, 256, 200, true, STRICT));
     }
 
     /// Codex51-2: capture_decode_step >= max_new - 1 is unreachable
-    /// because the decode loop runs `0..max_new - 1`. Earlier this
-    /// returned eligible and silently produced a no-op graph
-    /// capture; now reject up front so the eager-fallback warn line
-    /// makes the misconfiguration visible.
+    /// because the decode loop runs `0..max_new - 1`. Holds in both
+    /// modes (recapture doesn't help if capture is never reached).
     #[test]
     fn unreachable_capture_at_blocks() {
-        // capture_at == max_new - 1 → loop never executes step 299
-        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 299, true));
-        // capture_at > max_new - 1 → also unreachable
-        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 300, true));
-        // max_new = 1 → zero decode-loop iterations; nothing to capture
-        assert!(!decode_graph_eligible_for_generation(200, 1, 256, 0, true));
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 299, true, LENIENT));
+        assert!(!decode_graph_eligible_for_generation(200, 300, 256, 300, true, LENIENT));
+        assert!(!decode_graph_eligible_for_generation(200, 1, 256, 0, true, LENIENT));
         // max_new = 2 → loop runs step 0 only; capture_at = 0 should
         // still be eligible if the parts check holds.
-        assert!(decode_graph_eligible_for_generation(0, 2, 256, 0, true));
+        assert!(decode_graph_eligible_for_generation(0, 2, 256, 0, true, LENIENT));
     }
 
     /// Lock down the env-var resolver: invalid (non-power-of-two,
@@ -3003,6 +3017,12 @@ impl Gemma4Bringup {
         // this just stops the heap traffic.
         let mut host_logits: Vec<f32> = Vec::new();
         let mut scaled: Vec<(u32, f32)> = Vec::new();
+        // Both sampling paths reuse this single softmax-output buffer
+        // (clear+extend instead of `.collect()`). The fast top_p>=1
+        // path treats it as exp-of-shifted-logits; the slow path
+        // first writes exp values, then in-place re-normalises them
+        // to a probability vector — same shape either way.
+        let mut probs: Vec<f32> = Vec::new();
         let mut host_sample_token = |logits_dev_ptr: u64,
                                  vocab: u32,
                                  temp: f32,
@@ -3066,14 +3086,13 @@ impl Gemma4Bringup {
                 if top_k.is_none() && top_p >= 1.0 {
                     let max_l = scaled.iter().map(|&(_, l)| l)
                         .fold(f32::NEG_INFINITY, f32::max);
-                    let exps: Vec<f32> = scaled.iter()
-                        .map(|&(_, l)| (l - max_l).exp())
-                        .collect();
-                    let z: f32 = exps.iter().sum();
+                    probs.clear();
+                    probs.extend(scaled.iter().map(|&(_, l)| (l - max_l).exp()));
+                    let z: f32 = probs.iter().sum();
                     if z > 0.0 {
                         let r = rng_f32() * z;
                         let mut acc = 0.0f32;
-                        for (i, &e) in exps.iter().enumerate() {
+                        for (i, &e) in probs.iter().enumerate() {
                             acc += e;
                             if r < acc { return Ok(scaled[i].0); }
                         }
@@ -3110,9 +3129,9 @@ impl Gemma4Bringup {
                 // Softmax-stabilise on the kept slice (avoids overflow
                 // on huge logits — Gemma 4 sees 60+).
                 let max_l = scaled[0].1;
-                let mut probs: Vec<f32> = scaled[..effective_len].iter()
-                    .map(|&(_, l)| (l - max_l).exp())
-                    .collect();
+                probs.clear();
+                probs.extend(scaled[..effective_len].iter()
+                    .map(|&(_, l)| (l - max_l).exp()));
                 let z: f32 = probs.iter().sum();
                 if z > 0.0 { for p in &mut probs { *p /= z; } }
                 // top_p: keep tokens until cumulative >= top_p, drop rest.
@@ -4792,6 +4811,9 @@ impl Gemma4Bringup {
             && (split_decode_for_graph.has_split_kernels(arch.head_dim_sliding as u32, false)
                 || global_split_decode_for_graph
                     .has_split_kernels(arch.head_dim_global as u32, false));
+        let recapture_enabled = std::env::var("RVLLM_DECODE_GRAPH_RECAPTURE")
+            .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE" | "no"))
+            .unwrap_or(true);
         let decode_graph_eligible = use_decode_graph
             && decode_graph_eligible_for_generation(
                 prompt_ids.len() as u32,
@@ -4799,6 +4821,7 @@ impl Gemma4Bringup {
                 partition_size_for_graph,
                 decode_graph_capture_at as u32,
                 split_kv_active_for_graph,
+                recapture_enabled,
             );
         if use_decode_graph && !decode_graph_eligible {
             tracing::warn!(
@@ -4812,6 +4835,14 @@ impl Gemma4Bringup {
         }
         let use_decode_graph = decode_graph_eligible;
         let mut decode_graph: Option<rvllm_graph::CapturedGraph> = None;
+        // Round-18 finding #4: track the parts-count the captured graph
+        // was recorded against so we can re-capture across split-KV
+        // partition boundaries instead of falling back to eager for the
+        // entire generation. `None` here means "no graph captured yet";
+        // `Some(parts)` means the live graph's frozen gridDim.z assumes
+        // exactly `parts` partitions. When `parts_now != Some(parts)`
+        // we drop the graph and recapture.
+        let mut current_graph_parts: Option<u32> = None;
         for decode_step in 0..max_new - 1 {
             // Early-out on caller-side cancellation. Checked once per
             // step (cheap atomic load) so the worker thread releases
@@ -4832,13 +4863,32 @@ impl Gemma4Bringup {
             let step = prompt_ids.len() + decode_step;
             if use_decode_graph && decode_step >= decode_graph_capture_at {
                 // Post-warmup path: prepare inputs eagerly, then either
-                // capture (first time) or replay the captured graph.
+                // capture (first time / parts-count flipped) or replay
+                // the captured graph.
                 prepare_decode_inputs(tok_id, step)?;
-                if decode_graph.is_none() {
+                let ctx_now = (prompt_ids.len() + decode_step + 1) as u32;
+                let parts_now = if split_kv_active_for_graph {
+                    ctx_now
+                        .div_ceil(partition_size_for_graph.max(1))
+                        .max(1)
+                } else {
+                    1
+                };
+                let needs_recapture = decode_graph.is_none()
+                    || (recapture_enabled
+                        && current_graph_parts != Some(parts_now));
+                if needs_recapture {
                     // Capture body: kernels are RECORDED into the graph,
                     // not executed. So we still need an eager run BEFORE
                     // capture to populate KV[step]; the capture body is
                     // a second invocation that records but does not run.
+                    // Drop the previous (now-stale) graph before
+                    // recording the new one so its CUgraphExec
+                    // resources are released. `Option::take` returns
+                    // the inner Some which drops at the end of this
+                    // statement; explicit `_old` makes the intent
+                    // (release before recapture) obvious.
+                    let _old = decode_graph.take();
                     decode_forward(step)?;
                     self.stream.fence()?;
                     let g = rvllm_graph::CapturedGraph::capture(
@@ -4851,9 +4901,10 @@ impl Gemma4Bringup {
                         || decode_forward(step),
                     )?;
                     self.stream.fence()?;
-                    eprintln!("[decode-graph] captured at decode_step={} step={}",
-                        decode_step, step);
+                    eprintln!("[decode-graph] captured at decode_step={} step={} parts={}",
+                        decode_step, step, parts_now);
                     decode_graph = Some(g);
+                    current_graph_parts = Some(parts_now);
                 } else {
                     decode_graph.as_ref().unwrap().replay(stream)?;
                 }

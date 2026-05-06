@@ -111,6 +111,31 @@ fn dump_dir() -> Option<&'static std::path::Path> {
         .as_deref()
 }
 
+/// In-place redaction for the request dump. Replaces any string value
+/// that starts with `data:` (i.e. an inline base64 image URI) with a
+/// stable placeholder of the form `data:<mime?>;base64,<N bytes
+/// redacted>`. The dump is for replay debugging, not forensics — the
+/// placeholder preserves shape/length info while keeping per-request
+/// disk I/O O(N_messages) instead of O(image_payload_size). Walks
+/// objects + arrays recursively; leaves all non-`data:` strings
+/// untouched.
+fn redact_data_uris(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) if s.starts_with("data:") => {
+            let bytes = s.len();
+            let mime_end = s[..bytes.min(64)]
+                .find(';')
+                .or_else(|| s[..bytes.min(64)].find(','))
+                .unwrap_or(0);
+            let mime = &s[5..5 + mime_end.saturating_sub(5)];
+            *s = format!("data:{};base64,<{} bytes redacted>", mime, bytes);
+        }
+        serde_json::Value::Array(arr) => arr.iter_mut().for_each(redact_data_uris),
+        serde_json::Value::Object(map) => map.values_mut().for_each(redact_data_uris),
+        _ => {}
+    }
+}
+
 fn dump_write(request_id: &Uuid, suffix: &str, body: &serde_json::Value) {
     let Some(dir) = dump_dir() else { return };
     if !dir.exists() {
@@ -230,20 +255,6 @@ pub async fn chat_completions(
         stream = req.stream,
     );
     let _enter = span.enter();
-
-    // Request dump (no-op unless RVLLM_DUMP_REQUEST_DIR is set). The
-    // request body is already owned (from the `Json(req)` extractor);
-    // reserialise selected fields into a stable shape for replay.
-    dump_write(&request_id, "request", &serde_json::json!({
-        "model": &req.model,
-        "messages": &req.messages,
-        "tools": &req.tools,
-        "temperature": req.temperature,
-        "top_p": req.top_p,
-        "max_tokens": req.max_tokens,
-        "stream": req.stream,
-        "stop": &req.stop,
-    }));
 
     if req.model.is_empty() {
         return Err(ApiError::invalid_param(
@@ -463,6 +474,28 @@ pub async fn chat_completions(
     // blocking-pool usage (not just "until handler returns").
     let _admission = Arc::new(state.worker.try_admit()?);
     let request_deadline = tokio::time::Instant::now() + state.config.request_timeout;
+
+    // Request dump (no-op unless RVLLM_DUMP_REQUEST_DIR is set). Gated
+    // AFTER validation + admission so a hostile/misconfigured client
+    // sending malformed bodies, unknown models, or storms past the
+    // queue cap can't drive synchronous disk writes (with serialized
+    // base64 image data) before we've decided to spend resources.
+    // `redact_data_uris` swaps inline image data: URIs for placeholders
+    // so a 20 MiB image doesn't hit the dump file 1:1.
+    if dump_dir().is_some() {
+        let mut dump_body = serde_json::json!({
+            "model": &req.model,
+            "messages": &req.messages,
+            "tools": &req.tools,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "max_tokens": req.max_tokens,
+            "stream": req.stream,
+            "stop": &req.stop,
+        });
+        redact_data_uris(&mut dump_body);
+        dump_write(&request_id, "request", &dump_body);
+    }
 
     // Cheap async-side pre-scan: text-only chats are the overwhelming
     // majority, so don't pay a `spawn_blocking` round-trip + the
@@ -2494,7 +2527,13 @@ fn validate_stops_against_tokenizer(
     tokenizer: &crate::tokenize::TokenizerHandle,
 ) -> ApiResult<()> {
     for (i, s) in stops.iter().enumerate() {
-        let toks = tokenizer.encode(s).map_err(|e| {
+        // Use the no-BOS encoder: the runtime stop scanner runs over
+        // generated-token tails which never contain `<bos>`, so the
+        // length budget must mirror that. The plain `encode` always
+        // prepends BOS for Gemma 4 (its post_processor is empty), so
+        // a stop string at exactly STOP_MAX_TOKENS would be wrongly
+        // rejected as STOP_MAX_TOKENS+1.
+        let toks = tokenizer.encode_no_bos(s).map_err(|e| {
             ApiError::invalid_param(
                 format!("stop[{i}] failed to tokenize: {e:?}"),
                 "stop",
