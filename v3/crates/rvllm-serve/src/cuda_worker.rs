@@ -126,7 +126,7 @@ pub async fn spawn_cuda_worker(
                         // to decode cost. See
                         // rvllm-mem/src/context.rs:bind_to_current_thread.
                         if let Err(e) = qwen.ctx.bind_to_current_thread() {
-                            let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                            let _ = req.events_tx.send(GenerateEvent::Error(
                                 format!("qwen36 ctx rebind: {e:?}"),
                             ));
                             continue;
@@ -146,7 +146,7 @@ pub async fn spawn_cuda_worker(
                             // for stochastic. The old hint mentioned
                             // "omit sampling params" — that's exactly
                             // the path that USED to fail; corrected.
-                            let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                            let _ = req.events_tx.send(GenerateEvent::Error(
                                 "qwen36 path: non-greedy sampling \
                                  (temperature>0 / top_p<1 / top_k / seed) \
                                  is not yet supported on Qwen 3.6. Set \
@@ -164,14 +164,14 @@ pub async fn spawn_cuda_worker(
                             .and_then(|_| qwen.reset_kv_cache())
                             .and_then(|_| qwen.reset_conv_state());
                         if let Err(e) = reset_ok {
-                            let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                            let _ = req.events_tx.send(GenerateEvent::Error(
                                 format!("qwen36 per-request reset: {e:?}"),
                             ));
                             unsafe { qwen.arena.restore(scratch_ck); }
                             continue;
                         }
                         if req.cancelled.load(Ordering::Relaxed) {
-                            let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+                            let _ = req.events_tx.send(GenerateEvent::Done {
                                 finish: FinishReason::Cancelled,
                                 prompt_tokens: prompt_len,
                                 completion_tokens: 0,
@@ -199,7 +199,7 @@ pub async fn spawn_cuda_worker(
                             match qwen.forward_qwen_vision(&item.bytes) {
                                 Ok(out) => {
                                     if out.num_tokens != item.num_tokens {
-                                        let _ = req.events_tx.blocking_send(
+                                        let _ = req.events_tx.send(
                                             GenerateEvent::Error(format!(
                                                 "vision tokens mismatch: predicted {} got {}",
                                                 item.num_tokens, out.num_tokens
@@ -217,7 +217,7 @@ pub async fn spawn_cuda_worker(
                                     vision_outputs.push(out);
                                 }
                                 Err(e) => {
-                                    let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                                    let _ = req.events_tx.send(GenerateEvent::Error(
                                         format!("vision forward: {e:?}"),
                                     ));
                                     vision_failed = true;
@@ -249,7 +249,7 @@ pub async fn spawn_cuda_worker(
                         {
                             Ok(t) => t,
                             Err(e) => {
-                                let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                                let _ = req.events_tx.send(GenerateEvent::Error(
                                     format!("qwen36 prefill: {e:?}"),
                                 ));
                                 unsafe { qwen.arena.restore(scratch_ck); }
@@ -261,15 +261,21 @@ pub async fn spawn_cuda_worker(
                         let max_new = req.max_new_tokens.max(1);
                         for step in 0..max_new {
                             let id = if next_token < 0 { 0u32 } else { next_token as u32 };
-                            let _ = req.events_tx.blocking_send(GenerateEvent::Token {
-                                id,
-                                position: prompt_len + step,
-                            });
-                            completion_tokens += 1;
+                            // Round-20 finding #2: stop-token check BEFORE
+                            // emit + counter bump, so the EOS / stop
+                            // token never reaches the SSE consumer and
+                            // `completion_tokens` doesn't include it
+                            // (mirrors mock-worker semantics; previously
+                            // qwen leaked the stop token both ways).
                             if req.stop_token_ids.contains(&id) {
                                 finish = FinishReason::Stop;
                                 break;
                             }
+                            let _ = req.events_tx.send(GenerateEvent::Token {
+                                id,
+                                position: prompt_len + step,
+                            });
+                            completion_tokens += 1;
                             if req.cancelled.load(Ordering::Relaxed) {
                                 finish = FinishReason::Cancelled;
                                 break;
@@ -283,7 +289,7 @@ pub async fn spawn_cuda_worker(
                             match qwen.forward_qwen36_decode(&[next_token], pos, &[]) {
                                 Ok(t) => next_token = t,
                                 Err(e) => {
-                                    let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                                    let _ = req.events_tx.send(GenerateEvent::Error(
                                         format!("qwen36 decode step {step}: {e:?}"),
                                     ));
                                     finish = FinishReason::Stop;
@@ -291,7 +297,7 @@ pub async fn spawn_cuda_worker(
                                 }
                             }
                         }
-                        let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+                        let _ = req.events_tx.send(GenerateEvent::Done {
                             finish,
                             prompt_tokens: prompt_len,
                             completion_tokens,
@@ -466,7 +472,7 @@ pub async fn spawn_cuda_worker(
                 // binding after a long blocking_recv idle can produce
                 // cuLaunchKernel failures on the next decode.
                 if let Err(e) = bringup.ctx.bind_to_current_thread() {
-                    let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                    let _ = req.events_tx.send(GenerateEvent::Error(
                         format!("gemma4 ctx rebind: {e:?}"),
                     ));
                     continue;
@@ -525,7 +531,7 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
     let prompt_len = req.prompt_ids.len() as u32;
 
     if req.cancelled.load(Ordering::Relaxed) {
-        let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+        let _ = req.events_tx.send(GenerateEvent::Done {
             finish: FinishReason::Cancelled,
             prompt_tokens: prompt_len,
             completion_tokens: 0,
@@ -573,7 +579,7 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             return false;
         }
         let pos = emitted;
-        match events_tx_ref.blocking_send(GenerateEvent::Token { id, position: pos }) {
+        match events_tx_ref.send(GenerateEvent::Token { id, position: pos }) {
             Ok(()) => {
                 emitted += 1;
                 true
@@ -617,8 +623,8 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         }
     }
     if let Some(msg) = vision_failed_msg {
-        let _ = req.events_tx.blocking_send(GenerateEvent::Error(msg));
-        let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+        let _ = req.events_tx.send(GenerateEvent::Error(msg));
+        let _ = req.events_tx.send(GenerateEvent::Done {
             finish: FinishReason::Stop,
             prompt_tokens: prompt_len,
             completion_tokens: 0,
@@ -673,7 +679,7 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
             } else {
                 FinishReason::Stop
             };
-            let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+            let _ = req.events_tx.send(GenerateEvent::Done {
                 finish,
                 prompt_tokens: prompt_len,
                 completion_tokens: final_emitted,
@@ -682,7 +688,7 @@ fn run_one(bringup: &Gemma4Bringup, kernels: &GenerateKernels, req: GenerateRequ
         Err(e) => {
             let msg = format!("run_generate: {e}");
             tracing::error!(request_id = %req.request_id, error = %msg, "generation failed");
-            let _ = req.events_tx.blocking_send(GenerateEvent::Error(msg));
+            let _ = req.events_tx.send(GenerateEvent::Error(msg));
         }
     }
 }

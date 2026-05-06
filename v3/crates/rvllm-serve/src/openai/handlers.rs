@@ -424,6 +424,12 @@ pub async fn chat_completions(
     }
 
     let sampling = req.sampling_params().ensure_supported()?;
+    // Round-20 finding #3: Qwen 3.6 has no logits-out variant yet, so
+    // the worker hard-rejects any non-greedy request with a generic
+    // 500. Lift that to a 400 here, before tokenisation + admission,
+    // so callers get a clear "not supported" instead of consuming a
+    // queue slot for a doomed request.
+    reject_unsupported_sampling_for_arch(state.vision_arch, &sampling)?;
     // Modern OpenAI SDKs (Python ≥1.30, TS ≥4.x) send only
     // `max_completion_tokens`. Fall through to it when `max_tokens`
     // is missing — the conflict-vs-equal validation above already
@@ -643,7 +649,7 @@ pub async fn chat_completions(
         "num_images": vision_items.len(),
     }));
 
-    let (events_tx, events_rx) = mpsc::channel::<GenerateEvent>(64);
+    let (events_tx, events_rx) = mpsc::unbounded_channel::<GenerateEvent>();
     let cancelled = Arc::new(AtomicBool::new(false));
     // Move `prompt_ids` into the worker request — the handler only
     // needs the length afterwards (for the debug-log line + budget),
@@ -727,7 +733,7 @@ impl IntoResponse for ChatCompletionsResponse {
 async fn chat_collect(
     model_id: &str,
     tokenizer: &crate::tokenize::TokenizerHandle,
-    mut events_rx: mpsc::Receiver<GenerateEvent>,
+    mut events_rx: mpsc::UnboundedReceiver<GenerateEvent>,
     cancelled: Arc<AtomicBool>,
     request_timeout: std::time::Duration,
     request_id: Uuid,
@@ -976,7 +982,7 @@ fn shape_assistant_message(
 fn chat_stream_sse(
     model_id: String,
     tokenizer: crate::tokenize::TokenizerHandle,
-    events_rx: mpsc::Receiver<GenerateEvent>,
+    events_rx: mpsc::UnboundedReceiver<GenerateEvent>,
     cancelled: Arc<AtomicBool>,
     keepalive: std::time::Duration,
     request_timeout: std::time::Duration,
@@ -1021,7 +1027,7 @@ fn chat_stream_sse(
     // request file written by the parent handler.
     enum S {
         Role {
-            rx: mpsc::Receiver<GenerateEvent>,
+            rx: mpsc::UnboundedReceiver<GenerateEvent>,
             decoder: crate::tokenize::StreamDecoder,
             accum: String,
             emitted: usize,
@@ -1030,7 +1036,7 @@ fn chat_stream_sse(
             streamed_visible: String,
         },
         Content {
-            rx: mpsc::Receiver<GenerateEvent>,
+            rx: mpsc::UnboundedReceiver<GenerateEvent>,
             decoder: crate::tokenize::StreamDecoder,
             /// Full RAW decoded text so far (markers preserved).
             accum: String,
@@ -1682,6 +1688,7 @@ pub async fn completions(
     }
 
     let sampling = req.sampling_params().ensure_supported()?;
+    reject_unsupported_sampling_for_arch(state.vision_arch, &sampling)?;
     let max_new = resolve_max_new(req.max_tokens, state.config.max_new_tokens_cap)?;
     // Cycle 34 P0 (codex bug #1): completions did not even parse `stop`.
     // Mirror chat-handler validation + post-decode truncation below.
@@ -1732,7 +1739,7 @@ pub async fn completions(
     };
     reject_oversized_prompt(prompt_ids.len(), max_new, state.config.max_new_tokens_cap, state.vision_arch)?;
 
-    let (events_tx, events_rx) = mpsc::channel::<GenerateEvent>(64);
+    let (events_tx, events_rx) = mpsc::unbounded_channel::<GenerateEvent>();
     let cancelled = Arc::new(AtomicBool::new(false));
 
     // Move prompt_ids into the worker request; only the length is
@@ -1802,7 +1809,7 @@ impl IntoResponse for CompletionsResponse {
 async fn completion_collect(
     model_id: &str,
     tokenizer: &crate::tokenize::TokenizerHandle,
-    mut events_rx: mpsc::Receiver<GenerateEvent>,
+    mut events_rx: mpsc::UnboundedReceiver<GenerateEvent>,
     cancelled: Arc<AtomicBool>,
     request_timeout: std::time::Duration,
     stop_text: &[String],
@@ -1887,7 +1894,7 @@ async fn completion_collect(
 fn completion_stream_sse(
     model_id: String,
     tokenizer: crate::tokenize::TokenizerHandle,
-    events_rx: mpsc::Receiver<GenerateEvent>,
+    events_rx: mpsc::UnboundedReceiver<GenerateEvent>,
     cancelled: Arc<AtomicBool>,
     keepalive: std::time::Duration,
     request_timeout: std::time::Duration,
@@ -1901,7 +1908,7 @@ fn completion_stream_sse(
 
     enum S {
         Content {
-            rx: mpsc::Receiver<GenerateEvent>,
+            rx: mpsc::UnboundedReceiver<GenerateEvent>,
             decoder: crate::tokenize::StreamDecoder,
         },
         Finish(FinishReason),
@@ -2486,6 +2493,28 @@ const STOP_TAIL_WINDOW: usize = 64;
 /// STOP_TAIL_WINDOW so a stop straddling a window boundary still
 /// fully fits inside a single window evaluation.
 const STOP_MAX_TOKENS: usize = STOP_TAIL_WINDOW - 8;
+
+/// Round-20 finding #3: front-load arch ↔ sampling compatibility so we
+/// don't tokenise + admit + GPU-warm a request the worker is going to
+/// reject with a generic 500. Today only Qwen 3.6 is constrained
+/// (greedy-only, no logits-out variant); Gemma 4 supports stochastic.
+fn reject_unsupported_sampling_for_arch(
+    arch: crate::router::VisionArch,
+    sampling: &crate::sampling::SamplingDecision,
+) -> ApiResult<()> {
+    use crate::router::VisionArch;
+    if matches!(arch, VisionArch::Qwen36) && !sampling.is_greedy() {
+        return Err(ApiError::invalid_param(
+            "qwen3-6 path is greedy-only today: non-greedy sampling \
+             (temperature>0 / top_p<1 / top_k / seed) is not supported. \
+             Set temperature=0 explicitly, or omit it to take the \
+             greedy default.",
+            "temperature",
+            "sampling_unsupported_for_arch",
+        ));
+    }
+    Ok(())
+}
 
 fn validate_stops(stops: &[String]) -> ApiResult<()> {
     if stops.len() > 4 {

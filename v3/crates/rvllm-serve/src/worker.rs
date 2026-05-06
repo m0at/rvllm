@@ -24,7 +24,12 @@ pub struct GenerateRequest {
     pub sampling: SamplingDecision,
     pub max_new_tokens: u32,
     pub stop_token_ids: Vec<u32>,
-    pub events_tx: mpsc::Sender<GenerateEvent>,
+    // Round-20 finding #1: unbounded so a slow / non-polling SSE
+    // client cannot back-pressure the single CUDA worker via the
+    // 64-event blocking_send. Memory is bounded by `max_new_tokens`
+    // (server-capped); worst case ~4 K events × small payload ≈ 64
+    // KiB per request, far below any realistic admission concern.
+    pub events_tx: mpsc::UnboundedSender<GenerateEvent>,
     pub cancelled: Arc<AtomicBool>,
     /// Vision attachments (one per `image_url` content part). Empty
     /// for text-only requests. The worker runs the native vision
@@ -203,7 +208,7 @@ pub fn spawn_erroring_mock_worker(
             while let Some(req) = rx.blocking_recv() {
                 let _ = req
                     .events_tx
-                    .blocking_send(GenerateEvent::Error(msg.clone()));
+                    .send(GenerateEvent::Error(msg.clone()));
                 // Drop events_tx implicitly — the SSE handler treats
                 // a dropped channel as the "channel closed before Done"
                 // failure mode, but it has already received the
@@ -222,7 +227,7 @@ fn mock_run(req: GenerateRequest) {
     let mut produced: u32 = 0;
     for tok in 1..=req.max_new_tokens {
         if req.cancelled.load(Ordering::Relaxed) {
-            let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+            let _ = req.events_tx.send(GenerateEvent::Done {
                 finish: FinishReason::Cancelled,
                 prompt_tokens: prompt_len,
                 completion_tokens: produced,
@@ -230,7 +235,7 @@ fn mock_run(req: GenerateRequest) {
             return;
         }
         if req.stop_token_ids.contains(&tok) {
-            let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+            let _ = req.events_tx.send(GenerateEvent::Done {
                 finish: FinishReason::Stop,
                 prompt_tokens: prompt_len,
                 completion_tokens: produced,
@@ -239,7 +244,7 @@ fn mock_run(req: GenerateRequest) {
         }
         if req
             .events_tx
-            .blocking_send(GenerateEvent::Token { id: tok, position: produced })
+            .send(GenerateEvent::Token { id: tok, position: produced })
             .is_err()
         {
             // Receiver dropped — handler is gone, stop.
@@ -248,7 +253,7 @@ fn mock_run(req: GenerateRequest) {
         produced += 1;
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let _ = req.events_tx.blocking_send(GenerateEvent::Done {
+    let _ = req.events_tx.send(GenerateEvent::Done {
         finish: FinishReason::Length,
         prompt_tokens: prompt_len,
         completion_tokens: produced,
@@ -264,7 +269,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mock_produces_tokens() {
         let (handle, _join) = spawn_mock_worker(4);
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let sampling = SamplingParams { temperature: 0.0, ..Default::default() }
             .ensure_supported()
             .expect("greedy");
@@ -306,7 +311,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mock_honours_cancellation() {
         let (handle, _join) = spawn_mock_worker(4);
-        let (tx, mut rx) = mpsc::channel(16);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let sampling = SamplingParams { temperature: 0.0, ..Default::default() }
             .ensure_supported()
             .expect("greedy");

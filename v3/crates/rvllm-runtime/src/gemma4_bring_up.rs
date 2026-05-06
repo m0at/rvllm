@@ -4670,18 +4670,20 @@ impl Gemma4Bringup {
 
         let mut output_ids: Vec<u32> = Vec::with_capacity(max_new);
         let first_tok = host_tok[0] as u32;
+        // Round-20 finding #2: check EOS BEFORE invoking the streaming
+        // callback and BEFORE pushing to `output_ids`. The previous
+        // order (push → cb → eos-check) leaked the EOS token into the
+        // SSE stream and inflated `completion_tokens` by one. The cb
+        // is what reaches the client; output_ids what reaches the
+        // non-streaming response. Both must omit EOS.
+        if eos_ids.contains(&first_tok) {
+            return Ok(output_ids);
+        }
         output_ids.push(first_tok);
-        // Per-token emission for true streaming. The callback runs
-        // synchronously on the worker thread; if it returns false
-        // (channel closed / client disconnected), we treat that as
-        // a cancel signal and return the partial output.
         if let Some(cb) = on_token.as_mut() {
             if !cb(first_tok) {
                 return Ok(output_ids);
             }
-        }
-        if eos_ids.contains(&first_tok) {
-            return Ok(output_ids);
         }
 
         // Phase 2: Decode new tokens
@@ -5237,17 +5239,20 @@ impl Gemma4Bringup {
                 );
             }
             let next_id = host_tok[0] as u32;
+            // Round-20 finding #2: EOS check BEFORE push + callback so
+            // the special token never leaks to the SSE consumer or
+            // bumps `completion_tokens`.
+            if eos_ids.contains(&next_id) { break; }
             output_ids.push(next_id);
             // True-streaming hook: emit each token to the worker's
-            // event channel before checking EOS / repetition guards.
-            // A `false` return means the consumer is gone (closed
-            // channel) — treat as cancel and stop decoding.
+            // event channel. A `false` return means the consumer is
+            // gone (closed channel) — treat as cancel and stop
+            // decoding.
             if let Some(cb) = on_token.as_mut() {
                 if !cb(next_id) {
                     break;
                 }
             }
-            if eos_ids.contains(&next_id) { break; }
             // Cycle 33 fix (codex bug #5): tool-call close `<tool_call|>`
             // (token 49) was not a generation stop. After a valid tool
             // call closed, the model kept emitting hallucinated prose
