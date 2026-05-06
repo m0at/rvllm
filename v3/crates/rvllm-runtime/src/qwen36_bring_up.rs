@@ -90,6 +90,13 @@ pub struct Qwen36OutsideKernels {
     /// with one launch.
     pub conv_state_advance_f16_mod: LoadedModule,
     pub fn_conv_state_advance_f16: KernelFn,
+    /// Fused alpha/beta computation for Qwen Gated-DeltaNet
+    /// linear-attn. Replaces a host DtoH + f16→f32 + nested CPU
+    /// GEMV (130k FLOPs/layer/token) + HtoD round-trip with one
+    /// launch. Outputs f32 vectors (matches the existing
+    /// alpha_region / beta_region dtype).
+    pub qwen_linear_alpha_beta_f16_mod: LoadedModule,
+    pub fn_qwen_linear_alpha_beta_f16: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -387,6 +394,10 @@ impl Qwen36Bringup {
         let conv_state_advance_f16_mod = kernels.load_ptx("conv_state_advance_f16")?;
         let fn_conv_state_advance_f16 = conv_state_advance_f16_mod
             .get_function("conv_state_advance_f16_kernel")?;
+        let qwen_linear_alpha_beta_f16_mod =
+            kernels.load_ptx("qwen_linear_alpha_beta_f16")?;
+        let fn_qwen_linear_alpha_beta_f16 = qwen_linear_alpha_beta_f16_mod
+            .get_function("qwen_linear_alpha_beta_f16_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -462,6 +473,8 @@ impl Qwen36Bringup {
             fn_split_q_gate_f16,
             conv_state_advance_f16_mod,
             fn_conv_state_advance_f16,
+            qwen_linear_alpha_beta_f16_mod,
+            fn_qwen_linear_alpha_beta_f16,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -4949,50 +4962,56 @@ impl Qwen36Bringup {
             }
         }
 
-        // 6. Read normed input + in_proj_a/b weights, compute a, b.
-        let mut input_host = vec![0u8; last_hidden_bytes];
+        // 6. GPU alpha/beta: fused dot-product + softplus / sigmoid
+        // launched against the live normed input. Pre-allocate
+        // alpha_region and beta_region as f32 device buffers; the
+        // kernel writes them directly. Replaces the host pipeline
+        // (DtoH input → f16→f32 → nested CPU GEMV → HtoD alpha/beta)
+        // with one launch. The bring-up-time host cache from iter3
+        // becomes unused on the production path; kept as a fallback
+        // reference for diagnostics.
+        let h_us = hidden as usize;
+        let alpha_region = self.arena.region("qwen36_pl_alpha", vus * 4, 16)?;
+        let beta_region  = self.arena.region("qwen36_pl_beta",  vus * 4, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                input_host.as_mut_ptr() as *mut _,
-                normed_region.device_ptr(),
-                last_hidden_bytes,
+            let mut a_out = alpha_region.device_ptr();
+            let mut b_out = beta_region.device_ptr();
+            let mut a_w_p = la.in_proj_a.offset_bytes;
+            let mut b_w_p = la.in_proj_b.offset_bytes;
+            let mut a_log_p = la.a_log.offset_bytes;
+            let mut dt_bias_p = la.dt_bias.offset_bytes;
+            let mut in_p = normed_region.device_ptr();
+            let mut vus_i: i32 = vus as i32;
+            let mut h_i: i32 = h_us as i32;
+            let args = [
+                (&mut a_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_w_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut b_w_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut a_log_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut dt_bias_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut in_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut h_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256u32.min(h_us as u32).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_qwen_linear_alpha_beta_f16.raw() as CUfunction,
+                vus as u32, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
             );
-        }
-        let h_us = hidden as usize;
-        let mut input_f32 = vec![0.0f32; h_us];
-        for i in 0..h_us {
-            input_f32[i] = f16_bits_to_f32(u16::from_le_bytes([
-                input_host[i * 2], input_host[i * 2 + 1],
-            ]));
-        }
-        // Use the bring-up-time host cache instead of DtoH'ing the
-        // constant weights per token. `linear_seq_idx` indexes the
-        // cache in the same linear-attn-layer order
-        // `forward_qwen36_decode` walks. Saves ~256 KB DtoH + the
-        // f16→f32 conversion per token.
-        let cache = &self.linear_attn_host_cache[linear_seq_idx as usize];
-        debug_assert_eq!(cache.vus, vus);
-        debug_assert_eq!(cache.h_us, h_us);
-        let mut alpha_f32 = vec![0.0f32; vus];
-        let mut beta_f32 = vec![0.0f32; vus];
-        for v in 0..vus {
-            let mut a_acc = 0.0f32;
-            let mut b_acc = 0.0f32;
-            let row = v * h_us;
-            for k in 0..h_us {
-                a_acc += cache.a_w_f32[row + k] * input_f32[k];
-                b_acc += cache.b_w_f32[row + k] * input_f32[k];
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 linear_attn alpha_beta launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
-            let dt_b = cache.dt_bias_f32[v];
-            let a_log = cache.a_log_f32[v];
-            let x = a_acc + dt_b;
-            // numerically-stable softplus
-            let sp = if x > 20.0 { x } else { (1.0f32 + x.exp()).ln() };
-            let g = -a_log.exp() * sp;
-            alpha_f32[v] = g.exp();
-            beta_f32[v] = 1.0f32 / (1.0f32 + (-b_acc).exp());
         }
 
         // Phase 5i: GPU delta-rule kernel.
@@ -5026,22 +5045,15 @@ impl Qwen36Bringup {
         let q_region = self.arena.region("qwen36_pl_q", qk_bytes, 16)?;
         let k_region = self.arena.region("qwen36_pl_k", qk_bytes, 16)?;
         let v_region = self.arena.region("qwen36_pl_v", v_bytes, 16)?;
-        let alpha_bytes: Vec<u8> =
-            alpha_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let beta_bytes: Vec<u8> =
-            beta_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let alpha_region =
-            self.arena.region("qwen36_pl_alpha", alpha_bytes.len(), 16)?;
-        let beta_region =
-            self.arena.region("qwen36_pl_beta", beta_bytes.len(), 16)?;
+        // alpha/beta_region were allocated + filled by the alpha_beta
+        // GPU kernel earlier in step 6. Keep using the same names.
         let readout_region =
             self.arena.region("qwen36_pl_readout", v_bytes, 16)?;
         unsafe {
             q_region.copy_from_host(&q_exp)?;
             k_region.copy_from_host(&k_exp)?;
             v_region.copy_from_host(&v_pack)?;
-            alpha_region.copy_from_host(&alpha_bytes)?;
-            beta_region.copy_from_host(&beta_bytes)?;
+            // alpha + beta are device-resident already.
         }
         #[cfg(feature = "cuda")]
         unsafe {

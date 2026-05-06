@@ -341,6 +341,11 @@
       "path": "probe_green_ctx.ptx",
       "sha256": "7fddcc1223529f89736a859f33a5b7fab538c90ee2411dffb3282b9cec1f57fc"
     },
+    "qwen_linear_alpha_beta_f16": {
+      "bytes": 13625,
+      "path": "qwen_linear_alpha_beta_f16.ptx",
+      "sha256": "c75d5da720e7d2645294c4be8f971c73f9f7ebbf0238e93f004ffa19b824b4a1"
+    },
     "repetition_penalty": {
       "bytes": 4570,
       "path": "repetition_penalty.ptx",
@@ -532,5 +537,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "4358fc3"
+  "revision": "210bd3e"
 }
