@@ -97,6 +97,12 @@ pub struct Qwen36OutsideKernels {
     /// alpha_region / beta_region dtype).
     pub qwen_linear_alpha_beta_f16_mod: LoadedModule,
     pub fn_qwen_linear_alpha_beta_f16: KernelFn,
+    /// Fused silu + Q/K L2-norm + GQA-expand + V silu-pack for
+    /// Qwen Gated-DeltaNet linear-attn. Replaces the host pipeline
+    /// (DtoH conv_out + CPU silu/L2/GQA + HtoD q_exp/k_exp/v_pack)
+    /// with one launch.
+    pub qwen_linear_silu_l2_gqa_f16_mod: LoadedModule,
+    pub fn_qwen_linear_silu_l2_gqa_f16: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -398,6 +404,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("qwen_linear_alpha_beta_f16")?;
         let fn_qwen_linear_alpha_beta_f16 = qwen_linear_alpha_beta_f16_mod
             .get_function("qwen_linear_alpha_beta_f16_kernel")?;
+        let qwen_linear_silu_l2_gqa_f16_mod =
+            kernels.load_ptx("qwen_linear_silu_l2_gqa_f16")?;
+        let fn_qwen_linear_silu_l2_gqa_f16 = qwen_linear_silu_l2_gqa_f16_mod
+            .get_function("qwen_linear_silu_l2_gqa_f16_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -475,6 +485,8 @@ impl Qwen36Bringup {
             fn_conv_state_advance_f16,
             qwen_linear_alpha_beta_f16_mod,
             fn_qwen_linear_alpha_beta_f16,
+            qwen_linear_silu_l2_gqa_f16_mod,
+            fn_qwen_linear_silu_l2_gqa_f16,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -4917,48 +4929,56 @@ impl Qwen36Bringup {
         }
         self.stream.fence()?;
 
-        // 4. Host: read conv_out, SiLU, split [Q | K | V] correctly.
-        let mut conv_out_host = vec![0u8; qkv_bytes_dev];
+        // 4+5. GPU-side fused silu + Q/K L2-norm + GQA-expand + V silu-pack.
+        // Allocates the q_exp / k_exp / v_pack device regions and
+        // writes them directly. Replaces the host pipeline (DtoH
+        // conv_out + CPU silu + per-k-head L2 + GQA-expand into
+        // host bytes + HtoD q/k/v).
+        let qk_bytes_pre = vus * hkd * 2;
+        let v_bytes_pre  = vus * hvd * 2;
+        let q_region = self.arena.region("qwen36_pl_q", qk_bytes_pre, 16)?;
+        let k_region = self.arena.region("qwen36_pl_k", qk_bytes_pre, 16)?;
+        let v_region = self.arena.region("qwen36_pl_v", v_bytes_pre, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                conv_out_host.as_mut_ptr() as *mut _,
-                conv_out_region.device_ptr(),
-                qkv_bytes_dev,
+            let mut q_out = q_region.device_ptr();
+            let mut k_out = k_region.device_ptr();
+            let mut v_out = v_region.device_ptr();
+            let mut conv_p = conv_out_region.device_ptr();
+            let mut vus_i: i32 = vus as i32;
+            let mut hkd_i: i32 = hkd as i32;
+            let mut hvd_i: i32 = hvd as i32;
+            let mut kd_i:  i32 = key_dim as i32;
+            let mut nvh:   i32 = num_v_heads as i32;
+            let mut vpk:   i32 = v_per_k as i32;
+            let args = [
+                (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut conv_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hkd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut kd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut vpk) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = (hkd.max(hvd)) as u32;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_qwen_linear_silu_l2_gqa_f16.raw() as CUfunction,
+                vus as u32, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
             );
-        }
-        let mut conv_silu = vec![0.0f32; qkv_n as usize];
-        for i in 0..qkv_n as usize {
-            let v = f16_bits_to_f32(u16::from_le_bytes([
-                conv_out_host[i * 2], conv_out_host[i * 2 + 1],
-            ]));
-            conv_silu[i] = v / (1.0f32 + (-v).exp());
-        }
-        // Q lives in [0..key_dim), K in [key_dim..2*key_dim), V in [2*key_dim..conv_dim).
-        let kd = key_dim as usize;
-        let vd = value_dim as usize;
-        let q_slice = &conv_silu[0..kd];
-        let k_slice = &conv_silu[kd..2*kd];
-        let v_slice = &conv_silu[2*kd..2*kd+vd];
-
-        // 5. L2-norm Q and K per k-head.
-        let mut q_l2 = vec![0.0f32; kd];
-        let mut k_l2 = vec![0.0f32; kd];
-        for h in 0..kus {
-            let mut q_sq = 0.0f32;
-            let mut k_sq = 0.0f32;
-            for d in 0..hkd {
-                let qv = q_slice[h * hkd + d];
-                let kv = k_slice[h * hkd + d];
-                q_sq += qv * qv;
-                k_sq += kv * kv;
-            }
-            let q_norm = (q_sq + 1e-6).sqrt();
-            let k_norm = (k_sq + 1e-6).sqrt();
-            for d in 0..hkd {
-                q_l2[h * hkd + d] = q_slice[h * hkd + d] / q_norm;
-                k_l2[h * hkd + d] = k_slice[h * hkd + d] / k_norm;
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 linear_attn silu_l2_gqa launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
         }
 
@@ -5022,39 +5042,13 @@ impl Qwen36Bringup {
         // updated in-place in the persistent linear-state slice.
         let layer_state_ptr = self.linear_state_layer_ptr(linear_seq_idx);
         let scale = 1.0f32 / (head_k_dim as f32).sqrt();
-        let qk_bytes = vus * hkd * 2;
         let v_bytes = vus * hvd * 2;
-        let mut q_exp = vec![0u8; qk_bytes];
-        let mut k_exp = vec![0u8; qk_bytes];
-        let mut v_pack = vec![0u8; v_bytes];
-        for v in 0..vus {
-            let kh = v / (v_per_k as usize);
-            for d in 0..hkd {
-                let qb = f32_to_f16_bits(q_l2[kh * hkd + d]).to_le_bytes();
-                let kb = f32_to_f16_bits(k_l2[kh * hkd + d]).to_le_bytes();
-                let base = (v * hkd + d) * 2;
-                q_exp[base] = qb[0]; q_exp[base + 1] = qb[1];
-                k_exp[base] = kb[0]; k_exp[base + 1] = kb[1];
-            }
-            for d in 0..hvd {
-                let vb = f32_to_f16_bits(v_slice[v * hvd + d]).to_le_bytes();
-                let base = (v * hvd + d) * 2;
-                v_pack[base] = vb[0]; v_pack[base + 1] = vb[1];
-            }
-        }
-        let q_region = self.arena.region("qwen36_pl_q", qk_bytes, 16)?;
-        let k_region = self.arena.region("qwen36_pl_k", qk_bytes, 16)?;
-        let v_region = self.arena.region("qwen36_pl_v", v_bytes, 16)?;
-        // alpha/beta_region were allocated + filled by the alpha_beta
-        // GPU kernel earlier in step 6. Keep using the same names.
+        // q_region, k_region, v_region were allocated + filled by
+        // the silu_l2_gqa GPU kernel in step 4+5; alpha_region and
+        // beta_region by the alpha_beta kernel in step 6. All four
+        // are device-resident already — no further HtoD needed.
         let readout_region =
             self.arena.region("qwen36_pl_readout", v_bytes, 16)?;
-        unsafe {
-            q_region.copy_from_host(&q_exp)?;
-            k_region.copy_from_host(&k_exp)?;
-            v_region.copy_from_host(&v_pack)?;
-            // alpha + beta are device-resident already.
-        }
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
