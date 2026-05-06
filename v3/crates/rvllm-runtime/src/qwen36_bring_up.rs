@@ -108,6 +108,13 @@ pub struct Qwen36OutsideKernels {
     /// + HtoD gated) at the end of `apply_layer_linear_attn`.
     pub qwen_linear_rmsnorm_gated_f16_mod: LoadedModule,
     pub fn_qwen_linear_rmsnorm_gated_f16: KernelFn,
+    /// Pointwise SwiGLU activation `out = silu(gate) * up`. Used in
+    /// `apply_layer_moe` to replace the per-expert host pipeline
+    /// (DtoH gate + DtoH up + CPU silu·mul + HtoD silu) — saves
+    /// two DtoH + one HtoD per expert × top_k experts × 30 MoE
+    /// layers per token (Phase 4b-prep iter11).
+    pub silu_mul_f16_mod: LoadedModule,
+    pub fn_silu_mul_f16: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -417,6 +424,9 @@ impl Qwen36Bringup {
             kernels.load_ptx("qwen_linear_rmsnorm_gated_f16")?;
         let fn_qwen_linear_rmsnorm_gated_f16 = qwen_linear_rmsnorm_gated_f16_mod
             .get_function("qwen_linear_rmsnorm_gated_f16_kernel")?;
+        let silu_mul_f16_mod = kernels.load_ptx("silu_mul_f16")?;
+        let fn_silu_mul_f16 =
+            silu_mul_f16_mod.get_function("silu_mul_f16_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -498,6 +508,8 @@ impl Qwen36Bringup {
             fn_qwen_linear_silu_l2_gqa_f16,
             qwen_linear_rmsnorm_gated_f16_mod,
             fn_qwen_linear_rmsnorm_gated_f16,
+            silu_mul_f16_mod,
+            fn_silu_mul_f16,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -5729,26 +5741,34 @@ impl Qwen36Bringup {
                     normed_region.device_ptr(),
                     m, n_int, k_in, stream_raw)?;
             }
-            self.stream.fence()?;
-            let mut g_host = vec![0u8; mid_bytes];
-            let mut u_host = vec![0u8; mid_bytes];
+            // GPU silu·mul: silu_region = silu(gate_region) * up_region
+            // (Phase 4b-prep iter11 — replaces DtoH gate + DtoH up +
+            // CPU loop + HtoD silu round-trip per expert).
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(g_host.as_mut_ptr() as *mut _,
-                    gate_region.device_ptr(), mid_bytes);
-                let _ = cuMemcpyDtoH_v2(u_host.as_mut_ptr() as *mut _,
-                    up_region.device_ptr(), mid_bytes);
+                let mut out = silu_region.device_ptr();
+                let mut g = gate_region.device_ptr();
+                let mut u = up_region.device_ptr();
+                let mut nn = n_int as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut g) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut u) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = (n_int as u32 + block - 1) / block;
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_silu_mul_f16.raw() as CUfunction,
+                    grid, 1, 1,
+                    block, 1, 1,
+                    0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
             }
-            let mut silu_host = vec![0u8; mid_bytes];
-            for i in 0..(n_int as usize) {
-                let g = f16_bits_to_f32(u16::from_le_bytes([g_host[i * 2], g_host[i * 2 + 1]]));
-                let u = f16_bits_to_f32(u16::from_le_bytes([u_host[i * 2], u_host[i * 2 + 1]]));
-                let s = g / (1.0f32 + (-g).exp());
-                let sb = f32_to_f16_bits(s * u).to_le_bytes();
-                silu_host[i * 2] = sb[0]; silu_host[i * 2 + 1] = sb[1];
-            }
-            unsafe { silu_region.copy_from_host(&silu_host)? };
             unsafe {
                 self.fp8_proj_dispatch(kernel_gemv, down_region.device_ptr(),
                     moe.experts_down_proj_fused.offset_bytes + e * down_per_expert_w,
@@ -5788,26 +5808,32 @@ impl Qwen36Bringup {
                     normed_region.device_ptr(),
                     m, n_int, k_in, stream_raw)?;
             }
-            self.stream.fence()?;
-            let mut g_host = vec![0u8; mid_bytes];
-            let mut u_host = vec![0u8; mid_bytes];
+            // GPU silu·mul on the shared expert (Phase 4b-prep iter11).
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(g_host.as_mut_ptr() as *mut _,
-                    gate_region.device_ptr(), mid_bytes);
-                let _ = cuMemcpyDtoH_v2(u_host.as_mut_ptr() as *mut _,
-                    up_region.device_ptr(), mid_bytes);
+                let mut out = silu_region.device_ptr();
+                let mut g = gate_region.device_ptr();
+                let mut u = up_region.device_ptr();
+                let mut nn = n_int as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut g) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut u) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = (n_int as u32 + block - 1) / block;
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_silu_mul_f16.raw() as CUfunction,
+                    grid, 1, 1,
+                    block, 1, 1,
+                    0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
             }
-            let mut silu_host = vec![0u8; mid_bytes];
-            for i in 0..(n_int as usize) {
-                let g = f16_bits_to_f32(u16::from_le_bytes([g_host[i * 2], g_host[i * 2 + 1]]));
-                let u = f16_bits_to_f32(u16::from_le_bytes([u_host[i * 2], u_host[i * 2 + 1]]));
-                let s = g / (1.0f32 + (-g).exp());
-                let sb = f32_to_f16_bits(s * u).to_le_bytes();
-                silu_host[i * 2] = sb[0]; silu_host[i * 2 + 1] = sb[1];
-            }
-            unsafe { silu_region.copy_from_host(&silu_host)? };
             unsafe {
                 self.fp8_proj_dispatch(kernel_gemv, down_region.device_ptr(),
                     moe.shared_expert_down_proj.offset_bytes, sh_down_bs,
