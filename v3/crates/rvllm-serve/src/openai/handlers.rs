@@ -613,6 +613,13 @@ pub async fn chat_completions(
         vision_slots,
         events_tx,
         cancelled: cancelled.clone(),
+        // Hand the worker a clone of the admission permit so the
+        // queue cap reflects "request still owned by the worker"
+        // — not just "handler still running". Released only when
+        // BOTH the handler-side clone and the in-request clone
+        // drop, which means the worker has finished pulling the
+        // request off the mpsc and processing it.
+        _admission: Some(_admission.clone()),
     };
     tracing::debug!(prompt_tokens = prompt_len, max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
@@ -1694,6 +1701,7 @@ pub async fn completions(
         vision_slots: Vec::new(),
         events_tx,
         cancelled: cancelled.clone(),
+        _admission: Some(_admission.clone()),
     };
     tracing::debug!(prompt_tokens = prompt_len, max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;

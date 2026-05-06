@@ -36,6 +36,18 @@ pub struct GenerateRequest {
     /// `hidden_region[slot.token_start .. slot.token_start + slot.num_tokens]`
     /// with the vision-tower output for `vision_items[slot.vision_item_idx]`.
     pub vision_slots: Vec<crate::tokenize::VisionSlot>,
+    /// Admission permit "owned" by this request for as long as the
+    /// worker is processing it. The handler passes a clone of its
+    /// `Arc<OwnedSemaphorePermit>` here; the permit is released
+    /// only when both the handler's clone and this one drop. The
+    /// worker owns this clone until it removes the request from
+    /// the channel + finishes (or cancels) it. Without this, a
+    /// handler-side timeout (chat_collect/completion_collect) used
+    /// to release the permit while the request was still queued
+    /// in the mpsc channel and/or in flight on the GPU; new
+    /// requests then passed admission, did the expensive
+    /// preprocessing, and bounced on a `try_send` "queue full".
+    pub _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 /// One image attached to a chat request.
@@ -267,6 +279,7 @@ mod tests {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 vision_items: Vec::new(),
                 vision_slots: Vec::new(),
+                _admission: None,
             })
             .await
             .expect("submit");
@@ -309,6 +322,7 @@ mod tests {
                 cancelled: cancel.clone(),
                 vision_items: Vec::new(),
                 vision_slots: Vec::new(),
+                _admission: None,
             })
             .await
             .expect("submit");
