@@ -4864,8 +4864,27 @@ impl Qwen36Bringup {
         // [1, D] slot, plus chunked-recurrent linear-attention
         // and batched-causal full-attention variants. Substantial
         // refactor; tracked as Codex round 16 #2 follow-up.
+        // Phase 4b-prep iter35: hoisted pos+context_len HtoD. Reused
+        // across all 10 full-attn layers within a token, replacing
+        // 10 per-layer 8-byte HtoDs with 1. Also a prerequisite for
+        // CUDA Graph capture — sync HtoDs cannot be inside a captured
+        // region.
+        let pos_cl_region = self.arena.region("qwen36_pf_pos_cl", 8, 16)?;
+        let pos_dev_ptr = pos_cl_region.device_ptr();
+        let cl_dev_ptr  = pos_dev_ptr + 4;
         for tok_local in 0..num_tokens {
             let tok_pos = start_position + tok_local;
+            // Update pos+context_len for THIS token. Sync HtoD; runs
+            // outside any future graph-captured region (it's a
+            // host-side mutation of the device buffer that the
+            // captured kernels read from on the next replay).
+            {
+                let cl_for_pack = (tok_pos as i32) + 1;
+                let mut bytes = [0u8; 8];
+                bytes[..4].copy_from_slice(&(tok_pos as i32).to_le_bytes());
+                bytes[4..].copy_from_slice(&cl_for_pack.to_le_bytes());
+                unsafe { pos_cl_region.copy_from_host(&bytes)? };
+            }
             // Phase 1 of the Qwen batched-prefill plan: the layer
             // functions now accept a raw device pointer to the
             // per-token slot in `hidden_region`. The previous
@@ -4923,6 +4942,7 @@ impl Qwen36Bringup {
                             fl, full_seq, tok_pos,
                             tok_ptr,
                             kernel_gemv, hidden, last_hidden_bytes,
+                            pos_dev_ptr, cl_dev_ptr,
                         )?;
                         full_seq += 1;
                         fl.post_attention_layernorm.offset_bytes
@@ -5446,6 +5466,7 @@ impl Qwen36Bringup {
     #[allow(clippy::too_many_arguments)]
     /// `last_hidden_ptr`: see `apply_layer_linear_attn` doc — same
     /// Phase-1 contract.
+    #[allow(clippy::too_many_arguments)]
     fn apply_layer_full_attn(
         &self,
         fl: &rvllm_loader::qwen36_weights::Qwen36FullAttnLayer,
@@ -5455,6 +5476,12 @@ impl Qwen36Bringup {
         kernel_gemv: rvllm_kernels::KernelFn,
         hidden: u32,
         last_hidden_bytes: usize,
+        // Phase 4b-prep iter35: caller hoists the pos+context_len
+        // HtoD out of the per-layer loop. Pass the already-uploaded
+        // device pointers (pos_dev_ptr is also re-used as slot_ptr,
+        // see iter24).
+        pos_dev_ptr: u64,
+        cl_dev_ptr: u64,
     ) -> Result<()> {
         let stream_raw = self.stream.raw() as u64;
         let head_dim = self.arch.base.head_dim as u32;
@@ -5602,20 +5629,10 @@ impl Qwen36Bringup {
         let half = (self.kv_cache_layer_bytes / 2) as u64;
         let k_cache_layer_ptr = kv_layer_ptr;
         let v_cache_layer_ptr = kv_layer_ptr + half;
-        // Phase 4b-prep iter26: pack `position` (used by RoPE as both
-        // pos and slot) AND `context_len = position + 1` (used by paged
-        // FA2) into ONE 8-byte HtoD per full-attn layer. Replaces two
-        // separate 4-byte HtoDs (pos_region + cl_region).
-        let context_len_for_pack = (position as i32) + 1;
-        let mut pos_cl_bytes = [0u8; 8];
-        pos_cl_bytes[..4].copy_from_slice(&(position as i32).to_le_bytes());
-        pos_cl_bytes[4..].copy_from_slice(&context_len_for_pack.to_le_bytes());
-        let pos_region = self.arena.region("qwen36_pf_pos_cl", 8, 16)?;
-        let slot_dev_ptr = pos_region.device_ptr();
-        let cl_dev_ptr = pos_region.device_ptr() + 4;
-        unsafe {
-            pos_region.copy_from_host(&pos_cl_bytes)?;
-        }
+        // Phase 4b-prep iter35: caller-hoisted pos+cl HtoD; we just
+        // use the device pointers passed in.
+        let _ = position; // RoPE reads from pos_dev_ptr instead.
+        let slot_dev_ptr = pos_dev_ptr;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -5627,7 +5644,7 @@ impl Qwen36Bringup {
             let mut vc = v_cache_layer_ptr;
             let mut cos_p = self.rope_cos;
             let mut sin_p = self.rope_sin;
-            let mut pos_p = pos_region.device_ptr();
+            let mut pos_p = pos_dev_ptr;
             let mut slot_p = slot_dev_ptr;
             let mut nt: i32 = m as i32;
             let mut nh: i32 = num_heads as i32;
