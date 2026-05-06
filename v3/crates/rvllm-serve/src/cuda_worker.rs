@@ -686,6 +686,14 @@ pub fn resolve_paths(
     // without nvidia-smi or whose first-line cap doesn't match the
     // CUDA device). Either is sufficient.
     fn is_sm121_via_nvidia_smi() -> bool {
+        // Authoritative device-property probe via nvidia-smi
+        // compute_cap. The earlier code OR'd this with a
+        // kernels_dir-based detection that flipped to sm_121 if the
+        // operator's kernel root happened to ship `sm_121/` alongside
+        // other arch dirs — an H100 host with a shared multi-arch
+        // kernel install would then be misclassified, the
+        // sm_121-only `libcutlass_sm120.so` resolver would fire, and
+        // startup would either ENOENT or load the wrong .so.
         let out = std::process::Command::new("nvidia-smi")
             .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
             .output();
@@ -697,17 +705,16 @@ pub fn resolve_paths(
             _ => false,
         }
     }
-    fn is_sm121_via_kernels_dir(p: &std::path::Path) -> bool {
-        // Codex34-3: kernels_dir already pointed at the per-arch
-        // sm_121 dir (allowed by Codex32-2) OR the kernels root has
-        // a sm_121/ subdir on disk. Either implies the operator
-        // expects sm_121.
-        if p.file_name().and_then(|s| s.to_str()) == Some("sm_121") {
-            return true;
-        }
-        p.join("sm_121").is_dir()
+    fn is_sm121_via_env_override() -> bool {
+        // Operator escape hatch: `RVLLM_FORCE_SM121=1` if nvidia-smi
+        // is unavailable in the container but the device IS sm_121.
+        // Replaces the implicit "directory exists" signal with an
+        // explicit one.
+        std::env::var("RVLLM_FORCE_SM121")
+            .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false)
     }
-    let sm121 = is_sm121_via_nvidia_smi() || is_sm121_via_kernels_dir(&kernels_dir);
+    let sm121 = is_sm121_via_nvidia_smi() || is_sm121_via_env_override();
 
     // Resolve the policy-json path. We never write into `kernels_dir`
     // here — that path can be a system-wide read-only location

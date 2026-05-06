@@ -3042,6 +3042,36 @@ impl Gemma4Bringup {
                         // `seed` fully reproduces a request.
                         .then(a.0.cmp(&b.0))
                 };
+                // Fast path: no top-k AND top_p covers the whole
+                // distribution → no truncation, the only reason to
+                // sort would be ordered iteration during the cumulative-
+                // cutoff loop, which is a no-op here. Skip the
+                // O(V log V) sort entirely and do a direct multinomial
+                // over the un-sorted vocab. The bulk of "default"
+                // OpenAI requests (temperature=1.0, top_p=1.0,
+                // top_k=None) lands here, which previously paid the
+                // full sort per token over a 262 k-element vocab on
+                // every decode step.
+                if top_k.is_none() && top_p >= 1.0 {
+                    let max_l = scaled.iter().map(|&(_, l)| l)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let exps: Vec<f32> = scaled.iter()
+                        .map(|&(_, l)| (l - max_l).exp())
+                        .collect();
+                    let z: f32 = exps.iter().sum();
+                    if z > 0.0 {
+                        let r = rng_f32() * z;
+                        let mut acc = 0.0f32;
+                        for (i, &e) in exps.iter().enumerate() {
+                            acc += e;
+                            if r < acc { return Ok(scaled[i].0); }
+                        }
+                    }
+                    // Either z == 0 (all-NaN logits, treat as the
+                    // last token) or floating drift past the cumsum
+                    // — return the highest-id token deterministically.
+                    return Ok(scaled.last().map(|x| x.0).unwrap_or(0));
+                }
                 // top_k: if set, drop everything past rank K before the
                 // softmax. With K typically 40-64, a full O(V log V)
                 // sort over a 262 k-vocab is wasteful — partial-select

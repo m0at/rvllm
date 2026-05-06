@@ -483,7 +483,7 @@ pub fn load_gemma4_model(
                         let cols = entry.nbytes as usize / rows;
                         let scale_name = format!("{}_scale", entry.name);
                         let ch_scales = if let Some(se) = get_tensor(&scale_name) {
-                            read_channelscale_bf16(&se, &shards, rows)
+                            read_channelscale_bf16(&se, &shards, rows)?
                         } else {
                             vec![1.0 / 448.0; rows]
                         };
@@ -975,12 +975,17 @@ fn read_channelscale_bf16(
     scale_entry: &(usize, TensorEntry),
     shards: &[ShardMap],
     rows: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>> {
     let (si, e) = scale_entry;
     let raw = &shards[*si].bytes()[e.file_offset as usize..(e.file_offset + e.nbytes) as usize];
     let n = raw.len() / 2;
-    // bf16 → f32: place bf16 in upper half of u32, zero lower.
     let bf16_le_to_f32 = |lo: u8, hi: u8| f32::from_bits(u32::from_le_bytes([0, 0, lo, hi]));
+
+    let corrupt = |msg: String| RvllmError::Loader {
+        err: LoaderError::Corrupt { detail: msg },
+        ctx: LoaderCtx { path: std::path::PathBuf::new(), tensor: Some(e.name.clone()) },
+        bt: std::backtrace::Backtrace::capture(),
+    };
 
     // Case 1: per-channel (1-D or trivially [rows, 1]).
     if n == rows && (e.shape.len() == 1 || (e.shape.len() == 2 && e.shape[1] == 1)) {
@@ -988,7 +993,7 @@ fn read_channelscale_bf16(
         for i in 0..n {
             out.push(bf16_le_to_f32(raw[2 * i], raw[2 * i + 1]));
         }
-        return out;
+        return Ok(out);
     }
 
     // Case 2: 2-D block-scale `[rows_blocks, cols_blocks]`.
@@ -996,29 +1001,29 @@ fn read_channelscale_bf16(
         let rows_blocks = e.shape[0];
         let cols_blocks = e.shape[1];
         const BLOCK: usize = 128;
-        assert_eq!(
-            n,
-            rows_blocks * cols_blocks,
-            "block-scale flat count {n} != rows_blocks {rows_blocks} * cols_blocks {cols_blocks}",
-        );
-        assert!(
-            rows_blocks * BLOCK >= rows,
-            "block-scale rows_blocks {rows_blocks} * {BLOCK} < weight rows {rows}",
-        );
+        if n != rows_blocks * cols_blocks {
+            return Err(corrupt(format!(
+                "block-scale flat count {n} != rows_blocks {rows_blocks} * cols_blocks {cols_blocks}"
+            )));
+        }
+        if rows_blocks * BLOCK < rows {
+            return Err(corrupt(format!(
+                "block-scale rows_blocks {rows_blocks} * {BLOCK} < weight rows {rows}"
+            )));
+        }
         let mut out = Vec::with_capacity(rows);
         for r in 0..rows {
             let rb = r / BLOCK;
-            // First column-block's scale for this row-block.
             let idx = rb * cols_blocks;
             out.push(bf16_le_to_f32(raw[2 * idx], raw[2 * idx + 1]));
         }
-        return out;
+        return Ok(out);
     }
 
-    panic!(
-        "unrecognized FP8 scale layout for {:?}: shape={:?}, flat_count={n}, expected rows={rows}",
-        e.name, e.shape
-    );
+    Err(corrupt(format!(
+        "unrecognized FP8 scale layout: shape={:?}, flat_count={n}, expected rows={rows}",
+        e.shape
+    )))
 }
 
 /// Pure-function core of `read_blockscale_bf16`: bf16-LE bytes →
@@ -1134,7 +1139,7 @@ fn upload_fp8_direct_channelscale(
     if let Some(se) = scale_entry {
         // Legacy per-row channelscale vector (compat path for cuBLASLt
         // OUTER_VEC_32F + any consumer that only knows per-row).
-        let ch_scales = read_channelscale_bf16(se, shards, rows);
+        let ch_scales = read_channelscale_bf16(se, shards, rows)?;
         let scale_bytes: Vec<u8> = ch_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
         let cs_r = arena.region("fp8_chscale", scale_bytes.len(), 16)?;
         unsafe { cs_r.copy_from_host(&scale_bytes)? };
@@ -1234,7 +1239,7 @@ fn fuse_fp8_direct_channelscale(
         if let Some(se) = scale_entries.get(i).and_then(|x| x.as_ref()) {
             // `read_channelscale_bf16` guarantees `len() == rows` for
             // both per-channel and blockwise layouts — see its docs.
-            let ch = read_channelscale_bf16(se, shards, rows);
+            let ch = read_channelscale_bf16(se, shards, rows)?;
             fused_scales.extend_from_slice(&ch);
             has_scales = true;
         } else {
