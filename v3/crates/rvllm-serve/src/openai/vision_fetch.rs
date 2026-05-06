@@ -274,33 +274,76 @@ fn vet_url_target(url: &str) -> Result<Option<VettedTarget>, VisionError> {
     Ok(Some(VettedTarget { host: host.to_string(), port, addrs }))
 }
 
+/// Cache of `(host, sorted vetted-addr set)` → pinned reqwest
+/// `Client`. Builders are cheap on cache hits; a single bounded
+/// number of unique vision-image hosts × addr-sets per process
+/// keeps it tiny in practice. Bounded growth is enforced by a soft
+/// eviction at 256 entries (FIFO via the rebuild + clear pattern;
+/// we don't strictly need LRU here).
+fn pinned_client_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<reqwest::blocking::Client>>>
+{
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<reqwest::blocking::Client>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn pinned_client_for(
+    t: &VettedTarget,
+) -> Result<std::sync::Arc<reqwest::blocking::Client>, VisionError> {
+    // Build a stable cache key from host + sorted IPs. Sorting the
+    // address strings means (v4, v6) and (v6, v4) collapse to the
+    // same client.
+    let mut ip_strs: Vec<String> = t.addrs.iter().map(|a| a.to_string()).collect();
+    ip_strs.sort();
+    let key = format!("{}|{}", t.host, ip_strs.join(","));
+
+    let cache = pinned_client_cache();
+    {
+        let map = cache.lock().expect("pinned client cache poisoned");
+        if let Some(c) = map.get(&key) {
+            return Ok(c.clone());
+        }
+    }
+
+    let mut b = reqwest::blocking::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .pool_max_idle_per_host(8)
+        .redirect(reqwest::redirect::Policy::none());
+    b = b.resolve_to_addrs(&t.host, &t.addrs);
+    let c = std::sync::Arc::new(
+        b.build()
+            .map_err(|e| VisionError::FetchFailed(format!("client build: {e}")))?,
+    );
+
+    let mut map = cache.lock().expect("pinned client cache poisoned");
+    if map.len() >= 256 {
+        // Defensive cap: drop everything rather than implement an
+        // LRU. A vision-image deployment with >256 distinct hosts is
+        // already past this trade-off's design point.
+        map.clear();
+    }
+    map.insert(key, c.clone());
+    Ok(c)
+}
+
 fn fetch_http(url: &str) -> Result<Vec<u8>, VisionError> {
     use std::io::Read;
     let vet = vet_url_target(url)?;
-    // Build a per-request client that pins the host to the IPs we
-    // already vetted. With `RVLLM_VISION_FETCH_ALLOW_PRIVATE=1` the
-    // vet returns None and we fall back to the shared client (no IP
-    // pinning, trusted-internal use case).
-    let client_owned: Option<reqwest::blocking::Client> = match &vet {
-        Some(t) => {
-            let mut b = reqwest::blocking::Client::builder()
-                .timeout(FETCH_TIMEOUT)
-                .pool_idle_timeout(std::time::Duration::from_secs(60))
-                .pool_max_idle_per_host(2)
-                .redirect(reqwest::redirect::Policy::none());
-            // resolve_to_addrs takes &[SocketAddr]; pinning ALL the
-            // vetted addresses lets reqwest fail-over between v4 / v6
-            // siblings without ever consulting DNS again.
-            b = b.resolve_to_addrs(&t.host, &t.addrs);
-            Some(
-                b.build()
-                    .map_err(|e| VisionError::FetchFailed(format!("client build: {e}")))?,
-            )
-        }
+    // Cache pinned clients per (host, vetted-addr-set) so we keep
+    // reqwest's connection pool, TLS session reuse, and DNS pin
+    // across multiple images on the same host. Building a fresh
+    // client every fetch — like the previous version — meant a
+    // full TLS handshake per image, swamping common cases (a chat
+    // request with several images on the same CDN).
+    let pinned_client = match &vet {
+        Some(t) => Some(pinned_client_for(t)?),
         None => None,
     };
-    let _ = vet; // keep alive for the lifetime of the client.
-    let client = match client_owned.as_ref() {
+    let client = match pinned_client.as_deref() {
         Some(c) => c,
         None => http_client(),
     };

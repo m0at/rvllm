@@ -3035,21 +3035,37 @@ impl Gemma4Bringup {
                 let inv_temp = 1.0f32 / temp.max(1e-3);
                 let mut scaled: Vec<(u32, f32)> = host_logits.iter().enumerate()
                     .map(|(i, &v)| (i as u32, v * inv_temp)).collect();
-                // Sort by scaled logit desc; lex-tiebreak on token id so
-                // ties are deterministic (caller-supplied `seed` then
-                // fully reproduces a request).
-                scaled.sort_by(|a, b| {
+                let cmp_desc = |a: &(u32, f32), b: &(u32, f32)| {
                     b.1.partial_cmp(&a.1)
                         .unwrap_or(std::cmp::Ordering::Equal)
+                        // Lex-tiebreak on token id so a caller-supplied
+                        // `seed` fully reproduces a request.
                         .then(a.0.cmp(&b.0))
-                });
+                };
                 // top_k: if set, drop everything past rank K before the
-                // softmax. Avoids wasted exp() on the long tail and is
-                // the canonical OpenAI ordering (top_k, then top_p).
-                let mut effective_len = scaled.len();
-                if let Some(k) = top_k {
-                    effective_len = effective_len.min(k as usize).max(1);
-                }
+                // softmax. With K typically 40-64, a full O(V log V)
+                // sort over a 262 k-vocab is wasteful — partial-select
+                // the top-K with `select_nth_unstable_by` (O(V) average)
+                // and only sort the K-sized prefix. Falls back to a
+                // full sort when top_k isn't set.
+                let effective_len = match top_k {
+                    Some(k) => {
+                        let k = (k as usize).min(scaled.len()).max(1);
+                        if k < scaled.len() {
+                            // Partition: first k are "the K largest" but
+                            // unsorted; sort that small prefix only.
+                            scaled.select_nth_unstable_by(k - 1, cmp_desc);
+                            scaled[..k].sort_by(cmp_desc);
+                        } else {
+                            scaled.sort_by(cmp_desc);
+                        }
+                        k
+                    }
+                    None => {
+                        scaled.sort_by(cmp_desc);
+                        scaled.len()
+                    }
+                };
                 // Softmax-stabilise on the kept slice (avoids overflow
                 // on huge logits — Gemma 4 sees 60+).
                 let max_l = scaled[0].1;

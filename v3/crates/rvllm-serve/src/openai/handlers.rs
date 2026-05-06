@@ -470,17 +470,32 @@ pub async fn chat_completions(
         // await, not the blocking work itself; without this flag
         // the loop would keep running and burning network +
         // blocking-pool threads after we returned `image_fetch_
-        // timeout` to the client.
+        // timeout` to the client. The Drop guard also ensures the
+        // flag fires when the handler future is dropped (client
+        // disconnect), not only on the explicit timeout arm.
         let fetch_cancel = Arc::new(AtomicBool::new(false));
+        struct CancelOnDrop(Arc<AtomicBool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let _cancel_guard = CancelOnDrop(fetch_cancel.clone());
         let fetch_cancel_inner = fetch_cancel.clone();
         let fetch_fut = tokio::task::spawn_blocking(
             move || collect_vision_items(arch, &messages, &fetch_cancel_inner),
         );
         match tokio::time::timeout_at(request_deadline, fetch_fut).await {
-            Ok(joined) => joined
-                .map_err(|e| ApiError::Internal(format!("vision fetch joined: {e}")))??,
+            Ok(joined) => {
+                // Got a result before the deadline AND before any
+                // disconnect; tell the guard not to fire spuriously
+                // when it goes out of scope.
+                std::mem::forget(_cancel_guard);
+                joined.map_err(|e| ApiError::Internal(format!("vision fetch joined: {e}")))??
+            }
             Err(_) => {
                 fetch_cancel.store(true, Ordering::Relaxed);
+                std::mem::forget(_cancel_guard);
                 return Err(ApiError::invalid_param(
                     "vision image fetch exceeded request_timeout — the \
                      client image URL(s) did not resolve in time",
