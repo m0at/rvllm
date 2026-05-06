@@ -44,9 +44,30 @@ impl Shape {
         self.dims[i]
     }
 
-    /// Total number of elements.
+    /// Total number of elements. Panics on overflow rather than
+    /// silently wrapping in release — a wrapped numel would let
+    /// downstream byte-budget checks accept a region that's
+    /// catastrophically too small. Real loaders should arrive here
+    /// only with shapes that have already been overflow-checked at
+    /// the file format boundary; the panic is a hard guard for
+    /// programmer-error / test-fuzzed inputs.
     pub fn numel(&self) -> usize {
-        self.dims[..self.rank as usize].iter().product()
+        let mut n: usize = 1;
+        for &d in &self.dims[..self.rank as usize] {
+            n = n.checked_mul(d).expect("Shape::numel overflow");
+        }
+        n
+    }
+
+    /// Total number of elements as `Option<usize>`. Same as
+    /// [`numel`](Self::numel) but returns `None` on overflow so the
+    /// caller can produce a typed error instead of unwinding.
+    pub fn numel_checked(&self) -> Option<usize> {
+        let mut n: usize = 1;
+        for &d in &self.dims[..self.rank as usize] {
+            n = n.checked_mul(d)?;
+        }
+        Some(n)
     }
 
     /// Row-major strides in elements.

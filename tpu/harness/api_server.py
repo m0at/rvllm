@@ -8,7 +8,12 @@ Usage:
     python3 api_server.py --model-dir ~/models/gemma-4-31B-it --port 8080
 """
 import argparse, json, os, sys, time, uuid, threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+# Sentinel returned from `_read_body` when a parse/limit error has
+# already been written to the wire. Distinct from `None` (which means
+# "empty body, that's allowed for a GET-shaped POST").
+_BODY_REJECTED = object()
 
 import jax
 import jax.numpy as jnp
@@ -94,7 +99,20 @@ def sample_token(logits, temperature):
         jax.random.PRNGKey(int(time.time() * 1e6) & 0xFFFFFFFF), jnp.log(probs)))
 
 
-def generate(prompt_ids, max_tokens, temperature, stop_sequences):
+class GenStatus:
+    """Mutable container the caller passes into `generate()` so it
+    can read back WHY generation ended after the iterator is
+    exhausted. Without this, a caller has no way to distinguish
+    "stop sequence hit" (OpenAI `finish_reason="stop"`) from
+    "ran out of `max_tokens`" (`finish_reason="length"`) — the
+    earlier code defaulted to "length" in both cases."""
+    __slots__ = ("finish_reason",)
+    def __init__(self):
+        # Default; overwritten on EOS / stop-sequence paths.
+        self.finish_reason = "length"
+
+
+def generate(prompt_ids, max_tokens, temperature, stop_sequences, status=None):
     """Token-by-token generation. Yields (token_id, token_text) pairs.
 
     NOTE — current limitations of this experimental TPU API harness:
@@ -135,15 +153,21 @@ def generate(prompt_ids, max_tokens, temperature, stop_sequences):
         if stop_sequences:
             tentative = accumulated + token_text
             if any(ss in tentative for ss in stop_sequences):
+                if status is not None:
+                    status.finish_reason = "stop"
                 return
         accumulated += token_text
         generated_count += 1
         yield sampled, token_text
 
         if sampled in EOS_TOKENS:
+            if status is not None:
+                status.finish_reason = "stop"
             return
 
         if num_prompt + decode_step + 1 >= MAX_CTX - 1:
+            # Ran out of context window before max_tokens — count as
+            # "length" per OpenAI semantics (truncated by capacity).
             return
 
         step = num_prompt + decode_step
@@ -222,11 +246,42 @@ class APIHandler(BaseHTTPRequestHandler):
             "error": {"message": message, "type": "invalid_request_error", "code": code}
         })
 
+    # Hard cap on request body size before we buffer it. Without this
+    # a bogus or hostile `Content-Length: 1_000_000_000` would have
+    # the single-process server read a gigabyte into RAM. 16 MiB is
+    # generous for a tokens+strings JSON; override via env if you
+    # actually need vision / very long pasted prompts on the TPU
+    # harness (not the production rvllm-serve path).
+    _MAX_BODY_BYTES = int(os.environ.get("RVLLM_TPU_MAX_BODY_BYTES",
+                                          str(16 * 1024 * 1024)))
+
     def _read_body(self):
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._send_error(400, "invalid Content-Length header")
+            return _BODY_REJECTED
+        if length < 0:
+            self._send_error(400, "negative Content-Length")
+            return _BODY_REJECTED
         if length == 0:
             return None
-        return json.loads(self.rfile.read(length))
+        if length > self._MAX_BODY_BYTES:
+            self._send_error(413, f"request body exceeds {self._MAX_BODY_BYTES} bytes")
+            return _BODY_REJECTED
+        try:
+            raw = self.rfile.read(length)
+        except Exception as e:
+            self._send_error(400, f"body read failed: {e}")
+            return _BODY_REJECTED
+        if len(raw) != length:
+            self._send_error(400, "body shorter than Content-Length")
+            return _BODY_REJECTED
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            self._send_error(400, f"invalid JSON: {e}")
+            return _BODY_REJECTED
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -256,6 +311,9 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         body = self._read_body()
+        if body is _BODY_REJECTED:
+            # `_read_body` already wrote the error response.
+            return
         if body is None:
             self._send_error(400, "empty request body")
             return
@@ -331,11 +389,15 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
         self.wfile.flush()
 
-        finish_reason = "length"
+        # GenStatus catches stop-sequence completion (which can't be
+        # observed from the yielded token stream alone — generate()
+        # exits via `return` before yielding the stop tokens).
+        status = GenStatus()
         completion_tokens = 0
-        for token_id, token_text in generate(prompt_ids, max_tokens, temperature, stop):
+        for token_id, token_text in generate(prompt_ids, max_tokens, temperature, stop, status):
             if token_id in EOS_TOKENS:
-                finish_reason = "stop"
+                # generate() also sets status.finish_reason="stop"
+                # for EOS, so we don't override here.
                 break
             completion_tokens += 1
             chunk = make_chunk(request_id, model, delta_content=token_text)
@@ -343,7 +405,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         # Final chunk
-        chunk = make_chunk(request_id, model, finish_reason=finish_reason)
+        chunk = make_chunk(request_id, model, finish_reason=status.finish_reason)
         self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -351,18 +413,17 @@ class APIHandler(BaseHTTPRequestHandler):
     def _handle_sync(self, request_id, model, prompt_ids, num_prompt,
                      max_tokens, temperature, stop):
         content_parts = []
-        finish_reason = "length"
+        status = GenStatus()
         completion_tokens = 0
 
-        for token_id, token_text in generate(prompt_ids, max_tokens, temperature, stop):
+        for token_id, token_text in generate(prompt_ids, max_tokens, temperature, stop, status):
             if token_id in EOS_TOKENS:
-                finish_reason = "stop"
                 break
             content_parts.append(token_text)
             completion_tokens += 1
 
         content = "".join(content_parts)
-        resp = make_response(request_id, model, content, finish_reason,
+        resp = make_response(request_id, model, content, status.finish_reason,
                              num_prompt, completion_tokens)
         self._send_json(200, resp)
 
@@ -419,7 +480,13 @@ def main():
     del sl_c, gl_c
 
     # Start server
-    server = HTTPServer((args.host, args.port), APIHandler)
+    # ThreadingHTTPServer instead of HTTPServer: a single in-flight
+    # generate() must NOT serialise concurrent /health probes or
+    # follow-up requests. GEN_LOCK still guarantees only one
+    # forward-pass at a time and returns 503 to extras; with the
+    # plain HTTPServer that 503 path was unreachable because the
+    # second request never even got dispatched.
+    server = ThreadingHTTPServer((args.host, args.port), APIHandler)
     print(f"serving on {args.host}:{args.port}", file=sys.stderr)
     print(f"  model:   {MODEL_NAME}", file=sys.stderr)
     print(f"  max_ctx: {MAX_CTX}", file=sys.stderr)
