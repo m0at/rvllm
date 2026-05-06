@@ -134,6 +134,15 @@ pub struct Qwen36OutsideKernels {
     /// MoE forward stays device-side (Phase 4b-prep iter19).
     pub f16_plus_f32_inplace_f16_mod: LoadedModule,
     pub fn_f16_plus_f32_inplace_f16: KernelFn,
+    /// Fused shared-expert gate dot product + sigmoid. Output is a
+    /// single f32 scalar on the device, consumed directly by
+    /// `scaled_add_f16_to_f32_devw` (Phase 4b-prep iter21).
+    pub shared_gate_dot_sigmoid_f16_mod: LoadedModule,
+    pub fn_shared_gate_dot_sigmoid_f16: KernelFn,
+    /// scaled_add variant that reads the scalar weight from a device
+    /// pointer (Phase 4b-prep iter21).
+    pub scaled_add_f16_to_f32_devw_mod: LoadedModule,
+    pub fn_scaled_add_f16_to_f32_devw: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -471,6 +480,14 @@ impl Qwen36Bringup {
             kernels.load_ptx("f16_plus_f32_inplace_f16")?;
         let fn_f16_plus_f32_inplace_f16 = f16_plus_f32_inplace_f16_mod
             .get_function("f16_plus_f32_inplace_f16_kernel")?;
+        let shared_gate_dot_sigmoid_f16_mod =
+            kernels.load_ptx("shared_gate_dot_sigmoid_f16")?;
+        let fn_shared_gate_dot_sigmoid_f16 = shared_gate_dot_sigmoid_f16_mod
+            .get_function("shared_gate_dot_sigmoid_f16_kernel")?;
+        let scaled_add_f16_to_f32_devw_mod =
+            kernels.load_ptx("scaled_add_f16_to_f32_devw")?;
+        let fn_scaled_add_f16_to_f32_devw = scaled_add_f16_to_f32_devw_mod
+            .get_function("scaled_add_f16_to_f32_devw_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -560,6 +577,10 @@ impl Qwen36Bringup {
             fn_scaled_add_f16_to_f32,
             f16_plus_f32_inplace_f16_mod,
             fn_f16_plus_f32_inplace_f16,
+            shared_gate_dot_sigmoid_f16_mod,
+            fn_shared_gate_dot_sigmoid_f16,
+            scaled_add_f16_to_f32_devw_mod,
+            fn_scaled_add_f16_to_f32_devw,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -5779,22 +5800,11 @@ impl Qwen36Bringup {
         // 2. Router top-k. Read normed input + router weights, compute
         //    logits on host, sort top-k, softmax-normalize.
         let hidden_us = hidden as usize;
-        let mut input_host = vec![0u8; last_hidden_bytes];
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                input_host.as_mut_ptr() as *mut _,
-                normed_region.device_ptr(),
-                last_hidden_bytes,
-            );
-        }
-        let mut input_f32 = vec![0.0f32; hidden_us];
-        for i in 0..hidden_us {
-            input_f32[i] = f16_bits_to_f32(u16::from_le_bytes([
-                input_host[i * 2], input_host[i * 2 + 1],
-            ]));
-        }
+        // Phase 4b-prep iter21: input_host / input_f32 are no longer
+        // needed on the hot path — the shared-expert gate dot product
+        // is now a fused GPU kernel (`shared_gate_dot_sigmoid_f16`).
+        // The optional debug `normed_l2` rebuilds them lazily.
+        let _ = hidden_us; // used by shared-gate kernel grid sizing
         // Phase 4b-prep iter17: GPU router GEMV. Replaces the
         // host-cached f32 matvec (~524k MAC × 30 layers / token)
         // with a single launch reading device-side f16 weights.
@@ -6047,30 +6057,59 @@ impl Qwen36Bringup {
             // shared expert output. Weights cached as f32 host vec at
             // bring-up (Phase 4b-prep iter16); per-token path is just
             // a dot-product over RAM.
-            let sg_w_f32 = &self.shared_gate_host_cache[layer_idx];
-            let mut g_logit = 0.0f32;
-            for k in 0..hidden_us {
-                g_logit += sg_w_f32[k] * input_f32[k];
+            // Phase 4b-prep iter21: fused GPU dot+sigmoid + a
+            // device-pointer scaled_add kills the per-layer fence +
+            // DtoH that an iter20 attempt regressed on. Both kernels
+            // run on stream_raw, chained via the device scalar
+            // `sg_sigmoid_region`; host never sees the value.
+            let sg_sigmoid_region =
+                self.arena.region("qwen36_pm_sg_sigmoid", 4, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut out = sg_sigmoid_region.device_ptr();
+                let mut weight = moe.shared_expert_gate_logit.offset_bytes;
+                let mut input_ptr = normed_region.device_ptr();
+                let mut hh = hidden_us as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut hh) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid: u32 = 1;
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_shared_gate_dot_sigmoid_f16.raw() as CUfunction,
+                    grid, 1, 1,
+                    block, 1, 1,
+                    0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
             }
-            let g_sigmoid = 1.0f32 / (1.0f32 + (-g_logit).exp());
-            // GPU scaled_add: routed_sum_region += g_sigmoid * down_region.
+            // GPU scaled_add (devw variant): routed_sum_region +=
+            // *sg_sigmoid_region * down_region. Reads the sigmoid
+            // from the device scalar produced by the kernel above —
+            // stream-ordered, no fence or host round-trip.
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
                 let mut acc = routed_sum_region.device_ptr();
                 let mut input = down_region.device_ptr();
-                let mut weight = g_sigmoid;
+                let mut devw = sg_sigmoid_region.device_ptr();
                 let mut nn = n_down as i32;
                 let args = [
                     (&mut acc) as *mut u64 as *mut core::ffi::c_void,
                     (&mut input) as *mut u64 as *mut core::ffi::c_void,
-                    (&mut weight) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut devw) as *mut u64 as *mut core::ffi::c_void,
                     (&mut nn) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block: u32 = 256;
                 let grid = (n_down as u32 + block - 1) / block;
                 let _ = cuLaunchKernel(
-                    self.outside_kernels.fn_scaled_add_f16_to_f32.raw() as CUfunction,
+                    self.outside_kernels.fn_scaled_add_f16_to_f32_devw.raw() as CUfunction,
                     grid, 1, 1,
                     block, 1, 1,
                     0,
@@ -6091,6 +6130,7 @@ impl Qwen36Bringup {
             self.stream.fence()?;
             let mut rs_host = vec![0.0f32; n_down as usize];
             let mut lh_host = vec![0u8; last_hidden_bytes];
+            let mut normed_host = vec![0u8; last_hidden_bytes];
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
@@ -6104,10 +6144,22 @@ impl Qwen36Bringup {
                     last_hidden_ptr,
                     last_hidden_bytes,
                 );
+                let _ = cuMemcpyDtoH_v2(
+                    normed_host.as_mut_ptr() as *mut _,
+                    normed_region.device_ptr(),
+                    last_hidden_bytes,
+                );
             }
             let total_l2: f32 = rs_host.iter().map(|x| x*x).sum::<f32>().sqrt();
             let shared_l2 = (total_l2*total_l2 - routed_only_l2*routed_only_l2).max(0.0).sqrt();
-            let normed_l2: f32 = input_f32.iter().map(|x| x*x).sum::<f32>().sqrt();
+            let mut normed_l2_sq = 0.0f32;
+            for i in 0..hidden_us {
+                let v = f16_bits_to_f32(u16::from_le_bytes([
+                    normed_host[i * 2], normed_host[i * 2 + 1],
+                ]));
+                normed_l2_sq += v * v;
+            }
+            let normed_l2 = normed_l2_sq.sqrt();
             eprintln!("[moe] normed_L2={normed_l2:.2} routed_L2={routed_only_l2:.3} shared_L2~{shared_l2:.3} total_L2={total_l2:.3}");
             let _ = lh_host; // reserved for future per-element debugging
         }
