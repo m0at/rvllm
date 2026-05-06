@@ -36,6 +36,10 @@ struct TokenizerInner {
     tokenizer: tokenizers::Tokenizer,
     /// Rendered into the first turn on every request.
     chat_template: String,
+    /// MiniJinja env with `chat_template` pre-compiled. Built once at
+    /// load (`add_template_owned`) and reused on every render —
+    /// previously each chat request paid the full template parse.
+    chat_env: minijinja::Environment<'static>,
     /// Literal `<bos>` style token the template references via
     /// `bos_token`. Rendered as a STRING by the template; the whole
     /// rendered string is then re-tokenized so the BOS id pops out
@@ -143,10 +147,20 @@ impl TokenizerHandle {
             }
         };
 
+        // Pre-compile the chat template once so per-request render
+        // doesn't pay for parsing on every call.
+        let mut chat_env = minijinja::Environment::new();
+        chat_env.set_unknown_method_callback(
+            minijinja_contrib::pycompat::unknown_method_callback,
+        );
+        chat_env.add_template_owned("chat", chat_template.clone())
+            .map_err(|e| ApiError::Tokenize(format!("chat template parse: {e}")))?;
+
         Ok(Self {
             inner: Arc::new(TokenizerInner {
                 tokenizer,
                 chat_template,
+                chat_env,
                 bos_token_str,
                 bos_token_id,
                 eos_token_ids,
@@ -204,11 +218,7 @@ impl TokenizerHandle {
         // `<|vision_start|><|image_pad|><|vision_end|>` tokens.
         use crate::openai::chat::{ChatContent, ChatContentPart};
 
-        let mut env = Environment::new();
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_template("chat", &self.inner.chat_template)
-            .map_err(|e| ApiError::Tokenize(format!("chat template parse: {e}")))?;
-        let tpl = env
+        let tpl = self.inner.chat_env
             .get_template("chat")
             .map_err(|e| ApiError::Internal(format!("get template: {e}")))?;
 
@@ -363,15 +373,11 @@ impl TokenizerHandle {
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
     ) -> Result<Vec<u32>, ApiError> {
-        let mut env = Environment::new();
-        // HF chat templates use Python-style `dict.get(key)` /
-        // `.items()` which jinja2 supports natively but minijinja
-        // does not. Register the pycompat shim so method calls on
-        // maps / strings resolve to the Python semantics.
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_template("chat", &self.inner.chat_template)
-            .map_err(|e| ApiError::Tokenize(format!("chat template parse: {e}")))?;
-        let tpl = env
+        // The Environment is built once at TokenizerHandle::load with
+        // the pycompat shim already wired in (HF chat templates use
+        // Python-style `dict.get(key)` / `.items()`). Per-request just
+        // looks up the pre-compiled template.
+        let tpl = self.inner.chat_env
             .get_template("chat")
             .map_err(|e| ApiError::Internal(format!("get template: {e}")))?;
 

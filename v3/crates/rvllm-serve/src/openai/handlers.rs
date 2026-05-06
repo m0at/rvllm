@@ -546,9 +546,14 @@ pub async fn chat_completions(
 
     let (events_tx, events_rx) = mpsc::channel::<GenerateEvent>(64);
     let cancelled = Arc::new(AtomicBool::new(false));
+    // Move `prompt_ids` into the worker request — the handler only
+    // needs the length afterwards (for the debug-log line + budget),
+    // so save that and skip the Vec<u32> clone (long contexts can
+    // mean many MiB on the hot path).
+    let prompt_len = prompt_ids.len();
     let gen_req = GenerateRequest {
         request_id,
-        prompt_ids: prompt_ids.clone(),
+        prompt_ids,
         sampling,
         max_new_tokens: max_new,
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
@@ -557,7 +562,7 @@ pub async fn chat_completions(
         events_tx,
         cancelled: cancelled.clone(),
     };
-    tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
+    tracing::debug!(prompt_tokens = prompt_len, max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
 
     let model_id = state.config.model_id.clone();
@@ -1622,9 +1627,12 @@ pub async fn completions(
     let (events_tx, events_rx) = mpsc::channel::<GenerateEvent>(64);
     let cancelled = Arc::new(AtomicBool::new(false));
 
+    // Move prompt_ids into the worker request; only the length is
+    // needed afterwards (debug log line below).
+    let prompt_len = prompt_ids.len();
     let gen_req = GenerateRequest {
         request_id,
-        prompt_ids: prompt_ids.clone(),
+        prompt_ids,
         sampling,
         max_new_tokens: max_new,
         stop_token_ids: state.tokenizer.eos_token_ids().to_vec(),
@@ -1633,7 +1641,7 @@ pub async fn completions(
         events_tx,
         cancelled: cancelled.clone(),
     };
-    tracing::debug!(prompt_tokens = prompt_ids.len(), max_new, "submitting to worker");
+    tracing::debug!(prompt_tokens = prompt_len, max_new, "submitting to worker");
     state.worker.submit(gen_req).await?;
 
     let model_id = state.config.model_id.clone();

@@ -173,6 +173,13 @@ fn http_client() -> &'static reqwest::blocking::Client {
             // Sensible defaults for short-lived image fetches.
             .pool_idle_timeout(std::time::Duration::from_secs(60))
             .pool_max_idle_per_host(8)
+            // Refuse redirects: every redirect would otherwise need
+            // its own `vet_url_target` call to keep the SSRF guard
+            // honest, and an attacker-controlled redirect chain can
+            // do that arbitrarily many times. The simpler fix is to
+            // turn redirects off — clients that need the redirected
+            // image must resolve and supply the final URL themselves.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build vision-fetch reqwest client")
     })
@@ -185,7 +192,17 @@ fn http_client() -> &'static reqwest::blocking::Client {
 /// bypass this with `RVLLM_VISION_FETCH_ALLOW_PRIVATE=1`.
 fn is_disallowed_target(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
-    match ip {
+    // Collapse IPv4-mapped IPv6 (`::ffff:127.0.0.1` etc.) to its
+    // underlying v4 first — otherwise an attacker can reach loopback
+    // by spelling it as a v6 literal and bypass the v4 checks.
+    let canonical = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v => v,
+    };
+    match canonical {
         IpAddr::V4(v4) => {
             v4.is_loopback()
                 || v4.is_private()
