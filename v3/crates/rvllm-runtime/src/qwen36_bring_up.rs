@@ -5082,25 +5082,39 @@ impl Qwen36Bringup {
             let dump_dir = std::env::var("RVLLM_QWEN36_DUMP_DIR").ok();
             let dump_token_idx = num_tokens.saturating_sub(1) as usize;
             let dump_active = dump_dir.is_some() && start_position == 0;
+            // Round-26 audit: dump per-(layer, tok) hidden rows. At
+            // any "post layer-L attn for tok t" moment, hidden[t] is
+            // the right snapshot. In layer-major we dump all rows at
+            // once at the end of each layer's block (all rows post-
+            // layer-L). In token-major we dump hidden[t] AT THE
+            // MOMENT tok t reaches layer L — not later, because
+            // subsequent layers have already overwritten that row by
+            // batch-dump time. File naming: `layer_LL_attn_tok{TT}.f16`
+            // (4096 bytes each = 1 hidden row). cmp_qwen36 iterates
+            // (L, phase, t) and reports per-row divergence.
             if let Some(dir) = dump_dir.as_ref() {
                 if dump_active {
                     let _ = std::fs::create_dir_all(dir);
-                    let mut buf = vec![0u8; last_hidden_bytes];
-                    let row_ptr = hidden_region.device_ptr()
-                        + (dump_token_idx as u64) * (last_hidden_bytes as u64);
                     self.stream.fence()?;
-                    #[cfg(feature = "cuda")]
-                    unsafe {
-                        use cudarc::driver::sys::*;
-                        let _ = cuMemcpyDtoH_v2(
-                            buf.as_mut_ptr() as *mut _,
-                            row_ptr,
-                            last_hidden_bytes,
-                        );
+                    for t in 0..num_tokens {
+                        let mut buf = vec![0u8; last_hidden_bytes];
+                        let row_ptr = hidden_region.device_ptr()
+                            + (t as u64) * (last_hidden_bytes as u64);
+                        #[cfg(feature = "cuda")]
+                        unsafe {
+                            use cudarc::driver::sys::*;
+                            let _ = cuMemcpyDtoH_v2(
+                                buf.as_mut_ptr() as *mut _,
+                                row_ptr,
+                                last_hidden_bytes,
+                            );
+                        }
+                        let _ = std::fs::write(
+                            format!("{dir}/embed_tok{t:02}.f16"), &buf);
                     }
-                    let _ = std::fs::write(format!("{dir}/embed.f16"), &buf);
                 }
             }
+            let _ = dump_token_idx;
             // Pre-stage pos+context_len for each token. Full-attn
             // still runs per-token below and reuses the existing
             // pos_cl_region, so we update it inside the per-token
@@ -5206,21 +5220,24 @@ impl Qwen36Bringup {
                 };
                 if dump_active {
                     let dir = dump_dir.as_ref().unwrap();
-                    let mut buf = vec![0u8; last_hidden_bytes];
-                    let row_ptr = hidden_region.device_ptr()
-                        + (dump_token_idx as u64) * (last_hidden_bytes as u64);
                     self.stream.fence()?;
-                    #[cfg(feature = "cuda")]
-                    unsafe {
-                        use cudarc::driver::sys::*;
-                        let _ = cuMemcpyDtoH_v2(
-                            buf.as_mut_ptr() as *mut _,
-                            row_ptr,
-                            last_hidden_bytes,
-                        );
+                    for t in 0..num_tokens {
+                        let mut buf = vec![0u8; last_hidden_bytes];
+                        let row_ptr = hidden_region.device_ptr()
+                            + (t as u64) * (last_hidden_bytes as u64);
+                        #[cfg(feature = "cuda")]
+                        unsafe {
+                            use cudarc::driver::sys::*;
+                            let _ = cuMemcpyDtoH_v2(
+                                buf.as_mut_ptr() as *mut _,
+                                row_ptr,
+                                last_hidden_bytes,
+                            );
+                        }
+                        let _ = std::fs::write(
+                            format!("{dir}/layer_{layer_idx:02}_attn_tok{t:02}.f16"),
+                            &buf);
                     }
-                    let _ = std::fs::write(
-                        format!("{dir}/layer_{layer_idx:02}_attn.f16"), &buf);
                 }
                 // MoE per token. The MoE block reads/writes through
                 // tok_ptr and post_attn_norm_ptr; routing is per-
@@ -5241,21 +5258,24 @@ impl Qwen36Bringup {
                 }
                 if dump_active {
                     let dir = dump_dir.as_ref().unwrap();
-                    let mut buf = vec![0u8; last_hidden_bytes];
-                    let row_ptr = hidden_region.device_ptr()
-                        + (dump_token_idx as u64) * (last_hidden_bytes as u64);
                     self.stream.fence()?;
-                    #[cfg(feature = "cuda")]
-                    unsafe {
-                        use cudarc::driver::sys::*;
-                        let _ = cuMemcpyDtoH_v2(
-                            buf.as_mut_ptr() as *mut _,
-                            row_ptr,
-                            last_hidden_bytes,
-                        );
+                    for t in 0..num_tokens {
+                        let mut buf = vec![0u8; last_hidden_bytes];
+                        let row_ptr = hidden_region.device_ptr()
+                            + (t as u64) * (last_hidden_bytes as u64);
+                        #[cfg(feature = "cuda")]
+                        unsafe {
+                            use cudarc::driver::sys::*;
+                            let _ = cuMemcpyDtoH_v2(
+                                buf.as_mut_ptr() as *mut _,
+                                row_ptr,
+                                last_hidden_bytes,
+                            );
+                        }
+                        let _ = std::fs::write(
+                            format!("{dir}/layer_{layer_idx:02}_moe_tok{t:02}.f16"),
+                            &buf);
                     }
-                    let _ = std::fs::write(
-                        format!("{dir}/layer_{layer_idx:02}_moe.f16"), &buf);
                 }
                 if let Some(c) = cancel {
                     if c.load(std::sync::atomic::Ordering::Relaxed) {
@@ -5305,10 +5325,24 @@ impl Qwen36Bringup {
             // host-side mutation of the device buffer that the
             // captured kernels read from on the next replay).
             {
+                // Round-26: same pos_cl HtoD vs non-blocking-stream race
+                // codex diagnosed in round 25 for the layer-major path
+                // also exists in the token-major prefill loop, just with
+                // a wider window (40 layers between consecutive H2Ds
+                // instead of 1). Empirically: without this fence the
+                // 22-token "Geister"-canary deterministically produces
+                // the "Schule"-joke; with fences in place (or with
+                // dump-mode active which inserts the same fences) the
+                // SAME computation produces the "Supermarkt"-joke. Both
+                // are valid German output but only one is the intended
+                // computation under sequential-consistency. Fence here
+                // matches the layer-major fence and removes the latent
+                // race in the production token-major path too.
                 let cl_for_pack = (tok_pos as i32) + 1;
                 let mut bytes = [0u8; 8];
                 bytes[..4].copy_from_slice(&(tok_pos as i32).to_le_bytes());
                 bytes[4..].copy_from_slice(&cl_for_pack.to_le_bytes());
+                self.stream.fence()?;
                 unsafe { pos_cl_region.copy_from_host(&bytes)? };
             }
             // Phase 1 of the Qwen batched-prefill plan: the layer
@@ -5328,15 +5362,18 @@ impl Qwen36Bringup {
             // ONLY for the last prompt token (tok_local == num_tokens-1
             // && start_position == 0) to avoid runaway disk usage on
             // multi-step decode.
+            // Round-26 audit: dump per-(layer, phase, tok) hidden rows.
+            // Now fires for ALL tokens (was last-token-only) so the
+            // cmp harness can compare per-token rows between token-
+            // major and layer-major paths and localise where any
+            // intermediate token rows diverge.
             let dump_dir =
                 std::env::var("RVLLM_QWEN36_DUMP_DIR").ok();
-            let dump_this_token = dump_dir.is_some()
-                && tok_local + 1 == num_tokens
-                && start_position == 0;
+            let dump_this_token = dump_dir.is_some() && start_position == 0;
             if let Some(dir) = dump_dir.as_ref() {
                 if dump_this_token {
                     let _ = std::fs::create_dir_all(dir);
-                    // Dump the embedding (input to layer 0) once.
+                    // Dump THIS token's embedding (input to layer 0).
                     let mut buf = vec![0u8; last_hidden_bytes];
                     self.stream.fence()?;
                     #[cfg(feature = "cuda")]
@@ -5348,7 +5385,8 @@ impl Qwen36Bringup {
                             last_hidden_bytes,
                         );
                     }
-                    let _ = std::fs::write(format!("{dir}/embed.f16"), &buf);
+                    let _ = std::fs::write(
+                        format!("{dir}/embed_tok{tok_local:02}.f16"), &buf);
                 }
             }
 
@@ -5389,7 +5427,8 @@ impl Qwen36Bringup {
                         );
                     }
                     let _ = std::fs::write(
-                        format!("{dir}/layer_{layer_idx:02}_attn.f16"), &buf);
+                        format!("{dir}/layer_{layer_idx:02}_attn_tok{tok_local:02}.f16"),
+                        &buf);
                 }
                 self.apply_layer_moe(
                     &self.model.layers[layer_idx].moe,
@@ -5412,7 +5451,8 @@ impl Qwen36Bringup {
                         );
                     }
                     let _ = std::fs::write(
-                        format!("{dir}/layer_{layer_idx:02}_moe.f16"), &buf);
+                        format!("{dir}/layer_{layer_idx:02}_moe_tok{tok_local:02}.f16"),
+                        &buf);
                 }
             }
             // No DtoD writeback needed: the layer functions wrote
