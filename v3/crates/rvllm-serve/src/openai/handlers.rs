@@ -473,14 +473,26 @@ pub async fn chat_completions(
         // timeout` to the client. The Drop guard also ensures the
         // flag fires when the handler future is dropped (client
         // disconnect), not only on the explicit timeout arm.
+        //
+        // An earlier version used `std::mem::forget` to suppress the
+        // guard on success — that leaked the underlying
+        // `Arc<AtomicBool>` (and the bool, the strong/weak counts,
+        // the allocator entry) on EVERY chat request. Use an
+        // `armed` flag instead so the guard's `Drop` runs normally
+        // and frees its Arc handle.
         let fetch_cancel = Arc::new(AtomicBool::new(false));
-        struct CancelOnDrop(Arc<AtomicBool>);
+        struct CancelOnDrop {
+            flag: Arc<AtomicBool>,
+            armed: bool,
+        }
         impl Drop for CancelOnDrop {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
+                if self.armed {
+                    self.flag.store(true, Ordering::Relaxed);
+                }
             }
         }
-        let _cancel_guard = CancelOnDrop(fetch_cancel.clone());
+        let mut cancel_guard = CancelOnDrop { flag: fetch_cancel.clone(), armed: true };
         let fetch_cancel_inner = fetch_cancel.clone();
         let fetch_fut = tokio::task::spawn_blocking(
             move || collect_vision_items(arch, &messages, &fetch_cancel_inner),
@@ -488,14 +500,15 @@ pub async fn chat_completions(
         match tokio::time::timeout_at(request_deadline, fetch_fut).await {
             Ok(joined) => {
                 // Got a result before the deadline AND before any
-                // disconnect; tell the guard not to fire spuriously
-                // when it goes out of scope.
-                std::mem::forget(_cancel_guard);
+                // disconnect — disarm so the guard doesn't fire a
+                // spurious cancel on its way out of scope. The Arc
+                // is still freed by the guard's normal Drop.
+                cancel_guard.armed = false;
                 joined.map_err(|e| ApiError::Internal(format!("vision fetch joined: {e}")))??
             }
             Err(_) => {
                 fetch_cancel.store(true, Ordering::Relaxed);
-                std::mem::forget(_cancel_guard);
+                cancel_guard.armed = false;
                 return Err(ApiError::invalid_param(
                     "vision image fetch exceeded request_timeout — the \
                      client image URL(s) did not resolve in time",

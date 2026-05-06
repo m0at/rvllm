@@ -73,13 +73,26 @@ impl<'e> PendingStep<'e> {
     }
 
     /// Drain the launched step. Consumes self so the engine borrow is
-    /// released on return. Phase D reads DtoH, commits to scheduler.
+    /// released on return.
+    ///
+    /// Phase D scope (DtoH the per-sequence sampled token, push it
+    /// into `Scheduler::commit_decode`, surface `StepOutput`s) is
+    /// NOT implemented yet. The previous body silently returned
+    /// `Ok(Vec::new())` — a caller would loop forever calling
+    /// `step_launch().collect()` and never see a sequence reach
+    /// `Finished`. rvllm-serve doesn't go through this path today
+    /// (it uses the monolithic worker), but anything that does will
+    /// hit the explicit error below instead of an infinite loop.
     pub fn collect(mut self) -> Result<Vec<StepOutput>> {
         let _plan = self.plan.take().expect("PendingStep::collect called twice");
         let _engine = &mut *self.engine;
-        // Phase D: decode DtoH, read tokens, scheduler.commit_decode,
-        // return StepOutputs.
-        Ok(Vec::new())
+        Err(rvllm_core::RvllmError::cuda(
+            "PendingStep::collect: Phase D not implemented (DtoH + \
+             Scheduler::commit_decode missing) — engine consumers must \
+             use the monolithic worker path until this lands",
+            rvllm_core::CudaErrorKind::Other,
+            rvllm_core::CudaCtx::setup(),
+        ))
     }
 }
 
@@ -113,9 +126,13 @@ mod tests {
             .enqueue(Request::new(ReqId(1), vec![TokenId(0)], 1));
         assert!(e.has_pending_work());
         let t = e.step_launch().unwrap();
-        let _outputs = t.collect().unwrap();
-        // Ticket consumed; engine borrow released; can launch again.
+        // `collect` is now an explicit Phase-D-not-implemented error
+        // rather than silently returning Ok(Vec::new()) — the test's
+        // original purpose (verify the borrow chain releases between
+        // launches) only requires the ticket to be consumed, not for
+        // collect to succeed.
+        let _ = t.collect();
         let t2 = e.step_launch().unwrap();
-        let _ = t2.collect().unwrap();
+        let _ = t2.collect();
     }
 }

@@ -108,7 +108,22 @@ impl ShardHeader {
                 )));
             }
             let nbytes = end - start;
-            let n_elements = shape.iter().product::<usize>() as u64;
+            // Use checked u64 multiply so a corrupt or hostile
+            // header carrying e.g. shape=[u64::MAX, 2] cleanly
+            // surfaces as a LoaderError. The naive
+            // `iter().product::<usize>()` panicked in debug and
+            // silently wrapped in release, after which `expected`
+            // bore no relation to reality and the range check below
+            // would then accept whatever fit.
+            let mut n_elements: u64 = 1;
+            for &dim in shape.iter() {
+                n_elements = (n_elements as u64)
+                    .checked_mul(dim as u64)
+                    .ok_or_else(|| loader_err(format!(
+                        "{name}: shape product overflow ({:?})",
+                        shape
+                    )))?;
+            }
             let expected = dtype_storage_bytes(dtype, n_elements);
             if expected != nbytes {
                 return Err(loader_err(format!(
