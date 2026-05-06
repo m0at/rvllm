@@ -6597,10 +6597,17 @@ impl Qwen36Bringup {
         vocab: u32,
         last_idx: usize,
     ) -> Result<i32> {
+        // Only the LAST token's argmax is consumed downstream. The
+        // earlier code ran rmsnorm + fp8_gemm over ALL `num_tokens`
+        // rows and then argmax'd the last; on a 4 k-token prompt
+        // with 262 k vocab that materialised ≈ 2 GiB of logits +
+        // 4096× the lm_head FLOPs we actually needed. Slice down to
+        // the single relevant row before doing any work.
+        let _ = num_tokens; // kept in the signature for back-compat
         let eps = self.arch.base.rms_norm_eps;
-        let hidden_fp8_bytes = (num_tokens as usize) * (hidden as usize);
-        let hidden_scale_bytes = (num_tokens as usize) * 4;
-        let logits_bytes = (num_tokens as usize) * (vocab as usize) * 2;
+        let hidden_fp8_bytes = hidden as usize;
+        let hidden_scale_bytes = 4usize;
+        let logits_bytes = (vocab as usize) * 2;
         let hidden_fp8_region = self
             .arena
             .region("qwen36_pl_h_fp8", hidden_fp8_bytes, 16)?;
@@ -6609,9 +6616,13 @@ impl Qwen36Bringup {
             .region("qwen36_pl_h_scale", hidden_scale_bytes, 16)?;
         let logits_region = self.arena.region("qwen36_pl_logits", logits_bytes, 16)?;
         let stream_raw = self.stream.raw() as u64;
+        // Pointer to the last token's hidden row inside the full
+        // [num_tokens, hidden] f16 region.
+        let last_hidden_row_ptr = hidden_region.device_ptr()
+            + (last_idx as u64) * (hidden as u64) * 2;
         unsafe {
             rvllm_fused::FusedRmsnormFp8QuantLaunch {
-                num_tokens,
+                num_tokens: 1,
                 hidden,
                 eps,
             }
@@ -6619,7 +6630,7 @@ impl Qwen36Bringup {
                 self.outside_kernels.fn_fused_rmsnorm_fp8_quant,
                 hidden_fp8_region.device_ptr(),
                 hidden_scale_region.device_ptr(),
-                hidden_region.device_ptr(),
+                last_hidden_row_ptr,
                 self.model.outside.final_norm.offset_bytes,
                 stream_raw,
             )?;
@@ -6630,7 +6641,7 @@ impl Qwen36Bringup {
                 hidden_fp8_region.device_ptr(),
                 self.model.outside.lm_head_fp8.offset_bytes,
                 logits_region.device_ptr(),
-                num_tokens as i32,
+                1,
                 vocab as i32,
                 hidden as i32,
                 hidden_scale_region.device_ptr(),
@@ -6641,14 +6652,13 @@ impl Qwen36Bringup {
         // Phase 4b-prep iter27: GPU argmax over the f16 logits row,
         // replacing a `vocab * 2`-byte DtoH (~524 KiB at vocab=262K)
         // + host max-loop with a single 4-byte device→host copy of
-        // the winning token id.
-        let logits_row_bytes = (vocab as usize) * 2;
-        let last_off = (last_idx as u64) * (logits_row_bytes as u64);
+        // the winning token id. With the slice-to-last-row above,
+        // the argmax now reads from offset 0 (single-row buffer).
         let token_region = self.arena.region("qwen36_pl_token", 4, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let mut logits_ptr = logits_region.device_ptr() + last_off;
+            let mut logits_ptr = logits_region.device_ptr();
             let mut out_ptr = token_region.device_ptr();
             let mut vs = vocab as i32;
             let args = [
@@ -6667,24 +6677,34 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
-        if rc != CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 argmax_f16 launch",
-                rvllm_core::CudaErrorKind::LaunchFailed,
-                rvllm_core::CudaCtx::setup(),
-            ));
-        }
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 argmax_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         self.stream.fence()?;
         let mut tok_buf = [0i32; 1];
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
+            // Consistency with the gemma4 closer: a swallowed DtoH
+            // failure used to leave `tok_buf[0] == 0`, which the
+            // server then emitted as a valid output token.
+            let rc = cuMemcpyDtoH_v2(
                 tok_buf.as_mut_ptr() as *mut _,
                 token_region.device_ptr(),
                 4,
             );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 closer token DtoH",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         Ok(tok_buf[0])
     }
