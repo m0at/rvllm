@@ -167,6 +167,19 @@ pub struct Qwen36OutsideKernels {
     pub fn_scatter_head_f16: KernelFn,
 }
 
+/// Pre-converted f32 weight caches for one linear-attention layer.
+/// Built once at bring-up; consumed by `apply_layer_linear_attn`'s
+/// alpha/beta computation in place of per-token DtoH+f16→f32.
+#[derive(Debug)]
+pub struct Qwen36LinearAttnHostCache {
+    pub a_w_f32: Vec<f32>,    // [vus, h_us]  row-major
+    pub b_w_f32: Vec<f32>,    // [vus, h_us]  row-major
+    pub a_log_f32: Vec<f32>,  // [vus]
+    pub dt_bias_f32: Vec<f32>,// [vus]
+    pub vus: usize,
+    pub h_us: usize,
+}
+
 pub struct Qwen36Bringup {
     pub paths: Gemma4EnginePaths,
     pub arena_bytes: usize,
@@ -202,6 +215,16 @@ pub struct Qwen36Bringup {
     pub linear_state_ptr: u64,
     pub linear_state_bytes: usize,
     pub linear_state_layer_bytes: usize,
+    /// Per-linear-attn-layer host-side f32 caches of constant
+    /// weights consumed by the Gated-DeltaNet alpha/beta loop. The
+    /// pre-Phase-5 implementation re-DtoH-copied these every token
+    /// (in_proj_a + in_proj_b ≈ 256 KB per token, plus a_log /
+    /// dt_bias) and re-converted f16→f32 in the same loop. Now we
+    /// dequantise once at bring-up and cache the f32 vectors here;
+    /// the per-token loop reads directly from RAM.
+    /// Layout per entry: `a_w[v, k]` row-major `[vus, h_us]`,
+    /// same for `b_w`; `a_log[v]` and `dt_bias[v]` are length-vus.
+    pub linear_attn_host_cache: Vec<Qwen36LinearAttnHostCache>,
     /// Phase 4u: paged f16 KV cache for the 10 full-attention
     /// layers. Layout `[num_full_layers, 2 (K+V), num_blocks,
     /// block_size, num_kv_heads, head_dim]` f16. Pre-allocated above
@@ -716,7 +739,7 @@ impl Qwen36Bringup {
             total = arena_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
 
-        let bringup = Self {
+        let mut bringup = Self {
             paths,
             arena_bytes,
             arch,
@@ -734,6 +757,8 @@ impl Qwen36Bringup {
             linear_state_ptr,
             linear_state_bytes,
             linear_state_layer_bytes,
+            linear_attn_host_cache: Vec::new(), // populated below
+
             kv_cache_ptr,
             kv_cache_bytes,
             kv_cache_layer_bytes,
@@ -743,6 +768,61 @@ impl Qwen36Bringup {
             conv_state_bytes,
             conv_state_layer_bytes,
         };
+        // Build per-linear-attn-layer host f32 weight caches BEFORE
+        // any probe / smoke runs (some of those reach into
+        // `apply_layer_linear_attn` and would panic on an empty
+        // cache). Pre-Phase-5 code DtoH-copied these weights every
+        // token (~256 KB of constants per token); now we dequantise
+        // once to f32 and the per-token alpha/beta loop reads
+        // straight from RAM.
+        {
+            let mut linear_caches: Vec<Qwen36LinearAttnHostCache> = Vec::new();
+            for layer in bringup.model.layers.iter() {
+                if let rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(la) = &layer.attn {
+                    let vus = la.in_proj_a.shape[0];
+                    let h_us = la.in_proj_a.shape[1];
+                    let proj_bytes = vus * h_us * 2;
+                    let mut a_w = vec![0u8; proj_bytes];
+                    let mut b_w = vec![0u8; proj_bytes];
+                    let mut a_log_h = vec![0u8; vus * 2];
+                    let mut dt_bias_h = vec![0u8; vus * 2];
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        cuMemcpyDtoH_v2(a_w.as_mut_ptr() as *mut _, la.in_proj_a.offset_bytes, proj_bytes);
+                        cuMemcpyDtoH_v2(b_w.as_mut_ptr() as *mut _, la.in_proj_b.offset_bytes, proj_bytes);
+                        cuMemcpyDtoH_v2(a_log_h.as_mut_ptr() as *mut _, la.a_log.offset_bytes, a_log_h.len());
+                        cuMemcpyDtoH_v2(dt_bias_h.as_mut_ptr() as *mut _, la.dt_bias.offset_bytes, dt_bias_h.len());
+                    }
+                    let mut a_w_f32 = vec![0.0f32; vus * h_us];
+                    let mut b_w_f32 = vec![0.0f32; vus * h_us];
+                    for i in 0..(vus * h_us) {
+                        a_w_f32[i] = f16_bits_to_f32(u16::from_le_bytes([a_w[i * 2], a_w[i * 2 + 1]]));
+                        b_w_f32[i] = f16_bits_to_f32(u16::from_le_bytes([b_w[i * 2], b_w[i * 2 + 1]]));
+                    }
+                    let mut a_log_f32 = vec![0.0f32; vus];
+                    let mut dt_bias_f32 = vec![0.0f32; vus];
+                    for v in 0..vus {
+                        a_log_f32[v] = f16_bits_to_f32(u16::from_le_bytes([a_log_h[v * 2], a_log_h[v * 2 + 1]]));
+                        dt_bias_f32[v] = f16_bits_to_f32(u16::from_le_bytes([dt_bias_h[v * 2], dt_bias_h[v * 2 + 1]]));
+                    }
+                    linear_caches.push(Qwen36LinearAttnHostCache {
+                        a_w_f32, b_w_f32, a_log_f32, dt_bias_f32, vus, h_us,
+                    });
+                }
+            }
+            let cache_bytes: usize = linear_caches.iter()
+                .map(|c| (c.a_w_f32.len() + c.b_w_f32.len()) * 4
+                      + (c.a_log_f32.len() + c.dt_bias_f32.len()) * 4)
+                .sum();
+            eprintln!(
+                "[qwen36] linear_attn host cache: {} layers, {:.1} MiB",
+                linear_caches.len(),
+                cache_bytes as f64 / (1024.0 * 1024.0)
+            );
+            bringup.linear_attn_host_cache = linear_caches;
+        }
+
         // Phase 3e smoke: actually launch embedding_gather against the
         // loaded weights. If this throws, the rest of the forward
         // pipeline can't be built on top — fail fast.
@@ -4893,33 +4973,26 @@ impl Qwen36Bringup {
                 input_host[i * 2], input_host[i * 2 + 1],
             ]));
         }
-        let proj_bytes = vus * h_us * 2;
-        let mut a_w = vec![0u8; proj_bytes];
-        let mut b_w = vec![0u8; proj_bytes];
-        let mut a_log_h = vec![0u8; vus * 2];
-        let mut dt_bias_h = vec![0u8; vus * 2];
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(a_w.as_mut_ptr() as *mut _, la.in_proj_a.offset_bytes, proj_bytes);
-            let _ = cuMemcpyDtoH_v2(b_w.as_mut_ptr() as *mut _, la.in_proj_b.offset_bytes, proj_bytes);
-            let _ = cuMemcpyDtoH_v2(a_log_h.as_mut_ptr() as *mut _, la.a_log.offset_bytes, a_log_h.len());
-            let _ = cuMemcpyDtoH_v2(dt_bias_h.as_mut_ptr() as *mut _, la.dt_bias.offset_bytes, dt_bias_h.len());
-        }
+        // Use the bring-up-time host cache instead of DtoH'ing the
+        // constant weights per token. `linear_seq_idx` indexes the
+        // cache in the same linear-attn-layer order
+        // `forward_qwen36_decode` walks. Saves ~256 KB DtoH + the
+        // f16→f32 conversion per token.
+        let cache = &self.linear_attn_host_cache[linear_seq_idx as usize];
+        debug_assert_eq!(cache.vus, vus);
+        debug_assert_eq!(cache.h_us, h_us);
         let mut alpha_f32 = vec![0.0f32; vus];
         let mut beta_f32 = vec![0.0f32; vus];
         for v in 0..vus {
             let mut a_acc = 0.0f32;
             let mut b_acc = 0.0f32;
-            let row = v * h_us * 2;
+            let row = v * h_us;
             for k in 0..h_us {
-                let aw = f16_bits_to_f32(u16::from_le_bytes([a_w[row + k*2], a_w[row + k*2 + 1]]));
-                let bw = f16_bits_to_f32(u16::from_le_bytes([b_w[row + k*2], b_w[row + k*2 + 1]]));
-                a_acc += aw * input_f32[k];
-                b_acc += bw * input_f32[k];
+                a_acc += cache.a_w_f32[row + k] * input_f32[k];
+                b_acc += cache.b_w_f32[row + k] * input_f32[k];
             }
-            let dt_b = f16_bits_to_f32(u16::from_le_bytes([dt_bias_h[v*2], dt_bias_h[v*2 + 1]]));
-            let a_log = f16_bits_to_f32(u16::from_le_bytes([a_log_h[v*2], a_log_h[v*2 + 1]]));
+            let dt_b = cache.dt_bias_f32[v];
+            let a_log = cache.a_log_f32[v];
             let x = a_acc + dt_b;
             // numerically-stable softplus
             let sp = if x > 20.0 { x } else { (1.0f32 + x.exp()).ln() };
