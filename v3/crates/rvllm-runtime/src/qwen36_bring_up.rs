@@ -5263,7 +5263,7 @@ impl Qwen36Bringup {
                 stream_raw,
             )?;
         }
-        self.stream.fence()?;
+        // No fence: q/k/v projections run on the same stream.
 
         // 2. q_proj, k_proj, v_proj GEMVs.
         let q_region =
@@ -5289,7 +5289,7 @@ impl Qwen36Bringup {
                 fl.v_proj.offset_bytes, v_bs, normed_region.device_ptr(),
                 m, v_n, hidden, stream_raw)?;
         }
-        self.stream.fence()?;
+        // No fence: split_q_gate runs on the same stream.
 
         // 3. GPU split of q_proj output [num_tokens, num_heads, 2*head_dim]
         //    into Q + gate [num_tokens, num_heads, head_dim] each.
@@ -5353,7 +5353,7 @@ impl Qwen36Bringup {
                 stream_raw,
             )?;
         }
-        self.stream.fence()?;
+        // No fence: fused_rope runs on the same stream.
 
         // 5. NeoX-style partial RoPE on GPU + KV-cache write.
         //
@@ -5430,7 +5430,9 @@ impl Qwen36Bringup {
                 ));
             }
         }
-        self.stream.fence()?;
+        // No fence: paged FA2 decode runs on the same stream after
+        // the fused_rope kernel writes Q (in-place into q_split_region)
+        // and K/V into the cache slots.
         // (Phase-4b prep) Q-rotation, K-rotation, KV-cache write all
         // happened in the GPU launch above; the previous host-side
         // pipeline (DtoH cos/sin + DtoH q/k/v + CPU NeoX rotation +
@@ -5509,7 +5511,7 @@ impl Qwen36Bringup {
                 core::ptr::null_mut(),
             );
         }
-        self.stream.fence()?;
+        // No fence: attn_output_gate kernel runs on the same stream.
 
         // 7. attn_output_gate: attn_out * sigmoid(gate).
         let gated_region =
@@ -5539,7 +5541,7 @@ impl Qwen36Bringup {
                 core::ptr::null_mut(),
             );
         }
-        self.stream.fence()?;
+        // No fence: o_proj runs on the same stream after sigmoid_mul.
 
         // 8. o_proj FP8 GEMV → out_buf [hidden]. (Phase 4a routing.)
         let out_region =
@@ -5549,7 +5551,8 @@ impl Qwen36Bringup {
                 fl.o_proj.offset_bytes, o_bs, gated_region.device_ptr(),
                 m, o_n, o_k, stream_raw)?;
         }
-        self.stream.fence()?;
+        // No fence: residual vector_add runs on the same stream
+        // after o_proj.
 
         // 9. Residual sum: last_hidden += out_buf, GPU-side.
         // Replaces a 2× DtoH + CPU loop over `hidden` halves + HtoD
@@ -5586,7 +5589,8 @@ impl Qwen36Bringup {
                 ));
             }
         }
-        self.stream.fence()?;
+        // No function-exit fence: same-stream ordering covers the
+        // next layer's first read of last_hidden_ptr.
         Ok(())
     }
 
