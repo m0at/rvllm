@@ -2994,7 +2994,16 @@ impl Gemma4Bringup {
             rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((rng_state >> 40) as f32) / (1u32 << 24) as f32
         };
-        let host_sample_token = |logits_dev_ptr: u64,
+        // Per-token sampling buffers, hoisted out of `host_sample_token`
+        // so we allocate once per request instead of `vec![…; vocab]` +
+        // `Vec<(u32,f32)>` collect on every decode step. For Gemma 4
+        // vocab=263 168 that's ~1 MiB f32 + ~2 MiB tuple-vec saved
+        // per token. The DtoH copy itself remains — replacing it
+        // needs a CUDA sampling kernel, which is out of scope here;
+        // this just stops the heap traffic.
+        let mut host_logits: Vec<f32> = Vec::new();
+        let mut scaled: Vec<(u32, f32)> = Vec::new();
+        let mut host_sample_token = |logits_dev_ptr: u64,
                                  vocab: u32,
                                  temp: f32,
                                  top_p: f32,
@@ -3003,7 +3012,8 @@ impl Gemma4Bringup {
             -> Result<u32> {
             #[cfg(feature = "cuda")]
             unsafe {
-                let mut host_logits = vec![0f32; vocab as usize];
+                host_logits.clear();
+                host_logits.resize(vocab as usize, 0.0);
                 // Check the cuMemcpyDtoH return — a silently-failing
                 // copy left `host_logits` all-zeros, every entry tied,
                 // and lex-tiebreak picked token-id 0 deterministically.
@@ -3033,8 +3043,9 @@ impl Gemma4Bringup {
                 // Apply temperature: divide by temp (clamped to >=1e-3 to
                 // avoid div-by-zero on sloppy callers).
                 let inv_temp = 1.0f32 / temp.max(1e-3);
-                let mut scaled: Vec<(u32, f32)> = host_logits.iter().enumerate()
-                    .map(|(i, &v)| (i as u32, v * inv_temp)).collect();
+                scaled.clear();
+                scaled.extend(host_logits.iter().enumerate()
+                    .map(|(i, &v)| (i as u32, v * inv_temp)));
                 let cmp_desc = |a: &(u32, f32), b: &(u32, f32)| {
                     b.1.partial_cmp(&a.1)
                         .unwrap_or(std::cmp::Ordering::Equal)

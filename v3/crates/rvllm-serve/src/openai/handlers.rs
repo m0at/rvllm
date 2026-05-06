@@ -464,7 +464,21 @@ pub async fn chat_completions(
     let _admission = Arc::new(state.worker.try_admit()?);
     let request_deadline = tokio::time::Instant::now() + state.config.request_timeout;
 
-    let vision_items = {
+    // Cheap async-side pre-scan: text-only chats are the overwhelming
+    // majority, so don't pay a `spawn_blocking` round-trip + the
+    // CancelOnDrop guard + an Arc<AtomicBool> just to walk the message
+    // list and discover there are no images. `image_urls()` is a pure
+    // slice iter, no I/O, no GPU work — it's safe to run inline. The
+    // budget-cap envs (`RVLLM_VISION_MAX_IMAGES`, …) are still enforced
+    // in `collect_vision_items` for the with-images branch below.
+    let has_image_parts = req
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_ref())
+        .any(|c| c.image_urls().next().is_some());
+    let vision_items: Vec<crate::worker::VisionItem> = if !has_image_parts {
+        Vec::new()
+    } else {
         let arch = state.vision_arch;
         let messages = req.messages.clone();
         // Cancellation flag the spawn_blocking fetch loop checks

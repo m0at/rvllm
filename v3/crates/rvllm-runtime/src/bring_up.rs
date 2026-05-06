@@ -235,10 +235,14 @@ impl Bringup {
         let cublaslt_ws_region = arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;
         let cublaslt = CublasLt::new(cublaslt_ws_region.device_ptr(), cublaslt_ws_bytes)?;
         // Keep offset for audit; Region lifetime is tied to arena
-        // which lives as long as Bringup.
+        // which lives as long as Bringup. The offset is the region's
+        // device pointer minus the arena base — earlier this expression
+        // was `device_ptr - device_ptr` (always 0), so the field
+        // recorded a placeholder rather than the real arena offset.
+        // No hot-path consumer reads it today, but a future caller
+        // would have inherited the bug silently.
         let cublaslt_ws = HbmArenaCheckpoint {
-            offset_bytes: (cublaslt_ws_region.device_ptr() - cublaslt_ws_region.device_ptr())
-                as usize,
+            offset_bytes: (cublaslt_ws_region.device_ptr() - arena.base_ptr()) as usize,
             bytes: cublaslt_ws_bytes,
         };
 
