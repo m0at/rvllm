@@ -255,6 +255,14 @@ pub struct Qwen36Bringup {
     /// Layout per entry: `a_w[v, k]` row-major `[vus, h_us]`,
     /// same for `b_w`; `a_log[v]` and `dt_bias[v]` are length-vus.
     pub linear_attn_host_cache: Vec<Qwen36LinearAttnHostCache>,
+    /// Per-layer host-side f32 cache of the router weight matrix
+    /// (`[num_experts, hidden]`). Pre-Phase-4b-prep iter15 the
+    /// router GEMV did a fresh DtoH of ~1 MiB f16 weights every
+    /// MoE layer × every token, then converted f16→f32 and ran
+    /// the host matvec. The weight is constant — caching it as
+    /// f32 once at bring-up replaces 30 MiB of per-token DtoH +
+    /// 16M f16→f32 conversions with a direct RAM read.
+    pub router_host_cache: Vec<Vec<f32>>,
     /// Phase 4u: paged f16 KV cache for the 10 full-attention
     /// layers. Layout `[num_full_layers, 2 (K+V), num_blocks,
     /// block_size, num_kv_heads, head_dim]` f16. Pre-allocated above
@@ -816,6 +824,7 @@ impl Qwen36Bringup {
             linear_state_bytes,
             linear_state_layer_bytes,
             linear_attn_host_cache: Vec::new(), // populated below
+            router_host_cache: Vec::new(),       // populated below
 
             kv_cache_ptr,
             kv_cache_bytes,
@@ -879,6 +888,42 @@ impl Qwen36Bringup {
                 cache_bytes as f64 / (1024.0 * 1024.0)
             );
             bringup.linear_attn_host_cache = linear_caches;
+        }
+
+        // Phase 4b-prep iter15: cache the router weight matrices as
+        // f32 host vectors so the per-layer router GEMV can skip the
+        // 1 MiB DtoH + f16→f32 unpack every token.
+        {
+            let num_experts = bringup.arch.num_experts;
+            let hidden_us = bringup.arch.base.hidden_size as usize;
+            let mut caches: Vec<Vec<f32>> = Vec::new();
+            for layer in bringup.model.layers.iter() {
+                let router_bytes = num_experts * hidden_us * 2;
+                let mut router_host = vec![0u8; router_bytes];
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    cuMemcpyDtoH_v2(
+                        router_host.as_mut_ptr() as *mut _,
+                        layer.moe.router.offset_bytes,
+                        router_bytes,
+                    );
+                }
+                let mut router_f32 = vec![0.0f32; num_experts * hidden_us];
+                for i in 0..(num_experts * hidden_us) {
+                    router_f32[i] = f16_bits_to_f32(u16::from_le_bytes([
+                        router_host[i * 2], router_host[i * 2 + 1],
+                    ]));
+                }
+                caches.push(router_f32);
+            }
+            let total_bytes: usize = caches.iter().map(|c| c.len() * 4).sum();
+            eprintln!(
+                "[qwen36] router host cache: {} layers, {:.1} MiB",
+                caches.len(),
+                total_bytes as f64 / (1024.0 * 1024.0)
+            );
+            bringup.router_host_cache = caches;
         }
 
         // Phase 3e smoke: actually launch embedding_gather against the
@@ -4729,6 +4774,7 @@ impl Qwen36Bringup {
                     post_attn_norm_ptr,
                     tok_ptr,
                     kernel_gemv, hidden, last_hidden_bytes,
+                    layer_idx,
                 )?;
                 if dump_this_token {
                     let dir = dump_dir.as_ref().unwrap();
@@ -5622,6 +5668,7 @@ impl Qwen36Bringup {
         kernel_gemv: rvllm_kernels::KernelFn,
         hidden: u32,
         last_hidden_bytes: usize,
+        layer_idx: usize,
     ) -> Result<()> {
         let stream_raw = self.stream.raw() as u64;
         let n_int = moe.experts_gate_proj_fused.shape[1] as u32; // 512
@@ -5677,27 +5724,16 @@ impl Qwen36Bringup {
                 input_host[i * 2], input_host[i * 2 + 1],
             ]));
         }
-        let router_bytes = num_experts * hidden_us * 2;
-        let mut router_host = vec![0u8; router_bytes];
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                router_host.as_mut_ptr() as *mut _,
-                moe.router.offset_bytes,
-                router_bytes,
-            );
-        }
+        // Phase 4b-prep iter15: cached f32 router weights (populated
+        // at bring-up). Replaces a 1 MiB DtoH + f16→f32 unpack per
+        // token per MoE layer.
+        let router_f32 = &self.router_host_cache[layer_idx];
         let mut logits = vec![0.0f32; num_experts];
         for e in 0..num_experts {
-            let row = e * hidden_us * 2;
+            let row = e * hidden_us;
             let mut acc = 0.0f32;
             for k in 0..hidden_us {
-                let bits = u16::from_le_bytes([
-                    router_host[row + k * 2],
-                    router_host[row + k * 2 + 1],
-                ]);
-                acc += f16_bits_to_f32(bits) * input_f32[k];
+                acc += router_f32[row + k] * input_f32[k];
             }
             logits[e] = acc;
         }
