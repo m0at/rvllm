@@ -85,6 +85,11 @@ pub struct Qwen36OutsideKernels {
     /// per-head copy_from_slice + HtoD round-trip per token.
     pub split_q_gate_f16_mod: LoadedModule,
     pub fn_split_q_gate_f16: KernelFn,
+    /// Conv1d state advance + conv_in assembly for the linear-attn
+    /// block. Replaces a 2× DtoH + 2× HtoD pure-shuffle round-trip
+    /// with one launch.
+    pub conv_state_advance_f16_mod: LoadedModule,
+    pub fn_conv_state_advance_f16: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -379,6 +384,9 @@ impl Qwen36Bringup {
         let split_q_gate_f16_mod = kernels.load_ptx("split_q_gate_f16")?;
         let fn_split_q_gate_f16 = split_q_gate_f16_mod
             .get_function("split_q_gate_f16_kernel")?;
+        let conv_state_advance_f16_mod = kernels.load_ptx("conv_state_advance_f16")?;
+        let fn_conv_state_advance_f16 = conv_state_advance_f16_mod
+            .get_function("conv_state_advance_f16_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -452,6 +460,8 @@ impl Qwen36Bringup {
             fn_fused_rope_qwen_partial_f16kv,
             split_q_gate_f16_mod,
             fn_split_q_gate_f16,
+            conv_state_advance_f16_mod,
+            fn_conv_state_advance_f16,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -4829,55 +4839,39 @@ impl Qwen36Bringup {
             self.arena.region("qwen36_pl_cin", conv_in_bytes, 16)?;
         let conv_out_region =
             self.arena.region("qwen36_pl_cout", qkv_bytes_dev, 16)?;
-        let mut qkv_host_real = vec![0u8; qkv_bytes_dev];
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                qkv_host_real.as_mut_ptr() as *mut _,
-                qkv_region.device_ptr(),
-                qkv_bytes_dev,
-            );
-        }
-        // Read the 3 previous timesteps from this layer's conv_state.
+        // GPU-side conv_in assembly + state advance. One launch
+        // replaces 2× DtoH + 2× HtoD + two CPU vec slicings.
         let conv_state_ptr_layer = self.conv_state_layer_ptr(linear_seq_idx);
-        let conv_state_layer_bytes_v = self.conv_state_layer_bytes;
-        let mut conv_state_host = vec![0u8; conv_state_layer_bytes_v];
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                conv_state_host.as_mut_ptr() as *mut _,
-                conv_state_ptr_layer,
-                conv_state_layer_bytes_v,
+            let mut conv_in = conv_in_region.device_ptr();
+            let mut state = conv_state_ptr_layer;
+            let mut cur = qkv_region.device_ptr();
+            let mut ts_i: i32 = qkv_n as i32;
+            let args = [
+                (&mut conv_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut state) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cur) as *mut u64 as *mut core::ffi::c_void,
+                (&mut ts_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((qkv_n + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_conv_state_advance_f16.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
             );
-        }
-        // Build conv_in: [state_t-3, state_t-2, state_t-1, current]
-        // Layout: [4, qkv_n] f16. state holds 3 timesteps × qkv_n f16.
-        let mut conv_in_host = vec![0u8; conv_in_bytes];
-        conv_in_host[..conv_state_layer_bytes_v]
-            .copy_from_slice(&conv_state_host);
-        let cur_off = conv_state_layer_bytes_v;
-        conv_in_host[cur_off..cur_off + qkv_bytes_dev]
-            .copy_from_slice(&qkv_host_real);
-        unsafe { conv_in_region.copy_from_host(&conv_in_host)? };
-        // Update conv_state: shift left by 1 timestep, append current.
-        // New state = [state_t-2, state_t-1, current].
-        let mut conv_state_new = vec![0u8; conv_state_layer_bytes_v];
-        let ts_bytes = qkv_n as usize * 2;
-        conv_state_new[..ts_bytes * 2]
-            .copy_from_slice(&conv_state_host[ts_bytes..ts_bytes * 3]);
-        conv_state_new[ts_bytes * 2..ts_bytes * 3]
-            .copy_from_slice(&qkv_host_real);
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let _ = cuMemcpyHtoDAsync_v2(
-                conv_state_ptr_layer,
-                conv_state_new.as_ptr() as *const _,
-                conv_state_layer_bytes_v,
-                self.stream.raw() as _,
-            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 linear_attn conv_state_advance launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
         }
         #[cfg(feature = "cuda")]
         unsafe {
