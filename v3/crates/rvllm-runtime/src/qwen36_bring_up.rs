@@ -4915,12 +4915,12 @@ impl Qwen36Bringup {
             // their final residual directly into `tok_ptr`, which
             // already points at the destination slot in hidden_region.
         }
-        // Single fence at end of prefill so the closer's read of the
-        // last hidden slot sees finalised values (host probes /
-        // cublasLt handle synchronisation themselves, but this is
-        // the canonical sync point between the per-token chain and
-        // the lm_head / argmax stage).
-        self.stream.fence()?;
+        // No fence: the per-token chain's last residual-GPU kernel
+        // runs on stream_raw, and the closer's first op
+        // (`fused_rmsnorm_fp8_quant`) is also on stream_raw. cublasLt
+        // attaches to stream_raw via the explicit `stream_raw` arg
+        // and the iter27 argmax+DtoH inside the closer already has
+        // its own fence-before-DtoH. (Phase 4b-prep iter30.)
 
         // 5. Final norm + lm_head + argmax (outside-only closer).
         self.forward_qwen36_outside_closer(
