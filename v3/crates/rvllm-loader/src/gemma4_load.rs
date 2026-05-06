@@ -620,7 +620,7 @@ where
     // (mean ≈ 4.88), but the vision-side gammas in the same dump are
     // not (mean ≈ 2.66, min ≈ -4.47) — i.e. centered around 0 with the
     // shift not applied. Bake +1 here so the kernel sees `(1+gamma)`.
-    let upload_with_bias = |name: &'static str, hf_name: &str, bias: f32| -> Result<F16Weight> {
+    let _upload_with_bias = |name: &'static str, hf_name: &str, bias: f32| -> Result<F16Weight> {
         let (si, e) = must_get(hf_name)?;
         let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
         if bias != 0.0 {

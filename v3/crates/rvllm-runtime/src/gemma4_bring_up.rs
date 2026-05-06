@@ -4103,8 +4103,20 @@ impl Gemma4Bringup {
                 // image-soft-token positions that fall inside this chunk,
                 // BEFORE the optional bf16 widen so the rest of the chain
                 // is dtype-uniform.
+                //
+                // No surrounding `self.stream.fence()`: every op here —
+                // the embedding_gather above, our HtoDAsync, and the
+                // F16ToBf16Launch below — runs on the same stream. CUDA
+                // serialises stream-ordered work, so the fences only
+                // host-stalled the worker without changing correctness.
+                //
+                // We DO check `cuMemcpyHtoDAsync_v2`'s return code now:
+                // a copy error here used to silently leave the residual
+                // populated with text-token embeddings while the rest
+                // of the prefill ran to completion, producing
+                // syntactically-clean but semantically wrong output for
+                // the image-bearing chunk.
                 if !vision_splice.is_empty() {
-                    self.stream.fence()?;
                     let row_bytes = (hidden as usize) * 2;
                     for (slot_start, emb_bytes) in vision_splice {
                         let slot_n = emb_bytes.len() / row_bytes;
@@ -4117,14 +4129,20 @@ impl Gemma4Bringup {
                         let n_rows = hi - lo;
                         let dst_off = ((lo - chunk_a) * row_bytes) as u64;
                         let src_off = ((lo - slot_start) * row_bytes) as usize;
-                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        let rc = cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                             residual_ptr + dst_off,
                             emb_bytes[src_off .. src_off + n_rows * row_bytes].as_ptr() as *const _,
                             n_rows * row_bytes,
                             self.stream.raw() as _,
                         );
+                        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                            return Err(rvllm_core::RvllmError::cuda(
+                                "gemma4 vision splice cuMemcpyHtoDAsync",
+                                rvllm_core::CudaErrorKind::MemcpyFailed,
+                                rvllm_core::CudaCtx::setup(),
+                            ));
+                        }
                     }
-                    self.stream.fence()?;
                 }
 
                 // Cycle 54 Stage 1: widen embedding-gather output (f16)
@@ -6015,7 +6033,7 @@ impl Gemma4Bringup {
             // head) instead of N per-token DtoD calls. With 27 blocks ×
             // 16 heads × N=2400 tokens, the per-token loop produced
             // millions of tiny CUDA driver calls and froze for minutes.
-            let extract_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
+            let _extract_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
                 #[cfg(feature = "cuda")]
                 unsafe {
                     let mut o = dst;
@@ -6048,7 +6066,7 @@ impl Gemma4Bringup {
                 }
                 Ok(())
             };
-            let scatter_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
+            let _scatter_head = |dst: u64, src: u64, head_idx: usize| -> Result<()> {
                 #[cfg(feature = "cuda")]
                 unsafe {
                     let mut o = dst;

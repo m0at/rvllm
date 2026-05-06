@@ -3272,10 +3272,10 @@ impl Qwen36Bringup {
             let _ = cuMemcpyDtoH_v2(probe.as_mut_ptr().add(8) as *mut _, last_ptr, 8);
         }
         let l0_zero = probe[0..8].iter().all(|b| *b == 0);
-        let lN_zero = probe[8..16].iter().all(|b| *b == 0);
+        let l_n_zero = probe[8..16].iter().all(|b| *b == 0);
         eprintln!(
             "[qwen36] kv_cache_probe: {n_full} full-attn slots, \
-             layer0 head8b zeroed={l0_zero}, last_layer head8b zeroed={lN_zero}, \
+             layer0 head8b zeroed={l0_zero}, last_layer head8b zeroed={l_n_zero}, \
              total={:.1} MiB persistent",
             self.kv_cache_bytes as f64 / (1024.0 * 1024.0),
         );
@@ -3732,7 +3732,7 @@ impl Qwen36Bringup {
         })?;
 
         // ── Step 1: decode + preprocess (CPU). ───────────────────────
-        let img = decode_image(image_bytes).map_err(|e| {
+        let img = decode_image(image_bytes).map_err(|_e| {
             rvllm_core::RvllmError::cuda(
                 "vision: image decode failed",
                 rvllm_core::CudaErrorKind::Other,
@@ -3740,7 +3740,7 @@ impl Qwen36Bringup {
             )
         })?;
         let cfg = QwenPreprocessConfig::default();
-        let pp = preprocess_qwen(&img, &cfg).map_err(|e| {
+        let pp = preprocess_qwen(&img, &cfg).map_err(|_e| {
             rvllm_core::RvllmError::cuda(
                 "vision: preprocess failed",
                 rvllm_core::CudaErrorKind::Other,
@@ -5225,9 +5225,9 @@ impl Qwen36Bringup {
         let head_k_dim: u32 = 128;
         let head_v_dim: u32 = 128;
         let key_dim = num_k_heads * head_k_dim; // 2048
-        let value_dim = num_v_heads * head_v_dim; // 4096
+        let _value_dim = num_v_heads * head_v_dim; // 4096
         let v_per_k = num_v_heads / num_k_heads; // 2
-        let kus = num_k_heads as usize;
+        let _kus = num_k_heads as usize;
         let vus = num_v_heads as usize;
         let hkd = head_k_dim as usize;
         let hvd = head_v_dim as usize;
@@ -5720,7 +5720,7 @@ impl Qwen36Bringup {
         //    Replaces a DtoH + CPU per-head copy_from_slice + HtoD
         //    round-trip per token with one launch.
         let q_size = (num_heads * head_dim) as usize; // 4096
-        let hd = head_dim as usize;
+        let _hd = head_dim as usize;
         let q_split_region =
             self.arena.region("qwen36_pf_qs", q_size * (m as usize) * 2, 16)?;
         let gate_region =
@@ -6035,7 +6035,7 @@ impl Qwen36Bringup {
         kernel_gemv: rvllm_kernels::KernelFn,
         hidden: u32,
         last_hidden_bytes: usize,
-        layer_idx: usize,
+        _layer_idx: usize,
     ) -> Result<()> {
         let stream_raw = self.stream.raw() as u64;
         let n_int = moe.experts_gate_proj_fused.shape[1] as u32; // 512
@@ -6170,8 +6170,8 @@ impl Qwen36Bringup {
         // 3. Routed experts: each runs gate+up FP8 → silu·mul → down FP8.
         let mid_bytes = (n_int as usize) * 2;
         let down_bytes = (n_down as usize) * 2;
-        let gate_region = self.arena.region("qwen36_pm_g", mid_bytes, 16)?;
-        let up_region = self.arena.region("qwen36_pm_u", mid_bytes, 16)?;
+        let _gate_region = self.arena.region("qwen36_pm_g", mid_bytes, 16)?;
+        let _up_region = self.arena.region("qwen36_pm_u", mid_bytes, 16)?;
         let silu_region = self.arena.region("qwen36_pm_s", mid_bytes, 16)?;
         let down_region = self.arena.region("qwen36_pm_d", down_bytes, 16)?;
         let int_per_expert_w = (n_int as u64) * (k_in as u64);

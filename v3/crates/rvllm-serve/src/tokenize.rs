@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use minijinja::{context, Environment};
+use minijinja::context;
 use serde::Serialize;
 
 use crate::error::ApiError;
@@ -34,11 +34,13 @@ pub struct TokenizerHandle {
 
 struct TokenizerInner {
     tokenizer: tokenizers::Tokenizer,
-    /// Rendered into the first turn on every request.
-    chat_template: String,
-    /// MiniJinja env with `chat_template` pre-compiled. Built once at
-    /// load (`add_template_owned`) and reused on every render —
-    /// previously each chat request paid the full template parse.
+    /// MiniJinja env with the chat template (loaded from
+    /// `chat_template.jinja` or the tokenizer-config inline value)
+    /// pre-compiled. Built once at load (`add_template_owned`)
+    /// and reused on every render — previously each chat request
+    /// paid the full template parse. The raw template string is
+    /// owned by the env via `add_template_owned`, so no separate
+    /// field needs to keep it alive.
     chat_env: minijinja::Environment<'static>,
     /// Literal `<bos>` style token the template references via
     /// `bos_token`. Rendered as a STRING by the template; the whole
@@ -153,13 +155,12 @@ impl TokenizerHandle {
         chat_env.set_unknown_method_callback(
             minijinja_contrib::pycompat::unknown_method_callback,
         );
-        chat_env.add_template_owned("chat", chat_template.clone())
+        chat_env.add_template_owned("chat", chat_template)
             .map_err(|e| ApiError::Tokenize(format!("chat template parse: {e}")))?;
 
         Ok(Self {
             inner: Arc::new(TokenizerInner {
                 tokenizer,
-                chat_template,
                 chat_env,
                 bos_token_str,
                 bos_token_id,

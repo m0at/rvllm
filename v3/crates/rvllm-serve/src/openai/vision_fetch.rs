@@ -232,7 +232,8 @@ fn is_disallowed_target(ip: std::net::IpAddr) -> bool {
 /// and connect can't swing onto a private IP.
 struct VettedTarget {
     host: String,
-    port: u16,
+    // The `addrs` already carry the port via `SocketAddr`; we don't
+    // need to keep it separately. Used only for `resolve_to_addrs`.
     addrs: Vec<std::net::SocketAddr>,
 }
 
@@ -271,7 +272,7 @@ fn vet_url_target(url: &str) -> Result<Option<VettedTarget>, VisionError> {
             )));
         }
     }
-    Ok(Some(VettedTarget { host: host.to_string(), port, addrs }))
+    Ok(Some(VettedTarget { host: host.to_string(), addrs }))
 }
 
 /// Cache of `(host, sorted vetted-addr set)` → pinned reqwest
