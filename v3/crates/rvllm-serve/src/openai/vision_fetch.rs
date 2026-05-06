@@ -226,13 +226,23 @@ fn is_disallowed_target(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn vet_url_target(url: &str) -> Result<(), VisionError> {
+/// Result of a successful URL vet — `host:port` parsed out and a
+/// VERIFIED set of public IPs that the host resolved to. The caller
+/// pins reqwest to these exact addresses so a DNS rebind between vet
+/// and connect can't swing onto a private IP.
+struct VettedTarget {
+    host: String,
+    port: u16,
+    addrs: Vec<std::net::SocketAddr>,
+}
+
+fn vet_url_target(url: &str) -> Result<Option<VettedTarget>, VisionError> {
     use std::net::ToSocketAddrs;
     if std::env::var("RVLLM_VISION_FETCH_ALLOW_PRIVATE")
         .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
         .unwrap_or(false)
     {
-        return Ok(());
+        return Ok(None);
     }
     let parsed = url::Url::parse(url)
         .map_err(|e| VisionError::FetchFailed(format!("invalid url: {e}")))?;
@@ -240,16 +250,19 @@ fn vet_url_target(url: &str) -> Result<(), VisionError> {
         .host_str()
         .ok_or_else(|| VisionError::FetchFailed("url has no host".into()))?;
     let port = parsed.port_or_known_default().unwrap_or(80);
-    // Resolve and check EVERY answer. Note: this is one DNS lookup;
-    // reqwest will do its own when it actually connects. A determined
-    // attacker can DNS-rebind between the two — closing that gap
-    // properly needs a custom reqwest connector that pins the IP we
-    // verified here. Filed for later; this still catches the obvious
-    // SSRF cases (literal-IP URLs, `metadata.google.internal`, etc).
-    let addrs = (host, port)
+    // Resolve once; check EVERY answer; pin reqwest to those IPs so
+    // its connect-time resolution can't drift onto a different (and
+    // possibly private) IP via DNS rebinding.
+    let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
-        .map_err(|e| VisionError::FetchFailed(format!("dns: {e}")))?;
-    for addr in addrs {
+        .map_err(|e| VisionError::FetchFailed(format!("dns: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(VisionError::FetchFailed(format!(
+            "dns: no addresses for host {host}"
+        )));
+    }
+    for addr in &addrs {
         if is_disallowed_target(addr.ip()) {
             return Err(VisionError::FetchFailed(format!(
                 "refusing to fetch from non-public address {} (set \
@@ -258,13 +271,39 @@ fn vet_url_target(url: &str) -> Result<(), VisionError> {
             )));
         }
     }
-    Ok(())
+    Ok(Some(VettedTarget { host: host.to_string(), port, addrs }))
 }
 
 fn fetch_http(url: &str) -> Result<Vec<u8>, VisionError> {
     use std::io::Read;
-    vet_url_target(url)?;
-    let client = http_client();
+    let vet = vet_url_target(url)?;
+    // Build a per-request client that pins the host to the IPs we
+    // already vetted. With `RVLLM_VISION_FETCH_ALLOW_PRIVATE=1` the
+    // vet returns None and we fall back to the shared client (no IP
+    // pinning, trusted-internal use case).
+    let client_owned: Option<reqwest::blocking::Client> = match &vet {
+        Some(t) => {
+            let mut b = reqwest::blocking::Client::builder()
+                .timeout(FETCH_TIMEOUT)
+                .pool_idle_timeout(std::time::Duration::from_secs(60))
+                .pool_max_idle_per_host(2)
+                .redirect(reqwest::redirect::Policy::none());
+            // resolve_to_addrs takes &[SocketAddr]; pinning ALL the
+            // vetted addresses lets reqwest fail-over between v4 / v6
+            // siblings without ever consulting DNS again.
+            b = b.resolve_to_addrs(&t.host, &t.addrs);
+            Some(
+                b.build()
+                    .map_err(|e| VisionError::FetchFailed(format!("client build: {e}")))?,
+            )
+        }
+        None => None,
+    };
+    let _ = vet; // keep alive for the lifetime of the client.
+    let client = match client_owned.as_ref() {
+        Some(c) => c,
+        None => http_client(),
+    };
     let mut resp = client.get(url).send().map_err(|e| {
         if e.is_timeout() {
             VisionError::FetchTimeout

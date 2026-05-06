@@ -2311,7 +2311,7 @@ fn collect_vision_items(
 fn reject_oversized_prompt(
     prompt_len: usize,
     max_new: u32,
-    _cap: u32,
+    cap: u32,
     vision_arch: crate::router::VisionArch,
 ) -> ApiResult<()> {
     // The runtime's KV cache capacity depends on the model arch's
@@ -2329,11 +2329,10 @@ fn reject_oversized_prompt(
     //     and corrupts the arena.
     let (kv_capacity_tokens, source) = match vision_arch {
         crate::router::VisionArch::Qwen36 => {
-            let cap = std::env::var("RVLLM_MAX_TOKENS_CAP")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(4096);
-            (cap as u64, format!("RVLLM_MAX_TOKENS_CAP={cap}"))
+            // `cap` is the value the CLI parsed (or the env override).
+            // main.rs mirrors it back into RVLLM_MAX_TOKENS_CAP so the
+            // Qwen runtime's bring-up reads the same number.
+            (cap as u64, format!("--max-tokens-cap={cap}"))
         }
         crate::router::VisionArch::Gemma4 => {
             const BLOCK_SIZE: u32 = 32;

@@ -95,6 +95,16 @@ async fn main() -> anyhow_compat::Result<()> {
 
     let cli = Cli::parse();
 
+    // Clap binds `--max-tokens-cap` to the `RVLLM_MAX_TOKENS_CAP` env
+    // var for parsing, but if the operator passes the flag and does
+    // NOT export the env var, downstream consumers that read
+    // `std::env::var("RVLLM_MAX_TOKENS_CAP")` directly (the Qwen
+    // request-validator at handlers.rs:2330+ and Qwen runtime KV/RoPE
+    // sizing at qwen36_bring_up.rs:731 / :832) silently fall back to
+    // 4096 — making the CLI flag a misleading no-op for Qwen. Mirror
+    // the value back into the env so every reader agrees.
+    std::env::set_var("RVLLM_MAX_TOKENS_CAP", cli.max_new_tokens_cap.to_string());
+
     let model_id = cli.model_id.clone().unwrap_or_else(|| {
         cli.model_dir
             .file_name()

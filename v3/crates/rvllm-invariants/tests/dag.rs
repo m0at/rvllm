@@ -27,8 +27,23 @@ fn allowed_deps() -> HashMap<&'static str, HashSet<&'static str>> {
         "rvllm-cutlass", "rvllm-attention", "rvllm-fused",
         "rvllm-metadata", "rvllm-graph", "rvllm-loader", "rvllm-sampling",
     ]));
-    m.insert("rvllm-serve", s(&["rvllm-core", "rvllm-runtime"]));
-    m.insert("rvllm-bench", s(&["rvllm-core", "rvllm-runtime"]));
+    // rvllm-serve depends on rvllm-kernels for kernel-handle types
+    // surfaced by the qwen36/gemma4 worker APIs, and on rvllm-graph
+    // / rvllm-metadata for the iter34 indirect-MoE / CUDA-Graph
+    // capture wiring.
+    m.insert("rvllm-serve", s(&[
+        "rvllm-core", "rvllm-runtime",
+        "rvllm-kernels",
+        "rvllm-graph", "rvllm-metadata",
+    ]));
+    // rvllm-bench (and its sibling binaries inside the same crate)
+    // intentionally drives kernel-level launchers and the FP8 GEMM
+    // shim directly so the perf harness can isolate single kernels
+    // without going through the full runtime forward path.
+    m.insert("rvllm-bench", s(&[
+        "rvllm-core", "rvllm-runtime",
+        "rvllm-fused", "rvllm-mem", "rvllm-kernels", "rvllm-cutlass",
+    ]));
     m.insert("rvllm-deploy", s(&["rvllm-core"]));
     m.insert("rvllm-invariants", s(&[]));
     m
