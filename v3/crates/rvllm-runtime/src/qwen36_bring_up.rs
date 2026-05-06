@@ -5795,7 +5795,10 @@ impl Qwen36Bringup {
                 stream_raw,
             )?;
         }
-        self.stream.fence()?;
+        // No fence after rmsnorm: the next op is the GPU router GEMV
+        // which runs on the same stream_raw, so ordering is automatic.
+        // Removing the per-layer fence saves ~30 fence syscalls / token
+        // (Phase 4b-prep iter22).
 
         // 2. Router top-k. Read normed input + router weights, compute
         //    logits on host, sort top-k, softmax-normalize.
