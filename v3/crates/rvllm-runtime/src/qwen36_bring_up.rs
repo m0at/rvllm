@@ -307,6 +307,12 @@ pub struct Qwen36Bringup {
     pub kv_cache_layer_bytes: usize,
     pub kv_cache_num_blocks: u32,
     pub kv_cache_block_size: u32,
+    /// Persistent device pointer to the identity block table
+    /// `[0, 1, …, kv_cache_num_blocks-1]` i32. The paged-attention
+    /// path used to rebuild + re-upload this constant table every
+    /// full-attn layer × every token; now we upload once at bring-up
+    /// (Phase 4b-prep iter25).
+    pub bt_persistent_ptr: u64,
     /// Phase 5f: persistent conv1d state cache for linear-attn layers.
     /// `[num_linear_layers, conv_kernel-1=3, conv_dim=8192]` f16.
     /// Holds the previous (kernel-1) conv-input timesteps so per-token
@@ -895,10 +901,25 @@ impl Qwen36Bringup {
             kv_cache_layer_bytes,
             kv_cache_num_blocks,
             kv_cache_block_size,
+            bt_persistent_ptr: 0, // populated below
             conv_state_ptr,
             conv_state_bytes,
             conv_state_layer_bytes,
         };
+        // Phase 4b-prep iter25: upload the constant identity block
+        // table once. The paged-attention layer used to rebuild it
+        // every full-attn layer × every token.
+        {
+            let max_blocks = bringup.kv_cache_num_blocks as usize;
+            let bt_bytes = max_blocks * 4;
+            let bt_region = bringup.arena.region("qwen36_bt_persistent", bt_bytes, 16)?;
+            let mut bt_host = Vec::with_capacity(bt_bytes);
+            for b in 0..max_blocks {
+                bt_host.extend_from_slice(&(b as i32).to_le_bytes());
+            }
+            unsafe { bt_region.copy_from_host(&bt_host)?; }
+            bringup.bt_persistent_ptr = bt_region.device_ptr();
+        }
         // Build per-linear-attn-layer host f32 weight caches BEFORE
         // any probe / smoke runs (some of those reach into
         // `apply_layer_linear_attn` and would panic on an empty
@@ -5597,16 +5618,11 @@ impl Qwen36Bringup {
         //    physical layout. context_lens=[position+1] (causal —
         //    attend to all prior tokens).
         let context_len = (position as i32) + 1;
-        let max_blocks = self.kv_cache_num_blocks as usize;
-        let bt_bytes = max_blocks * 4;
-        let bt_region = self.arena.region("qwen36_pf_bt", bt_bytes, 16)?;
+        // Phase 4b-prep iter25: identity block table is constant —
+        // uploaded once at bring-up. Only context_len varies per
+        // token, so only one small HtoD per layer instead of two.
         let cl_region = self.arena.region("qwen36_pf_cl", 4, 16)?;
-        let mut bt_host = Vec::with_capacity(bt_bytes);
-        for b in 0..max_blocks {
-            bt_host.extend_from_slice(&(b as i32).to_le_bytes());
-        }
         unsafe {
-            bt_region.copy_from_host(&bt_host)?;
             cl_region.copy_from_host(&context_len.to_le_bytes())?;
         }
         let attn_out_region =
@@ -5630,7 +5646,7 @@ impl Qwen36Bringup {
             let mut query = q_split_region.device_ptr();
             let mut key_cache = k_cache_layer_ptr;
             let mut value_cache = v_cache_layer_ptr;
-            let mut block_tables = bt_region.device_ptr();
+            let mut block_tables = self.bt_persistent_ptr;
             let mut context_lens = cl_region.device_ptr();
             let mut scale_arg = scale;
             let mut nh = num_heads as i32;
