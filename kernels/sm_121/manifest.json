@@ -36,6 +36,11 @@
       "path": "causal_conv1d_f16.ptx",
       "sha256": "ac5ac20ae30468b48afee780c9e5839f7562ac06133d70e5a944ecfb87b7982f"
     },
+    "conv_state_advance_batched_f16": {
+      "bytes": 8311,
+      "path": "conv_state_advance_batched_f16.ptx",
+      "sha256": "cf0283a6d0c092188660b741b03bc5d7efd1170f3816fbcfab092eae56ac9516"
+    },
     "conv_state_advance_f16": {
       "bytes": 1794,
       "path": "conv_state_advance_f16.ptx",
@@ -290,6 +295,11 @@
       "bytes": 16857,
       "path": "gated_delta_rule_decode_f16.ptx",
       "sha256": "4008181da23b9fae274b6cc1725e60ee1d2af5889e2978d72d9a368f5e59e668"
+    },
+    "gated_delta_rule_prefill_f16": {
+      "bytes": 38412,
+      "path": "gated_delta_rule_prefill_f16.ptx",
+      "sha256": "986a3cbc505668dc8c8d6c64daa8a692ab8aac3ac39b55127928ea26c44692c3"
     },
     "gated_delta_state_update_f16": {
       "bytes": 7864,
@@ -597,5 +607,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "5c0b27f"
+  "revision": "cbaec3a"
 }
