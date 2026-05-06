@@ -5092,6 +5092,29 @@ impl Qwen36Bringup {
             "qwen36_pf_positions", n_tokens_usize * 4, 16)?;
         let context_lens_region = self.arena.region(
             "qwen36_pf_clens", n_tokens_usize * 4, 16)?;
+        // Phase Full: a single-element [1] i32 with value N for the
+        // f16kv prefill kernel's `context_lens[seq_idx=0]` slot. Same
+        // self.stream for the memset → no race vs subsequent kernel
+        // reads.
+        let prefill_ctx_len_region = self.arena.region(
+            "qwen36_pf_prefill_clen", 4, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemsetD32Async(
+                prefill_ctx_len_region.device_ptr(),
+                num_tokens,
+                1,
+                self.stream.raw() as _,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 prefill: prefill_ctx_len memset",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
@@ -5246,27 +5269,48 @@ impl Qwen36Bringup {
                         la.post_attention_layernorm.offset_bytes
                     }
                     rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(fl) => {
-                        // Round-26: pos/context_len now live in the
-                        // device-filled `positions_region` /
-                        // `context_lens_region` arrays. Per-token call
-                        // passes its slot's offset; no HtoD here, no
-                        // race vs the non-blocking stream.
-                        for t in 0..num_tokens {
-                            let tok_pos = start_position + t;
-                            let tok_ptr = hidden_region.device_ptr()
-                                + (t as u64) * (last_hidden_bytes as u64);
-                            let pos_p = positions_region.device_ptr()
-                                + (t as u64) * 4;
-                            let cl_p = context_lens_region.device_ptr()
-                                + (t as u64) * 4;
+                        // Round-26 / Phase Full: env-gate
+                        // RVLLM_QWEN36_BATCH_FULL_PREFILL=1 enables the
+                        // batched-prefill path (one launch per layer
+                        // for the entire chunk). When off, fall back to
+                        // the per-token sub-loop. start_position must
+                        // be 0 (= prefill chunk anchored at sequence
+                        // start) for batched mode; later chunks use the
+                        // per-token path.
+                        let batch_full = start_position == 0
+                            && std::env::var("RVLLM_QWEN36_BATCH_FULL_PREFILL")
+                                .map(|s| matches!(s.as_str(),
+                                    "1"|"true"|"TRUE"|"yes"))
+                                .unwrap_or(false);
+                        if batch_full {
                             let inner_ck = self.arena.checkpoint();
-                            self.apply_layer_full_attn(
-                                fl, full_seq, tok_pos,
-                                tok_ptr,
+                            self.apply_layer_full_attn_batched(
+                                fl, full_seq,
+                                hidden_region.device_ptr(),
+                                num_tokens,
                                 kernel_gemv, hidden, last_hidden_bytes,
-                                pos_p, cl_p,
+                                positions_region.device_ptr(),
+                                prefill_ctx_len_region.device_ptr(),
                             )?;
                             unsafe { self.arena.restore(inner_ck); }
+                        } else {
+                            for t in 0..num_tokens {
+                                let tok_pos = start_position + t;
+                                let tok_ptr = hidden_region.device_ptr()
+                                    + (t as u64) * (last_hidden_bytes as u64);
+                                let pos_p = positions_region.device_ptr()
+                                    + (t as u64) * 4;
+                                let cl_p = context_lens_region.device_ptr()
+                                    + (t as u64) * 4;
+                                let inner_ck = self.arena.checkpoint();
+                                self.apply_layer_full_attn(
+                                    fl, full_seq, tok_pos,
+                                    tok_ptr,
+                                    kernel_gemv, hidden, last_hidden_bytes,
+                                    pos_p, cl_p,
+                                )?;
+                                unsafe { self.arena.restore(inner_ck); }
+                            }
                         }
                         full_seq += 1;
                         fl.post_attention_layernorm.offset_bytes
@@ -6442,6 +6486,493 @@ impl Qwen36Bringup {
             }
         }
 
+        Ok(())
+    }
+
+    /// Phase Full / Round-26: batched-prefill counterpart of
+    /// `apply_layer_full_attn`. Operates on `[num_tokens, hidden]`
+    /// in `hidden_ptr`. One full-attn launch per layer instead of
+    /// N. Reuses `flash_attention_2_f16kv_kernel` (the existing F32-Q
+    /// / F16-KV / F32-O FA2 prefill kernel from
+    /// kernels/flash_attention.cu) sandwiched between two cheap
+    /// f16↔f32 cast launches; codex round-26 explicitly picked this
+    /// over writing a brand-new f16-IO prefill kernel.
+    ///
+    /// Invariant: `positions[t] = start_pos + t` and the KV slot
+    /// for token t equals `positions[t]` — both buffers were filled
+    /// by the round-26 device-side fill kernel, so no host-driven
+    /// HtoD races vs the non-blocking stream.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_layer_full_attn_batched(
+        &self,
+        fl: &rvllm_loader::qwen36_weights::Qwen36FullAttnLayer,
+        full_seq_idx: u32,
+        hidden_ptr: u64,
+        num_tokens: u32,
+        kernel_gemv: rvllm_kernels::KernelFn,
+        hidden: u32,
+        last_hidden_bytes: usize,
+        positions_dev_ptr: u64,
+        prefill_ctx_len_dev_ptr: u64,
+    ) -> Result<()> {
+        if num_tokens == 0 {
+            return Ok(());
+        }
+        if num_tokens == 1 {
+            // Degenerate: delegate to the per-token path so the
+            // single-token decode case stays byte-identical.
+            return self.apply_layer_full_attn(
+                fl, full_seq_idx, 0,
+                hidden_ptr, kernel_gemv, hidden, last_hidden_bytes,
+                positions_dev_ptr, prefill_ctx_len_dev_ptr,
+            );
+        }
+        let stream_raw = self.stream.raw() as u64;
+        let n = num_tokens as usize;
+        let head_dim = self.arch.base.head_dim as u32;
+        let num_heads = self.arch.base.num_attention_heads as u32;
+        let num_kv_heads = self.arch.base.num_key_value_heads as u32;
+        let q_n = fl.q_proj.shape[0] as u32;
+        let k_n = fl.k_proj.shape[0] as u32;
+        let v_n = fl.v_proj.shape[0] as u32;
+        let o_n = fl.o_proj.shape[0] as u32;
+        let o_k = fl.o_proj.shape[1] as u32;
+        let q_bs = match fl.q_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let k_bs = match fl.k_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let v_bs = match fl.v_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+        let o_bs = match fl.o_proj.blockscale_ptr { Some(p) => p, None => return Ok(()) };
+
+        let q_size = num_heads * head_dim;
+        let _ = last_hidden_bytes;
+        let h = hidden as usize;
+
+        // 1. RMSNorm batched on a [N, hidden] copy of the chunk.
+        let normed_bytes = n * h * 2;
+        let normed_region =
+            self.arena.region("qwen36_pfb_normed", normed_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoDAsync_v2(
+                normed_region.device_ptr(), hidden_ptr, normed_bytes,
+                self.stream.raw() as _,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn_batched DtoD copy",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let eps = self.arch.base.rms_norm_eps;
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens, hidden, eps,
+            }.launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                normed_region.device_ptr(),
+                fl.input_layernorm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+
+        // 2. Q/K/V projections at m=num_tokens via dispatcher.
+        let q_region = self.arena.region("qwen36_pfb_qg", n * (q_n as usize) * 2, 16)?;
+        let k_region = self.arena.region("qwen36_pfb_k",  n * (k_n as usize) * 2, 16)?;
+        let v_region = self.arena.region("qwen36_pfb_v",  n * (v_n as usize) * 2, 16)?;
+        unsafe {
+            self.fp8_proj_dispatch(
+                kernel_gemv, q_region.device_ptr(),
+                fl.q_proj.offset_bytes, q_bs, normed_region.device_ptr(),
+                num_tokens, q_n, hidden, stream_raw,
+            )?;
+            self.fp8_proj_dispatch(
+                kernel_gemv, k_region.device_ptr(),
+                fl.k_proj.offset_bytes, k_bs, normed_region.device_ptr(),
+                num_tokens, k_n, hidden, stream_raw,
+            )?;
+            self.fp8_proj_dispatch(
+                kernel_gemv, v_region.device_ptr(),
+                fl.v_proj.offset_bytes, v_bs, normed_region.device_ptr(),
+                num_tokens, v_n, hidden, stream_raw,
+            )?;
+        }
+
+        // 3. split_q_gate batched: kernel grid is (num_heads, m, 1).
+        // m=num_tokens works out of the box.
+        let qsize_us = q_size as usize;
+        let q_split_region =
+            self.arena.region("qwen36_pfb_qs", n * qsize_us * 2, 16)?;
+        let gate_region =
+            self.arena.region("qwen36_pfb_gt", n * qsize_us * 2, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut qo = q_split_region.device_ptr();
+            let mut go = gate_region.device_ptr();
+            let mut qi = q_region.device_ptr();
+            let mut nh: i32 = num_heads as i32;
+            let mut hd_i: i32 = head_dim as i32;
+            let args = [
+                (&mut qo) as *mut u64 as *mut core::ffi::c_void,
+                (&mut go) as *mut u64 as *mut core::ffi::c_void,
+                (&mut qi) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_split_q_gate_f16.raw() as CUfunction,
+                num_heads, num_tokens, 1,
+                head_dim, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn_batched split_q_gate",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // 4. q_norm + k_norm batched. The rmsnorm kernel processes
+        // grid.x rows of length hidden each; treating each (token,
+        // head) as one row gives us the needed per-head normalisation
+        // across all tokens in one launch each.
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: num_heads * num_tokens,
+                hidden: head_dim,
+                eps,
+            }.launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                q_split_region.device_ptr(),
+                fl.q_norm.offset_bytes,
+                stream_raw,
+            )?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: num_kv_heads * num_tokens,
+                hidden: head_dim,
+                eps,
+            }.launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                k_region.device_ptr(),
+                fl.k_norm.offset_bytes,
+                stream_raw,
+            )?;
+        }
+
+        // 5. RoPE + KV-cache write batched. fused_rope_qwen_partial_f16kv
+        // already has array semantics for positions/slot_mapping —
+        // launching with grid.x=num_tokens drives the array index. The
+        // existing per-token apply_layer_full_attn already passes
+        // slot=positions (qwen3-next slot==position invariant); we keep
+        // that here.
+        let rotary_dim = (head_dim as f32 * 0.25) as u32; // 64
+        let kv_layer_ptr = self.kv_cache_layer_ptr(full_seq_idx);
+        let half = (self.kv_cache_layer_bytes / 2) as u64;
+        let k_cache_layer_ptr = kv_layer_ptr;
+        let v_cache_layer_ptr = kv_layer_ptr + half;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut q_in_p = q_split_region.device_ptr();
+            let mut k_in_p = k_region.device_ptr();
+            let mut v_in_p = v_region.device_ptr();
+            let mut q_out_p = q_split_region.device_ptr(); // in-place
+            let mut kc = k_cache_layer_ptr;
+            let mut vc = v_cache_layer_ptr;
+            let mut cos_p = self.rope_cos;
+            let mut sin_p = self.rope_sin;
+            let mut pos_p = positions_dev_ptr;
+            let mut slot_p = positions_dev_ptr; // slot==pos in qwen3-next
+            let mut nt: i32 = num_tokens as i32;
+            let mut nh: i32 = num_heads as i32;
+            let mut nkh: i32 = num_kv_heads as i32;
+            let mut hd_i: i32 = head_dim as i32;
+            let mut rd: i32 = rotary_dim as i32;
+            let args = [
+                (&mut q_in_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut k_in_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut v_in_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut q_out_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut kc) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vc) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cos_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut sin_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut pos_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut slot_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut rd) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let max_h = num_heads.max(num_kv_heads);
+            let block_x: u32 = (head_dim / 2) as u32;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_fused_rope_qwen_partial_f16kv.raw() as CUfunction,
+                num_tokens, max_h, 1,
+                block_x, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn_batched fused_rope",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // 6. Attention via flash_attention_2_f16kv_kernel. The kernel
+        // wants f32 query and produces f32 output, so wrap with cast
+        // launches. With num_seqs=1, num_query_tokens=N, causal=1,
+        // context_lens=[N], seq_start_pos=[0,N], the kernel scans all
+        // N query tokens against KV slots [0..t+1) (causal) per head.
+        let q_f32_bytes = n * qsize_us * 4;
+        let q_f32_region =
+            self.arena.region("qwen36_pfb_qf32", q_f32_bytes, 16)?;
+        // f16 q_split → f32 q_f32 via cast
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let n_elem = n * qsize_us;
+            let mut output = q_f32_region.device_ptr();
+            let mut input  = q_split_region.device_ptr();
+            let mut nn: i32 = n_elem as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input)  as *mut u64 as *mut core::ffi::c_void,
+                (&mut nn)     as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid = ((n_elem as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_cast_f16_to_f32.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn_batched q cast f16→f32",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let attn_out_f32_region = self.arena.region(
+            "qwen36_pfb_attn_f32", q_f32_bytes, 16)?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let max_blocks_per_seq_i = self.kv_cache_num_blocks as i32;
+        let block_size_i = self.kv_cache_block_size as i32;
+        // The f16kv prefill kernel needs `seq_start_pos[num_seqs+1]`.
+        // For our num_seqs=1 case we need [0, N]. Build a tiny on-arena
+        // 2-element i32 buffer and populate via a one-off device fill
+        // (reusing fn_qwen_fill_pos_slots_i32 isn't quite right since
+        // it produces start..start+N; here we want [0, N]). Build via
+        // a single host-side cuMemsetD32 + cuMemcpyHtoDAsync on
+        // self.stream so it stays stream-ordered.
+        let seq_start_region = self.arena.region("qwen36_pfb_seqstart", 2 * 4, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            // Set [0, N] via two cuMemsetD32 calls on self.stream.
+            // cuMemsetD32 doesn't take an offset, so we do two calls
+            // each with size=1.
+            let zero: u32 = 0;
+            let nval: u32 = num_tokens;
+            let r0 = cuMemsetD32Async(seq_start_region.device_ptr(), zero, 1, self.stream.raw() as _);
+            let r1 = cuMemsetD32Async(seq_start_region.device_ptr() + 4, nval, 1, self.stream.raw() as _);
+            if r0 != CUresult::CUDA_SUCCESS || r1 != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn_batched seq_start_pos memset",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        const FA2_THREADS: i32 = 128;
+        const FA2_BC: i32 = 32;
+        let smem_bytes = 2 * FA2_BC * head_dim as i32 * 4 + FA2_BC * 4
+            + (FA2_THREADS / 32) * 4;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            if smem_bytes as u32 >= 48 * 1024 {
+                let _ = cuFuncSetAttribute(
+                    self.outside_kernels.fn_flash_attention_2_f16kv.raw() as CUfunction,
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem_bytes,
+                );
+            }
+            let mut output = attn_out_f32_region.device_ptr();
+            let mut query = q_f32_region.device_ptr();
+            let mut key_cache = k_cache_layer_ptr;
+            let mut value_cache = v_cache_layer_ptr;
+            let mut block_tables = self.bt_persistent_ptr;
+            let mut context_lens = prefill_ctx_len_dev_ptr;
+            let mut seq_start_pos = seq_start_region.device_ptr();
+            let mut scale_arg = scale;
+            let mut nh = num_heads as i32;
+            let mut nkvh = num_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut bs = block_size_i;
+            let mut max_ctx = num_tokens as i32;
+            let mut mbps = max_blocks_per_seq_i;
+            let mut nqt = num_tokens as i32;
+            let mut causal: i32 = 1;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut query) as *mut u64 as *mut core::ffi::c_void,
+                (&mut key_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut value_cache) as *mut u64 as *mut core::ffi::c_void,
+                (&mut block_tables) as *mut u64 as *mut core::ffi::c_void,
+                (&mut context_lens) as *mut u64 as *mut core::ffi::c_void,
+                (&mut seq_start_pos) as *mut u64 as *mut core::ffi::c_void,
+                (&mut scale_arg) as *mut f32 as *mut core::ffi::c_void,
+                (&mut nh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nkvh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut core::ffi::c_void,
+                (&mut bs) as *mut i32 as *mut core::ffi::c_void,
+                (&mut max_ctx) as *mut i32 as *mut core::ffi::c_void,
+                (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nqt) as *mut i32 as *mut core::ffi::c_void,
+                (&mut causal) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_flash_attention_2_f16kv.raw() as CUfunction,
+                1u32, num_heads, 1,
+                FA2_THREADS as u32, 1, 1,
+                smem_bytes as u32,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn_batched flash_attention_2_f16kv",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        // f32 attn_out → f16 attn_out (replace q_split's storage role)
+        let attn_out_region = self.arena.region(
+            "qwen36_pfb_attn_f16", n * qsize_us * 2, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let n_elem = n * qsize_us;
+            let mut output = attn_out_region.device_ptr();
+            let mut input  = attn_out_f32_region.device_ptr();
+            let mut nn: i32 = n_elem as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input)  as *mut u64 as *mut core::ffi::c_void,
+                (&mut nn)     as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid = ((n_elem as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn_batched out cast f32→f16",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // 7. attn_output_gate (sigmoid_mul) batched: n_elem = N * q_size
+        let gated_region = self.arena.region(
+            "qwen36_pfb_gated", n * qsize_us * 2, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let n_elem = n * qsize_us;
+            let mut output = gated_region.device_ptr();
+            let mut values = attn_out_region.device_ptr();
+            let mut gate = gate_region.device_ptr();
+            let mut nn: i32 = n_elem as i32;
+            let args = [
+                (&mut output) as *mut u64 as *mut core::ffi::c_void,
+                (&mut values) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gate) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid = ((n_elem as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_sigmoid_mul_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn_batched sigmoid_mul",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // 8. o_proj: [N, o_k] → [N, o_n] via dispatcher.
+        let out_region = self.arena.region(
+            "qwen36_pfb_out", n * (o_n as usize) * 2, 16)?;
+        unsafe {
+            self.fp8_proj_dispatch(
+                kernel_gemv, out_region.device_ptr(),
+                fl.o_proj.offset_bytes, o_bs, gated_region.device_ptr(),
+                num_tokens, o_n, o_k, stream_raw,
+            )?;
+        }
+
+        // 9. Residual: hidden_ptr += out_region elementwise [N*hidden].
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let n_elem = n * h;
+            let mut dst = hidden_ptr;
+            let mut src = out_region.device_ptr();
+            let mut nn: i32 = n_elem as i32;
+            let args = [
+                (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nn)  as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 1024.min(n_elem as u32).max(1);
+            let grid = ((n_elem as u32 + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_vector_add_f16.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 full_attn_batched residual",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         Ok(())
     }
 
