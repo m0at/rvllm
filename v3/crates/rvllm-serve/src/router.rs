@@ -104,16 +104,28 @@ pub fn build_router(state: AppState) -> Router {
         // Hard cap on request-body size before axum buffers the JSON
         // into RAM. Without this a single client can post a 1 GiB
         // data: URI and burn memory before any vision-admission
-        // limits kick in. 80 MiB matches the per-request multimodal
-        // ceiling (RVLLM_VISION_MAX_TOTAL_BYTES default 64 MiB +
-        // generous JSON overhead for base64-encoding + chat history)
-        // and is independently overridable via
-        // `RVLLM_HTTP_BODY_LIMIT_BYTES`. Returns 413 Payload Too Large.
+        // limits kick in.
+        //
+        // Sizing: the vision admission ceiling
+        // (`RVLLM_VISION_MAX_TOTAL_BYTES`, default 64 MiB) is the
+        // RAW image payload aggregated across all `image_url` parts
+        // in a request. When those parts are `data:image/...;base64,…`
+        // URIs (the common case for inline images), base64 expands
+        // 3 bytes → 4 chars (≈ 33 % grow), so a 64 MiB raw payload
+        // needs ≥ 85.3 MiB of body to encode, before any JSON keys /
+        // chat history. The earlier 80 MiB cap rejected
+        // spec-compliant default-vision requests with 413.
+        //
+        // Cap: 128 MiB. Covers the 64 MiB → 85.3 MiB expansion plus
+        // ~40 MiB of slack for JSON syntax, multi-image prompts that
+        // stack base64 payloads, and chat history. Override via
+        // `RVLLM_HTTP_BODY_LIMIT_BYTES` for deployments that raised
+        // the vision admission ceiling. Returns 413 Payload Too Large.
         .layer({
             let limit_bytes: usize = std::env::var("RVLLM_HTTP_BODY_LIMIT_BYTES")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(80 * 1024 * 1024);
+                .unwrap_or(128 * 1024 * 1024);
             DefaultBodyLimit::max(limit_bytes)
         })
         .layer(trace)
