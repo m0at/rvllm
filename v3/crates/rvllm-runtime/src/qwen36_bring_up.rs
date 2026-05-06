@@ -128,6 +128,12 @@ pub struct Qwen36OutsideKernels {
     /// from iter13/14 was diagnosed in iter17).
     pub scaled_add_f16_to_f32_mod: LoadedModule,
     pub fn_scaled_add_f16_to_f32: KernelFn,
+    /// In-place residual add `inout_f16 += add_f32`. Replaces the
+    /// final per-MoE-layer host residual round-trip (DtoH
+    /// last_hidden + CPU f16+f32 add + HtoD residual) so the whole
+    /// MoE forward stays device-side (Phase 4b-prep iter19).
+    pub f16_plus_f32_inplace_f16_mod: LoadedModule,
+    pub fn_f16_plus_f32_inplace_f16: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -461,6 +467,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("scaled_add_f16_to_f32")?;
         let fn_scaled_add_f16_to_f32 = scaled_add_f16_to_f32_mod
             .get_function("scaled_add_f16_to_f32_kernel")?;
+        let f16_plus_f32_inplace_f16_mod =
+            kernels.load_ptx("f16_plus_f32_inplace_f16")?;
+        let fn_f16_plus_f32_inplace_f16 = f16_plus_f32_inplace_f16_mod
+            .get_function("f16_plus_f32_inplace_f16_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -548,6 +558,8 @@ impl Qwen36Bringup {
             fn_router_gemv_f16_to_f32,
             scaled_add_f16_to_f32_mod,
             fn_scaled_add_f16_to_f32,
+            f16_plus_f32_inplace_f16_mod,
+            fn_f16_plus_f32_inplace_f16,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -6068,65 +6080,70 @@ impl Qwen36Bringup {
                 );
             }
         }
-        // iter17 invariant: fence stream_raw before the sync DtoH.
-        self.stream.fence()?;
-        // DtoH the f32 routed_sum once for the host residual add.
-        let mut routed_sum = vec![0.0f32; n_down as usize];
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                routed_sum.as_mut_ptr() as *mut _,
-                routed_sum_region.device_ptr(),
-                routed_sum_bytes,
-            );
-        }
-
-        // 5. Residual sum: last_hidden_new = last_hidden + moe_out.
+        // 5. Residual sum, GPU-side (Phase 4b-prep iter19):
+        //    last_hidden[i] = f16(f16_to_f32(last_hidden[i]) + routed_sum[i])
+        // Same stream as the per-expert scaled_add and the prior
+        // attn writeback into last_hidden_ptr — automatic ordering.
+        // Also: with the residual now device-side, the optional debug
+        // `RVLLM_QWEN36_DEBUG_MOE` path no longer has free routed_sum
+        // on the host. We DtoH it lazily inside the env-gated branch.
         if std::env::var("RVLLM_QWEN36_DEBUG_MOE").is_ok() {
-            let total_l2: f32 = routed_sum.iter().map(|x| x*x).sum::<f32>().sqrt();
+            self.stream.fence()?;
+            let mut rs_host = vec![0.0f32; n_down as usize];
+            let mut lh_host = vec![0u8; last_hidden_bytes];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    rs_host.as_mut_ptr() as *mut _,
+                    routed_sum_region.device_ptr(),
+                    routed_sum_bytes,
+                );
+                let _ = cuMemcpyDtoH_v2(
+                    lh_host.as_mut_ptr() as *mut _,
+                    last_hidden_ptr,
+                    last_hidden_bytes,
+                );
+            }
+            let total_l2: f32 = rs_host.iter().map(|x| x*x).sum::<f32>().sqrt();
             let shared_l2 = (total_l2*total_l2 - routed_only_l2*routed_only_l2).max(0.0).sqrt();
             let normed_l2: f32 = input_f32.iter().map(|x| x*x).sum::<f32>().sqrt();
             eprintln!("[moe] normed_L2={normed_l2:.2} routed_L2={routed_only_l2:.3} shared_L2~{shared_l2:.3} total_L2={total_l2:.3}");
+            let _ = lh_host; // reserved for future per-element debugging
         }
-        let mut last_hidden_host = vec![0u8; last_hidden_bytes];
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                last_hidden_host.as_mut_ptr() as *mut _,
-                last_hidden_ptr,
-                last_hidden_bytes,
+            let mut inout = last_hidden_ptr;
+            let mut add = routed_sum_region.device_ptr();
+            let mut nn = hidden as i32;
+            let args = [
+                (&mut inout) as *mut u64 as *mut core::ffi::c_void,
+                (&mut add) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid = (hidden + block - 1) / block;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_f16_plus_f32_inplace_f16.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
             );
-        }
-        let mut residual = Vec::with_capacity(last_hidden_bytes);
-        for i in 0..(hidden as usize) {
-            let h = f16_bits_to_f32(u16::from_le_bytes([
-                last_hidden_host[i * 2], last_hidden_host[i * 2 + 1],
-            ]));
-            let m = routed_sum[i];
-            residual.extend_from_slice(&f32_to_f16_bits(h + m).to_le_bytes());
-        }
-        // Sync HtoD into the per-token slot (was Region::copy_from_host).
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let r = cuMemcpyHtoD_v2(
-                last_hidden_ptr,
-                residual.as_ptr() as *const _,
-                residual.len(),
-            );
-            if r != CUresult::CUDA_SUCCESS {
+            if rc != CUresult::CUDA_SUCCESS {
                 return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 moe residual writeback HtoD",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    "qwen36 moe residual launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
                     rvllm_core::CudaCtx::setup(),
                 ));
             }
         }
-        // No fence: the writeback above is a sync cuMemcpyHtoD_v2
-        // from a pageable Vec, which CUDA serialises with the stream
-        // context — the next layer's first read is already ordered.
+        // No fence: the residual kernel runs on stream_raw, the next
+        // layer's first read of last_hidden_ptr is also on stream_raw,
+        // so ordering is automatic.
         Ok(())
     }
 
