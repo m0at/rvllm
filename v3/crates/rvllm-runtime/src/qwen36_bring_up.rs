@@ -4759,7 +4759,10 @@ impl Qwen36Bringup {
                     }
                 }
             }
-            self.stream.fence()?;
+            // No fence: vision splice uses cuMemcpyHtoDAsync_v2 on
+            // stream_raw and the decode-loop kernels also run on
+            // stream_raw, so same-stream ordering is automatic
+            // (Phase 4b-prep iter29).
         }
 
         // 2. Resolve the FP8 GEMV kernel. Hard-fail when missing —
