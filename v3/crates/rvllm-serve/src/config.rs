@@ -85,6 +85,18 @@ impl ServerConfig {
         if self.model_id.is_empty() {
             return Err(ConfigError::InvalidModelId);
         }
+        // `request_timeout=0` was accepted before — clap parses any
+        // u64 from `--request-timeout-secs` /
+        // `RVLLM_REQUEST_TIMEOUT_SECS`. The handler uses it to build
+        // `tokio::time::Instant::now() + request_timeout` as the
+        // per-request deadline, so a 0-duration deadline rejects
+        // every preprocess step (or hits an immediate timeout
+        // post-submit) and the server is unusable. Refuse at
+        // startup with a clear error instead of staying up and
+        // 4xx-ing every request.
+        if self.request_timeout.is_zero() {
+            return Err(ConfigError::InvalidRequestTimeout);
+        }
         Ok(())
     }
 }
@@ -103,6 +115,8 @@ pub enum ConfigError {
     InvalidMaxTokens,
     #[error("--model-id must be non-empty")]
     InvalidModelId,
+    #[error("--request-timeout-secs must be > 0 (zero deadlines reject every request)")]
+    InvalidRequestTimeout,
 }
 
 #[cfg(test)]
@@ -120,5 +134,22 @@ mod tests {
     fn validate_rejects_empty_model_dir() {
         let c = ServerConfig::default();
         assert!(matches!(c.validate(), Err(ConfigError::MissingModelDir)));
+    }
+
+    #[test]
+    fn validate_rejects_zero_request_timeout() {
+        // Use std::env::current_dir() as a guaranteed-existing dir so
+        // the model-dir check passes; we only want to exercise the
+        // request_timeout branch.
+        let here = std::env::current_dir().expect("cwd");
+        let c = ServerConfig {
+            model_dir: here,
+            model_id: "test".into(),
+            max_queue_depth: 2,
+            max_new_tokens_cap: 32,
+            request_timeout: Duration::from_secs(0),
+            ..ServerConfig::default()
+        };
+        assert!(matches!(c.validate(), Err(ConfigError::InvalidRequestTimeout)));
     }
 }

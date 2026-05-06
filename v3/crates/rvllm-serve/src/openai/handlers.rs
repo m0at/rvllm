@@ -453,13 +453,15 @@ pub async fn chat_completions(
     // client now gets 429 immediately instead of being able to keep
     // the blocking pool, network and memory busy producing
     // ultimately-doomed requests in parallel.
-    let _admission = state.worker.try_admit()?;
-    // Single end-to-end deadline starting at admission, so fetch +
-    // render + worker-submit + decode collectively respect
-    // request_timeout. Previously fetch had its own timeout and the
-    // worker drain had a separate one, with a gap in between
-    // (template render / tokenize on a 80 MiB body could pin an
-    // admission permit indefinitely).
+    // Wrap the admission permit in `Arc` so we can share it with
+    // every preprocessing spawn_blocking task (vision fetch, chat
+    // render). On `timeout_at` the handler returns and the
+    // handler-side `_admission` clone drops — but the closure-
+    // captured clone inside the still-running blocking task keeps
+    // the permit alive until the underlying sync call finishes.
+    // That's how we get the queue-cap to genuinely bound the
+    // blocking-pool usage (not just "until handler returns").
+    let _admission = Arc::new(state.worker.try_admit()?);
     let request_deadline = tokio::time::Instant::now() + state.config.request_timeout;
 
     let vision_items = {
@@ -494,8 +496,16 @@ pub async fn chat_completions(
         }
         let mut cancel_guard = CancelOnDrop { flag: fetch_cancel.clone(), armed: true };
         let fetch_cancel_inner = fetch_cancel.clone();
+        // Hold a clone of the admission permit inside the blocking
+        // closure: it's released only when the closure returns
+        // (cancel-flag-honoured early-exit included), so the queue
+        // cap continues to bound this slot even after a timeout.
+        let admission_keepalive = _admission.clone();
         let fetch_fut = tokio::task::spawn_blocking(
-            move || collect_vision_items(arch, &messages, &fetch_cancel_inner),
+            move || {
+                let _admission = admission_keepalive;
+                collect_vision_items(arch, &messages, &fetch_cancel_inner)
+            },
         );
         match tokio::time::timeout_at(request_deadline, fetch_fut).await {
             Ok(joined) => {
@@ -541,8 +551,10 @@ pub async fn chat_completions(
     let render_messages = req.messages.clone();
     let render_tools = req.tools.clone();
     let render_tokenizer = state.tokenizer.clone();
+    let render_admission = _admission.clone();
     type RenderOut = (Vec<u32>, Vec<crate::tokenize::VisionSlot>, Vec<crate::worker::VisionItem>);
     let render_join = tokio::task::spawn_blocking(move || -> ApiResult<RenderOut> {
+        let _admission = render_admission;
         if vision_items.is_empty() {
             Ok((render_tokenizer.render_chat(&render_messages, render_tools.as_ref())?,
                 Vec::new(),
@@ -921,7 +933,7 @@ fn chat_stream_sse(
     // handler returns the Sse response — would let new requests pass
     // try_admit while the previous request is still actively running
     // on the worker.
-    admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 ) -> axum::response::Response {
     let id = new_chat_completion_id();
     let created = unix_now_secs();
@@ -997,7 +1009,7 @@ fn chat_stream_sse(
         // Released on Drop together with the rest of the Ctx — i.e.
         // when the stream ends or the client disconnects. Marked
         // `_` because it is only here for its lifetime.
-        _admission: Option<tokio::sync::OwnedSemaphorePermit>,
+        _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     }
 
     impl Drop for Ctx {
@@ -1635,20 +1647,22 @@ pub async fn completions(
     }
 
     // Reserve one in-flight slot before tokenization (see chat handler).
-    let _admission = state.worker.try_admit()?;
-    // Single end-to-end deadline starting at admission, mirroring
-    // the chat handler. Prior code reset the budget for
-    // collect/stream so a request could legitimately run for
-    // `preprocess_time + request_timeout`.
+    // Wrapped in `Arc` so the spawn_blocking closure below can hold a
+    // clone — that keeps the queue cap bounding blocking-pool usage
+    // even when `timeout_at` returns early on the handler side.
+    let _admission = Arc::new(state.worker.try_admit()?);
     let request_deadline = tokio::time::Instant::now() + state.config.request_timeout;
 
-    // Move tokenization off the async runtime: bodies up to 80 MiB
-    // (router default) can take O(prompt_chars) to encode and would
-    // block the Tokio worker. Bound by the same deadline as the rest
-    // of the request, mirroring the chat handler at L505+.
+    // Move tokenization off the async runtime: bodies up to the body
+    // limit (router default 128 MiB) can take O(prompt_chars) to
+    // encode and would block the Tokio worker. Bound by the same
+    // deadline as the rest of the request, mirroring the chat
+    // handler at L505+.
     let encode_tokenizer = state.tokenizer.clone();
     let encode_text = prompt_text;
+    let encode_admission = _admission.clone();
     let encode_join = tokio::task::spawn_blocking(move || -> ApiResult<Vec<u32>> {
+        let _admission = encode_admission;
         encode_tokenizer.encode(&encode_text)
     });
     let prompt_ids = match tokio::time::timeout_at(request_deadline, encode_join).await {
@@ -1824,7 +1838,7 @@ fn completion_stream_sse(
     request_timeout: std::time::Duration,
     // See chat_stream_sse: the permit lives inside the stream so it
     // is released only when the SSE response ends.
-    admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 ) -> axum::response::Response {
     let id = new_completion_id();
     let created = unix_now_secs();
@@ -1852,7 +1866,7 @@ fn completion_stream_sse(
         model: String,
         cancelled: Arc<AtomicBool>,
         deadline: tokio::time::Instant,
-        _admission: Option<tokio::sync::OwnedSemaphorePermit>,
+        _admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     }
 
     impl Drop for Ctx {
