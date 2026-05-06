@@ -381,6 +381,11 @@
       "path": "rmsnorm_inplace_f16.ptx",
       "sha256": "1aef2417c71a593607976b4e251a557e28c7f1575b42e2c95ce9f23708b42a9c"
     },
+    "router_gemv_f16_to_f32": {
+      "bytes": 6486,
+      "path": "router_gemv_f16_to_f32.ptx",
+      "sha256": "6629a1c457fc931569e7b91f82a6a4b89ea3c77286d319902f921a73694aaa45"
+    },
     "scale_cols_f16": {
       "bytes": 1413,
       "path": "scale_cols_f16.ptx",
@@ -405,6 +410,11 @@
       "bytes": 1573,
       "path": "scale_rows_f32_ratio.ptx",
       "sha256": "a9a6f1907c0be8f1ed0d08cf958d626f21dc20b2004d912c31b7e1f35aa12c11"
+    },
+    "scaled_add_f16_to_f32": {
+      "bytes": 1413,
+      "path": "scaled_add_f16_to_f32.ptx",
+      "sha256": "a5ea9316a1f920b9baaaa9a16f87c327a03b9cf43358a574ea202442f31ee632"
     },
     "scatter_heads_bf16": {
       "bytes": 1616,
@@ -547,5 +557,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "3637e67"
+  "revision": "00bf4af"
 }

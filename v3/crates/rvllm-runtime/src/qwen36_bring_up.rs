@@ -115,6 +115,12 @@ pub struct Qwen36OutsideKernels {
     /// layers per token (Phase 4b-prep iter11).
     pub silu_mul_f16_mod: LoadedModule,
     pub fn_silu_mul_f16: KernelFn,
+    /// Router-GEMV for the per-layer MoE gate. Reads
+    /// `router_weight[num_experts, hidden]` f16 + the rmsnormed
+    /// hidden state f16 from device memory and writes f32 logits.
+    /// Replaces the host-cached f32 matvec (Phase 4b-prep iter17).
+    pub router_gemv_f16_to_f32_mod: LoadedModule,
+    pub fn_router_gemv_f16_to_f32: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -440,6 +446,10 @@ impl Qwen36Bringup {
         let silu_mul_f16_mod = kernels.load_ptx("silu_mul_f16")?;
         let fn_silu_mul_f16 =
             silu_mul_f16_mod.get_function("silu_mul_f16_kernel")?;
+        let router_gemv_f16_to_f32_mod =
+            kernels.load_ptx("router_gemv_f16_to_f32")?;
+        let fn_router_gemv_f16_to_f32 = router_gemv_f16_to_f32_mod
+            .get_function("router_gemv_f16_to_f32_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -523,6 +533,8 @@ impl Qwen36Bringup {
             fn_qwen_linear_rmsnorm_gated_f16,
             silu_mul_f16_mod,
             fn_silu_mul_f16,
+            router_gemv_f16_to_f32_mod,
+            fn_router_gemv_f16_to_f32,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -5758,18 +5770,61 @@ impl Qwen36Bringup {
                 input_host[i * 2], input_host[i * 2 + 1],
             ]));
         }
-        // Phase 4b-prep iter15: cached f32 router weights (populated
-        // at bring-up). Replaces a 1 MiB DtoH + f16→f32 unpack per
-        // token per MoE layer.
-        let router_f32 = &self.router_host_cache[layer_idx];
-        let mut logits = vec![0.0f32; num_experts];
-        for e in 0..num_experts {
-            let row = e * hidden_us;
-            let mut acc = 0.0f32;
-            for k in 0..hidden_us {
-                acc += router_f32[row + k] * input_f32[k];
+        // Phase 4b-prep iter17: GPU router GEMV. Replaces the
+        // host-cached f32 matvec (~524k MAC × 30 layers / token)
+        // with a single launch reading device-side f16 weights.
+        let logits_bytes = num_experts * 4;
+        let logits_region =
+            self.arena.region("qwen36_pm_logits", logits_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut out = logits_region.device_ptr();
+            let mut router_ptr = moe.router.offset_bytes;
+            let mut input_ptr = normed_region.device_ptr();
+            let mut nx = num_experts as i32;
+            let mut hh = hidden_us as i32;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut router_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nx) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hh) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = num_experts as u32;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_router_gemv_f16_to_f32.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 router_gemv launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
-            logits[e] = acc;
+        }
+        // Fence to flush stream_raw before the sync DtoH below: empirically
+        // sync `cuMemcpyDtoH_v2` does NOT synchronise non-default streams
+        // on this driver/cudarc combination, so without this fence the
+        // host reads stale (zero-initialised) logits for some blocks.
+        self.stream.fence()?;
+        // DtoH the small f32 logits buffer (1 KiB at num_experts=256).
+        let mut logits = vec![0.0f32; num_experts];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                logits.as_mut_ptr() as *mut _,
+                logits_region.device_ptr(),
+                logits_bytes,
+            );
         }
         let mut indexed: Vec<(usize, f32)> =
             logits.iter().enumerate().map(|(i, &l)| (i, l)).collect();
