@@ -4853,7 +4853,9 @@ impl Qwen36Bringup {
                 stream_raw,
             )?;
         }
-        self.stream.fence()?;
+        // No fence: in_proj_qkv runs on the same stream and reads
+        // normed_region after rmsnorm has written to it; stream
+        // ordering guarantees that.
 
         // 2. in_proj_qkv FP8 GEMV → conv-input. (Phase 4a routing.)
         let qkv_bytes_dev = (qkv_n as usize) * 2;
@@ -4863,7 +4865,8 @@ impl Qwen36Bringup {
                 la.in_proj_qkv.offset_bytes, qkv_bs, normed_region.device_ptr(),
                 m, qkv_n, hidden, stream_raw)?;
         }
-        self.stream.fence()?;
+        // No fence: conv_state_advance + conv1d run on the same
+        // stream and read qkv after the GEMV has written to it.
 
         // 3. causal_conv1d. Single-step: prepend the ks-1=3 previous
         //    timesteps from the persistent conv-state cache, append
@@ -4938,7 +4941,7 @@ impl Qwen36Bringup {
                 core::ptr::null_mut(),
             );
         }
-        self.stream.fence()?;
+        // No fence: silu_l2_gqa runs on the same stream after conv1d.
 
         // 4+5. GPU-side fused silu + Q/K L2-norm + GQA-expand + V silu-pack.
         // Allocates the q_exp / k_exp / v_pack device regions and
@@ -5098,7 +5101,8 @@ impl Qwen36Bringup {
                 core::ptr::null_mut(),
             );
         }
-        self.stream.fence()?;
+        // No fence: in_proj_z + rmsnorm_gated run on the same
+        // stream after the delta-rule kernel.
 
         // 10. in_proj_z FP8 GEMV → z [value_dim] (stays on device).
         let z_bytes_dev = (z_n as usize) * 2;
@@ -5157,7 +5161,8 @@ impl Qwen36Bringup {
                 la.out_proj.offset_bytes, out_bs, gated_region.device_ptr(),
                 m, out_n, out_k, stream_raw)?;
         }
-        self.stream.fence()?;
+        // No fence: residual vector_add runs on the same stream
+        // after out_proj.
 
         // 13. Residual sum: last_hidden_new = last_hidden + o_buf.
         // GPU residual: last_hidden += out_buf via vector_add_f16.
@@ -5193,7 +5198,10 @@ impl Qwen36Bringup {
                 ));
             }
         }
-        self.stream.fence()?;
+        // No function-exit fence: the next layer call (or the
+        // outer-loop's end-of-prefill fence before lm_head) runs
+        // on the same stream and same-stream ordering already
+        // guarantees the residual write is visible.
         Ok(())
     }
 
