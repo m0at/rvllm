@@ -226,7 +226,10 @@ pub async fn spawn_cuda_worker(
                             })
                             .collect();
                         let mut next_token = match qwen
-                            .forward_qwen36_decode(&prompt_i32, 0, &vision_splice)
+                            .forward_qwen36_decode_cancellable(
+                                &prompt_i32, 0, &vision_splice,
+                                Some(&*req.cancelled),
+                            )
                         {
                             Ok(t) => t,
                             Err(e) => {

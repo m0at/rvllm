@@ -2946,7 +2946,7 @@ impl Qwen36Bringup {
             ];
             let block: u32 = 256;
             let grid_x = (qkv_n + block - 1) / block;
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_causal_conv1d_f16.raw() as CUfunction,
                 grid_x, 1, 1,
                 block, 1, 1,
@@ -2955,6 +2955,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 causal_conv1d_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         self.stream.fence()?;
 
@@ -3081,7 +3088,7 @@ impl Qwen36Bringup {
                 (&mut dk) as *mut i32 as *mut core::ffi::c_void,
                 (&mut dv) as *mut i32 as *mut core::ffi::c_void,
             ];
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_gated_delta_state_update_f16.raw() as CUfunction,
                 num_heads, 1, 1,
                 16, 16, 1,
@@ -3090,6 +3097,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 gated_delta_state_update_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         self.stream.fence()?;
 
@@ -3787,7 +3801,7 @@ impl Qwen36Bringup {
                 ];
                 let block: u32 = 256;
                 let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
                     grid.0, grid.1, grid.2,
                     block, 1, 1,
@@ -3795,6 +3809,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 cast_f32_to_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
                 // Add bias in-place
                 let mut tensor = out_dev;
                 let mut bias = b_dev;
@@ -3805,7 +3826,7 @@ impl Qwen36Bringup {
                     (&mut dim) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block_b: u32 = (n as u32).min(1024);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_add_bias_f16.raw() as CUfunction,
                     m as u32, 1, 1,
                     block_b, 1, 1,
@@ -3813,6 +3834,13 @@ impl Qwen36Bringup {
                     bargs.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 add_bias_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
             self.stream.fence()?;
             Ok(())
@@ -3871,7 +3899,7 @@ impl Qwen36Bringup {
                 (&mut hd) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = 256;
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_vit_pos_embed_interp_f16.raw() as CUfunction,
                 n_tokens as u32, 1, 1,
                 block, 1, 1,
@@ -3879,6 +3907,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 vit_pos_embed_interp_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         self.stream.fence()?;
 
@@ -4012,7 +4047,7 @@ impl Qwen36Bringup {
                     (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block: u32 = (hidden as u32).min(1024);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_layernorm_inplace_f16.raw() as CUfunction,
                     n_tokens as u32, 1, 1,
                     block, 1, 1,
@@ -4020,6 +4055,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 layernorm_inplace_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
             self.stream.fence()?;
 
@@ -4096,7 +4138,7 @@ impl Qwen36Bringup {
                         (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
                         (&mut rd_i) as *mut i32 as *mut core::ffi::c_void,
                     ];
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.outside_kernels.fn_vit_rotary_2d_f16.raw() as CUfunction,
                         n_tokens as u32, num_heads as u32, 1,
                         (rotary_dim / 2) as u32, 1, 1,
@@ -4104,6 +4146,13 @@ impl Qwen36Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 vit_rotary_2d_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
                 }
             }
             self.stream.fence()?;
@@ -4248,7 +4297,7 @@ impl Qwen36Bringup {
                     let block: u32 = 256;
                     let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
                     use cudarc::driver::sys::*;
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
                         grid.0, grid.1, grid.2,
                         block, 1, 1,
@@ -4256,6 +4305,13 @@ impl Qwen36Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 cast_f32_to_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
                 }
                 self.stream.fence()?;
 
@@ -4277,7 +4333,7 @@ impl Qwen36Bringup {
                     ];
                     let block: u32 = 256;
                     let grid = ((nn as u32 + block - 1) / block, 1u32, 1u32);
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.outside_kernels.fn_scale_inplace_f16.raw() as CUfunction,
                         grid.0, grid.1, grid.2,
                         block, 1, 1,
@@ -4285,6 +4341,13 @@ impl Qwen36Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 scale_inplace_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
                 }
                 self.stream.fence()?;
 
@@ -4299,7 +4362,7 @@ impl Qwen36Bringup {
                         (&mut sl) as *mut i32 as *mut core::ffi::c_void,
                     ];
                     let block: u32 = (n_tokens as u32).min(1024);
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.outside_kernels.fn_softmax_row_f16.raw() as CUfunction,
                         n_tokens as u32, 1, 1,
                         block, 1, 1,
@@ -4307,6 +4370,13 @@ impl Qwen36Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 softmax_row_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
                 }
                 self.stream.fence()?;
 
@@ -4329,7 +4399,7 @@ impl Qwen36Bringup {
                     ];
                     let gx = ((cols as u32) + 15) / 16;
                     let gy = ((rows as u32) + 15) / 16;
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.outside_kernels.fn_transpose_2d_f16.raw() as CUfunction,
                         gx, gy, 1,
                         16, 16, 1,
@@ -4337,6 +4407,13 @@ impl Qwen36Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 transpose_2d_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
                 }
                 self.stream.fence()?;
                 #[cfg(feature = "cuda")]
@@ -4360,7 +4437,7 @@ impl Qwen36Bringup {
                     let block: u32 = 256;
                     let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
                     use cudarc::driver::sys::*;
-                    let _ = cuLaunchKernel(
+                    let rc = cuLaunchKernel(
                         self.outside_kernels.fn_cast_f32_to_f16.raw() as CUfunction,
                         grid.0, grid.1, grid.2,
                         block, 1, 1,
@@ -4368,6 +4445,13 @@ impl Qwen36Bringup {
                         args.as_ptr() as *mut *mut core::ffi::c_void,
                         core::ptr::null_mut(),
                     );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 cast_f32_to_f16 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
                 }
                 self.stream.fence()?;
 
@@ -4472,7 +4556,7 @@ impl Qwen36Bringup {
                     (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
                 ];
                 let block: u32 = (hidden as u32).min(1024);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_layernorm_inplace_f16.raw() as CUfunction,
                     n_tokens as u32, 1, 1,
                     block, 1, 1,
@@ -4480,6 +4564,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 layernorm_inplace_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
             self.stream.fence()?;
 
@@ -4504,7 +4595,7 @@ impl Qwen36Bringup {
                 ];
                 let block: u32 = 256;
                 let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_gelu_tanh_f16.raw() as CUfunction,
                     grid.0, grid.1, grid.2,
                     block, 1, 1,
@@ -4512,6 +4603,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 gelu_tanh_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
             self.stream.fence()?;
             let mlp_out = self.arena.region("qvis_mlp_out", n_tokens * hidden * 2, 16)?;
@@ -4621,7 +4719,7 @@ impl Qwen36Bringup {
                 (&mut hd_i) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = (hidden as u32).min(1024);
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_layernorm_inplace_f16.raw() as CUfunction,
                 n_tokens as u32, 1, 1,
                 block, 1, 1,
@@ -4629,6 +4727,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 layernorm_inplace_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         self.stream.fence()?;
 
@@ -4677,7 +4782,7 @@ impl Qwen36Bringup {
             ];
             let block: u32 = 256;
             let grid = ((n_elem as u32 + block - 1) / block, 1u32, 1u32);
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_gelu_tanh_f16.raw() as CUfunction,
                 grid.0, grid.1, grid.2,
                 block, 1, 1,
@@ -4685,6 +4790,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 gelu_tanh_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         self.stream.fence()?;
         let final_region = self.arena.region("qvis_final", n_merged * out_hidden * 2, 16)?;
@@ -4732,6 +4844,21 @@ impl Qwen36Bringup {
         token_ids: &[i32],
         start_position: u32,
         vision_splice: &[(usize, &[u8])],
+    ) -> Result<i32> {
+        self.forward_qwen36_decode_cancellable(token_ids, start_position, vision_splice, None)
+    }
+
+    /// Same as `forward_qwen36_decode` but with caller-supplied
+    /// cancellation. The flag is checked between each prompt-token
+    /// iteration so a long Qwen 3.6 prefill on a client-disconnected
+    /// request stops blocking the GPU. Mirrors Gemma 4's `cancel`
+    /// arg in `run_generate`.
+    pub fn forward_qwen36_decode_cancellable(
+        &self,
+        token_ids: &[i32],
+        start_position: u32,
+        vision_splice: &[(usize, &[u8])],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<i32> {
         if token_ids.is_empty() {
             return Err(rvllm_core::RvllmError::cuda(
@@ -4872,7 +4999,31 @@ impl Qwen36Bringup {
         let pos_cl_region = self.arena.region("qwen36_pf_pos_cl", 8, 16)?;
         let pos_dev_ptr = pos_cl_region.device_ptr();
         let cl_dev_ptr  = pos_dev_ptr + 4;
+        // Per-token scratch checkpoint — bounds arena growth to ONE
+        // token's worth of layer scratch instead of `tokens × layers`.
+        // The persistent state (KV cache, linear-attn state, conv
+        // state, host caches' device mirrors, the bt_persistent_ptr
+        // and pos_cl_region above) all live ABOVE this checkpoint
+        // (allocated at bring-up), so the per-token restore is safe.
+        let per_token_ck = self.arena.checkpoint();
         for tok_local in 0..num_tokens {
+            // Cancellation check — long prefills can be cancelled by
+            // a client disconnect; without this the GPU keeps running
+            // through every prompt token even though the HTTP handler
+            // has already returned.
+            if let Some(c) = cancel {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "forward_qwen36_decode: cancelled by caller",
+                        rvllm_core::CudaErrorKind::Other,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            // Reset scratch from the previous token's pass. First
+            // iteration's restore is a no-op (used == per_token_ck
+            // already).
+            unsafe { self.arena.restore(per_token_ck); }
             let tok_pos = start_position + tok_local;
             // Update pos+context_len for THIS token. Sync HtoD; runs
             // outside any future graph-captured region (it's a
@@ -5183,7 +5334,7 @@ impl Qwen36Bringup {
             ];
             let block: u32 = 256;
             let grid_x = (qkv_n + block - 1) / block;
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_causal_conv1d_f16.raw() as CUfunction,
                 grid_x, 1, 1,
                 block, 1, 1,
@@ -5192,6 +5343,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 causal_conv1d_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         // No fence: silu_l2_gqa runs on the same stream after conv1d.
 
@@ -5343,7 +5501,7 @@ impl Qwen36Bringup {
             // Block = head_v_dim threads, one per output row.
             // Shared mem = (2*head_k_dim + head_v_dim) * 4 bytes.
             let smem = (2 * head_k_dim + head_v_dim) * 4;
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_gated_delta_rule_decode_f16.raw() as CUfunction,
                 num_v_heads, 1, 1,
                 head_v_dim, 1, 1,
@@ -5352,6 +5510,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 gated_delta_rule_decode_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         // No fence: in_proj_z + rmsnorm_gated run on the same
         // stream after the delta-rule kernel.
@@ -5747,7 +5912,7 @@ impl Qwen36Bringup {
                 (&mut mbps) as *mut i32 as *mut core::ffi::c_void,
                 (&mut window) as *mut i32 as *mut core::ffi::c_void,
             ];
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_flash_attention_2_decode_f16io.raw() as CUfunction,
                 1, num_heads, 1,
                 FA2_THREADS as u32, 1, 1,
@@ -5756,6 +5921,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 flash_attention_2_decode_f16io launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         // No fence: attn_output_gate kernel runs on the same stream.
 
@@ -5777,7 +5949,7 @@ impl Qwen36Bringup {
             ];
             let block: u32 = 256;
             let grid = (q_size as u32 + block - 1) / block;
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_sigmoid_mul_f16.raw() as CUfunction,
                 grid, 1, 1,
                 block, 1, 1,
@@ -5786,6 +5958,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 sigmoid_mul_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         // No fence: o_proj runs on the same stream after sigmoid_mul.
 
@@ -5970,7 +6149,7 @@ impl Qwen36Bringup {
                 (&mut kk) as *mut i32 as *mut core::ffi::c_void,
             ];
             let block: u32 = num_experts as u32;
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_topk_softmax_f32.raw() as CUfunction,
                 1, 1, 1,
                 block, 1, 1,
@@ -5979,6 +6158,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 topk_softmax_f32 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
 
         // 3. Routed experts: each runs gate+up FP8 → silu·mul → down FP8.
@@ -6066,7 +6252,7 @@ impl Qwen36Bringup {
                 ];
                 let grid = ((n_int + 7) / 8, m, 1u32);
                 let block = (256u32, 1u32, 1u32);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_fp8_gemv_dual_silu_indirect.raw() as CUfunction,
                     grid.0, grid.1, grid.2,
                     block.0, block.1, block.2,
@@ -6075,6 +6261,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 fp8_gemv_dual_silu_indirect launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
             // Indirect down GEMV: reads expert idx from device.
             #[cfg(feature = "cuda")]
@@ -6106,7 +6299,7 @@ impl Qwen36Bringup {
                 ];
                 let grid = ((n_down + 7) / 8, m, 1u32);
                 let block = (256u32, 1u32, 1u32);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_fp8_gemv_indirect.raw() as CUfunction,
                     grid.0, grid.1, grid.2,
                     block.0, block.1, block.2,
@@ -6115,6 +6308,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 fp8_gemv_indirect launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
             // scaled_add_devw: routed_sum_region += topk_w[i] * down_region.
             #[cfg(feature = "cuda")]
@@ -6132,7 +6332,7 @@ impl Qwen36Bringup {
                 ];
                 let block: u32 = 256;
                 let grid = (n_down as u32 + block - 1) / block;
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_scaled_add_f16_to_f32_devw.raw() as CUfunction,
                     grid, 1, 1,
                     block, 1, 1,
@@ -6141,6 +6341,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 scaled_add_f16_to_f32_devw launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
         }
         // Optional debug L2 of routed-only sum.
@@ -6193,7 +6400,7 @@ impl Qwen36Bringup {
                 ];
                 let grid = ((n_int + 7) / 8, m, 1u32);
                 let block = (256u32, 1u32, 1u32);
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_fp8_gemv_dual_silu.raw() as CUfunction,
                     grid.0, grid.1, grid.2,
                     block.0, block.1, block.2,
@@ -6202,6 +6409,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 fp8_gemv_dual_silu launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
             unsafe {
                 self.fp8_proj_dispatch(kernel_gemv, down_region.device_ptr(),
@@ -6237,7 +6451,7 @@ impl Qwen36Bringup {
                 ];
                 let block: u32 = 256;
                 let grid: u32 = 1;
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_shared_gate_dot_sigmoid_f16.raw() as CUfunction,
                     grid, 1, 1,
                     block, 1, 1,
@@ -6246,6 +6460,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 shared_gate_dot_sigmoid_f16 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
             // GPU scaled_add (devw variant): routed_sum_region +=
             // *sg_sigmoid_region * down_region. Reads the sigmoid
@@ -6266,7 +6487,7 @@ impl Qwen36Bringup {
                 ];
                 let block: u32 = 256;
                 let grid = (n_down as u32 + block - 1) / block;
-                let _ = cuLaunchKernel(
+                let rc = cuLaunchKernel(
                     self.outside_kernels.fn_scaled_add_f16_to_f32_devw.raw() as CUfunction,
                     grid, 1, 1,
                     block, 1, 1,
@@ -6275,6 +6496,13 @@ impl Qwen36Bringup {
                     args.as_ptr() as *mut *mut core::ffi::c_void,
                     core::ptr::null_mut(),
                 );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 scaled_add_f16_to_f32_devw launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
             }
         }
         // 5. Residual sum, GPU-side (Phase 4b-prep iter19):
@@ -6430,7 +6658,7 @@ impl Qwen36Bringup {
             ];
             let block: u32 = 512;
             let grid: u32 = 1;
-            let _ = cuLaunchKernel(
+            let rc = cuLaunchKernel(
                 self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
                 grid, 1, 1,
                 block, 1, 1,
@@ -6439,6 +6667,13 @@ impl Qwen36Bringup {
                 args.as_ptr() as *mut *mut core::ffi::c_void,
                 core::ptr::null_mut(),
             );
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(rvllm_core::RvllmError::cuda(
+                "qwen36 argmax_f16 launch",
+                rvllm_core::CudaErrorKind::LaunchFailed,
+                rvllm_core::CudaCtx::setup(),
+            ));
+        }
         }
         self.stream.fence()?;
         let mut tok_buf = [0i32; 1];
