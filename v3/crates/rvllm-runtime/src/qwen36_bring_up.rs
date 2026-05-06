@@ -4717,7 +4717,10 @@ impl Qwen36Bringup {
                 stream_raw,
             )?;
         }
-        self.stream.fence()?;
+        // No fence: embed_gather wrote hidden_region on stream_raw and
+        // every subsequent reader (vision splice HtoDAsync, decode loop
+        // kernels) is also on stream_raw — same-stream ordering covers
+        // it (Phase 4b-prep iter28).
 
         // Phase 4d vision splice: overwrite the placeholder-token
         // slots in hidden_region with the per-image vision-tower
