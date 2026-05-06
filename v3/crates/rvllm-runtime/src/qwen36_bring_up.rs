@@ -5920,7 +5920,9 @@ impl Qwen36Bringup {
                 ));
             }
         }
-        self.stream.fence()?;
+        // No fence: the writeback above is a sync cuMemcpyHtoD_v2
+        // from a pageable Vec, which CUDA serialises with the stream
+        // context — the next layer's first read is already ordered.
         Ok(())
     }
 
