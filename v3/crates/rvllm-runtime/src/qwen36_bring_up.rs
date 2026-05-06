@@ -5521,11 +5521,14 @@ impl Qwen36Bringup {
         let k_cache_layer_ptr = kv_layer_ptr;
         let v_cache_layer_ptr = kv_layer_ptr + half;
         let pos_bytes = (position as i32).to_le_bytes();
+        // Phase 4b-prep iter24: pos_region and slot_region carried the
+        // same i32 `position` value via two separate 4-byte HtoDs per
+        // full-attn layer. Same value → share the device pointer; one
+        // HtoD per layer × 10 layers / token saved.
         let pos_region = self.arena.region("qwen36_pf_pos", 4, 16)?;
-        let slot_region = self.arena.region("qwen36_pf_slot", 4, 16)?;
+        let slot_dev_ptr = pos_region.device_ptr();
         unsafe {
             pos_region.copy_from_host(&pos_bytes)?;
-            slot_region.copy_from_host(&pos_bytes)?;
         }
         #[cfg(feature = "cuda")]
         unsafe {
@@ -5539,7 +5542,7 @@ impl Qwen36Bringup {
             let mut cos_p = self.rope_cos;
             let mut sin_p = self.rope_sin;
             let mut pos_p = pos_region.device_ptr();
-            let mut slot_p = slot_region.device_ptr();
+            let mut slot_p = slot_dev_ptr;
             let mut nt: i32 = m as i32;
             let mut nh: i32 = num_heads as i32;
             let mut nkh: i32 = num_kv_heads as i32;
