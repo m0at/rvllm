@@ -526,6 +526,18 @@ pub async fn chat_completions(
     // Move vision_items INTO the closure (avoids cloning multi-MB
     // image bytes) and return them back along with the rendered
     // ids + slots so the rest of the handler still has them.
+    //
+    // Cancellation note: minijinja's render and the HF tokenizer
+    // encode are pure synchronous calls without an interrupt API,
+    // so a `tokio::time::timeout_at` here will release the admission
+    // permit but the spawn_blocking task continues running until
+    // the underlying call returns. The bound is therefore
+    // `body_limit × tokenize-throughput`. Two things keep that
+    // finite under load: (a) `DefaultBodyLimit` (router.rs, 128
+    // MiB default) caps the input size, (b) the worker-queue
+    // admission cap bounds concurrent in-flight blocking tasks.
+    // A real interrupt requires patching tokenizers/minijinja
+    // upstream.
     let render_messages = req.messages.clone();
     let render_tools = req.tools.clone();
     let render_tokenizer = state.tokenizer.clone();

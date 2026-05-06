@@ -115,6 +115,22 @@ pub async fn spawn_cuda_worker(
                     // scratch checkpoint so they survive that restore
                     // and only get reset by the explicit calls below.
                     while let Some(req) = req_rx.blocking_recv() {
+                        // GB10 belt-and-suspenders: rebind the retained
+                        // primary CUDA context to this worker thread once
+                        // per request. `Qwen36Bringup::load` already
+                        // bound it during init, but a context binding that
+                        // sat idle across `blocking_recv` has been
+                        // observed to drop on GB10, producing
+                        // `cuLaunchKernel` failures on the next launch.
+                        // One `cuCtxSetCurrent` per request is free next
+                        // to decode cost. See
+                        // rvllm-mem/src/context.rs:bind_to_current_thread.
+                        if let Err(e) = qwen.ctx.bind_to_current_thread() {
+                            let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                                format!("qwen36 ctx rebind: {e:?}"),
+                            ));
+                            continue;
+                        }
                         let prompt_len = req.prompt_ids.len() as u32;
                         // Qwen 3.6 path is greedy-only today: the
                         // forward_qwen36_decode runtime samples internally
@@ -444,6 +460,17 @@ pub async fn spawn_cuda_worker(
 
             // Main serve loop. One request at a time (single-seq).
             while let Some(req) = req_rx.blocking_recv() {
+                // Same GB10 ctx-rebind guard as the qwen36 branch
+                // (see rvllm-mem/src/context.rs::bind_to_current_thread).
+                // One `cuCtxSetCurrent` per request is free; a dropped
+                // binding after a long blocking_recv idle can produce
+                // cuLaunchKernel failures on the next decode.
+                if let Err(e) = bringup.ctx.bind_to_current_thread() {
+                    let _ = req.events_tx.blocking_send(GenerateEvent::Error(
+                        format!("gemma4 ctx rebind: {e:?}"),
+                    ));
+                    continue;
+                }
                 run_one(&bringup, &kernels_ctx, req);
                 // SAFETY: `run_one` fully consumes the `Region`s it
                 // allocated inside `bringup.run_generate` — they're

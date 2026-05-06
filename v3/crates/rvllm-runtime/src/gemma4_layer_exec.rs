@@ -178,40 +178,83 @@ impl KvDtype {
         layer_idx: usize,
         f16_only: bool,
     ) -> Self {
-        let default = Self::from_env(f16_only);
-        // Env-list override fires first. Most targeted, lets operators
-        // pin specific layer indices to FP8 even if hybrid is off.
-        if default == KvDtype::Nvfp4 && layer_idx != usize::MAX {
-            if let Ok(list) = std::env::var("RVLLM_FP8_KV_LAYERS") {
-                if list.split(',')
-                    .filter_map(|s| s.trim().parse::<usize>().ok())
-                    .any(|i| i == layer_idx)
-                {
-                    return KvDtype::Fp8;
-                }
-            }
+        // Parse the env state ONCE per process and cache it. The
+        // earlier code read `RVLLM_FP8_KV_LAYERS`,
+        // `RVLLM_NVFP4_HYBRID_GLOBAL_FP8`, and
+        // `RVLLM_NVFP4_HYBRID_SLIDING_FP8` on every call —
+        // 60 layers × N decode tokens × 4–5 syscalls each adds up
+        // on the low-batch latency path. Operators expect KV-dtype
+        // env state to be process-stable; mutating it mid-run is
+        // not a supported workflow.
+        let state = cached_env_state();
+        let default = if f16_only {
+            KvDtype::F16
+        } else {
+            state.default
+        };
+        if default == KvDtype::Nvfp4
+            && layer_idx != usize::MAX
+            && state.fp8_layers.binary_search(&layer_idx).is_ok()
+        {
+            return KvDtype::Fp8;
         }
-        let hybrid = crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
-            .unwrap_or(false);
-        if hybrid && default == KvDtype::Nvfp4
+        if state.hybrid_global_fp8
+            && default == KvDtype::Nvfp4
             && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::GlobalAttention
         {
             return KvDtype::Fp8;
         }
-        // Inverse hybrid (cycle 25 research): all SLIDING layers FP8,
-        // globals stay NVFP4. Tests whether sliding-layer cumulative
-        // noise dominates over global-layer noise, given that the prior
-        // global-FP8 hybrid did not close the WEATHER cliff.
-        let hybrid_sliding =
-            crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HYBRID_SLIDING_FP8")
-                .unwrap_or(false);
-        if hybrid_sliding && default == KvDtype::Nvfp4
+        if state.hybrid_sliding_fp8
+            && default == KvDtype::Nvfp4
             && layer_type == rvllm_loader::gemma4_arch::Gemma4LayerType::SlidingAttention
         {
             return KvDtype::Fp8;
         }
         default
     }
+}
+
+/// Process-wide cache of the parsed KV-dtype env state. Read once
+/// on the first call to `for_layer_index_or_env` and reused on
+/// every subsequent call — saves the per-token-per-layer
+/// `std::env::var` syscalls on the Gemma decode hot path.
+struct KvDtypeEnvState {
+    default: KvDtype,
+    /// Sorted list of layer indices forced to FP8 via
+    /// `RVLLM_FP8_KV_LAYERS`. Sorted so the per-call lookup uses
+    /// `binary_search` instead of re-parsing the comma-separated
+    /// string every time.
+    fp8_layers: Vec<usize>,
+    hybrid_global_fp8: bool,
+    hybrid_sliding_fp8: bool,
+}
+
+fn cached_env_state() -> &'static KvDtypeEnvState {
+    use std::sync::OnceLock;
+    static STATE: OnceLock<KvDtypeEnvState> = OnceLock::new();
+    STATE.get_or_init(|| {
+        let default = KvDtype::from_env(false);
+        let mut fp8_layers: Vec<usize> = std::env::var("RVLLM_FP8_KV_LAYERS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        fp8_layers.sort_unstable();
+        fp8_layers.dedup();
+        KvDtypeEnvState {
+            default,
+            fp8_layers,
+            hybrid_global_fp8:
+                crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HYBRID_GLOBAL_FP8")
+                    .unwrap_or(false),
+            hybrid_sliding_fp8:
+                crate::gemma4_bring_up::parse_truthy_env("RVLLM_NVFP4_HYBRID_SLIDING_FP8")
+                    .unwrap_or(false),
+        }
+    })
 }
 
 #[derive(Copy, Clone, Debug)]
