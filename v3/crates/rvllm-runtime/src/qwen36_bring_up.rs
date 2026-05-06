@@ -5073,6 +5073,34 @@ impl Qwen36Bringup {
                 .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
                 .unwrap_or(false);
         if batch_linear {
+            // Round-24 audit: mirror the per-token path's last-token
+            // dump from `RVLLM_QWEN36_DUMP_DIR`. Drops the same files
+            // (embed.f16, layer_NN_attn.f16, layer_NN_moe.f16) for
+            // the LAST prompt token's hidden row so the per-token
+            // and batched paths can be diffed layer-by-layer with a
+            // simple `cmp` / cosine harness.
+            let dump_dir = std::env::var("RVLLM_QWEN36_DUMP_DIR").ok();
+            let dump_token_idx = num_tokens.saturating_sub(1) as usize;
+            let dump_active = dump_dir.is_some() && start_position == 0;
+            if let Some(dir) = dump_dir.as_ref() {
+                if dump_active {
+                    let _ = std::fs::create_dir_all(dir);
+                    let mut buf = vec![0u8; last_hidden_bytes];
+                    let row_ptr = hidden_region.device_ptr()
+                        + (dump_token_idx as u64) * (last_hidden_bytes as u64);
+                    self.stream.fence()?;
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut _,
+                            row_ptr,
+                            last_hidden_bytes,
+                        );
+                    }
+                    let _ = std::fs::write(format!("{dir}/embed.f16"), &buf);
+                }
+            }
             // Pre-stage pos+context_len for each token. Full-attn
             // still runs per-token below and reuses the existing
             // pos_cl_region, so we update it inside the per-token
@@ -5097,10 +5125,35 @@ impl Qwen36Bringup {
                 let layer_ck = self.arena.checkpoint();
                 let post_attn_norm_ptr = match &self.model.layers[layer_idx].attn {
                     rvllm_loader::qwen36_weights::Qwen36LayerAttn::Linear(la) => {
-                        self.apply_layer_linear_attn_batched(
-                            la, linear_seq, hidden_region.device_ptr(),
-                            num_tokens, kernel_gemv, hidden,
-                        )?;
+                        // Round-24 audit: env-gate
+                        // RVLLM_QWEN36_BATCH_LINEAR_HOST_LOOP=1 bypasses the
+                        // batched kernel and replays the per-token function
+                        // N times in this layer's slot. If that produces
+                        // byte-identical hidden[N-1] dumps to the
+                        // token-major path, the layer-major orchestration
+                        // is correct and any divergence is in the batched
+                        // kernel itself.
+                        let host_loop_only = std::env::var(
+                            "RVLLM_QWEN36_BATCH_LINEAR_HOST_LOOP")
+                            .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
+                            .unwrap_or(false);
+                        if host_loop_only {
+                            for t in 0..num_tokens {
+                                let tok_ptr = hidden_region.device_ptr()
+                                    + (t as u64) * (last_hidden_bytes as u64);
+                                let inner_ck = self.arena.checkpoint();
+                                self.apply_layer_linear_attn(
+                                    la, linear_seq, tok_ptr,
+                                    kernel_gemv, hidden, last_hidden_bytes,
+                                )?;
+                                unsafe { self.arena.restore(inner_ck); }
+                            }
+                        } else {
+                            self.apply_layer_linear_attn_batched(
+                                la, linear_seq, hidden_region.device_ptr(),
+                                num_tokens, kernel_gemv, hidden,
+                            )?;
+                        }
                         linear_seq += 1;
                         la.post_attention_layernorm.offset_bytes
                     }
@@ -5129,6 +5182,24 @@ impl Qwen36Bringup {
                         fl.post_attention_layernorm.offset_bytes
                     }
                 };
+                if dump_active {
+                    let dir = dump_dir.as_ref().unwrap();
+                    let mut buf = vec![0u8; last_hidden_bytes];
+                    let row_ptr = hidden_region.device_ptr()
+                        + (dump_token_idx as u64) * (last_hidden_bytes as u64);
+                    self.stream.fence()?;
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut _,
+                            row_ptr,
+                            last_hidden_bytes,
+                        );
+                    }
+                    let _ = std::fs::write(
+                        format!("{dir}/layer_{layer_idx:02}_attn.f16"), &buf);
+                }
                 // MoE per token. The MoE block reads/writes through
                 // tok_ptr and post_attn_norm_ptr; routing is per-
                 // token, so this stays in the per-token sub-loop
@@ -5145,6 +5216,24 @@ impl Qwen36Bringup {
                         layer_idx,
                     )?;
                     unsafe { self.arena.restore(inner_ck); }
+                }
+                if dump_active {
+                    let dir = dump_dir.as_ref().unwrap();
+                    let mut buf = vec![0u8; last_hidden_bytes];
+                    let row_ptr = hidden_region.device_ptr()
+                        + (dump_token_idx as u64) * (last_hidden_bytes as u64);
+                    self.stream.fence()?;
+                    #[cfg(feature = "cuda")]
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut _,
+                            row_ptr,
+                            last_hidden_bytes,
+                        );
+                    }
+                    let _ = std::fs::write(
+                        format!("{dir}/layer_{layer_idx:02}_moe.f16"), &buf);
                 }
                 if let Some(c) = cancel {
                     if c.load(std::sync::atomic::Ordering::Relaxed) {
@@ -5227,6 +5316,7 @@ impl Qwen36Bringup {
                     let _ = std::fs::create_dir_all(dir);
                     // Dump the embedding (input to layer 0) once.
                     let mut buf = vec![0u8; last_hidden_bytes];
+                    self.stream.fence()?;
                     #[cfg(feature = "cuda")]
                     unsafe {
                         use cudarc::driver::sys::*;
@@ -5266,6 +5356,7 @@ impl Qwen36Bringup {
                 if dump_this_token {
                     let dir = dump_dir.as_ref().unwrap();
                     let mut buf = vec![0u8; last_hidden_bytes];
+                    self.stream.fence()?;
                     #[cfg(feature = "cuda")]
                     unsafe {
                         use cudarc::driver::sys::*;
@@ -5288,6 +5379,7 @@ impl Qwen36Bringup {
                 if dump_this_token {
                     let dir = dump_dir.as_ref().unwrap();
                     let mut buf = vec![0u8; last_hidden_bytes];
+                    self.stream.fence()?;
                     #[cfg(feature = "cuda")]
                     unsafe {
                         use cudarc::driver::sys::*;
