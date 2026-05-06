@@ -121,6 +121,13 @@ pub struct Qwen36OutsideKernels {
     /// Replaces the host-cached f32 matvec (Phase 4b-prep iter17).
     pub router_gemv_f16_to_f32_mod: LoadedModule,
     pub fn_router_gemv_f16_to_f32: KernelFn,
+    /// Per-expert weighted accumulator into f32 routed_sum:
+    /// `acc[i] += weight * f16_to_f32(in[i])`. Replaces the host
+    /// pipeline (fence + DtoH down + CPU scaled-add) per expert
+    /// (Phase 4b-prep iter18, after the fence-before-DtoH bug
+    /// from iter13/14 was diagnosed in iter17).
+    pub scaled_add_f16_to_f32_mod: LoadedModule,
+    pub fn_scaled_add_f16_to_f32: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -450,6 +457,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("router_gemv_f16_to_f32")?;
         let fn_router_gemv_f16_to_f32 = router_gemv_f16_to_f32_mod
             .get_function("router_gemv_f16_to_f32_kernel")?;
+        let scaled_add_f16_to_f32_mod =
+            kernels.load_ptx("scaled_add_f16_to_f32")?;
+        let fn_scaled_add_f16_to_f32 = scaled_add_f16_to_f32_mod
+            .get_function("scaled_add_f16_to_f32_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -535,6 +546,8 @@ impl Qwen36Bringup {
             fn_silu_mul_f16,
             router_gemv_f16_to_f32_mod,
             fn_router_gemv_f16_to_f32,
+            scaled_add_f16_to_f32_mod,
+            fn_scaled_add_f16_to_f32,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -5851,7 +5864,31 @@ impl Qwen36Bringup {
         let gate_bs = match moe.experts_gate_proj_fused.blockscale_ptr { Some(p) => p, None => return Ok(()) };
         let up_bs = match moe.experts_up_proj_fused.blockscale_ptr { Some(p) => p, None => return Ok(()) };
         let down_bs = match moe.experts_down_proj_fused.blockscale_ptr { Some(p) => p, None => return Ok(()) };
-        let mut routed_sum = vec![0.0f32; n_down as usize];
+        // Phase 4b-prep iter18: keep routed_sum on the GPU for the
+        // entire expert loop. f32 accumulator, zeroed once on
+        // stream_raw, then DtoH'd ONCE after the shared expert
+        // finishes (with a self.stream.fence() before the DtoH —
+        // that fence is the iter17-discovered invariant).
+        let routed_sum_bytes = (n_down as usize) * 4;
+        let routed_sum_region =
+            self.arena.region("qwen36_pm_rs", routed_sum_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let rc = cuMemsetD8Async(
+                routed_sum_region.device_ptr(),
+                0,
+                routed_sum_bytes,
+                stream_raw as CUstream,
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 moe routed_sum cuMemsetD8Async",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         for ((e_idx, _logit), w) in top.iter().zip(weights.iter()) {
             let e = *e_idx as u64;
             unsafe {
@@ -5901,21 +5938,48 @@ impl Qwen36Bringup {
                     silu_region.device_ptr(),
                     m, n_down, k_down, stream_raw)?;
             }
-            self.stream.fence()?;
-            let mut d_host = vec![0u8; down_bytes];
+            // GPU scaled_add: routed_sum_region += w * down_region.
+            // Same stream as down GEMV → automatic ordering.
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(d_host.as_mut_ptr() as *mut _,
-                    down_region.device_ptr(), down_bytes);
-            }
-            for i in 0..(n_down as usize) {
-                let v = f16_bits_to_f32(u16::from_le_bytes([d_host[i * 2], d_host[i * 2 + 1]]));
-                routed_sum[i] += v * w;
+                let mut acc = routed_sum_region.device_ptr();
+                let mut input = down_region.device_ptr();
+                let mut weight = *w;
+                let mut nn = n_down as i32;
+                let args = [
+                    (&mut acc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut weight) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = (n_down as u32 + block - 1) / block;
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_scaled_add_f16_to_f32.raw() as CUfunction,
+                    grid, 1, 1,
+                    block, 1, 1,
+                    0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
             }
         }
+        // Optional debug L2 of routed-only sum.
         let routed_only_l2: f32 = if std::env::var("RVLLM_QWEN36_DEBUG_MOE").is_ok() {
-            routed_sum.iter().map(|x| x*x).sum::<f32>().sqrt()
+            self.stream.fence()?;
+            let mut rs_host = vec![0.0f32; n_down as usize];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    rs_host.as_mut_ptr() as *mut _,
+                    routed_sum_region.device_ptr(),
+                    routed_sum_bytes,
+                );
+            }
+            rs_host.iter().map(|x| x*x).sum::<f32>().sqrt()
         } else { 0.0 };
 
         // 4. Shared expert FFN scaled by sigmoid(shared_expert_gate_logit).
@@ -5965,14 +6029,6 @@ impl Qwen36Bringup {
                     silu_region.device_ptr(),
                     m, n_down, k_down, stream_raw)?;
             }
-            self.stream.fence()?;
-            let mut sh_host = vec![0u8; down_bytes];
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(sh_host.as_mut_ptr() as *mut _,
-                    down_region.device_ptr(), down_bytes);
-            }
             // shared_expert_gate is Linear(hidden→1) per vLLM
             // qwen3_next.py:127-133: gate_logit = weight · normed_hidden
             // (scalar per token), then sigmoid(gate_logit) scales the
@@ -5985,10 +6041,45 @@ impl Qwen36Bringup {
                 g_logit += sg_w_f32[k] * input_f32[k];
             }
             let g_sigmoid = 1.0f32 / (1.0f32 + (-g_logit).exp());
-            for i in 0..(n_down as usize) {
-                let v = f16_bits_to_f32(u16::from_le_bytes([sh_host[i * 2], sh_host[i * 2 + 1]]));
-                routed_sum[i] += v * g_sigmoid;
+            // GPU scaled_add: routed_sum_region += g_sigmoid * down_region.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut acc = routed_sum_region.device_ptr();
+                let mut input = down_region.device_ptr();
+                let mut weight = g_sigmoid;
+                let mut nn = n_down as i32;
+                let args = [
+                    (&mut acc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut weight) as *mut f32 as *mut core::ffi::c_void,
+                    (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid = (n_down as u32 + block - 1) / block;
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_scaled_add_f16_to_f32.raw() as CUfunction,
+                    grid, 1, 1,
+                    block, 1, 1,
+                    0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
             }
+        }
+        // iter17 invariant: fence stream_raw before the sync DtoH.
+        self.stream.fence()?;
+        // DtoH the f32 routed_sum once for the host residual add.
+        let mut routed_sum = vec![0.0f32; n_down as usize];
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let _ = cuMemcpyDtoH_v2(
+                routed_sum.as_mut_ptr() as *mut _,
+                routed_sum_region.device_ptr(),
+                routed_sum_bytes,
+            );
         }
 
         // 5. Residual sum: last_hidden_new = last_hidden + moe_out.
