@@ -263,6 +263,11 @@ pub struct Qwen36Bringup {
     /// f32 once at bring-up replaces 30 MiB of per-token DtoH +
     /// 16M f16→f32 conversions with a direct RAM read.
     pub router_host_cache: Vec<Vec<f32>>,
+    /// Per-layer host-side f32 cache of the shared-expert gate
+    /// weight (`[hidden]`). The pre-iter16 path DtoH'd this every
+    /// MoE layer × every token (4 KiB) and converted f16→f32; same
+    /// caching pattern as `router_host_cache` (Phase 4b-prep iter16).
+    pub shared_gate_host_cache: Vec<Vec<f32>>,
     /// Phase 4u: paged f16 KV cache for the 10 full-attention
     /// layers. Layout `[num_full_layers, 2 (K+V), num_blocks,
     /// block_size, num_kv_heads, head_dim]` f16. Pre-allocated above
@@ -825,6 +830,7 @@ impl Qwen36Bringup {
             linear_state_layer_bytes,
             linear_attn_host_cache: Vec::new(), // populated below
             router_host_cache: Vec::new(),       // populated below
+            shared_gate_host_cache: Vec::new(),  // populated below
 
             kv_cache_ptr,
             kv_cache_bytes,
@@ -924,6 +930,34 @@ impl Qwen36Bringup {
                 total_bytes as f64 / (1024.0 * 1024.0)
             );
             bringup.router_host_cache = caches;
+        }
+
+        // Phase 4b-prep iter16: cache shared-expert gate weights as
+        // f32 host vectors. Saves 4 KiB DtoH × num_layers × per token.
+        {
+            let hidden_us = bringup.arch.base.hidden_size as usize;
+            let mut caches: Vec<Vec<f32>> = Vec::new();
+            for layer in bringup.model.layers.iter() {
+                let sg_bytes = hidden_us * 2;
+                let mut sg_host = vec![0u8; sg_bytes];
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    cuMemcpyDtoH_v2(
+                        sg_host.as_mut_ptr() as *mut _,
+                        layer.moe.shared_expert_gate_logit.offset_bytes,
+                        sg_bytes,
+                    );
+                }
+                let mut sg_f32 = vec![0.0f32; hidden_us];
+                for k in 0..hidden_us {
+                    sg_f32[k] = f16_bits_to_f32(u16::from_le_bytes([
+                        sg_host[k * 2], sg_host[k * 2 + 1],
+                    ]));
+                }
+                caches.push(sg_f32);
+            }
+            bringup.shared_gate_host_cache = caches;
         }
 
         // Phase 3e smoke: actually launch embedding_gather against the
@@ -5887,25 +5921,13 @@ impl Qwen36Bringup {
             // shared_expert_gate is Linear(hidden→1) per vLLM
             // qwen3_next.py:127-133: gate_logit = weight · normed_hidden
             // (scalar per token), then sigmoid(gate_logit) scales the
-            // shared expert output. Earlier we read it as a single f16
-            // scalar — that was wrong; weight has shape [1, hidden].
-            let sg_bytes = hidden_us * 2;
-            let mut sg_w_host = vec![0u8; sg_bytes];
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let _ = cuMemcpyDtoH_v2(
-                    sg_w_host.as_mut_ptr() as *mut _,
-                    moe.shared_expert_gate_logit.offset_bytes,
-                    sg_bytes,
-                );
-            }
+            // shared expert output. Weights cached as f32 host vec at
+            // bring-up (Phase 4b-prep iter16); per-token path is just
+            // a dot-product over RAM.
+            let sg_w_f32 = &self.shared_gate_host_cache[layer_idx];
             let mut g_logit = 0.0f32;
             for k in 0..hidden_us {
-                let w = f16_bits_to_f32(u16::from_le_bytes([
-                    sg_w_host[k * 2], sg_w_host[k * 2 + 1],
-                ]));
-                g_logit += w * input_f32[k];
+                g_logit += sg_w_f32[k] * input_f32[k];
             }
             let g_sigmoid = 1.0f32 / (1.0f32 + (-g_logit).exp());
             for i in 0..(n_down as usize) {
