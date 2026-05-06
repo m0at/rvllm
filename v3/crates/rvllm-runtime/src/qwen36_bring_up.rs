@@ -6273,33 +6273,48 @@ impl Qwen36Bringup {
                 stream_raw,
             )?;
         }
-        self.stream.fence()?;
+        // Phase 4b-prep iter27: GPU argmax over the f16 logits row,
+        // replacing a `vocab * 2`-byte DtoH (~524 KiB at vocab=262K)
+        // + host max-loop with a single 4-byte device→host copy of
+        // the winning token id.
         let logits_row_bytes = (vocab as usize) * 2;
         let last_off = (last_idx as u64) * (logits_row_bytes as u64);
-        let mut logits_row_f16 = vec![0u8; logits_row_bytes];
+        let token_region = self.arena.region("qwen36_pl_token", 4, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut logits_ptr = logits_region.device_ptr() + last_off;
+            let mut out_ptr = token_region.device_ptr();
+            let mut vs = vocab as i32;
+            let args = [
+                (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vs) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 512;
+            let grid: u32 = 1;
+            let _ = cuLaunchKernel(
+                self.outside_kernels.fn_argmax_f16.raw() as CUfunction,
+                grid, 1, 1,
+                block, 1, 1,
+                0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+        }
+        self.stream.fence()?;
+        let mut tok_buf = [0i32; 1];
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
             let _ = cuMemcpyDtoH_v2(
-                logits_row_f16.as_mut_ptr() as *mut _,
-                logits_region.device_ptr() + last_off,
-                logits_row_bytes,
+                tok_buf.as_mut_ptr() as *mut _,
+                token_region.device_ptr(),
+                4,
             );
         }
-        let mut best_logit = f32::NEG_INFINITY;
-        let mut best_token: i32 = -1;
-        for v in 0..vocab as usize {
-            let bits = u16::from_le_bytes([
-                logits_row_f16[v * 2],
-                logits_row_f16[v * 2 + 1],
-            ]);
-            let l = f16_bits_to_f32(bits);
-            if l > best_logit {
-                best_logit = l;
-                best_token = v as i32;
-            }
-        }
-        Ok(best_token)
+        Ok(tok_buf[0])
     }
 
     pub fn forward_outside_smoke(&self) -> Result<()> {
