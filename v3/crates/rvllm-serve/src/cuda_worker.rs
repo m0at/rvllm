@@ -700,8 +700,6 @@ pub fn resolve_paths(
     policy_json: Option<PathBuf>,
 ) -> Result<Gemma4EnginePaths, ApiError> {
     const UNUSED: &str = "<unused-on-sm121>";
-    const MINIMAL_POLICY: &str =
-        r#"{"revision":"serve-sm121","arch":"sm_121","variants":[],"entries":{}}"#;
 
     // Codex31/34: detect sm_121 host so we can (a) point cutlass_so at
     // the real libcutlass_sm120.so (lib_so.rs's resolver anchors at
@@ -769,27 +767,37 @@ pub fn resolve_paths(
     let policy_json = match policy_json {
         Some(p) => p,
         None => {
+            // On sm_121 the runtime (Codex30-2 / Codex31-2) skips
+            // policy.json entirely — neither the generic nor the
+            // gemma4 bring-up reads it. Synthesise a path so anything
+            // that prints `policy_json` for diagnostics shows a
+            // sensible location, but do NOT touch disk: a read-only
+            // /tmp or a restricted container shouldn't abort startup
+            // for a file that won't be read.
+            //
+            // On non-sm_121 (RTX 5090, RTX 6000 Blackwell, …) the
+            // FP8 plan loader DOES read this file — and the legacy
+            // fallback wrote a tiny placeholder body that
+            // `Fp8GemmPlan::from_policy(...)` then rejects later, deep
+            // inside autotune. That produced a confusing "plan
+            // missing entry for shape X" instead of the truthful
+            // "operator forgot to pass --policy-json". Refuse here
+            // with a clear startup error.
             let p = std::env::var_os("RVLLM_MINIMAL_POLICY_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
                     std::env::temp_dir().join("rvllm-serve-minimal-policy.json")
                 });
-            // Codex31-2: on sm_121 the runtime (Codex30-2) skips
-            // policy.json entirely — neither the generic nor the
-            // gemma4 bring-up reads it. Avoid touching disk when
-            // unnecessary so a read-only /tmp or restricted container
-            // doesn't abort startup. Still record the path so any
-            // diagnostic that prints `policy_json` shows the would-be
-            // location.
-            if !sm121 && !p.exists() {
-                std::fs::write(&p, MINIMAL_POLICY).map_err(|e| {
-                    ApiError::Internal(format!(
-                        "write minimal policy {}: {e} \
-                         (set RVLLM_MINIMAL_POLICY_PATH to a writeable path or \
-                         pass an explicit policy via --policy-json)",
-                        p.display()
-                    ))
-                })?;
+            if !sm121 {
+                return Err(ApiError::Internal(format!(
+                    "policy_json required on non-sm_121 hosts: pass an \
+                     explicit FP8 policy via --policy-json (a real one \
+                     produced by the autotune sweep, not a placeholder). \
+                     Resolved would-be path was {} but no policy was \
+                     supplied and synthesising a stub here only delays \
+                     the failure to Fp8GemmPlan::from_policy(...)",
+                    p.display()
+                )));
             }
             p
         }
@@ -850,12 +858,38 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Detect sm_121 the same way `resolve_paths` does, so tests
+    /// stay portable between an x86 dev box and a GB10 CI host
+    /// without pulling in a cudarc dep.
+    fn detect_sm121_for_test() -> bool {
+        std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout).ok()
+                } else { None }
+            })
+            .map(|s| s.lines().next().map(|l| l.trim() == "12.1").unwrap_or(false))
+            .unwrap_or(false)
+            || std::env::var("RVLLM_FORCE_SM121")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+                .unwrap_or(false)
+    }
+
     /// `resolve_paths` must NOT write into `kernels_dir`. A read-only
     /// kernel install (Nix store, container layer, root-owned shared
     /// dir) is a legitimate deploy shape; the resolver writing a
     /// `.serve-minimal-policy.json` there used to fail at startup
-    /// with a confusing IO error. The fallback now lives in
-    /// `std::env::temp_dir()`.
+    /// with a confusing IO error.
+    ///
+    /// On sm_121 the runtime skips policy_json entirely so the
+    /// resolver succeeds without touching disk. On non-sm_121 the
+    /// resolver now refuses (Codex60 / round-16 finding #2): the
+    /// loader needs a real autotune-produced policy, and the old
+    /// behaviour of synthesising a placeholder only delayed the
+    /// failure to `Fp8GemmPlan::from_policy(...)`.
     #[test]
     fn resolve_paths_does_not_write_into_kernels_dir() {
         let _g = env_lock().lock().expect("env lock");
@@ -868,18 +902,21 @@ mod tests {
         let model_dir = tmp.join("model");
         std::fs::create_dir_all(&model_dir).expect("setup model");
 
-        // Sanity: the kernels_dir starts empty.
-        let before: Vec<_> = std::fs::read_dir(&kernels_dir)
-            .expect("read kernels_dir")
-            .collect();
-        assert!(before.is_empty(), "test setup not empty");
-
-        // Strip env override so we exercise the temp_dir fallback path.
         std::env::remove_var("RVLLM_MINIMAL_POLICY_PATH");
-        let paths = resolve_paths(model_dir, kernels_dir.clone(), None, None, None)
-            .expect("resolve");
+        let result = resolve_paths(model_dir, kernels_dir.clone(), None, None, None);
 
-        // Postcondition #1: kernels_dir untouched.
+        if detect_sm121_for_test() {
+            let paths = result.expect("resolve on sm_121");
+            assert!(!paths.policy_json.starts_with(&kernels_dir),
+                "policy_json {:?} is inside kernels_dir {:?}",
+                paths.policy_json, kernels_dir);
+        } else {
+            assert!(result.is_err(),
+                "resolve_paths must refuse on non-sm_121 without --policy-json: {:?}",
+                result.map(|p| p.policy_json));
+        }
+
+        // Postcondition: kernels_dir untouched in either branch.
         let after: Vec<_> = std::fs::read_dir(&kernels_dir)
             .expect("read kernels_dir")
             .collect();
@@ -888,47 +925,16 @@ mod tests {
             after.into_iter().filter_map(|e| e.ok().map(|e| e.path())).collect::<Vec<_>>()
         );
 
-        // Postcondition #2: policy_json points somewhere outside
-        // kernels_dir AND the file exists.
-        assert!(!paths.policy_json.starts_with(&kernels_dir),
-            "policy_json {:?} is inside kernels_dir {:?}",
-            paths.policy_json, kernels_dir);
-        // On sm_121 hosts the resolver intentionally skips
-        // materialising the minimal-policy file (the runtime
-        // loader doesn't read policy_json on that arch). Skip the
-        // existence check there so the test stays portable
-        // between an x86 dev box and a GB10 CI host. Detection
-        // mirrors the resolver's own `is_sm121_via_nvidia_smi` —
-        // we don't pull in a full cudarc dep just for the test.
-        let on_sm121 = std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8(o.stdout).ok()
-                } else { None }
-            })
-            .map(|s| s.lines().next().map(|l| l.trim() == "12.1").unwrap_or(false))
-            .unwrap_or(false)
-            || std::env::var("RVLLM_FORCE_SM121")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false);
-        if !on_sm121 {
-            assert!(paths.policy_json.exists(),
-                "policy_json {:?} not created", paths.policy_json);
-        }
-
-        // Cleanup.
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Operator can override the policy path via env var, e.g. on a
     /// read-only host where /tmp is also read-only. The override path
-    /// MUST be materialised on disk by `resolve_paths` — the runtime
-    /// loader reads it strictly, and a path that "exists in the env
-    /// var" but not on the filesystem produces an ENOENT that
-    /// contradicts the error message we hand the operator.
+    /// On sm_121 the env override decides where the (unread)
+    /// policy_json path is recorded; the resolver doesn't touch
+    /// disk. On non-sm_121 the resolver refuses regardless of the
+    /// env override — the env var only steers the placeholder
+    /// location, not a real policy.
     #[test]
     fn resolve_paths_honours_env_override() {
         let _g = env_lock().lock().expect("env lock");
@@ -941,43 +947,25 @@ mod tests {
         let custom_policy = tmp.join("my-policy.json");
 
         std::env::set_var("RVLLM_MINIMAL_POLICY_PATH", &custom_policy);
-        let paths = resolve_paths(
+        let result = resolve_paths(
             tmp.join("model"),
             kernels_dir.clone(),
             None,
             None,
             None,
-        )
-        .expect("resolve");
+        );
         std::env::remove_var("RVLLM_MINIMAL_POLICY_PATH");
 
-        assert_eq!(paths.policy_json, custom_policy,
-            "env override not honoured: got {:?}", paths.policy_json);
-        // Same arch-gate as the sibling test: on sm_121 the
-        // resolver intentionally skips materialising the policy
-        // file (runtime loader doesn't read it there).
-        let on_sm121 = std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8(o.stdout).ok()
-                } else { None }
-            })
-            .map(|s| s.lines().next().map(|l| l.trim() == "12.1").unwrap_or(false))
-            .unwrap_or(false)
-            || std::env::var("RVLLM_FORCE_SM121")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false);
-        if !on_sm121 {
-            assert!(paths.policy_json.exists(),
-                "env-override path {:?} not materialised on disk — runtime loader will ENOENT",
-                paths.policy_json);
-            let body = std::fs::read_to_string(&paths.policy_json)
-                .expect("read materialised policy");
-            assert!(body.contains("serve-sm121"), "minimal-policy body missing: {body:?}");
+        if detect_sm121_for_test() {
+            let paths = result.expect("resolve on sm_121 with env override");
+            assert_eq!(paths.policy_json, custom_policy,
+                "env override not honoured: got {:?}", paths.policy_json);
+        } else {
+            assert!(result.is_err(),
+                "non-sm_121 must refuse even with env override: {:?}",
+                result.map(|p| p.policy_json));
         }
+
         let after: Vec<_> = std::fs::read_dir(&kernels_dir)
             .expect("read kernels_dir")
             .collect();

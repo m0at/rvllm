@@ -24,12 +24,10 @@ pub struct ServerConfig {
     pub model_id: String,
     /// Max number of in-flight + queued generate requests. Full =
     /// admission returns 429. The worker pulls one request out of the
-    /// queue and processes it on its dedicated thread, so the channel
-    /// buffer is sized as `max_queue_depth - 1` (queued slots) + 1
-    /// in-flight = `max_queue_depth` total. Minimum 2 (validate()
-    /// rejects 1 because mpsc::channel(0) is invalid and the
-    /// resulting clamp would silently admit 2 against a doc-promised
-    /// "strictly serial" semantics).
+    /// queue and processes it on its dedicated thread; the channel
+    /// buffer + admission permits are both sized to `max_queue_depth`,
+    /// so depth=1 is strictly serial (1 permit + 1 channel slot,
+    /// dequeued one at a time). Validate() only rejects 0.
     pub max_queue_depth: usize,
     /// Hard upper bound on `max_tokens` a request may ask for. Prevents
     /// a single client from pinning the worker.
@@ -70,15 +68,13 @@ impl ServerConfig {
         if self.max_queue_depth == 0 {
             return Err(ConfigError::InvalidQueueDepth);
         }
-        if self.max_queue_depth < 2 {
-            // depth=1 admits 2 concurrent requests (one in-flight on
-            // the worker thread + one in the channel buffer, because
-            // `mpsc::channel(0)` is invalid). The doc says
-            // "1 = strictly serial" but the actual semantics need
-            // depth >= 2 to honour the count exactly. Refuse depth=1
-            // at validate() so admission control matches the doc.
-            return Err(ConfigError::InvalidQueueDepth);
-        }
+        // Both the cuda_worker and the mock spawn use
+        // `mpsc::channel(queue_depth.max(1))` and the same number of
+        // admission permits. With depth=1 that's exactly:
+        //   1 admission permit + 1 channel slot + serial dequeue
+        // = strictly serial, which is what the doc says it is. The
+        // earlier ≥2 floor was a leftover from before the
+        // admission/channel arithmetic was harmonised.
         if self.max_new_tokens_cap == 0 {
             return Err(ConfigError::InvalidMaxTokens);
         }
@@ -134,6 +130,20 @@ mod tests {
     fn validate_rejects_empty_model_dir() {
         let c = ServerConfig::default();
         assert!(matches!(c.validate(), Err(ConfigError::MissingModelDir)));
+    }
+
+    #[test]
+    fn validate_accepts_queue_depth_one() {
+        let here = std::env::current_dir().expect("cwd");
+        let c = ServerConfig {
+            model_dir: here,
+            model_id: "test".into(),
+            max_queue_depth: 1,
+            max_new_tokens_cap: 32,
+            request_timeout: Duration::from_secs(60),
+            ..ServerConfig::default()
+        };
+        assert!(c.validate().is_ok(), "depth=1 should be allowed (strictly serial)");
     }
 
     #[test]
