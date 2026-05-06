@@ -143,6 +143,13 @@ pub struct Qwen36OutsideKernels {
     /// pointer (Phase 4b-prep iter21).
     pub scaled_add_f16_to_f32_devw_mod: LoadedModule,
     pub fn_scaled_add_f16_to_f32_devw: KernelFn,
+    /// Dual-output FP8 GEMV: same f16 input, two FP8 weights → two
+    /// f16 outputs in one launch. Replaces the per-expert
+    /// `gate FP8 GEMV` + `up FP8 GEMV` pair with a single fused
+    /// kernel — saves 8 launches/layer × 30 layers/token plus halves
+    /// the input-tile bandwidth (Phase 4b-prep iter31).
+    pub fp8_gemv_dual_mod: LoadedModule,
+    pub fn_fp8_gemv_dual: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -494,6 +501,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("scaled_add_f16_to_f32_devw")?;
         let fn_scaled_add_f16_to_f32_devw = scaled_add_f16_to_f32_devw_mod
             .get_function("scaled_add_f16_to_f32_devw_kernel")?;
+        let fp8_gemv_dual_mod =
+            kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual")?;
+        let fn_fp8_gemv_dual = fp8_gemv_dual_mod
+            .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -587,6 +598,8 @@ impl Qwen36Bringup {
             fn_shared_gate_dot_sigmoid_f16,
             scaled_add_f16_to_f32_devw_mod,
             fn_scaled_add_f16_to_f32_devw,
+            fp8_gemv_dual_mod,
+            fn_fp8_gemv_dual,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -5940,17 +5953,48 @@ impl Qwen36Bringup {
         }
         for ((e_idx, _logit), w) in top.iter().zip(weights.iter()) {
             let e = *e_idx as u64;
+            // Phase 4b-prep iter31: dual-output FP8 GEMV — gate AND up
+            // in one launch from the same input. Math is bit-identical
+            // to two `fp8_proj_dispatch(m=1)` calls but the input tile
+            // is read once and amortised over both weight matrices.
+            #[cfg(feature = "cuda")]
             unsafe {
-                self.fp8_proj_dispatch(kernel_gemv, gate_region.device_ptr(),
-                    moe.experts_gate_proj_fused.offset_bytes + e * int_per_expert_w,
-                    gate_bs + e * int_per_expert_bs,
-                    normed_region.device_ptr(),
-                    m, n_int, k_in, stream_raw)?;
-                self.fp8_proj_dispatch(kernel_gemv, up_region.device_ptr(),
-                    moe.experts_up_proj_fused.offset_bytes + e * int_per_expert_w,
-                    up_bs + e * int_per_expert_bs,
-                    normed_region.device_ptr(),
-                    m, n_int, k_in, stream_raw)?;
+                use cudarc::driver::sys::*;
+                let mut og = gate_region.device_ptr();
+                let mut ou = up_region.device_ptr();
+                let mut wg = moe.experts_gate_proj_fused.offset_bytes + e * int_per_expert_w;
+                let mut wu = moe.experts_up_proj_fused.offset_bytes + e * int_per_expert_w;
+                let mut sg = gate_bs + e * int_per_expert_bs;
+                let mut su = up_bs + e * int_per_expert_bs;
+                let mut inp = normed_region.device_ptr();
+                let mut m_i = m as i32;
+                let mut n_i = n_int as i32;
+                let mut k_i = k_in as i32;
+                let mut ncb = ((k_in + 127) / 128) as i32;
+                let args = [
+                    (&mut og) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut ou) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wg) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wu) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sg) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut su) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let grid = ((n_int + 7) / 8, m, 1u32);
+                let block = (256u32, 1u32, 1u32);
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_fp8_gemv_dual.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block.0, block.1, block.2,
+                    0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
             }
             // GPU silu·mul: silu_region = silu(gate_region) * up_region
             // (Phase 4b-prep iter11 — replaces DtoH gate + DtoH up +
@@ -6036,15 +6080,46 @@ impl Qwen36Bringup {
         let sh_up_bs = moe.shared_expert_up_proj.blockscale_ptr.unwrap_or(0);
         let sh_down_bs = moe.shared_expert_down_proj.blockscale_ptr.unwrap_or(0);
         if sh_gate_bs != 0 && sh_up_bs != 0 && sh_down_bs != 0 {
+            // Phase 4b-prep iter31: same dual-output kernel for the
+            // shared expert.
+            #[cfg(feature = "cuda")]
             unsafe {
-                self.fp8_proj_dispatch(kernel_gemv, gate_region.device_ptr(),
-                    moe.shared_expert_gate_proj.offset_bytes, sh_gate_bs,
-                    normed_region.device_ptr(),
-                    m, n_int, k_in, stream_raw)?;
-                self.fp8_proj_dispatch(kernel_gemv, up_region.device_ptr(),
-                    moe.shared_expert_up_proj.offset_bytes, sh_up_bs,
-                    normed_region.device_ptr(),
-                    m, n_int, k_in, stream_raw)?;
+                use cudarc::driver::sys::*;
+                let mut og = gate_region.device_ptr();
+                let mut ou = up_region.device_ptr();
+                let mut wg = moe.shared_expert_gate_proj.offset_bytes;
+                let mut wu = moe.shared_expert_up_proj.offset_bytes;
+                let mut sg = sh_gate_bs;
+                let mut su = sh_up_bs;
+                let mut inp = normed_region.device_ptr();
+                let mut m_i = m as i32;
+                let mut n_i = n_int as i32;
+                let mut k_i = k_in as i32;
+                let mut ncb = ((k_in + 127) / 128) as i32;
+                let args = [
+                    (&mut og) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut ou) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wg) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wu) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sg) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut su) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let grid = ((n_int + 7) / 8, m, 1u32);
+                let block = (256u32, 1u32, 1u32);
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_fp8_gemv_dual.raw() as CUfunction,
+                    grid.0, grid.1, grid.2,
+                    block.0, block.1, block.2,
+                    0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
             }
             // GPU silu·mul on the shared expert (Phase 4b-prep iter11).
             #[cfg(feature = "cuda")]
