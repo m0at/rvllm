@@ -202,6 +202,14 @@ pub struct Qwen36OutsideKernels {
     /// per token. Kernel: kernels/gated_delta_rule_prefill_f16.cu.
     pub gated_delta_rule_prefill_f16_mod: LoadedModule,
     pub fn_gated_delta_rule_prefill_f16: KernelFn,
+    /// Round-26: device-side fill of per-token `positions` and
+    /// `context_lens` arrays. Replaces the legacy per-token
+    /// `pos_cl_region.copy_from_host(...)` HtoD that raced with
+    /// non-blocking-stream kernels; this kernel runs ON
+    /// `self.stream`, so it's stream-ordered with subsequent reads.
+    /// Kernel: kernels/qwen_fill_pos_slots_i32.cu.
+    pub qwen_fill_pos_slots_i32_mod: LoadedModule,
+    pub fn_qwen_fill_pos_slots_i32: KernelFn,
     /// Batched-prefill conv1d state-advance + flat history assembly.
     /// Builds the `[num_tokens + ks - 1, channels]` history buffer
     /// the existing `causal_conv1d_f16` kernel expects, with state
@@ -581,6 +589,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("conv_state_advance_batched_f16")?;
         let fn_conv_state_advance_batched_f16 = conv_state_advance_batched_f16_mod
             .get_function("conv_state_advance_batched_f16_kernel")?;
+        let qwen_fill_pos_slots_i32_mod =
+            kernels.load_ptx("qwen_fill_pos_slots_i32")?;
+        let fn_qwen_fill_pos_slots_i32 = qwen_fill_pos_slots_i32_mod
+            .get_function("qwen_fill_pos_slots_i32_kernel")?;
         // Vision-tower kernels (Phase 1 .cu added on rusty_sm121_vision).
         let layernorm_inplace_f16_mod = kernels.load_ptx("layernorm_inplace_f16")?;
         let fn_layernorm_inplace_f16 =
@@ -681,6 +693,8 @@ impl Qwen36Bringup {
             fn_gated_delta_rule_prefill_f16,
             conv_state_advance_batched_f16_mod,
             fn_conv_state_advance_batched_f16,
+            qwen_fill_pos_slots_i32_mod,
+            fn_qwen_fill_pos_slots_i32,
             layernorm_inplace_f16_mod,
             fn_layernorm_inplace_f16,
             gelu_tanh_f16_mod,
@@ -5040,14 +5054,57 @@ impl Qwen36Bringup {
         // [1, D] slot, plus chunked-recurrent linear-attention
         // and batched-causal full-attention variants. Substantial
         // refactor; tracked as Codex round 16 #2 follow-up.
-        // Phase 4b-prep iter35: hoisted pos+context_len HtoD. Reused
-        // across all 10 full-attn layers within a token, replacing
-        // 10 per-layer 8-byte HtoDs with 1. Also a prerequisite for
-        // CUDA Graph capture — sync HtoDs cannot be inside a captured
-        // region.
-        let pos_cl_region = self.arena.region("qwen36_pf_pos_cl", 8, 16)?;
-        let pos_dev_ptr = pos_cl_region.device_ptr();
-        let cl_dev_ptr  = pos_dev_ptr + 4;
+        // Round-26: device-side fill of per-token positions and
+        // context_lens. Replaces the legacy 8-byte pos_cl_region +
+        // per-token `cuMemcpyHtoD_v2` (default-stream sync) with two
+        // [num_tokens] i32 arrays populated by a single kernel
+        // launch on `self.stream`. The race that diagnosed in
+        // Round-25/26 (sync HtoD vs CU_STREAM_NON_BLOCKING) is now
+        // structurally gone: every reader of `positions_region` /
+        // `context_lens_region` runs on the same stream, so stream
+        // ordering covers what host-side fences used to cover. Cleans
+        // up both the token-major prefill loop and my layer-major
+        // full-attn sub-loop. (Caller-side: per-token full-attn now
+        // passes `positions + t*4` / `context_lens + t*4` as the
+        // scalar-looking pointers; the existing fused_rope kernel
+        // reads positions[token_idx=0] regardless of grid.x=1, so the
+        // scalar view is a single-element array view of one token's
+        // slot in the shared array.)
+        let n_tokens_usize = num_tokens as usize;
+        let positions_region = self.arena.region(
+            "qwen36_pf_positions", n_tokens_usize * 4, 16)?;
+        let context_lens_region = self.arena.region(
+            "qwen36_pf_clens", n_tokens_usize * 4, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut pos_ptr = positions_region.device_ptr();
+            let mut cl_ptr = context_lens_region.device_ptr();
+            let mut start = start_position as i32;
+            let mut nt = num_tokens as i32;
+            let args = [
+                (&mut pos_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut cl_ptr)  as *mut u64 as *mut core::ffi::c_void,
+                (&mut start)   as *mut i32 as *mut core::ffi::c_void,
+                (&mut nt)      as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid: u32 = ((num_tokens + block - 1) / block).max(1);
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_qwen_fill_pos_slots_i32.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 prefill: qwen_fill_pos_slots_i32 launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
         // Per-token scratch checkpoint — bounds arena growth to ONE
         // token's worth of layer scratch instead of `tokens × layers`.
         // The persistent state (KV cache, linear-attn state, conv
@@ -5172,45 +5229,25 @@ impl Qwen36Bringup {
                         la.post_attention_layernorm.offset_bytes
                     }
                     rvllm_loader::qwen36_weights::Qwen36LayerAttn::Full(fl) => {
-                        // Per-token full-attn: pos_cl_region updated
-                        // per token to drive RoPE + KV-slot writes.
+                        // Round-26: pos/context_len now live in the
+                        // device-filled `positions_region` /
+                        // `context_lens_region` arrays. Per-token call
+                        // passes its slot's offset; no HtoD here, no
+                        // race vs the non-blocking stream.
                         for t in 0..num_tokens {
                             let tok_pos = start_position + t;
                             let tok_ptr = hidden_region.device_ptr()
                                 + (t as u64) * (last_hidden_bytes as u64);
-                            let cl_for_pack = (tok_pos as i32) + 1;
-                            let mut bytes = [0u8; 8];
-                            bytes[..4].copy_from_slice(&(tok_pos as i32).to_le_bytes());
-                            bytes[4..].copy_from_slice(&cl_for_pack.to_le_bytes());
-                            // Round-24 pos_cl race (codex-diagnosed):
-                            // `Region::copy_from_host` uses
-                            // `cuMemcpyHtoD_v2` on the legacy default
-                            // stream. `self.stream` is
-                            // `CU_STREAM_NON_BLOCKING` — those don't
-                            // synchronise with the legacy default. So
-                            // a kernel from the previous iter that
-                            // still reads `pos_cl_region` (RoPE / FA2
-                            // decode) can race with the host's
-                            // overwrite for the next iter, producing
-                            // exactly the layer_03 onwards drift seen
-                            // in the cmp harness. Token-major has the
-                            // same race but the read-then-overwrite
-                            // window spans 40 layers + per-token arena
-                            // restore so it almost never fires; layer-
-                            // major with full-attn sub-loop puts the
-                            // overwrite one iter away and the race
-                            // fires deterministically. Brutal proof
-                            // here (`self.stream.fence()` before the
-                            // sync H2D); the proper fix is an async
-                            // H2D on `self.stream`, follow-up.
-                            self.stream.fence()?;
-                            unsafe { pos_cl_region.copy_from_host(&bytes)? };
+                            let pos_p = positions_region.device_ptr()
+                                + (t as u64) * 4;
+                            let cl_p = context_lens_region.device_ptr()
+                                + (t as u64) * 4;
                             let inner_ck = self.arena.checkpoint();
                             self.apply_layer_full_attn(
                                 fl, full_seq, tok_pos,
                                 tok_ptr,
                                 kernel_gemv, hidden, last_hidden_bytes,
-                                pos_dev_ptr, cl_dev_ptr,
+                                pos_p, cl_p,
                             )?;
                             unsafe { self.arena.restore(inner_ck); }
                         }
@@ -5324,27 +5361,14 @@ impl Qwen36Bringup {
             // outside any future graph-captured region (it's a
             // host-side mutation of the device buffer that the
             // captured kernels read from on the next replay).
-            {
-                // Round-26: same pos_cl HtoD vs non-blocking-stream race
-                // codex diagnosed in round 25 for the layer-major path
-                // also exists in the token-major prefill loop, just with
-                // a wider window (40 layers between consecutive H2Ds
-                // instead of 1). Empirically: without this fence the
-                // 22-token "Geister"-canary deterministically produces
-                // the "Schule"-joke; with fences in place (or with
-                // dump-mode active which inserts the same fences) the
-                // SAME computation produces the "Supermarkt"-joke. Both
-                // are valid German output but only one is the intended
-                // computation under sequential-consistency. Fence here
-                // matches the layer-major fence and removes the latent
-                // race in the production token-major path too.
-                let cl_for_pack = (tok_pos as i32) + 1;
-                let mut bytes = [0u8; 8];
-                bytes[..4].copy_from_slice(&(tok_pos as i32).to_le_bytes());
-                bytes[4..].copy_from_slice(&cl_for_pack.to_le_bytes());
-                self.stream.fence()?;
-                unsafe { pos_cl_region.copy_from_host(&bytes)? };
-            }
+            // Round-26: positions/context_lens now live in
+            // device-filled arrays from the single launch above; no
+            // per-token HtoD anymore. Per-token full-attn calls below
+            // pass `positions + t*4` / `context_lens + t*4`.
+            let tok_pos_dev_ptr = positions_region.device_ptr()
+                + (tok_local as u64) * 4;
+            let tok_cl_dev_ptr = context_lens_region.device_ptr()
+                + (tok_local as u64) * 4;
             // Phase 1 of the Qwen batched-prefill plan: the layer
             // functions now accept a raw device pointer to the
             // per-token slot in `hidden_region`. The previous
@@ -5407,7 +5431,7 @@ impl Qwen36Bringup {
                             fl, full_seq, tok_pos,
                             tok_ptr,
                             kernel_gemv, hidden, last_hidden_bytes,
-                            pos_dev_ptr, cl_dev_ptr,
+                            tok_pos_dev_ptr, tok_cl_dev_ptr,
                         )?;
                         full_seq += 1;
                         fl.post_attention_layernorm.offset_bytes
