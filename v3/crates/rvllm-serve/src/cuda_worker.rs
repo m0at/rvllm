@@ -124,11 +124,18 @@ pub async fn spawn_cuda_worker(
                         // were honoured. Lift the rejection when Qwen's
                         // bring-up grows a logits-out variant + sampler.
                         if !req.sampling.is_greedy() {
+                            // Note: the absent-temperature default now
+                            // resolves to 0.0 (greedy) globally; if the
+                            // client lands here they explicitly asked
+                            // for stochastic. The old hint mentioned
+                            // "omit sampling params" — that's exactly
+                            // the path that USED to fail; corrected.
                             let _ = req.events_tx.blocking_send(GenerateEvent::Error(
                                 "qwen36 path: non-greedy sampling \
-                                 (temperature/top_p/top_k/seed) not yet \
-                                 supported — set temperature=0 or omit \
-                                 sampling params"
+                                 (temperature>0 / top_p<1 / top_k / seed) \
+                                 is not yet supported on Qwen 3.6. Set \
+                                 temperature=0 explicitly, or omit it to \
+                                 take the (now greedy) default."
                                     .to_string(),
                             ));
                             continue;

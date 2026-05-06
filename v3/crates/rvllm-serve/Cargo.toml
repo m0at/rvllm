@@ -37,6 +37,7 @@ bytes = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 base64 = "0.22"
 image = { workspace = true }
+url = "2"
 
 # Serde
 serde = { workspace = true }

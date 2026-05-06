@@ -206,11 +206,13 @@ impl From<&str> for ChatContent {
 }
 
 impl ChatContent {
-    /// Flatten to a plain text string. Multiple text parts are joined
-    /// with a single space — the OpenAI ref clients do the same.
+    /// Flatten to a plain text string. Multiple text parts are
+    /// concatenated verbatim — they're sequential prompt content per
+    /// the OpenAI spec, not separate words. An earlier version
+    /// inserted a space between parts, which corrupted prompts that
+    /// chunk on token boundaries (e.g. `["foo", "."]` → `"foo ."`).
     /// Non-text parts are skipped here; the request validator (called
-    /// before tokenisation) is responsible for rejecting them with a
-    /// 400, so this fallback only fires on already-validated input.
+    /// before tokenisation) rejects unsupported part types with a 400.
     pub fn to_text(&self) -> String {
         match self {
             ChatContent::Text(s) => s.clone(),
@@ -218,9 +220,6 @@ impl ChatContent {
                 let mut out = String::new();
                 for p in parts {
                     if let ChatContentPart::Text { text } = p {
-                        if !out.is_empty() {
-                            out.push(' ');
-                        }
                         out.push_str(text);
                     }
                 }
@@ -547,7 +546,10 @@ mod tests {
             }
             _ => panic!("expected Parts variant"),
         }
-        assert_eq!(m.content_text(), "hello world");
+        // Text parts are sequential prompt content per the OpenAI
+        // spec — concatenated verbatim, no inserted space (the prior
+        // " " separator corrupted prompts like ["foo", "."] → "foo .").
+        assert_eq!(m.content_text(), "helloworld");
         assert_eq!(m.content.as_ref().unwrap().first_unsupported_part_type(), None);
     }
 

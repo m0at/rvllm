@@ -178,8 +178,75 @@ fn http_client() -> &'static reqwest::blocking::Client {
     })
 }
 
+/// Returns true if `ip` is one we refuse to fetch by default —
+/// loopback, private (RFC 1918, ULA), link-local (incl. cloud-metadata
+/// 169.254.169.254), multicast, reserved, and the IPv4 broadcast.
+/// Operators running rvllm-serve in trusted internal contexts can
+/// bypass this with `RVLLM_VISION_FETCH_ALLOW_PRIVATE=1`.
+fn is_disallowed_target(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                // RFC 6598 carrier-grade NAT, not flagged by std today.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                // Unique local fc00::/7 — std lacks `is_unique_local`
+                // on stable, so check the leading byte directly.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local fe80::/10.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn vet_url_target(url: &str) -> Result<(), VisionError> {
+    use std::net::ToSocketAddrs;
+    if std::env::var("RVLLM_VISION_FETCH_ALLOW_PRIVATE")
+        .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(url)
+        .map_err(|e| VisionError::FetchFailed(format!("invalid url: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| VisionError::FetchFailed("url has no host".into()))?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    // Resolve and check EVERY answer. Note: this is one DNS lookup;
+    // reqwest will do its own when it actually connects. A determined
+    // attacker can DNS-rebind between the two — closing that gap
+    // properly needs a custom reqwest connector that pins the IP we
+    // verified here. Filed for later; this still catches the obvious
+    // SSRF cases (literal-IP URLs, `metadata.google.internal`, etc).
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| VisionError::FetchFailed(format!("dns: {e}")))?;
+    for addr in addrs {
+        if is_disallowed_target(addr.ip()) {
+            return Err(VisionError::FetchFailed(format!(
+                "refusing to fetch from non-public address {} (set \
+                 RVLLM_VISION_FETCH_ALLOW_PRIVATE=1 if intentional)",
+                addr.ip()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn fetch_http(url: &str) -> Result<Vec<u8>, VisionError> {
     use std::io::Read;
+    vet_url_target(url)?;
     let client = http_client();
     let mut resp = client.get(url).send().map_err(|e| {
         if e.is_timeout() {

@@ -39,7 +39,36 @@ impl std::error::Error for PreprocessError {}
 
 /// Decode PNG/JPEG/WebP bytes → RGB8 image. Honours EXIF orientation
 /// is NOT done here (HF doesn't either by default — caveat for client).
+///
+/// Pixel-budget guard: an attacker can ship a heavily-compressed
+/// "ZIP-bomb" image whose encoded bytes pass the upstream
+/// `MAX_IMAGE_BYTES` cap but whose RGB8 decode would allocate
+/// gigabytes (a 50000×50000 PNG is ~25 KiB compressed but 7 GiB
+/// expanded). We read the header dimensions FIRST and reject before
+/// the full decode runs. Operators with legitimate large-image
+/// workloads can raise the cap via `RVLLM_VISION_MAX_PIXELS`.
 pub fn decode_image(bytes: &[u8]) -> Result<RgbImage, PreprocessError> {
+    let cursor = Cursor::new(bytes);
+    let reader = ImageReader::new(cursor)
+        .with_guessed_format()
+        .map_err(|e| PreprocessError::Decode(format!("guess format: {e}")))?;
+    let max_pixels: u64 = std::env::var("RVLLM_VISION_MAX_PIXELS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        // 32 MP default. Covers a 6K-equivalent (≈22 MP) with headroom
+        // and refuses 50000×50000 zip-bomb PNGs (2.5 G pixels).
+        .unwrap_or(32 * 1024 * 1024);
+    if let Ok((w, h)) = reader.into_dimensions() {
+        let pixels = (w as u64) * (h as u64);
+        if pixels > max_pixels {
+            return Err(PreprocessError::Decode(format!(
+                "image dimensions {}×{} = {} pixels exceed cap {} \
+                 (RVLLM_VISION_MAX_PIXELS to override)",
+                w, h, pixels, max_pixels
+            )));
+        }
+    }
+    // Re-open: `into_dimensions` consumed the reader.
     let cursor = Cursor::new(bytes);
     let reader = ImageReader::new(cursor)
         .with_guessed_format()
