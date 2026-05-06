@@ -81,7 +81,12 @@ pub enum PromptField {
 impl CompletionRequest {
     pub fn sampling_params(&self) -> SamplingParams {
         SamplingParams {
-            temperature: self.temperature.unwrap_or_else(super::default_temperature),
+            temperature: super::resolve_temperature(
+                self.temperature,
+                self.top_p,
+                self.top_k,
+                self.seed,
+            ),
             top_p: self.top_p.unwrap_or(1.0),
             top_k: self.top_k,
             seed: self.seed,
