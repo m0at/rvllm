@@ -5168,6 +5168,28 @@ impl Qwen36Bringup {
                             let mut bytes = [0u8; 8];
                             bytes[..4].copy_from_slice(&(tok_pos as i32).to_le_bytes());
                             bytes[4..].copy_from_slice(&cl_for_pack.to_le_bytes());
+                            // Round-24 pos_cl race (codex-diagnosed):
+                            // `Region::copy_from_host` uses
+                            // `cuMemcpyHtoD_v2` on the legacy default
+                            // stream. `self.stream` is
+                            // `CU_STREAM_NON_BLOCKING` — those don't
+                            // synchronise with the legacy default. So
+                            // a kernel from the previous iter that
+                            // still reads `pos_cl_region` (RoPE / FA2
+                            // decode) can race with the host's
+                            // overwrite for the next iter, producing
+                            // exactly the layer_03 onwards drift seen
+                            // in the cmp harness. Token-major has the
+                            // same race but the read-then-overwrite
+                            // window spans 40 layers + per-token arena
+                            // restore so it almost never fires; layer-
+                            // major with full-attn sub-loop puts the
+                            // overwrite one iter away and the race
+                            // fires deterministically. Brutal proof
+                            // here (`self.stream.fence()` before the
+                            // sync H2D); the proper fix is an async
+                            // H2D on `self.stream`, follow-up.
+                            self.stream.fence()?;
                             unsafe { pos_cl_region.copy_from_host(&bytes)? };
                             let inner_ck = self.arena.checkpoint();
                             self.apply_layer_full_attn(
