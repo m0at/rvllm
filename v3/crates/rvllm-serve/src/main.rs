@@ -152,14 +152,32 @@ async fn main() -> anyhow_compat::Result<()> {
         .map_err(|e| anyhow_compat::err(format!("bind {}: {e}", config.bind)))?;
 
     let drain_timeout = config.shutdown_drain_timeout;
+    // Round-21 finding #4: a single signal listener fans out to both
+    // axum's graceful-shutdown hook and the force-drain watchdog via a
+    // shared `Notify`. Previously each side awaited its own
+    // `shutdown_signal()` future — two independent SIGINT/SIGTERM
+    // subscribers, racing on the actual signal arrival. With the shared
+    // notify they both observe the SAME signal moment, and the
+    // watchdog's `drain_timeout` countdown begins exactly when axum
+    // starts draining.
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let shutdown_pub = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_pub.notify_waiters();
+        });
+    }
+    let shutdown_axum = shutdown.clone();
+    let shutdown_watchdog = shutdown.clone();
     let serve = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal());
+        .with_graceful_shutdown(async move { shutdown_axum.notified().await });
 
     tokio::select! {
         res = serve => {
             res.map_err(|e| anyhow_compat::err(format!("axum serve: {e}")))?;
         }
-        _ = forced_drain_watchdog(drain_timeout) => {
+        _ = forced_drain_watchdog(shutdown_watchdog, drain_timeout) => {
             tracing::warn!(
                 drain_timeout_secs = drain_timeout.as_secs(),
                 "drain timeout exceeded — forcing shutdown",
@@ -170,8 +188,11 @@ async fn main() -> anyhow_compat::Result<()> {
     Ok(())
 }
 
-async fn forced_drain_watchdog(drain_timeout: std::time::Duration) {
-    shutdown_signal().await;
+async fn forced_drain_watchdog(
+    shutdown: std::sync::Arc<tokio::sync::Notify>,
+    drain_timeout: std::time::Duration,
+) {
+    shutdown.notified().await;
     tokio::time::sleep(drain_timeout).await;
 }
 

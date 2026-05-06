@@ -180,6 +180,14 @@ fn http_client() -> &'static reqwest::blocking::Client {
             // turn redirects off — clients that need the redirected
             // image must resolve and supply the final URL themselves.
             .redirect(reqwest::redirect::Policy::none())
+            // Round-21 finding #3: reqwest reads HTTP_PROXY /
+            // HTTPS_PROXY / ALL_PROXY from the env by default. If
+            // any of those are set in production the client routes
+            // via the proxy, which then resolves and connects on its
+            // own — defeating the IP-vetting + DNS-rebind protection
+            // we did upfront in `resolve_to_addrs`. Disable proxy use
+            // entirely so the SSRF guard is the actual network path.
+            .no_proxy()
             .build()
             .expect("build vision-fetch reqwest client")
     })
@@ -313,7 +321,12 @@ fn pinned_client_for(
         .timeout(FETCH_TIMEOUT)
         .pool_idle_timeout(std::time::Duration::from_secs(60))
         .pool_max_idle_per_host(8)
-        .redirect(reqwest::redirect::Policy::none());
+        .redirect(reqwest::redirect::Policy::none())
+        // Round-21 finding #3: same as the unpinned client above —
+        // ignore HTTP(S)_PROXY / ALL_PROXY env vars so the
+        // `resolve_to_addrs` pin below is the actual network path
+        // rather than a hint a configured proxy can override.
+        .no_proxy();
     b = b.resolve_to_addrs(&t.host, &t.addrs);
     let c = std::sync::Arc::new(
         b.build()
