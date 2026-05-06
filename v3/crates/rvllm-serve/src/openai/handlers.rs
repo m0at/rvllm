@@ -64,6 +64,37 @@ where
     }
 }
 
+/// Round-23 finding #1: admit BEFORE body buffering + JSON parsing.
+///
+/// The OpenAI handlers used to call `state.worker.try_admit()?` near
+/// the top of the function, but axum's extractors (`OpenAiJson`,
+/// `Bytes::from_request`) run BEFORE the handler body — meaning the
+/// 128 MiB body buffer + serde_json parse for every concurrent
+/// request happened with zero admission backpressure. A flood of
+/// large requests could saturate RAM and CPU long before any of them
+/// reached `try_admit`.
+///
+/// As an axum middleware (applied via `route_layer` on
+/// /v1/chat/completions + /v1/completions), this runs before the
+/// extractors. On success it stashes the permit in the request's
+/// extensions so the handler can pull it out via `Extension(...)`
+/// and keep it alive for the request lifecycle. On failure the
+/// caller gets a 429 immediately, before we read the body.
+pub async fn admit_first_middleware(
+    axum::extract::State(state): axum::extract::State<crate::router::AppState>,
+    mut req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.worker.try_admit() {
+        Ok(permit) => {
+            req.extensions_mut().insert(std::sync::Arc::new(permit));
+            next.run(req).await
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
 /// Erased SSE event stream used by the streaming handlers' return
 /// types. Writing out `Pin<Box<dyn Stream ...>>` at every call site
 /// is repetitive; this alias keeps the signatures readable.
@@ -138,17 +169,36 @@ fn redact_data_uris(value: &mut serde_json::Value) {
 
 fn dump_write(request_id: &Uuid, suffix: &str, body: &serde_json::Value) {
     let Some(dir) = dump_dir() else { return };
-    if !dir.exists() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let path = dir.join(format!("{}_{}.json", request_id, suffix));
-    match serde_json::to_vec_pretty(body) {
-        Ok(bytes) => {
-            if let Err(e) = std::fs::write(&path, &bytes) {
-                tracing::warn!(?path, error = %e, "dump write failed");
-            }
+    // Round-23 finding #4: serialize on the calling thread (cheap,
+    // bounded by request size) but push the actual filesystem I/O
+    // off the request / SSE poll path. The dump is purely
+    // diagnostic; a slow disk previously stalled the tokio worker
+    // mid-stream when `RVLLM_DUMP_REQUEST_DIR` was on. Inside a
+    // tokio runtime we offload to `spawn_blocking`; outside one
+    // (sync test contexts) we fall back to a direct write so the
+    // helper stays usable from the worker thread / unit tests.
+    let bytes = match serde_json::to_vec_pretty(body) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "dump serialize failed");
+            return;
         }
-        Err(e) => tracing::warn!(error = %e, "dump serialize failed"),
+    };
+    let path = dir.join(format!("{}_{}.json", request_id, suffix));
+    let dir_owned = dir.to_path_buf();
+    let writer = move || {
+        if !dir_owned.exists() {
+            let _ = std::fs::create_dir_all(&dir_owned);
+        }
+        if let Err(e) = std::fs::write(&path, &bytes) {
+            tracing::warn!(?path, error = %e, "dump write failed");
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) => {
+            rt.spawn_blocking(writer);
+        }
+        Err(_) => writer(),
     }
 }
 
@@ -245,6 +295,14 @@ use crate::worker::{GenerateEvent, GenerateRequest};
 /// on `req.stream`.
 pub async fn chat_completions(
     State(state): State<AppState>,
+    // Round-23 finding #1: the admission permit is now reserved by
+    // `admit_first_middleware` BEFORE any body buffering / JSON parse,
+    // and stashed in the request extensions. Pull it out here so it
+    // stays alive for the rest of the handler scope; the inline
+    // `state.worker.try_admit()?` call below was removed.
+    axum::Extension(_admission): axum::Extension<
+        std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    >,
     _headers: axum::http::HeaderMap,
     OpenAiJson(req): OpenAiJson<ChatCompletionRequest>,
 ) -> ApiResult<ChatCompletionsResponse> {
@@ -463,22 +521,13 @@ pub async fn chat_completions(
     // Calling it on the axum executor would block one Tokio worker
     // thread per request and starve the rest of the server. Codex
     // review #1 (round 4) caught this.
-    // Reserve one in-flight slot BEFORE doing any per-request work
-    // (image fetch, chat-template render). The permit is held until
-    // the handler returns so the queue limit covers the full
-    // request lifecycle, not just the worker queue. A saturating
-    // client now gets 429 immediately instead of being able to keep
-    // the blocking pool, network and memory busy producing
-    // ultimately-doomed requests in parallel.
-    // Wrap the admission permit in `Arc` so we can share it with
-    // every preprocessing spawn_blocking task (vision fetch, chat
-    // render). On `timeout_at` the handler returns and the
-    // handler-side `_admission` clone drops — but the closure-
-    // captured clone inside the still-running blocking task keeps
-    // the permit alive until the underlying sync call finishes.
-    // That's how we get the queue-cap to genuinely bound the
-    // blocking-pool usage (not just "until handler returns").
-    let _admission = Arc::new(state.worker.try_admit()?);
+    // The admission permit is reserved by `admit_first_middleware`
+    // BEFORE the body extractor runs (round-23 finding #1) — see the
+    // `_admission` extractor in this handler's signature. The permit
+    // is wrapped in `Arc` there so we can share it with every
+    // preprocessing `spawn_blocking` task (vision fetch, chat render)
+    // so the queue cap genuinely bounds blocking-pool usage and not
+    // just "until the handler returns".
     let request_deadline = tokio::time::Instant::now() + state.config.request_timeout;
 
     // Request dump (no-op unless RVLLM_DUMP_REQUEST_DIR is set). Gated
@@ -1638,6 +1687,11 @@ pub(crate) fn sse_error_event(message: impl Into<String>) -> Event {
 
 pub async fn completions(
     State(state): State<AppState>,
+    // Round-23 finding #1: admission permit reserved upstream by
+    // `admit_first_middleware` (see chat handler for the rationale).
+    axum::Extension(_admission): axum::Extension<
+        std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    >,
     _headers: axum::http::HeaderMap,
     OpenAiJson(req): OpenAiJson<CompletionRequest>,
 ) -> ApiResult<CompletionsResponse> {
@@ -1707,11 +1761,11 @@ pub async fn completions(
         ));
     }
 
-    // Reserve one in-flight slot before tokenization (see chat handler).
-    // Wrapped in `Arc` so the spawn_blocking closure below can hold a
-    // clone — that keeps the queue cap bounding blocking-pool usage
-    // even when `timeout_at` returns early on the handler side.
-    let _admission = Arc::new(state.worker.try_admit()?);
+    // Admission permit reserved upstream by `admit_first_middleware`
+    // (round-23 finding #1) — see the `_admission` extractor in this
+    // handler's signature. Wrapped in Arc there so the spawn_blocking
+    // closure below can hold a clone for the lifetime of the queued
+    // request.
     let request_deadline = tokio::time::Instant::now() + state.config.request_timeout;
 
     // Move tokenization off the async runtime: bodies up to the body

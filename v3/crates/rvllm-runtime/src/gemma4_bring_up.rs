@@ -3023,6 +3023,11 @@ impl Gemma4Bringup {
         // first writes exp values, then in-place re-normalises them
         // to a probability vector — same shape either way.
         let mut probs: Vec<f32> = Vec::new();
+        // Round-23 finding #3: read once per request, not once per
+        // decode token. The env var doesn't change mid-generation; the
+        // syscall + alloc on every sampled token is pure overhead.
+        let top_p_candidate_cap: usize = std::env::var("RVLLM_TOP_P_CANDIDATE_CAP")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
         let mut host_sample_token = |logits_dev_ptr: u64,
                                  vocab: u32,
                                  temp: f32,
@@ -3108,19 +3113,15 @@ impl Gemma4Bringup {
                 // the top-K with `select_nth_unstable_by` (O(V) average)
                 // and only sort the K-sized prefix. Falls back to a
                 // full sort when top_k isn't set.
-                // Round-22 finding #3: when top_p<1 and no top_k is set,
-                // we used to do a full O(V log V) sort over the entire
-                // 262 k-vocab on every decode token. Realistic top_p
-                // values (≤0.99) almost never keep more than a few
-                // hundred tokens, so cap candidates internally and use
-                // partial-select instead. The cap is intentionally
-                // generous (`RVLLM_TOP_P_CANDIDATE_CAP`, default 2048)
-                // — far above any realistic kept-set, so the resulting
-                // distribution is indistinguishable from a true full
-                // sort for any practical prompt — but tunable for
-                // operators who want strict spec compliance.
-                let top_p_candidate_cap: usize = std::env::var("RVLLM_TOP_P_CANDIDATE_CAP")
-                    .ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+                // Round-22 finding #3 / round-23 hoist: when top_p<1
+                // and no top_k is set, we used to do a full
+                // O(V log V) sort over the entire 262 k-vocab on every
+                // decode token. Realistic top_p values (≤0.99) almost
+                // never keep more than a few hundred tokens, so cap
+                // candidates internally and use partial-select. The
+                // cap (`RVLLM_TOP_P_CANDIDATE_CAP`, default 2048) is
+                // resolved once per request above the closure to keep
+                // the env-var read off the per-token hot path.
                 let effective_len = match top_k {
                     Some(k) => {
                         let k = (k as usize).min(scaled.len()).max(1);

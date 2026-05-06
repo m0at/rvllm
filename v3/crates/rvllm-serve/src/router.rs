@@ -74,16 +74,31 @@ pub fn build_router(state: AppState) -> Router {
         .on_response(DefaultOnResponse::new().level(tracing::Level::INFO))
         .on_failure(DefaultOnFailure::new().level(tracing::Level::ERROR));
 
+    // Round-23 finding #1: admit BEFORE the body extractor / JSON
+    // parser runs. As a per-route layer this fires at the tower
+    // service level, ahead of `OpenAiJson::from_request`, so a
+    // saturated queue rejects with 429 before we buffer up to 128 MiB
+    // of body or invoke serde_json on it. Only applied to the two
+    // generate endpoints; /health and /v1/models stay unguarded so
+    // load balancers + clients listing models keep working under
+    // load.
+    let admission_layer = axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::openai::handlers::admit_first_middleware,
+    );
+
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(crate::openai::models::list_models))
         .route(
             "/v1/chat/completions",
-            post(crate::openai::handlers::chat_completions),
+            post(crate::openai::handlers::chat_completions)
+                .route_layer(admission_layer.clone()),
         )
         .route(
             "/v1/completions",
-            post(crate::openai::handlers::completions),
+            post(crate::openai::handlers::completions)
+                .route_layer(admission_layer),
         )
         // OpenAI's 2025 "Responses API". Different request/response
         // shape from `/v1/chat/completions` (conversation-state,
