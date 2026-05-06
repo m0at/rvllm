@@ -155,6 +155,11 @@ pub struct Qwen36OutsideKernels {
     /// per-expert FFN (Phase 4b-prep iter32).
     pub fp8_gemv_dual_silu_mod: LoadedModule,
     pub fn_fp8_gemv_dual_silu: KernelFn,
+    /// GPU top-k + softmax over the f32 router logits. Output is
+    /// (top_idx[k] i32, top_w[k] f32) on the device. Foundation for
+    /// the indirect-MoE / CUDA-Graph project (Phase 4b-prep iter33).
+    pub topk_softmax_f32_mod: LoadedModule,
+    pub fn_topk_softmax_f32: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -249,6 +254,12 @@ pub struct Qwen36LinearAttnHostCache {
     pub vus: usize,
     pub h_us: usize,
 }
+
+/// One-shot latch for the iter33 GPU top-k probe (process-wide; all
+/// layers share it — we only need to validate the kernel once per
+/// service start, not 30× per token).
+static RVLLM_QWEN36_TOPK_PROBE_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub struct Qwen36Bringup {
     pub paths: Gemma4EnginePaths,
@@ -514,6 +525,9 @@ impl Qwen36Bringup {
             kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual_silu")?;
         let fn_fp8_gemv_dual_silu = fp8_gemv_dual_silu_mod
             .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_kernel")?;
+        let topk_softmax_f32_mod = kernels.load_ptx("topk_softmax_f32")?;
+        let fn_topk_softmax_f32 = topk_softmax_f32_mod
+            .get_function("topk_softmax_f32_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -611,6 +625,8 @@ impl Qwen36Bringup {
             fn_fp8_gemv_dual,
             fp8_gemv_dual_silu_mod,
             fn_fp8_gemv_dual_silu,
+            topk_softmax_f32_mod,
+            fn_topk_softmax_f32,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -5920,6 +5936,78 @@ impl Qwen36Bringup {
         let exps: Vec<f32> = top.iter().map(|(_, v)| (v - max).exp()).collect();
         let sum: f32 = exps.iter().sum();
         let weights: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+
+        // ITER33 PROBE: launch the GPU top-k+softmax kernel against
+        // the device-resident logits, DtoH the (idx, weight) tuples,
+        // and compare to the host result. One-shot — first MoE call
+        // only. Verifies the kernel before iter34 wires it into the
+        // indirect MoE path.
+        if !RVLLM_QWEN36_TOPK_PROBE_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+            RVLLM_QWEN36_TOPK_PROBE_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+            let topk_idx_region = self.arena.region("qwen36_pm_topk_idx", top_k * 4, 16)?;
+            let topk_w_region = self.arena.region("qwen36_pm_topk_w", top_k * 4, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut logits_ptr = logits_region.device_ptr();
+                let mut idx_ptr = topk_idx_region.device_ptr();
+                let mut w_ptr = topk_w_region.device_ptr();
+                let mut nx = num_experts as i32;
+                let mut kk = top_k as i32;
+                let args = [
+                    (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut idx_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nx) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut kk) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = num_experts as u32;
+                let _ = cuLaunchKernel(
+                    self.outside_kernels.fn_topk_softmax_f32.raw() as CUfunction,
+                    1, 1, 1,
+                    block, 1, 1,
+                    0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+            }
+            self.stream.fence()?;
+            let mut idx_host = vec![0i32; top_k];
+            let mut w_host = vec![0.0f32; top_k];
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    idx_host.as_mut_ptr() as *mut _,
+                    topk_idx_region.device_ptr(),
+                    top_k * 4,
+                );
+                let _ = cuMemcpyDtoH_v2(
+                    w_host.as_mut_ptr() as *mut _,
+                    topk_w_region.device_ptr(),
+                    top_k * 4,
+                );
+            }
+            let host_idx: Vec<i32> = top.iter().map(|(i, _)| *i as i32).collect();
+            let mut max_w_diff: f32 = 0.0;
+            let mut idx_match = true;
+            for i in 0..top_k {
+                if idx_host[i] != host_idx[i] {
+                    idx_match = false;
+                }
+                let d = (w_host[i] - weights[i]).abs();
+                if d > max_w_diff { max_w_diff = d; }
+            }
+            eprintln!(
+                "[ITER33_PROBE] gpu_topk: idx_match={} max_w_diff={:.6} \
+                 host_idx={:?} gpu_idx={:?} host_w[..3]={:?} gpu_w[..3]={:?}",
+                idx_match, max_w_diff,
+                host_idx, idx_host,
+                &weights[..weights.len().min(3)],
+                &w_host[..w_host.len().min(3)],
+            );
+        }
 
         // 3. Routed experts: each runs gate+up FP8 → silu·mul → down FP8.
         let mid_bytes = (n_int as usize) * 2;
