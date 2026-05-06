@@ -103,6 +103,11 @@ pub struct Qwen36OutsideKernels {
     /// with one launch.
     pub qwen_linear_silu_l2_gqa_f16_mod: LoadedModule,
     pub fn_qwen_linear_silu_l2_gqa_f16: KernelFn,
+    /// Per-v-head RMSNormGated with silu(z) gate. Replaces the
+    /// host pipeline (DtoH readout/z/gamma + CPU rms + sigmoid·z
+    /// + HtoD gated) at the end of `apply_layer_linear_attn`.
+    pub qwen_linear_rmsnorm_gated_f16_mod: LoadedModule,
+    pub fn_qwen_linear_rmsnorm_gated_f16: KernelFn,
     /// Phase 4h: paged f16 attention decode kernel
     /// (`flash_attention_2_decode_f16io_kernel`). f16 Q/K/V with a
     /// paged f16 KV cache; sliding-window param `< 0` means no window
@@ -408,6 +413,10 @@ impl Qwen36Bringup {
             kernels.load_ptx("qwen_linear_silu_l2_gqa_f16")?;
         let fn_qwen_linear_silu_l2_gqa_f16 = qwen_linear_silu_l2_gqa_f16_mod
             .get_function("qwen_linear_silu_l2_gqa_f16_kernel")?;
+        let qwen_linear_rmsnorm_gated_f16_mod =
+            kernels.load_ptx("qwen_linear_rmsnorm_gated_f16")?;
+        let fn_qwen_linear_rmsnorm_gated_f16 = qwen_linear_rmsnorm_gated_f16_mod
+            .get_function("qwen_linear_rmsnorm_gated_f16_kernel")?;
         let flash_attention_mod = kernels.load_ptx("flash_attention")?;
         let fn_flash_attention_2_decode_f16io = flash_attention_mod
             .get_function("flash_attention_2_decode_f16io_kernel")?;
@@ -487,6 +496,8 @@ impl Qwen36Bringup {
             fn_qwen_linear_alpha_beta_f16,
             qwen_linear_silu_l2_gqa_f16_mod,
             fn_qwen_linear_silu_l2_gqa_f16,
+            qwen_linear_rmsnorm_gated_f16_mod,
+            fn_qwen_linear_rmsnorm_gated_f16,
             flash_attention_mod,
             fn_flash_attention_2_decode_f16io,
             sigmoid_mul_f16_mod,
@@ -5088,26 +5099,8 @@ impl Qwen36Bringup {
             );
         }
         self.stream.fence()?;
-        // Read readout back to host for the post-RMSNormGated step
-        // (still computed host-side: silu(z) gate composition).
-        let mut readout_f32 = vec![0.0f32; vus * hvd];
-        let mut readout_host = vec![0u8; v_bytes];
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                readout_host.as_mut_ptr() as *mut _,
-                readout_region.device_ptr(),
-                v_bytes,
-            );
-        }
-        for i in 0..(vus * hvd) {
-            readout_f32[i] = f16_bits_to_f32(u16::from_le_bytes([
-                readout_host[i * 2], readout_host[i * 2 + 1],
-            ]));
-        }
 
-        // 10. in_proj_z FP8 GEMV → z [value_dim].
+        // 10. in_proj_z FP8 GEMV → z [value_dim] (stays on device).
         let z_bytes_dev = (z_n as usize) * 2;
         let z_region = self.arena.region("qwen36_pl_z", z_bytes_dev, 16)?;
         unsafe {
@@ -5115,59 +5108,47 @@ impl Qwen36Bringup {
                 la.in_proj_z.offset_bytes, z_bs, normed_region.device_ptr(),
                 m, z_n, hidden, stream_raw)?;
         }
-        self.stream.fence()?;
-        let mut z_host_bytes = vec![0u8; z_bytes_dev];
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                z_host_bytes.as_mut_ptr() as *mut _,
-                z_region.device_ptr(),
-                z_bytes_dev,
-            );
-        }
 
-        // 11. Per-v-head RMSNorm with norm.weight + sigmoid(z) gate.
-        let mut norm_gamma = vec![0u8; hvd * 2];
+        // 11. GPU per-v-head RMSNormGated + silu(z) gate fused into
+        // one launch. Replaces 3× DtoH (readout, z, norm.gamma) +
+        // host CPU loop over (vus × hvd) elements + 1× HtoD gated.
+        let gated_region = self.arena.region("qwen36_pl_gated", vus * hvd * 2, 16)?;
         #[cfg(feature = "cuda")]
         unsafe {
             use cudarc::driver::sys::*;
-            let _ = cuMemcpyDtoH_v2(
-                norm_gamma.as_mut_ptr() as *mut _,
-                la.norm.offset_bytes,
-                norm_gamma.len(),
+            let mut g_out = gated_region.device_ptr();
+            let mut r_in = readout_region.device_ptr();
+            let mut z_in = z_region.device_ptr();
+            let mut gamma_p = la.norm.offset_bytes;
+            let mut vus_i: i32 = vus as i32;
+            let mut hvd_i: i32 = hvd as i32;
+            let mut eps_f: f32 = 1e-6;
+            let args = [
+                (&mut g_out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut r_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut z_in) as *mut u64 as *mut core::ffi::c_void,
+                (&mut gamma_p) as *mut u64 as *mut core::ffi::c_void,
+                (&mut vus_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hvd_i) as *mut i32 as *mut core::ffi::c_void,
+                (&mut eps_f) as *mut f32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = hvd as u32;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_qwen_linear_rmsnorm_gated_f16.raw() as CUfunction,
+                vus as u32, 1, 1,
+                block, 1, 1,
+                0, self.stream.raw() as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
             );
-        }
-        let mut gated = vec![0u8; vus * hvd * 2];
-        for v in 0..vus {
-            let mut sumsq = 0.0f32;
-            for d in 0..hvd {
-                let r = readout_f32[v * hvd + d];
-                sumsq += r * r;
-            }
-            let rms = (sumsq / hvd as f32 + 1e-6).sqrt();
-            for d in 0..hvd {
-                let r = readout_f32[v * hvd + d] / rms;
-                let g = f16_bits_to_f32(u16::from_le_bytes([
-                    norm_gamma[d*2], norm_gamma[d*2 + 1],
-                ]));
-                let z_logit = f16_bits_to_f32(u16::from_le_bytes([
-                    z_host_bytes[(v * hvd + d) * 2],
-                    z_host_bytes[(v * hvd + d) * 2 + 1],
-                ]));
-                // RMSNormGated with norm_before_gate=True, activation=swish:
-                //   out = (norm(readout) * gamma) * silu(z)
-                //   silu(z) = z * sigmoid(z)
-                let sig = 1.0f32 / (1.0f32 + (-z_logit).exp());
-                let silu_z = z_logit * sig;
-                let out = r * g * silu_z;
-                let ob = f32_to_f16_bits(out).to_le_bytes();
-                gated[(v * hvd + d) * 2] = ob[0];
-                gated[(v * hvd + d) * 2 + 1] = ob[1];
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 linear_attn rmsnorm_gated launch",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
             }
         }
-        let gated_region = self.arena.region("qwen36_pl_gated", gated.len(), 16)?;
-        unsafe { gated_region.copy_from_host(&gated)? };
 
         // 12. out_proj FP8 GEMV → o_buf [hidden].
         let out_region = self.arena.region("qwen36_pl_out", (out_n as usize) * 2, 16)?;
