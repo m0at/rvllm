@@ -168,17 +168,17 @@ int cutlass_nvfp4_gemm_sm120(
     size_t workspace_size,
     cudaStream_t stream)
 {
-    // Per the integration spec, the global scale folds into alpha.
-    // We host-copy 4 bytes once per call — negligible vs the GEMM.
-    float alpha_host = 1.0f;
-    if (b_global_scale_f32 != nullptr) {
-        cudaError_t e = cudaMemcpyAsync(
-            &alpha_host, b_global_scale_f32, sizeof(float),
-            cudaMemcpyDeviceToHost, stream);
-        if (e != cudaSuccess) return -10;
-        e = cudaStreamSynchronize(stream);
-        if (e != cudaSuccess) return -11;
-    }
+    // Codex review (2026-05-07): the original implementation did
+    // a cudaMemcpyAsync(b_global_scale_f32 -> host) +
+    // cudaStreamSynchronize per launch to fold the F32 scale into
+    // args.epilogue.thread.alpha. That's a host stall per layer.
+    //
+    // CUTLASS's Sm120 epilogue fusion Args has both `alpha` and
+    // `alpha_ptr` (cf. cutlass/epilogue/fusion/sm120_callbacks_*.hpp,
+    // ~line 145-150). When alpha_ptr is non-null the kernel reads
+    // the scalar from device memory at runtime, no host round-trip.
+    // We populate alpha=1.0 as the harmless fallback and feed
+    // b_global_scale_f32 directly as alpha_ptr.
 
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
@@ -199,12 +199,18 @@ int cutlass_nvfp4_gemm_sm120(
             reinterpret_cast<const typename ElementA::ScaleFactorType*>(sfa), layout_SFA,
             reinterpret_cast<const typename ElementB::ScaleFactorType*>(b_scale_e4m3), layout_SFB,
         },
-        { // epilogue
-            {alpha_host, 0.0f},
+        { // epilogue — alpha_ptr (device F32) overrides alpha (scalar)
+          // when non-null. beta=0, beta_ptr=nullptr → pure alpha*A·B.
+            {},
             nullptr, stride_C,                                       // no C
             reinterpret_cast<ElementD*>(output), stride_D,
         }
     };
+    args.epilogue.thread.alpha = 1.0f;
+    args.epilogue.thread.beta = 0.0f;
+    args.epilogue.thread.alpha_ptr =
+        reinterpret_cast<const float*>(b_global_scale_f32);
+    args.epilogue.thread.beta_ptr = nullptr;
 
     Gemm gemm_op;
     cutlass::Status status = gemm_op.can_implement(args);
