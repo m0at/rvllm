@@ -180,7 +180,7 @@ impl LayerScratchBudget {
     /// SFA is at most this large plus modest swizzle padding which
     /// the per-shape backend query reports exactly. Callers that
     /// have a live `CutlassBackend` should prefer
-    /// [`with_backend`].
+    /// [`Self::with_backend`].
     pub fn natural(arch: &Mistral35Arch, m: usize) -> Self {
         let h = arch.text.hidden_size;
         let i = arch.text.intermediate_size;
@@ -194,15 +194,81 @@ impl LayerScratchBudget {
             workspace_bytes_max: 0,
         }
     }
+
+    /// Backend-aware budget computation. Asks the live
+    /// `CutlassBackend` for the exact CUTLASS-interleaved SFA size
+    /// + GEMM workspace bytes per Mistral projection shape, taking
+    /// the max across the seven projections so a single allocation
+    /// covers every layer. Falls back to [`Self::natural`] when the
+    /// backend reports zero (e.g. NVFP4 symbols not yet bound).
+    #[cfg(feature = "cuda")]
+    pub fn with_backend(
+        arch: &Mistral35Arch,
+        m: usize,
+        backend: &rvllm_cutlass::lib_so::CutlassBackend,
+    ) -> Self {
+        let mut out = Self::natural(arch, m);
+        let mi = m as i32;
+        let h = arch.text.hidden_size as i32;
+        let i = arch.text.intermediate_size as i32;
+        let q = arch.q_rows() as i32;
+        let kv = arch.kv_rows() as i32;
+        // Walk each projection (q/k/v/o/gate/up/down) and take the
+        // max SFA + workspace size across them.
+        let projections: [(i32, i32); 7] = [
+            (q, h),    // q
+            (kv, h),   // k
+            (kv, h),   // v
+            (q, h),    // o
+            (i, h),    // gate
+            (i, h),    // up
+            (h, i),    // down
+        ];
+        for (n, k) in projections {
+            let sfa = backend.nvfp4_sfa_bytes(mi, k);
+            if sfa > out.sfa_cutlass_bytes_max {
+                out.sfa_cutlass_bytes_max = sfa;
+            }
+            let ws = backend.nvfp4_workspace_size(mi, n, k);
+            if ws > out.workspace_bytes_max {
+                out.workspace_bytes_max = ws;
+            }
+        }
+        // Backend's natural-SFA query (when active) overrides the
+        // arithmetic estimate; the two should match but the backend
+        // accounts for any future layout-padding rules without us
+        // having to mirror them here.
+        let max_k = h.max(i);
+        let nat = backend.nvfp4_natural_sfa_bytes(mi, max_k);
+        if nat > 0 {
+            out.sfa_natural_bytes = nat;
+        }
+        out
+    }
 }
 
 impl Mistral35Bringup {
     /// Pre-compute the per-layer scratch budget for a prefill chunk
-    /// of `m` tokens. Independent of the CUTLASS backend (the
-    /// backend-aware variant lives in [`scratch_budget_with_backend`]
-    /// — added when the runtime forward integration lands).
+    /// of `m` tokens, using pure arithmetic (no CUTLASS backend
+    /// involvement). The backend-aware variant lives in
+    /// [`Self::scratch_budget_with_backend`].
     pub fn scratch_budget(&self, m: usize) -> LayerScratchBudget {
         LayerScratchBudget::natural(&self.arch, m)
+    }
+
+    /// Backend-aware scratch budget. Queries the active
+    /// `CutlassBackend` for exact SFA + workspace sizes per
+    /// projection shape and returns the per-layer max. Useful when
+    /// the runtime forward integration knows the live backend
+    /// (the bring-up doesn't hold the backend handle today —
+    /// `cuda_worker.rs` does — so this fn takes one explicitly).
+    #[cfg(feature = "cuda")]
+    pub fn scratch_budget_with_backend(
+        &self,
+        m: usize,
+        backend: &rvllm_cutlass::lib_so::CutlassBackend,
+    ) -> LayerScratchBudget {
+        LayerScratchBudget::with_backend(&self.arch, m, backend)
     }
 }
 
@@ -678,6 +744,21 @@ mod tests {
         let b = LayerScratchBudget::natural(&arch, 0);
         assert_eq!(b.a_packed_bytes, 0);
         assert_eq!(b.sfa_natural_bytes, 0);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn scratch_budget_with_absent_backend_falls_back_to_natural() {
+        // With CutlassBackend::Absent every backend query returns 0,
+        // so the budget should match the natural arithmetic exactly.
+        let arch = test_arch_fixture(2);
+        let backend = rvllm_cutlass::lib_so::CutlassBackend::Absent;
+        let b_arith = LayerScratchBudget::natural(&arch, 256);
+        let b_back = LayerScratchBudget::with_backend(&arch, 256, &backend);
+        assert_eq!(b_arith.a_packed_bytes, b_back.a_packed_bytes);
+        assert_eq!(b_arith.sfa_natural_bytes, b_back.sfa_natural_bytes);
+        assert_eq!(b_arith.sfa_cutlass_bytes_max, b_back.sfa_cutlass_bytes_max);
+        assert_eq!(b_arith.workspace_bytes_max, b_back.workspace_bytes_max);
     }
 
     #[test]
