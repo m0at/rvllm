@@ -238,6 +238,62 @@ pub fn mistral_layer_step(
     residual2.iter().zip(&mlp_out).map(|(a, b)| a + b).collect()
 }
 
+/// Whole-stack reference state — embedding table, per-layer
+/// weights, final RMSNorm, lm_head. Used by [`mistral_full_step`]
+/// for end-to-end CPU validation.
+pub struct StackWeightsF32 {
+    /// `[vocab_size, hidden_size]`. Looked up by token id.
+    pub embed: Vec<f32>,
+    /// One per layer; length defines the depth of the stack.
+    pub layers: Vec<LayerWeightsF32>,
+    /// Final RMSNorm scale before lm_head, `[hidden_size]`.
+    pub final_norm: Vec<f32>,
+    /// `[hidden_size, vocab_size]` — `untied` per the Mistral arch
+    /// (`tie_word_embeddings = false`).
+    pub lm_head: Vec<f32>,
+    pub vocab_size: usize,
+}
+
+/// Single-token full-stack forward: embed → N layers → final norm
+/// → lm_head → logits. Returns the `[vocab_size]` logit vector.
+///
+/// `kv_caches` must have one entry per layer in `weights.layers`,
+/// pre-extended via prior calls or starting empty for pos=0.
+pub fn mistral_full_step(
+    token_id: u32,
+    pos: usize,
+    dims: &LayerDimsF32,
+    weights: &StackWeightsF32,
+    kv_caches: &mut [KvCacheF32],
+    rope: &YarnRopeTables,
+) -> Vec<f32> {
+    assert_eq!(
+        weights.layers.len(), kv_caches.len(),
+        "mistral_full_step: layers={} kv_caches={}",
+        weights.layers.len(), kv_caches.len()
+    );
+    let h = dims.hidden_size;
+    assert!(
+        (token_id as usize) < weights.vocab_size,
+        "token_id {} >= vocab_size {}", token_id, weights.vocab_size
+    );
+
+    // Embedding lookup: row of the embed table at `token_id`.
+    let row_off = (token_id as usize) * h;
+    let mut x = weights.embed[row_off..row_off + h].to_vec();
+
+    // N decoder layers.
+    for (lw, kv) in weights.layers.iter().zip(kv_caches.iter_mut()) {
+        x = mistral_layer_step(&x, pos, dims, lw, kv, rope);
+    }
+
+    // Final RMSNorm.
+    let xn = rms_norm(&x, &weights.final_norm, dims.rms_norm_eps);
+
+    // lm_head projection -> logits [vocab_size].
+    matmul_f32(&xn, 1, &weights.lm_head, weights.vocab_size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +383,78 @@ mod tests {
             assert_eq!(y.len(), dims.hidden_size);
             assert_eq!(kv.seq_len(dims.kv_dim()), pos + 1);
         }
+    }
+
+    fn tiny_stack(dims: &LayerDimsF32, num_layers: usize, vocab_size: usize) -> StackWeightsF32 {
+        let h = dims.hidden_size;
+        StackWeightsF32 {
+            embed: (0..vocab_size * h).map(|i| (i as f32) * 0.001).collect(),
+            layers: (0..num_layers).map(|_| tiny_weights(dims)).collect(),
+            final_norm: vec![1.0; h],
+            lm_head: (0..h * vocab_size).map(|i| (i as f32) * 0.0005).collect(),
+            vocab_size,
+        }
+    }
+
+    #[test]
+    fn full_stack_step_returns_vocab_logits() {
+        let cfg = tiny_yarn();
+        let dims = tiny_dims();
+        let stack = tiny_stack(&dims, 2, 8);
+        let rope = build_yarn_rope_tables(&cfg, dims.head_dim, 4);
+        let mut kvs: Vec<KvCacheF32> =
+            (0..stack.layers.len()).map(|_| KvCacheF32::default()).collect();
+        let logits = mistral_full_step(0, 0, &dims, &stack, &mut kvs, &rope);
+        assert_eq!(logits.len(), stack.vocab_size);
+        for v in &logits {
+            assert!(v.is_finite(), "non-finite logit {v}");
+        }
+        // Each layer's KV should hold one position now.
+        for k in &kvs {
+            assert_eq!(k.seq_len(dims.kv_dim()), 1);
+        }
+    }
+
+    #[test]
+    fn full_stack_step_extends_per_layer_kv() {
+        let cfg = tiny_yarn();
+        let dims = tiny_dims();
+        let stack = tiny_stack(&dims, 3, 8);
+        let rope = build_yarn_rope_tables(&cfg, dims.head_dim, 8);
+        let mut kvs: Vec<KvCacheF32> =
+            (0..stack.layers.len()).map(|_| KvCacheF32::default()).collect();
+        for pos in 0..3 {
+            let token = (pos as u32) % stack.vocab_size as u32;
+            let logits = mistral_full_step(token, pos, &dims, &stack, &mut kvs, &rope);
+            assert_eq!(logits.len(), stack.vocab_size);
+            for k in &kvs {
+                assert_eq!(k.seq_len(dims.kv_dim()), pos + 1);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn full_stack_step_rejects_out_of_vocab_token() {
+        let cfg = tiny_yarn();
+        let dims = tiny_dims();
+        let stack = tiny_stack(&dims, 1, 8);
+        let rope = build_yarn_rope_tables(&cfg, dims.head_dim, 4);
+        let mut kvs: Vec<KvCacheF32> =
+            (0..stack.layers.len()).map(|_| KvCacheF32::default()).collect();
+        let _ = mistral_full_step(99, 0, &dims, &stack, &mut kvs, &rope);
+    }
+
+    #[test]
+    #[should_panic]
+    fn full_stack_step_rejects_kv_count_mismatch() {
+        let cfg = tiny_yarn();
+        let dims = tiny_dims();
+        let stack = tiny_stack(&dims, 3, 8);
+        let rope = build_yarn_rope_tables(&cfg, dims.head_dim, 4);
+        // Only 2 caches for a 3-layer stack — should panic.
+        let mut kvs: Vec<KvCacheF32> = (0..2).map(|_| KvCacheF32::default()).collect();
+        let _ = mistral_full_step(0, 0, &dims, &stack, &mut kvs, &rope);
     }
 
     #[test]
