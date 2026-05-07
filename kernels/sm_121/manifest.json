@@ -421,6 +421,11 @@
       "path": "rmsnorm_inplace_f16.ptx",
       "sha256": "1aef2417c71a593607976b4e251a557e28c7f1575b42e2c95ce9f23708b42a9c"
     },
+    "router_gemv_batched_f16_to_f32": {
+      "bytes": 7112,
+      "path": "router_gemv_batched_f16_to_f32.ptx",
+      "sha256": "bd5c642a53864cd623f3f65fac9003801ac8a086b28931a81fe378601e53ae61"
+    },
     "router_gemv_f16_to_f32": {
       "bytes": 6486,
       "path": "router_gemv_f16_to_f32.ptx",
@@ -505,6 +510,11 @@
       "bytes": 1845,
       "path": "split_q_gate_f16.ptx",
       "sha256": "6635cb33db88d817c7cb7d3e45e3c31a77c5d79d9bea5a460a5868477f8a9095"
+    },
+    "topk_softmax_batched_f32": {
+      "bytes": 6499,
+      "path": "topk_softmax_batched_f32.ptx",
+      "sha256": "e7b99ae902bcd354a0f07b4bd6fd2594af7a539d17fec733587e0f4951287452"
     },
     "topk_softmax_f32": {
       "bytes": 5834,
@@ -612,5 +622,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "a08fe43"
+  "revision": "00edd39"
 }

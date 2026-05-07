@@ -222,6 +222,17 @@ pub struct Qwen36OutsideKernels {
     /// Kernel: kernels/qwen_fill_pos_slots_i32.cu.
     pub qwen_fill_pos_slots_i32_mod: LoadedModule,
     pub fn_qwen_fill_pos_slots_i32: KernelFn,
+    /// Phase 6a / Round-27: batched router GEMV. Per-token grid.y
+    /// dimension over the existing single-token kernel; one launch
+    /// per layer instead of N. Kernel:
+    /// kernels/router_gemv_batched_f16_to_f32.cu.
+    pub router_gemv_batched_f16_to_f32_mod: LoadedModule,
+    pub fn_router_gemv_batched_f16_to_f32: KernelFn,
+    /// Phase 6a / Round-27: batched top-k+softmax. Per-token grid.x
+    /// over the existing kernel; one launch per layer. Kernel:
+    /// kernels/topk_softmax_batched_f32.cu.
+    pub topk_softmax_batched_f32_mod: LoadedModule,
+    pub fn_topk_softmax_batched_f32: KernelFn,
     /// Batched-prefill conv1d state-advance + flat history assembly.
     /// Builds the `[num_tokens + ks - 1, channels]` history buffer
     /// the existing `causal_conv1d_f16` kernel expects, with state
@@ -607,6 +618,14 @@ impl Qwen36Bringup {
             kernels.load_ptx("qwen_fill_pos_slots_i32")?;
         let fn_qwen_fill_pos_slots_i32 = qwen_fill_pos_slots_i32_mod
             .get_function("qwen_fill_pos_slots_i32_kernel")?;
+        let router_gemv_batched_f16_to_f32_mod =
+            kernels.load_ptx("router_gemv_batched_f16_to_f32")?;
+        let fn_router_gemv_batched_f16_to_f32 = router_gemv_batched_f16_to_f32_mod
+            .get_function("router_gemv_batched_f16_to_f32_kernel")?;
+        let topk_softmax_batched_f32_mod =
+            kernels.load_ptx("topk_softmax_batched_f32")?;
+        let fn_topk_softmax_batched_f32 = topk_softmax_batched_f32_mod
+            .get_function("topk_softmax_batched_f32_kernel")?;
         // Vision-tower kernels (Phase 1 .cu added on rusty_sm121_vision).
         let layernorm_inplace_f16_mod = kernels.load_ptx("layernorm_inplace_f16")?;
         let fn_layernorm_inplace_f16 =
@@ -712,6 +731,10 @@ impl Qwen36Bringup {
             fn_conv_state_advance_batched_f16,
             qwen_fill_pos_slots_i32_mod,
             fn_qwen_fill_pos_slots_i32,
+            router_gemv_batched_f16_to_f32_mod,
+            fn_router_gemv_batched_f16_to_f32,
+            topk_softmax_batched_f32_mod,
+            fn_topk_softmax_batched_f32,
             layernorm_inplace_f16_mod,
             fn_layernorm_inplace_f16,
             gelu_tanh_f16_mod,
@@ -5337,22 +5360,42 @@ impl Qwen36Bringup {
                             &buf);
                     }
                 }
-                // MoE per token. The MoE block reads/writes through
-                // tok_ptr and post_attn_norm_ptr; routing is per-
-                // token, so this stays in the per-token sub-loop
-                // until the MoE batched phase lands.
-                for t in 0..num_tokens {
-                    let tok_ptr = hidden_region.device_ptr()
-                        + (t as u64) * (last_hidden_bytes as u64);
+                // MoE: env-gated batched routing (Phase 6a /
+                // Round-27). When `RVLLM_QWEN36_BATCH_MOE_PREFILL=1`
+                // and start_position == 0, route batched (one
+                // launch each for router GEMV + topk-softmax) and
+                // delegate per-token expert FFN with override. Else
+                // fall back to per-token routing+FFN.
+                let batch_moe = start_position == 0
+                    && std::env::var("RVLLM_QWEN36_BATCH_MOE_PREFILL")
+                        .map(|s| matches!(s.as_str(),
+                            "1"|"true"|"TRUE"|"yes"))
+                        .unwrap_or(false);
+                if batch_moe {
                     let inner_ck = self.arena.checkpoint();
-                    self.apply_layer_moe(
+                    self.apply_layer_moe_batched(
                         &self.model.layers[layer_idx].moe,
                         post_attn_norm_ptr,
-                        tok_ptr,
+                        hidden_region.device_ptr(),
+                        num_tokens,
                         kernel_gemv, hidden, last_hidden_bytes,
                         layer_idx,
                     )?;
                     unsafe { self.arena.restore(inner_ck); }
+                } else {
+                    for t in 0..num_tokens {
+                        let tok_ptr = hidden_region.device_ptr()
+                            + (t as u64) * (last_hidden_bytes as u64);
+                        let inner_ck = self.arena.checkpoint();
+                        self.apply_layer_moe(
+                            &self.model.layers[layer_idx].moe,
+                            post_attn_norm_ptr,
+                            tok_ptr,
+                            kernel_gemv, hidden, last_hidden_bytes,
+                            layer_idx,
+                        )?;
+                        unsafe { self.arena.restore(inner_ck); }
+                    }
                 }
                 if dump_active {
                     let dir = dump_dir.as_ref().unwrap();
@@ -7391,6 +7434,209 @@ impl Qwen36Bringup {
         last_hidden_bytes: usize,
         _layer_idx: usize,
     ) -> Result<()> {
+        self.apply_layer_moe_with_override(
+            moe, post_attn_norm_ptr, last_hidden_ptr,
+            kernel_gemv, hidden, last_hidden_bytes, _layer_idx,
+            None,
+        )
+    }
+
+    /// Phase 6a / Round-27: batched routing for the MoE layer.
+    /// Pre-computes top-k indices + weights for ALL N tokens via one
+    /// `router_gemv_batched_f16_to_f32` launch + one
+    /// `topk_softmax_batched_f32` launch, then loops the per-token
+    /// expert FFN compute (existing `apply_layer_moe_with_override`)
+    /// with a route override pointing at each token's slot in the
+    /// batched arrays. The expert FFN itself remains per-token in
+    /// this first cut — codex round-27's recommended "first 200 LOC
+    /// cut: router+topk batched, routed FFN unchanged" — to isolate
+    /// routing-semantics correctness before tackling the
+    /// gather/scatter rewrite for batched expert FFN. Save: 2*N
+    /// launches per layer drop to 2 per layer (N=22 → 88 → 4 saved
+    /// kernels per layer per request); the batched routing also lets
+    /// the FFN reuse a single batched-RMSNorm post_attention_layernorm
+    /// (one launch instead of N).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_layer_moe_batched(
+        &self,
+        moe: &rvllm_loader::qwen36_weights::Qwen36MoeBlock,
+        post_attn_norm_ptr: u64,
+        hidden_ptr: u64,
+        num_tokens: u32,
+        kernel_gemv: rvllm_kernels::KernelFn,
+        hidden: u32,
+        last_hidden_bytes: usize,
+        layer_idx: usize,
+    ) -> Result<()> {
+        if num_tokens == 0 {
+            return Ok(());
+        }
+        if num_tokens == 1 {
+            return self.apply_layer_moe(
+                moe, post_attn_norm_ptr, hidden_ptr,
+                kernel_gemv, hidden, last_hidden_bytes, layer_idx,
+            );
+        }
+        let n = num_tokens as usize;
+        let h = hidden as usize;
+        let stream_raw = self.stream.raw() as u64;
+        let num_experts = self.arch.num_experts;
+        let top_k = self.arch.num_experts_per_tok;
+
+        // 1. Batched RMSNorm on a [N, hidden] copy.
+        let normed_bytes = n * h * 2;
+        let normed_region =
+            self.arena.region("qwen36_pmb_normed", normed_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoDAsync_v2(
+                normed_region.device_ptr(), hidden_ptr, normed_bytes,
+                self.stream.raw() as _,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 moe_batched DtoD copy",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        let eps = self.arch.base.rms_norm_eps;
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens, hidden, eps,
+            }.launch(
+                self.outside_kernels.fn_rmsnorm_inplace_f16,
+                normed_region.device_ptr(),
+                post_attn_norm_ptr,
+                stream_raw,
+            )?;
+        }
+
+        // 2. Batched router GEMV → logits [N, num_experts] f32.
+        let logits_bytes = n * num_experts * 4;
+        let logits_region =
+            self.arena.region("qwen36_pmb_logits", logits_bytes, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut out = logits_region.device_ptr();
+            let mut router_ptr = moe.router.offset_bytes;
+            let mut input_ptr = normed_region.device_ptr();
+            let mut nx = num_experts as i32;
+            let mut hh = hidden as i32;
+            let mut nt = num_tokens as i32;
+            let args = [
+                (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                (&mut router_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut input_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nx) as *mut i32 as *mut core::ffi::c_void,
+                (&mut hh) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = 256;
+            let grid_x: u32 = num_experts as u32;
+            let grid_y: u32 = num_tokens;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_router_gemv_batched_f16_to_f32.raw() as CUfunction,
+                grid_x, grid_y, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 moe_batched router_gemv_batched",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // 3. Batched topk+softmax → top_idx [N, K] i32, top_w [N, K] f32.
+        let topk_idx_region =
+            self.arena.region("qwen36_pmb_topk_idx", n * top_k * 4, 16)?;
+        let topk_w_region =
+            self.arena.region("qwen36_pmb_topk_w", n * top_k * 4, 16)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let mut logits_ptr = logits_region.device_ptr();
+            let mut idx_ptr = topk_idx_region.device_ptr();
+            let mut w_ptr = topk_w_region.device_ptr();
+            let mut nx = num_experts as i32;
+            let mut kk = top_k as i32;
+            let mut nt = num_tokens as i32;
+            let args = [
+                (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut idx_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                (&mut nx) as *mut i32 as *mut core::ffi::c_void,
+                (&mut kk) as *mut i32 as *mut core::ffi::c_void,
+                (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+            ];
+            let block: u32 = num_experts as u32;
+            let grid: u32 = num_tokens;
+            let rc = cuLaunchKernel(
+                self.outside_kernels.fn_topk_softmax_batched_f32.raw() as CUfunction,
+                grid, 1, 1, block, 1, 1, 0,
+                stream_raw as CUstream,
+                args.as_ptr() as *mut *mut core::ffi::c_void,
+                core::ptr::null_mut(),
+            );
+            if rc != CUresult::CUDA_SUCCESS {
+                return Err(rvllm_core::RvllmError::cuda(
+                    "qwen36 moe_batched topk_softmax_batched",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+
+        // 4. Per-token expert FFN with route override pointing at the
+        // pre-computed slot. Keeps existing per-token order
+        // k=0..K-1, then shared+sigmoid_gate, then residual — so
+        // numerical output is byte-identical to per-token MoE
+        // (codex round-27: "Per-token add order k=0..7, danach
+        // shared, danach residual: byte-Identität realistisch").
+        let topk_idx_base = topk_idx_region.device_ptr();
+        let topk_w_base = topk_w_region.device_ptr();
+        let topk_stride_bytes = (top_k as u64) * 4;
+        for t in 0..num_tokens {
+            let tok_ptr = hidden_ptr + (t as u64) * (last_hidden_bytes as u64);
+            let inner_ck = self.arena.checkpoint();
+            let idx_t = topk_idx_base + (t as u64) * topk_stride_bytes;
+            let w_t = topk_w_base + (t as u64) * topk_stride_bytes;
+            self.apply_layer_moe_with_override(
+                moe, post_attn_norm_ptr, tok_ptr,
+                kernel_gemv, hidden, last_hidden_bytes, layer_idx,
+                Some((idx_t, w_t)),
+            )?;
+            unsafe { self.arena.restore(inner_ck); }
+        }
+        Ok(())
+    }
+
+    /// Phase 6a / Round-27: per-token MoE forward with optional
+    /// pre-computed routing. When `route_override = Some((idx_ptr,
+    /// w_ptr))`, the in-function router-GEMV + top-k+softmax launches
+    /// are skipped and the downstream expert FFN reads top-k from the
+    /// caller-supplied device buffers (one (token's row-of-top_k))
+    /// instead. Used by `apply_layer_moe_batched` to share batched
+    /// routing across N tokens.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_layer_moe_with_override(
+        &self,
+        moe: &rvllm_loader::qwen36_weights::Qwen36MoeBlock,
+        post_attn_norm_ptr: u64,
+        last_hidden_ptr: u64,
+        kernel_gemv: rvllm_kernels::KernelFn,
+        hidden: u32,
+        last_hidden_bytes: usize,
+        _layer_idx: usize,
+        route_override: Option<(u64, u64)>,
+    ) -> Result<()> {
         let stream_raw = self.stream.raw() as u64;
         let n_int = moe.experts_gate_proj_fused.shape[1] as u32; // 512
         let k_in = moe.experts_gate_proj_fused.shape[2] as u32; // 2048
@@ -7429,97 +7675,87 @@ impl Qwen36Bringup {
         // Removing the per-layer fence saves ~30 fence syscalls / token
         // (Phase 4b-prep iter22).
 
-        // 2. Router top-k. Read normed input + router weights, compute
-        //    logits on host, sort top-k, softmax-normalize.
+        // 2. Router top-k. When `route_override` is Some, skip both
+        // the router GEMV and topk+softmax — the caller has already
+        // pre-computed (top_idx, top_w) for this token in shared
+        // batched arrays. Else compute fresh per-token routing.
         let hidden_us = hidden as usize;
-        // Phase 4b-prep iter21: input_host / input_f32 are no longer
-        // needed on the hot path — the shared-expert gate dot product
-        // is now a fused GPU kernel (`shared_gate_dot_sigmoid_f16`).
-        // The optional debug `normed_l2` rebuilds them lazily.
-        let _ = hidden_us; // used by shared-gate kernel grid sizing
-        // Phase 4b-prep iter17: GPU router GEMV. Replaces the
-        // host-cached f32 matvec (~524k MAC × 30 layers / token)
-        // with a single launch reading device-side f16 weights.
-        let logits_bytes = num_experts * 4;
-        let logits_region =
-            self.arena.region("qwen36_pm_logits", logits_bytes, 16)?;
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let mut out = logits_region.device_ptr();
-            let mut router_ptr = moe.router.offset_bytes;
-            let mut input_ptr = normed_region.device_ptr();
-            let mut nx = num_experts as i32;
-            let mut hh = hidden_us as i32;
-            let args = [
-                (&mut out) as *mut u64 as *mut core::ffi::c_void,
-                (&mut router_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut input_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nx) as *mut i32 as *mut core::ffi::c_void,
-                (&mut hh) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let block: u32 = 256;
-            let grid: u32 = num_experts as u32;
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_router_gemv_f16_to_f32.raw() as CUfunction,
-                grid, 1, 1,
-                block, 1, 1,
-                0,
-                stream_raw as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 router_gemv launch",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+        let _ = hidden_us;
+        let (route_idx_ptr, route_w_ptr) = if let Some((idx, w)) = route_override {
+            (idx, w)
+        } else {
+            let logits_bytes = num_experts * 4;
+            let logits_region =
+                self.arena.region("qwen36_pm_logits", logits_bytes, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut out = logits_region.device_ptr();
+                let mut router_ptr = moe.router.offset_bytes;
+                let mut input_ptr = normed_region.device_ptr();
+                let mut nx = num_experts as i32;
+                let mut hh = hidden as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut router_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nx) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut hh) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid: u32 = num_experts as u32;
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_router_gemv_f16_to_f32.raw() as CUfunction,
+                    grid, 1, 1, block, 1, 1, 0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 router_gemv launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
-        }
-        // Phase 4b-prep iter34: GPU top-k+softmax instead of the
-        // fence + DtoH(logits) + host sort. Output goes to two
-        // device buffers (top_idx_region i32, top_w_region f32);
-        // the per-expert loop below reads from them indirectly.
-        // No fence here — top-k chains on stream_raw after the
-        // router GEMV.
-        let topk_idx_region =
-            self.arena.region("qwen36_pm_topk_idx", top_k * 4, 16)?;
-        let topk_w_region =
-            self.arena.region("qwen36_pm_topk_w", top_k * 4, 16)?;
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let mut logits_ptr = logits_region.device_ptr();
-            let mut idx_ptr = topk_idx_region.device_ptr();
-            let mut w_ptr = topk_w_region.device_ptr();
-            let mut nx = num_experts as i32;
-            let mut kk = top_k as i32;
-            let args = [
-                (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut idx_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
-                (&mut nx) as *mut i32 as *mut core::ffi::c_void,
-                (&mut kk) as *mut i32 as *mut core::ffi::c_void,
-            ];
-            let block: u32 = num_experts as u32;
-            let rc = cuLaunchKernel(
-                self.outside_kernels.fn_topk_softmax_f32.raw() as CUfunction,
-                1, 1, 1,
-                block, 1, 1,
-                0,
-                stream_raw as CUstream,
-                args.as_ptr() as *mut *mut core::ffi::c_void,
-                core::ptr::null_mut(),
-            );
-        if rc != CUresult::CUDA_SUCCESS {
-            return Err(rvllm_core::RvllmError::cuda(
-                "qwen36 topk_softmax_f32 launch",
-                rvllm_core::CudaErrorKind::LaunchFailed,
-                rvllm_core::CudaCtx::setup(),
-            ));
-        }
-        }
+            let topk_idx_region =
+                self.arena.region("qwen36_pm_topk_idx", top_k * 4, 16)?;
+            let topk_w_region =
+                self.arena.region("qwen36_pm_topk_w", top_k * 4, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut logits_ptr = logits_region.device_ptr();
+                let mut idx_ptr = topk_idx_region.device_ptr();
+                let mut w_ptr = topk_w_region.device_ptr();
+                let mut nx = num_experts as i32;
+                let mut kk = top_k as i32;
+                let args = [
+                    (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut idx_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut w_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nx) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut kk) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = num_experts as u32;
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_topk_softmax_f32.raw() as CUfunction,
+                    1, 1, 1, block, 1, 1, 0,
+                    stream_raw as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 topk_softmax_f32 launch",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            (topk_idx_region.device_ptr(), topk_w_region.device_ptr())
+        };
 
         // 3. Routed experts: each runs gate+up FP8 → silu·mul → down FP8.
         let mid_bytes = (n_int as usize) * 2;
@@ -7568,8 +7804,8 @@ impl Qwen36Bringup {
         // `topk_w_region[i]` — no host-known offsets baked into
         // launch params, every launch's args are stable across
         // calls. CUDA-Graph-captureable.
-        let topk_idx_base = topk_idx_region.device_ptr();
-        let topk_w_base   = topk_w_region.device_ptr();
+        let topk_idx_base = route_idx_ptr;
+        let topk_w_base   = route_w_ptr;
         for i in 0..top_k {
             let idx_ptr_i = topk_idx_base + (i as u64) * 4;
             let w_ptr_i   = topk_w_base   + (i as u64) * 4;
