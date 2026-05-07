@@ -23,6 +23,7 @@ pub mod gemma4_load;
 pub mod gemma4_weights;
 pub mod load;
 pub mod load_multiformat;
+pub mod mistral35_arch;
 pub mod qwen36_load;
 pub mod qwen36_weights;
 pub mod safetensors;

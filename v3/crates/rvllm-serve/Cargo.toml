@@ -26,6 +26,7 @@ gb10 = ["cuda", "rvllm-runtime/gb10"]
 rvllm-core = { workspace = true }
 rvllm-kernels = { workspace = true }
 rvllm-runtime = { workspace = true }
+rvllm-loader = { workspace = true }
 
 # Async + HTTP
 tokio = { workspace = true }

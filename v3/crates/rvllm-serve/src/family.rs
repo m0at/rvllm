@@ -168,6 +168,11 @@ fn read_config(model_dir: &Path) -> Result<Option<serde_json::Value>, FamilyReso
 }
 
 fn is_mistral35(model_dir: &Path) -> Result<bool, FamilyResolveError> {
+    // Cheap marker probe first so a Gemma / Qwen dir doesn't pull in
+    // the full Mistral arch parser (which validates YaRN, GQA ratio,
+    // pixtral vision, etc.). Only when the three Mistral markers
+    // match do we run the full parser — and at that point any field
+    // failure surfaces as `FamilyResolveError::Mistral{...}`.
     let v = match read_config(model_dir)? {
         Some(v) => v,
         None => return Ok(false),
@@ -181,25 +186,39 @@ fn is_mistral35(model_dir: &Path) -> Result<bool, FamilyResolveError> {
         .as_str()
         .map(|s| s == "nvfp4-pack-quantized")
         .unwrap_or(false);
-
-    if arch_match && model_type_match && quant_match {
-        // Validate the YaRN correction one-liner up-front so an
-        // explicit `--model-family mistral35` picks it up before
-        // weight load. The integration spec calls this out as a
-        // known checkpoint correction; we refuse to keep going on
-        // a non-zero value because the YaRN math diverges silently.
-        let mscale_all_dim = v["text_config"]["rope_scaling"]["mscale_all_dim"]
-            .as_f64()
-            .or_else(|| v["rope_scaling"]["mscale_all_dim"].as_f64())
-            .unwrap_or(0.0);
-        if mscale_all_dim != 0.0 {
-            return Err(FamilyResolveError::MistralBadMscaleAllDim {
-                got: mscale_all_dim,
-            });
-        }
-        return Ok(true);
+    if !(arch_match && model_type_match && quant_match) {
+        return Ok(false);
     }
-    Ok(false)
+
+    // Markers say Mistral 3.5 — run the full arch parser so YaRN /
+    // GQA / pixtral invariants get validated *before* the worker
+    // even starts. Any error here propagates so the operator sees
+    // the field-level reason rather than a generic "wrong family".
+    match rvllm_loader::mistral35_arch::Mistral35Arch::from_dir(model_dir) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => {
+            // Markers matched but the parser returned None — should
+            // not happen, treat as non-Mistral so the caller falls
+            // through gracefully.
+            Ok(false)
+        }
+        Err(e) => {
+            // Surface the YaRN-correction case with its dedicated
+            // error variant so the test suite + operator log keep
+            // their existing message; everything else flows through
+            // the generic `Other` variant.
+            let msg = format!("{e:?}");
+            if msg.contains("mscale_all_dim") {
+                let got = v["text_config"]["rope_scaling"]["mscale_all_dim"]
+                    .as_f64()
+                    .or_else(|| v["rope_scaling"]["mscale_all_dim"].as_f64())
+                    .unwrap_or(0.0);
+                Err(FamilyResolveError::MistralBadMscaleAllDim { got })
+            } else {
+                Err(FamilyResolveError::Other(msg))
+            }
+        }
+    }
 }
 
 fn is_qwen36(model_dir: &Path) -> bool {
@@ -247,17 +266,35 @@ mod tests {
         f.write_all(body.as_bytes()).expect("write");
     }
 
+    fn mistral_full() -> &'static str {
+        r#"{
+          "architectures": ["Mistral3ForConditionalGeneration"],
+          "model_type": "mistral3",
+          "quantization_config": {"format": "nvfp4-pack-quantized"},
+          "image_token_index": 10,
+          "text_config": {
+            "num_hidden_layers": 88, "hidden_size": 12288,
+            "intermediate_size": 28672, "num_attention_heads": 96,
+            "num_key_value_heads": 8, "head_dim": 128,
+            "vocab_size": 131072, "max_position_embeddings": 262144,
+            "rms_norm_eps": 1e-5, "hidden_act": "silu",
+            "tie_word_embeddings": false, "rope_theta": 1000000.0,
+            "rope_scaling": {"rope_type":"yarn","original_max_position_embeddings":4096,
+              "factor":64.0,"beta_fast":4.0,"beta_slow":1.0,"mscale":1.0,"mscale_all_dim":0.0}
+          },
+          "vision_config": {
+            "model_type":"pixtral","hidden_size":1664,"num_hidden_layers":48,
+            "num_attention_heads":16,"head_dim":104,"intermediate_size":8192,
+            "patch_size":14,"image_size":1540,"num_channels":3,
+            "rope_theta":10000.0,"spatial_merge_size":2
+          }
+        }"#
+    }
+
     #[test]
     fn auto_detects_mistral_marker() {
         let tmp = tempdir();
-        write_config(
-            &tmp,
-            r#"{
-              "architectures": ["Mistral3ForConditionalGeneration"],
-              "model_type": "mistral3",
-              "quantization_config": {"format": "nvfp4-pack-quantized"}
-            }"#,
-        );
+        write_config(&tmp, mistral_full());
         let r = resolve_model_family(&tmp, ModelFamily::Auto).expect("ok");
         assert_eq!(r.family, ModelFamily::Mistral35);
         assert_eq!(r.vision_arch, VisionArch::Mistral35);
@@ -280,14 +317,7 @@ mod tests {
     #[test]
     fn explicit_gemma_rejects_mistral_dir() {
         let tmp = tempdir();
-        write_config(
-            &tmp,
-            r#"{
-              "architectures": ["Mistral3ForConditionalGeneration"],
-              "model_type": "mistral3",
-              "quantization_config": {"format": "nvfp4-pack-quantized"}
-            }"#,
-        );
+        write_config(&tmp, mistral_full());
         let err = resolve_model_family(&tmp, ModelFamily::Gemma4).unwrap_err();
         assert!(matches!(err, FamilyResolveError::Mismatch { .. }));
     }
@@ -295,15 +325,8 @@ mod tests {
     #[test]
     fn mistral_bad_mscale_all_dim_rejected() {
         let tmp = tempdir();
-        write_config(
-            &tmp,
-            r#"{
-              "architectures": ["Mistral3ForConditionalGeneration"],
-              "model_type": "mistral3",
-              "quantization_config": {"format": "nvfp4-pack-quantized"},
-              "text_config": {"rope_scaling": {"mscale_all_dim": 1.0}}
-            }"#,
-        );
+        let body = mistral_full().replace("\"mscale_all_dim\":0.0", "\"mscale_all_dim\":1.0");
+        write_config(&tmp, &body);
         let err = resolve_model_family(&tmp, ModelFamily::Auto).unwrap_err();
         assert!(matches!(err, FamilyResolveError::MistralBadMscaleAllDim { .. }));
     }
