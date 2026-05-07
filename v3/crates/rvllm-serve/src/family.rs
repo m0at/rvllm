@@ -194,7 +194,7 @@ fn is_mistral35(model_dir: &Path) -> Result<bool, FamilyResolveError> {
     // GQA / pixtral invariants get validated *before* the worker
     // even starts. Any error here propagates so the operator sees
     // the field-level reason rather than a generic "wrong family".
-    match rvllm_loader::mistral35_arch::Mistral35Arch::from_dir(model_dir) {
+    match rvllm_runtime::mistral35_arch::Mistral35Arch::from_dir(model_dir) {
         Ok(Some(_)) => Ok(true),
         Ok(None) => {
             // Markers matched but the parser returned None — should

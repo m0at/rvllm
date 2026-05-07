@@ -81,6 +81,13 @@ pub mod sched_state;
 pub mod vision_preprocess;
 pub mod scheduler;
 
+/// Re-export the Mistral 3.5 loader-side modules so downstream
+/// crates (`rvllm-serve`) can reach them through `rvllm-runtime`
+/// without taking a direct `rvllm-loader` dependency — keeps the
+/// declared crate DAG (rvllm-invariants/tests/dag.rs) intact.
+pub use rvllm_loader::mistral35_arch;
+pub use rvllm_loader::mistral35_weights;
+
 pub use bring_up::{Bringup, EnginePaths, FusedModules, PplResult};
 pub use engine::{Engine, PendingStep, StepOutput};
 pub use layer_exec::{forward, LayerDims};
