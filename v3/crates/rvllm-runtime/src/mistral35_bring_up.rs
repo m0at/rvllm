@@ -147,6 +147,90 @@ impl Mistral35Bringup {
         }
         KvDecodeStrategy::for_gqa_ratio(q / kv)
     }
+
+    /// Resolved batched-prefill phase configuration. Read once at
+    /// startup so individual layer-launches can branch in O(1) on
+    /// the cached struct rather than touching env vars per launch.
+    /// Phase semantics are documented in
+    /// `v3/MISTRAL35_BATCHED_PREFILL_PLAN.md`.
+    pub fn batched_prefill_config(&self) -> BatchedPrefillConfig {
+        BatchedPrefillConfig::from_env()
+    }
+}
+
+/// Per-phase env gates for the Mistral 3.5 batched prefill pipeline.
+/// Mirrors the Qwen 3.6 `RVLLM_QWEN36_BATCH_*` family so a future
+/// rollout can flip the same gates per phase as it lands. Default
+/// is "all on" matching the Qwen phase-7 production default — opt
+/// out by setting the var to `0` if a phase regresses cosine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BatchedPrefillConfig {
+    /// Phase M-A: NVFP4 q/k/v/o/gate/up/down projections batched
+    /// over N tokens. Single CUTLASS NVFP4 GEMM launch per
+    /// projection per layer.
+    pub batch_projections: bool,
+    /// Phase M-A optional: fused `[Q || K || V]` projection. Off
+    /// by default — the Mistral checkpoint ships split tensors;
+    /// fusing is a load-time staging step that doubles loader
+    /// complexity for ~2 launches/layer saved.
+    pub fused_qkv: bool,
+    /// Phase M-B: fused YaRN RoPE + NVFP4 KV-write across N
+    /// tokens. One launch per layer.
+    pub batch_rope: bool,
+    /// Phase M-C: FA2 NVFP4 prefill kernel served the whole `[N]`
+    /// prompt in one launch per layer.
+    pub batch_full_prefill: bool,
+    /// Phase M-D: outer-loop deletion in `run_generate`. Implicit
+    /// when M-A/M-B/M-C are all on. Stored explicitly so a
+    /// regression bisect can flip phases independently.
+    pub outer_loop_deleted: bool,
+    /// Phase M-E: decode-step CUDA Graph capture. Off by default
+    /// — same scope as the parked Qwen Phase 8 work.
+    pub decode_graph_capture: bool,
+}
+
+impl Default for BatchedPrefillConfig {
+    fn default() -> Self {
+        // Production default once the kernels land: every prefill
+        // gate ON, decode-graph still off. Until then `load()`
+        // ignores the config because `run_generate` is a stub.
+        Self {
+            batch_projections: true,
+            fused_qkv: false,
+            batch_rope: true,
+            batch_full_prefill: true,
+            outer_loop_deleted: true,
+            decode_graph_capture: false,
+        }
+    }
+}
+
+impl BatchedPrefillConfig {
+    fn from_env() -> Self {
+        let on = |name: &str, default: bool| -> bool {
+            match std::env::var(name).ok().as_deref() {
+                Some("0") | Some("false") | Some("FALSE") | Some("off") => false,
+                Some("1") | Some("true") | Some("TRUE") | Some("on") => true,
+                _ => default,
+            }
+        };
+        let batch_projections = on("RVLLM_MISTRAL35_BATCH_PROJ_PREFILL", true);
+        let fused_qkv = on("RVLLM_MISTRAL35_FUSED_QKV", false);
+        let batch_rope = on("RVLLM_MISTRAL35_BATCH_ROPE_PREFILL", true);
+        let batch_full_prefill = on("RVLLM_MISTRAL35_BATCH_FULL_PREFILL", true);
+        let decode_graph_capture = on("RVLLM_MISTRAL35_DECODE_GRAPH", false);
+        // Phase M-D collapses when its predecessors are all on.
+        let outer_loop_deleted =
+            batch_projections && batch_rope && batch_full_prefill;
+        Self {
+            batch_projections,
+            fused_qkv,
+            batch_rope,
+            batch_full_prefill,
+            outer_loop_deleted,
+            decode_graph_capture,
+        }
+    }
 }
 
 impl Mistral35Bringup {
@@ -211,6 +295,17 @@ impl Mistral35Bringup {
                  constants to >=12 to flip onto the fused path."
             );
         }
+        let prefill = bringup.batched_prefill_config();
+        eprintln!(
+            "[mistral35] batched-prefill: proj={} fused_qkv={} rope={} \
+             full_prefill={} outer_loop_deleted={} decode_graph={}",
+            prefill.batch_projections,
+            prefill.fused_qkv,
+            prefill.batch_rope,
+            prefill.batch_full_prefill,
+            prefill.outer_loop_deleted,
+            prefill.decode_graph_capture,
+        );
         Ok(bringup)
     }
 
@@ -402,5 +497,40 @@ mod tests {
             KvDecodeStrategy::for_gqa_ratio(0),
             KvDecodeStrategy::PerHeadFallback
         );
+    }
+
+    #[test]
+    fn batched_prefill_default_is_full_on_except_decode_graph_and_qkv() {
+        // Ensure no env vars from a previous test leak in.
+        for v in [
+            "RVLLM_MISTRAL35_BATCH_PROJ_PREFILL",
+            "RVLLM_MISTRAL35_FUSED_QKV",
+            "RVLLM_MISTRAL35_BATCH_ROPE_PREFILL",
+            "RVLLM_MISTRAL35_BATCH_FULL_PREFILL",
+            "RVLLM_MISTRAL35_DECODE_GRAPH",
+        ] {
+            std::env::remove_var(v);
+        }
+        let cfg = BatchedPrefillConfig::from_env();
+        assert!(cfg.batch_projections);
+        assert!(cfg.batch_rope);
+        assert!(cfg.batch_full_prefill);
+        assert!(cfg.outer_loop_deleted);
+        assert!(!cfg.fused_qkv);
+        assert!(!cfg.decode_graph_capture);
+    }
+
+    #[test]
+    fn batched_prefill_outer_loop_collapses_when_phase_off() {
+        // Disabling any one of the prefill phases must drop the
+        // implicit outer-loop-deleted flag, even though the
+        // operator did not flip it directly.
+        std::env::set_var("RVLLM_MISTRAL35_BATCH_PROJ_PREFILL", "0");
+        std::env::set_var("RVLLM_MISTRAL35_BATCH_ROPE_PREFILL", "1");
+        std::env::set_var("RVLLM_MISTRAL35_BATCH_FULL_PREFILL", "1");
+        let cfg = BatchedPrefillConfig::from_env();
+        assert!(!cfg.batch_projections);
+        assert!(!cfg.outer_loop_deleted);
+        std::env::remove_var("RVLLM_MISTRAL35_BATCH_PROJ_PREFILL");
     }
 }
