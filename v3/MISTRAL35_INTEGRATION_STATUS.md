@@ -1,9 +1,21 @@
 # Mistral 3.5 integration status
 
-Snapshot for the `rusty_sm121_mistral` branch after **25 incremental
+Snapshot for the `rusty_sm121_mistral` branch after **34 incremental
 loop iterations**. The integration spec lives in
 `mistral-35-integration.md` (repo root); this file tracks what's
 landed in code vs what still needs the GPU/CUTLASS work.
+
+**Companion plan docs** (read for design context before touching
+the GPU work-stream):
+
+- `v3/MISTRAL35_BATCHED_PREFILL_PLAN.md` — phase-by-phase rollout
+  of the batched prefill (M-A through M-E mirroring Qwen 4b/5/6/7/8).
+- `v3/MISTRAL35_PIXTRAL_VISION_PLAN.md` — Pixtral ViT kernel
+  reuse map; only 2 truly Pixtral-specific kernels needed.
+- `v3/crates/rvllm-runtime/src/mistral35_bring_up.rs` module-doc —
+  load-time-once SFB transform strategy + per-prefill SFA scratch
+  reuse + alpha_ptr device-pointer convention (codex-reviewed).
+- `v3/MISTRAL35_PROFILE_TEMPLATE.env` — drop-in rvllm profile.
 
 ## What's landed (Rust + design + math + harness, fully tested)
 
@@ -58,11 +70,47 @@ below.
 | Cosine harness: `tools/cmp_mistral35_layer_ref.py` walks every `*.bin`, loads as f32 LE, reports per-file cosine + max-abs-error, exits 1 with first-drift bisect pointer when below threshold. | tools/cmp_mistral35_layer_ref.py | (drift-detection live verified) |
 | CI determinism gate: `tests/mistral35_layer_ref_determinism.rs` runs the layer ref twice with the same seed + byte-compares; runs the probe binary twice + byte-compares; asserts different seeds yield different outputs. | tests/mistral35_layer_ref_determinism.rs | 3 |
 
-### Workspace test counts (post iteration 22)
+### Step 4 hardening — codex review cycle (iterations 27-30)
+
+Three rounds of codex review against the standalone-compiled .cu
+sources caught + landed real bugs before any GPU run:
+
+| Bug | File | Severity | Status |
+|---|---|---|---|
+| SFA-transform coord arithmetic — `(row, kb, 0)` wrong; `tile_atom_to_shape_SFA` consumes LOGICAL K, not K/16 block index. The layout has zero stride within each 16-element scale group, so the canonical coord for scale-block `kb` is `(row, kb * 16, 0)`. | `kernels/cutlass_nvfp4_gemm_sm120.cu` | medium (silent wrong-stride lookup) | fixed (commit a013748) |
+| **Missing SFB transform** — original landing only handled SFA (regenerated per-layer per-token); the Mistral checkpoint ships `weight_scale` as natural `[N, K/16]` row-major but the GEMM reads it as if already CUTLASS-interleaved. Without an SFB transform the GEMM consumes garbage scales and silently produces wrong outputs. | `kernels/cutlass_nvfp4_gemm_sm120.cu`, `rvllm-cutlass/src/lib_so.rs` | **high (silent garbage)** | fixed (commit a013748) — full sfb_transform + sfb_bytes + sfb_natural_bytes ABI |
+| Host stall on global F32 scale — original `cudaMemcpyAsync(b_global_scale_f32 → host)` + `cudaStreamSynchronize` per launch costs ~5-15µs of host blocking time per layer per token. CUTLASS's Sm120 epilogue Args has `alpha_ptr` device-pointer support (cf. `cutlass/epilogue/fusion/sm120_callbacks_tma_warpspecialized.hpp:148`); switch to that. | `kernels/cutlass_nvfp4_gemm_sm120.cu` | medium (perf) | fixed (commit f35b0c2) |
+| ABI naming `a_fp8` for NVFP4-packed buffers — Codex flagged that the parameter name in the Rust ABI was misleading (the buffer is NVFP4-packed `m * k / 2` bytes, not raw FP8 `m * k`). Renamed to `a_packed`. | `rvllm-cutlass/src/lib_so.rs` | low (docs / clarity) | fixed (commit fb4f07e) |
+| `sfb_bytes(n, k)` accepted `k % 16 != 0` and returned a plausible-looking byte count for an impossible NVFP4 scale geometry. Now rejects, matching the transform + natural-bytes queries. | `kernels/cutlass_nvfp4_gemm_sm120.cu` | low (defensive) | fixed (commit dc5efcc) |
+
+Plus a follow-up codex round confirmed the **load-time-once SFB
+transform** strategy is correct (CUTLASS's
+`tile_atom_to_shape_SFB` consumes only `(N, K, L)` — runtime `M`
+is discarded), so no `(m_bucket, n, k)` cache is needed. Strategy
+codified in `mistral35_bring_up.rs` module doc.
+
+### Vision plan doc — Pixtral GPU forward (iteration 31)
+
+`v3/MISTRAL35_PIXTRAL_VISION_PLAN.md`: phase-by-phase ViT forward
+sequence (48 blocks, head_dim=104, 2D RoPE), kernel-reuse map.
+Only **2 truly Pixtral-specific kernels** identified:
+
+* `vit_rotary_pixtral_2d_{f16,bf16}.cu` — head_dim=104 means
+  head_dim/2=52 sin/cos pairs/head, NOT a power of 2 (existing
+  rotary kernels are 64/128). New variant required.
+* `patch_merger_pixtral_2x2.cu` — 2×2 spatial concat into a
+  6656-channel merged token (different shape from Qwen
+  PatchMerger).
+
+All other vision pieces (RMSNorm, gelu_tanh, softmax, FA2 BF16,
+extract/scatter heads, splice mechanism) port unchanged from the
+existing Qwen 3.6 / Gemma 4 vision paths.
+
+### Workspace test counts (post iteration 31)
 
 ```
 cargo test --workspace --features cuda,gb10
-→ 41 test binaries / 450 passed / 0 failed
+→ 41 test binaries / 454 passed / 0 failed
 ```
 
 Net new tests landed by this branch: **~110**, distributed across
@@ -144,11 +192,30 @@ Mistral's image-token id 10. The host-side preprocess
 
 ## Branch-shape summary
 
-25 commits on `rusty_sm121_mistral`, each gated by build-green +
+34 commits on `rusty_sm121_mistral`, each gated by build-green +
 tests-green + zero regressions on Gemma 4 / Qwen 3.6 paths. Every
 Rust-callable surface for Mistral 3.5 is in place and CI-locked
 (determinism integration test). The CPU baseline + cosine
-validation harness is operational. The GPU work-stream remaining
-is concentrated in five well-bounded kernel-implementation tasks
-above; each has its CPU-reference numpy diff already wired so the
-implementation cycle is predictable.
+validation harness is operational. **Three rounds of codex
+(GPT-5.5) review** landed against the standalone-compiled .cu
+sources caught five real bugs (one would have been silent garbage
+in production); all addressed before any GPU run.
+
+The GPU work-stream remaining is concentrated in five well-
+bounded kernel-implementation tasks (A-E above) plus the two
+Pixtral-specific kernels (`vit_rotary_pixtral_2d`,
+`patch_merger_pixtral_2x2`). Each piece has its CPU-reference
+numpy diff already wired or its strategy doc nailed down so the
+implementation cycle is predictable rather than exploratory.
+
+Plan-doc cross-reference for whoever picks up the GPU side:
+
+```
+mistral-35-integration.md             — upstream spec (root of repo)
+v3/MISTRAL35_INTEGRATION_STATUS.md    — THIS file: what's landed
+v3/MISTRAL35_BATCHED_PREFILL_PLAN.md  — decoder phases M-A through M-E
+v3/MISTRAL35_PIXTRAL_VISION_PLAN.md   — vision forward + 2 new kernels
+v3/MISTRAL35_PROFILE_TEMPLATE.env     — drop-in rvllm profile
+v3/crates/rvllm-runtime/src/mistral35_bring_up.rs (module-doc)
+                                      — load-time SFB strategy
+```
