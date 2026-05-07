@@ -180,6 +180,67 @@ curl -s http://127.0.0.1:8010/v1/chat/completions -d \
 # → error.code = "reserved_marker_in_text"
 ```
 
+## Qwen 3.6 batched prefill (Phases 4b/5/6/7) — production default
+
+Status (head `aac7220`): all transformer-stack batched-prefill
+phases are GREEN and **default-ON** in production. Per-request
+1.77×–2.69× TTFT improvement at N = 22 / 293 vs the legacy
+token-major path.
+
+Five env-gates control the path; each is ON by default and can be
+opted out individually with `=0`:
+
+| Env | What it batches | Files |
+|---|---|---|
+| `RVLLM_QWEN36_BATCH_LINEAR_PREFILL` | linear-attn (Gated-DeltaNet) over N tokens, one launch per layer | `kernels/gated_delta_rule_prefill_f16.cu`, `kernels/conv_state_advance_batched_f16.cu` |
+| `RVLLM_QWEN36_BATCH_FULL_PREFILL` | full-attn causal-prefill via existing `flash_attention_2_f16kv_kernel` + cast f16↔f32 | reuse |
+| `RVLLM_QWEN36_BATCH_MOE_PREFILL` | router GEMV + topk-softmax batched over N | `kernels/router_gemv_batched_f16_to_f32.cu`, `kernels/topk_softmax_batched_f32.cu` |
+| `RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN` | per-row indirect FP8 GEMVs (8 k-rounds × 3 launches per layer) | `kernels/fp8_gemv_blockwise_wpr_native_f16in_*_indirect_batched_topk.cu`, `kernels/scaled_add_f16_to_f32_devw_batched_topk.cu` |
+| `RVLLM_QWEN36_BATCH_MOE_SHARED` | shared-expert batched + final residual | `kernels/shared_gate_dot_sigmoid_f16_batched.cu`, `kernels/scaled_add_f16_to_f32_devw_batched.cu` |
+
+Outer-loop deletion (Phase 7) is implicit: when the gates are on,
+`forward_qwen36_decode_cancellable` runs strictly layer-major and
+skips the legacy `for tok_local in 0..num_tokens` chain.
+
+### Audit
+Per-(layer, phase, tok) hidden-state dumps via
+`RVLLM_QWEN36_DUMP_DIR=/tmp/dump`; `v3/tools/cmp_qwen36_prefill_layers.py`
+diffs two dump dirs row-wise. With all five gates on vs token-major
+default: all 40 layers × N tokens × 2 phases produce
+`cos = 1.000000` / `max_abs = 0.0` (byte-equivalent, 1782 rows on
+the N = 22 canary).
+
+### Bench
+`RVLLM_QWEN36_TIMING=1` logs per-prefill `[qwen36-timing]` lines
+with prompt_tokens + prefill_ms + per-gate state. Headline:
+* N = 22:  449 ms → 254 ms (1.77×, −43%)
+* N = 293: 6836 ms → 2539 ms (2.69×, −63%)
+
+The win scales with prompt length because per-token launch
+overhead dominates for the legacy path.
+
+### Production rollout invariant — round-26 / 27 race fixes
+* `pos_cl_region` / `context_lens` / `positions` per-token slot
+  ids live in DRAM, populated once per request by
+  `qwen_fill_pos_slots_i32` on `self.stream`. The legacy
+  `Region::copy_from_host` path — which was a sync
+  `cuMemcpyHtoD_v2` on the legacy default stream and raced with
+  the non-blocking compute stream — is replaced. Both token-major
+  and layer-major branches use the device-fill path now.
+* The token-major path was non-deterministic across runs prior to
+  the round-26 fix; repeated greedy canaries used to alternate
+  between two valid German jokes. Post-fix the same canary is
+  byte-stable.
+
+### Phase 8 — TODO
+Decode-step CUDA Graph capture is parked as Phase 8 in
+`v3/QWEN_BATCHED_PREFILL_PLAN.md`. Codex round-28 picked a
+workspace-based factoring (`decode_step_launch_only` reading
+device pointers, no per-call arena allocation, no sync DtoH inside
+the captured body) over capturing the current allocation-heavy
+forward. Realistic scope 500–1000 LOC, separate session. Not
+blocking the prefill rollout above.
+
 ## Other docs in this tree
 
 - `llm_instructions_sm121.md` — NVFP4 + FP8 algorithmic picture

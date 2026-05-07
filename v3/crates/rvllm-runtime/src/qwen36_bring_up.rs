@@ -5248,10 +5248,15 @@ impl Qwen36Bringup {
         // expert routing (MoE) — those are the next phases.
         //
         // Default OFF until canary green vs the per-token reference.
+        // Round-27d: batched-prefill phases are default-ON in production
+        // post-audit (Phases Linear / Full / MoE 6a–6c all byte-identical
+        // to the per-token reference across 1782 layer/phase/token dump
+        // rows). Set the env-var to "0" / "false" to opt back into the
+        // legacy token-major path.
         let batch_linear = num_tokens > 1
             && std::env::var("RVLLM_QWEN36_BATCH_LINEAR_PREFILL")
-                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes"))
-                .unwrap_or(false);
+                .map(|s| !matches!(s.as_str(), "0" | "false" | "FALSE" | "no"))
+                .unwrap_or(true);
         if batch_linear {
             // Round-24 audit: mirror the per-token path's last-token
             // dump from `RVLLM_QWEN36_DUMP_DIR`. Drops the same files
@@ -5360,11 +5365,13 @@ impl Qwen36Bringup {
                         // be 0 (= prefill chunk anchored at sequence
                         // start) for batched mode; later chunks use the
                         // per-token path.
+                        // Round-27d: default-ON post-audit. "0"/"false"
+                        // selects the legacy per-token sub-loop.
                         let batch_full = start_position == 0
                             && std::env::var("RVLLM_QWEN36_BATCH_FULL_PREFILL")
-                                .map(|s| matches!(s.as_str(),
-                                    "1"|"true"|"TRUE"|"yes"))
-                                .unwrap_or(false);
+                                .map(|s| !matches!(s.as_str(),
+                                    "0"|"false"|"FALSE"|"no"))
+                                .unwrap_or(true);
                         if batch_full {
                             let inner_ck = self.arena.checkpoint();
                             self.apply_layer_full_attn_batched(
@@ -5426,11 +5433,12 @@ impl Qwen36Bringup {
                 // launch each for router GEMV + topk-softmax) and
                 // delegate per-token expert FFN with override. Else
                 // fall back to per-token routing+FFN.
+                // Round-27d: default-ON post-audit.
                 let batch_moe = start_position == 0
                     && std::env::var("RVLLM_QWEN36_BATCH_MOE_PREFILL")
-                        .map(|s| matches!(s.as_str(),
-                            "1"|"true"|"TRUE"|"yes"))
-                        .unwrap_or(false);
+                        .map(|s| !matches!(s.as_str(),
+                            "0"|"false"|"FALSE"|"no"))
+                        .unwrap_or(true);
                 if batch_moe {
                     let inner_ck = self.arena.checkpoint();
                     self.apply_layer_moe_batched(
@@ -7659,10 +7667,11 @@ impl Qwen36Bringup {
         // token expert FFN with override). Codex round-27 routed-FFN
         // batched plan: 8 k-rounds × 3 batched kernels = 24 launches
         // per layer, retains the per-token k=0..7 add order.
+        // Round-27d: default-ON post-audit.
         let routed_ffn_batched = std::env::var(
             "RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN")
-            .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
-            .unwrap_or(false);
+            .map(|s| !matches!(s.as_str(), "0"|"false"|"FALSE"|"no"))
+            .unwrap_or(true);
         let topk_idx_base = topk_idx_region.device_ptr();
         let topk_w_base = topk_w_region.device_ptr();
         let topk_stride_bytes = (top_k as u64) * 4;
@@ -7875,10 +7884,11 @@ impl Qwen36Bringup {
         // / down GEMV / shared_gate / scaled_add jeweils row-
         // unabhängig sind und der inner-reduction Pfad m=1 vs m=N
         // identisch ist.
+        // Round-27d: default-ON post-audit.
         let shared_batched = routed_ffn_batched
             && std::env::var("RVLLM_QWEN36_BATCH_MOE_SHARED")
-                .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
-                .unwrap_or(false);
+                .map(|s| !matches!(s.as_str(), "0"|"false"|"FALSE"|"no"))
+                .unwrap_or(true);
         if shared_batched {
             let sh_gate_bs = match moe.shared_expert_gate_proj.blockscale_ptr {
                 Some(p) => p, None => return Ok(()) };
