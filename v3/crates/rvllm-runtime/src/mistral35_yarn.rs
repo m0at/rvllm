@@ -194,6 +194,68 @@ impl YarnRopeTables {
     }
 }
 
+/// Apply YaRN-RoPE rotation to one Q or K head vector at a single
+/// position, using pre-computed cos/sin tables. Pure CPU
+/// reference — the future fused CUDA kernel does the same math
+/// in-place on Q/K activations during the projection epilogue.
+///
+/// Layout convention follows the canonical Llama / Mistral RoPE:
+/// the head vector is split into two halves, where element `i`
+/// pairs with element `i + half`:
+///
+/// ```text
+///   x_rot[i]        = x[i]        * cos[i] - x[i + half] * sin[i]
+///   x_rot[i + half] = x[i + half] * cos[i] + x[i]        * sin[i]
+/// ```
+///
+/// This matches HuggingFace's `rotate_half` convention. Mistral's
+/// reference impl + the existing rvllm Gemma/Qwen kernels use this
+/// layout; the NVFP4 kernel will too. Returns a new
+/// `Vec<f32>` so tests / probes can compare against numpy refs.
+pub fn apply_rope_pair(
+    x: &[f32],
+    cos_pos: &[f32],
+    sin_pos: &[f32],
+) -> Vec<f32> {
+    assert_eq!(
+        x.len() % 2, 0,
+        "apply_rope_pair: head_dim={} must be even", x.len()
+    );
+    let half = x.len() / 2;
+    assert_eq!(
+        cos_pos.len(), half,
+        "apply_rope_pair: cos_pos len={} expected {half}", cos_pos.len()
+    );
+    assert_eq!(
+        sin_pos.len(), half,
+        "apply_rope_pair: sin_pos len={} expected {half}", sin_pos.len()
+    );
+    let mut out = vec![0.0f32; x.len()];
+    for i in 0..half {
+        let a = x[i];
+        let b = x[i + half];
+        out[i]        = a * cos_pos[i] - b * sin_pos[i];
+        out[i + half] = b * cos_pos[i] + a * sin_pos[i];
+    }
+    out
+}
+
+/// Convenience: index into a [`YarnRopeTables`] at `pos` and call
+/// [`apply_rope_pair`]. Returns the rotated head vector.
+pub fn apply_rope_at(
+    tables: &YarnRopeTables,
+    x: &[f32],
+    pos: usize,
+) -> Vec<f32> {
+    assert!(
+        pos < tables.max_pos,
+        "apply_rope_at: pos={pos} >= max_pos={}", tables.max_pos
+    );
+    let half = tables.head_dim / 2;
+    let off = pos * half;
+    apply_rope_pair(x, &tables.cos[off..off + half], &tables.sin[off..off + half])
+}
+
 /// Build the YaRN cos/sin tables for `pos in 0..max_pos`. `max_pos`
 /// is typically `original_max_position_embeddings` at startup
 /// (4096 for Mistral 3.5) — positions beyond that fall through to
@@ -336,6 +398,81 @@ mod tests {
     fn yarn_inv_freq_rejects_odd_head_dim() {
         let cfg = mistral_yarn();
         let _ = yarn_inv_freq(&cfg, 65);
+    }
+
+    #[test]
+    fn apply_rope_at_pos_zero_is_identity_modulo_mscale() {
+        // At pos=0, cos = mscale, sin = 0 → rotated vector is just
+        // x * mscale (component-wise).
+        let cfg = mistral_yarn();
+        let head_dim = 8usize;
+        let t = build_yarn_rope_tables(&cfg, head_dim, 4);
+        let x: Vec<f32> = (0..head_dim).map(|i| (i + 1) as f32).collect();
+        let rot = apply_rope_at(&t, &x, 0);
+        for i in 0..head_dim {
+            let expect = x[i] * t.mscale;
+            assert!(
+                (rot[i] - expect).abs() < 1e-5,
+                "i={i} rot={} expect={}", rot[i], expect
+            );
+        }
+    }
+
+    #[test]
+    fn apply_rope_pair_rotation_invariant() {
+        // For any (a, b) pair, the rotation preserves the
+        // sum-of-squares (modulo the mscale^2 factor when applied
+        // through the table). Verify with a hand-picked angle.
+        let cos = vec![0.6f32];
+        let sin = vec![0.8f32]; // unit vector: cos^2 + sin^2 = 1
+        let x = vec![3.0f32, 4.0f32]; // norm² = 25
+        let r = apply_rope_pair(&x, &cos, &sin);
+        // r[0] = 3*0.6 - 4*0.8 = 1.8 - 3.2 = -1.4
+        // r[1] = 4*0.6 + 3*0.8 = 2.4 + 2.4 = 4.8
+        // norm² = 1.96 + 23.04 = 25.0 ✓
+        assert!((r[0] - (-1.4)).abs() < 1e-5);
+        assert!((r[1] - 4.8).abs() < 1e-5);
+        let n2 = r.iter().map(|v| v * v).sum::<f32>();
+        assert!((n2 - 25.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn apply_rope_at_pos_one_matches_explicit_rotation() {
+        // pos=1 → angle_i = inv_freq[i]; verify one element pair
+        // matches the cos/sin formula directly.
+        let cfg = mistral_yarn();
+        let head_dim = 8usize;
+        let t = build_yarn_rope_tables(&cfg, head_dim, 4);
+        let (inv_freq, mscale) = yarn_inv_freq_and_mscale(&cfg, head_dim);
+
+        let x: Vec<f32> = (0..head_dim).map(|i| (i + 1) as f32).collect();
+        let rot = apply_rope_at(&t, &x, 1);
+
+        let half = head_dim / 2;
+        for i in 0..half {
+            let angle = inv_freq[i];
+            let c = mscale * angle.cos();
+            let s = mscale * angle.sin();
+            let expect_lo = x[i] * c - x[i + half] * s;
+            let expect_hi = x[i + half] * c + x[i] * s;
+            assert!((rot[i]        - expect_lo).abs() < 1e-5);
+            assert!((rot[i + half] - expect_hi).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn apply_rope_pair_rejects_size_mismatch() {
+        // cos has half = 3, but x has head_dim = 4 (half = 2).
+        let _ = apply_rope_pair(&[1.0, 2.0, 3.0, 4.0], &[1.0; 3], &[0.0; 3]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn apply_rope_at_rejects_out_of_range_pos() {
+        let cfg = mistral_yarn();
+        let t = build_yarn_rope_tables(&cfg, 8, 4);
+        let _ = apply_rope_at(&t, &[1.0; 8], 100);
     }
 
     #[test]
