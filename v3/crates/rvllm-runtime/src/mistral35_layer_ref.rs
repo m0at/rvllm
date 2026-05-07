@@ -114,7 +114,10 @@ pub struct KvCacheF32 {
 
 impl KvCacheF32 {
     pub fn seq_len(&self, kv_dim: usize) -> usize {
-        if kv_dim == 0 { 0 } else { self.k.len() / kv_dim }
+        // Explicit branch over `checked_div` so the panic-free
+        // semantics are obvious on review and the kv_dim==0 case
+        // returns zero without unwrap noise.
+        self.k.len().checked_div(kv_dim).unwrap_or(0)
     }
     pub fn push(&mut self, k_row: &[f32], v_row: &[f32]) {
         self.k.extend_from_slice(k_row);
@@ -182,8 +185,12 @@ pub fn mistral_layer_step(
         let q_off = h_idx * dims.head_dim;
         let kv_off_per_pos = kv_h * dims.head_dim;
 
-        // Scores [seq_len].
+        // Scores [seq_len]. Index-loop is clearer here than
+        // `iter_mut().enumerate()` because each step reads from
+        // BOTH `q_rot` (per-head offset) AND `kv.k` (per-position
+        // stride) — a paired iter() chain hides that structure.
         let mut scores = vec![0.0f32; seq_len];
+        #[allow(clippy::needless_range_loop)]
         for s in 0..seq_len {
             let mut dot = 0.0f32;
             for d in 0..dims.head_dim {
@@ -193,7 +200,10 @@ pub fn mistral_layer_step(
             scores[s] = dot * scale;
         }
         let probs = softmax_row(&scores);
-        // attn = sum_s probs[s] * V[s, kv_h, :]
+        // attn = sum_s probs[s] * V[s, kv_h, :].  Same rationale —
+        // the nested loop reads probs[s] and kv.v[s, kv_h, d] in
+        // a strided pattern; iter() would obscure the math.
+        #[allow(clippy::needless_range_loop)]
         for d in 0..dims.head_dim {
             let mut acc = 0.0f32;
             for s in 0..seq_len {

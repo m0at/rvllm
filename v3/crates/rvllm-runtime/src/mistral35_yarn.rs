@@ -130,6 +130,10 @@ pub fn yarn_inv_freq(cfg: &YarnRopeConfig, head_dim: usize) -> Vec<f32> {
 
     let inv_factor = if cfg.factor > 0.0 { 1.0 / cfg.factor } else { 1.0 };
 
+    // Index-driven loop: clippy suggests iter().enumerate() but the
+    // ramp expression is most readable as a function of `i` (the
+    // freq-index sitting between low_dim and high_dim).
+    #[allow(clippy::needless_range_loop)]
     for i in 0..half {
         // ramp ∈ [0, 1]: 0 at the high-freq end (low i), 1 at the
         // low-freq end (high i). Per YaRN reference impl, this is
@@ -278,6 +282,10 @@ pub fn build_yarn_rope_tables(
     let total = max_pos * half;
     let mut cos = Vec::with_capacity(total);
     let mut sin = Vec::with_capacity(total);
+    // Two-level index loops: outer indexes positions, inner reads
+    // inv_freq[i]. iter().enumerate() on an empty Vec is awkward
+    // here because we're growing cos / sin in step.
+    #[allow(clippy::needless_range_loop)]
     for pos in 0..max_pos {
         let posf = pos as f32;
         for i in 0..half {
