@@ -322,7 +322,7 @@ pub async fn chat_completions(
         ));
     }
     ensure_model_matches(&state, &req.model)?;
-    reject_v1_unsupported_chat(&req)?;
+    reject_v1_unsupported_chat(&req, state.vision_arch)?;
 
     if req.messages.is_empty() {
         return Err(ApiError::invalid_param(
@@ -654,6 +654,7 @@ pub async fn chat_completions(
     let render_tools = req.tools.clone();
     let render_tokenizer = state.tokenizer.clone();
     let render_admission = _admission.clone();
+    let render_vision_arch = state.vision_arch;
     type RenderOut = (Vec<u32>, Vec<crate::tokenize::VisionSlot>, Vec<crate::worker::VisionItem>);
     let render_join = tokio::task::spawn_blocking(move || -> ApiResult<RenderOut> {
         let _admission = render_admission;
@@ -666,6 +667,7 @@ pub async fn chat_completions(
                 &render_messages,
                 render_tools.as_ref(),
                 &vision_items,
+                render_vision_arch,
             )?;
             Ok((ids, slots, vision_items))
         }
@@ -2122,7 +2124,39 @@ fn completion_stream_sse(
 // Helpers shared by both handlers
 // ═════════════════════════════════════════════════════════════════════
 
-fn reject_v1_unsupported_chat(req: &ChatCompletionRequest) -> ApiResult<()> {
+fn reject_v1_unsupported_chat(
+    req: &ChatCompletionRequest,
+    vision_arch: crate::router::VisionArch,
+) -> ApiResult<()> {
+    // Mistral 3.5 introduces `reasoning_effort` (allowed values
+    // `"none"` and `"high"`). For non-Mistral families this field
+    // is rejected so a Gemma/Qwen caller doesn't think the knob is
+    // taking effect server-side. For Mistral, validate the value
+    // up-front and let the chat-template render path use it later.
+    if let Some(eff) = req.reasoning_effort.as_deref() {
+        let normalised = eff.trim().to_ascii_lowercase();
+        match vision_arch {
+            crate::router::VisionArch::Mistral35 => {
+                if !matches!(normalised.as_str(), "none" | "high") {
+                    return Err(ApiError::invalid_param(
+                        "reasoning_effort must be \"none\" or \"high\" for Mistral 3.5",
+                        "reasoning_effort",
+                        "reasoning_effort_invalid",
+                    ));
+                }
+            }
+            _ => {
+                return Err(ApiError::invalid_param(
+                    "reasoning_effort is only honoured by Mistral 3.5; \
+                     this server is running a different family. Remove \
+                     the field to avoid silently downgraded behaviour.",
+                    "reasoning_effort",
+                    "reasoning_effort_unsupported",
+                ));
+            }
+        }
+    }
+
     // Capture-and-reject for params we don't honour. Without an
     // explicit error here, OpenAI clients silently get plain greedy/
     // sampled output even though they asked for JSON mode, penalties,
@@ -2366,8 +2400,10 @@ fn collect_vision_items(
     messages: &[crate::openai::chat::ChatMessage],
     cancelled: &Arc<AtomicBool>,
 ) -> ApiResult<Vec<crate::worker::VisionItem>> {
-    use crate::openai::vision_fetch::{fetch_image, predict_gemma_num_tokens, predict_qwen_num_tokens, VisionError};
-    let is_gemma = matches!(vision_arch, crate::router::VisionArch::Gemma4);
+    use crate::openai::vision_fetch::{
+        fetch_image, predict_gemma_num_tokens, predict_mistral35_num_tokens,
+        predict_qwen_num_tokens, VisionError,
+    };
 
     // Cheap admission preflight: count image parts BEFORE fetching any
     // bytes, so a request with hundreds of slow URLs can't tie up the
@@ -2426,10 +2462,10 @@ fn collect_vision_items(
                     "image_fetch_failed",
                 ),
             })?;
-            let num_tokens = if is_gemma {
-                predict_gemma_num_tokens(w, h)
-            } else {
-                predict_qwen_num_tokens(w, h)
+            let num_tokens = match vision_arch {
+                crate::router::VisionArch::Gemma4 => predict_gemma_num_tokens(w, h),
+                crate::router::VisionArch::Qwen36 => predict_qwen_num_tokens(w, h),
+                crate::router::VisionArch::Mistral35 => predict_mistral35_num_tokens(w, h),
             }
             .map_err(|e| {
                 ApiError::invalid_param(

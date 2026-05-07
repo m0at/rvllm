@@ -220,13 +220,15 @@ impl TokenizerHandle {
     /// vision-tower output into the post-embed hidden buffer.
     ///
     /// Qwen 3.6 specifically: image_pad token id = 248056. Gemma 4
-    /// uses a different placeholder; that path is added when Gemma
-    /// vision lands (Phase 3).
+    /// uses `<|image|>` = 258880. Mistral 3.5 uses image_token_index
+    /// = 10 (also a regular '\n' in many tokenizers, so this branch
+    /// is gated by `vision_arch`).
     pub fn render_chat_with_vision(
         &self,
         messages: &[crate::openai::chat::ChatMessage],
         tools: Option<&serde_json::Value>,
         vision_items: &[crate::worker::VisionItem],
+        vision_arch: crate::router::VisionArch,
     ) -> Result<(Vec<u32>, Vec<VisionSlot>), ApiError> {
         // Render via the existing template path. Build per-message
         // content as a typed list when image parts are present, so the
@@ -323,13 +325,21 @@ impl TokenizerHandle {
         let raw_ids = enc.get_ids().to_vec();
 
         // Locate each model-specific image-placeholder token and expand
-        // it to `vision_items[i].num_tokens` copies in document order.
-        //   Qwen 3.6:  `<|image_pad|>` = 248056
-        //   Gemma 4:   `<|image|>`     = 258880
-        // Whichever fires for the current template wins per request.
-        const QWEN_IMAGE_PAD: u32 = 248056;
-        const GEMMA_IMAGE: u32 = 258880;
-        let is_image_token = |t: u32| -> bool { t == QWEN_IMAGE_PAD || t == GEMMA_IMAGE };
+        // it to `vision_items[i].num_tokens` copies. The recognised
+        // ids are GATED by `vision_arch` because Mistral 3.5's
+        // `image_token_index = 10` collides with newline (id 10) in
+        // many other tokenizers — recognising it unconditionally would
+        // explode every request that contains a newline once a non-
+        // Mistral model is loaded.
+        //   Qwen 3.6:    `<|image_pad|>` = 248056
+        //   Gemma 4:     `<|image|>`     = 258880
+        //   Mistral 3.5: `[IMG]`         = 10
+        let image_token_ids: &[u32] = match vision_arch {
+            crate::router::VisionArch::Qwen36 => &[248056],
+            crate::router::VisionArch::Gemma4 => &[258880],
+            crate::router::VisionArch::Mistral35 => &[10],
+        };
+        let is_image_token = |t: u32| -> bool { image_token_ids.contains(&t) };
         let mut expanded: Vec<u32> = Vec::with_capacity(
             raw_ids.len()
                 + vision_items

@@ -434,6 +434,107 @@ pub fn predict_gemma_num_tokens(width: u32, height: u32) -> Result<usize, Vision
     Ok(n_patches / k2)
 }
 
+/// Pixtral preprocessing parameters used for token-count prediction
+/// (Mistral 3.5). Match the public checkpoint:
+/// `image_size = 1540` (longest edge), `patch_size = 14`,
+/// `spatial_merge_size = 2`. The product `patch_size *
+/// spatial_merge_size = 28` is the rounding factor for the resized
+/// dims so the merged grid stays integer.
+#[derive(Clone, Copy, Debug)]
+pub struct Mistral35PixtralPredictConfig {
+    pub longest_edge: u32,
+    pub patch_size: u32,
+    pub spatial_merge_size: u32,
+}
+
+impl Default for Mistral35PixtralPredictConfig {
+    fn default() -> Self {
+        Self {
+            longest_edge: 1540,
+            patch_size: 14,
+            spatial_merge_size: 2,
+        }
+    }
+}
+
+/// Predict the number of soft tokens Mistral 3.5's Pixtral tower
+/// emits for an image of `width × height`. Must match the actual
+/// preprocess (`vision_preprocess::preprocess_mistral35_pixtral`,
+/// landed in Step 7); the worker compares predicted vs measured
+/// token counts and rejects on mismatch.
+///
+/// Algorithm:
+///   1. Reject zero-pixel images up-front.
+///   2. Scale by `s = min(1, longest_edge / max(w, h))` so the
+///      longest edge fits within `longest_edge` px while preserving
+///      aspect ratio.
+///   3. Round each dim to a multiple of `patch_size *
+///      spatial_merge_size` so `merged_h × merged_w` stays integer.
+///   4. `merged_h = resized_h / (patch_size * spatial_merge_size)`,
+///      `merged_w = resized_w / (patch_size * spatial_merge_size)`.
+///   5. `num_tokens = merged_h * merged_w`.
+pub fn predict_mistral35_num_tokens(width: u32, height: u32) -> Result<usize, VisionError> {
+    predict_mistral35_num_tokens_with(
+        width,
+        height,
+        Mistral35PixtralPredictConfig::default(),
+    )
+}
+
+pub fn predict_mistral35_num_tokens_with(
+    width: u32,
+    height: u32,
+    cfg: Mistral35PixtralPredictConfig,
+) -> Result<usize, VisionError> {
+    if width == 0 || height == 0 {
+        return Err(VisionError::Predict(format!(
+            "mistral35: zero-pixel image ({width}x{height})"
+        )));
+    }
+    if cfg.patch_size == 0 || cfg.spatial_merge_size == 0 || cfg.longest_edge == 0 {
+        return Err(VisionError::Predict(
+            "mistral35: pixtral predict config has zero field".into(),
+        ));
+    }
+
+    let factor = cfg.patch_size * cfg.spatial_merge_size; // 14 * 2 = 28
+    let max_side = width.max(height);
+
+    // Aspect-preserving downscale (no upscale: preserve images
+    // already within the longest-edge cap as-is, then round).
+    let (mut resized_h, mut resized_w) = if max_side <= cfg.longest_edge {
+        (height, width)
+    } else {
+        let scale = cfg.longest_edge as f64 / max_side as f64;
+        let h = ((height as f64) * scale).floor().max(1.0) as u32;
+        let w = ((width as f64) * scale).floor().max(1.0) as u32;
+        (h, w)
+    };
+
+    // Round each dim DOWN to a multiple of `factor`. If the rounded
+    // value would be zero, snap up to one factor unit so the image
+    // contributes at least 1 merged token (matches HF Pixtral's
+    // ceil-min behaviour for tiny images).
+    resized_h = (resized_h / factor) * factor;
+    resized_w = (resized_w / factor) * factor;
+    if resized_h == 0 {
+        resized_h = factor;
+    }
+    if resized_w == 0 {
+        resized_w = factor;
+    }
+
+    let merged_h = resized_h / factor;
+    let merged_w = resized_w / factor;
+    let num_tokens = (merged_h as usize) * (merged_w as usize);
+    if num_tokens == 0 {
+        return Err(VisionError::Predict(format!(
+            "mistral35: predicted zero tokens for {width}x{height}"
+        )));
+    }
+    Ok(num_tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +574,49 @@ mod tests {
     fn parse_data_uri_percent_encoded_path() {
         let bytes = parse_data_uri("image/png,%89PNG%0D%0A%1A%0A").unwrap();
         assert_eq!(bytes, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    }
+
+    #[test]
+    fn mistral35_predict_square_at_longest_edge() {
+        // 1540x1540 fits exactly. factor=28, merged grid 55x55 = 3025.
+        let n = predict_mistral35_num_tokens(1540, 1540).unwrap();
+        assert_eq!(n, 55 * 55);
+    }
+
+    #[test]
+    fn mistral35_predict_wide_image_scales_down() {
+        // 3080x1540 → scale 0.5 → 1540x770 → factor-28 round →
+        // 1540x756 → merged 55x27 = 1485.
+        let n = predict_mistral35_num_tokens(3080, 1540).unwrap();
+        assert_eq!(n, 55 * 27);
+    }
+
+    #[test]
+    fn mistral35_predict_tall_image_scales_down() {
+        // Symmetric to wide.
+        let n = predict_mistral35_num_tokens(1540, 3080).unwrap();
+        assert_eq!(n, 27 * 55);
+    }
+
+    #[test]
+    fn mistral35_predict_tiny_image_snaps_to_one_factor() {
+        // 10x10 < factor=28, rounds down to 0 then snaps up to 28
+        // so merged = 1x1 = 1 token.
+        let n = predict_mistral35_num_tokens(10, 10).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn mistral35_predict_rejects_zero_pixels() {
+        assert!(predict_mistral35_num_tokens(0, 100).is_err());
+        assert!(predict_mistral35_num_tokens(100, 0).is_err());
+    }
+
+    #[test]
+    fn mistral35_predict_under_longest_edge_no_upscale() {
+        // 100x200 stays at 100x200 (no upscale) → factor-28 →
+        // 84x196 → merged 3x7 = 21.
+        let n = predict_mistral35_num_tokens(100, 200).unwrap();
+        assert_eq!(n, 3 * 7);
     }
 }

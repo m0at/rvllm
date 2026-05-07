@@ -64,6 +64,13 @@ pub struct ChatCompletionRequest {
     /// follow-up but until then we reject so callers don't think
     /// they got it.
     pub stream_options: Option<serde_json::Value>,
+
+    /// Mistral 3.5's `reasoning_effort` knob. Allowed values:
+    /// `"none"` (default — direct reply) and `"high"` (long-form
+    /// reasoning). Rendered into the chat template by the Mistral
+    /// path. For non-Mistral families this field is rejected with a
+    /// clear error so callers don't think the knob took effect.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for ChatCompletionRequest {
@@ -89,6 +96,7 @@ impl Default for ChatCompletionRequest {
             presence_penalty: None,
             frequency_penalty: None,
             stream_options: None,
+            reasoning_effort: None,
         }
     }
 }
