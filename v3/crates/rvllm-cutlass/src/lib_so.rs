@@ -462,19 +462,29 @@ fn resolve_sm120_so_path(
 // at startup so Mistral 3.5 refuses to bring up against a stale
 // `.so`. The Gemma 4 / Qwen 3.6 paths keep working unchanged.
 
-/// Main NVFP4 GEMM kernel. `b_packed` is the NVFP4 weight tensor
-/// (`U8 [N, K/2]`, two E2M1 values per byte, low-nibble first).
-/// `b_scale_e4m3` is the per-row × per-16-K scale grid
-/// (`Fp8E4M3 [N, K/16]`). `b_global_scale_f32` is the F32 scalar.
-/// Activation FP8 + per-token scale come in via `a_fp8` / `sfa`.
+/// Main NVFP4 GEMM kernel. Both A and B are NVFP4-packed
+/// (`U8 [_, K/2]`, two E2M1 values per byte, low-nibble first):
+///   - `a_packed`: `[m, k/2]` activation tensor.
+///   - `b_packed`: `[n, k/2]` weight tensor.
+/// `sfa` is the staged CUTLASS-interleaved per-token activation
+/// scale (`Fp8E4M3`, sized via [`Nvfp4Sm120SfaBytesFn`]).
+/// `b_scale_e4m3` is the staged CUTLASS-interleaved weight scale
+/// (`Fp8E4M3`, sized via [`Nvfp4Sm120SfbBytesFn`]).
+/// `b_global_scale_f32` is the `[1]` F32 device scalar fed to the
+/// epilogue's `alpha_ptr` (no host stall).
+///
+/// Codex review (2026-05-07) flagged the original `a_fp8` parameter
+/// name as misleading — the buffer is NVFP4-packed, not raw FP8
+/// E4M3. The kernel internally dequantises NVFP4 → FP8/F16 inside
+/// the tensor-core MMA path; callers stage NVFP4 in `a_packed`.
 #[cfg(feature = "cuda")]
 #[allow(clippy::type_complexity)]
 pub type Nvfp4GemmSm120Fn = unsafe extern "C" fn(
     output: *mut c_void,
-    a_fp8: *const c_void,
+    a_packed: *const c_void,
     b_packed: *const c_void,
     sfa: *const c_void,            // staged per-token activation scales
-    b_scale_e4m3: *const c_void,   // [N, K/16] E4M3
+    b_scale_e4m3: *const c_void,   // [N, K/16] E4M3 → CUTLASS interleaved
     b_global_scale_f32: *const c_void, // [1] F32
     m: i32,
     n: i32,
@@ -493,18 +503,20 @@ pub type Nvfp4GemmSm120WorkspaceFn = unsafe extern "C" fn(m: i32, n: i32, k: i32
 #[cfg(feature = "cuda")]
 pub type Nvfp4Sm120SfaBytesFn = unsafe extern "C" fn(m: i32, k: i32) -> usize;
 
-/// Single-call activation prep: BF16/F16 -> NVFP4 packed + CUTLASS-
-/// interleaved SFA. Internally chains [`Nvfp4Sm120PrepActFn`] and
-/// [`Nvfp4Sm120SfaTransformFn`]; the caller still must provide a
-/// scratch buffer for the natural-layout intermediate. The `.so`
-/// today returns -100 for this entry pending the chained
-/// implementation; callers should use the explicit prep_act +
-/// sfa_natural_to_interleaved pair below until then.
+/// Single-call activation prep: BF16/F16 -> NVFP4-packed bytes +
+/// CUTLASS-interleaved SFA. Internally chains
+/// [`Nvfp4Sm120PrepActFn`] and [`Nvfp4Sm120SfaTransformFn`]; the
+/// caller still must provide a scratch buffer for the natural-
+/// layout intermediate. The `.so` today returns -100 for this
+/// entry pending the chained implementation; callers should use
+/// the explicit prep_act + sfa_natural_to_interleaved pair below
+/// until then. Output `a_packed_out` is `m * k / 2` U8 bytes (NOT
+/// `m * k` — the buffer is FP4-packed, not raw FP8).
 #[cfg(feature = "cuda")]
 #[allow(clippy::type_complexity)]
 pub type Nvfp4Sm120PrepSfaFn = unsafe extern "C" fn(
     a_input_fp16_or_bf16: *const c_void,
-    a_fp8_out: *mut c_void,
+    a_packed_out: *mut c_void,
     sfa_out: *mut c_void,
     m: i32,
     k: i32,
@@ -1250,19 +1262,24 @@ impl CutlassSm120Lib {
         )
     }
 
-    /// Quantize activations to FP8 + stage SFA scratch. Single launch
-    /// per layer.
+    /// Single-call activation prep: BF16/F16 -> NVFP4-packed bytes
+    /// + CUTLASS-interleaved SFA scratch. Today the underlying
+    /// `cutlass_nvfp4_gemm_sm120_prep_sfa` symbol stubs to -100 in
+    /// the .cu source; callers should prefer
+    /// [`Self::launch_nvfp4_prep_sfa_chain`] which runs the
+    /// explicit prep_act → sfa_transform chain.
     ///
     /// # Safety
     /// All device pointers must be valid for the kernel's duration.
-    /// `a_fp8_out` must have at least `m * k` bytes; `sfa_out` must
-    /// have at least `nvfp4_sfa_bytes(m, k)` bytes.
+    /// `a_packed_out` must have at least `m * k / 2` bytes (NVFP4-
+    /// packed, two E2M1 per byte); `sfa_out` must have at least
+    /// `nvfp4_sfa_bytes(m, k)` bytes.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch_nvfp4_prep_sfa(
         &self,
         a_input: u64,
-        a_fp8_out: u64,
+        a_packed_out: u64,
         sfa_out: u64,
         m: i32,
         k: i32,
@@ -1283,7 +1300,7 @@ impl CutlassSm120Lib {
         })?;
         let rc = f(
             a_input as *const c_void,
-            a_fp8_out as *mut c_void,
+            a_packed_out as *mut c_void,
             sfa_out as *mut c_void,
             m,
             k,
@@ -1305,22 +1322,31 @@ impl CutlassSm120Lib {
         Ok(())
     }
 
-    /// Launch the NVFP4 GEMM. Selects the m=1 specialised kernel
-    /// when one is loaded and `m == 1`; otherwise routes to the
-    /// general batched-prefill kernel.
+    /// Launch the NVFP4 GEMM. When `m == 1` AND the specialised
+    /// `decode_m1` symbol is loaded, the call routes to it;
+    /// otherwise the general prefill kernel handles `m == 1`
+    /// correctly (codex review 2026-05-07: today
+    /// `cutlass_nvfp4_gemm_sm120_decode_m1` in the .cu source is
+    /// just an alias on the prefill kernel — the route is taken,
+    /// but no actual specialisation runs until that .cu function
+    /// gains a real m=1 register-light implementation).
     ///
     /// # Safety
     /// All device pointers must be valid for the kernel's duration.
-    /// `b_packed` is `[N, K/2]` U8; `b_scale_e4m3` is `[N, K/16]`
-    /// E4M3; `b_global_scale_f32` is `[1]` F32. `a_fp8` is the
-    /// activations FP8E4M3-quantized by `launch_nvfp4_prep_sfa`;
-    /// `sfa` is the staged per-token scales.
+    /// `a_packed` is `[m, k/2]` NVFP4-packed activations (NOT raw
+    /// FP8 — staged by `launch_nvfp4_prep_act`); `b_packed` is
+    /// `[n, k/2]` NVFP4 weights; `b_scale_e4m3` is the CUTLASS-
+    /// interleaved weight SFB (sized via `nvfp4_sfb_bytes`);
+    /// `sfa` is the CUTLASS-interleaved per-token activation SFA
+    /// (sized via `nvfp4_sfa_bytes`); `b_global_scale_f32` is the
+    /// `[1]` F32 device scalar (fed to the epilogue's `alpha_ptr`,
+    /// no host stall).
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch_nvfp4_gemm(
         &self,
         output: u64,
-        a_fp8: u64,
+        a_packed: u64,
         b_packed: u64,
         sfa: u64,
         b_scale_e4m3: u64,
@@ -1359,7 +1385,7 @@ impl CutlassSm120Lib {
         })?;
         let rc = f(
             output as *mut c_void,
-            a_fp8 as *const c_void,
+            a_packed as *const c_void,
             b_packed as *const c_void,
             sfa as *const c_void,
             b_scale_e4m3 as *const c_void,
@@ -1893,7 +1919,7 @@ impl CutlassBackend {
     pub unsafe fn launch_nvfp4_prep_sfa(
         &self,
         a_input: u64,
-        a_fp8_out: u64,
+        a_packed_out: u64,
         sfa_out: u64,
         m: i32,
         k: i32,
@@ -1903,7 +1929,7 @@ impl CutlassBackend {
         match self {
             CutlassBackend::SoSm120(lib) => lib.launch_nvfp4_prep_sfa(
                 a_input,
-                a_fp8_out,
+                a_packed_out,
                 sfa_out,
                 m,
                 k,
@@ -1927,7 +1953,7 @@ impl CutlassBackend {
     pub unsafe fn launch_nvfp4_gemm(
         &self,
         output: u64,
-        a_fp8: u64,
+        a_packed: u64,
         b_packed: u64,
         sfa: u64,
         b_scale_e4m3: u64,
@@ -1942,7 +1968,7 @@ impl CutlassBackend {
         match self {
             CutlassBackend::SoSm120(lib) => lib.launch_nvfp4_gemm(
                 output,
-                a_fp8,
+                a_packed,
                 b_packed,
                 sfa,
                 b_scale_e4m3,
