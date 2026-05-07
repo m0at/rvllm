@@ -62,6 +62,13 @@ pub struct Mistral35Bringup {
     /// Whether every required NVFP4 CUTLASS symbol resolved. Always
     /// true on the `Ok` path — `load` refuses startup otherwise.
     pub nvfp4_active: bool,
+    /// Resolved CUTLASS backend handle (only populated under the
+    /// `cuda` feature; the .so + fn-pointer cache lives here so the
+    /// forward path doesn't have to re-open it). The struct is
+    /// `Send + Sync` per its own unsafe impl, so the worker thread
+    /// can hold the bring-up across the whole request loop.
+    #[cfg(feature = "cuda")]
+    pub cutlass_backend: Option<rvllm_cutlass::lib_so::CutlassBackend>,
 }
 
 #[derive(Debug)]
@@ -413,8 +420,24 @@ impl Mistral35Bringup {
         //     skip the gate there and only record the field. Any
         //     attempt to actually generate then trips
         //     `Mistral35Error::NoCudaFeature` cleanly.
-        let nvfp4_active = require_nvfp4_symbols(&paths)?;
+        // (3) CUTLASS backend resolution. On `cuda` builds we store
+        //     the loaded backend handle so the forward path can call
+        //     into it directly. On default (no-cuda) builds we skip
+        //     the dlopen entirely and report nvfp4_active=false; any
+        //     forward call then errors with NoCudaFeature.
+        #[cfg(feature = "cuda")]
+        let (nvfp4_active, cutlass_backend) = {
+            let backend = load_and_require_nvfp4(&paths)?;
+            (backend.nvfp4_active(), Some(backend))
+        };
+        #[cfg(not(feature = "cuda"))]
+        let nvfp4_active = false;
 
+        #[cfg(feature = "cuda")]
+        let bringup = Self {
+            paths, arch, inventory, arena_bytes, nvfp4_active, cutlass_backend,
+        };
+        #[cfg(not(feature = "cuda"))]
         let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
         let strategy = bringup.kv_decode_strategy();
         eprintln!(
@@ -445,12 +468,24 @@ impl Mistral35Bringup {
         // Indicative scratch-budget at a few common prefill chunk
         // sizes so the operator can see whether the requested
         // arena_bytes covers the steady-state working set up front.
+        // The backend-aware path takes precedence under `cuda` so
+        // the line reports the exact CUTLASS-derived sizes; the
+        // arithmetic fallback covers no-cuda builds.
         for m in [1usize, 32, 256] {
+            #[cfg(feature = "cuda")]
+            let b = match bringup.cutlass_backend.as_ref() {
+                Some(backend) => bringup.scratch_budget_with_backend(m, backend),
+                None => bringup.scratch_budget(m),
+            };
+            #[cfg(not(feature = "cuda"))]
             let b = bringup.scratch_budget(m);
+
             eprintln!(
                 "[mistral35] scratch_budget m={m:>3}: a_packed={:>10} B  \
-                 sfa_natural={:>9} B  sfa_cutlass(max)={:>9} B",
+                 sfa_natural={:>9} B  sfa_cutlass(max)={:>9} B  \
+                 workspace(max)={:>9} B",
                 b.a_packed_bytes, b.sfa_natural_bytes, b.sfa_cutlass_bytes_max,
+                b.workspace_bytes_max,
             );
         }
         Ok(bringup)
@@ -492,7 +527,9 @@ fn scan_safetensors_index(
 }
 
 #[cfg(feature = "cuda")]
-fn require_nvfp4_symbols(paths: &Mistral35EnginePaths) -> Result<bool> {
+fn load_and_require_nvfp4(
+    paths: &Mistral35EnginePaths,
+) -> Result<rvllm_cutlass::lib_so::CutlassBackend> {
     use rvllm_cutlass::lib_so::CutlassBackend;
     use rvllm_core::CompileTarget;
 
@@ -504,16 +541,7 @@ fn require_nvfp4_symbols(paths: &Mistral35EnginePaths) -> Result<bool> {
         &[],
     )?;
     backend.require_nvfp4()?;
-    Ok(true)
-}
-
-#[cfg(not(feature = "cuda"))]
-fn require_nvfp4_symbols(_paths: &Mistral35EnginePaths) -> Result<bool> {
-    // No CUDA build: skip the dlopen check. The bring-up record
-    // still parses arch + validates inventory so config.json /
-    // checkpoint integrity is verifiable without a GPU. Every
-    // forward call then errors with NoCudaFeature.
-    Ok(false)
+    Ok(backend)
 }
 
 fn corrupt(path: PathBuf, detail: String) -> RvllmError {
