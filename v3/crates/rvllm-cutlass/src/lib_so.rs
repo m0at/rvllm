@@ -548,6 +548,30 @@ pub type Nvfp4Sm120SfaTransformFn = unsafe extern "C" fn(
 #[cfg(feature = "cuda")]
 pub type Nvfp4Sm120NaturalSfaBytesFn = unsafe extern "C" fn(m: i32, k: i32) -> usize;
 
+/// Weight-side SFB transform: natural row-major `[n, k/16]` E4M3
+/// (the Mistral checkpoint's `weight_scale`) -> CUTLASS Sm120
+/// interleaved SFB. Required because the checkpoint ships natural
+/// layout; without this transform the GEMM reads garbage scales.
+/// Pure index permutation. Codex review (2026-05-07) caught the
+/// missing SFB transform — the original landing only handled SFA
+/// (the activation side, which IS regenerated per layer).
+#[cfg(feature = "cuda")]
+pub type Nvfp4Sm120SfbTransformFn = unsafe extern "C" fn(
+    src_natural: *const c_void,
+    dst_cutlass: *mut c_void,
+    n: i32,
+    k: i32,
+    stream: *mut c_void,
+) -> i32;
+
+/// CUTLASS-interleaved SFB destination size (with swizzle padding).
+#[cfg(feature = "cuda")]
+pub type Nvfp4Sm120SfbBytesFn = unsafe extern "C" fn(n: i32, k: i32) -> usize;
+
+/// Natural-layout SFB scratch size — `n * k / 16`.
+#[cfg(feature = "cuda")]
+pub type Nvfp4Sm120SfbNaturalBytesFn = unsafe extern "C" fn(n: i32, k: i32) -> usize;
+
 /// Resolved `libcutlass_sm120.so` + fn pointer. Intentionally simpler
 /// than `CutlassLib`: only one entry point today
 /// (`cutlass_fp8_gemm_blockscale_sm120` + its workspace helper),
@@ -593,6 +617,15 @@ pub struct CutlassSm120Lib {
     /// Natural-layout SFA size query.
     #[cfg(feature = "cuda")]
     pub nvfp4_natural_sfa_bytes: Option<Nvfp4Sm120NaturalSfaBytesFn>,
+    /// Weight-side SFB transform — required (codex review). The
+    /// loader runs this once per per-layer linear at load time so
+    /// the device-resident `weight_scale` is GEMM-ready.
+    #[cfg(feature = "cuda")]
+    pub nvfp4_sfb_transform: Option<Nvfp4Sm120SfbTransformFn>,
+    #[cfg(feature = "cuda")]
+    pub nvfp4_sfb_bytes: Option<Nvfp4Sm120SfbBytesFn>,
+    #[cfg(feature = "cuda")]
+    pub nvfp4_sfb_natural_bytes: Option<Nvfp4Sm120SfbNaturalBytesFn>,
 }
 
 #[cfg(feature = "cuda")]
@@ -680,6 +713,21 @@ impl CutlassSm120Lib {
                 .ok()
                 .map(|s| *s)
         };
+        let nvfp4_sfb_transform: Option<Nvfp4Sm120SfbTransformFn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_sfb_natural_to_interleaved\0")
+                .ok()
+                .map(|s| *s)
+        };
+        let nvfp4_sfb_bytes: Option<Nvfp4Sm120SfbBytesFn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_sfb_bytes\0")
+                .ok()
+                .map(|s| *s)
+        };
+        let nvfp4_sfb_natural_bytes: Option<Nvfp4Sm120SfbNaturalBytesFn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_sfb_natural_bytes\0")
+                .ok()
+                .map(|s| *s)
+        };
         Ok(Self {
             so_path: path,
             _lib: lib,
@@ -697,6 +745,9 @@ impl CutlassSm120Lib {
             nvfp4_prep_act,
             nvfp4_sfa_transform,
             nvfp4_natural_sfa_bytes,
+            nvfp4_sfb_transform,
+            nvfp4_sfb_bytes,
+            nvfp4_sfb_natural_bytes,
         })
     }
 
@@ -909,6 +960,13 @@ impl CutlassSm120Lib {
             && self.nvfp4_prep_act.is_some()
             && self.nvfp4_sfa_transform.is_some()
             && self.nvfp4_natural_sfa_bytes.is_some()
+            // Codex review (2026-05-07): the weight SFB transform
+            // is mandatory — without it the GEMM reads natural-
+            // layout `weight_scale` as if it were CUTLASS-
+            // interleaved and produces garbage outputs.
+            && self.nvfp4_sfb_transform.is_some()
+            && self.nvfp4_sfb_bytes.is_some()
+            && self.nvfp4_sfb_natural_bytes.is_some()
     }
 
     /// `Ok(())` iff `nvfp4_active`. Used at Mistral 3.5 startup —
@@ -937,6 +995,15 @@ impl CutlassSm120Lib {
         }
         if self.nvfp4_natural_sfa_bytes.is_none() {
             missing.push("cutlass_nvfp4_gemm_sm120_prep_act_sfa_bytes");
+        }
+        if self.nvfp4_sfb_transform.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120_sfb_natural_to_interleaved");
+        }
+        if self.nvfp4_sfb_bytes.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120_sfb_bytes");
+        }
+        if self.nvfp4_sfb_natural_bytes.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120_sfb_natural_bytes");
         }
         // Diagnostic stderr line so the operator sees exactly which
         // symbols failed to bind without grepping a missing-feature
@@ -1080,6 +1147,66 @@ impl CutlassSm120Lib {
                     cuda: rvllm_core::CudaErrorKind::LaunchFailed,
                 },
                 CutlassCtx { kernel: "nvfp4_sfa_transform_sm120", stream },
+            ));
+        }
+        Ok(())
+    }
+
+    /// CUTLASS-interleaved SFB destination size (with swizzle padding).
+    #[cfg(feature = "cuda")]
+    pub fn nvfp4_sfb_bytes(&self, n: i32, k: i32) -> usize {
+        self.nvfp4_sfb_bytes
+            .map(|f| unsafe { f(n, k) })
+            .unwrap_or(0)
+    }
+
+    /// Natural-layout SFB scratch size (`n * k / 16`).
+    #[cfg(feature = "cuda")]
+    pub fn nvfp4_sfb_natural_bytes(&self, n: i32, k: i32) -> usize {
+        self.nvfp4_sfb_natural_bytes
+            .map(|f| unsafe { f(n, k) })
+            .unwrap_or(0)
+    }
+
+    /// Weight SFB transform: natural row-major `[n, k/16]` E4M3 ->
+    /// CUTLASS-interleaved SFB. Run once at load time per per-layer
+    /// linear so the device-resident weight scale is GEMM-ready.
+    ///
+    /// # Safety
+    /// `src_natural` must be `n * k / 16` bytes;
+    /// `dst_cutlass` must be `nvfp4_sfb_bytes(n, k)` bytes.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_sfb_transform(
+        &self,
+        src_natural: u64,
+        dst_cutlass: u64,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> Result<()> {
+        let f = self.nvfp4_sfb_transform.ok_or_else(|| {
+            RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::Other,
+                },
+                CutlassCtx { kernel: "nvfp4_sfb_transform_sm120 (missing from .so)", stream },
+            )
+        })?;
+        let rc = f(
+            src_natural as *const c_void,
+            dst_cutlass as *mut c_void,
+            n, k,
+            stream as *mut c_void,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                },
+                CutlassCtx { kernel: "nvfp4_sfb_transform_sm120", stream },
             ));
         }
         Ok(())
@@ -1671,6 +1798,52 @@ impl CutlassBackend {
                     op: "nvfp4_sfa_transform requires CutlassBackend::SoSm120",
                 },
                 CutlassCtx { kernel: "nvfp4_sfa_transform", stream },
+            )),
+        }
+    }
+
+    /// CUTLASS-interleaved SFB destination size.
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn nvfp4_sfb_bytes(&self, n: i32, k: i32) -> usize {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.nvfp4_sfb_bytes(n, k),
+            _ => 0,
+        }
+    }
+
+    /// Natural-layout SFB scratch size (`n * k / 16`).
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn nvfp4_sfb_natural_bytes(&self, n: i32, k: i32) -> usize {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.nvfp4_sfb_natural_bytes(n, k),
+            _ => 0,
+        }
+    }
+
+    /// # Safety
+    /// See `CutlassSm120Lib::launch_nvfp4_sfb_transform` for buffer
+    /// requirements.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_sfb_transform(
+        &self,
+        src_natural: u64,
+        dst_cutlass: u64,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.launch_nvfp4_sfb_transform(
+                src_natural, dst_cutlass, n, k, stream,
+            ),
+            _ => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "nvfp4_sfb_transform requires CutlassBackend::SoSm120",
+                },
+                CutlassCtx { kernel: "nvfp4_sfb_transform", stream },
             )),
         }
     }

@@ -307,18 +307,25 @@ size_t cutlass_nvfp4_gemm_sm120_sfa_bytes(int m, int k) {
 // thread; cache benefits dominate over thread-density on this kind
 // of pure-permutation kernel).
 // -------------------------------------------------------------------
-// Concrete SFA layout type, deduced from the Mistral GEMM
-// instantiation above. We bind it to a fixed layout type so the
-// kernel below isn't a template — nvcc's __cudaRegisterEntry stub
+// Concrete SFA / SFB layout types, deduced from the Mistral GEMM
+// instantiation above. We bind them to fixed layout types so the
+// kernels below aren't templates — nvcc's __cudaRegisterEntry stub
 // generation doesn't tolerate template kernels in anonymous
 // namespaces with cute::Layout type parameters (bug-shape: the
 // mangled-name pasted into the stub trips the host C compiler).
 //
-// `layout_SFA` deduced shape:
-//   ((MMA_M_atom, M_tile), (K_block_atom, K_tile), (1, L))
-// — i.e. 3 modes. Coord is therefore (row, k_block, l=0).
+// SFA shape: 3 modes (M, K, L) — N elided.
+// SFB shape: 3 modes (N, K, L) — M elided.
+// Coord arity is therefore 3-tuple in both cases. Per CUTLASS
+// reference, the K mode encodes LOGICAL K elements (not K/16
+// scale-block indices); the layout has zero stride inside each
+// 16-element scale group, so the canonical representative coord
+// for scale-block `kb` is `kb * 16`.
 using SfaInterleavedLayout =
     decltype(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+        cute::make_shape(int{0}, int{0}, int{0}, int{0})));
+using SfbInterleavedLayout =
+    decltype(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
         cute::make_shape(int{0}, int{0}, int{0}, int{0})));
 
 __global__ void nvfp4_sfa_natural_to_interleaved_kernel(
@@ -332,8 +339,15 @@ __global__ void nvfp4_sfa_natural_to_interleaved_kernel(
     const int row = blockIdx.y;
     if (row >= m || kb >= k_blocks) return;
 
+    // The SFA layout produced by `tile_atom_to_shape_SFA` has 3
+    // modes (M, K, L) — the N dim is elided. K is the LOGICAL
+    // K dim, not the K/16 block index; the layout has zero stride
+    // within each 16-element scale group, so the canonical
+    // representative coord for scale-block `kb` is `kb * 16`.
+    // Codex review (2026-05-07) caught the original `(row, kb, 0)`
+    // — wrong stride accumulation on the hierarchical K mode.
     const __nv_fp8_e4m3 v = src_natural[row * k_blocks + kb];
-    const auto idx = layout(cute::make_coord(row, kb, 0));
+    const auto idx = layout(cute::make_coord(row, kb * 16, 0));
     dst_cutlass[idx] = v;
 }
 
@@ -373,6 +387,87 @@ int cutlass_nvfp4_gemm_sm120_sfa_natural_to_interleaved(
         m, k_blocks);
 
     return (cudaGetLastError() == cudaSuccess) ? 0 : -3;
+}
+
+} // extern "C" — transition out for the SFB transform kernel.
+
+// SFB transform: natural row-major [N, K/16] E4M3 -> CUTLASS Sm120
+// interleaved SFB layout. Mistral 3.5 ships `weight_scale` in the
+// natural layout; without this transform the GEMM reads garbage
+// scales and silently produces wrong outputs (codex review caught
+// this — the original landing forgot SFB and only handled SFA).
+__global__ void nvfp4_sfb_natural_to_interleaved_kernel(
+    const __nv_fp8_e4m3* __restrict__ src_natural,  // [n, k/16] row-major
+    __nv_fp8_e4m3*       __restrict__ dst_cutlass,  // CUTLASS interleaved
+    SfbInterleavedLayout layout,
+    int n,
+    int k_blocks)
+{
+    const int kb     = blockIdx.x;
+    const int n_row  = blockIdx.y;
+    if (n_row >= n || kb >= k_blocks) return;
+
+    // Same coord-arity rule as SFA: 3 modes (N, K, L), K is the
+    // logical K dim — coord for scale-block `kb` is `kb * 16`.
+    const __nv_fp8_e4m3 v = src_natural[n_row * k_blocks + kb];
+    const auto idx = layout(cute::make_coord(n_row, kb * 16, 0));
+    dst_cutlass[idx] = v;
+}
+
+extern "C" {
+
+/// Transform a natural row-major SFB tensor (`[n, k/16]` E4M3,
+/// the Mistral checkpoint's `weight_scale`) into the CUTLASS Sm120
+/// interleaved layout the GEMM kernel consumes. Companion to the
+/// SFA transform above; both must run before
+/// `cutlass_nvfp4_gemm_sm120` reads the per-block scales.
+///
+/// Returns 0 on success, -1 on bad shape, -3 on launch failure.
+int cutlass_nvfp4_gemm_sm120_sfb_natural_to_interleaved(
+    const void* src_natural,
+    void*       dst_cutlass,
+    int n,
+    int k,
+    cudaStream_t stream)
+{
+    if (n <= 0 || k <= 0 || (k % 16) != 0) return -1;
+    if (src_natural == nullptr || dst_cutlass == nullptr) return -1;
+    const int k_blocks = k / 16;
+
+    // Same layout-helper trick as the SFA path: pass an n-independent
+    // m_dummy so the cute layout deduces correctly.
+    const int m_dummy = (n > 0) ? n : 1;
+    auto layout = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
+        cute::make_shape(m_dummy, n, k, 1));
+
+    const dim3 grid(k_blocks, n, 1);
+    const dim3 block(1, 1, 1);
+    nvfp4_sfb_natural_to_interleaved_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(src_natural),
+        reinterpret_cast<__nv_fp8_e4m3*>(dst_cutlass),
+        layout,
+        n, k_blocks);
+
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -3;
+}
+
+/// CUTLASS-interleaved SFB scratch bytes for `[n, k/16]` E4M3 in
+/// the same swizzled layout the GEMM consumes. Mirrors
+/// `cutlass_nvfp4_gemm_sm120_sfa_bytes` for the weight side.
+size_t cutlass_nvfp4_gemm_sm120_sfb_bytes(int n, int k) {
+    if (n <= 0 || k <= 0) return 0;
+    int m_dummy = (n > 0) ? n : 1;
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
+        cute::make_shape(m_dummy, n, k, 1));
+    return static_cast<size_t>(size(filter_zeros(layout_SFB)));
+}
+
+/// Natural-layout SFB bytes — `n * k / 16` (one E4M3 per (n, k_block)
+/// pair). Distinct from `cutlass_nvfp4_gemm_sm120_sfb_bytes`, which
+/// reports the swizzled-and-padded final destination size.
+size_t cutlass_nvfp4_gemm_sm120_sfb_natural_bytes(int n, int k) {
+    if (n <= 0 || k <= 0 || (k % 16) != 0) return 0;
+    return static_cast<size_t>(n) * static_cast<size_t>(k / 16);
 }
 
 /// Activation prep wrapper — chains the natural-layout
