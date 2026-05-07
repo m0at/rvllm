@@ -54,6 +54,15 @@ name = "probe-qwen-fp8-proj"
 path = "src/bin/probe_qwen_fp8_proj.rs"
 required-features = ["gb10"]
 
+# `probe-mistral35-layer-ref` runs the pure-CPU Mistral 3.5 layer
+# reference (mistral35_layer_ref::mistral_layer_step) and dumps
+# per-position hidden states + final KV cache to disk as f32 LE.
+# No CUDA / no model directory needed — the future cosine
+# validation harness uses this as a deterministic baseline.
+[[bin]]
+name = "probe-mistral35-layer-ref"
+path = "src/bin/probe_mistral35_layer_ref.rs"
+
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
