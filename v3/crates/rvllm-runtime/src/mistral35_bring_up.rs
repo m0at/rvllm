@@ -25,6 +25,35 @@
 //! No CUDA / cudarc imports here — the heavy GPU plumbing lives
 //! alongside the Gemma 4 / Qwen 3.6 paths and lands when the
 //! NVFP4 kernel ABI is wired through (steps 4-CUDA / 6 / 9).
+//!
+//! ## Device-upload strategy (codex review, 2026-05-07/08)
+//!
+//! When the CUDA forward path lands, weight upload follows this
+//! per-projection plan:
+//!
+//! 1. mmap → DtoH-stream-upload `weight_packed` (`U8 [N, K/2]`) →
+//!    persistent device-resident NVFP4 weight buffer.
+//! 2. mmap → DtoH-stream-upload `weight_scale` (`E4M3 [N, K/16]`)
+//!    into a TRANSIENT load-time scratch buffer.
+//! 3. Run `CutlassBackend::launch_nvfp4_sfb_transform` to convert
+//!    the natural-layout weight scale into the CUTLASS-interleaved
+//!    SFB layout. The result is **persistent** device-resident.
+//! 4. Free / re-use the natural-layout scratch buffer; the
+//!    safetensors mmap is the durable source-of-truth, no need to
+//!    keep the natural copy around.
+//! 5. mmap → DtoH-stream-upload `weight_global_scale` (`F32 [1]`)
+//!    → persistent device-resident scalar (4-byte aligned, used as
+//!    `epilogue.thread.alpha_ptr` in every GEMM call).
+//!
+//! `tile_atom_to_shape_SFB` consumes only `(N, K, L)` — runtime
+//! `M` is discarded — so the load-time-once transform is
+//! correct: there is no need for an `(m_bucket, n, k)` SFB cache.
+//!
+//! Per-prefill SFA (activation side) follows the inverse pattern:
+//! `prep_act` → `sfa_transform` → GEMM, all on the same stream
+//! into a single reusable scratch buffer sized at the max SFA
+//! across the seven projection shapes (`scratch_budget_with_
+//! backend` already reports this number).
 
 use std::path::PathBuf;
 

@@ -460,8 +460,19 @@ int cutlass_nvfp4_gemm_sm120_sfb_natural_to_interleaved(
 /// CUTLASS-interleaved SFB scratch bytes for `[n, k/16]` E4M3 in
 /// the same swizzled layout the GEMM consumes. Mirrors
 /// `cutlass_nvfp4_gemm_sm120_sfa_bytes` for the weight side.
+///
+/// Codex review (2026-05-08) flagged that the original
+/// implementation didn't reject `k % 16 != 0`, so a misconfigured
+/// caller would receive a plausible-looking byte count for an
+/// impossible NVFP4 scale geometry. The transform + natural-bytes
+/// queries already reject; this one matches now.
+///
+/// CUTLASS's `tile_atom_to_shape_SFB` consumes only `(N, K, L)` —
+/// `M` is discarded — so passing `m_dummy` here is harmless. The
+/// load-time SFB transform runs once per projection regardless
+/// of any later prefill chunk size.
 size_t cutlass_nvfp4_gemm_sm120_sfb_bytes(int n, int k) {
-    if (n <= 0 || k <= 0) return 0;
+    if (n <= 0 || k <= 0 || (k % 16) != 0) return 0;
     int m_dummy = (n > 0) ? n : 1;
     auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
         cute::make_shape(m_dummy, n, k, 1));
