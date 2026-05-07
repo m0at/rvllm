@@ -204,10 +204,11 @@ impl LayerScratchBudget {
 
     /// Backend-aware budget computation. Asks the live
     /// `CutlassBackend` for the exact CUTLASS-interleaved SFA size
-    /// + GEMM workspace bytes per Mistral projection shape, taking
-    /// the max across the seven projections so a single allocation
-    /// covers every layer. Falls back to [`Self::natural`] when the
-    /// backend reports zero (e.g. NVFP4 symbols not yet bound).
+    /// and the GEMM workspace bytes per Mistral projection shape,
+    /// taking the max across the seven projections so a single
+    /// allocation covers every layer. Falls back to
+    /// [`Self::natural`] when the backend reports zero (e.g. NVFP4
+    /// symbols not yet bound).
     #[cfg(feature = "cuda")]
     pub fn with_backend(
         arch: &Mistral35Arch,
