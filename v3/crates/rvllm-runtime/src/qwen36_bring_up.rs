@@ -233,6 +233,20 @@ pub struct Qwen36OutsideKernels {
     /// kernels/topk_softmax_batched_f32.cu.
     pub topk_softmax_batched_f32_mod: LoadedModule,
     pub fn_topk_softmax_batched_f32: KernelFn,
+    /// Phase 6b / Round-27: row-batched indirect FP8 GEMV for the
+    /// MoE down-proj. Per token row m, reads expert index from
+    /// top_idx[m * top_k + k_round]. One launch per layer per
+    /// k-round (3 ker. * 8 = 24 launches per layer instead of N*8*3).
+    pub fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_mod: LoadedModule,
+    pub fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk: KernelFn,
+    /// Phase 6b / Round-27: row-batched indirect FP8 dual-silu GEMV
+    /// for the MoE gate+up-proj fused path.
+    pub fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod: LoadedModule,
+    pub fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk: KernelFn,
+    /// Phase 6b / Round-27: row-batched scaled_add. For each token
+    /// m and hidden n: acc[m, n] += top_w[m, k_round] * f16_to_f32(in[m, n]).
+    pub scaled_add_f16_to_f32_devw_batched_topk_mod: LoadedModule,
+    pub fn_scaled_add_f16_to_f32_devw_batched_topk: KernelFn,
     /// Batched-prefill conv1d state-advance + flat history assembly.
     /// Builds the `[num_tokens + ks - 1, channels]` history buffer
     /// the existing `causal_conv1d_f16` kernel expects, with state
@@ -626,6 +640,21 @@ impl Qwen36Bringup {
             kernels.load_ptx("topk_softmax_batched_f32")?;
         let fn_topk_softmax_batched_f32 = topk_softmax_batched_f32_mod
             .get_function("topk_softmax_batched_f32_kernel")?;
+        let fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_mod =
+            kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk")?;
+        let fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk =
+            fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_mod
+                .get_function("fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_kernel")?;
+        let fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod =
+            kernels.load_ptx("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk")?;
+        let fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk =
+            fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod
+                .get_function("fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_kernel")?;
+        let scaled_add_f16_to_f32_devw_batched_topk_mod =
+            kernels.load_ptx("scaled_add_f16_to_f32_devw_batched_topk")?;
+        let fn_scaled_add_f16_to_f32_devw_batched_topk =
+            scaled_add_f16_to_f32_devw_batched_topk_mod
+                .get_function("scaled_add_f16_to_f32_devw_batched_topk_kernel")?;
         // Vision-tower kernels (Phase 1 .cu added on rusty_sm121_vision).
         let layernorm_inplace_f16_mod = kernels.load_ptx("layernorm_inplace_f16")?;
         let fn_layernorm_inplace_f16 =
@@ -735,6 +764,12 @@ impl Qwen36Bringup {
             fn_router_gemv_batched_f16_to_f32,
             topk_softmax_batched_f32_mod,
             fn_topk_softmax_batched_f32,
+            fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk_mod,
+            fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk,
+            fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk_mod,
+            fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk,
+            scaled_add_f16_to_f32_devw_batched_topk_mod,
+            fn_scaled_add_f16_to_f32_devw_batched_topk,
             layernorm_inplace_f16_mod,
             fn_layernorm_inplace_f16,
             gelu_tanh_f16_mod,
@@ -7437,7 +7472,7 @@ impl Qwen36Bringup {
         self.apply_layer_moe_with_override(
             moe, post_attn_norm_ptr, last_hidden_ptr,
             kernel_gemv, hidden, last_hidden_bytes, _layer_idx,
-            None,
+            None, None,
         )
     }
 
@@ -7594,24 +7629,228 @@ impl Qwen36Bringup {
             }
         }
 
-        // 4. Per-token expert FFN with route override pointing at the
-        // pre-computed slot. Keeps existing per-token order
-        // k=0..K-1, then shared+sigmoid_gate, then residual — so
-        // numerical output is byte-identical to per-token MoE
-        // (codex round-27: "Per-token add order k=0..7, danach
-        // shared, danach residual: byte-Identität realistisch").
+        // 4. Routed FFN: env-gate Phase 6b (batched k-round expert
+        // FFN via row-batched indirect kernels) vs Phase 6a (per-
+        // token expert FFN with override). Codex round-27 routed-FFN
+        // batched plan: 8 k-rounds × 3 batched kernels = 24 launches
+        // per layer, retains the per-token k=0..7 add order.
+        let routed_ffn_batched = std::env::var(
+            "RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN")
+            .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
+            .unwrap_or(false);
         let topk_idx_base = topk_idx_region.device_ptr();
         let topk_w_base = topk_w_region.device_ptr();
         let topk_stride_bytes = (top_k as u64) * 4;
+        // Pre-compute n_int / n_down dimensions for routed FFN.
+        let n_int = moe.experts_gate_proj_fused.shape[1] as u32;
+        let k_in = moe.experts_gate_proj_fused.shape[2] as u32;
+        let n_down = moe.experts_down_proj_fused.shape[1] as u32;
+        let k_down = moe.experts_down_proj_fused.shape[2] as u32;
+        let int_per_expert_w = (n_int as u64) * (k_in as u64);
+        let int_per_expert_bs =
+            ((n_int as u64) / 128) * ((k_in as u64) / 128) * 4;
+        let down_per_expert_w = (n_down as u64) * (k_down as u64);
+        let down_per_expert_bs =
+            ((n_down as u64) / 128) * ((k_down as u64) / 128) * 4;
+        let n_int_us = n_int as usize;
+        let n_down_us = n_down as usize;
+        let h_us = hidden as usize;
+        let mut rs_batched_ptr_opt: Option<u64> = None;
+        if routed_ffn_batched {
+            let gate_bs = match moe.experts_gate_proj_fused.blockscale_ptr {
+                Some(p) => p, None => return Ok(()) };
+            let up_bs = match moe.experts_up_proj_fused.blockscale_ptr {
+                Some(p) => p, None => return Ok(()) };
+            let down_bs = match moe.experts_down_proj_fused.blockscale_ptr {
+                Some(p) => p, None => return Ok(()) };
+            let silu_b_bytes = n * n_int_us * 2;
+            let down_b_bytes = n * n_down_us * 2;
+            let rs_b_bytes = n * h_us * 4;
+            let silu_b = self.arena.region("qwen36_pmb_silu", silu_b_bytes, 16)?;
+            let down_b = self.arena.region("qwen36_pmb_down", down_b_bytes, 16)?;
+            let rs_b = self.arena.region("qwen36_pmb_rs", rs_b_bytes, 16)?;
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let rc = cuMemsetD8Async(
+                    rs_b.device_ptr(), 0, rs_b_bytes,
+                    self.stream.raw() as CUstream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 moe_routed_batched rs_batched memset",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            let num_col_blocks_int = (k_in as i32) / 128;
+            let num_col_blocks_down = (k_down as i32) / 128;
+            for k_round in 0..top_k {
+                // (a) dual_silu_indirect_batched_topk: silu[N, n_int]
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut out_p = silu_b.device_ptr();
+                    let mut bwg = moe.experts_gate_proj_fused.offset_bytes;
+                    let mut bwu = moe.experts_up_proj_fused.offset_bytes;
+                    let mut bsg = gate_bs;
+                    let mut bsu = up_bs;
+                    let mut inp = normed_region.device_ptr();
+                    let mut idx_p = topk_idx_base;
+                    let mut wstride: i64 = int_per_expert_w as i64;
+                    let mut sstride: i64 = (int_per_expert_bs / 4) as i64;
+                    let mut nn = n_int as i32;
+                    let mut kk = k_in as i32;
+                    let mut ncb = num_col_blocks_int;
+                    let mut tk = top_k as i32;
+                    let mut kr = k_round as i32;
+                    let mut nt = num_tokens as i32;
+                    let args = [
+                        (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bwg) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bwu) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bsg) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bsu) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut idx_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut wstride) as *mut i64 as *mut core::ffi::c_void,
+                        (&mut sstride) as *mut i64 as *mut core::ffi::c_void,
+                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut kk) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut tk) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut kr) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid_x: u32 = ((n_int + 7) / 8).max(1);
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels
+                            .fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk
+                            .raw() as CUfunction,
+                        grid_x, num_tokens, 1, block, 1, 1, 0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 moe_routed_batched dual_silu_indirect_batched_topk",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                // (b) down_indirect_batched_topk: down[N, n_down]
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut out_p = down_b.device_ptr();
+                    let mut bw = moe.experts_down_proj_fused.offset_bytes;
+                    let mut bs = down_bs;
+                    let mut inp = silu_b.device_ptr();
+                    let mut idx_p = topk_idx_base;
+                    let mut wstride: i64 = down_per_expert_w as i64;
+                    let mut sstride: i64 = (down_per_expert_bs / 4) as i64;
+                    let mut nn = n_down as i32;
+                    let mut kk = k_down as i32;
+                    let mut ncb = num_col_blocks_down;
+                    let mut tk = top_k as i32;
+                    let mut kr = k_round as i32;
+                    let mut nt = num_tokens as i32;
+                    let args = [
+                        (&mut out_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bw) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut bs) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut idx_p) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut wstride) as *mut i64 as *mut core::ffi::c_void,
+                        (&mut sstride) as *mut i64 as *mut core::ffi::c_void,
+                        (&mut nn) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut kk) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut tk) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut kr) as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid_x: u32 = ((n_down + 7) / 8).max(1);
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels
+                            .fn_fp8_gemv_blockwise_wpr_native_f16in_indirect_batched_topk
+                            .raw() as CUfunction,
+                        grid_x, num_tokens, 1, block, 1, 1, 0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 moe_routed_batched down_indirect_batched_topk",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                // (c) scaled_add_devw_batched_topk: rs_b += top_w[t,k] * down_b
+                #[cfg(feature = "cuda")]
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let mut acc = rs_b.device_ptr();
+                    let mut inp = down_b.device_ptr();
+                    let mut wp = topk_w_base;
+                    let mut hd = hidden as i32;
+                    let mut tk = top_k as i32;
+                    let mut kr = k_round as i32;
+                    let mut nt = num_tokens as i32;
+                    let args = [
+                        (&mut acc) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                        (&mut wp)  as *mut u64 as *mut core::ffi::c_void,
+                        (&mut hd)  as *mut i32 as *mut core::ffi::c_void,
+                        (&mut tk)  as *mut i32 as *mut core::ffi::c_void,
+                        (&mut kr)  as *mut i32 as *mut core::ffi::c_void,
+                        (&mut nt)  as *mut i32 as *mut core::ffi::c_void,
+                    ];
+                    let block: u32 = 256;
+                    let grid_x: u32 = ((hidden + block - 1) / block).max(1);
+                    let rc = cuLaunchKernel(
+                        self.outside_kernels
+                            .fn_scaled_add_f16_to_f32_devw_batched_topk
+                            .raw() as CUfunction,
+                        grid_x, num_tokens, 1, block, 1, 1, 0,
+                        self.stream.raw() as CUstream,
+                        args.as_ptr() as *mut *mut core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    );
+                    if rc != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "qwen36 moe_routed_batched scaled_add_devw_batched_topk",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+            }
+            rs_batched_ptr_opt = Some(rs_b.device_ptr());
+            // Keep regions alive for the per-token loop below; the
+            // arena bump-alloc ensures pointers remain valid until the
+            // outer caller restores. silu/down can technically be
+            // dropped now but rs_batched is still read.
+            let _ = (silu_b, down_b);
+        }
         for t in 0..num_tokens {
             let tok_ptr = hidden_ptr + (t as u64) * (last_hidden_bytes as u64);
             let inner_ck = self.arena.checkpoint();
             let idx_t = topk_idx_base + (t as u64) * topk_stride_bytes;
             let w_t = topk_w_base + (t as u64) * topk_stride_bytes;
+            let rs_seed = rs_batched_ptr_opt.map(|p| p + (t as u64) * (h_us as u64) * 4);
             self.apply_layer_moe_with_override(
                 moe, post_attn_norm_ptr, tok_ptr,
                 kernel_gemv, hidden, last_hidden_bytes, layer_idx,
                 Some((idx_t, w_t)),
+                rs_seed,
             )?;
             unsafe { self.arena.restore(inner_ck); }
         }
@@ -7636,6 +7875,7 @@ impl Qwen36Bringup {
         last_hidden_bytes: usize,
         _layer_idx: usize,
         route_override: Option<(u64, u64)>,
+        rs_seed: Option<u64>,
     ) -> Result<()> {
         let stream_raw = self.stream.raw() as u64;
         let n_int = moe.experts_gate_proj_fused.shape[1] as u32; // 512
@@ -7781,32 +8021,52 @@ impl Qwen36Bringup {
         let routed_sum_bytes = (n_down as usize) * 4;
         let routed_sum_region =
             self.arena.region("qwen36_pm_rs", routed_sum_bytes, 16)?;
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let rc = cuMemsetD8Async(
-                routed_sum_region.device_ptr(),
-                0,
-                routed_sum_bytes,
-                stream_raw as CUstream,
-            );
-            if rc != CUresult::CUDA_SUCCESS {
-                return Err(rvllm_core::RvllmError::cuda(
-                    "qwen36 moe routed_sum cuMemsetD8Async",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
+        // Phase 6b: when `rs_seed = Some(seed)`, the routed FFN was
+        // already computed batched by the caller into `seed`. Copy
+        // that into our local routed_sum_region (so downstream
+        // shared-expert + residual code path stays unchanged) and
+        // skip the per-expert FFN k-loop entirely.
+        if let Some(seed) = rs_seed {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let rc = cuMemcpyDtoDAsync_v2(
+                    routed_sum_region.device_ptr(),
+                    seed,
+                    routed_sum_bytes,
+                    self.stream.raw() as _,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 moe rs_seed copy",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        } else {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let rc = cuMemsetD8Async(
+                    routed_sum_region.device_ptr(),
+                    0,
+                    routed_sum_bytes,
+                    stream_raw as CUstream,
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 moe routed_sum cuMemsetD8Async",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
             }
         }
-        // Phase 4b-prep iter34: indirect-expert MoE chain. Each
-        // iteration's launches read the expert index from
-        // `topk_idx_region[i]` and the routed-sum weight from
-        // `topk_w_region[i]` — no host-known offsets baked into
-        // launch params, every launch's args are stable across
-        // calls. CUDA-Graph-captureable.
         let topk_idx_base = route_idx_ptr;
         let topk_w_base   = route_w_ptr;
-        for i in 0..top_k {
+        let skip_routed_ffn = rs_seed.is_some();
+        for i in 0..(if skip_routed_ffn { 0 } else { top_k }) {
             let idx_ptr_i = topk_idx_base + (i as u64) * 4;
             let w_ptr_i   = topk_w_base   + (i as u64) * 4;
             #[cfg(feature = "cuda")]
