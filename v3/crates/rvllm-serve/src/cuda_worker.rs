@@ -241,6 +241,12 @@ pub async fn spawn_cuda_worker(
                                 (s.token_start, vision_outputs[s.vision_item_idx].data.as_slice())
                             })
                             .collect();
+                        let timing_on = std::env::var("RVLLM_QWEN36_TIMING")
+                            .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
+                            .unwrap_or(false);
+                        let prefill_start = if timing_on {
+                            Some(std::time::Instant::now())
+                        } else { None };
                         let mut next_token = match qwen
                             .forward_qwen36_decode_cancellable(
                                 &prompt_i32, 0, &vision_splice,
@@ -256,6 +262,18 @@ pub async fn spawn_cuda_worker(
                                 continue;
                             }
                         };
+                        if let Some(t0) = prefill_start {
+                            let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            tracing::info!(
+                                prompt_tokens = prompt_len,
+                                prefill_ms = format!("{dt_ms:.2}"),
+                                batch_linear = std::env::var("RVLLM_QWEN36_BATCH_LINEAR_PREFILL").unwrap_or_else(|_| "0".to_string()),
+                                batch_full = std::env::var("RVLLM_QWEN36_BATCH_FULL_PREFILL").unwrap_or_else(|_| "0".to_string()),
+                                batch_moe = std::env::var("RVLLM_QWEN36_BATCH_MOE_PREFILL").unwrap_or_else(|_| "0".to_string()),
+                                batch_moe_routed_ffn = std::env::var("RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN").unwrap_or_else(|_| "0".to_string()),
+                                "[qwen36-timing] prefill done",
+                            );
+                        }
                         let mut completion_tokens: u32 = 0;
                         let mut finish = FinishReason::Length;
                         let max_new = req.max_new_tokens.max(1);

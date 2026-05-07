@@ -247,6 +247,17 @@ pub struct Qwen36OutsideKernels {
     /// m and hidden n: acc[m, n] += top_w[m, k_round] * f16_to_f32(in[m, n]).
     pub scaled_add_f16_to_f32_devw_batched_topk_mod: LoadedModule,
     pub fn_scaled_add_f16_to_f32_devw_batched_topk: KernelFn,
+    /// Phase 6c / Round-27: batched shared_gate dot+sigmoid.
+    /// One block per token, output [num_tokens] f32. Replaces
+    /// N per-token launches of `shared_gate_dot_sigmoid_f16`.
+    pub shared_gate_dot_sigmoid_f16_batched_mod: LoadedModule,
+    pub fn_shared_gate_dot_sigmoid_f16_batched: KernelFn,
+    /// Phase 6c / Round-27: row-batched scaled_add with per-token
+    /// weight (devw[m]). Different from the topk variant because
+    /// the weight indexing here is a flat [N] array rather than
+    /// [N, top_k] indexed by k_round.
+    pub scaled_add_f16_to_f32_devw_batched_mod: LoadedModule,
+    pub fn_scaled_add_f16_to_f32_devw_batched: KernelFn,
     /// Batched-prefill conv1d state-advance + flat history assembly.
     /// Builds the `[num_tokens + ks - 1, channels]` history buffer
     /// the existing `causal_conv1d_f16` kernel expects, with state
@@ -655,6 +666,16 @@ impl Qwen36Bringup {
         let fn_scaled_add_f16_to_f32_devw_batched_topk =
             scaled_add_f16_to_f32_devw_batched_topk_mod
                 .get_function("scaled_add_f16_to_f32_devw_batched_topk_kernel")?;
+        let shared_gate_dot_sigmoid_f16_batched_mod =
+            kernels.load_ptx("shared_gate_dot_sigmoid_f16_batched")?;
+        let fn_shared_gate_dot_sigmoid_f16_batched =
+            shared_gate_dot_sigmoid_f16_batched_mod
+                .get_function("shared_gate_dot_sigmoid_f16_batched_kernel")?;
+        let scaled_add_f16_to_f32_devw_batched_mod =
+            kernels.load_ptx("scaled_add_f16_to_f32_devw_batched")?;
+        let fn_scaled_add_f16_to_f32_devw_batched =
+            scaled_add_f16_to_f32_devw_batched_mod
+                .get_function("scaled_add_f16_to_f32_devw_batched_kernel")?;
         // Vision-tower kernels (Phase 1 .cu added on rusty_sm121_vision).
         let layernorm_inplace_f16_mod = kernels.load_ptx("layernorm_inplace_f16")?;
         let fn_layernorm_inplace_f16 =
@@ -770,6 +791,10 @@ impl Qwen36Bringup {
             fn_fp8_gemv_blockwise_wpr_native_f16in_dual_silu_indirect_batched_topk,
             scaled_add_f16_to_f32_devw_batched_topk_mod,
             fn_scaled_add_f16_to_f32_devw_batched_topk,
+            shared_gate_dot_sigmoid_f16_batched_mod,
+            fn_shared_gate_dot_sigmoid_f16_batched,
+            scaled_add_f16_to_f32_devw_batched_mod,
+            fn_scaled_add_f16_to_f32_devw_batched,
             layernorm_inplace_f16_mod,
             fn_layernorm_inplace_f16,
             gelu_tanh_f16_mod,
@@ -7834,12 +7859,212 @@ impl Qwen36Bringup {
                 }
             }
             rs_batched_ptr_opt = Some(rs_b.device_ptr());
-            // Keep regions alive for the per-token loop below; the
-            // arena bump-alloc ensures pointers remain valid until the
-            // outer caller restores. silu/down can technically be
-            // dropped now but rs_batched is still read.
+            // Keep regions alive for the per-token loop / shared-
+            // batched stage below; the arena bump-alloc ensures
+            // pointers remain valid until the outer caller restores.
             let _ = (silu_b, down_b);
         }
+
+        // Phase 6c / Round-27: shared-expert batched. Runs only if
+        // routed FFN was already batched (we need rs_b on device).
+        // Codex round-27: 2 new kernels (shared_gate_dot_sigmoid_
+        // batched, scaled_add_devw_batched), reuse existing
+        // dual_silu and Fp8GemvF16InLaunch with m=N for the GEMVs,
+        // existing f16_plus_f32_inplace_f16 with n=N*hidden for the
+        // residual. byte-Identität pro Token erhalten weil dual_silu
+        // / down GEMV / shared_gate / scaled_add jeweils row-
+        // unabhängig sind und der inner-reduction Pfad m=1 vs m=N
+        // identisch ist.
+        let shared_batched = routed_ffn_batched
+            && std::env::var("RVLLM_QWEN36_BATCH_MOE_SHARED")
+                .map(|s| matches!(s.as_str(), "1"|"true"|"TRUE"|"yes"))
+                .unwrap_or(false);
+        if shared_batched {
+            let sh_gate_bs = match moe.shared_expert_gate_proj.blockscale_ptr {
+                Some(p) => p, None => return Ok(()) };
+            let sh_up_bs = match moe.shared_expert_up_proj.blockscale_ptr {
+                Some(p) => p, None => return Ok(()) };
+            let sh_down_bs = match moe.shared_expert_down_proj.blockscale_ptr {
+                Some(p) => p, None => return Ok(()) };
+            let kernel_gemv_unwrap = self.outside_kernels.fn_fp8_gemv_wpr_native_f16in
+                .ok_or_else(|| rvllm_core::RvllmError::cuda(
+                    "qwen36 moe shared batched: fn_fp8_gemv_wpr_native_f16in missing",
+                    rvllm_core::CudaErrorKind::Other,
+                    rvllm_core::CudaCtx::setup(),
+                ))?;
+            let _ = kernel_gemv;
+
+            let silu_sh_bytes = n * n_int_us * 2;
+            let down_sh_bytes = n * n_down_us * 2;
+            let silu_sh = self.arena.region("qwen36_pmb_sh_silu", silu_sh_bytes, 16)?;
+            let down_sh = self.arena.region("qwen36_pmb_sh_down", down_sh_bytes, 16)?;
+            let sg_sigmoid_b = self.arena.region("qwen36_pmb_sg_sig", n * 4, 16)?;
+
+            // shared dual_silu: m=N. Existing kernel grid (ceil(N/8), m, 1).
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut osi = silu_sh.device_ptr();
+                let mut wg = moe.shared_expert_gate_proj.offset_bytes;
+                let mut wu = moe.shared_expert_up_proj.offset_bytes;
+                let mut sg = sh_gate_bs;
+                let mut su = sh_up_bs;
+                let mut inp = normed_region.device_ptr();
+                let mut m_i = num_tokens as i32;
+                let mut n_i = n_int as i32;
+                let mut k_i = k_in as i32;
+                let mut ncb = ((k_in + 127) / 128) as i32;
+                let args = [
+                    (&mut osi) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wg) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wu) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut sg) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut su) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut m_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut n_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut k_i) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut ncb) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let grid_x = (n_int + 7) / 8;
+                let block: u32 = 256;
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_fp8_gemv_dual_silu.raw() as CUfunction,
+                    grid_x, num_tokens, 1, block, 1, 1, 0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 moe shared dual_silu batched",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+
+            // shared down: m=N via Fp8GemvF16InLaunch directly
+            // (NOT fp8_proj_dispatch which would route to a different
+            // m≥2 GEMM path; codex round-27 explicit).
+            unsafe {
+                rvllm_fused::gemma4_launcher::Fp8GemvF16InLaunch {
+                    m: num_tokens, n: n_down, k: k_down,
+                }.launch(
+                    kernel_gemv_unwrap,
+                    down_sh.device_ptr(),
+                    moe.shared_expert_down_proj.offset_bytes,
+                    sh_down_bs,
+                    silu_sh.device_ptr(),
+                    self.stream.raw() as u64,
+                )?;
+            }
+
+            // shared_gate_dot_sigmoid batched → sigmoid[N] f32.
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut out = sg_sigmoid_b.device_ptr();
+                let mut weight = moe.shared_expert_gate_logit.offset_bytes;
+                let mut input_ptr = normed_region.device_ptr();
+                let mut hh = hidden as i32;
+                let mut nt = num_tokens as i32;
+                let args = [
+                    (&mut out) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut weight) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut input_ptr) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut hh) as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nt) as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid: u32 = num_tokens;
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_shared_gate_dot_sigmoid_f16_batched.raw() as CUfunction,
+                    grid, 1, 1, block, 1, 1, 0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 moe shared_gate_dot_sigmoid_batched",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+
+            // scaled_add_devw_batched: rs_b[m, n] += sigmoid[m] * down_sh[m, n]
+            let rs_b_ptr = rs_batched_ptr_opt.unwrap();
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let mut acc = rs_b_ptr;
+                let mut inp = down_sh.device_ptr();
+                let mut wp = sg_sigmoid_b.device_ptr();
+                let mut hd = hidden as i32;
+                let mut nt = num_tokens as i32;
+                let args = [
+                    (&mut acc) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut inp) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut wp)  as *mut u64 as *mut core::ffi::c_void,
+                    (&mut hd)  as *mut i32 as *mut core::ffi::c_void,
+                    (&mut nt)  as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 256;
+                let grid_x: u32 = ((hidden + block - 1) / block).max(1);
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_scaled_add_f16_to_f32_devw_batched.raw() as CUfunction,
+                    grid_x, num_tokens, 1, block, 1, 1, 0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 moe scaled_add_devw_batched (shared)",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+
+            // Final residual batched: hidden_ptr += f16(rs_b)
+            // elementwise [N * hidden].
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let n_elem = (n * h_us) as i32;
+                let mut dst = hidden_ptr;
+                let mut src = rs_b_ptr;
+                let mut nn = n_elem;
+                let args = [
+                    (&mut dst) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut src) as *mut u64 as *mut core::ffi::c_void,
+                    (&mut nn)  as *mut i32 as *mut core::ffi::c_void,
+                ];
+                let block: u32 = 1024.min(n_elem as u32).max(1);
+                let grid: u32 = ((n_elem as u32 + block - 1) / block).max(1);
+                let rc = cuLaunchKernel(
+                    self.outside_kernels.fn_f16_plus_f32_inplace_f16.raw() as CUfunction,
+                    grid, 1, 1, block, 1, 1, 0,
+                    self.stream.raw() as CUstream,
+                    args.as_ptr() as *mut *mut core::ffi::c_void,
+                    core::ptr::null_mut(),
+                );
+                if rc != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "qwen36 moe shared batched residual",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            // Skip the per-token loop below — shared+residual already
+            // applied for all N tokens.
+            return Ok(());
+        }
+
         for t in 0..num_tokens {
             let tok_ptr = hidden_ptr + (t as u64) * (last_hidden_bytes as u64);
             let inner_ck = self.arena.checkpoint();

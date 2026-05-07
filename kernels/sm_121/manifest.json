@@ -476,6 +476,11 @@
       "path": "scaled_add_f16_to_f32_devw.ptx",
       "sha256": "4989af20fe9c05f7fdba01e6f3545b66bfe729ef69f00796fb1300ca0184a2cf"
     },
+    "scaled_add_f16_to_f32_devw_batched": {
+      "bytes": 2018,
+      "path": "scaled_add_f16_to_f32_devw_batched.ptx",
+      "sha256": "423871b5c783c9786e8ab3b627d6b1a29b6ad9463a1b469e30dd853480bc612a"
+    },
     "scaled_add_f16_to_f32_devw_batched_topk": {
       "bytes": 2462,
       "path": "scaled_add_f16_to_f32_devw_batched_topk.ptx",
@@ -495,6 +500,11 @@
       "bytes": 6310,
       "path": "shared_gate_dot_sigmoid_f16.ptx",
       "sha256": "dae8405f2d15a885aed7c0b0e96727c79ff7bb0bd52eefebfd4be09161ded72f"
+    },
+    "shared_gate_dot_sigmoid_f16_batched": {
+      "bytes": 7179,
+      "path": "shared_gate_dot_sigmoid_f16_batched.ptx",
+      "sha256": "21199072a85b056f612b01bb7ee9e400766b199a45306d833db43eac56100282"
     },
     "sigmoid_mul_f16": {
       "bytes": 2008,
@@ -637,5 +647,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "652378e"
+  "revision": "77586da"
 }
