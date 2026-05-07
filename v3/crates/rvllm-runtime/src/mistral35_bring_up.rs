@@ -136,6 +136,76 @@ impl KvDecodeStrategy {
     }
 }
 
+/// Per-layer scratch budget for one Mistral 3.5 prefill chunk of
+/// `m` tokens. Outputs are byte counts the runtime needs to reserve
+/// in its HbmArena before the GPU forward path runs. Pure
+/// arithmetic — no GPU access — so it's testable from the no-cuda
+/// build.
+///
+/// The fields cover the four projection shapes Mistral uses:
+///   * `q/o`:    `n=12288, k=12288`
+///   * `k/v`:    `n=1024,  k=12288`
+///   * `gate/up`: `n=28672, k=12288`
+///   * `down`:   `n=12288, k=28672`
+///
+/// `_a_packed` is the activation NVFP4-packed buffer (`m * k / 2`).
+/// `_sfa_natural` is the natural-layout SFA scratch (`m * k / 16`).
+/// `_sfa_cutlass` is the GEMM-ready interleaved SFA — sized as the
+/// maximum across projection K's to allow re-use across layers.
+/// `_workspace` is the CUTLASS GEMM workspace; we report the max
+/// across projection shapes so a single allocation covers them all.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayerScratchBudget {
+    pub a_packed_bytes: usize,
+    pub sfa_natural_bytes: usize,
+    /// Upper bound across the (q/o, k/v, gate/up, down) projection
+    /// shapes — the runtime reuses one buffer across layers and
+    /// projections, so we size for the worst case.
+    pub sfa_cutlass_bytes_max: usize,
+    /// Same upper-bound logic for the CUTLASS workspace. 0 here is
+    /// a valid value when the backend reports it doesn't need any
+    /// scratch for the queried shapes.
+    pub workspace_bytes_max: usize,
+}
+
+impl LayerScratchBudget {
+    /// Pure-Rust budget computation independent of the CUTLASS
+    /// `.so` — used at load time when the backend's symbol set
+    /// hasn't been validated yet, and as the test-friendly path.
+    /// `m` is the number of tokens in one prefill chunk.
+    ///
+    /// `a_packed = m * max_k / 2`, `sfa_natural = m * max_k / 16`.
+    /// `sfa_cutlass_bytes_max` returns the natural-layout size as
+    /// a conservative upper bound — the real CUTLASS-interleaved
+    /// SFA is at most this large plus modest swizzle padding which
+    /// the per-shape backend query reports exactly. Callers that
+    /// have a live `CutlassBackend` should prefer
+    /// [`with_backend`].
+    pub fn natural(arch: &Mistral35Arch, m: usize) -> Self {
+        let h = arch.text.hidden_size;
+        let i = arch.text.intermediate_size;
+        // Max K across the seven projections is the down-proj K
+        // (= intermediate_size). Everything else has K = hidden_size.
+        let max_k = h.max(i);
+        Self {
+            a_packed_bytes: m * (max_k / 2),
+            sfa_natural_bytes: m * (max_k / 16),
+            sfa_cutlass_bytes_max: m * (max_k / 16),
+            workspace_bytes_max: 0,
+        }
+    }
+}
+
+impl Mistral35Bringup {
+    /// Pre-compute the per-layer scratch budget for a prefill chunk
+    /// of `m` tokens. Independent of the CUTLASS backend (the
+    /// backend-aware variant lives in [`scratch_budget_with_backend`]
+    /// — added when the runtime forward integration lands).
+    pub fn scratch_budget(&self, m: usize) -> LayerScratchBudget {
+        LayerScratchBudget::natural(&self.arch, m)
+    }
+}
+
 impl Mistral35Bringup {
     /// Decode-strategy gate. Surfaced at startup so the operator
     /// log line records exactly which path each request will take.
@@ -306,6 +376,17 @@ impl Mistral35Bringup {
             prefill.outer_loop_deleted,
             prefill.decode_graph_capture,
         );
+        // Indicative scratch-budget at a few common prefill chunk
+        // sizes so the operator can see whether the requested
+        // arena_bytes covers the steady-state working set up front.
+        for m in [1usize, 32, 256] {
+            let b = bringup.scratch_budget(m);
+            eprintln!(
+                "[mistral35] scratch_budget m={m:>3}: a_packed={:>10} B  \
+                 sfa_natural={:>9} B  sfa_cutlass(max)={:>9} B",
+                b.a_packed_bytes, b.sfa_natural_bytes, b.sfa_cutlass_bytes_max,
+            );
+        }
         Ok(bringup)
     }
 
@@ -388,6 +469,56 @@ mod tests {
             cutlass_so: PathBuf::from("/tmp/rvllm-mistral-test-libcutlass.so"),
             fa3_so: PathBuf::from("/tmp/rvllm-mistral-test-fa3.so"),
             policy_json: PathBuf::from("/tmp/rvllm-mistral-test-policy.json"),
+        }
+    }
+
+    /// Test arch fixture matching the public Mistral 3.5 NVFP4
+    /// checkpoint (88L decoder + 48L pixtral, real shapes for
+    /// dense decoder; vision block carries the spec defaults).
+    /// `num_hidden_layers` is overridable so cheap unit tests
+    /// don't have to care about per-layer counts.
+    fn test_arch_fixture(num_hidden_layers: usize) -> Mistral35Arch {
+        use rvllm_loader::mistral35_arch::{
+            Mistral35TextArch, Mistral35VisionArch, YarnRopeConfig,
+        };
+        Mistral35Arch {
+            text: Mistral35TextArch {
+                num_hidden_layers,
+                hidden_size: 12288,
+                intermediate_size: 28672,
+                num_attention_heads: 96,
+                num_key_value_heads: 8,
+                head_dim: 128,
+                vocab_size: 131072,
+                max_position_embeddings: 262144,
+                rms_norm_eps: 1e-5,
+                hidden_act_silu: true,
+                tie_word_embeddings: false,
+                yarn: YarnRopeConfig {
+                    rope_theta: 1_000_000.0,
+                    original_max_position_embeddings: 4096,
+                    factor: 64.0,
+                    beta_fast: 4.0,
+                    beta_slow: 1.0,
+                    mscale: 1.0,
+                    mscale_all_dim: 0.0,
+                },
+            },
+            vision: Mistral35VisionArch {
+                model_type_pixtral: true,
+                hidden_size: 1664,
+                num_hidden_layers: 48,
+                num_attention_heads: 16,
+                head_dim: 104,
+                intermediate_size: 8192,
+                patch_size: 14,
+                image_size: 1540,
+                num_channels: 3,
+                rope_theta: 10_000.0,
+                spatial_merge_size: 2,
+            },
+            image_token_index: 10,
+            weight_prefix: "model.language_model".into(),
         }
     }
 
@@ -499,8 +630,14 @@ mod tests {
         );
     }
 
+    /// Serialise the env-var-touching tests so cargo's parallel
+    /// runner doesn't make them race. (Tests that don't touch env
+    /// don't acquire — keeps the rest of the suite parallel.)
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn batched_prefill_default_is_full_on_except_decode_graph_and_qkv() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Ensure no env vars from a previous test leak in.
         for v in [
             "RVLLM_MISTRAL35_BATCH_PROJ_PREFILL",
@@ -521,7 +658,31 @@ mod tests {
     }
 
     #[test]
+    fn scratch_budget_natural_matches_spec_shapes() {
+        // Mistral 3.5: hidden=12288, intermediate=28672. The
+        // budget pivots on max_k = max(h, i) = 28672 (the down-proj
+        // K). At m=256 that's:
+        //   a_packed     = 256 * 28672 / 2  = 3 670 016 bytes
+        //   sfa_natural  = 256 * 28672 / 16 =   458 752 bytes
+        let arch = test_arch_fixture(2);
+        let b = LayerScratchBudget::natural(&arch, 256);
+        assert_eq!(b.a_packed_bytes, 256 * 28672 / 2);
+        assert_eq!(b.sfa_natural_bytes, 256 * 28672 / 16);
+        assert_eq!(b.sfa_cutlass_bytes_max, 256 * 28672 / 16);
+        assert_eq!(b.workspace_bytes_max, 0);
+    }
+
+    #[test]
+    fn scratch_budget_zero_tokens_is_zero_bytes() {
+        let arch = test_arch_fixture(2);
+        let b = LayerScratchBudget::natural(&arch, 0);
+        assert_eq!(b.a_packed_bytes, 0);
+        assert_eq!(b.sfa_natural_bytes, 0);
+    }
+
+    #[test]
     fn batched_prefill_outer_loop_collapses_when_phase_off() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Disabling any one of the prefill phases must drop the
         // implicit outer-loop-deleted flag, even though the
         // operator did not flip it directly.
