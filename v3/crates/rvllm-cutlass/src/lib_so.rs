@@ -432,6 +432,82 @@ fn resolve_sm120_so_path(
     None
 }
 
+// ─── Mistral 3.5 NVFP4 ABI ──────────────────────────────────────────
+//
+// NVFP4 weight tensors carry a *per-row × per-16-K* scale grid
+// (`[N, K/16]` E4M3) plus a single F32 global scale, NOT the
+// `[N/128, K/128]` FP8 blockscale layout the Gemma 4 / Qwen 3.6
+// path uses. Mixing the two shapes silently passes the wrong
+// pointer to the kernel, so we keep these as DISTINCT fn-pointer
+// types — the Rust type system refuses to call a blockscale wrapper
+// with NVFP4 tensors and vice versa.
+//
+// Activations enter dynamically quantized to FP8 E4M3 with a
+// per-token scale (matches the existing FP8 path). The kernel does
+// FP8 × NVFP4 → BF16/F16 on the Blackwell tensor cores. Two entry
+// points are distinguished:
+//
+//   * `cutlass_nvfp4_gemm_sm120`            — batched prefill (any M)
+//   * `cutlass_nvfp4_gemm_sm120_decode_m1`  — optimised m=1 decode
+//
+// The companion preparation + sizing helpers are:
+//
+//   * `cutlass_nvfp4_gemm_sm120_workspace`     — CUTLASS workspace bytes
+//   * `cutlass_nvfp4_gemm_sm120_sfa_bytes`     — activation-scale staging size
+//   * `cutlass_nvfp4_gemm_sm120_prep_sfa`      — FP8-quant activations + stage SFA
+//
+// Until the `.cu` source lands and the Sm120 `.so` is rebuilt with
+// these symbols (Step 4-CUDA), `CutlassSm120Lib::load` returns
+// `None` for every NVFP4 fn pointer. `require_nvfp4()` then errors
+// at startup so Mistral 3.5 refuses to bring up against a stale
+// `.so`. The Gemma 4 / Qwen 3.6 paths keep working unchanged.
+
+/// Main NVFP4 GEMM kernel. `b_packed` is the NVFP4 weight tensor
+/// (`U8 [N, K/2]`, two E2M1 values per byte, low-nibble first).
+/// `b_scale_e4m3` is the per-row × per-16-K scale grid
+/// (`Fp8E4M3 [N, K/16]`). `b_global_scale_f32` is the F32 scalar.
+/// Activation FP8 + per-token scale come in via `a_fp8` / `sfa`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+pub type Nvfp4GemmSm120Fn = unsafe extern "C" fn(
+    output: *mut c_void,
+    a_fp8: *const c_void,
+    b_packed: *const c_void,
+    sfa: *const c_void,            // staged per-token activation scales
+    b_scale_e4m3: *const c_void,   // [N, K/16] E4M3
+    b_global_scale_f32: *const c_void, // [1] F32
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut c_void,
+    workspace_size: usize,
+    stream: *mut c_void,
+) -> i32;
+
+#[cfg(feature = "cuda")]
+pub type Nvfp4GemmSm120WorkspaceFn = unsafe extern "C" fn(m: i32, n: i32, k: i32) -> usize;
+
+/// SFA scratch size for the activation-scale staging (m × K/16
+/// E4M3). Mirrors the FP8 blockscale `sf_bytes` helpers but with
+/// the K/16 grid Mistral's NVFP4 layout uses.
+#[cfg(feature = "cuda")]
+pub type Nvfp4Sm120SfaBytesFn = unsafe extern "C" fn(m: i32, k: i32) -> usize;
+
+/// Quantize the BF16/F16 activation tensor to FP8 E4M3 in-place
+/// (`a_fp8` output) AND populate the SFA scratch with per-token
+/// scales aligned to the K/16 block grid. One launch per layer.
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+pub type Nvfp4Sm120PrepSfaFn = unsafe extern "C" fn(
+    a_input_fp16_or_bf16: *const c_void,
+    a_fp8_out: *mut c_void,
+    sfa_out: *mut c_void,
+    m: i32,
+    k: i32,
+    a_input_dtype: i32, // 0 = F16, 1 = BF16
+    stream: *mut c_void,
+) -> i32;
+
 /// Resolved `libcutlass_sm120.so` + fn pointer. Intentionally simpler
 /// than `CutlassLib`: only one entry point today
 /// (`cutlass_fp8_gemm_blockscale_sm120` + its workspace helper),
@@ -453,6 +529,19 @@ pub struct CutlassSm120Lib {
     pub prep_sfa: Option<BlockscaleSm120PrepFn>,
     #[cfg(feature = "cuda")]
     pub prep_sfb: Option<BlockscaleSm120PrepFn>,
+    /// Mistral 3.5 NVFP4 entry point — batched prefill (any M).
+    /// `None` when the `.so` was built before the NVFP4 source landed.
+    #[cfg(feature = "cuda")]
+    pub nvfp4_gemm: Option<Nvfp4GemmSm120Fn>,
+    /// Mistral 3.5 NVFP4 — optimised m=1 decode kernel.
+    #[cfg(feature = "cuda")]
+    pub nvfp4_gemm_decode_m1: Option<Nvfp4GemmSm120Fn>,
+    #[cfg(feature = "cuda")]
+    pub nvfp4_workspace: Option<Nvfp4GemmSm120WorkspaceFn>,
+    #[cfg(feature = "cuda")]
+    pub nvfp4_sfa_bytes: Option<Nvfp4Sm120SfaBytesFn>,
+    #[cfg(feature = "cuda")]
+    pub nvfp4_prep_sfa: Option<Nvfp4Sm120PrepSfaFn>,
 }
 
 #[cfg(feature = "cuda")]
@@ -498,6 +587,33 @@ impl CutlassSm120Lib {
                 .ok()
                 .map(|s| *s)
         };
+        // Mistral 3.5 NVFP4 entry points (optional — `None` on a
+        // pre-NVFP4 `.so`; required at startup for Mistral via
+        // `require_nvfp4`). The five symbols form one set; either
+        // all resolve or the path is treated as unavailable.
+        let nvfp4_gemm: Option<Nvfp4GemmSm120Fn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120\0").ok().map(|s| *s)
+        };
+        let nvfp4_gemm_decode_m1: Option<Nvfp4GemmSm120Fn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_decode_m1\0")
+                .ok()
+                .map(|s| *s)
+        };
+        let nvfp4_workspace: Option<Nvfp4GemmSm120WorkspaceFn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_workspace\0")
+                .ok()
+                .map(|s| *s)
+        };
+        let nvfp4_sfa_bytes: Option<Nvfp4Sm120SfaBytesFn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_sfa_bytes\0")
+                .ok()
+                .map(|s| *s)
+        };
+        let nvfp4_prep_sfa: Option<Nvfp4Sm120PrepSfaFn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_prep_sfa\0")
+                .ok()
+                .map(|s| *s)
+        };
         Ok(Self {
             so_path: path,
             _lib: lib,
@@ -507,6 +623,11 @@ impl CutlassSm120Lib {
             sfb_bytes,
             prep_sfa,
             prep_sfb,
+            nvfp4_gemm,
+            nvfp4_gemm_decode_m1,
+            nvfp4_workspace,
+            nvfp4_sfa_bytes,
+            nvfp4_prep_sfa,
         })
     }
 
@@ -692,6 +813,220 @@ impl CutlassSm120Lib {
                 },
                 CutlassCtx {
                     kernel: "fp8_gemm_blockscale_sm120",
+                    stream,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    // ─── NVFP4 (Mistral 3.5) ─────────────────────────────────────────
+
+    /// True iff the resolved `.so` exposes the full NVFP4 entry point
+    /// set. Either every required symbol resolves or this returns
+    /// false — partial binding is treated as missing.
+    #[cfg(feature = "cuda")]
+    pub fn nvfp4_active(&self) -> bool {
+        self.nvfp4_gemm.is_some()
+            && self.nvfp4_workspace.is_some()
+            && self.nvfp4_sfa_bytes.is_some()
+            && self.nvfp4_prep_sfa.is_some()
+        // `nvfp4_gemm_decode_m1` is optional (the prefill kernel can
+        // serve m=1 too, just slower); treat it as a hint, not gate.
+    }
+
+    /// `Ok(())` iff `nvfp4_active`. Used at Mistral 3.5 startup —
+    /// missing symbols are a hard error per the integration spec
+    /// ("missing required CUTLASS symbols are startup errors").
+    #[cfg(feature = "cuda")]
+    pub fn require_nvfp4(&self) -> Result<()> {
+        if self.nvfp4_active() {
+            return Ok(());
+        }
+        let mut missing: Vec<&'static str> = Vec::new();
+        if self.nvfp4_gemm.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120");
+        }
+        if self.nvfp4_workspace.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120_workspace");
+        }
+        if self.nvfp4_sfa_bytes.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120_sfa_bytes");
+        }
+        if self.nvfp4_prep_sfa.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120_prep_sfa");
+        }
+        // Diagnostic stderr line so the operator sees exactly which
+        // symbols failed to bind without grepping a missing-feature
+        // generic message. rvllm-cutlass deliberately avoids a
+        // `tracing` dep so the lower crates stay ABI-light.
+        eprintln!(
+            "[rvllm-cutlass] Mistral 3.5 NVFP4 backend not loaded; \
+             missing symbols: {missing:?} (path={})",
+            self.so_path.display()
+        );
+        Err(RvllmError::cutlass(
+            CutlassError::KernelLaunchFailed {
+                variant: 0,
+                cuda: rvllm_core::CudaErrorKind::Other,
+            },
+            CutlassCtx {
+                kernel: "nvfp4 sm_120 symbol set incomplete: \
+                         rebuild libcutlass_sm120.so with the NVFP4 \
+                         source on top of build_cutlass_sm120_so.sh",
+                stream: 0,
+            },
+        ))
+    }
+
+    /// CUTLASS workspace bytes for an NVFP4 GEMM at this problem
+    /// shape. Returns 0 when the symbol is missing — the caller
+    /// must already have failed via `require_nvfp4` for Mistral.
+    #[cfg(feature = "cuda")]
+    pub fn nvfp4_workspace_size(&self, m: i32, n: i32, k: i32) -> usize {
+        self.nvfp4_workspace
+            .map(|f| unsafe { f(m, n, k) })
+            .unwrap_or(0)
+    }
+
+    /// Activation-scale staging bytes for an NVFP4 GEMM (m × K/16
+    /// E4M3, plus alignment slack). 0 when the symbol is missing.
+    #[cfg(feature = "cuda")]
+    pub fn nvfp4_sfa_bytes(&self, m: i32, k: i32) -> usize {
+        self.nvfp4_sfa_bytes
+            .map(|f| unsafe { f(m, k) })
+            .unwrap_or(0)
+    }
+
+    /// Quantize activations to FP8 + stage SFA scratch. Single launch
+    /// per layer.
+    ///
+    /// # Safety
+    /// All device pointers must be valid for the kernel's duration.
+    /// `a_fp8_out` must have at least `m * k` bytes; `sfa_out` must
+    /// have at least `nvfp4_sfa_bytes(m, k)` bytes.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_prep_sfa(
+        &self,
+        a_input: u64,
+        a_fp8_out: u64,
+        sfa_out: u64,
+        m: i32,
+        k: i32,
+        a_input_dtype_f16_eq_0_bf16_eq_1: i32,
+        stream: u64,
+    ) -> Result<()> {
+        let f = self.nvfp4_prep_sfa.ok_or_else(|| {
+            RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::Other,
+                },
+                CutlassCtx {
+                    kernel: "nvfp4_prep_sfa_sm120 (missing from .so)",
+                    stream,
+                },
+            )
+        })?;
+        let rc = f(
+            a_input as *const c_void,
+            a_fp8_out as *mut c_void,
+            sfa_out as *mut c_void,
+            m,
+            k,
+            a_input_dtype_f16_eq_0_bf16_eq_1,
+            stream as *mut c_void,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                },
+                CutlassCtx {
+                    kernel: "nvfp4_prep_sfa_sm120",
+                    stream,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Launch the NVFP4 GEMM. Selects the m=1 specialised kernel
+    /// when one is loaded and `m == 1`; otherwise routes to the
+    /// general batched-prefill kernel.
+    ///
+    /// # Safety
+    /// All device pointers must be valid for the kernel's duration.
+    /// `b_packed` is `[N, K/2]` U8; `b_scale_e4m3` is `[N, K/16]`
+    /// E4M3; `b_global_scale_f32` is `[1]` F32. `a_fp8` is the
+    /// activations FP8E4M3-quantized by `launch_nvfp4_prep_sfa`;
+    /// `sfa` is the staged per-token scales.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_gemm(
+        &self,
+        output: u64,
+        a_fp8: u64,
+        b_packed: u64,
+        sfa: u64,
+        b_scale_e4m3: u64,
+        b_global_scale_f32: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<()> {
+        // Decode-fast-path selection: only when m==1 AND the
+        // specialised symbol is present. Otherwise the general
+        // kernel handles m=1 correctly, just at a small perf cost.
+        let chosen = if m == 1 {
+            self.nvfp4_gemm_decode_m1.or(self.nvfp4_gemm)
+        } else {
+            self.nvfp4_gemm
+        };
+        let kernel_name: &'static str = if m == 1 && self.nvfp4_gemm_decode_m1.is_some() {
+            "nvfp4_gemm_sm120_decode_m1"
+        } else {
+            "nvfp4_gemm_sm120"
+        };
+        let f = chosen.ok_or_else(|| {
+            RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::Other,
+                },
+                CutlassCtx {
+                    kernel: "nvfp4_gemm_sm120 (missing from .so)",
+                    stream,
+                },
+            )
+        })?;
+        let rc = f(
+            output as *mut c_void,
+            a_fp8 as *const c_void,
+            b_packed as *const c_void,
+            sfa as *const c_void,
+            b_scale_e4m3 as *const c_void,
+            b_global_scale_f32 as *const c_void,
+            m,
+            n,
+            k,
+            workspace as *mut c_void,
+            workspace_size,
+            stream as *mut c_void,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                },
+                CutlassCtx {
+                    kernel: kernel_name,
                     stream,
                 },
             ));
@@ -991,6 +1326,141 @@ impl CutlassBackend {
             _ => 0,
         }
     }
+
+    // ─── NVFP4 dispatchers (Mistral 3.5) ─────────────────────────
+
+    /// Whether the NVFP4 entry-point set is fully resolved on this
+    /// backend. Always false for `So` (SM90) and `Absent`.
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn nvfp4_active(&self) -> bool {
+        matches!(self, CutlassBackend::SoSm120(lib) if lib.nvfp4_active())
+    }
+
+    /// Hard-fail at startup if the active backend doesn't expose
+    /// the NVFP4 symbols. Mistral 3.5 calls this in
+    /// `Mistral35Bringup::load`; per the integration spec missing
+    /// symbols are a startup error rather than a silent fall-through.
+    #[cfg(feature = "cuda")]
+    pub fn require_nvfp4(&self) -> Result<()> {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.require_nvfp4(),
+            CutlassBackend::So(_) => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "nvfp4_gemm_sm120 requires the Blackwell .so backend; \
+                         the active backend is the SM90 fp8 .so. \
+                         Mistral 3.5 only runs on sm_121.",
+                },
+                CutlassCtx { kernel: "nvfp4 backend", stream: 0 },
+            )),
+            CutlassBackend::Absent => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "nvfp4_gemm_sm120: libcutlass_sm120.so not built or not found. \
+                         Build via kernels/build_cutlass_sm120_so.sh sm_121a and \
+                         either set RVLLM_CUTLASS_SM120_SO or place the .so under \
+                         <kernels>/sm_121/libcutlass_sm120.so.",
+                },
+                CutlassCtx { kernel: "nvfp4 backend", stream: 0 },
+            )),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn nvfp4_workspace_size(&self, m: i32, n: i32, k: i32) -> usize {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.nvfp4_workspace_size(m, n, k),
+            _ => 0,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn nvfp4_sfa_bytes(&self, m: i32, k: i32) -> usize {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.nvfp4_sfa_bytes(m, k),
+            _ => 0,
+        }
+    }
+
+    /// # Safety
+    /// All device pointers must be valid for the kernel's duration.
+    /// See `CutlassSm120Lib::launch_nvfp4_prep_sfa` for layout
+    /// requirements.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_prep_sfa(
+        &self,
+        a_input: u64,
+        a_fp8_out: u64,
+        sfa_out: u64,
+        m: i32,
+        k: i32,
+        a_input_dtype_f16_eq_0_bf16_eq_1: i32,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.launch_nvfp4_prep_sfa(
+                a_input,
+                a_fp8_out,
+                sfa_out,
+                m,
+                k,
+                a_input_dtype_f16_eq_0_bf16_eq_1,
+                stream,
+            ),
+            _ => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "nvfp4_prep_sfa requires CutlassBackend::SoSm120",
+                },
+                CutlassCtx { kernel: "nvfp4_prep_sfa", stream },
+            )),
+        }
+    }
+
+    /// # Safety
+    /// All device pointers must be valid for the kernel's duration.
+    /// See `CutlassSm120Lib::launch_nvfp4_gemm` for layout requirements.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_gemm(
+        &self,
+        output: u64,
+        a_fp8: u64,
+        b_packed: u64,
+        sfa: u64,
+        b_scale_e4m3: u64,
+        b_global_scale_f32: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.launch_nvfp4_gemm(
+                output,
+                a_fp8,
+                b_packed,
+                sfa,
+                b_scale_e4m3,
+                b_global_scale_f32,
+                m,
+                n,
+                k,
+                workspace,
+                workspace_size,
+                stream,
+            ),
+            _ => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "nvfp4_gemm requires CutlassBackend::SoSm120",
+                },
+                CutlassCtx { kernel: "nvfp4_gemm_sm120", stream },
+            )),
+        }
+    }
 }
 
 impl From<CutlassLib> for CutlassBackend {
@@ -1099,5 +1569,35 @@ mod tests {
         let err = CutlassLib::load("/nonexistent/libcutlass.so".into(), &[]).unwrap_err();
         let s = format!("{err}");
         assert!(s.contains("libcutlass_kernels.so not at"));
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn nvfp4_absent_backend_rejects() {
+        // Default-feature build has no `.so` mechanism; require_nvfp4
+        // / nvfp4_active are still callable on `Absent` and must
+        // refuse cleanly so a Mistral 3.5 startup on a no-cuda build
+        // gets a typed error rather than a confusing crash.
+        let backend = CutlassBackend::Absent;
+        // The require_nvfp4 method is gated on `cuda`; this branch
+        // just sanity-checks that the no-cuda build still compiles.
+        let _ = backend;
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_require_on_absent_errors() {
+        let backend = CutlassBackend::Absent;
+        assert!(!backend.nvfp4_active());
+        let err = backend.require_nvfp4().unwrap_err();
+        assert!(format!("{err}").contains("nvfp4"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_workspace_zero_when_inactive() {
+        let backend = CutlassBackend::Absent;
+        assert_eq!(backend.nvfp4_workspace_size(1, 12288, 12288), 0);
+        assert_eq!(backend.nvfp4_sfa_bytes(1, 12288), 0);
     }
 }
