@@ -74,6 +74,81 @@ pub enum Mistral35Error {
     NoCudaFeature,
 }
 
+/// Which NVFP4-KV decode kernel can serve a given GQA ratio.
+///
+/// The existing NVFP4-KV decode kernel set has compile-time caps:
+///
+/// - `kernels/flash_attention_nvfp4kv.cu::MAX_GQA_DECODE = 4`
+///   (also `..._bf16out.cu`) — fused per-`(seq, kv_head)` decode that
+///   loads K/V exactly once per tile and computes Q·Kᵀ for all q-heads
+///   sharing that kv-head. Gemma 4 sliding (GQA=2) fits.
+/// - `kernels/flash_attention_split_decode_nvfp4kv.cu::MAX_GQA_SPLIT = 8`
+///   (also `..._bf16out.cu`) — paged_attention_v2-style split decode.
+///   Qwen 3.6 (GQA=8) fits.
+/// - Per-head fallback (`flash_attention_2_decode_nvfp4kv_kernel`) — one
+///   block per `(seq, head)`. Loads K/V once per tile per Q-HEAD
+///   instead of per (seq, kv_head); ~`gqa_ratio×` bandwidth waste vs
+///   the fused path, but works for any GQA.
+///
+/// Mistral 3.5 has GQA=12. The kernel-side fix is to raise both
+/// constants to ≥12 (q_reg / row_max / acc / s_score allocations
+/// scale linearly; sm_121 has the register + smem headroom). Until
+/// that lands, Mistral routes through the per-head fallback —
+/// correct, just slower. The gate lives here so a future kernel
+/// rebuild flips the strategy without changing the runtime.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KvDecodeStrategy {
+    /// `flash_attention_2_decode_nvfp4kv_gqa_kernel` — fused
+    /// per-(seq, kv_head), MAX_GQA_DECODE=4. Tightest path.
+    FusedGqa,
+    /// `paged_attention_v2_split_decode_nvfp4kv_kernel` —
+    /// MAX_GQA_SPLIT=8. Used for Qwen 3.6's GQA=8.
+    SplitDecode,
+    /// `flash_attention_2_decode_nvfp4kv_kernel` — one block per
+    /// (seq, head). Works for any GQA at the cost of `gqa_ratio×`
+    /// duplicated K/V load. Mistral 3.5 (GQA=12) currently routes
+    /// here.
+    PerHeadFallback,
+}
+
+impl KvDecodeStrategy {
+    /// Pick a strategy from the model's GQA ratio. The per-head
+    /// fallback is universal; we prefer the fused / split paths
+    /// whenever the kernel cap covers the requested ratio.
+    pub fn for_gqa_ratio(gqa_ratio: usize) -> Self {
+        // Match the kernel-side caps exactly. Bumping these here
+        // without bumping MAX_GQA_DECODE / MAX_GQA_SPLIT in the .cu
+        // sources would silently route Mistral through a kernel
+        // that returns early on `GQA > MAX_*`.
+        const MAX_GQA_DECODE_FUSED: usize = 4;
+        const MAX_GQA_SPLIT: usize = 8;
+
+        if gqa_ratio == 0 {
+            return Self::PerHeadFallback;
+        }
+        if gqa_ratio <= MAX_GQA_DECODE_FUSED {
+            Self::FusedGqa
+        } else if gqa_ratio <= MAX_GQA_SPLIT {
+            Self::SplitDecode
+        } else {
+            Self::PerHeadFallback
+        }
+    }
+}
+
+impl Mistral35Bringup {
+    /// Decode-strategy gate. Surfaced at startup so the operator
+    /// log line records exactly which path each request will take.
+    pub fn kv_decode_strategy(&self) -> KvDecodeStrategy {
+        let q = self.arch.text.num_attention_heads;
+        let kv = self.arch.text.num_key_value_heads;
+        if kv == 0 {
+            return KvDecodeStrategy::PerHeadFallback;
+        }
+        KvDecodeStrategy::for_gqa_ratio(q / kv)
+    }
+}
+
 impl Mistral35Bringup {
     /// Open + validate the model directory. Does not yet upload any
     /// weights. Fails on:
@@ -120,7 +195,23 @@ impl Mistral35Bringup {
         //     `Mistral35Error::NoCudaFeature` cleanly.
         let nvfp4_active = require_nvfp4_symbols(&paths)?;
 
-        Ok(Self { paths, arch, inventory, arena_bytes, nvfp4_active })
+        let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
+        let strategy = bringup.kv_decode_strategy();
+        eprintln!(
+            "[mistral35] kv_decode_strategy={:?} (gqa_ratio={})",
+            strategy,
+            bringup.arch.gqa_ratio()
+        );
+        if matches!(strategy, KvDecodeStrategy::PerHeadFallback) {
+            eprintln!(
+                "[mistral35] note: Mistral 3.5's GQA=12 exceeds the existing \
+                 NVFP4-KV fused (MAX_GQA_DECODE=4) and split-decode \
+                 (MAX_GQA_SPLIT=8) kernel caps; per-head fallback is \
+                 correct but ~12x duplicated K/V load. Raise both .cu \
+                 constants to >=12 to flip onto the fused path."
+            );
+        }
+        Ok(bringup)
     }
 
     /// Forward placeholder. Returns a typed error at every call.
@@ -264,5 +355,52 @@ mod tests {
     fn forward_stub_is_typed_error() {
         let e = Mistral35Bringup::forward_not_implemented_yet();
         assert!(matches!(e, Mistral35Error::ForwardNotImplemented));
+    }
+
+    #[test]
+    fn kv_decode_strategy_picks_fused_for_low_gqa() {
+        // Gemma 4 sliding has GQA=2; falls under MAX_GQA_DECODE=4.
+        assert_eq!(
+            KvDecodeStrategy::for_gqa_ratio(2),
+            KvDecodeStrategy::FusedGqa
+        );
+        assert_eq!(
+            KvDecodeStrategy::for_gqa_ratio(4),
+            KvDecodeStrategy::FusedGqa
+        );
+    }
+
+    #[test]
+    fn kv_decode_strategy_picks_split_for_qwen_ratio() {
+        // Qwen 3.6 full attention has GQA=8; below MAX_GQA_SPLIT=8.
+        assert_eq!(
+            KvDecodeStrategy::for_gqa_ratio(5),
+            KvDecodeStrategy::SplitDecode
+        );
+        assert_eq!(
+            KvDecodeStrategy::for_gqa_ratio(8),
+            KvDecodeStrategy::SplitDecode
+        );
+    }
+
+    #[test]
+    fn kv_decode_strategy_falls_back_for_mistral() {
+        // Mistral 3.5 has GQA=12; both fused and split caps blown.
+        assert_eq!(
+            KvDecodeStrategy::for_gqa_ratio(12),
+            KvDecodeStrategy::PerHeadFallback
+        );
+        assert_eq!(
+            KvDecodeStrategy::for_gqa_ratio(16),
+            KvDecodeStrategy::PerHeadFallback
+        );
+    }
+
+    #[test]
+    fn kv_decode_strategy_safe_on_zero_ratio() {
+        assert_eq!(
+            KvDecodeStrategy::for_gqa_ratio(0),
+            KvDecodeStrategy::PerHeadFallback
+        );
     }
 }
