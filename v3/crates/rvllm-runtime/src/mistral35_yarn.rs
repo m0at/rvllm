@@ -163,6 +163,70 @@ pub fn yarn_inv_freq_and_mscale(
     (yarn_inv_freq(cfg, head_dim), yarn_mscale(cfg))
 }
 
+/// Pre-computed cos/sin RoPE tables for Mistral 3.5 YaRN. Stored
+/// in row-major `[max_pos, head_dim/2]` f32 layout — exactly the
+/// shape the future fused CUDA kernel
+/// (`fused_yarn_rope_nvfp4kv_mistral.cu`) takes as input. Tables
+/// are mscale-applied (multiplied through cos/sin) so the kernel
+/// just does a lookup + complex-number rotation per element pair.
+#[derive(Clone, Debug)]
+pub struct YarnRopeTables {
+    /// `[max_pos, head_dim / 2]` f32 row-major. `cos[pos * (d/2) + i]
+    /// = mscale * cos(pos * inv_freq[i])`.
+    pub cos: Vec<f32>,
+    /// Same shape as `cos`; `sin[pos * (d/2) + i] = mscale *
+    /// sin(pos * inv_freq[i])`.
+    pub sin: Vec<f32>,
+    pub max_pos: usize,
+    pub head_dim: usize,
+    pub mscale: f32,
+}
+
+impl YarnRopeTables {
+    /// Total f32 element count (`cos` + `sin` combined).
+    pub fn total_elements(&self) -> usize {
+        self.cos.len() + self.sin.len()
+    }
+    /// Total bytes for one `cos` or `sin` half (caller doubles for
+    /// both buffers).
+    pub fn half_bytes(&self) -> usize {
+        self.max_pos * (self.head_dim / 2) * std::mem::size_of::<f32>()
+    }
+}
+
+/// Build the YaRN cos/sin tables for `pos in 0..max_pos`. `max_pos`
+/// is typically `original_max_position_embeddings` at startup
+/// (4096 for Mistral 3.5) — positions beyond that fall through to
+/// the device-side per-position table extension when the kernel
+/// lands. With `head_dim=128, max_pos=4096` the tables are
+/// `4096 * 64 * 4` = 1 MiB each = 2 MiB total, comfortably
+/// resident in HBM.
+pub fn build_yarn_rope_tables(
+    cfg: &YarnRopeConfig,
+    head_dim: usize,
+    max_pos: usize,
+) -> YarnRopeTables {
+    assert!(
+        head_dim > 0 && head_dim % 2 == 0,
+        "build_yarn_rope_tables: head_dim={head_dim} must be even and >0"
+    );
+    assert!(max_pos > 0, "build_yarn_rope_tables: max_pos must be >0");
+    let (inv_freq, mscale) = yarn_inv_freq_and_mscale(cfg, head_dim);
+    let half = head_dim / 2;
+    let total = max_pos * half;
+    let mut cos = Vec::with_capacity(total);
+    let mut sin = Vec::with_capacity(total);
+    for pos in 0..max_pos {
+        let posf = pos as f32;
+        for i in 0..half {
+            let angle = posf * inv_freq[i];
+            cos.push(mscale * angle.cos());
+            sin.push(mscale * angle.sin());
+        }
+    }
+    YarnRopeTables { cos, sin, max_pos, head_dim, mscale }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +336,64 @@ mod tests {
     fn yarn_inv_freq_rejects_odd_head_dim() {
         let cfg = mistral_yarn();
         let _ = yarn_inv_freq(&cfg, 65);
+    }
+
+    #[test]
+    fn rope_tables_shape_and_pos_zero() {
+        let cfg = mistral_yarn();
+        let head_dim = 128usize;
+        let max_pos = 32usize;
+        let t = build_yarn_rope_tables(&cfg, head_dim, max_pos);
+        assert_eq!(t.head_dim, head_dim);
+        assert_eq!(t.max_pos, max_pos);
+        assert_eq!(t.cos.len(), max_pos * (head_dim / 2));
+        assert_eq!(t.sin.len(), max_pos * (head_dim / 2));
+        // pos=0: cos = mscale, sin = 0 across all i.
+        for i in 0..head_dim / 2 {
+            assert!((t.cos[i] - t.mscale).abs() < 1e-5,
+                    "pos=0,i={i} cos={} mscale={}", t.cos[i], t.mscale);
+            assert!(t.sin[i].abs() < 1e-5,
+                    "pos=0,i={i} sin={}", t.sin[i]);
+        }
+    }
+
+    #[test]
+    fn rope_tables_match_inv_freq_at_pos_one() {
+        let cfg = mistral_yarn();
+        let head_dim = 128usize;
+        let t = build_yarn_rope_tables(&cfg, head_dim, 4);
+        let (inv_freq, mscale) = yarn_inv_freq_and_mscale(&cfg, head_dim);
+        let half = head_dim / 2;
+        // pos=1: angle = 1 * inv_freq[i]
+        for i in 0..half {
+            let angle = inv_freq[i];
+            let expect_cos = mscale * angle.cos();
+            let expect_sin = mscale * angle.sin();
+            let got_cos = t.cos[1 * half + i];
+            let got_sin = t.sin[1 * half + i];
+            assert!((got_cos - expect_cos).abs() < 1e-5,
+                    "i={i} got_cos={got_cos} expect={expect_cos}");
+            assert!((got_sin - expect_sin).abs() < 1e-5,
+                    "i={i} got_sin={got_sin} expect={expect_sin}");
+        }
+    }
+
+    #[test]
+    fn rope_tables_mistral_steady_state_size() {
+        // At Mistral 3.5's full original-max precompute window:
+        //   max_pos=4096, head_dim=128 → 4096 * 64 = 262 144 f32
+        //   = 1 MiB per buffer (cos + sin = 2 MiB total).
+        let cfg = mistral_yarn();
+        let t = build_yarn_rope_tables(&cfg, 128, 4096);
+        assert_eq!(t.total_elements(), 4096 * 64 * 2);
+        assert_eq!(t.half_bytes(), 4096 * 64 * 4);
+        assert_eq!(t.cos.len() * 4, t.half_bytes());
+    }
+
+    #[test]
+    #[should_panic]
+    fn rope_tables_reject_zero_max_pos() {
+        let _ = build_yarn_rope_tables(&mistral_yarn(), 128, 0);
     }
 
     #[test]

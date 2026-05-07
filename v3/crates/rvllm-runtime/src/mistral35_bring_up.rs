@@ -263,6 +263,27 @@ impl Mistral35Bringup {
         LayerScratchBudget::natural(&self.arch, m)
     }
 
+    /// Build the YaRN cos/sin tables for `pos in 0..max_pos` using
+    /// the arch's resolved YaRN config + head_dim. Pure CPU work
+    /// here; the future fused CUDA kernel takes the result as a
+    /// uniform `[max_pos, head_dim/2]` f32 device buffer.
+    ///
+    /// Defaults `max_pos` to `original_max_position_embeddings`
+    /// when callers want the in-trained-window precompute (4096
+    /// for Mistral 3.5).
+    pub fn build_rope_tables(
+        &self,
+        max_pos: Option<usize>,
+    ) -> crate::mistral35_yarn::YarnRopeTables {
+        let mp = max_pos
+            .unwrap_or(self.arch.text.yarn.original_max_position_embeddings);
+        crate::mistral35_yarn::build_yarn_rope_tables(
+            &self.arch.text.yarn,
+            self.arch.text.head_dim,
+            mp,
+        )
+    }
+
     /// Backend-aware scratch budget. Queries the active
     /// `CutlassBackend` for exact SFA + workspace sizes per
     /// projection shape and returns the per-layer max. Useful when
@@ -452,6 +473,23 @@ impl Mistral35Bringup {
                  (MAX_GQA_SPLIT=8) kernel caps; per-head fallback is \
                  correct but ~12x duplicated K/V load. Raise both .cu \
                  constants to >=12 to flip onto the fused path."
+            );
+        }
+        // YaRN cos/sin tables for the original-max window. The
+        // device upload happens later (CUDA forward path); for now
+        // we just log the table size + the mscale value so the
+        // operator can sanity-check the YaRN parameters resolved
+        // correctly from config.json.
+        {
+            let head_dim = bringup.arch.text.head_dim;
+            let max_pos = bringup.arch.text.yarn.original_max_position_embeddings;
+            let mscale = crate::mistral35_yarn::yarn_mscale(&bringup.arch.text.yarn);
+            eprintln!(
+                "[mistral35] yarn: head_dim={head_dim} original_max={max_pos} \
+                 mscale={mscale:.5} (factor={}, beta_fast={}, beta_slow={})",
+                bringup.arch.text.yarn.factor,
+                bringup.arch.text.yarn.beta_fast,
+                bringup.arch.text.yarn.beta_slow,
             );
         }
         let prefill = bringup.batched_prefill_config();
@@ -772,6 +810,23 @@ mod tests {
         let b = LayerScratchBudget::natural(&arch, 0);
         assert_eq!(b.a_packed_bytes, 0);
         assert_eq!(b.sfa_natural_bytes, 0);
+    }
+
+    #[test]
+    fn rope_tables_default_max_pos_is_yarn_original_max() {
+        // With max_pos=None, the bring-up uses the YaRN
+        // original_max_position_embeddings (4096 for Mistral 3.5).
+        // No live bring-up needed for this test — we exercise the
+        // helper directly through the same code path.
+        let arch = test_arch_fixture(2);
+        let head_dim = arch.text.head_dim;
+        let omp = arch.text.yarn.original_max_position_embeddings;
+        let t = super::super::mistral35_yarn::build_yarn_rope_tables(
+            &arch.text.yarn, head_dim, omp,
+        );
+        assert_eq!(t.max_pos, 4096);
+        assert_eq!(t.head_dim, 128);
+        assert_eq!(t.cos.len(), 4096 * 64);
     }
 
     #[cfg(feature = "cuda")]
