@@ -493,9 +493,13 @@ pub type Nvfp4GemmSm120WorkspaceFn = unsafe extern "C" fn(m: i32, n: i32, k: i32
 #[cfg(feature = "cuda")]
 pub type Nvfp4Sm120SfaBytesFn = unsafe extern "C" fn(m: i32, k: i32) -> usize;
 
-/// Quantize the BF16/F16 activation tensor to FP8 E4M3 in-place
-/// (`a_fp8` output) AND populate the SFA scratch with per-token
-/// scales aligned to the K/16 block grid. One launch per layer.
+/// Single-call activation prep: BF16/F16 -> NVFP4 packed + CUTLASS-
+/// interleaved SFA. Internally chains [`Nvfp4Sm120PrepActFn`] and
+/// [`Nvfp4Sm120SfaTransformFn`]; the caller still must provide a
+/// scratch buffer for the natural-layout intermediate. The `.so`
+/// today returns -100 for this entry pending the chained
+/// implementation; callers should use the explicit prep_act +
+/// sfa_natural_to_interleaved pair below until then.
 #[cfg(feature = "cuda")]
 #[allow(clippy::type_complexity)]
 pub type Nvfp4Sm120PrepSfaFn = unsafe extern "C" fn(
@@ -507,6 +511,42 @@ pub type Nvfp4Sm120PrepSfaFn = unsafe extern "C" fn(
     a_input_dtype: i32, // 0 = F16, 1 = BF16
     stream: *mut c_void,
 ) -> i32;
+
+/// Activation prep step 1 — BF16/F16 -> NVFP4-packed bytes
+/// `[m, k/2]` plus per-(row, K-block-of-16) E4M3 scales in the
+/// natural row-major `[m, k/16]` layout.
+///
+/// Wired by `kernels/cutlass_nvfp4_prep_act_sm120.cu`. Output
+/// `sfa_natural` must be `nvfp4_natural_sfa_bytes(m, k)` wide.
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+pub type Nvfp4Sm120PrepActFn = unsafe extern "C" fn(
+    a_input_fp16_or_bf16: *const c_void,
+    a_packed_out: *mut c_void,
+    sfa_natural_out: *mut c_void,
+    m: i32,
+    k: i32,
+    a_input_dtype: i32, // 0 = F16, 1 = BF16
+    stream: *mut c_void,
+) -> i32;
+
+/// Activation prep step 2 — natural `[m, k/16]` E4M3 -> CUTLASS
+/// `Sm1xxBlkScaledConfig` interleaved SFA. Pure index permutation.
+#[cfg(feature = "cuda")]
+pub type Nvfp4Sm120SfaTransformFn = unsafe extern "C" fn(
+    src_natural: *const c_void,
+    dst_cutlass: *mut c_void,
+    m: i32,
+    k: i32,
+    stream: *mut c_void,
+) -> i32;
+
+/// Natural-layout SFA scratch size in bytes (one E4M3 byte per
+/// (row, K-block) pair = `m * k / 16`). Distinct from
+/// [`Nvfp4Sm120SfaBytesFn`], which queries the CUTLASS-interleaved
+/// destination size and includes layout-swizzle padding.
+#[cfg(feature = "cuda")]
+pub type Nvfp4Sm120NaturalSfaBytesFn = unsafe extern "C" fn(m: i32, k: i32) -> usize;
 
 /// Resolved `libcutlass_sm120.so` + fn pointer. Intentionally simpler
 /// than `CutlassLib`: only one entry point today
@@ -542,6 +582,17 @@ pub struct CutlassSm120Lib {
     pub nvfp4_sfa_bytes: Option<Nvfp4Sm120SfaBytesFn>,
     #[cfg(feature = "cuda")]
     pub nvfp4_prep_sfa: Option<Nvfp4Sm120PrepSfaFn>,
+    /// Step-1 activation prep — BF16/F16 -> NVFP4-packed +
+    /// natural-layout SFA. Required member of the chain.
+    #[cfg(feature = "cuda")]
+    pub nvfp4_prep_act: Option<Nvfp4Sm120PrepActFn>,
+    /// Step-2 SFA layout transform — natural -> CUTLASS interleaved.
+    /// Required member of the chain.
+    #[cfg(feature = "cuda")]
+    pub nvfp4_sfa_transform: Option<Nvfp4Sm120SfaTransformFn>,
+    /// Natural-layout SFA size query.
+    #[cfg(feature = "cuda")]
+    pub nvfp4_natural_sfa_bytes: Option<Nvfp4Sm120NaturalSfaBytesFn>,
 }
 
 #[cfg(feature = "cuda")]
@@ -614,6 +665,21 @@ impl CutlassSm120Lib {
                 .ok()
                 .map(|s| *s)
         };
+        let nvfp4_prep_act: Option<Nvfp4Sm120PrepActFn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_prep_act\0")
+                .ok()
+                .map(|s| *s)
+        };
+        let nvfp4_sfa_transform: Option<Nvfp4Sm120SfaTransformFn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_sfa_natural_to_interleaved\0")
+                .ok()
+                .map(|s| *s)
+        };
+        let nvfp4_natural_sfa_bytes: Option<Nvfp4Sm120NaturalSfaBytesFn> = unsafe {
+            lib.get(b"cutlass_nvfp4_gemm_sm120_prep_act_sfa_bytes\0")
+                .ok()
+                .map(|s| *s)
+        };
         Ok(Self {
             so_path: path,
             _lib: lib,
@@ -628,6 +694,9 @@ impl CutlassSm120Lib {
             nvfp4_workspace,
             nvfp4_sfa_bytes,
             nvfp4_prep_sfa,
+            nvfp4_prep_act,
+            nvfp4_sfa_transform,
+            nvfp4_natural_sfa_bytes,
         })
     }
 
@@ -825,14 +894,21 @@ impl CutlassSm120Lib {
     /// True iff the resolved `.so` exposes the full NVFP4 entry point
     /// set. Either every required symbol resolves or this returns
     /// false — partial binding is treated as missing.
+    ///
+    /// `nvfp4_prep_sfa` is the future single-call wrapper (today
+    /// stubs to -100 even when bound); the runtime relies on the
+    /// explicit chain `nvfp4_prep_act` -> `nvfp4_sfa_transform` ->
+    /// `nvfp4_gemm`, so those three are the gating set.
+    /// `nvfp4_gemm_decode_m1` is optional (the prefill kernel can
+    /// serve m=1 too, just slower); treat it as a hint, not gate.
     #[cfg(feature = "cuda")]
     pub fn nvfp4_active(&self) -> bool {
         self.nvfp4_gemm.is_some()
             && self.nvfp4_workspace.is_some()
             && self.nvfp4_sfa_bytes.is_some()
-            && self.nvfp4_prep_sfa.is_some()
-        // `nvfp4_gemm_decode_m1` is optional (the prefill kernel can
-        // serve m=1 too, just slower); treat it as a hint, not gate.
+            && self.nvfp4_prep_act.is_some()
+            && self.nvfp4_sfa_transform.is_some()
+            && self.nvfp4_natural_sfa_bytes.is_some()
     }
 
     /// `Ok(())` iff `nvfp4_active`. Used at Mistral 3.5 startup —
@@ -853,8 +929,14 @@ impl CutlassSm120Lib {
         if self.nvfp4_sfa_bytes.is_none() {
             missing.push("cutlass_nvfp4_gemm_sm120_sfa_bytes");
         }
-        if self.nvfp4_prep_sfa.is_none() {
-            missing.push("cutlass_nvfp4_gemm_sm120_prep_sfa");
+        if self.nvfp4_prep_act.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120_prep_act");
+        }
+        if self.nvfp4_sfa_transform.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120_sfa_natural_to_interleaved");
+        }
+        if self.nvfp4_natural_sfa_bytes.is_none() {
+            missing.push("cutlass_nvfp4_gemm_sm120_prep_act_sfa_bytes");
         }
         // Diagnostic stderr line so the operator sees exactly which
         // symbols failed to bind without grepping a missing-feature
@@ -896,6 +978,149 @@ impl CutlassSm120Lib {
         self.nvfp4_sfa_bytes
             .map(|f| unsafe { f(m, k) })
             .unwrap_or(0)
+    }
+
+    /// Natural-layout SFA scratch size in bytes. Distinct from
+    /// `nvfp4_sfa_bytes` — the natural intermediate is plain
+    /// row-major `[m, k/16]` E4M3 (one byte per (row, K-block));
+    /// the CUTLASS query reports the swizzled-and-padded final
+    /// destination size.
+    #[cfg(feature = "cuda")]
+    pub fn nvfp4_natural_sfa_bytes(&self, m: i32, k: i32) -> usize {
+        self.nvfp4_natural_sfa_bytes
+            .map(|f| unsafe { f(m, k) })
+            .unwrap_or(0)
+    }
+
+    /// Activation prep step 1: BF16/F16 -> NVFP4-packed bytes +
+    /// natural-layout SFA. The natural SFA must be transformed via
+    /// `launch_nvfp4_sfa_transform` before it can feed the GEMM.
+    ///
+    /// # Safety
+    /// `a_input` must be `m * k * sizeof(elem_dtype)` bytes wide.
+    /// `a_packed_out` must be at least `m * k / 2` bytes;
+    /// `sfa_natural_out` must be at least `nvfp4_natural_sfa_bytes`
+    /// bytes.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_prep_act(
+        &self,
+        a_input: u64,
+        a_packed_out: u64,
+        sfa_natural_out: u64,
+        m: i32,
+        k: i32,
+        a_input_dtype_f16_eq_0_bf16_eq_1: i32,
+        stream: u64,
+    ) -> Result<()> {
+        let f = self.nvfp4_prep_act.ok_or_else(|| {
+            RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::Other,
+                },
+                CutlassCtx { kernel: "nvfp4_prep_act_sm120 (missing from .so)", stream },
+            )
+        })?;
+        let rc = f(
+            a_input as *const c_void,
+            a_packed_out as *mut c_void,
+            sfa_natural_out as *mut c_void,
+            m, k,
+            a_input_dtype_f16_eq_0_bf16_eq_1,
+            stream as *mut c_void,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                },
+                CutlassCtx { kernel: "nvfp4_prep_act_sm120", stream },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Activation prep step 2: natural-layout `[m, k/16]` E4M3 ->
+    /// CUTLASS interleaved SFA. Pure index permutation.
+    ///
+    /// # Safety
+    /// `src_natural` must be `nvfp4_natural_sfa_bytes(m, k)` bytes;
+    /// `dst_cutlass` must be `nvfp4_sfa_bytes(m, k)` bytes.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_sfa_transform(
+        &self,
+        src_natural: u64,
+        dst_cutlass: u64,
+        m: i32,
+        k: i32,
+        stream: u64,
+    ) -> Result<()> {
+        let f = self.nvfp4_sfa_transform.ok_or_else(|| {
+            RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::Other,
+                },
+                CutlassCtx { kernel: "nvfp4_sfa_transform_sm120 (missing from .so)", stream },
+            )
+        })?;
+        let rc = f(
+            src_natural as *const c_void,
+            dst_cutlass as *mut c_void,
+            m, k,
+            stream as *mut c_void,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: 0,
+                    cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                },
+                CutlassCtx { kernel: "nvfp4_sfa_transform_sm120", stream },
+            ));
+        }
+        Ok(())
+    }
+
+    /// High-level convenience: prep_act + sfa_transform back-to-back.
+    /// `a_packed_out` and `sfa_cutlass_out` are the GEMM-ready
+    /// outputs; `sfa_natural_scratch` is consumed and overwritten,
+    /// the caller can reuse it across layers.
+    ///
+    /// # Safety
+    /// All four buffers must outlive the launch. `sfa_natural_scratch`
+    /// must be at least `nvfp4_natural_sfa_bytes(m, k)`,
+    /// `sfa_cutlass_out` must be at least `nvfp4_sfa_bytes(m, k)`.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_prep_sfa_chain(
+        &self,
+        a_input: u64,
+        a_packed_out: u64,
+        sfa_natural_scratch: u64,
+        sfa_cutlass_out: u64,
+        m: i32,
+        k: i32,
+        a_input_dtype_f16_eq_0_bf16_eq_1: i32,
+        stream: u64,
+    ) -> Result<()> {
+        self.launch_nvfp4_prep_act(
+            a_input,
+            a_packed_out,
+            sfa_natural_scratch,
+            m, k,
+            a_input_dtype_f16_eq_0_bf16_eq_1,
+            stream,
+        )?;
+        self.launch_nvfp4_sfa_transform(
+            sfa_natural_scratch,
+            sfa_cutlass_out,
+            m, k,
+            stream,
+        )
     }
 
     /// Quantize activations to FP8 + stage SFA scratch. Single launch
@@ -1383,6 +1608,109 @@ impl CutlassBackend {
         }
     }
 
+    /// Natural-layout SFA scratch size — see
+    /// `CutlassSm120Lib::nvfp4_natural_sfa_bytes`. Returns 0 for
+    /// non-Sm120 backends.
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub fn nvfp4_natural_sfa_bytes(&self, m: i32, k: i32) -> usize {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.nvfp4_natural_sfa_bytes(m, k),
+            _ => 0,
+        }
+    }
+
+    /// # Safety
+    /// See `CutlassSm120Lib::launch_nvfp4_prep_act` for buffer
+    /// requirements.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_prep_act(
+        &self,
+        a_input: u64,
+        a_packed_out: u64,
+        sfa_natural_out: u64,
+        m: i32,
+        k: i32,
+        a_input_dtype_f16_eq_0_bf16_eq_1: i32,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.launch_nvfp4_prep_act(
+                a_input, a_packed_out, sfa_natural_out, m, k,
+                a_input_dtype_f16_eq_0_bf16_eq_1, stream,
+            ),
+            _ => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "nvfp4_prep_act requires CutlassBackend::SoSm120",
+                },
+                CutlassCtx { kernel: "nvfp4_prep_act", stream },
+            )),
+        }
+    }
+
+    /// # Safety
+    /// See `CutlassSm120Lib::launch_nvfp4_sfa_transform` for buffer
+    /// requirements.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_sfa_transform(
+        &self,
+        src_natural: u64,
+        dst_cutlass: u64,
+        m: i32,
+        k: i32,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.launch_nvfp4_sfa_transform(
+                src_natural, dst_cutlass, m, k, stream,
+            ),
+            _ => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "nvfp4_sfa_transform requires CutlassBackend::SoSm120",
+                },
+                CutlassCtx { kernel: "nvfp4_sfa_transform", stream },
+            )),
+        }
+    }
+
+    /// High-level prep: prep_act + sfa_transform back-to-back. The
+    /// caller-supplied `sfa_natural_scratch` is consumed across the
+    /// chain (overwritten then immediately read by the transform);
+    /// reuse across layers is fine.
+    ///
+    /// # Safety
+    /// All four buffers must outlive the launch and be sized per
+    /// the underlying backend's queries.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_nvfp4_prep_sfa_chain(
+        &self,
+        a_input: u64,
+        a_packed_out: u64,
+        sfa_natural_scratch: u64,
+        sfa_cutlass_out: u64,
+        m: i32,
+        k: i32,
+        a_input_dtype_f16_eq_0_bf16_eq_1: i32,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            CutlassBackend::SoSm120(lib) => lib.launch_nvfp4_prep_sfa_chain(
+                a_input, a_packed_out, sfa_natural_scratch,
+                sfa_cutlass_out, m, k,
+                a_input_dtype_f16_eq_0_bf16_eq_1, stream,
+            ),
+            _ => Err(RvllmError::cutlass(
+                CutlassError::FeatureNotAvailable {
+                    op: "nvfp4_prep_sfa_chain requires CutlassBackend::SoSm120",
+                },
+                CutlassCtx { kernel: "nvfp4_prep_sfa_chain", stream },
+            )),
+        }
+    }
+
     /// # Safety
     /// All device pointers must be valid for the kernel's duration.
     /// See `CutlassSm120Lib::launch_nvfp4_prep_sfa` for layout
@@ -1599,5 +1927,32 @@ mod tests {
         let backend = CutlassBackend::Absent;
         assert_eq!(backend.nvfp4_workspace_size(1, 12288, 12288), 0);
         assert_eq!(backend.nvfp4_sfa_bytes(1, 12288), 0);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_natural_sfa_bytes_zero_when_inactive() {
+        let backend = CutlassBackend::Absent;
+        assert_eq!(backend.nvfp4_natural_sfa_bytes(1, 12288), 0);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn nvfp4_chain_dispatch_rejects_absent_backend() {
+        let backend = CutlassBackend::Absent;
+        // SAFETY: the dispatch fails before touching the dummy
+        // pointers, so passing zeros is fine.
+        let r = unsafe {
+            backend.launch_nvfp4_prep_sfa_chain(0, 0, 0, 0, 1, 16, 0, 0)
+        };
+        assert!(r.is_err());
+        let r = unsafe {
+            backend.launch_nvfp4_prep_act(0, 0, 0, 1, 16, 0, 0)
+        };
+        assert!(r.is_err());
+        let r = unsafe {
+            backend.launch_nvfp4_sfa_transform(0, 0, 1, 16, 0)
+        };
+        assert!(r.is_err());
     }
 }
