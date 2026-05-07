@@ -264,13 +264,26 @@ pub async fn spawn_cuda_worker(
                         };
                         if let Some(t0) = prefill_start {
                             let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            // Round-27d: gates are default-ON post-audit;
+                            // log the RESOLVED state (env-var=0/false → off,
+                            // anything else including "unset" → on) so the
+                            // log reflects what the runtime actually
+                            // dispatched, not just the literal env string.
+                            let resolved = |name: &str| -> &'static str {
+                                match std::env::var(name) {
+                                    Ok(s) if matches!(s.as_str(),
+                                        "0"|"false"|"FALSE"|"no") => "off",
+                                    _ => "on",
+                                }
+                            };
                             tracing::info!(
                                 prompt_tokens = prompt_len,
                                 prefill_ms = format!("{dt_ms:.2}"),
-                                batch_linear = std::env::var("RVLLM_QWEN36_BATCH_LINEAR_PREFILL").unwrap_or_else(|_| "0".to_string()),
-                                batch_full = std::env::var("RVLLM_QWEN36_BATCH_FULL_PREFILL").unwrap_or_else(|_| "0".to_string()),
-                                batch_moe = std::env::var("RVLLM_QWEN36_BATCH_MOE_PREFILL").unwrap_or_else(|_| "0".to_string()),
-                                batch_moe_routed_ffn = std::env::var("RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN").unwrap_or_else(|_| "0".to_string()),
+                                batch_linear = resolved("RVLLM_QWEN36_BATCH_LINEAR_PREFILL"),
+                                batch_full = resolved("RVLLM_QWEN36_BATCH_FULL_PREFILL"),
+                                batch_moe = resolved("RVLLM_QWEN36_BATCH_MOE_PREFILL"),
+                                batch_moe_routed_ffn = resolved("RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN"),
+                                batch_moe_shared = resolved("RVLLM_QWEN36_BATCH_MOE_SHARED"),
                                 "[qwen36-timing] prefill done",
                             );
                         }
