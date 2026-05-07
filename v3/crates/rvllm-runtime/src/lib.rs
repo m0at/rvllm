@@ -73,6 +73,7 @@ pub mod gemma4_bring_up;
 pub mod gemma4_layer_exec;
 pub mod layer_exec;
 pub mod qwen36_arch;
+pub mod mistral35_bring_up;
 pub mod qwen36_bring_up;
 pub mod qwen36_layer_exec;
 pub mod qwen36_load;

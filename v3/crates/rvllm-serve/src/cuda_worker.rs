@@ -81,17 +81,45 @@ pub async fn spawn_cuda_worker(
     let join = std::thread::Builder::new()
         .name("rvllm-serve-cuda-worker".into())
         .spawn(move || {
-            // Mistral 3.5 (NVFP4 dense decoder + Pixtral vision)
-            // bring-up lands incrementally. Until the worker branch is
-            // wired through, fail fast with a clear message rather
-            // than fall through to the Gemma 4 loader (which would
-            // panic on missing tensors).
+            // Mistral 3.5: parse arch + validate inventory + assert
+            // CUTLASS NVFP4 symbols present, then refuse per-request
+            // generation cleanly until the GPU forward path is wired.
+            // This covers steps 1-4 + 7 partial — the operator gets
+            // concrete startup diagnostics on a real Mistral
+            // checkpoint, and per-request errors carry the same
+            // "kernel not implemented" reason instead of corrupting
+            // arena state.
             if matches!(family, ModelFamily::Mistral35) {
-                let _ = ready_tx.send(Err(
-                    "Mistral 3.5 worker bring-up not yet wired (Phase 1 \
-                     scaffolding only); see mistral-35-integration.md"
-                        .into(),
-                ));
+                let bringup = match rvllm_runtime::mistral35_bring_up::Mistral35Bringup::load(
+                    paths,
+                    arena_bytes,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!(
+                            "Mistral35Bringup::load: {e:?}"
+                        )));
+                        return;
+                    }
+                };
+                tracing::info!(
+                    nvfp4_active = bringup.nvfp4_active,
+                    "Mistral 3.5 bring-up validated; forward path not yet implemented"
+                );
+                let _ = ready_tx.send(Ok(()));
+
+                while let Some(req) = req_rx.blocking_recv() {
+                    let _ = req.events_tx.send(GenerateEvent::Error(format!(
+                        "Mistral 3.5 forward path not yet implemented \
+                         (CUTLASS NVFP4 GEMM kernel pending — see \
+                         kernels/cutlass_nvfp4_gemm_sm120.cu and \
+                         v3/crates/rvllm-runtime/src/mistral35_bring_up.rs). \
+                         Bring-up validation passed: arch + inventory \
+                         clean, nvfp4_active={}",
+                        bringup.nvfp4_active
+                    )));
+                }
+                tracing::info!("Mistral 3.5 cuda worker queue closed, exiting");
                 return;
             }
 
