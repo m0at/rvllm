@@ -25,6 +25,7 @@ use tokio::sync::oneshot;
 
 use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
 
+use crate::config::ModelFamily;
 use crate::error::ApiError;
 use crate::openai::types::FinishReason;
 use crate::worker::{GenerateEvent, GenerateRequest, WorkerHandle};
@@ -45,6 +46,12 @@ pub struct CudaWorkerConfig {
     pub paths: Gemma4EnginePaths,
     pub arena_bytes: usize,
     pub queue_depth: usize,
+    /// Resolved model family. Drives explicit dispatch in
+    /// [`spawn_cuda_worker`]. With `Auto` the worker still does
+    /// per-family marker probing as before, but `Mistral35` /
+    /// `Qwen36` / `Gemma4` short-circuit to the matching bring-up
+    /// without re-probing.
+    pub family: ModelFamily,
 }
 
 /// Spawn the CUDA worker on a dedicated OS thread.
@@ -70,19 +77,57 @@ pub async fn spawn_cuda_worker(
     let (req_tx, mut req_rx) = mpsc::channel::<GenerateRequest>(channel_buf);
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
-    let CudaWorkerConfig { paths, arena_bytes, .. } = cfg;
+    let CudaWorkerConfig { paths, arena_bytes, family, .. } = cfg;
     let join = std::thread::Builder::new()
         .name("rvllm-serve-cuda-worker".into())
         .spawn(move || {
-            // Phase-0 Qwen 3.6 detection. If the model_dir's config.json
-            // carries the Qwen-3.6 markers (linear+full hybrid attention,
-            // 256-expert MoE, attn_output_gate=true), short-circuit
-            // before the Gemma 4 loader hits a missing-tensor panic.
-            // Phase 1+ replaces this branch with a real Qwen36Bringup
-            // forward path; until then we surface a clean "not yet
-            // implemented" message at startup so the operator knows
-            // the branch is intentionally a scaffold.
-            match rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(&paths.model_dir) {
+            // Mistral 3.5 (NVFP4 dense decoder + Pixtral vision)
+            // bring-up lands incrementally. Until the worker branch is
+            // wired through, fail fast with a clear message rather
+            // than fall through to the Gemma 4 loader (which would
+            // panic on missing tensors).
+            if matches!(family, ModelFamily::Mistral35) {
+                let _ = ready_tx.send(Err(
+                    "Mistral 3.5 worker bring-up not yet wired (Phase 1 \
+                     scaffolding only); see mistral-35-integration.md"
+                        .into(),
+                ));
+                return;
+            }
+
+            // Qwen 3.6 detection — under explicit `--model-family`,
+            // skip the probe; under Auto fall back to the marker
+            // probe. `Gemma4` selection short-circuits straight to the
+            // Gemma 4 loader.
+            let qwen_probe = match family {
+                ModelFamily::Gemma4 => Ok(None),
+                ModelFamily::Qwen36 => {
+                    rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(&paths.model_dir)
+                        .and_then(|opt| match opt {
+                            Some(a) => Ok(Some(a)),
+                            None => {
+                                use rvllm_core::{LoaderCtx, LoaderError, RvllmError};
+                                Err(RvllmError::Loader {
+                                    err: LoaderError::Corrupt {
+                                        detail:
+                                            "operator forced --model-family=qwen36 but config.json \
+                                             does not match the Qwen 3.6 markers"
+                                                .into(),
+                                    },
+                                    ctx: LoaderCtx {
+                                        path: paths.model_dir.join("config.json"),
+                                        tensor: None,
+                                    },
+                                    bt: std::backtrace::Backtrace::capture(),
+                                })
+                            }
+                        })
+                }
+                ModelFamily::Auto | ModelFamily::Mistral35 => {
+                    rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(&paths.model_dir)
+                }
+            };
+            match qwen_probe {
                 Ok(Some(_)) => {
                     let qwen = match rvllm_runtime::qwen36_bring_up::Qwen36Bringup::load(
                         paths,

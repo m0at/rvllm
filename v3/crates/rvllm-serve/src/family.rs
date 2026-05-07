@@ -1,0 +1,331 @@
+//! Single source of truth for resolving the loaded model's family
+//! (Qwen 3.6 / Gemma 4 / Mistral 3.5) from a model directory.
+//!
+//! Until this module landed, vision-arch detection in `main.rs` and
+//! decoder dispatch in `cuda_worker.rs::spawn_cuda_worker` each
+//! hand-rolled their own probe. The two could disagree if a future
+//! family was wired into one site but not the other; the chat
+//! template, image-token predictor, and worker would then disagree on
+//! what was loaded. Both sites now call `resolve_model_family`.
+//!
+//! Markers used (see `mistral-35-integration.md`, the Qwen 3.6
+//! `Qwen36Arch::from_dir` probe, and `Gemma4Arch::from_dir`):
+//!
+//! - **Mistral 3.5**: `architectures[0] == "Mistral3ForConditionalGeneration"`
+//!   AND `model_type == "mistral3"` AND
+//!   `quantization_config.format == "nvfp4-pack-quantized"`.
+//! - **Qwen 3.6**: `Qwen36Arch::from_dir` (MoE marker count + linear
+//!   layer present + `attn_output_gate=true`).
+//! - **Gemma 4**: fall-through default.
+//!
+//! Explicit `--model-family` overrides assert that the requested
+//! family matches the markers and fail with a typed error on mismatch
+//! — never silently fall through.
+
+use std::path::Path;
+
+use crate::config::ModelFamily;
+use crate::router::VisionArch;
+
+#[derive(Debug, thiserror::Error)]
+pub enum FamilyResolveError {
+    #[error("config.json missing or unreadable at {path}: {source}")]
+    ConfigUnreadable {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("config.json at {path} is not valid JSON: {source}")]
+    ConfigJson {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "operator selected --model-family={requested} but config.json at {path} does not match \
+         (markers seen: {markers}); refusing to fall through to a different family"
+    )]
+    Mismatch {
+        requested: &'static str,
+        path: std::path::PathBuf,
+        markers: String,
+    },
+    #[error("Mistral 3.5 config requires mscale_all_dim=0.0 (got {got}); refusing to load")]
+    MistralBadMscaleAllDim { got: f64 },
+    #[error("internal: {0}")]
+    Other(String),
+}
+
+/// Selected family + matching `VisionArch` for the HTTP layer.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedFamily {
+    pub family: ModelFamily,
+    pub vision_arch: VisionArch,
+}
+
+impl ResolvedFamily {
+    pub fn log_summary(&self, model_dir: &Path) {
+        tracing::info!(
+            family = %self.family.as_str(),
+            vision_arch = ?self.vision_arch,
+            model_dir = %model_dir.display(),
+            "model family resolved",
+        );
+    }
+}
+
+/// Inspect `<model_dir>/config.json` and decide which decoder/vision
+/// stack to load. `selected` is the operator preference (`Auto` =
+/// detect; explicit value = assert match).
+pub fn resolve_model_family(
+    model_dir: &Path,
+    selected: ModelFamily,
+) -> Result<ResolvedFamily, FamilyResolveError> {
+    // Cheap probes first (don't fail just because there's no
+    // config.json — Qwen probe handles its own absence gracefully).
+    let mistral_match = is_mistral35(model_dir)?;
+    let qwen_match = is_qwen36(model_dir);
+
+    match selected {
+        ModelFamily::Auto => {
+            if mistral_match {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Mistral35,
+                    vision_arch: VisionArch::Mistral35,
+                })
+            } else if qwen_match {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Qwen36,
+                    vision_arch: VisionArch::Qwen36,
+                })
+            } else {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Gemma4,
+                    vision_arch: VisionArch::Gemma4,
+                })
+            }
+        }
+        ModelFamily::Mistral35 => {
+            if mistral_match {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Mistral35,
+                    vision_arch: VisionArch::Mistral35,
+                })
+            } else {
+                Err(FamilyResolveError::Mismatch {
+                    requested: "mistral35",
+                    path: model_dir.join("config.json"),
+                    markers: collect_markers(model_dir),
+                })
+            }
+        }
+        ModelFamily::Qwen36 => {
+            if qwen_match {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Qwen36,
+                    vision_arch: VisionArch::Qwen36,
+                })
+            } else {
+                Err(FamilyResolveError::Mismatch {
+                    requested: "qwen36",
+                    path: model_dir.join("config.json"),
+                    markers: collect_markers(model_dir),
+                })
+            }
+        }
+        ModelFamily::Gemma4 => {
+            // Gemma 4 has no single-line config marker; we assert by
+            // exclusion. If the dir matches Mistral or Qwen markers,
+            // refusing here is the right thing — the user explicitly
+            // asked for Gemma 4 and silently loading another family
+            // would defeat the purpose of the explicit flag.
+            if mistral_match || qwen_match {
+                Err(FamilyResolveError::Mismatch {
+                    requested: "gemma4",
+                    path: model_dir.join("config.json"),
+                    markers: collect_markers(model_dir),
+                })
+            } else {
+                Ok(ResolvedFamily {
+                    family: ModelFamily::Gemma4,
+                    vision_arch: VisionArch::Gemma4,
+                })
+            }
+        }
+    }
+}
+
+fn read_config(model_dir: &Path) -> Result<Option<serde_json::Value>, FamilyResolveError> {
+    let path = model_dir.join("config.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(FamilyResolveError::ConfigUnreadable { path, source }),
+    };
+    let v: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|source| FamilyResolveError::ConfigJson { path: path.clone(), source })?;
+    Ok(Some(v))
+}
+
+fn is_mistral35(model_dir: &Path) -> Result<bool, FamilyResolveError> {
+    let v = match read_config(model_dir)? {
+        Some(v) => v,
+        None => return Ok(false),
+    };
+    let arch_match = v["architectures"][0]
+        .as_str()
+        .map(|s| s == "Mistral3ForConditionalGeneration")
+        .unwrap_or(false);
+    let model_type_match = v["model_type"].as_str() == Some("mistral3");
+    let quant_match = v["quantization_config"]["format"]
+        .as_str()
+        .map(|s| s == "nvfp4-pack-quantized")
+        .unwrap_or(false);
+
+    if arch_match && model_type_match && quant_match {
+        // Validate the YaRN correction one-liner up-front so an
+        // explicit `--model-family mistral35` picks it up before
+        // weight load. The integration spec calls this out as a
+        // known checkpoint correction; we refuse to keep going on
+        // a non-zero value because the YaRN math diverges silently.
+        let mscale_all_dim = v["text_config"]["rope_scaling"]["mscale_all_dim"]
+            .as_f64()
+            .or_else(|| v["rope_scaling"]["mscale_all_dim"].as_f64())
+            .unwrap_or(0.0);
+        if mscale_all_dim != 0.0 {
+            return Err(FamilyResolveError::MistralBadMscaleAllDim {
+                got: mscale_all_dim,
+            });
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn is_qwen36(model_dir: &Path) -> bool {
+    matches!(
+        rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(model_dir),
+        Ok(Some(_))
+    )
+}
+
+fn collect_markers(model_dir: &Path) -> String {
+    let v = match std::fs::read(model_dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    {
+        Some(v) => v,
+        None => return "no config.json".into(),
+    };
+    let arch = v["architectures"][0].as_str().unwrap_or("?");
+    let mt = v["model_type"].as_str().unwrap_or("?");
+    let q = v["quantization_config"]["format"].as_str().unwrap_or("?");
+    format!("architectures[0]={arch:?} model_type={mt:?} quant.format={q:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tempdir() -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "rvllm-serve-family-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create_dir_all");
+        p
+    }
+
+    fn write_config(dir: &Path, body: &str) {
+        let mut f = std::fs::File::create(dir.join("config.json")).expect("create");
+        f.write_all(body.as_bytes()).expect("write");
+    }
+
+    #[test]
+    fn auto_detects_mistral_marker() {
+        let tmp = tempdir();
+        write_config(
+            &tmp,
+            r#"{
+              "architectures": ["Mistral3ForConditionalGeneration"],
+              "model_type": "mistral3",
+              "quantization_config": {"format": "nvfp4-pack-quantized"}
+            }"#,
+        );
+        let r = resolve_model_family(&tmp, ModelFamily::Auto).expect("ok");
+        assert_eq!(r.family, ModelFamily::Mistral35);
+        assert_eq!(r.vision_arch, VisionArch::Mistral35);
+    }
+
+    #[test]
+    fn explicit_mistral_rejects_gemma_dir() {
+        let tmp = tempdir();
+        write_config(
+            &tmp,
+            r#"{
+              "architectures": ["Gemma4ForConditionalGeneration"],
+              "model_type": "gemma4"
+            }"#,
+        );
+        let err = resolve_model_family(&tmp, ModelFamily::Mistral35).unwrap_err();
+        assert!(matches!(err, FamilyResolveError::Mismatch { .. }));
+    }
+
+    #[test]
+    fn explicit_gemma_rejects_mistral_dir() {
+        let tmp = tempdir();
+        write_config(
+            &tmp,
+            r#"{
+              "architectures": ["Mistral3ForConditionalGeneration"],
+              "model_type": "mistral3",
+              "quantization_config": {"format": "nvfp4-pack-quantized"}
+            }"#,
+        );
+        let err = resolve_model_family(&tmp, ModelFamily::Gemma4).unwrap_err();
+        assert!(matches!(err, FamilyResolveError::Mismatch { .. }));
+    }
+
+    #[test]
+    fn mistral_bad_mscale_all_dim_rejected() {
+        let tmp = tempdir();
+        write_config(
+            &tmp,
+            r#"{
+              "architectures": ["Mistral3ForConditionalGeneration"],
+              "model_type": "mistral3",
+              "quantization_config": {"format": "nvfp4-pack-quantized"},
+              "text_config": {"rope_scaling": {"mscale_all_dim": 1.0}}
+            }"#,
+        );
+        let err = resolve_model_family(&tmp, ModelFamily::Auto).unwrap_err();
+        assert!(matches!(err, FamilyResolveError::MistralBadMscaleAllDim { .. }));
+    }
+
+    #[test]
+    fn auto_falls_through_to_gemma() {
+        let tmp = tempdir();
+        write_config(
+            &tmp,
+            r#"{ "architectures": ["Gemma4ForConditionalGeneration"], "model_type": "gemma4" }"#,
+        );
+        let r = resolve_model_family(&tmp, ModelFamily::Auto).expect("ok");
+        assert_eq!(r.family, ModelFamily::Gemma4);
+    }
+
+    #[test]
+    fn parse_modelfamily_aliases() {
+        assert_eq!(ModelFamily::parse("auto").unwrap(), ModelFamily::Auto);
+        assert_eq!(ModelFamily::parse("mistral35").unwrap(), ModelFamily::Mistral35);
+        assert_eq!(ModelFamily::parse("Mistral-3.5").unwrap(), ModelFamily::Mistral35);
+        assert_eq!(ModelFamily::parse("gemma4").unwrap(), ModelFamily::Gemma4);
+        assert_eq!(ModelFamily::parse("qwen36").unwrap(), ModelFamily::Qwen36);
+        assert!(ModelFamily::parse("llama").is_err());
+    }
+}

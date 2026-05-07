@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use rvllm_serve::{build_router, AppState, ServerConfig};
+use rvllm_serve::{build_router, AppState, ModelFamily, ServerConfig};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -82,6 +82,13 @@ struct Cli {
     /// before forcing process exit.
     #[arg(long, env = "RVLLM_SHUTDOWN_DRAIN_SECS", default_value_t = 30)]
     shutdown_drain_secs: u64,
+
+    /// Model family to load. `auto` (default) inspects config.json
+    /// markers; explicit values assert match and refuse to silently
+    /// fall through. Accepted: `auto`, `qwen36`, `gemma4`,
+    /// `mistral35`.
+    #[arg(long, env = "RVLLM_MODEL_FAMILY", default_value = "auto")]
+    model_family: String,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -112,6 +119,9 @@ async fn main() -> anyhow_compat::Result<()> {
             .unwrap_or_else(|| "rvllm".into())
     });
 
+    let model_family = ModelFamily::parse(&cli.model_family)
+        .map_err(|e| anyhow_compat::err(format!("--model-family: {e}")))?;
+
     let config = ServerConfig {
         bind: cli.bind,
         model_dir: cli.model_dir.clone(),
@@ -120,6 +130,7 @@ async fn main() -> anyhow_compat::Result<()> {
         max_new_tokens_cap: cli.max_new_tokens_cap,
         request_timeout: Duration::from_secs(cli.request_timeout_secs),
         shutdown_drain_timeout: Duration::from_secs(cli.shutdown_drain_secs),
+        model_family,
         ..ServerConfig::default()
     };
     config.validate().map_err(|e| anyhow_compat::err(format!("config: {e}")))?;
@@ -128,21 +139,24 @@ async fn main() -> anyhow_compat::Result<()> {
     let tokenizer = rvllm_serve::tokenize::TokenizerHandle::load(&cli.model_dir)
         .map_err(|e| anyhow_compat::err(format!("tokenizer: {e:?}")))?;
 
-    let (worker, _join) = spawn_worker(&cli, config.max_queue_depth).await?;
+    // Resolve the model family ONCE — both the worker spawn and the
+    // HTTP layer's `vision_arch` read from this same result. Before
+    // this resolver landed, main.rs and cuda_worker.rs each ran their
+    // own probe, leaving the door open for the two to disagree on
+    // future families. With `--model-family` explicit, mismatch
+    // becomes a hard startup error.
+    let resolved = rvllm_serve::family::resolve_model_family(&cli.model_dir, model_family)
+        .map_err(|e| anyhow_compat::err(format!("model family resolve: {e}")))?;
+    resolved.log_summary(&cli.model_dir);
+    let vision_arch = resolved.vision_arch;
+
+    let (worker, _join) = spawn_worker(&cli, config.max_queue_depth, resolved.family).await?;
 
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Detect vision-tower architecture from config.json (NOT from
-    // the operator-supplied model_id alias). Mirrors the same probe
-    // the cuda_worker uses to pick the bring-up path.
-    let vision_arch = match rvllm_runtime::qwen36_arch::Qwen36Arch::from_dir(&cli.model_dir) {
-        Ok(Some(_)) => rvllm_serve::router::VisionArch::Qwen36,
-        _ => rvllm_serve::router::VisionArch::Gemma4,
-    };
-    tracing::info!(?vision_arch, "vision arch resolved from config.json");
     let state = AppState { config: config.clone(), tokenizer, worker, started_at, vision_arch };
     let router = build_router(state);
 
@@ -200,6 +214,7 @@ async fn forced_drain_watchdog(
 async fn spawn_worker(
     cli: &Cli,
     queue_depth: usize,
+    family: ModelFamily,
 ) -> anyhow_compat::Result<(
     rvllm_serve::WorkerHandle,
     std::thread::JoinHandle<()>,
@@ -221,12 +236,14 @@ async fn spawn_worker(
 
     tracing::info!(
         arena_gb = cli.arena_gb,
-        "starting cuda worker — Gemma4Bringup::load takes ~20 s for Gemma 4 31B",
+        family = %family.as_str(),
+        "starting cuda worker — bring-up takes ~20-90 s depending on family",
     );
     let cfg = cuda_worker::CudaWorkerConfig {
         paths,
         arena_bytes: (cli.arena_gb as usize) * 1024 * 1024 * 1024,
         queue_depth,
+        family,
     };
     cuda_worker::spawn_cuda_worker(cfg)
         .await
@@ -237,6 +254,7 @@ async fn spawn_worker(
 async fn spawn_worker(
     _cli: &Cli,
     queue_depth: usize,
+    _family: ModelFamily,
 ) -> anyhow_compat::Result<(
     rvllm_serve::WorkerHandle,
     std::thread::JoinHandle<()>,

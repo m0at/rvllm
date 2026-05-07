@@ -2513,6 +2513,24 @@ fn reject_oversized_prompt(
             let cap = num_blocks as u64 * BLOCK_SIZE as u64;
             (cap, format!("RVLLM_NUM_BLOCKS={num_blocks} × block_size={BLOCK_SIZE}"))
         }
+        crate::router::VisionArch::Mistral35 => {
+            // Mistral 3.5 uses the same paged NVFP4 KV layout as the
+            // existing NVFP4 path. Until the worker is wired through
+            // (Phase 5), reuse `RVLLM_NUM_BLOCKS × block_size=32` as
+            // the same admission ceiling Gemma 4 uses; once the real
+            // bring-up reports its KV capacity this branch reads from
+            // it directly.
+            const BLOCK_SIZE: u32 = 32;
+            let num_blocks: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1024);
+            let cap = num_blocks as u64 * BLOCK_SIZE as u64;
+            (
+                cap,
+                format!("RVLLM_NUM_BLOCKS={num_blocks} × block_size={BLOCK_SIZE} (mistral35)"),
+            )
+        }
     };
     if prompt_len as u64 + max_new as u64 > kv_capacity_tokens {
         return Err(ApiError::invalid_param(

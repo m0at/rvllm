@@ -16,6 +16,7 @@ pub mod config;
 #[cfg(feature = "cuda")]
 pub mod cuda_worker;
 pub mod error;
+pub mod family;
 pub mod openai;
 pub mod router;
 pub mod sampling;
@@ -23,7 +24,7 @@ pub mod tokenize;
 pub mod tool_parser;
 pub mod worker;
 
-pub use config::ServerConfig;
+pub use config::{ModelFamily, ServerConfig};
 pub use error::{ApiError, ApiResult};
 pub use router::{build_router, AppState};
 pub use worker::{GenerateEvent, GenerateRequest, WorkerHandle};

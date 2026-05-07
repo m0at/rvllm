@@ -56,6 +56,11 @@ pub enum VisionArch {
     /// `Gemma4MultimodalEmbedder`). `<|image|>` = 258880, predictor
     /// = `predict_gemma_num_tokens`.
     Gemma4,
+    /// Mistral Medium 3.5 128B NVFP4 with Pixtral vision tower
+    /// (48 layers, head_dim=104, 2D RoPE, longest-edge 1540,
+    /// spatial_merge=2). Image-pad token id = 10, predictor =
+    /// `predict_mistral35_num_tokens`.
+    Mistral35,
 }
 
 /// Build the top-level router with all endpoints attached.

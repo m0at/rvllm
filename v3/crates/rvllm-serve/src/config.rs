@@ -7,6 +7,62 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Which model family the worker should bring up.
+///
+/// `Auto` (default) defers to `crate::family::resolve_model_family`,
+/// which inspects the model dir's `config.json`. Explicit values take
+/// precedence and require the dir to actually match — mismatch is a
+/// startup error rather than silent fall-through. The CLI flag
+/// `--model-family` and env var `RVLLM_MODEL_FAMILY` map onto this
+/// enum directly (kebab-case lowercase).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ModelFamily {
+    #[default]
+    Auto,
+    Qwen36,
+    Gemma4,
+    Mistral35,
+}
+
+impl ModelFamily {
+    /// Parse the CLI / env-var spelling. Accepts the canonical
+    /// kebab-case ids plus a couple of obvious aliases. Unknown values
+    /// produce a typed error so the operator gets a clear startup
+    /// rejection instead of a silent default.
+    pub fn parse(s: &str) -> Result<Self, ModelFamilyParseError> {
+        let norm = s.trim().to_ascii_lowercase();
+        match norm.as_str() {
+            "auto" | "" => Ok(ModelFamily::Auto),
+            "qwen36" | "qwen-36" | "qwen3.6" | "qwen-3.6" => Ok(ModelFamily::Qwen36),
+            "gemma4" | "gemma-4" => Ok(ModelFamily::Gemma4),
+            "mistral35" | "mistral-35" | "mistral3.5" | "mistral-3.5" => {
+                Ok(ModelFamily::Mistral35)
+            }
+            other => Err(ModelFamilyParseError(other.to_string())),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelFamily::Auto => "auto",
+            ModelFamily::Qwen36 => "qwen36",
+            ModelFamily::Gemma4 => "gemma4",
+            ModelFamily::Mistral35 => "mistral35",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--model-family must be one of auto|qwen36|gemma4|mistral35 (got: {0:?})")]
+pub struct ModelFamilyParseError(pub String);
+
+impl std::str::FromStr for ModelFamily {
+    type Err = ModelFamilyParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
 /// Top-level server configuration.
 ///
 /// All fields are public so `main.rs` and tests can populate them
@@ -39,6 +95,10 @@ pub struct ServerConfig {
     /// After the shutdown signal, wait at most this long for
     /// in-flight requests to finish before forcing the server down.
     pub shutdown_drain_timeout: Duration,
+    /// Operator-supplied model family. `Auto` defers to
+    /// config-marker detection. Anything else asserts the model
+    /// matches and fails on mismatch.
+    pub model_family: ModelFamily,
 }
 
 impl Default for ServerConfig {
@@ -52,6 +112,7 @@ impl Default for ServerConfig {
             request_timeout: Duration::from_secs(300),
             sse_keepalive: Duration::from_secs(15),
             shutdown_drain_timeout: Duration::from_secs(30),
+            model_family: ModelFamily::Auto,
         }
     }
 }
