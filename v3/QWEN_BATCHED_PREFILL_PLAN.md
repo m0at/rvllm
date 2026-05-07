@@ -145,3 +145,95 @@ not the saved copies themselves.
 
 These are solvable, just non-trivial. They get chosen during
 Phase 4 / Phase 5 based on bench-harness numbers from Phase 2.
+
+## Status snapshot — head 8241c8f
+
+All transformer-stack batched-prefill phases are GREEN (byte-equivalent
+to per-token reference, all 1782 layer/phase/token dump rows
+cos = 1.000000):
+
+* Phase Linear (Round-24+25): batched delta-rule + conv-state-advance
+  via two new kernels. Env-gate `RVLLM_QWEN36_BATCH_LINEAR_PREFILL=1`.
+* Phase Full (Round-26): f16-IO causal-prefill via existing
+  `flash_attention_2_f16kv_kernel` wrapped with f16↔f32 casts. Env-gate
+  `RVLLM_QWEN36_BATCH_FULL_PREFILL=1`.
+* Phase 6a (Round-27): batched router GEMV + topk_softmax. Env-gate
+  `RVLLM_QWEN36_BATCH_MOE_PREFILL=1`.
+* Phase 6b (Round-27b): row-batched-by-topk indirect FFN k-rounds via
+  three new kernels (codex' "skip the gather/sort, extend
+  blockIdx.y to token-row + read expert from top_idx[m*K+k]"
+  insight). Env-gate `RVLLM_QWEN36_BATCH_MOE_ROUTED_FFN=1`.
+* Phase 6c (Round-27c): batched shared-expert + final residual via two
+  new kernels (`shared_gate_dot_sigmoid_batched`,
+  `scaled_add_devw_batched`) + reuse of dual_silu/Fp8GemvF16InLaunch
+  m=N/f16_plus_f32_inplace N*hidden. Env-gate
+  `RVLLM_QWEN36_BATCH_MOE_SHARED=1`.
+* Phase 7: outer-loop deletion is implicit — `forward_qwen36_decode_
+  cancellable`'s batched branch is strictly layer-major; the legacy
+  for-tok loop is skipped when the gates are set.
+
+Production race fixes en route:
+* Round-25 / 26: pos_cl HtoD vs `CU_STREAM_NON_BLOCKING` race —
+  diagnosed by codex, structurally fixed via device-fill kernel
+  `qwen_fill_pos_slots_i32`. Both token-major and layer-major.
+
+Bench (`RVLLM_QWEN36_TIMING=1`):
+* N = 22:  token-major 449 ms → all 5 gates 254 ms (1.77×, −43%).
+* N = 293: token-major 6836 ms → all 5 gates 2539 ms (2.69×, −63%).
+
+Default for all 5 gates is OFF until the prod-flip is taken explicitly;
+single-line change.
+
+## TODO — Phase 8: Decode-step CUDA Graph capture
+
+Codex Round-28 reviewed the path:
+
+> The minimal-risk first green graph is therefore not "capture
+> forward_qwen36_decode", but "factor a fixed-workspace
+> qwen36_decode_step_launch_only and capture that."
+
+Today's `forward_qwen36_decode_cancellable` allocates new arena
+regions per call, does sync `Region::copy_from_host` on the legacy
+default stream, and runs a sync `cuMemcpyDtoH` inside the closer.
+None of these are graph-friendly.
+
+Concrete plan when picked up:
+
+1. **Workspace** — `Qwen36DecodeWorkspace` struct holding the ~30
+   per-step scratch regions preallocated once (normed, qkv, q/k/v,
+   conv_in, silu, down, rs, logits, topk_idx, topk_w, etc.).
+   Allocated at decode-loop entry, reused for every step.
+2. **`decode_step_launch_only(workspace, token_dev_ptr,
+   pos_dev_ptr, ctx_dev_ptr)`** — pure launch sequence, no
+   `arena.region`/`checkpoint`/`restore`, no `copy_from_host`,
+   no DtoH. Reads inputs and writes outputs through device
+   pointers passed in.
+3. **`outside_closer_launch_only`** — argmax launch + write to
+   a token-output device buffer; no DtoH inside.
+4. **Outer loop in `cuda_worker.rs`** —
+    - prefill eager → first next_token
+    - decode step 0 eager (warmup, advances state once)
+    - decode step 1: set token/pos/clen via `cuMemsetD32Async`,
+      eager run, fence, capture identical body without executing,
+      DtoH token from the eager run
+    - decode steps 2..N: set token/pos/clen, `graph.replay`, fence,
+      DtoH token (4 bytes) outside graph
+5. **Env-gate** `RVLLM_QWEN36_DECODE_GRAPH=1`. Default OFF; capture
+   is per-request scope so graph-cache mgmt is trivial.
+
+Realistic scope per Round-28: 500–1000 LOC across the decode forward
+factoring, the workspace struct, the cuda_worker capture/replay
+loop, and the audit harness (decode-step dumps rather than per-layer).
+Not a one-iteration task; Round-28 explicitly flagged it as bigger
+than the "200 LOC" placeholder I had in my initial sketch.
+
+Numerical contract: replay is the same kernel sequence with the same
+device pointers and scalar launch args. With token/pos/clen updated
+device-side before each replay, decoded tokens must be byte-identical
+to eager-mode for the same input. Any divergence points at captured
+stale metadata, hidden scratch aliasing, or accidental double-advance
+of state on the capture step.
+
+Not blocking the prefill batched path's production rollout — those
+gates are independent of decode-graph and ready to flip on whenever
+desired.
