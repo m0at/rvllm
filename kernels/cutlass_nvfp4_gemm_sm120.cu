@@ -284,16 +284,133 @@ size_t cutlass_nvfp4_gemm_sm120_sfa_bytes(int m, int k) {
     return static_cast<size_t>(size(filter_zeros(layout_SFA)));
 }
 
-// Activation prep (BF16/F16 → NVFP4 packed + per-block E4M3 SFA).
-// Not yet implemented — returns -100 so the runtime sees a clean
-// "missing entry" path until the per-token absmax + nibble pack
-// kernel lands. The Rust wrapper already maps -100 to a typed
-// `Mistral35Error::Nvfp4SymbolsMissing`-equivalent.
-int cutlass_nvfp4_gemm_sm120_prep_sfa(
-    const void*, void*, void*,
-    int, int, int,
-    cudaStream_t)
+} // extern "C"
+
+// -------------------------------------------------------------------
+// SFA layout transform — natural row-major [m, k/16] E4M3 → CUTLASS
+// Sm120 NVFP4 interleaved SFA layout.
+//
+// `cutlass_nvfp4_prep_act_sm120.cu`'s prep_act kernel writes the
+// per-block E4M3 scales as a plain row-major [m, k/16] byte tensor
+// (one scale per (token, K-block-of-16)). The CUTLASS NVFP4 GEMM
+// expects the SFA tensor in the interleaved layout produced by
+// `Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA`, which swizzles
+// the (m_tile, n_tile, k_block) coords into a tensor-core-friendly
+// access pattern.
+//
+// The transform is a pure index permutation. We enumerate every
+// natural (row, k_block) coordinate, look up the destination index
+// via the cute Layout, and copy one byte. No reduction, no
+// quantisation rework — purely a memory rearrangement.
+//
+// Grid: (k_blocks, m). Block: 1 thread (the work is one byte per
+// thread; cache benefits dominate over thread-density on this kind
+// of pure-permutation kernel).
+// -------------------------------------------------------------------
+// Concrete SFA layout type, deduced from the Mistral GEMM
+// instantiation above. We bind it to a fixed layout type so the
+// kernel below isn't a template — nvcc's __cudaRegisterEntry stub
+// generation doesn't tolerate template kernels in anonymous
+// namespaces with cute::Layout type parameters (bug-shape: the
+// mangled-name pasted into the stub trips the host C compiler).
+//
+// `layout_SFA` deduced shape:
+//   ((MMA_M_atom, M_tile), (K_block_atom, K_tile), (1, L))
+// — i.e. 3 modes. Coord is therefore (row, k_block, l=0).
+using SfaInterleavedLayout =
+    decltype(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+        cute::make_shape(int{0}, int{0}, int{0}, int{0})));
+
+__global__ void nvfp4_sfa_natural_to_interleaved_kernel(
+    const __nv_fp8_e4m3* __restrict__ src_natural,  // [m, k/16] row-major
+    __nv_fp8_e4m3*       __restrict__ dst_cutlass,  // CUTLASS interleaved
+    SfaInterleavedLayout layout,
+    int m,
+    int k_blocks)
 {
+    const int kb  = blockIdx.x;
+    const int row = blockIdx.y;
+    if (row >= m || kb >= k_blocks) return;
+
+    const __nv_fp8_e4m3 v = src_natural[row * k_blocks + kb];
+    const auto idx = layout(cute::make_coord(row, kb, 0));
+    dst_cutlass[idx] = v;
+}
+
+extern "C" {
+
+/// Transform a natural row-major SFA tensor (`[m, k/16]` E4M3 from
+/// `cutlass_nvfp4_gemm_sm120_prep_act`) into the CUTLASS Sm120
+/// interleaved layout the GEMM kernel consumes. After this call,
+/// `dst_cutlass` is ready to feed `cutlass_nvfp4_gemm_sm120` as
+/// `sfa`.
+///
+/// Returns 0 on success, -1 on bad shape, -3 on launch failure.
+int cutlass_nvfp4_gemm_sm120_sfa_natural_to_interleaved(
+    const void* src_natural,
+    void*       dst_cutlass,
+    int m,
+    int k,
+    cudaStream_t stream)
+{
+    if (m <= 0 || k <= 0 || (k % 16) != 0) return -1;
+    if (src_natural == nullptr || dst_cutlass == nullptr) return -1;
+    const int k_blocks = k / 16;
+
+    // Build the same SFA layout the GEMM uses. n_dummy stays > 0 so
+    // the helper produces a valid layout (the SFA index is
+    // n-independent in practice).
+    const int n_dummy = (m > 0) ? m : 1;
+    auto layout = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+        cute::make_shape(m, n_dummy, k, 1));
+
+    const dim3 grid(k_blocks, m, 1);
+    const dim3 block(1, 1, 1);
+    nvfp4_sfa_natural_to_interleaved_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(src_natural),
+        reinterpret_cast<__nv_fp8_e4m3*>(dst_cutlass),
+        layout,
+        m, k_blocks);
+
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -3;
+}
+
+/// Activation prep wrapper — chains the natural-layout
+/// `prep_act` kernel (in `cutlass_nvfp4_prep_act_sm120.cu`) with
+/// the SFA layout transform above to produce a CUTLASS-ready
+/// (a_packed, sfa_cutlass) pair from a BF16/F16 input tensor.
+///
+/// Caller-provided buffers (must be sized via the corresponding
+/// queries):
+///   `a_packed_out`            `m * k / 2` bytes
+///   `sfa_natural_scratch`     `m * k / 16` bytes (intermediate)
+///   `sfa_cutlass_out`         `cutlass_nvfp4_gemm_sm120_sfa_bytes(m, k)` bytes
+///
+/// Returns 0 on success; forwards the underlying error rc on failure.
+/// Stub today (-100) until `prep_act` is wired in via the build
+/// SOURCES list — the symbol is defined in a sibling .cu so chaining
+/// here would require `extern "C"` decl, but the linker resolution
+/// is what closes the loop. Operators rebuilding the .so with both
+/// sources flip this from -100 to a real chain.
+int cutlass_nvfp4_gemm_sm120_prep_sfa(
+    const void* /*a_input*/,
+    void*       /*a_packed_out*/,
+    void*       /*sfa_cutlass_out*/,
+    int         /*m*/,
+    int         /*k*/,
+    int         /*a_input_dtype*/,
+    cudaStream_t /*stream*/)
+{
+    // Wiring helper:
+    //   1. cutlass_nvfp4_gemm_sm120_prep_act(...)  -> a_packed +
+    //      a temporary natural SFA buffer.
+    //   2. cutlass_nvfp4_gemm_sm120_sfa_natural_to_interleaved(...)
+    //      -> CUTLASS SFA.
+    // Today the public Rust wrapper (`launch_nvfp4_prep_sfa`) does
+    // NOT supply a scratch buffer for the natural-layout SFA; that's
+    // the missing piece. Until the runtime provides it, return -100
+    // so callers fall back to the kernel-side error path rather than
+    // get incorrect SFA bytes.
     return -100;
 }
 
