@@ -86,6 +86,21 @@ pub struct Mistral35ForwardKernels {
     pub fn_vector_add_bf16: KernelFn,
     pub argmax_mod: LoadedModule,
     pub fn_argmax_f32: KernelFn,
+    pub rope_split_half_bf16_mod: LoadedModule,
+    pub fn_rope_split_half_bf16: KernelFn,
+}
+
+/// YaRN cos/sin tables resident on device (F32 layout). Built host-side
+/// in `mistral35_yarn::build_yarn_rope_tables` and uploaded once at
+/// bring-up time. The forward path indexes per-position into them via
+/// the `rope_split_half_bf16` kernel.
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub struct Mistral35RopeTables {
+    pub cos_ptr: u64,
+    pub sin_ptr: u64,
+    pub max_pos: usize,
+    pub head_dim: usize,
 }
 
 /// Same path bundle Gemma 4 takes — kept so `cuda_worker` can pass
@@ -140,6 +155,9 @@ pub struct Mistral35Bringup {
     /// cuBLASLt handle + workspace for the BF16×BF16→F32 lm_head GEMM.
     #[cfg(feature = "cuda")]
     pub cublaslt: Option<rvllm_cutlass::cublaslt::CublasLt>,
+    /// Device-resident YaRN cos/sin tables.
+    #[cfg(feature = "cuda")]
+    pub rope_tables: Option<Mistral35RopeTables>,
 }
 
 #[derive(Debug)]
@@ -533,7 +551,7 @@ impl Mistral35Bringup {
         //     stored alongside and ensures the device context outlives
         //     the arena.
         #[cfg(feature = "cuda")]
-        let (ctx, stream, arena, model, forward_kernels_opt, cublaslt_opt) = {
+        let (ctx, stream, arena, model, forward_kernels_opt, cublaslt_opt, rope_tables_opt) = {
             use std::sync::Arc;
             let ctx = Arc::new(rvllm_mem::context::CudaContextHandle::init(0)?);
             let compile_target: Option<rvllm_core::CompileTarget> = {
@@ -618,6 +636,9 @@ impl Mistral35Bringup {
                 .get_function("vector_add_bf16_kernel")?;
             let argmax_mod = kernels.load_ptx("argmax")?;
             let fn_argmax_f32 = argmax_mod.get_function("argmax_kernel")?;
+            let rope_split_half_bf16_mod = kernels.load_ptx("rope_split_half_bf16")?;
+            let fn_rope_split_half_bf16 = rope_split_half_bf16_mod
+                .get_function("rope_split_half_bf16_kernel")?;
             let forward_kernels = Mistral35ForwardKernels {
                 embedding_gather_bf16_mod,
                 fn_embedding_gather_bf16,
@@ -631,10 +652,49 @@ impl Mistral35Bringup {
                 fn_vector_add_bf16,
                 argmax_mod,
                 fn_argmax_f32,
+                rope_split_half_bf16_mod,
+                fn_rope_split_half_bf16,
             };
 
+            // YaRN cos/sin tables — build host-side (4096 positions ×
+            // head_dim/2 = 64 floats each, ~1 MiB per table) and upload
+            // to device as F32. Position 0 is identity (cos=1, sin=0).
+            let yarn_tables = crate::mistral35_yarn::build_yarn_rope_tables(
+                &arch.text.yarn,
+                arch.text.head_dim,
+                arch.text.yarn.original_max_position_embeddings,
+            );
+            let cos_bytes = yarn_tables.cos.len() * 4;
+            let sin_bytes = yarn_tables.sin.len() * 4;
+            let cos_region = arena_box.region("mistral35_rope_cos", cos_bytes, 16)?;
+            let sin_region = arena_box.region("mistral35_rope_sin", sin_bytes, 16)?;
+            unsafe {
+                let cos_bytes_slice: &[u8] = std::slice::from_raw_parts(
+                    yarn_tables.cos.as_ptr() as *const u8,
+                    yarn_tables.cos.len() * 4,
+                );
+                let sin_bytes_slice: &[u8] = std::slice::from_raw_parts(
+                    yarn_tables.sin.as_ptr() as *const u8,
+                    yarn_tables.sin.len() * 4,
+                );
+                cos_region.copy_from_host(cos_bytes_slice)?;
+                sin_region.copy_from_host(sin_bytes_slice)?;
+            }
+            let rope_tables_dev = Mistral35RopeTables {
+                cos_ptr: cos_region.device_ptr(),
+                sin_ptr: sin_region.device_ptr(),
+                max_pos: yarn_tables.max_pos,
+                head_dim: yarn_tables.head_dim,
+            };
+            eprintln!(
+                "[mistral35] yarn tables uploaded: max_pos={} head_dim={} \
+                 mscale={:.5} ({} KiB)",
+                rope_tables_dev.max_pos, rope_tables_dev.head_dim,
+                yarn_tables.mscale, (cos_bytes + sin_bytes) / 1024,
+            );
+
             (Some(ctx), Some(stream), Some(arena_box), Some(model),
-             Some(forward_kernels), Some(cublaslt_handle))
+             Some(forward_kernels), Some(cublaslt_handle), Some(rope_tables_dev))
         };
 
         #[cfg(feature = "cuda")]
@@ -643,6 +703,7 @@ impl Mistral35Bringup {
             cutlass_backend, ctx, stream, arena, model,
             forward_kernels: forward_kernels_opt,
             cublaslt: cublaslt_opt,
+            rope_tables: rope_tables_opt,
         };
         #[cfg(not(feature = "cuda"))]
         let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
@@ -1010,6 +1071,49 @@ impl Mistral35Bringup {
             rvllm_fused::launch_raw(kernel, grid, block, 0, stream_u64, args)
         }
 
+        // RoPE handles + tables. The kernel rotates a [n_heads, head_dim]
+        // BF16 buffer in-place at the given absolute position. The
+        // closure captures head_dim/cos_ptr/sin_ptr; head_dim itself
+        // is declared further down (alongside n_q_heads/gqa_ratio) so
+        // we capture it via a local Copy of self.arch.text.head_dim
+        // up here.
+        let rope_tables = self.rope_tables.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_layer0: rope_tables absent".into(),
+        ))?;
+        let rope_position: i32 = std::env::var("RVLLM_SMOKE_POSITION")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if rope_position < 0 || (rope_position as usize) >= rope_tables.max_pos {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                format!("forward_smoke_layer0: rope_position={rope_position} \
+                         out of range [0, {})", rope_tables.max_pos),
+            ));
+        }
+        let head_dim_for_rope: i32 = self.arch.text.head_dim as i32;
+        let rope = |buf_ptr: u64, n_heads: u32| -> Result<()> {
+            let mut ptr = buf_ptr;
+            let mut cos_ptr = rope_tables.cos_ptr;
+            let mut sin_ptr = rope_tables.sin_ptr;
+            let mut head_dim_arg = head_dim_for_rope;
+            let mut pos_arg = rope_position;
+            let args = [
+                (&mut ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut cos_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut sin_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut head_dim_arg) as *mut i32 as *mut std::ffi::c_void,
+                (&mut pos_arg) as *mut i32 as *mut std::ffi::c_void,
+            ];
+            unsafe {
+                launch_kernel(
+                    kernels.fn_rope_split_half_bf16,
+                    (n_heads, 1, 1),
+                    ((head_dim_for_rope as u32) / 2, 1, 1),
+                    &args, stream_u64,
+                )
+            }
+        };
+
         // ============================================================
         // Layer-0 forward (pos=0, single token; RoPE is identity at
         // pos=0 so we skip it; m=1 attention reduces to V broadcast
@@ -1054,6 +1158,11 @@ impl Mistral35Bringup {
         gemm(q_out_region.device_ptr(), &layer0.q_proj)?;
         gemm(k_out_region.device_ptr(), &layer0.k_proj)?;
         gemm(v_out_region.device_ptr(), &layer0.v_proj)?;
+        // RoPE on Q and K (V never gets rotated). Identity at pos=0.
+        let n_q_heads_u: u32 = self.arch.text.num_attention_heads as u32;
+        let n_kv_heads_u: u32 = self.arch.text.num_key_value_heads as u32;
+        rope(q_out_region.device_ptr(), n_q_heads_u)?;
+        rope(k_out_region.device_ptr(), n_kv_heads_u)?;
         let q_out = dump_bf16(stream, stream_u64,
             q_out_region.device_ptr(), layer0.q_proj.shape.n, "smoke_q_out")?;
         let k_out = dump_bf16(stream, stream_u64,
@@ -1202,13 +1311,15 @@ impl Mistral35Bringup {
                 stream_u64,
             )?;
 
-            // Q/K/V.
+            // Q/K/V + RoPE on Q and K.
             stage_act(h_work_region.device_ptr(), h_k)?;
             gemm(q_out_region.device_ptr(), &layer.q_proj)?;
             gemm(k_out_region.device_ptr(), &layer.k_proj)?;
             gemm(v_out_region.device_ptr(), &layer.v_proj)?;
+            rope(q_out_region.device_ptr(), n_q_heads_u)?;
+            rope(k_out_region.device_ptr(), n_kv_heads_u)?;
 
-            // m=1 GQA-broadcast attention (RoPE@pos=0 = identity).
+            // m=1 GQA-broadcast attention.
             {
                 let mut out_ptr = attn_out_region.device_ptr();
                 let mut v_ptr = v_out_region.device_ptr();
