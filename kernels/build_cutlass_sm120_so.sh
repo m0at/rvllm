@@ -73,15 +73,19 @@ OK=0
 FAIL=0
 OBJS=""
 
-# Sources that build the Blackwell-Geforce FP8 GEMM .so.
+# Sources that build the Blackwell-Geforce FP8 + NVFP4 GEMM .so.
 #
-# `cutlass_nvfp4_gemm_sm120.cu` (Mistral 3.5 NVFP4 path, Step 4) is
-# intentionally NOT yet compiled in: only the Rust-side ABI scaffolding
-# has landed. Once the kernel implementation lands, append the source
-# below and rebuild — `CutlassBackend::require_nvfp4()` then resolves
-# the symbol set successfully.
+# NVFP4 path (Mistral 3.5, sm_121a):
+#   - cutlass_nvfp4_gemm_sm120.cu        — main GEMM + SFA/SFB transforms
+#   - cutlass_nvfp4_prep_act_sm120.cu    — BF16/F16 → NVFP4 packed +
+#                                           per-token E4M3 SFA staging
+# Standalone-compiled clean against CUTLASS 4.5 (commit ae6bccf3); now
+# linked into the production .so so `CutlassBackend::require_nvfp4()`
+# resolves the full chain.
 SOURCES=(
     cutlass_fp8_gemm_blockscale_sm120.cu
+    cutlass_nvfp4_gemm_sm120.cu
+    cutlass_nvfp4_prep_act_sm120.cu
 )
 
 for f in "${SOURCES[@]}"; do
