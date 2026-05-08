@@ -177,8 +177,11 @@ int cutlass_nvfp4_gemm_sm120(
     // `alpha_ptr` (cf. cutlass/epilogue/fusion/sm120_callbacks_*.hpp,
     // ~line 145-150). When alpha_ptr is non-null the kernel reads
     // the scalar from device memory at runtime, no host round-trip.
-    // We populate alpha=1.0 as the harmless fallback and feed
-    // b_global_scale_f32 directly as alpha_ptr.
+    // We populate alpha=1.0 as the harmless fallback and feed the
+    // caller-provided device scalar directly as alpha_ptr. For
+    // LLMCompressor NVFP4 weights, the loader must upload
+    // 1 / weight_global_scale here because the checkpoint scalar is an
+    // encode scale while CUTLASS alpha is multiplicative.
 
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));

@@ -229,8 +229,24 @@ fn upload_nvfp4_linear(
             bt: std::backtrace::Backtrace::capture(),
         });
     }
+    // LLMCompressor / compressed-tensors NVFP4 stores weight_global_scale
+    // as the encode scale `FP8_E4M3_MAX * FP4_E2M1_MAX / weight_amax`.
+    // Its per-block E4M3 scales are generated as `(block_amax / 6) *
+    // weight_global_scale`, while dequantization divides that local scale
+    // by weight_global_scale.
+    //
+    // CUTLASS Sm120 blockscaled MMA multiplies by SFA and SFB as supplied,
+    // and its epilogue `alpha_ptr` is a plain multiplicative output scalar.
+    // Therefore the device scalar passed to CUTLASS must be the decode
+    // scale, `1 / weight_global_scale`, not the checkpoint value.
+    let gs_f32: f32 = f32::from_le_bytes([gs_raw[0], gs_raw[1], gs_raw[2], gs_raw[3]]);
+    let alpha_f32 = if gs_f32.is_finite() && gs_f32 != 0.0 {
+        1.0_f32 / gs_f32
+    } else {
+        gs_f32
+    };
     let gs_region = arena.region("mistral35_w_global_scale", 4, 4)?;
-    unsafe { gs_region.copy_from_host(gs_raw)? };
+    unsafe { gs_region.copy_from_host(&alpha_f32.to_le_bytes())? };
     let global_scale_ptr = gs_region.device_ptr();
 
     Ok(Nvfp4LinearLoaded {
