@@ -227,11 +227,19 @@ pub fn validate_mistral35_inventory(
     // in Step 7) — just count what's present so an obviously-wrong
     // checkpoint trips before bring-up.
     for (name, entry) in tensors.iter() {
-        if name.starts_with("vision_tower.") {
+        // Real Mistral 3.5 NVFP4 checkpoint prefixes (verified
+        // against the public zdy1995love/Mistral-Medium-3.5-128B-NVFP4
+        // index.json on 2026-05-08): vision tensors live under
+        // `model.vision_tower.*` (NOT bare `vision_tower.*`), and
+        // the projector under `model.multi_modal_projector.*`. We
+        // accept both spellings so a future repackage that drops
+        // the `model.` outer namespace still validates.
+        if name.starts_with("model.vision_tower.") || name.starts_with("vision_tower.") {
             if entry.dtype == DType::Bf16 {
                 counts.vision_bf16 += 1;
             }
-        } else if name.starts_with("multi_modal_projector.") {
+        } else if name.starts_with("model.multi_modal_projector.")
+            || name.starts_with("multi_modal_projector.") {
             if entry.dtype == DType::Bf16 {
                 counts.projector_bf16 += 1;
             }

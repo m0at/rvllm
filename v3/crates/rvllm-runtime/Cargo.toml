@@ -77,5 +77,8 @@ rvllm-sampling = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 half = { workspace = true }
+# Mistral 3.5 bring-up mmaps each safetensors shard for header
+# parsing without pulling the multi-GiB payload into RAM.
+memmap2 = "0.9"
 image = { workspace = true }
 cudarc = { version = "0.19", features = ["driver", "cuda-version-from-build-system"], optional = true }

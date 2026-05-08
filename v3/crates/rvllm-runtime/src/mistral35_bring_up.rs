@@ -576,20 +576,29 @@ fn scan_safetensors_index(
     let mut tensors: std::collections::BTreeMap<String, TensorEntry> =
         std::collections::BTreeMap::new();
     for shard_path in &idx.shards {
-        // For the inventory pass we only need the header. Read the
-        // first 8 bytes (header_bytes prefix) + the JSON header,
-        // never the payload. That keeps load() fast on a 128B
-        // checkpoint (~80 GiB on disk) — full validation in seconds
-        // rather than a multi-second mmap walk.
-        let bytes = std::fs::read(shard_path).map_err(|source| RvllmError::Io {
+        // mmap the whole shard so ShardHeader::parse can validate
+        // tensor offsets against the real file size. mmap costs no
+        // RAM up-front (kernel pages-in lazily), and we only touch
+        // the first ~33 KiB header region; payload pages stay
+        // unmapped. Mirrors the qwen36_load.rs / gemma4_load.rs
+        // pattern. The original `std::fs::read` (full Vec<u8> read)
+        // OOM'd on /home/r00t/mistral-3.5 — 75 GiB across 10 shards;
+        // a truncated read was rejected by the offset validator.
+        let f = std::fs::File::open(shard_path).map_err(|source| RvllmError::Io {
             err: rvllm_core::IoError::from(&source),
             path: shard_path.clone(),
             source,
         })?;
-        let header = ShardHeader::parse(shard_path, &bytes)?;
+        let mmap = unsafe { memmap2::Mmap::map(&f) }.map_err(|source| RvllmError::Io {
+            err: rvllm_core::IoError::from(&source),
+            path: shard_path.clone(),
+            source,
+        })?;
+        let header = ShardHeader::parse(shard_path, &mmap)?;
         for (name, entry) in header.tensors.into_iter() {
             tensors.insert(name, entry);
         }
+        // mmap drops here — kernel reclaims any paged-in regions.
     }
     Ok(tensors)
 }
