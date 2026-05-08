@@ -70,14 +70,20 @@ use crate::gemma4_bring_up::Gemma4EnginePaths;
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 
 /// PTX kernel handles needed by the Mistral 3.5 smoke-forward (Step
-/// 5 GPU half, iteration A). Held on `Mistral35Bringup` so the
-/// LoadedModule lifetimes outlive every per-request launch.
+/// 5 GPU half). Held on `Mistral35Bringup` so the LoadedModule
+/// lifetimes outlive every per-request launch.
 #[cfg(feature = "cuda")]
 pub struct Mistral35ForwardKernels {
     pub embedding_gather_bf16_mod: LoadedModule,
     pub fn_embedding_gather_bf16: KernelFn,
     pub rmsnorm_inplace_bf16_gbf16_mod: LoadedModule,
     pub fn_rmsnorm_inplace_bf16_gbf16: KernelFn,
+    pub silu_mul_bf16_mod: LoadedModule,
+    pub fn_silu_mul_bf16: KernelFn,
+    pub attn_m1_gqa_broadcast_mod: LoadedModule,
+    pub fn_attn_m1_gqa_broadcast: KernelFn,
+    pub vector_add_bf16_mod: LoadedModule,
+    pub fn_vector_add_bf16: KernelFn,
 }
 
 /// Same path bundle Gemma 4 takes — kept so `cuda_worker` can pass
@@ -587,11 +593,27 @@ impl Mistral35Bringup {
                 kernels.load_ptx("rmsnorm_inplace_bf16_gbf16")?;
             let fn_rmsnorm_inplace_bf16_gbf16 = rmsnorm_inplace_bf16_gbf16_mod
                 .get_function("rmsnorm_inplace_bf16_gbf16_kernel")?;
+            let silu_mul_bf16_mod = kernels.load_ptx("silu_mul_bf16")?;
+            let fn_silu_mul_bf16 = silu_mul_bf16_mod
+                .get_function("silu_mul_bf16_kernel")?;
+            let attn_m1_gqa_broadcast_mod =
+                kernels.load_ptx("mistral35_attn_m1_gqa_broadcast_bf16")?;
+            let fn_attn_m1_gqa_broadcast = attn_m1_gqa_broadcast_mod
+                .get_function("mistral35_attn_m1_gqa_broadcast_bf16_kernel")?;
+            let vector_add_bf16_mod = kernels.load_ptx("vector_add_bf16")?;
+            let fn_vector_add_bf16 = vector_add_bf16_mod
+                .get_function("vector_add_bf16_kernel")?;
             let forward_kernels = Mistral35ForwardKernels {
                 embedding_gather_bf16_mod,
                 fn_embedding_gather_bf16,
                 rmsnorm_inplace_bf16_gbf16_mod,
                 fn_rmsnorm_inplace_bf16_gbf16,
+                silu_mul_bf16_mod,
+                fn_silu_mul_bf16,
+                attn_m1_gqa_broadcast_mod,
+                fn_attn_m1_gqa_broadcast,
+                vector_add_bf16_mod,
+                fn_vector_add_bf16,
             };
 
             (Some(ctx), Some(stream), Some(arena_box), Some(model), Some(forward_kernels))
@@ -744,14 +766,26 @@ fn corrupt(path: PathBuf, detail: String) -> RvllmError {
     }
 }
 
-/// Per-stage stats returned by [`Mistral35Bringup::forward_smoke_q_proj`].
-/// Each field is the BF16-as-F32 widened buffer at that pipeline stage.
+/// Per-stage dump returned by [`Mistral35Bringup::forward_smoke_layer0`].
+/// Full layer-0 flow at pos=0 (RoPE is identity, single-token attention
+/// degenerates to V broadcast across q-heads). All BF16 widened to F32.
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct SmokeStageDump {
-    pub post_embed: Vec<f32>,    // [hidden=12288]
-    pub post_rmsnorm: Vec<f32>,  // [hidden=12288]
-    pub q_out: Vec<f32>,         // [n_q*head_dim=12288]
+    pub post_embed: Vec<f32>,      // [hidden=12288]
+    pub post_rmsnorm: Vec<f32>,    // [hidden=12288] = RMSNorm(embed, gamma_in)
+    pub q_out: Vec<f32>,           // [n_q*head_dim=12288]
+    pub k_out: Vec<f32>,           // [n_kv*head_dim=1024]
+    pub v_out: Vec<f32>,           // [n_kv*head_dim=1024]
+    pub attn_out: Vec<f32>,        // [hidden=12288] V broadcast across q-heads
+    pub o_out: Vec<f32>,           // [hidden=12288] o_proj(attn_out)
+    pub h_after_attn: Vec<f32>,    // [hidden=12288] embed + o_out (residual)
+    pub post_attn_norm: Vec<f32>,  // [hidden=12288] RMSNorm(h_after_attn, gamma_post)
+    pub gate_out: Vec<f32>,        // [intermediate=28672]
+    pub up_out: Vec<f32>,          // [intermediate=28672]
+    pub silu_mid: Vec<f32>,        // [intermediate=28672] silu(gate)*up
+    pub down_out: Vec<f32>,        // [hidden=12288] down_proj(silu_mid)
+    pub h_after_layer0: Vec<f32>,  // [hidden=12288] h_after_attn + down_out
 }
 
 /// Smoke-forward for the upload+kernel pipeline: embed token id →
@@ -765,29 +799,29 @@ impl Mistral35Bringup {
 
         let model = self.model.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
-            "forward_smoke_q_proj: model not uploaded".into(),
+            "forward_smoke_layer0: model not uploaded".into(),
         ))?;
         let kernels = self.forward_kernels.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
-            "forward_smoke_q_proj: forward_kernels not loaded".into(),
+            "forward_smoke_layer0: forward_kernels not loaded".into(),
         ))?;
         let arena = self.arena.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
-            "forward_smoke_q_proj: arena absent".into(),
+            "forward_smoke_layer0: arena absent".into(),
         ))?;
         let stream = self.stream.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
-            "forward_smoke_q_proj: stream absent".into(),
+            "forward_smoke_layer0: stream absent".into(),
         ))?;
         let backend: &CutlassBackend = self.cutlass_backend.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
-            "forward_smoke_q_proj: cutlass backend absent".into(),
+            "forward_smoke_layer0: cutlass backend absent".into(),
         ))?;
         if (token_id as usize) >= self.arch.text.vocab_size {
             return Err(corrupt(
                 self.paths.model_dir.clone(),
                 format!(
-                    "forward_smoke_q_proj: token_id={token_id} >= vocab={}",
+                    "forward_smoke_layer0: token_id={token_id} >= vocab={}",
                     self.arch.text.vocab_size,
                 ),
             ));
@@ -798,38 +832,62 @@ impl Mistral35Bringup {
         let vocab = self.arch.text.vocab_size as u32;
 
         let layer0 = &model.layers[0];
-        let q = &layer0.q_proj;
         let m: i32 = 1;
-        let n: i32 = q.shape.n as i32;
-        let k: i32 = q.shape.k as i32;
-        if k as usize != self.arch.text.hidden_size {
-            return Err(corrupt(
-                self.paths.model_dir.clone(),
-                format!("forward_smoke_q_proj: q_proj K={k} != hidden={hidden}"),
-            ));
-        }
+        let h_k: i32 = self.arch.text.hidden_size as i32;
+        let i_k: i32 = self.arch.text.intermediate_size as i32;
 
-        // Scratch allocations. Single-token, single-projection — the
-        // smoke path doesn't reuse the full prefill scratch budget.
+        // Scratch allocations for the full layer-0 forward.
         let token_region = arena.region("smoke_token_id", 4, 4)?;
         token_region.copy_from_host(&token_id.to_le_bytes())?;
 
         let hidden_bytes = (hidden as usize) * 2; // BF16
-        let hidden_region = arena.region("smoke_hidden_bf16", hidden_bytes, 16)?;
+        // h_residual: persistent residual stream. Receives the embed,
+        // then accumulates attn_out and mlp_out via vector_add_bf16.
+        let h_residual_region = arena.region("smoke_h_residual", hidden_bytes, 16)?;
+        // h_work: scratch where each pre-projection RMSNorm runs.
+        // Refilled from h_residual via DtoD copy at each norm site.
+        let h_work_region = arena.region("smoke_h_work", hidden_bytes, 16)?;
 
-        let a_packed_bytes = (m as usize) * (k as usize) / 2;
+        // Activation prep scratch — worst-case K = max(hidden, intermediate)
+        // (intermediate=28672 for Mistral 3.5 down_proj).
+        let max_k = h_k.max(i_k);
+        let a_packed_bytes = (m as usize) * (max_k as usize) / 2;
         let a_packed_region = arena.region("smoke_a_packed", a_packed_bytes, 16)?;
-
-        let sfa_natural_bytes = backend.nvfp4_natural_sfa_bytes(m, k);
+        let sfa_natural_bytes = backend.nvfp4_natural_sfa_bytes(m, max_k);
         let sfa_natural_region = arena.region("smoke_sfa_natural", sfa_natural_bytes, 16)?;
-
-        let sfa_cutlass_bytes = backend.nvfp4_sfa_bytes(m, k);
+        let sfa_cutlass_bytes = backend.nvfp4_sfa_bytes(m, max_k);
         let sfa_cutlass_region = arena.region("smoke_sfa_cutlass", sfa_cutlass_bytes, 16)?;
 
-        let q_out_bytes = (n as usize) * 2; // BF16 [m=1, n]
-        let q_out_region = arena.region("smoke_q_out_bf16", q_out_bytes, 16)?;
+        // Per-projection output regions. Sized to the projection's N.
+        let q_out_region = arena.region("smoke_q_out_bf16",
+            (layer0.q_proj.shape.n) * 2, 16)?;
+        let k_out_region = arena.region("smoke_k_out_bf16",
+            (layer0.k_proj.shape.n) * 2, 16)?;
+        let v_out_region = arena.region("smoke_v_out_bf16",
+            (layer0.v_proj.shape.n) * 2, 16)?;
+        // attn_out: GQA-broadcast V to [hidden=12288] for o_proj input.
+        let attn_out_region = arena.region("smoke_attn_out_bf16",
+            (hidden as usize) * 2, 16)?;
+        let o_out_region = arena.region("smoke_o_out_bf16",
+            (layer0.o_proj.shape.n) * 2, 16)?;
+        let gate_out_region = arena.region("smoke_gate_out_bf16",
+            (layer0.gate_proj.shape.n) * 2, 16)?;
+        let up_out_region = arena.region("smoke_up_out_bf16",
+            (layer0.up_proj.shape.n) * 2, 16)?;
+        // silu_mid: silu(gate)*up, [intermediate=28672].
+        let silu_mid_region = arena.region("smoke_silu_mid_bf16",
+            (layer0.gate_proj.shape.n) * 2, 16)?;
+        let down_out_region = arena.region("smoke_down_out_bf16",
+            (layer0.down_proj.shape.n) * 2, 16)?;
 
-        let workspace_bytes = backend.nvfp4_workspace_size(m, n, k).max(16);
+        // Workspace — size to the max across all 7 projections.
+        let mut workspace_bytes_max = 0usize;
+        for lin in layer0.linears() {
+            let w = backend.nvfp4_workspace_size(
+                m, lin.shape.n as i32, lin.shape.k as i32);
+            if w > workspace_bytes_max { workspace_bytes_max = w; }
+        }
+        let workspace_bytes = workspace_bytes_max.max(16);
         let workspace_region = arena.region("smoke_ws", workspace_bytes, 16)?;
 
         // Helper: fence + DtoH a bf16 region of `count` elements, widen to f32.
@@ -861,75 +919,236 @@ impl Mistral35Bringup {
             Ok(buf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect())
         }
 
-        // (1) Embed gather.
+        // Helper: device-to-device async copy on our stream.
+        unsafe fn dtod(stream_u64: u64, dst: u64, src: u64, n_bytes: usize) -> Result<()> {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoDAsync_v2(
+                dst as CUdeviceptr, src as CUdeviceptr,
+                n_bytes, stream_u64 as CUstream,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "cuMemcpyDtoDAsync_v2(layer0)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx { stream: stream_u64,
+                        kernel: "dtod_copy", launch: None, device: -1 },
+                ));
+            }
+            Ok(())
+        }
+
+        // Helper: prep_act + sfa_transform (NVFP4 activation staging).
+        let stage_act = |src_bf16_ptr: u64, k_dim: i32| -> Result<()> {
+            backend.launch_nvfp4_prep_act(
+                src_bf16_ptr,
+                a_packed_region.device_ptr(),
+                sfa_natural_region.device_ptr(),
+                m, k_dim, 1 /* BF16 */, stream_u64,
+            )?;
+            backend.launch_nvfp4_sfa_transform(
+                sfa_natural_region.device_ptr(),
+                sfa_cutlass_region.device_ptr(),
+                m, k_dim, stream_u64,
+            )
+        };
+
+        // Helper: NVFP4 GEMM using the staged a_packed + sfa_cutlass.
+        let gemm = |out_ptr: u64,
+                    lin: &rvllm_loader::mistral35_weights::Nvfp4LinearLoaded|
+         -> Result<()> {
+            backend.launch_nvfp4_gemm(
+                out_ptr,
+                a_packed_region.device_ptr(),
+                lin.packed_ptr,
+                sfa_cutlass_region.device_ptr(),
+                lin.sfb_cutlass_ptr,
+                lin.global_scale_ptr,
+                m, lin.shape.n as i32, lin.shape.k as i32,
+                workspace_region.device_ptr(),
+                workspace_bytes,
+                stream_u64,
+            )
+        };
+
+        // Helper: launch a kernel via the rvllm-fused launch_raw path.
+        unsafe fn launch_kernel(
+            kernel: rvllm_kernels::KernelFn,
+            grid: (u32, u32, u32),
+            block: (u32, u32, u32),
+            args: &[*mut std::ffi::c_void],
+            stream_u64: u64,
+        ) -> Result<()> {
+            rvllm_fused::launch_raw(kernel, grid, block, 0, stream_u64, args)
+        }
+
+        // ============================================================
+        // Layer-0 forward (pos=0, single token; RoPE is identity at
+        // pos=0 so we skip it; m=1 attention reduces to V broadcast
+        // because softmax over a single key is 1.0).
+        // ============================================================
+
+        // (1) Embed gather → h_residual.
         rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
             .launch(
                 kernels.fn_embedding_gather_bf16,
-                hidden_region.device_ptr(),
+                h_residual_region.device_ptr(),
                 model.outside.embed_tokens.offset_bytes,
                 token_region.device_ptr(),
                 stream_u64,
             )?;
         let post_embed = dump_bf16(
             stream, stream_u64,
-            hidden_region.device_ptr(), hidden as usize,
+            h_residual_region.device_ptr(), hidden as usize,
             "smoke_post_embed",
         )?;
 
-        // (2) First-layer input RMSNorm (in-place, BF16 x bf16-gamma).
+        // (2) DtoD copy h_residual → h_work, then RMSNorm in-place
+        //     with input_layernorm gamma.
+        dtod(stream_u64, h_work_region.device_ptr(),
+             h_residual_region.device_ptr(), hidden_bytes)?;
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-            num_tokens: 1,
-            hidden,
-            eps: self.arch.text.rms_norm_eps as f32,
-        }
-        .launch(
+            num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
+        }.launch(
             kernels.fn_rmsnorm_inplace_bf16_gbf16,
-            hidden_region.device_ptr(),
+            h_work_region.device_ptr(),
             layer0.input_layernorm.offset_bytes,
             stream_u64,
         )?;
         let post_rmsnorm = dump_bf16(
             stream, stream_u64,
-            hidden_region.device_ptr(), hidden as usize,
+            h_work_region.device_ptr(), hidden as usize,
             "smoke_post_rmsnorm",
         )?;
 
-        // (3) NVFP4 activation prep + SFA layout transform.
-        backend.launch_nvfp4_prep_act(
-            hidden_region.device_ptr(),
-            a_packed_region.device_ptr(),
-            sfa_natural_region.device_ptr(),
-            m, k,
-            1, // BF16
-            stream_u64,
-        )?;
-        backend.launch_nvfp4_sfa_transform(
-            sfa_natural_region.device_ptr(),
-            sfa_cutlass_region.device_ptr(),
-            m, k,
-            stream_u64,
-        )?;
+        // (3) NVFP4 prep h_work, then Q/K/V projections.
+        stage_act(h_work_region.device_ptr(), h_k)?;
+        gemm(q_out_region.device_ptr(), &layer0.q_proj)?;
+        gemm(k_out_region.device_ptr(), &layer0.k_proj)?;
+        gemm(v_out_region.device_ptr(), &layer0.v_proj)?;
+        let q_out = dump_bf16(stream, stream_u64,
+            q_out_region.device_ptr(), layer0.q_proj.shape.n, "smoke_q_out")?;
+        let k_out = dump_bf16(stream, stream_u64,
+            k_out_region.device_ptr(), layer0.k_proj.shape.n, "smoke_k_out")?;
+        let v_out = dump_bf16(stream, stream_u64,
+            v_out_region.device_ptr(), layer0.v_proj.shape.n, "smoke_v_out")?;
 
-        // (4) Q-projection NVFP4 GEMM.
-        backend.launch_nvfp4_gemm(
-            q_out_region.device_ptr(),
-            a_packed_region.device_ptr(),
-            q.packed_ptr,
-            sfa_cutlass_region.device_ptr(),
-            q.sfb_cutlass_ptr,
-            q.global_scale_ptr,
-            m, n, k,
-            workspace_region.device_ptr(),
-            workspace_bytes,
+        // (4) m=1 GQA-broadcast attention: attn_out[h_q, d] = V[h_kv, d]
+        //     where h_kv = h_q / gqa_ratio. Skip RoPE (identity@pos=0).
+        let head_dim = self.arch.text.head_dim as i32;
+        let n_q_heads = self.arch.text.num_attention_heads as u32;
+        let gqa_ratio = (self.arch.text.num_attention_heads
+            / self.arch.text.num_key_value_heads) as i32;
+        {
+            let mut out_ptr = attn_out_region.device_ptr();
+            let mut v_ptr = v_out_region.device_ptr();
+            let mut head_dim_arg = head_dim;
+            let mut gqa_arg = gqa_ratio;
+            let args = [
+                (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut v_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut head_dim_arg) as *mut i32 as *mut std::ffi::c_void,
+                (&mut gqa_arg) as *mut i32 as *mut std::ffi::c_void,
+            ];
+            launch_kernel(
+                kernels.fn_attn_m1_gqa_broadcast,
+                (n_q_heads, 1, 1),
+                (head_dim as u32, 1, 1),
+                &args, stream_u64,
+            )?;
+        }
+        let attn_out = dump_bf16(stream, stream_u64,
+            attn_out_region.device_ptr(), hidden as usize, "smoke_attn_out")?;
+
+        // (5) O-projection: NVFP4 prep_act on attn_out, then o_proj.
+        stage_act(attn_out_region.device_ptr(), h_k)?;
+        gemm(o_out_region.device_ptr(), &layer0.o_proj)?;
+        let o_out = dump_bf16(stream, stream_u64,
+            o_out_region.device_ptr(), layer0.o_proj.shape.n, "smoke_o_out")?;
+
+        // (6) Residual: h_residual += o_out.
+        rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
+            kernels.fn_vector_add_bf16,
+            h_residual_region.device_ptr(),
+            o_out_region.device_ptr(),
             stream_u64,
         )?;
-        let q_out = dump_bf16(
-            stream, stream_u64,
-            q_out_region.device_ptr(), n as usize,
-            "smoke_q_out",
-        )?;
+        let h_after_attn = dump_bf16(stream, stream_u64,
+            h_residual_region.device_ptr(), hidden as usize, "smoke_h_after_attn")?;
 
-        Ok(SmokeStageDump { post_embed, post_rmsnorm, q_out })
+        // (7) DtoD copy h_residual → h_work, RMSNorm with
+        //     post_attention_layernorm.
+        dtod(stream_u64, h_work_region.device_ptr(),
+             h_residual_region.device_ptr(), hidden_bytes)?;
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
+        }.launch(
+            kernels.fn_rmsnorm_inplace_bf16_gbf16,
+            h_work_region.device_ptr(),
+            layer0.post_attention_layernorm.offset_bytes,
+            stream_u64,
+        )?;
+        let post_attn_norm = dump_bf16(stream, stream_u64,
+            h_work_region.device_ptr(), hidden as usize, "smoke_post_attn_norm")?;
+
+        // (8) NVFP4 prep h_work, then gate / up projections.
+        stage_act(h_work_region.device_ptr(), h_k)?;
+        gemm(gate_out_region.device_ptr(), &layer0.gate_proj)?;
+        gemm(up_out_region.device_ptr(),   &layer0.up_proj)?;
+        let gate_out = dump_bf16(stream, stream_u64,
+            gate_out_region.device_ptr(), layer0.gate_proj.shape.n, "smoke_gate_out")?;
+        let up_out = dump_bf16(stream, stream_u64,
+            up_out_region.device_ptr(), layer0.up_proj.shape.n, "smoke_up_out")?;
+
+        // (9) silu_mul: silu_mid = silu(gate) * up, both BF16.
+        let i_size = self.arch.text.intermediate_size as i32;
+        {
+            let mut out_ptr = silu_mid_region.device_ptr();
+            let mut g_ptr = gate_out_region.device_ptr();
+            let mut u_ptr = up_out_region.device_ptr();
+            let mut n_arg = i_size;
+            let args = [
+                (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut g_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut u_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut n_arg) as *mut i32 as *mut std::ffi::c_void,
+            ];
+            const BLOCK: u32 = 256;
+            let n = i_size as u32;
+            let grid = ((n + BLOCK - 1) / BLOCK, 1, 1);
+            launch_kernel(
+                kernels.fn_silu_mul_bf16,
+                grid, (BLOCK, 1, 1), &args, stream_u64,
+            )?;
+        }
+        let silu_mid = dump_bf16(stream, stream_u64,
+            silu_mid_region.device_ptr(),
+            self.arch.text.intermediate_size, "smoke_silu_mid")?;
+
+        // (10) Down projection: NVFP4 prep_act on silu_mid (K=intermediate),
+        //      then down_proj GEMM.
+        stage_act(silu_mid_region.device_ptr(), i_k)?;
+        gemm(down_out_region.device_ptr(), &layer0.down_proj)?;
+        let down_out = dump_bf16(stream, stream_u64,
+            down_out_region.device_ptr(),
+            layer0.down_proj.shape.n, "smoke_down_out")?;
+
+        // (11) Residual: h_residual += down_out.
+        rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
+            kernels.fn_vector_add_bf16,
+            h_residual_region.device_ptr(),
+            down_out_region.device_ptr(),
+            stream_u64,
+        )?;
+        let h_after_layer0 = dump_bf16(stream, stream_u64,
+            h_residual_region.device_ptr(), hidden as usize, "smoke_h_after_layer0")?;
+
+        Ok(SmokeStageDump {
+            post_embed, post_rmsnorm,
+            q_out, k_out, v_out,
+            attn_out, o_out, h_after_attn,
+            post_attn_norm, gate_out, up_out, silu_mid,
+            down_out, h_after_layer0,
+        })
     }
 }
 

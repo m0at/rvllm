@@ -356,6 +356,11 @@
       "path": "logit_softcap.ptx",
       "sha256": "db466db1a6a764caa61d9ca83e482bf4c14153cefab25747a7aa1fb7c666561a"
     },
+    "mistral35_attn_m1_gqa_broadcast_bf16": {
+      "bytes": 1448,
+      "path": "mistral35_attn_m1_gqa_broadcast_bf16.ptx",
+      "sha256": "099ba929763771bbf075b755d917aea0ee770e3bcf6bf26c99d9caddf9760a85"
+    },
     "mma_throughput_bench": {
       "bytes": 4424,
       "path": "mma_throughput_bench.ptx",
@@ -511,6 +516,11 @@
       "path": "sigmoid_mul_f16.ptx",
       "sha256": "5cda217b5208b5ab4ba41d4a3c8a4e42c5c6aff5215b48ff2e934e0ba228aeea"
     },
+    "silu_mul_bf16": {
+      "bytes": 1994,
+      "path": "silu_mul_bf16.ptx",
+      "sha256": "4e30dbedbc40814ff4df8fa102e340ae20bdcb8fd42c28b452f1ee1aaeb3ba18"
+    },
     "silu_mul_f16": {
       "bytes": 1983,
       "path": "silu_mul_f16.ptx",
@@ -647,5 +657,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "879b2d0"
+  "revision": "21b83e5"
 }

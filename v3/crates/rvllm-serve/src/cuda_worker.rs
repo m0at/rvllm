@@ -141,12 +141,41 @@ pub async fn spawn_cuda_worker(
                             stage_stats("post_embed", &d.post_embed);
                             stage_stats("post_rmsnorm", &d.post_rmsnorm);
                             stage_stats("q_out", &d.q_out);
-                            let nz_e = d.post_embed.iter().filter(|x| **x != 0.0).count();
-                            let nz_n = d.post_rmsnorm.iter().filter(|x| **x != 0.0).count();
-                            let nz_q = d.q_out.iter().filter(|x| **x != 0.0).count();
-                            format!(
-                                "token={token_id} nz(embed/rmsnorm/qout)={nz_e}/{nz_n}/{nz_q}"
-                            )
+                            stage_stats("k_out", &d.k_out);
+                            stage_stats("v_out", &d.v_out);
+                            stage_stats("attn_out", &d.attn_out);
+                            stage_stats("o_out", &d.o_out);
+                            stage_stats("h_after_attn", &d.h_after_attn);
+                            stage_stats("post_attn_norm", &d.post_attn_norm);
+                            stage_stats("gate_out", &d.gate_out);
+                            stage_stats("up_out", &d.up_out);
+                            stage_stats("silu_mid", &d.silu_mid);
+                            stage_stats("down_out", &d.down_out);
+                            stage_stats("h_after_layer0", &d.h_after_layer0);
+                            let stages = [
+                                ("embed", &d.post_embed[..]),
+                                ("norm_in", &d.post_rmsnorm[..]),
+                                ("q", &d.q_out[..]),
+                                ("k", &d.k_out[..]),
+                                ("v", &d.v_out[..]),
+                                ("attn", &d.attn_out[..]),
+                                ("o", &d.o_out[..]),
+                                ("h+attn", &d.h_after_attn[..]),
+                                ("norm_post", &d.post_attn_norm[..]),
+                                ("gate", &d.gate_out[..]),
+                                ("up", &d.up_out[..]),
+                                ("silu", &d.silu_mid[..]),
+                                ("down", &d.down_out[..]),
+                                ("h_l0", &d.h_after_layer0[..]),
+                            ];
+                            let parts: Vec<String> = stages.iter().map(|(name, v)| {
+                                let n = v.len();
+                                let mut sumsq = 0.0f64;
+                                for &x in *v { sumsq += (x as f64) * (x as f64); }
+                                let rms = (sumsq / (n as f64)).sqrt();
+                                format!("{name}={rms:.3}")
+                            }).collect();
+                            format!("token={token_id} rms[{}]", parts.join(","))
                         }
                         Err(e) => format!("smoke FAILED: {e:?}"),
                     };
