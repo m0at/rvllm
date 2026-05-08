@@ -132,9 +132,15 @@ pub async fn spawn_cuda_worker(
                 }
 
                 while let Some(req) = req_rx.blocking_recv() {
-                    // Token id taken from RVLLM_SMOKE_TOKEN env (default 1).
-                    let token_id: u32 = std::env::var("RVLLM_SMOKE_TOKEN")
+                    // Default: use the LAST tokenized prompt id, falling
+                    // back to RVLLM_SMOKE_TOKEN env (default 1=BOS) when
+                    // the prompt is empty. The full-attention / KV-cache
+                    // path is still pending, so the smoke only exercises
+                    // "what does Mistral predict after seeing this single
+                    // token" — useful for poking at the model interactively.
+                    let env_token: u32 = std::env::var("RVLLM_SMOKE_TOKEN")
                         .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+                    let token_id: u32 = req.prompt_ids.last().copied().unwrap_or(env_token);
                     let smoke = unsafe { bringup.forward_smoke_q_proj(token_id) };
                     let summary = match smoke {
                         Ok(d) => {
