@@ -974,6 +974,29 @@ pub struct SmokeStageDump {
 #[cfg(feature = "cuda")]
 impl Mistral35Bringup {
     pub unsafe fn forward_smoke_q_proj(&self, token_id: u32, position: i32) -> Result<SmokeStageDump> {
+        // Default to computing logits + argmax + DtoH on every call —
+        // backwards-compatible for the smoke endpoint.
+        self.forward_smoke_q_proj_inner(token_id, position, true)
+    }
+
+    /// Same as [`forward_smoke_q_proj`] with optional skip of the
+    /// final lm_head + argmax + per-call DtoH-fence on the predicted
+    /// token. Used by `generate_smoke` to elide the expensive
+    /// [vocab=131072, hidden=12288] BF16 GEMM and the per-call stream
+    /// fence on every prefill step except the last — that's where the
+    /// O(N²) prefill latency was hiding.
+    ///
+    /// When `compute_logits` is false:
+    ///   * lm_head BF16 GEMM is skipped
+    ///   * argmax kernel is skipped
+    ///   * predicted_token DtoH is skipped (predicted_token = u32::MAX)
+    ///   * h_after_final_norm is uncomputed
+    pub unsafe fn forward_smoke_q_proj_inner(
+        &self,
+        token_id: u32,
+        position: i32,
+        compute_logits: bool,
+    ) -> Result<SmokeStageDump> {
         use rvllm_cutlass::lib_so::CutlassBackend;
 
         let model = self.model.as_ref().ok_or_else(|| corrupt(
@@ -1587,8 +1610,30 @@ impl Mistral35Bringup {
         }
 
         // ============================================================
-        // Final RMSNorm + lm_head + argmax.
+        // Final RMSNorm + lm_head + argmax. Skipped entirely when
+        // `compute_logits` is false (prefill non-last steps).
         // ============================================================
+        if !compute_logits {
+            // Force the stream to drain so the caller can safely
+            // arena.restore() — without this, deferred kernels would
+            // race with the next step's region allocations writing to
+            // the same offsets. The fence is the natural per-step
+            // serialization the lm_head DtoH used to provide
+            // implicitly.
+            stream.fence()?;
+            return Ok(SmokeStageDump {
+                post_embed, post_rmsnorm,
+                q_out, k_out, v_out,
+                attn_out, o_out, h_after_attn,
+                post_attn_norm, gate_out, up_out, silu_mid,
+                down_out, h_after_layer0,
+                layer_residual_rms,
+                h_after_final_norm: Vec::new(),
+                logits_top8: Vec::new(),
+                predicted_token: u32::MAX,
+            });
+        }
+
         let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "forward_smoke_layer0: cublaslt absent".into(),
@@ -1748,15 +1793,22 @@ impl Mistral35Bringup {
         let mut last_dump: Option<SmokeStageDump> = None;
         let mut last_predicted: u32 = 0;
 
-        // Prefill: feed each prompt token at its position.
+        // Prefill: feed each prompt token at its position. Skip the
+        // expensive lm_head + argmax + per-call DtoH-fence on every
+        // step except the last — those steps' predicted tokens are
+        // discarded anyway.
         for (i, &tok) in prompt.iter().enumerate() {
-            let dump = self.forward_smoke_q_proj(tok, i as i32)?;
-            last_predicted = dump.predicted_token;
-            // Keep only the LAST prompt's full dump. Earlier ones
-            // would just balloon the response.
-            if i == prompt.len() - 1 {
+            let is_last = i == prompt.len() - 1;
+            let dump = self.forward_smoke_q_proj_inner(
+                tok, i as i32, is_last,
+            )?;
+            if is_last {
+                last_predicted = dump.predicted_token;
                 last_dump = Some(dump);
             }
+            // Restore between calls is now safe: the inner path
+            // does a stream.fence() before returning when compute_logits
+            // is false, and the public path fences via DtoH on logits.
             if do_restore { unsafe { arena.restore(ck); } }
         }
 
@@ -1777,6 +1829,11 @@ impl Mistral35Bringup {
             last_dump = Some(dump);
             if do_restore { unsafe { arena.restore(ck); } }
         }
+
+        // Free all per-step scratch in one shot. The last forward
+        // (whichever path took it) finished with a stream fence + DtoH
+        // so all in-flight kernels are guaranteed complete by here.
+        if do_restore { unsafe { arena.restore(ck); } }
 
         Ok(GenerateSmokeResult {
             tokens,
