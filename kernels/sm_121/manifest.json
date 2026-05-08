@@ -401,6 +401,11 @@
       "path": "paged_attention_sm89.ptx",
       "sha256": "b9c9cb0326069a19ce1945a5c64fcbc630d98912663a6a67ce3be8d4024ca52b"
     },
+    "pixtral_rotary_2d_bf16": {
+      "bytes": 2833,
+      "path": "pixtral_rotary_2d_bf16.ptx",
+      "sha256": "d1d683bed73805f2cf8ec24eac3a760fa61df72741b936544b368f1c9406295a"
+    },
     "probe_green_ctx": {
       "bytes": 202,
       "path": "probe_green_ctx.ptx",
@@ -677,5 +682,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "85d49e9"
+  "revision": "68dd981"
 }
