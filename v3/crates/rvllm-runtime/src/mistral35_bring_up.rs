@@ -88,6 +88,36 @@ pub struct Mistral35ForwardKernels {
     pub fn_argmax_f32: KernelFn,
     pub rope_split_half_bf16_mod: LoadedModule,
     pub fn_rope_split_half_bf16: KernelFn,
+    pub kv_cache_write_bf16_mod: LoadedModule,
+    pub fn_kv_cache_write_bf16: KernelFn,
+    pub qk_dot_bf16_mod: LoadedModule,
+    pub fn_qk_dot_bf16: KernelFn,
+    pub softmax_v_bf16_mod: LoadedModule,
+    pub fn_softmax_v_bf16: KernelFn,
+}
+
+/// Per-layer KV cache (BF16). Stored as
+/// `[max_pos, n_kv_heads, head_dim]` row-major. Allocated
+/// up-front in the arena at bring-up time, one (K, V) pair per
+/// transformer layer. The `position`-th token's K and V are
+/// written at slot `position` by the kv_cache_write kernel.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+pub struct LayerKvCache {
+    pub k_ptr: u64,
+    pub v_ptr: u64,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub struct Mistral35KvCache {
+    pub layers: Vec<LayerKvCache>,
+    pub max_pos: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    /// Scratch F32 buffer for `qk_dot` output of shape
+    /// `[n_q_heads, max_pos]`. Single allocation reused per layer.
+    pub scores_f32_ptr: u64,
 }
 
 /// YaRN cos/sin tables resident on device (F32 layout). Built host-side
@@ -158,6 +188,9 @@ pub struct Mistral35Bringup {
     /// Device-resident YaRN cos/sin tables.
     #[cfg(feature = "cuda")]
     pub rope_tables: Option<Mistral35RopeTables>,
+    /// Per-layer BF16 KV cache + F32 scores scratch.
+    #[cfg(feature = "cuda")]
+    pub kv_cache: Option<Mistral35KvCache>,
 }
 
 #[derive(Debug)]
@@ -551,7 +584,8 @@ impl Mistral35Bringup {
         //     stored alongside and ensures the device context outlives
         //     the arena.
         #[cfg(feature = "cuda")]
-        let (ctx, stream, arena, model, forward_kernels_opt, cublaslt_opt, rope_tables_opt) = {
+        let (ctx, stream, arena, model, forward_kernels_opt, cublaslt_opt,
+             rope_tables_opt, kv_cache_opt) = {
             use std::sync::Arc;
             let ctx = Arc::new(rvllm_mem::context::CudaContextHandle::init(0)?);
             let compile_target: Option<rvllm_core::CompileTarget> = {
@@ -639,6 +673,15 @@ impl Mistral35Bringup {
             let rope_split_half_bf16_mod = kernels.load_ptx("rope_split_half_bf16")?;
             let fn_rope_split_half_bf16 = rope_split_half_bf16_mod
                 .get_function("rope_split_half_bf16_kernel")?;
+            let kv_cache_write_bf16_mod = kernels.load_ptx("mistral35_kv_cache_write_bf16")?;
+            let fn_kv_cache_write_bf16 = kv_cache_write_bf16_mod
+                .get_function("mistral35_kv_cache_write_bf16_kernel")?;
+            let qk_dot_bf16_mod = kernels.load_ptx("mistral35_qk_dot_bf16")?;
+            let fn_qk_dot_bf16 = qk_dot_bf16_mod
+                .get_function("mistral35_qk_dot_bf16_kernel")?;
+            let softmax_v_bf16_mod = kernels.load_ptx("mistral35_softmax_v_bf16")?;
+            let fn_softmax_v_bf16 = softmax_v_bf16_mod
+                .get_function("mistral35_softmax_v_bf16_kernel")?;
             let forward_kernels = Mistral35ForwardKernels {
                 embedding_gather_bf16_mod,
                 fn_embedding_gather_bf16,
@@ -654,6 +697,12 @@ impl Mistral35Bringup {
                 fn_argmax_f32,
                 rope_split_half_bf16_mod,
                 fn_rope_split_half_bf16,
+                kv_cache_write_bf16_mod,
+                fn_kv_cache_write_bf16,
+                qk_dot_bf16_mod,
+                fn_qk_dot_bf16,
+                softmax_v_bf16_mod,
+                fn_softmax_v_bf16,
             };
 
             // YaRN cos/sin tables — build host-side (4096 positions ×
@@ -693,8 +742,47 @@ impl Mistral35Bringup {
                 yarn_tables.mscale, (cos_bytes + sin_bytes) / 1024,
             );
 
+            // Per-layer KV cache (BF16). One pair (K, V) per layer at
+            // [max_pos, n_kv_heads, head_dim] BF16. RVLLM_KV_CACHE_MAX_POS
+            // override; defaults to original_max_position_embeddings (4096
+            // for Mistral 3.5). Per-layer 4 MiB at max_pos=4096; 88
+            // layers → ~700 MiB total — well within the 80 GiB arena.
+            let kv_max_pos: usize = std::env::var("RVLLM_KV_CACHE_MAX_POS")
+                .ok().and_then(|s| s.parse().ok())
+                .unwrap_or(arch.text.yarn.original_max_position_embeddings);
+            let kv_n_heads = arch.text.num_key_value_heads;
+            let kv_head_dim = arch.text.head_dim;
+            let per_layer_bytes = kv_max_pos * kv_n_heads * kv_head_dim * 2;
+            let mut kv_layers: Vec<LayerKvCache> = Vec::with_capacity(model.layers.len());
+            for _ in 0..model.layers.len() {
+                let k = arena_box.region("mistral35_k_cache", per_layer_bytes, 16)?;
+                let v = arena_box.region("mistral35_v_cache", per_layer_bytes, 16)?;
+                kv_layers.push(LayerKvCache {
+                    k_ptr: k.device_ptr(), v_ptr: v.device_ptr(),
+                });
+            }
+            // Scratch F32 [n_q_heads, max_pos] for attention scores.
+            let scores_bytes = arch.text.num_attention_heads * kv_max_pos * 4;
+            let scores_region = arena_box.region(
+                "mistral35_scores_f32", scores_bytes, 16)?;
+            let kv_cache_dev = Mistral35KvCache {
+                layers: kv_layers,
+                max_pos: kv_max_pos,
+                n_kv_heads: kv_n_heads,
+                head_dim: kv_head_dim,
+                scores_f32_ptr: scores_region.device_ptr(),
+            };
+            eprintln!(
+                "[mistral35] kv cache allocated: layers={} max_pos={} \
+                 n_kv_heads={} head_dim={} per_layer={} KiB total={} MiB",
+                kv_cache_dev.layers.len(), kv_max_pos, kv_n_heads, kv_head_dim,
+                per_layer_bytes / 1024,
+                (per_layer_bytes * kv_cache_dev.layers.len() * 2) / (1024 * 1024),
+            );
+
             (Some(ctx), Some(stream), Some(arena_box), Some(model),
-             Some(forward_kernels), Some(cublaslt_handle), Some(rope_tables_dev))
+             Some(forward_kernels), Some(cublaslt_handle), Some(rope_tables_dev),
+             Some(kv_cache_dev))
         };
 
         #[cfg(feature = "cuda")]
@@ -704,6 +792,7 @@ impl Mistral35Bringup {
             forward_kernels: forward_kernels_opt,
             cublaslt: cublaslt_opt,
             rope_tables: rope_tables_opt,
+            kv_cache: kv_cache_opt,
         };
         #[cfg(not(feature = "cuda"))]
         let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
@@ -1091,6 +1180,119 @@ impl Mistral35Bringup {
             ));
         }
         let head_dim_for_rope: i32 = self.arch.text.head_dim as i32;
+        let kv_cache = self.kv_cache.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_layer0: kv_cache absent".into(),
+        ))?;
+        // For now: position=0, past_len=1. Decode loop will increment.
+        let attn_position: i32 = rope_position;
+        let past_len: i32 = attn_position + 1;
+        if (past_len as usize) > kv_cache.max_pos {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                format!("forward_smoke_layer0: past_len={past_len} > kv_max_pos={}",
+                    kv_cache.max_pos),
+            ));
+        }
+        let inv_sqrt_d: f32 = 1.0 / (self.arch.text.head_dim as f32).sqrt();
+        let n_q_heads_attn: u32 = self.arch.text.num_attention_heads as u32;
+        let n_kv_heads_attn: i32 = self.arch.text.num_key_value_heads as i32;
+        let gqa_ratio_attn: i32 = (self.arch.text.num_attention_heads
+            / self.arch.text.num_key_value_heads) as i32;
+        let head_dim_attn: i32 = self.arch.text.head_dim as i32;
+
+        // Attention closure: KV write + qk_dot + softmax_v.
+        let attention_step = |layer_idx: usize| -> Result<()> {
+            let layer_kv = &kv_cache.layers[layer_idx];
+            // (a) Write K_in and V_in to slot=position of the cache.
+            {
+                let mut kin = k_out_region.device_ptr();
+                let mut vin = v_out_region.device_ptr();
+                let mut k_cache = layer_kv.k_ptr;
+                let mut v_cache = layer_kv.v_ptr;
+                let mut nkv = n_kv_heads_attn;
+                let mut hd = head_dim_attn;
+                let mut pos = attn_position;
+                let args = [
+                    (&mut kin) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut vin) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pos) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                unsafe {
+                    launch_kernel(
+                        kernels.fn_kv_cache_write_bf16,
+                        (n_kv_heads_attn as u32, 1, 1),
+                        (head_dim_attn as u32, 1, 1),
+                        &args, stream_u64,
+                    )?;
+                }
+            }
+
+            // (b) qk_dot: scores[n_q_heads, past_len] = Q · K[0..past_len]^T / sqrt(d)
+            {
+                let mut q_ptr = q_out_region.device_ptr();
+                let mut k_cache = layer_kv.k_ptr;
+                let mut sc_ptr = kv_cache.scores_f32_ptr;
+                let mut hd = head_dim_attn;
+                let mut nkv = n_kv_heads_attn;
+                let mut gr = gqa_ratio_attn;
+                let mut pl = past_len;
+                let mut isd = inv_sqrt_d;
+                let args = [
+                    (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut sc_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                ];
+                let smem = (head_dim_attn as u32) * 4;
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_qk_dot_bf16,
+                        (n_q_heads_attn, past_len as u32, 1),
+                        (head_dim_attn as u32, 1, 1),
+                        smem, stream_u64, &args,
+                    )?;
+                }
+            }
+
+            // (c) softmax_v: out[n_q_heads, head_dim] = softmax(scores) · V[0..past_len]
+            {
+                let mut sc_ptr = kv_cache.scores_f32_ptr;
+                let mut v_cache = layer_kv.v_ptr;
+                let mut out_ptr = attn_out_region.device_ptr();
+                let mut hd = head_dim_attn;
+                let mut nkv = n_kv_heads_attn;
+                let mut gr = gqa_ratio_attn;
+                let mut pl = past_len;
+                let args = [
+                    (&mut sc_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                let smem = (past_len as u32) * 4;
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_softmax_v_bf16,
+                        (n_q_heads_attn, 1, 1),
+                        (head_dim_attn as u32, 1, 1),
+                        smem, stream_u64, &args,
+                    )?;
+                }
+            }
+            Ok(())
+        };
         let rope = |buf_ptr: u64, n_heads: u32| -> Result<()> {
             let mut ptr = buf_ptr;
             let mut cos_ptr = rope_tables.cos_ptr;
@@ -1170,30 +1372,12 @@ impl Mistral35Bringup {
         let v_out = dump_bf16(stream, stream_u64,
             v_out_region.device_ptr(), layer0.v_proj.shape.n, "smoke_v_out")?;
 
-        // (4) m=1 GQA-broadcast attention: attn_out[h_q, d] = V[h_kv, d]
-        //     where h_kv = h_q / gqa_ratio. Skip RoPE (identity@pos=0).
-        let head_dim = self.arch.text.head_dim as i32;
-        let n_q_heads = self.arch.text.num_attention_heads as u32;
-        let gqa_ratio = (self.arch.text.num_attention_heads
-            / self.arch.text.num_key_value_heads) as i32;
-        {
-            let mut out_ptr = attn_out_region.device_ptr();
-            let mut v_ptr = v_out_region.device_ptr();
-            let mut head_dim_arg = head_dim;
-            let mut gqa_arg = gqa_ratio;
-            let args = [
-                (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
-                (&mut v_ptr) as *mut u64 as *mut std::ffi::c_void,
-                (&mut head_dim_arg) as *mut i32 as *mut std::ffi::c_void,
-                (&mut gqa_arg) as *mut i32 as *mut std::ffi::c_void,
-            ];
-            launch_kernel(
-                kernels.fn_attn_m1_gqa_broadcast,
-                (n_q_heads, 1, 1),
-                (head_dim as u32, 1, 1),
-                &args, stream_u64,
-            )?;
-        }
+        // (4) Attention: write K/V to layer-0 cache @ pos=position,
+        //     compute scores via qk_dot, softmax · V into attn_out.
+        attention_step(0)?;
+        let head_dim = head_dim_attn;
+        let n_q_heads = n_q_heads_attn;
+        let gqa_ratio = gqa_ratio_attn;
         let attn_out = dump_bf16(stream, stream_u64,
             attn_out_region.device_ptr(), hidden as usize, "smoke_attn_out")?;
 
@@ -1319,25 +1503,8 @@ impl Mistral35Bringup {
             rope(q_out_region.device_ptr(), n_q_heads_u)?;
             rope(k_out_region.device_ptr(), n_kv_heads_u)?;
 
-            // m=1 GQA-broadcast attention.
-            {
-                let mut out_ptr = attn_out_region.device_ptr();
-                let mut v_ptr = v_out_region.device_ptr();
-                let mut hd = head_dim_arg;
-                let mut g = gqa_ratio_arg;
-                let args = [
-                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut v_ptr) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
-                    (&mut g) as *mut i32 as *mut std::ffi::c_void,
-                ];
-                launch_kernel(
-                    kernels.fn_attn_m1_gqa_broadcast,
-                    (n_q_heads_arg, 1, 1),
-                    (head_dim_arg as u32, 1, 1),
-                    &args, stream_u64,
-                )?;
-            }
+            // Attention via KV cache (write + qk_dot + softmax_v).
+            attention_step(layer_idx)?;
 
             // O proj + residual.
             stage_act(attn_out_region.device_ptr(), h_k)?;
