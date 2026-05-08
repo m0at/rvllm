@@ -84,6 +84,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_attn_m1_gqa_broadcast: KernelFn,
     pub vector_add_bf16_mod: LoadedModule,
     pub fn_vector_add_bf16: KernelFn,
+    pub argmax_mod: LoadedModule,
+    pub fn_argmax_f32: KernelFn,
 }
 
 /// Same path bundle Gemma 4 takes — kept so `cuda_worker` can pass
@@ -135,6 +137,9 @@ pub struct Mistral35Bringup {
     /// no-cuda build.
     #[cfg(feature = "cuda")]
     pub forward_kernels: Option<Mistral35ForwardKernels>,
+    /// cuBLASLt handle + workspace for the BF16×BF16→F32 lm_head GEMM.
+    #[cfg(feature = "cuda")]
+    pub cublaslt: Option<rvllm_cutlass::cublaslt::CublasLt>,
 }
 
 #[derive(Debug)]
@@ -528,7 +533,7 @@ impl Mistral35Bringup {
         //     stored alongside and ensures the device context outlives
         //     the arena.
         #[cfg(feature = "cuda")]
-        let (ctx, stream, arena, model, forward_kernels_opt) = {
+        let (ctx, stream, arena, model, forward_kernels_opt, cublaslt_opt) = {
             use std::sync::Arc;
             let ctx = Arc::new(rvllm_mem::context::CudaContextHandle::init(0)?);
             let compile_target: Option<rvllm_core::CompileTarget> = {
@@ -573,6 +578,14 @@ impl Mistral35Bringup {
                 model.layers.len(),
             );
 
+            // cuBLASLt for the BF16 lm_head GEMM. 32 MiB workspace
+            // matches the Gemma 4 setup; same arena.
+            let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
+            let cublaslt_ws_region = arena_box.region(
+                "mistral35_cublaslt_ws", cublaslt_ws_bytes, 256)?;
+            let cublaslt_handle = rvllm_cutlass::cublaslt::CublasLt::new(
+                cublaslt_ws_region.device_ptr(), cublaslt_ws_bytes)?;
+
             // Resolve the PTX kernel handles for the smoke-forward
             // path. Only the bare minimum for "embed + first
             // RMSNorm + Q proj" is loaded today; the full forward
@@ -603,6 +616,8 @@ impl Mistral35Bringup {
             let vector_add_bf16_mod = kernels.load_ptx("vector_add_bf16")?;
             let fn_vector_add_bf16 = vector_add_bf16_mod
                 .get_function("vector_add_bf16_kernel")?;
+            let argmax_mod = kernels.load_ptx("argmax")?;
+            let fn_argmax_f32 = argmax_mod.get_function("argmax_kernel")?;
             let forward_kernels = Mistral35ForwardKernels {
                 embedding_gather_bf16_mod,
                 fn_embedding_gather_bf16,
@@ -614,9 +629,12 @@ impl Mistral35Bringup {
                 fn_attn_m1_gqa_broadcast,
                 vector_add_bf16_mod,
                 fn_vector_add_bf16,
+                argmax_mod,
+                fn_argmax_f32,
             };
 
-            (Some(ctx), Some(stream), Some(arena_box), Some(model), Some(forward_kernels))
+            (Some(ctx), Some(stream), Some(arena_box), Some(model),
+             Some(forward_kernels), Some(cublaslt_handle))
         };
 
         #[cfg(feature = "cuda")]
@@ -624,6 +642,7 @@ impl Mistral35Bringup {
             paths, arch, inventory, arena_bytes, nvfp4_active,
             cutlass_backend, ctx, stream, arena, model,
             forward_kernels: forward_kernels_opt,
+            cublaslt: cublaslt_opt,
         };
         #[cfg(not(feature = "cuda"))]
         let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
@@ -766,9 +785,10 @@ fn corrupt(path: PathBuf, detail: String) -> RvllmError {
     }
 }
 
-/// Per-stage dump returned by [`Mistral35Bringup::forward_smoke_layer0`].
-/// Full layer-0 flow at pos=0 (RoPE is identity, single-token attention
-/// degenerates to V broadcast across q-heads). All BF16 widened to F32.
+/// Per-stage dump returned by the smoke-forward. Layer-0 stages stay
+/// dumped for visibility; for layers 1..88 only the residual rms is
+/// captured (in `layer_residual_rms`). Final stages cover RMSNorm
+/// → lm_head → argmax → predicted token id.
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct SmokeStageDump {
@@ -786,6 +806,15 @@ pub struct SmokeStageDump {
     pub silu_mid: Vec<f32>,        // [intermediate=28672] silu(gate)*up
     pub down_out: Vec<f32>,        // [hidden=12288] down_proj(silu_mid)
     pub h_after_layer0: Vec<f32>,  // [hidden=12288] h_after_attn + down_out
+    /// Per-layer residual rms after each layer (88 entries).
+    pub layer_residual_rms: Vec<f32>,
+    /// Final RMSNorm output (just before lm_head).
+    pub h_after_final_norm: Vec<f32>,
+    /// Top-8 (token_id, logit) pairs for sanity. logits_top8 is sorted
+    /// descending by logit value.
+    pub logits_top8: Vec<(u32, f32)>,
+    /// argmax of the lm_head output — the predicted next token id.
+    pub predicted_token: u32,
 }
 
 /// Smoke-forward for the upload+kernel pipeline: embed token id →
@@ -1142,12 +1171,228 @@ impl Mistral35Bringup {
         let h_after_layer0 = dump_bf16(stream, stream_u64,
             h_residual_region.device_ptr(), hidden as usize, "smoke_h_after_layer0")?;
 
+        // ============================================================
+        // Layers 1..88 — same flow as layer 0 with that layer's
+        // weights. Closure reused; only the residual rms is captured
+        // per layer (full per-stage dumps would be ~88×14 tensors).
+        // ============================================================
+        let mut layer_residual_rms: Vec<f32> = Vec::with_capacity(model.layers.len());
+        // Record layer-0 residual rms as the first entry.
+        let l0_sumsq: f64 = h_after_layer0.iter()
+            .map(|&x| (x as f64) * (x as f64)).sum();
+        layer_residual_rms.push(
+            (l0_sumsq / (h_after_layer0.len() as f64)).sqrt() as f32);
+
+        let head_dim_arg = head_dim;
+        let n_q_heads_arg = n_q_heads;
+        let gqa_ratio_arg = gqa_ratio;
+        let i_size = i_size;
+        for layer_idx in 1..model.layers.len() {
+            let layer = &model.layers[layer_idx];
+
+            // Pre-attn norm.
+            dtod(stream_u64, h_work_region.device_ptr(),
+                 h_residual_region.device_ptr(), hidden_bytes)?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
+            }.launch(
+                kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                h_work_region.device_ptr(),
+                layer.input_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+
+            // Q/K/V.
+            stage_act(h_work_region.device_ptr(), h_k)?;
+            gemm(q_out_region.device_ptr(), &layer.q_proj)?;
+            gemm(k_out_region.device_ptr(), &layer.k_proj)?;
+            gemm(v_out_region.device_ptr(), &layer.v_proj)?;
+
+            // m=1 GQA-broadcast attention (RoPE@pos=0 = identity).
+            {
+                let mut out_ptr = attn_out_region.device_ptr();
+                let mut v_ptr = v_out_region.device_ptr();
+                let mut hd = head_dim_arg;
+                let mut g = gqa_ratio_arg;
+                let args = [
+                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut g) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                launch_kernel(
+                    kernels.fn_attn_m1_gqa_broadcast,
+                    (n_q_heads_arg, 1, 1),
+                    (head_dim_arg as u32, 1, 1),
+                    &args, stream_u64,
+                )?;
+            }
+
+            // O proj + residual.
+            stage_act(attn_out_region.device_ptr(), h_k)?;
+            gemm(o_out_region.device_ptr(), &layer.o_proj)?;
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
+                kernels.fn_vector_add_bf16,
+                h_residual_region.device_ptr(),
+                o_out_region.device_ptr(),
+                stream_u64,
+            )?;
+
+            // Post-attn norm.
+            dtod(stream_u64, h_work_region.device_ptr(),
+                 h_residual_region.device_ptr(), hidden_bytes)?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
+            }.launch(
+                kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                h_work_region.device_ptr(),
+                layer.post_attention_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+
+            // gate / up / silu_mul.
+            stage_act(h_work_region.device_ptr(), h_k)?;
+            gemm(gate_out_region.device_ptr(), &layer.gate_proj)?;
+            gemm(up_out_region.device_ptr(),   &layer.up_proj)?;
+            {
+                let mut out_ptr = silu_mid_region.device_ptr();
+                let mut g_ptr = gate_out_region.device_ptr();
+                let mut u_ptr = up_out_region.device_ptr();
+                let mut n_arg = i_size;
+                let args = [
+                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut g_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut u_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut n_arg) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                const BLOCK: u32 = 256;
+                let n = i_size as u32;
+                let grid = ((n + BLOCK - 1) / BLOCK, 1, 1);
+                launch_kernel(
+                    kernels.fn_silu_mul_bf16,
+                    grid, (BLOCK, 1, 1), &args, stream_u64,
+                )?;
+            }
+
+            // down + residual.
+            stage_act(silu_mid_region.device_ptr(), i_k)?;
+            gemm(down_out_region.device_ptr(), &layer.down_proj)?;
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
+                kernels.fn_vector_add_bf16,
+                h_residual_region.device_ptr(),
+                down_out_region.device_ptr(),
+                stream_u64,
+            )?;
+
+            // Per-layer residual rms (single fence + DtoH every 8 layers
+            // is plenty; the per-launch is tiny but the fence cost
+            // adds up). For initial smoke we want every layer.
+            let v = dump_bf16(stream, stream_u64,
+                h_residual_region.device_ptr(), hidden as usize,
+                "smoke_layer_residual")?;
+            let sumsq: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            layer_residual_rms.push((sumsq / (v.len() as f64)).sqrt() as f32);
+        }
+
+        // ============================================================
+        // Final RMSNorm + lm_head + argmax.
+        // ============================================================
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_layer0: cublaslt absent".into(),
+        ))?;
+
+        // Final norm: copy h_residual → h_work, RMSNorm with
+        // outside.final_norm gamma.
+        dtod(stream_u64, h_work_region.device_ptr(),
+             h_residual_region.device_ptr(), hidden_bytes)?;
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
+        }.launch(
+            kernels.fn_rmsnorm_inplace_bf16_gbf16,
+            h_work_region.device_ptr(),
+            model.outside.final_norm.offset_bytes,
+            stream_u64,
+        )?;
+        let h_after_final_norm = dump_bf16(stream, stream_u64,
+            h_work_region.device_ptr(), hidden as usize, "smoke_h_after_final_norm")?;
+
+        // lm_head: BF16 [vocab, hidden] × BF16 [1, hidden] → F32 [1, vocab]
+        let vocab = self.arch.text.vocab_size as i32;
+        let logits_region = arena.region(
+            "smoke_logits_f32", (vocab as usize) * 4, 16)?;
+        cublaslt.bf16_gemm_f32(
+            h_work_region.device_ptr(),       // a [1, hidden] (BF16)
+            model.outside.lm_head.offset_bytes, // b [vocab, hidden] (BF16)
+            logits_region.device_ptr(),        // d [1, vocab] (F32)
+            1,                                 // m = num_seqs
+            vocab,
+            h_k,
+            stream_u64,
+        )?;
+
+        // argmax_kernel(logits_f32, out_token_i32, vocab_size).
+        let token_out_region = arena.region("smoke_token_out", 4, 4)?;
+        {
+            let mut logits_ptr = logits_region.device_ptr();
+            let mut tok_ptr = token_out_region.device_ptr();
+            let mut vocab_arg = vocab;
+            let args = [
+                (&mut logits_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut tok_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut vocab_arg) as *mut i32 as *mut std::ffi::c_void,
+            ];
+            launch_kernel(
+                kernels.fn_argmax_f32,
+                (1, 1, 1), (1024, 1, 1), &args, stream_u64,
+            )?;
+        }
+
+        // DtoH the predicted token + the full logits vector for top-8.
+        stream.fence()?;
+        let mut tok_buf = [0u8; 4];
+        let mut logits_host = vec![0f32; vocab as usize];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r1 = cuMemcpyDtoH_v2(
+                tok_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                token_out_region.device_ptr() as CUdeviceptr, 4);
+            if r1 != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "cuMemcpyDtoH_v2(predicted_token)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx { stream: stream_u64,
+                        kernel: "smoke_token_dtoh", launch: None, device: -1 },
+                ));
+            }
+            let r2 = cuMemcpyDtoH_v2(
+                logits_host.as_mut_ptr() as *mut std::ffi::c_void,
+                logits_region.device_ptr() as CUdeviceptr,
+                (vocab as usize) * 4);
+            if r2 != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "cuMemcpyDtoH_v2(logits)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx { stream: stream_u64,
+                        kernel: "smoke_logits_dtoh", launch: None, device: -1 },
+                ));
+            }
+        }
+        let predicted_token = u32::from_le_bytes(tok_buf);
+        // Top-8 by logit value (host-side for diagnostics; small N).
+        let mut indexed: Vec<(u32, f32)> = logits_host.iter().enumerate()
+            .map(|(i, &v)| (i as u32, v)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let logits_top8: Vec<(u32, f32)> = indexed.into_iter().take(8).collect();
+
         Ok(SmokeStageDump {
             post_embed, post_rmsnorm,
             q_out, k_out, v_out,
             attn_out, o_out, h_after_attn,
             post_attn_norm, gate_out, up_out, silu_mid,
             down_out, h_after_layer0,
+            layer_residual_rms, h_after_final_norm,
+            logits_top8, predicted_token,
         })
     }
 }

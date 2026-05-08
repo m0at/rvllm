@@ -152,6 +152,22 @@ pub async fn spawn_cuda_worker(
                             stage_stats("silu_mid", &d.silu_mid);
                             stage_stats("down_out", &d.down_out);
                             stage_stats("h_after_layer0", &d.h_after_layer0);
+                            stage_stats("h_after_final_norm", &d.h_after_final_norm);
+                            // Per-layer residual rms cascade (88 entries).
+                            let lr_min = d.layer_residual_rms.iter().cloned().fold(f32::INFINITY, f32::min);
+                            let lr_max = d.layer_residual_rms.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let lr_first = &d.layer_residual_rms[..d.layer_residual_rms.len().min(4)];
+                            let lr_last  = &d.layer_residual_rms[d.layer_residual_rms.len().saturating_sub(4)..];
+                            tracing::info!(
+                                n_layers = d.layer_residual_rms.len(),
+                                lr_min, lr_max,
+                                "mistral35 smoke layer_residual_rms first4={:.3?} last4={:.3?}",
+                                lr_first, lr_last,
+                            );
+                            tracing::info!(
+                                predicted_token = d.predicted_token,
+                                "mistral35 smoke logits_top8={:?}", d.logits_top8,
+                            );
                             let stages = [
                                 ("embed", &d.post_embed[..]),
                                 ("norm_in", &d.post_rmsnorm[..]),
@@ -167,6 +183,7 @@ pub async fn spawn_cuda_worker(
                                 ("silu", &d.silu_mid[..]),
                                 ("down", &d.down_out[..]),
                                 ("h_l0", &d.h_after_layer0[..]),
+                                ("h_fnorm", &d.h_after_final_norm[..]),
                             ];
                             let parts: Vec<String> = stages.iter().map(|(name, v)| {
                                 let n = v.len();
@@ -175,7 +192,10 @@ pub async fn spawn_cuda_worker(
                                 let rms = (sumsq / (n as f64)).sqrt();
                                 format!("{name}={rms:.3}")
                             }).collect();
-                            format!("token={token_id} rms[{}]", parts.join(","))
+                            format!(
+                                "in={token_id} predicted={} rms[{}]",
+                                d.predicted_token, parts.join(",")
+                            )
                         }
                         Err(e) => format!("smoke FAILED: {e:?}"),
                     };
