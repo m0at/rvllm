@@ -744,15 +744,23 @@ fn corrupt(path: PathBuf, detail: String) -> RvllmError {
     }
 }
 
+/// Per-stage stats returned by [`Mistral35Bringup::forward_smoke_q_proj`].
+/// Each field is the BF16-as-F32 widened buffer at that pipeline stage.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+pub struct SmokeStageDump {
+    pub post_embed: Vec<f32>,    // [hidden=12288]
+    pub post_rmsnorm: Vec<f32>,  // [hidden=12288]
+    pub q_out: Vec<f32>,         // [n_q*head_dim=12288]
+}
+
 /// Smoke-forward for the upload+kernel pipeline: embed token id →
 /// first-layer RMSNorm → first-layer Q-projection (NVFP4 GEMM) →
-/// host readback. Returns the per-channel BF16-as-F32 vector (length
-/// `n_q * head_dim = 12288`). Plausibility check: not NaN, not all
-/// zero, and a non-degenerate dynamic range — anything stronger
-/// requires a reference dump.
+/// host readback at every stage. Lets callers bisect which step
+/// is producing the all-zero output.
 #[cfg(feature = "cuda")]
 impl Mistral35Bringup {
-    pub unsafe fn forward_smoke_q_proj(&self, token_id: u32) -> Result<Vec<f32>> {
+    pub unsafe fn forward_smoke_q_proj(&self, token_id: u32) -> Result<SmokeStageDump> {
         use rvllm_cutlass::lib_so::CutlassBackend;
 
         let model = self.model.as_ref().ok_or_else(|| corrupt(
@@ -824,6 +832,35 @@ impl Mistral35Bringup {
         let workspace_bytes = backend.nvfp4_workspace_size(m, n, k).max(16);
         let workspace_region = arena.region("smoke_ws", workspace_bytes, 16)?;
 
+        // Helper: fence + DtoH a bf16 region of `count` elements, widen to f32.
+        unsafe fn dump_bf16(
+            stream: &rvllm_mem::stream::Stream,
+            stream_u64: u64,
+            dev_ptr: u64,
+            count: usize,
+            label: &'static str,
+        ) -> Result<Vec<f32>> {
+            stream.fence()?;
+            let mut buf = vec![0u16; count];
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                dev_ptr as CUdeviceptr,
+                count * 2,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "cuMemcpyDtoH_v2(smoke stage)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx {
+                        stream: stream_u64, kernel: label,
+                        launch: None, device: -1,
+                    },
+                ));
+            }
+            Ok(buf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect())
+        }
+
         // (1) Embed gather.
         rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
             .launch(
@@ -833,6 +870,11 @@ impl Mistral35Bringup {
                 token_region.device_ptr(),
                 stream_u64,
             )?;
+        let post_embed = dump_bf16(
+            stream, stream_u64,
+            hidden_region.device_ptr(), hidden as usize,
+            "smoke_post_embed",
+        )?;
 
         // (2) First-layer input RMSNorm (in-place, BF16 x bf16-gamma).
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
@@ -845,6 +887,11 @@ impl Mistral35Bringup {
             hidden_region.device_ptr(),
             layer0.input_layernorm.offset_bytes,
             stream_u64,
+        )?;
+        let post_rmsnorm = dump_bf16(
+            stream, stream_u64,
+            hidden_region.device_ptr(), hidden as usize,
+            "smoke_post_rmsnorm",
         )?;
 
         // (3) NVFP4 activation prep + SFA layout transform.
@@ -876,33 +923,13 @@ impl Mistral35Bringup {
             workspace_bytes,
             stream_u64,
         )?;
+        let q_out = dump_bf16(
+            stream, stream_u64,
+            q_out_region.device_ptr(), n as usize,
+            "smoke_q_out",
+        )?;
 
-        // (5) Fence + DtoH copy.
-        stream.fence()?;
-        let mut out_bf16 = vec![0u16; n as usize];
-        {
-            use cudarc::driver::sys::*;
-            let r = cuMemcpyDtoH_v2(
-                out_bf16.as_mut_ptr() as *mut std::ffi::c_void,
-                q_out_region.device_ptr() as CUdeviceptr,
-                q_out_bytes,
-            );
-            if r != CUresult::CUDA_SUCCESS {
-                return Err(RvllmError::cuda(
-                    "cuMemcpyDtoH_v2(smoke_q_out)",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx {
-                        stream: stream_u64, kernel: "smoke_q_proj_dtoh",
-                        launch: None, device: -1,
-                    },
-                ));
-            }
-        }
-
-        // BF16 → F32 widen for callers.
-        Ok(out_bf16.iter()
-            .map(|&b| f32::from_bits((b as u32) << 16))
-            .collect())
+        Ok(SmokeStageDump { post_embed, post_rmsnorm, q_out })
     }
 }
 

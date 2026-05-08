@@ -108,56 +108,50 @@ pub async fn spawn_cuda_worker(
                 );
                 let _ = ready_tx.send(Ok(()));
 
+                fn stage_stats(label: &str, v: &[f32]) {
+                    let n = v.len();
+                    let any_nan = v.iter().any(|x| x.is_nan());
+                    let any_inf = v.iter().any(|x| x.is_infinite());
+                    let mut min = f32::INFINITY;
+                    let mut max = f32::NEG_INFINITY;
+                    let mut nz = 0usize;
+                    let mut sumsq = 0.0f64;
+                    for &x in v {
+                        if x < min { min = x; }
+                        if x > max { max = x; }
+                        if x != 0.0 { nz += 1; }
+                        sumsq += (x as f64) * (x as f64);
+                    }
+                    let rms = (sumsq / (n as f64)).sqrt();
+                    let head: Vec<String> = v.iter().take(8)
+                        .map(|x| format!("{:+.4}", x)).collect();
+                    tracing::info!(
+                        n, any_nan, any_inf, nz, min, max, rms,
+                        "mistral35 smoke {label} head[8]={}", head.join(",")
+                    );
+                }
+
                 while let Some(req) = req_rx.blocking_recv() {
-                    // Smoke-forward path (Step 5 GPU half, iteration A):
-                    // run embed → first-layer RMSNorm → first-layer
-                    // Q-projection on token id 42 against the resident
-                    // model. Logs first 16 BF16-as-F32 channels +
-                    // basic plausibility stats, then returns a typed
-                    // "smoke-only" error so the per-request pipeline
-                    // reports concrete numerics instead of garbage.
-                    let token_id: u32 = 42;
+                    // Token id taken from RVLLM_SMOKE_TOKEN env (default 1).
+                    let token_id: u32 = std::env::var("RVLLM_SMOKE_TOKEN")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
                     let smoke = unsafe { bringup.forward_smoke_q_proj(token_id) };
                     let summary = match smoke {
-                        Ok(q) => {
-                            let n = q.len();
-                            let any_nan = q.iter().any(|v| v.is_nan());
-                            let any_inf = q.iter().any(|v| v.is_infinite());
-                            let mut min = f32::INFINITY;
-                            let mut max = f32::NEG_INFINITY;
-                            let mut nz = 0usize;
-                            let mut sumsq = 0.0f64;
-                            for &v in &q {
-                                if v < min { min = v; }
-                                if v > max { max = v; }
-                                if v != 0.0 { nz += 1; }
-                                sumsq += (v as f64) * (v as f64);
-                            }
-                            let rms = (sumsq / (n as f64)).sqrt();
-                            let head: Vec<String> = q.iter().take(16)
-                                .map(|v| format!("{:+.4}", v)).collect();
-                            tracing::info!(
-                                token_id, n, any_nan, any_inf, nz,
-                                min, max, rms,
-                                "mistral35 smoke Q-proj head[16]={}",
-                                head.join(",")
-                            );
+                        Ok(d) => {
+                            stage_stats("post_embed", &d.post_embed);
+                            stage_stats("post_rmsnorm", &d.post_rmsnorm);
+                            stage_stats("q_out", &d.q_out);
+                            let nz_e = d.post_embed.iter().filter(|x| **x != 0.0).count();
+                            let nz_n = d.post_rmsnorm.iter().filter(|x| **x != 0.0).count();
+                            let nz_q = d.q_out.iter().filter(|x| **x != 0.0).count();
                             format!(
-                                "smoke Q-proj OK: token={token_id} \
-                                 n={n} nan={any_nan} inf={any_inf} \
-                                 nz={nz} min={min:+.4} max={max:+.4} \
-                                 rms={rms:.4} head=[{}]",
-                                head.join(",")
+                                "token={token_id} nz(embed/rmsnorm/qout)={nz_e}/{nz_n}/{nz_q}"
                             )
                         }
-                        Err(e) => format!("smoke Q-proj FAILED: {e:?}"),
+                        Err(e) => format!("smoke FAILED: {e:?}"),
                     };
                     let _ = req.events_tx.send(GenerateEvent::Error(format!(
-                        "Mistral 3.5 forward path: smoke-only iteration A \
-                         (embed + first-layer RMSNorm + Q-projection NVFP4 \
-                         GEMM); full layer + sampling pending. \
-                         nvfp4_active={}, {}",
-                        bringup.nvfp4_active, summary,
+                        "[mistral35-smoke debug] {summary}"
                     )));
                 }
                 tracing::info!("Mistral 3.5 cuda worker queue closed, exiting");
