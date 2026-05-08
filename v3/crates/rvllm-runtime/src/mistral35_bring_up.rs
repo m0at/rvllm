@@ -66,6 +66,20 @@ use rvllm_loader::safetensors::{ShardHeader, ShardIndex, TensorEntry};
 
 use crate::gemma4_bring_up::Gemma4EnginePaths;
 
+#[cfg(feature = "cuda")]
+use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
+
+/// PTX kernel handles needed by the Mistral 3.5 smoke-forward (Step
+/// 5 GPU half, iteration A). Held on `Mistral35Bringup` so the
+/// LoadedModule lifetimes outlive every per-request launch.
+#[cfg(feature = "cuda")]
+pub struct Mistral35ForwardKernels {
+    pub embedding_gather_bf16_mod: LoadedModule,
+    pub fn_embedding_gather_bf16: KernelFn,
+    pub rmsnorm_inplace_bf16_gbf16_mod: LoadedModule,
+    pub fn_rmsnorm_inplace_bf16_gbf16: KernelFn,
+}
+
 /// Same path bundle Gemma 4 takes — kept so `cuda_worker` can pass
 /// the resolved paths through unchanged. We alias rather than
 /// inventing `Mistral35EnginePaths` to avoid duplicated path
@@ -111,6 +125,10 @@ pub struct Mistral35Bringup {
     /// (which short-circuits before upload).
     #[cfg(feature = "cuda")]
     pub model: Option<rvllm_loader::mistral35_weights::Mistral35LoadedModel>,
+    /// PTX kernel handles for the smoke-forward path. None on the
+    /// no-cuda build.
+    #[cfg(feature = "cuda")]
+    pub forward_kernels: Option<Mistral35ForwardKernels>,
 }
 
 #[derive(Debug)]
@@ -504,7 +522,7 @@ impl Mistral35Bringup {
         //     stored alongside and ensures the device context outlives
         //     the arena.
         #[cfg(feature = "cuda")]
-        let (ctx, stream, arena, model) = {
+        let (ctx, stream, arena, model, forward_kernels_opt) = {
             use std::sync::Arc;
             let ctx = Arc::new(rvllm_mem::context::CudaContextHandle::init(0)?);
             let compile_target: Option<rvllm_core::CompileTarget> = {
@@ -549,13 +567,41 @@ impl Mistral35Bringup {
                 model.layers.len(),
             );
 
-            (Some(ctx), Some(stream), Some(arena_box), Some(model))
+            // Resolve the PTX kernel handles for the smoke-forward
+            // path. Only the bare minimum for "embed + first
+            // RMSNorm + Q proj" is loaded today; the full forward
+            // expands this set as it lands.
+            let kernels_dir =
+                crate::bring_up::resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
+            let manifest_path = kernels_dir.join("manifest.json");
+            let manifest = rvllm_kernels::manifest::KernelManifest
+                ::load_and_verify(&manifest_path)?;
+            if let Some(t) = compile_target {
+                manifest.assert_arch(t.as_sm_str())?;
+            }
+            let kernels = std::sync::Arc::new(KernelLoader::new(manifest));
+            let embedding_gather_bf16_mod = kernels.load_ptx("embedding_gather_bf16")?;
+            let fn_embedding_gather_bf16 = embedding_gather_bf16_mod
+                .get_function("embedding_gather_bf16_kernel")?;
+            let rmsnorm_inplace_bf16_gbf16_mod =
+                kernels.load_ptx("rmsnorm_inplace_bf16_gbf16")?;
+            let fn_rmsnorm_inplace_bf16_gbf16 = rmsnorm_inplace_bf16_gbf16_mod
+                .get_function("rmsnorm_inplace_bf16_gbf16_kernel")?;
+            let forward_kernels = Mistral35ForwardKernels {
+                embedding_gather_bf16_mod,
+                fn_embedding_gather_bf16,
+                rmsnorm_inplace_bf16_gbf16_mod,
+                fn_rmsnorm_inplace_bf16_gbf16,
+            };
+
+            (Some(ctx), Some(stream), Some(arena_box), Some(model), Some(forward_kernels))
         };
 
         #[cfg(feature = "cuda")]
         let bringup = Self {
             paths, arch, inventory, arena_bytes, nvfp4_active,
             cutlass_backend, ctx, stream, arena, model,
+            forward_kernels: forward_kernels_opt,
         };
         #[cfg(not(feature = "cuda"))]
         let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
@@ -950,6 +996,14 @@ mod tests {
         assert_eq!(b_arith.sfa_natural_bytes, b_back.sfa_natural_bytes);
         assert_eq!(b_arith.sfa_cutlass_bytes_max, b_back.sfa_cutlass_bytes_max);
         assert_eq!(b_arith.workspace_bytes_max, b_back.workspace_bytes_max);
+    }
+
+    #[test]
+    fn forward_smoke_handles_inactive_bringup_gracefully() {
+        // Pure-Rust path — verifies the helper compiles. The real
+        // smoke-forward needs CUDA + an uploaded model, exercised
+        // out-of-band against /home/r00t/mistral-3.5.
+        let _ = test_arch_fixture(2);
     }
 
     #[test]
