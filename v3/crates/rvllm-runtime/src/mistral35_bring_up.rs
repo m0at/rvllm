@@ -96,6 +96,37 @@ pub struct Mistral35ForwardKernels {
     pub fn_softmax_v_bf16: KernelFn,
 }
 
+/// Pre-allocated per-token forward scratch — sized for m=1 across
+/// every Mistral 3.5 projection shape so a single forward never
+/// hits the arena allocator. Hoisting these out of
+/// `forward_smoke_q_proj_inner` cuts ~5K allocator + restore calls
+/// per chat request and eliminates a real per-step latency spike
+/// observed empirically (440 ms/step with per-call alloc + restore
+/// vs an expected ~30-60 ms once those go away).
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy)]
+pub struct Mistral35Scratch {
+    pub token_in_ptr: u64,        // i32 [1] — embed gather input
+    pub h_residual_ptr: u64,      // BF16 [hidden]
+    pub h_work_ptr: u64,          // BF16 [hidden]
+    pub a_packed_ptr: u64,        // U8   [m=1 * max_k / 2]
+    pub sfa_natural_ptr: u64,     // E4M3 [m=1 * max_k / 16]
+    pub sfa_cutlass_ptr: u64,     // CUTLASS-interleaved SFA scratch
+    pub q_out_ptr: u64,           // BF16 [n_q_heads * head_dim]
+    pub k_out_ptr: u64,           // BF16 [n_kv_heads * head_dim]
+    pub v_out_ptr: u64,           // BF16 [n_kv_heads * head_dim]
+    pub attn_out_ptr: u64,        // BF16 [hidden]
+    pub o_out_ptr: u64,           // BF16 [hidden]
+    pub gate_out_ptr: u64,        // BF16 [intermediate]
+    pub up_out_ptr: u64,          // BF16 [intermediate]
+    pub silu_mid_ptr: u64,        // BF16 [intermediate]
+    pub down_out_ptr: u64,        // BF16 [hidden]
+    pub workspace_ptr: u64,       // CUTLASS GEMM scratch
+    pub workspace_bytes: usize,
+    pub logits_ptr: u64,          // F32 [vocab]
+    pub token_out_ptr: u64,       // i32 [1] — argmax target
+}
+
 /// Per-layer KV cache (BF16). Stored as
 /// `[max_pos, n_kv_heads, head_dim]` row-major. Allocated
 /// up-front in the arena at bring-up time, one (K, V) pair per
@@ -191,6 +222,9 @@ pub struct Mistral35Bringup {
     /// Per-layer BF16 KV cache + F32 scores scratch.
     #[cfg(feature = "cuda")]
     pub kv_cache: Option<Mistral35KvCache>,
+    /// Pre-allocated per-call forward scratch.
+    #[cfg(feature = "cuda")]
+    pub scratch: Option<Mistral35Scratch>,
 }
 
 #[derive(Debug)]
@@ -585,7 +619,7 @@ impl Mistral35Bringup {
         //     the arena.
         #[cfg(feature = "cuda")]
         let (ctx, stream, arena, model, forward_kernels_opt, cublaslt_opt,
-             rope_tables_opt, kv_cache_opt) = {
+             rope_tables_opt, kv_cache_opt, scratch_opt) = {
             use std::sync::Arc;
             let ctx = Arc::new(rvllm_mem::context::CudaContextHandle::init(0)?);
             let compile_target: Option<rvllm_core::CompileTarget> = {
@@ -780,9 +814,60 @@ impl Mistral35Bringup {
                 (per_layer_bytes * kv_cache_dev.layers.len() * 2) / (1024 * 1024),
             );
 
+            // Pre-allocated per-call scratch. Sized for m=1 across the
+            // worst-case projection shapes Mistral 3.5 uses. Reused on
+            // every forward step so the hot path never touches the
+            // arena allocator.
+            let h = arch.text.hidden_size;
+            let i_s = arch.text.intermediate_size;
+            let max_k = h.max(i_s);
+            let n_q_dim = arch.text.num_attention_heads * arch.text.head_dim;
+            let n_kv_dim = arch.text.num_key_value_heads * arch.text.head_dim;
+            let vocab = arch.text.vocab_size;
+            let h_bytes = h * 2;
+            let i_bytes = i_s * 2;
+            let cb = cutlass_backend.as_ref()
+                .expect("cutlass_backend must be Some on cuda build");
+            let mut max_workspace = 0usize;
+            for &(n, k) in &[
+                (n_q_dim, h), (n_kv_dim, h), (h, h),
+                (i_s, h), (h, i_s),
+            ] {
+                let w = cb.nvfp4_workspace_size(1, n as i32, k as i32);
+                if w > max_workspace { max_workspace = w; }
+            }
+            let max_workspace = max_workspace.max(16);
+            let scratch = Mistral35Scratch {
+                token_in_ptr:   arena_box.region("mistral35_token_in", 4, 4)?.device_ptr(),
+                h_residual_ptr: arena_box.region("mistral35_h_residual", h_bytes, 16)?.device_ptr(),
+                h_work_ptr:     arena_box.region("mistral35_h_work", h_bytes, 16)?.device_ptr(),
+                a_packed_ptr:   arena_box.region("mistral35_a_packed", max_k / 2, 16)?.device_ptr(),
+                sfa_natural_ptr: arena_box.region("mistral35_sfa_natural",
+                    cb.nvfp4_natural_sfa_bytes(1, max_k as i32), 16)?.device_ptr(),
+                sfa_cutlass_ptr: arena_box.region("mistral35_sfa_cutlass",
+                    cb.nvfp4_sfa_bytes(1, max_k as i32), 16)?.device_ptr(),
+                q_out_ptr:      arena_box.region("mistral35_q_out", n_q_dim * 2, 16)?.device_ptr(),
+                k_out_ptr:      arena_box.region("mistral35_k_out", n_kv_dim * 2, 16)?.device_ptr(),
+                v_out_ptr:      arena_box.region("mistral35_v_out", n_kv_dim * 2, 16)?.device_ptr(),
+                attn_out_ptr:   arena_box.region("mistral35_attn_out", h_bytes, 16)?.device_ptr(),
+                o_out_ptr:      arena_box.region("mistral35_o_out", h_bytes, 16)?.device_ptr(),
+                gate_out_ptr:   arena_box.region("mistral35_gate_out", i_bytes, 16)?.device_ptr(),
+                up_out_ptr:     arena_box.region("mistral35_up_out", i_bytes, 16)?.device_ptr(),
+                silu_mid_ptr:   arena_box.region("mistral35_silu_mid", i_bytes, 16)?.device_ptr(),
+                down_out_ptr:   arena_box.region("mistral35_down_out", h_bytes, 16)?.device_ptr(),
+                workspace_ptr:  arena_box.region("mistral35_workspace", max_workspace, 256)?.device_ptr(),
+                workspace_bytes: max_workspace,
+                logits_ptr:     arena_box.region("mistral35_logits_f32", vocab * 4, 16)?.device_ptr(),
+                token_out_ptr:  arena_box.region("mistral35_token_out", 4, 4)?.device_ptr(),
+            };
+            eprintln!(
+                "[mistral35] scratch hoisted to bring-up: max_workspace={} bytes",
+                max_workspace,
+            );
+
             (Some(ctx), Some(stream), Some(arena_box), Some(model),
              Some(forward_kernels), Some(cublaslt_handle), Some(rope_tables_dev),
-             Some(kv_cache_dev))
+             Some(kv_cache_dev), Some(scratch))
         };
 
         #[cfg(feature = "cuda")]
@@ -793,6 +878,7 @@ impl Mistral35Bringup {
             cublaslt: cublaslt_opt,
             rope_tables: rope_tables_opt,
             kv_cache: kv_cache_opt,
+            scratch: scratch_opt,
         };
         #[cfg(not(feature = "cuda"))]
         let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
@@ -1038,59 +1124,34 @@ impl Mistral35Bringup {
         let h_k: i32 = self.arch.text.hidden_size as i32;
         let i_k: i32 = self.arch.text.intermediate_size as i32;
 
-        // Scratch allocations for the full layer-0 forward.
-        let token_region = arena.region("smoke_token_id", 4, 4)?;
-        token_region.copy_from_host(&token_id.to_le_bytes())?;
-
+        // Pre-allocated scratch (bring-up time). Hot-path forward never
+        // touches the arena allocator.
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_layer0: scratch absent".into(),
+        ))?;
         let hidden_bytes = (hidden as usize) * 2; // BF16
-        // h_residual: persistent residual stream. Receives the embed,
-        // then accumulates attn_out and mlp_out via vector_add_bf16.
-        let h_residual_region = arena.region("smoke_h_residual", hidden_bytes, 16)?;
-        // h_work: scratch where each pre-projection RMSNorm runs.
-        // Refilled from h_residual via DtoD copy at each norm site.
-        let h_work_region = arena.region("smoke_h_work", hidden_bytes, 16)?;
-
-        // Activation prep scratch — worst-case K = max(hidden, intermediate)
-        // (intermediate=28672 for Mistral 3.5 down_proj).
-        let max_k = h_k.max(i_k);
-        let a_packed_bytes = (m as usize) * (max_k as usize) / 2;
-        let a_packed_region = arena.region("smoke_a_packed", a_packed_bytes, 16)?;
-        let sfa_natural_bytes = backend.nvfp4_natural_sfa_bytes(m, max_k);
-        let sfa_natural_region = arena.region("smoke_sfa_natural", sfa_natural_bytes, 16)?;
-        let sfa_cutlass_bytes = backend.nvfp4_sfa_bytes(m, max_k);
-        let sfa_cutlass_region = arena.region("smoke_sfa_cutlass", sfa_cutlass_bytes, 16)?;
-
-        // Per-projection output regions. Sized to the projection's N.
-        let q_out_region = arena.region("smoke_q_out_bf16",
-            (layer0.q_proj.shape.n) * 2, 16)?;
-        let k_out_region = arena.region("smoke_k_out_bf16",
-            (layer0.k_proj.shape.n) * 2, 16)?;
-        let v_out_region = arena.region("smoke_v_out_bf16",
-            (layer0.v_proj.shape.n) * 2, 16)?;
-        // attn_out: GQA-broadcast V to [hidden=12288] for o_proj input.
-        let attn_out_region = arena.region("smoke_attn_out_bf16",
-            (hidden as usize) * 2, 16)?;
-        let o_out_region = arena.region("smoke_o_out_bf16",
-            (layer0.o_proj.shape.n) * 2, 16)?;
-        let gate_out_region = arena.region("smoke_gate_out_bf16",
-            (layer0.gate_proj.shape.n) * 2, 16)?;
-        let up_out_region = arena.region("smoke_up_out_bf16",
-            (layer0.up_proj.shape.n) * 2, 16)?;
-        // silu_mid: silu(gate)*up, [intermediate=28672].
-        let silu_mid_region = arena.region("smoke_silu_mid_bf16",
-            (layer0.gate_proj.shape.n) * 2, 16)?;
-        let down_out_region = arena.region("smoke_down_out_bf16",
-            (layer0.down_proj.shape.n) * 2, 16)?;
-
-        // Workspace — size to the max across all 7 projections.
-        let mut workspace_bytes_max = 0usize;
-        for lin in layer0.linears() {
-            let w = backend.nvfp4_workspace_size(
-                m, lin.shape.n as i32, lin.shape.k as i32);
-            if w > workspace_bytes_max { workspace_bytes_max = w; }
+        // Refresh the input-token slot. 4 bytes HtoD per call; we still
+        // do this since the token id changes every step.
+        unsafe {
+            use cudarc::driver::sys::*;
+            let bytes = token_id.to_le_bytes();
+            let r = cuMemcpyHtoDAsync_v2(
+                scr.token_in_ptr as CUdeviceptr,
+                bytes.as_ptr() as *const std::ffi::c_void,
+                4,
+                stream_u64 as CUstream,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "cuMemcpyHtoDAsync(token_in)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx { stream: stream_u64,
+                        kernel: "token_in_htod", launch: None, device: -1 },
+                ));
+            }
         }
-        let workspace_bytes = workspace_bytes_max.max(16);
-        let workspace_region = arena.region("smoke_ws", workspace_bytes, 16)?;
+        let workspace_bytes = scr.workspace_bytes;
 
         // Per-stage dumps cost a fence + DtoH each. Off by default in
         // multi-token generation paths; turn on with
@@ -1152,13 +1213,13 @@ impl Mistral35Bringup {
         let stage_act = |src_bf16_ptr: u64, k_dim: i32| -> Result<()> {
             backend.launch_nvfp4_prep_act(
                 src_bf16_ptr,
-                a_packed_region.device_ptr(),
-                sfa_natural_region.device_ptr(),
+                scr.a_packed_ptr,
+                scr.sfa_natural_ptr,
                 m, k_dim, 1 /* BF16 */, stream_u64,
             )?;
             backend.launch_nvfp4_sfa_transform(
-                sfa_natural_region.device_ptr(),
-                sfa_cutlass_region.device_ptr(),
+                scr.sfa_natural_ptr,
+                scr.sfa_cutlass_ptr,
                 m, k_dim, stream_u64,
             )
         };
@@ -1169,13 +1230,13 @@ impl Mistral35Bringup {
          -> Result<()> {
             backend.launch_nvfp4_gemm(
                 out_ptr,
-                a_packed_region.device_ptr(),
+                scr.a_packed_ptr,
                 lin.packed_ptr,
-                sfa_cutlass_region.device_ptr(),
+                scr.sfa_cutlass_ptr,
                 lin.sfb_cutlass_ptr,
                 lin.global_scale_ptr,
                 m, lin.shape.n as i32, lin.shape.k as i32,
-                workspace_region.device_ptr(),
+                scr.workspace_ptr,
                 workspace_bytes,
                 stream_u64,
             )
@@ -1237,8 +1298,8 @@ impl Mistral35Bringup {
             let layer_kv = &kv_cache.layers[layer_idx];
             // (a) Write K_in and V_in to slot=position of the cache.
             {
-                let mut kin = k_out_region.device_ptr();
-                let mut vin = v_out_region.device_ptr();
+                let mut kin = scr.k_out_ptr;
+                let mut vin = scr.v_out_ptr;
                 let mut k_cache = layer_kv.k_ptr;
                 let mut v_cache = layer_kv.v_ptr;
                 let mut nkv = n_kv_heads_attn;
@@ -1265,7 +1326,7 @@ impl Mistral35Bringup {
 
             // (b) qk_dot: scores[n_q_heads, past_len] = Q · K[0..past_len]^T / sqrt(d)
             {
-                let mut q_ptr = q_out_region.device_ptr();
+                let mut q_ptr = scr.q_out_ptr;
                 let mut k_cache = layer_kv.k_ptr;
                 let mut sc_ptr = kv_cache.scores_f32_ptr;
                 let mut hd = head_dim_attn;
@@ -1298,7 +1359,7 @@ impl Mistral35Bringup {
             {
                 let mut sc_ptr = kv_cache.scores_f32_ptr;
                 let mut v_cache = layer_kv.v_ptr;
-                let mut out_ptr = attn_out_region.device_ptr();
+                let mut out_ptr = scr.attn_out_ptr;
                 let mut hd = head_dim_attn;
                 let mut nkv = n_kv_heads_attn;
                 let mut gr = gqa_ratio_attn;
@@ -1357,51 +1418,51 @@ impl Mistral35Bringup {
         rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
             .launch(
                 kernels.fn_embedding_gather_bf16,
-                h_residual_region.device_ptr(),
+                scr.h_residual_ptr,
                 model.outside.embed_tokens.offset_bytes,
-                token_region.device_ptr(),
+                scr.token_in_ptr,
                 stream_u64,
             )?;
         let post_embed = dump_bf16(
             stream, stream_u64,
-            h_residual_region.device_ptr(), hidden as usize,
+            scr.h_residual_ptr, hidden as usize,
             "smoke_post_embed",
         )?;
 
         // (2) DtoD copy h_residual → h_work, then RMSNorm in-place
         //     with input_layernorm gamma.
-        dtod(stream_u64, h_work_region.device_ptr(),
-             h_residual_region.device_ptr(), hidden_bytes)?;
+        dtod(stream_u64, scr.h_work_ptr,
+             scr.h_residual_ptr, hidden_bytes)?;
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
         }.launch(
             kernels.fn_rmsnorm_inplace_bf16_gbf16,
-            h_work_region.device_ptr(),
+            scr.h_work_ptr,
             layer0.input_layernorm.offset_bytes,
             stream_u64,
         )?;
         let post_rmsnorm = dump_bf16(
             stream, stream_u64,
-            h_work_region.device_ptr(), hidden as usize,
+            scr.h_work_ptr, hidden as usize,
             "smoke_post_rmsnorm",
         )?;
 
         // (3) NVFP4 prep h_work, then Q/K/V projections.
-        stage_act(h_work_region.device_ptr(), h_k)?;
-        gemm(q_out_region.device_ptr(), &layer0.q_proj)?;
-        gemm(k_out_region.device_ptr(), &layer0.k_proj)?;
-        gemm(v_out_region.device_ptr(), &layer0.v_proj)?;
+        stage_act(scr.h_work_ptr, h_k)?;
+        gemm(scr.q_out_ptr, &layer0.q_proj)?;
+        gemm(scr.k_out_ptr, &layer0.k_proj)?;
+        gemm(scr.v_out_ptr, &layer0.v_proj)?;
         // RoPE on Q and K (V never gets rotated). Identity at pos=0.
         let n_q_heads_u: u32 = self.arch.text.num_attention_heads as u32;
         let n_kv_heads_u: u32 = self.arch.text.num_key_value_heads as u32;
-        rope(q_out_region.device_ptr(), n_q_heads_u)?;
-        rope(k_out_region.device_ptr(), n_kv_heads_u)?;
+        rope(scr.q_out_ptr, n_q_heads_u)?;
+        rope(scr.k_out_ptr, n_kv_heads_u)?;
         let q_out = dump_bf16(stream, stream_u64,
-            q_out_region.device_ptr(), layer0.q_proj.shape.n, "smoke_q_out")?;
+            scr.q_out_ptr, layer0.q_proj.shape.n, "smoke_q_out")?;
         let k_out = dump_bf16(stream, stream_u64,
-            k_out_region.device_ptr(), layer0.k_proj.shape.n, "smoke_k_out")?;
+            scr.k_out_ptr, layer0.k_proj.shape.n, "smoke_k_out")?;
         let v_out = dump_bf16(stream, stream_u64,
-            v_out_region.device_ptr(), layer0.v_proj.shape.n, "smoke_v_out")?;
+            scr.v_out_ptr, layer0.v_proj.shape.n, "smoke_v_out")?;
 
         // (4) Attention: write K/V to layer-0 cache @ pos=position,
         //     compute scores via qk_dot, softmax · V into attn_out.
@@ -1410,54 +1471,54 @@ impl Mistral35Bringup {
         let n_q_heads = n_q_heads_attn;
         let gqa_ratio = gqa_ratio_attn;
         let attn_out = dump_bf16(stream, stream_u64,
-            attn_out_region.device_ptr(), hidden as usize, "smoke_attn_out")?;
+            scr.attn_out_ptr, hidden as usize, "smoke_attn_out")?;
 
         // (5) O-projection: NVFP4 prep_act on attn_out, then o_proj.
-        stage_act(attn_out_region.device_ptr(), h_k)?;
-        gemm(o_out_region.device_ptr(), &layer0.o_proj)?;
+        stage_act(scr.attn_out_ptr, h_k)?;
+        gemm(scr.o_out_ptr, &layer0.o_proj)?;
         let o_out = dump_bf16(stream, stream_u64,
-            o_out_region.device_ptr(), layer0.o_proj.shape.n, "smoke_o_out")?;
+            scr.o_out_ptr, layer0.o_proj.shape.n, "smoke_o_out")?;
 
         // (6) Residual: h_residual += o_out.
         rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
             kernels.fn_vector_add_bf16,
-            h_residual_region.device_ptr(),
-            o_out_region.device_ptr(),
+            scr.h_residual_ptr,
+            scr.o_out_ptr,
             stream_u64,
         )?;
         let h_after_attn = dump_bf16(stream, stream_u64,
-            h_residual_region.device_ptr(), hidden as usize, "smoke_h_after_attn")?;
+            scr.h_residual_ptr, hidden as usize, "smoke_h_after_attn")?;
 
         // (7) DtoD copy h_residual → h_work, RMSNorm with
         //     post_attention_layernorm.
-        dtod(stream_u64, h_work_region.device_ptr(),
-             h_residual_region.device_ptr(), hidden_bytes)?;
+        dtod(stream_u64, scr.h_work_ptr,
+             scr.h_residual_ptr, hidden_bytes)?;
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
         }.launch(
             kernels.fn_rmsnorm_inplace_bf16_gbf16,
-            h_work_region.device_ptr(),
+            scr.h_work_ptr,
             layer0.post_attention_layernorm.offset_bytes,
             stream_u64,
         )?;
         let post_attn_norm = dump_bf16(stream, stream_u64,
-            h_work_region.device_ptr(), hidden as usize, "smoke_post_attn_norm")?;
+            scr.h_work_ptr, hidden as usize, "smoke_post_attn_norm")?;
 
         // (8) NVFP4 prep h_work, then gate / up projections.
-        stage_act(h_work_region.device_ptr(), h_k)?;
-        gemm(gate_out_region.device_ptr(), &layer0.gate_proj)?;
-        gemm(up_out_region.device_ptr(),   &layer0.up_proj)?;
+        stage_act(scr.h_work_ptr, h_k)?;
+        gemm(scr.gate_out_ptr, &layer0.gate_proj)?;
+        gemm(scr.up_out_ptr,   &layer0.up_proj)?;
         let gate_out = dump_bf16(stream, stream_u64,
-            gate_out_region.device_ptr(), layer0.gate_proj.shape.n, "smoke_gate_out")?;
+            scr.gate_out_ptr, layer0.gate_proj.shape.n, "smoke_gate_out")?;
         let up_out = dump_bf16(stream, stream_u64,
-            up_out_region.device_ptr(), layer0.up_proj.shape.n, "smoke_up_out")?;
+            scr.up_out_ptr, layer0.up_proj.shape.n, "smoke_up_out")?;
 
         // (9) silu_mul: silu_mid = silu(gate) * up, both BF16.
         let i_size = self.arch.text.intermediate_size as i32;
         {
-            let mut out_ptr = silu_mid_region.device_ptr();
-            let mut g_ptr = gate_out_region.device_ptr();
-            let mut u_ptr = up_out_region.device_ptr();
+            let mut out_ptr = scr.silu_mid_ptr;
+            let mut g_ptr = scr.gate_out_ptr;
+            let mut u_ptr = scr.up_out_ptr;
             let mut n_arg = i_size;
             let args = [
                 (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
@@ -1474,26 +1535,26 @@ impl Mistral35Bringup {
             )?;
         }
         let silu_mid = dump_bf16(stream, stream_u64,
-            silu_mid_region.device_ptr(),
+            scr.silu_mid_ptr,
             self.arch.text.intermediate_size, "smoke_silu_mid")?;
 
         // (10) Down projection: NVFP4 prep_act on silu_mid (K=intermediate),
         //      then down_proj GEMM.
-        stage_act(silu_mid_region.device_ptr(), i_k)?;
-        gemm(down_out_region.device_ptr(), &layer0.down_proj)?;
+        stage_act(scr.silu_mid_ptr, i_k)?;
+        gemm(scr.down_out_ptr, &layer0.down_proj)?;
         let down_out = dump_bf16(stream, stream_u64,
-            down_out_region.device_ptr(),
+            scr.down_out_ptr,
             layer0.down_proj.shape.n, "smoke_down_out")?;
 
         // (11) Residual: h_residual += down_out.
         rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
             kernels.fn_vector_add_bf16,
-            h_residual_region.device_ptr(),
-            down_out_region.device_ptr(),
+            scr.h_residual_ptr,
+            scr.down_out_ptr,
             stream_u64,
         )?;
         let h_after_layer0 = dump_bf16(stream, stream_u64,
-            h_residual_region.device_ptr(), hidden as usize, "smoke_h_after_layer0")?;
+            scr.h_residual_ptr, hidden as usize, "smoke_h_after_layer0")?;
 
         // ============================================================
         // Layers 1..88 — same flow as layer 0 with that layer's
@@ -1515,58 +1576,58 @@ impl Mistral35Bringup {
             let layer = &model.layers[layer_idx];
 
             // Pre-attn norm.
-            dtod(stream_u64, h_work_region.device_ptr(),
-                 h_residual_region.device_ptr(), hidden_bytes)?;
+            dtod(stream_u64, scr.h_work_ptr,
+                 scr.h_residual_ptr, hidden_bytes)?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
             }.launch(
                 kernels.fn_rmsnorm_inplace_bf16_gbf16,
-                h_work_region.device_ptr(),
+                scr.h_work_ptr,
                 layer.input_layernorm.offset_bytes,
                 stream_u64,
             )?;
 
             // Q/K/V + RoPE on Q and K.
-            stage_act(h_work_region.device_ptr(), h_k)?;
-            gemm(q_out_region.device_ptr(), &layer.q_proj)?;
-            gemm(k_out_region.device_ptr(), &layer.k_proj)?;
-            gemm(v_out_region.device_ptr(), &layer.v_proj)?;
-            rope(q_out_region.device_ptr(), n_q_heads_u)?;
-            rope(k_out_region.device_ptr(), n_kv_heads_u)?;
+            stage_act(scr.h_work_ptr, h_k)?;
+            gemm(scr.q_out_ptr, &layer.q_proj)?;
+            gemm(scr.k_out_ptr, &layer.k_proj)?;
+            gemm(scr.v_out_ptr, &layer.v_proj)?;
+            rope(scr.q_out_ptr, n_q_heads_u)?;
+            rope(scr.k_out_ptr, n_kv_heads_u)?;
 
             // Attention via KV cache (write + qk_dot + softmax_v).
             attention_step(layer_idx)?;
 
             // O proj + residual.
-            stage_act(attn_out_region.device_ptr(), h_k)?;
-            gemm(o_out_region.device_ptr(), &layer.o_proj)?;
+            stage_act(scr.attn_out_ptr, h_k)?;
+            gemm(scr.o_out_ptr, &layer.o_proj)?;
             rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
                 kernels.fn_vector_add_bf16,
-                h_residual_region.device_ptr(),
-                o_out_region.device_ptr(),
+                scr.h_residual_ptr,
+                scr.o_out_ptr,
                 stream_u64,
             )?;
 
             // Post-attn norm.
-            dtod(stream_u64, h_work_region.device_ptr(),
-                 h_residual_region.device_ptr(), hidden_bytes)?;
+            dtod(stream_u64, scr.h_work_ptr,
+                 scr.h_residual_ptr, hidden_bytes)?;
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
             }.launch(
                 kernels.fn_rmsnorm_inplace_bf16_gbf16,
-                h_work_region.device_ptr(),
+                scr.h_work_ptr,
                 layer.post_attention_layernorm.offset_bytes,
                 stream_u64,
             )?;
 
             // gate / up / silu_mul.
-            stage_act(h_work_region.device_ptr(), h_k)?;
-            gemm(gate_out_region.device_ptr(), &layer.gate_proj)?;
-            gemm(up_out_region.device_ptr(),   &layer.up_proj)?;
+            stage_act(scr.h_work_ptr, h_k)?;
+            gemm(scr.gate_out_ptr, &layer.gate_proj)?;
+            gemm(scr.up_out_ptr,   &layer.up_proj)?;
             {
-                let mut out_ptr = silu_mid_region.device_ptr();
-                let mut g_ptr = gate_out_region.device_ptr();
-                let mut u_ptr = up_out_region.device_ptr();
+                let mut out_ptr = scr.silu_mid_ptr;
+                let mut g_ptr = scr.gate_out_ptr;
+                let mut u_ptr = scr.up_out_ptr;
                 let mut n_arg = i_size;
                 let args = [
                     (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
@@ -1584,12 +1645,12 @@ impl Mistral35Bringup {
             }
 
             // down + residual.
-            stage_act(silu_mid_region.device_ptr(), i_k)?;
-            gemm(down_out_region.device_ptr(), &layer.down_proj)?;
+            stage_act(scr.silu_mid_ptr, i_k)?;
+            gemm(scr.down_out_ptr, &layer.down_proj)?;
             rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
                 kernels.fn_vector_add_bf16,
-                h_residual_region.device_ptr(),
-                down_out_region.device_ptr(),
+                scr.h_residual_ptr,
+                scr.down_out_ptr,
                 stream_u64,
             )?;
 
@@ -1600,7 +1661,7 @@ impl Mistral35Bringup {
             // length matches num_layers.
             if std::env::var_os("RVLLM_SMOKE_LAYER_RMS").is_some() {
                 let v = dump_bf16(stream, stream_u64,
-                    h_residual_region.device_ptr(), hidden as usize,
+                    scr.h_residual_ptr, hidden as usize,
                     "smoke_layer_residual")?;
                 let sumsq: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
                 layer_residual_rms.push((sumsq / (v.len() as f64)).sqrt() as f32);
@@ -1614,13 +1675,14 @@ impl Mistral35Bringup {
         // `compute_logits` is false (prefill non-last steps).
         // ============================================================
         if !compute_logits {
-            // Force the stream to drain so the caller can safely
-            // arena.restore() — without this, deferred kernels would
-            // race with the next step's region allocations writing to
-            // the same offsets. The fence is the natural per-step
-            // serialization the lm_head DtoH used to provide
-            // implicitly.
-            stream.fence()?;
+            // Scratch is pre-allocated at bring-up; consecutive forward
+            // steps overwrite the SAME device addresses. CUDA's same-
+            // stream ordering ensures kernel-N+1 doesn't start before
+            // kernel-N completes, so no host-side fence is needed
+            // between calls — the driver's launch queue auto-throttles
+            // when full. Deliberately no `stream.fence()` here: that
+            // was the dominant per-step latency in the per-call
+            // arena.region path.
             return Ok(SmokeStageDump {
                 post_embed, post_rmsnorm,
                 q_out, k_out, v_out,
@@ -1641,27 +1703,25 @@ impl Mistral35Bringup {
 
         // Final norm: copy h_residual → h_work, RMSNorm with
         // outside.final_norm gamma.
-        dtod(stream_u64, h_work_region.device_ptr(),
-             h_residual_region.device_ptr(), hidden_bytes)?;
+        dtod(stream_u64, scr.h_work_ptr,
+             scr.h_residual_ptr, hidden_bytes)?;
         rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
             num_tokens: 1, hidden, eps: self.arch.text.rms_norm_eps as f32,
         }.launch(
             kernels.fn_rmsnorm_inplace_bf16_gbf16,
-            h_work_region.device_ptr(),
+            scr.h_work_ptr,
             model.outside.final_norm.offset_bytes,
             stream_u64,
         )?;
         let h_after_final_norm = dump_bf16(stream, stream_u64,
-            h_work_region.device_ptr(), hidden as usize, "smoke_h_after_final_norm")?;
+            scr.h_work_ptr, hidden as usize, "smoke_h_after_final_norm")?;
 
         // lm_head: BF16 [vocab, hidden] × BF16 [1, hidden] → F32 [1, vocab]
         let vocab = self.arch.text.vocab_size as i32;
-        let logits_region = arena.region(
-            "smoke_logits_f32", (vocab as usize) * 4, 16)?;
         cublaslt.bf16_gemm_f32(
-            h_work_region.device_ptr(),       // a [1, hidden] (BF16)
+            scr.h_work_ptr,       // a [1, hidden] (BF16)
             model.outside.lm_head.offset_bytes, // b [vocab, hidden] (BF16)
-            logits_region.device_ptr(),        // d [1, vocab] (F32)
+            scr.logits_ptr,        // d [1, vocab] (F32)
             1,                                 // m = num_seqs
             vocab,
             h_k,
@@ -1669,10 +1729,9 @@ impl Mistral35Bringup {
         )?;
 
         // argmax_kernel(logits_f32, out_token_i32, vocab_size).
-        let token_out_region = arena.region("smoke_token_out", 4, 4)?;
         {
-            let mut logits_ptr = logits_region.device_ptr();
-            let mut tok_ptr = token_out_region.device_ptr();
+            let mut logits_ptr = scr.logits_ptr;
+            let mut tok_ptr = scr.token_out_ptr;
             let mut vocab_arg = vocab;
             let args = [
                 (&mut logits_ptr) as *mut u64 as *mut std::ffi::c_void,
@@ -1695,7 +1754,7 @@ impl Mistral35Bringup {
             use cudarc::driver::sys::*;
             let r1 = cuMemcpyDtoH_v2(
                 tok_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                token_out_region.device_ptr() as CUdeviceptr, 4);
+                scr.token_out_ptr as CUdeviceptr, 4);
             if r1 != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
                     "cuMemcpyDtoH_v2(predicted_token)",
@@ -1712,7 +1771,7 @@ impl Mistral35Bringup {
                 use cudarc::driver::sys::*;
                 let r2 = cuMemcpyDtoH_v2(
                     logits_host.as_mut_ptr() as *mut std::ffi::c_void,
-                    logits_region.device_ptr() as CUdeviceptr,
+                    scr.logits_ptr as CUdeviceptr,
                     (vocab as usize) * 4);
                 if r2 != CUresult::CUDA_SUCCESS {
                     return Err(RvllmError::cuda(
