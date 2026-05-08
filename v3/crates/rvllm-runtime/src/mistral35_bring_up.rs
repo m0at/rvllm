@@ -744,6 +744,168 @@ fn corrupt(path: PathBuf, detail: String) -> RvllmError {
     }
 }
 
+/// Smoke-forward for the upload+kernel pipeline: embed token id →
+/// first-layer RMSNorm → first-layer Q-projection (NVFP4 GEMM) →
+/// host readback. Returns the per-channel BF16-as-F32 vector (length
+/// `n_q * head_dim = 12288`). Plausibility check: not NaN, not all
+/// zero, and a non-degenerate dynamic range — anything stronger
+/// requires a reference dump.
+#[cfg(feature = "cuda")]
+impl Mistral35Bringup {
+    pub unsafe fn forward_smoke_q_proj(&self, token_id: u32) -> Result<Vec<f32>> {
+        use rvllm_cutlass::lib_so::CutlassBackend;
+
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_q_proj: model not uploaded".into(),
+        ))?;
+        let kernels = self.forward_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_q_proj: forward_kernels not loaded".into(),
+        ))?;
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_q_proj: arena absent".into(),
+        ))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_q_proj: stream absent".into(),
+        ))?;
+        let backend: &CutlassBackend = self.cutlass_backend.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_q_proj: cutlass backend absent".into(),
+        ))?;
+        if (token_id as usize) >= self.arch.text.vocab_size {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                format!(
+                    "forward_smoke_q_proj: token_id={token_id} >= vocab={}",
+                    self.arch.text.vocab_size,
+                ),
+            ));
+        }
+
+        let stream_u64 = stream.raw();
+        let hidden = self.arch.text.hidden_size as u32;
+        let vocab = self.arch.text.vocab_size as u32;
+
+        let layer0 = &model.layers[0];
+        let q = &layer0.q_proj;
+        let m: i32 = 1;
+        let n: i32 = q.shape.n as i32;
+        let k: i32 = q.shape.k as i32;
+        if k as usize != self.arch.text.hidden_size {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                format!("forward_smoke_q_proj: q_proj K={k} != hidden={hidden}"),
+            ));
+        }
+
+        // Scratch allocations. Single-token, single-projection — the
+        // smoke path doesn't reuse the full prefill scratch budget.
+        let token_region = arena.region("smoke_token_id", 4, 4)?;
+        token_region.copy_from_host(&token_id.to_le_bytes())?;
+
+        let hidden_bytes = (hidden as usize) * 2; // BF16
+        let hidden_region = arena.region("smoke_hidden_bf16", hidden_bytes, 16)?;
+
+        let a_packed_bytes = (m as usize) * (k as usize) / 2;
+        let a_packed_region = arena.region("smoke_a_packed", a_packed_bytes, 16)?;
+
+        let sfa_natural_bytes = backend.nvfp4_natural_sfa_bytes(m, k);
+        let sfa_natural_region = arena.region("smoke_sfa_natural", sfa_natural_bytes, 16)?;
+
+        let sfa_cutlass_bytes = backend.nvfp4_sfa_bytes(m, k);
+        let sfa_cutlass_region = arena.region("smoke_sfa_cutlass", sfa_cutlass_bytes, 16)?;
+
+        let q_out_bytes = (n as usize) * 2; // BF16 [m=1, n]
+        let q_out_region = arena.region("smoke_q_out_bf16", q_out_bytes, 16)?;
+
+        let workspace_bytes = backend.nvfp4_workspace_size(m, n, k).max(16);
+        let workspace_region = arena.region("smoke_ws", workspace_bytes, 16)?;
+
+        // (1) Embed gather.
+        rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
+            .launch(
+                kernels.fn_embedding_gather_bf16,
+                hidden_region.device_ptr(),
+                model.outside.embed_tokens.offset_bytes,
+                token_region.device_ptr(),
+                stream_u64,
+            )?;
+
+        // (2) First-layer input RMSNorm (in-place, BF16 x bf16-gamma).
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1,
+            hidden,
+            eps: self.arch.text.rms_norm_eps as f32,
+        }
+        .launch(
+            kernels.fn_rmsnorm_inplace_bf16_gbf16,
+            hidden_region.device_ptr(),
+            layer0.input_layernorm.offset_bytes,
+            stream_u64,
+        )?;
+
+        // (3) NVFP4 activation prep + SFA layout transform.
+        backend.launch_nvfp4_prep_act(
+            hidden_region.device_ptr(),
+            a_packed_region.device_ptr(),
+            sfa_natural_region.device_ptr(),
+            m, k,
+            1, // BF16
+            stream_u64,
+        )?;
+        backend.launch_nvfp4_sfa_transform(
+            sfa_natural_region.device_ptr(),
+            sfa_cutlass_region.device_ptr(),
+            m, k,
+            stream_u64,
+        )?;
+
+        // (4) Q-projection NVFP4 GEMM.
+        backend.launch_nvfp4_gemm(
+            q_out_region.device_ptr(),
+            a_packed_region.device_ptr(),
+            q.packed_ptr,
+            sfa_cutlass_region.device_ptr(),
+            q.sfb_cutlass_ptr,
+            q.global_scale_ptr,
+            m, n, k,
+            workspace_region.device_ptr(),
+            workspace_bytes,
+            stream_u64,
+        )?;
+
+        // (5) Fence + DtoH copy.
+        stream.fence()?;
+        let mut out_bf16 = vec![0u16; n as usize];
+        {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoH_v2(
+                out_bf16.as_mut_ptr() as *mut std::ffi::c_void,
+                q_out_region.device_ptr() as CUdeviceptr,
+                q_out_bytes,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "cuMemcpyDtoH_v2(smoke_q_out)",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx {
+                        stream: stream_u64, kernel: "smoke_q_proj_dtoh",
+                        launch: None, device: -1,
+                    },
+                ));
+            }
+        }
+
+        // BF16 → F32 widen for callers.
+        Ok(out_bf16.iter()
+            .map(|&b| f32::from_bits((b as u32) << 16))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

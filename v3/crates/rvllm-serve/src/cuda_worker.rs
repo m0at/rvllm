@@ -109,14 +109,55 @@ pub async fn spawn_cuda_worker(
                 let _ = ready_tx.send(Ok(()));
 
                 while let Some(req) = req_rx.blocking_recv() {
+                    // Smoke-forward path (Step 5 GPU half, iteration A):
+                    // run embed → first-layer RMSNorm → first-layer
+                    // Q-projection on token id 42 against the resident
+                    // model. Logs first 16 BF16-as-F32 channels +
+                    // basic plausibility stats, then returns a typed
+                    // "smoke-only" error so the per-request pipeline
+                    // reports concrete numerics instead of garbage.
+                    let token_id: u32 = 42;
+                    let smoke = unsafe { bringup.forward_smoke_q_proj(token_id) };
+                    let summary = match smoke {
+                        Ok(q) => {
+                            let n = q.len();
+                            let any_nan = q.iter().any(|v| v.is_nan());
+                            let any_inf = q.iter().any(|v| v.is_infinite());
+                            let mut min = f32::INFINITY;
+                            let mut max = f32::NEG_INFINITY;
+                            let mut nz = 0usize;
+                            let mut sumsq = 0.0f64;
+                            for &v in &q {
+                                if v < min { min = v; }
+                                if v > max { max = v; }
+                                if v != 0.0 { nz += 1; }
+                                sumsq += (v as f64) * (v as f64);
+                            }
+                            let rms = (sumsq / (n as f64)).sqrt();
+                            let head: Vec<String> = q.iter().take(16)
+                                .map(|v| format!("{:+.4}", v)).collect();
+                            tracing::info!(
+                                token_id, n, any_nan, any_inf, nz,
+                                min, max, rms,
+                                "mistral35 smoke Q-proj head[16]={}",
+                                head.join(",")
+                            );
+                            format!(
+                                "smoke Q-proj OK: token={token_id} \
+                                 n={n} nan={any_nan} inf={any_inf} \
+                                 nz={nz} min={min:+.4} max={max:+.4} \
+                                 rms={rms:.4} head=[{}]",
+                                head.join(",")
+                            )
+                        }
+                        Err(e) => format!("smoke Q-proj FAILED: {e:?}"),
+                    };
                     let _ = req.events_tx.send(GenerateEvent::Error(format!(
-                        "Mistral 3.5 forward path not yet implemented \
-                         (CUTLASS NVFP4 GEMM kernel pending — see \
-                         kernels/cutlass_nvfp4_gemm_sm120.cu and \
-                         v3/crates/rvllm-runtime/src/mistral35_bring_up.rs). \
-                         Bring-up validation passed: arch + inventory \
-                         clean, nvfp4_active={}",
-                        bringup.nvfp4_active
+                        "Mistral 3.5 forward path: smoke-only iteration A \
+                         (embed + first-layer RMSNorm + Q-projection NVFP4 \
+                         GEMM); full layer + sampling pending. \
+                         nvfp4_active={}, {}",
+                        bringup.nvfp4_active, summary,
                     )));
                 }
                 tracing::info!("Mistral 3.5 cuda worker queue closed, exiting");
