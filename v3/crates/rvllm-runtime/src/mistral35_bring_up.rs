@@ -973,7 +973,7 @@ pub struct SmokeStageDump {
 /// is producing the all-zero output.
 #[cfg(feature = "cuda")]
 impl Mistral35Bringup {
-    pub unsafe fn forward_smoke_q_proj(&self, token_id: u32) -> Result<SmokeStageDump> {
+    pub unsafe fn forward_smoke_q_proj(&self, token_id: u32, position: i32) -> Result<SmokeStageDump> {
         use rvllm_cutlass::lib_so::CutlassBackend;
 
         let model = self.model.as_ref().ok_or_else(|| corrupt(
@@ -1069,34 +1069,43 @@ impl Mistral35Bringup {
         let workspace_bytes = workspace_bytes_max.max(16);
         let workspace_region = arena.region("smoke_ws", workspace_bytes, 16)?;
 
+        // Per-stage dumps cost a fence + DtoH each. Off by default in
+        // multi-token generation paths; turn on with
+        // RVLLM_SMOKE_FULL_DUMP=1 for one-shot diagnostics.
+        let full_dump = std::env::var_os("RVLLM_SMOKE_FULL_DUMP").is_some();
+
         // Helper: fence + DtoH a bf16 region of `count` elements, widen to f32.
-        unsafe fn dump_bf16(
-            stream: &rvllm_mem::stream::Stream,
-            stream_u64: u64,
-            dev_ptr: u64,
-            count: usize,
-            label: &'static str,
-        ) -> Result<Vec<f32>> {
-            stream.fence()?;
+        // Returns empty Vec when full_dump is off.
+        let dump_bf16 = |_stream: &rvllm_mem::stream::Stream,
+                         stream_u64: u64,
+                         dev_ptr: u64,
+                         count: usize,
+                         label: &'static str| -> Result<Vec<f32>> {
+            if !full_dump {
+                return Ok(Vec::new());
+            }
+            _stream.fence()?;
             let mut buf = vec![0u16; count];
-            use cudarc::driver::sys::*;
-            let r = cuMemcpyDtoH_v2(
-                buf.as_mut_ptr() as *mut std::ffi::c_void,
-                dev_ptr as CUdeviceptr,
-                count * 2,
-            );
-            if r != CUresult::CUDA_SUCCESS {
-                return Err(RvllmError::cuda(
-                    "cuMemcpyDtoH_v2(smoke stage)",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx {
-                        stream: stream_u64, kernel: label,
-                        launch: None, device: -1,
-                    },
-                ));
+            unsafe {
+                use cudarc::driver::sys::*;
+                let r = cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    dev_ptr as CUdeviceptr,
+                    count * 2,
+                );
+                if r != CUresult::CUDA_SUCCESS {
+                    return Err(RvllmError::cuda(
+                        "cuMemcpyDtoH_v2(smoke stage)",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx {
+                            stream: stream_u64, kernel: label,
+                            launch: None, device: -1,
+                        },
+                    ));
+                }
             }
             Ok(buf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect())
-        }
+        };
 
         // Helper: device-to-device async copy on our stream.
         unsafe fn dtod(stream_u64: u64, dst: u64, src: u64, n_bytes: usize) -> Result<()> {
@@ -1170,8 +1179,7 @@ impl Mistral35Bringup {
             self.paths.model_dir.clone(),
             "forward_smoke_layer0: rope_tables absent".into(),
         ))?;
-        let rope_position: i32 = std::env::var("RVLLM_SMOKE_POSITION")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let rope_position: i32 = position;
         if rope_position < 0 || (rope_position as usize) >= rope_tables.max_pos {
             return Err(corrupt(
                 self.paths.model_dir.clone(),
@@ -1562,14 +1570,20 @@ impl Mistral35Bringup {
                 stream_u64,
             )?;
 
-            // Per-layer residual rms (single fence + DtoH every 8 layers
-            // is plenty; the per-launch is tiny but the fence cost
-            // adds up). For initial smoke we want every layer.
-            let v = dump_bf16(stream, stream_u64,
-                h_residual_region.device_ptr(), hidden as usize,
-                "smoke_layer_residual")?;
-            let sumsq: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
-            layer_residual_rms.push((sumsq / (v.len() as f64)).sqrt() as f32);
+            // Per-layer residual rms costs a stream fence + DtoH per
+            // layer × 88 layers × N prefill steps. Off by default;
+            // RVLLM_SMOKE_LAYER_RMS=1 turns it on for one-shot
+            // diagnostics. When off, push 0.0 placeholder so the
+            // length matches num_layers.
+            if std::env::var_os("RVLLM_SMOKE_LAYER_RMS").is_some() {
+                let v = dump_bf16(stream, stream_u64,
+                    h_residual_region.device_ptr(), hidden as usize,
+                    "smoke_layer_residual")?;
+                let sumsq: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                layer_residual_rms.push((sumsq / (v.len() as f64)).sqrt() as f32);
+            } else {
+                layer_residual_rms.push(0.0);
+            }
         }
 
         // ============================================================
@@ -1626,10 +1640,12 @@ impl Mistral35Bringup {
             )?;
         }
 
-        // DtoH the predicted token + the full logits vector for top-8.
+        // DtoH the predicted token (always 4 bytes). Full 131072×4
+        // logits DtoH + host-side top-8 sort are gated behind
+        // RVLLM_SMOKE_FULL_DUMP — they're 524 KB + ~250k cmp ops
+        // per call which dominates a multi-token decode.
         stream.fence()?;
         let mut tok_buf = [0u8; 4];
-        let mut logits_host = vec![0f32; vocab as usize];
         unsafe {
             use cudarc::driver::sys::*;
             let r1 = cuMemcpyDtoH_v2(
@@ -1643,25 +1659,32 @@ impl Mistral35Bringup {
                         kernel: "smoke_token_dtoh", launch: None, device: -1 },
                 ));
             }
-            let r2 = cuMemcpyDtoH_v2(
-                logits_host.as_mut_ptr() as *mut std::ffi::c_void,
-                logits_region.device_ptr() as CUdeviceptr,
-                (vocab as usize) * 4);
-            if r2 != CUresult::CUDA_SUCCESS {
-                return Err(RvllmError::cuda(
-                    "cuMemcpyDtoH_v2(logits)",
-                    rvllm_core::CudaErrorKind::MemcpyFailed,
-                    rvllm_core::CudaCtx { stream: stream_u64,
-                        kernel: "smoke_logits_dtoh", launch: None, device: -1 },
-                ));
-            }
         }
         let predicted_token = u32::from_le_bytes(tok_buf);
-        // Top-8 by logit value (host-side for diagnostics; small N).
-        let mut indexed: Vec<(u32, f32)> = logits_host.iter().enumerate()
-            .map(|(i, &v)| (i as u32, v)).collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let logits_top8: Vec<(u32, f32)> = indexed.into_iter().take(8).collect();
+        let logits_top8: Vec<(u32, f32)> = if full_dump {
+            let mut logits_host = vec![0f32; vocab as usize];
+            unsafe {
+                use cudarc::driver::sys::*;
+                let r2 = cuMemcpyDtoH_v2(
+                    logits_host.as_mut_ptr() as *mut std::ffi::c_void,
+                    logits_region.device_ptr() as CUdeviceptr,
+                    (vocab as usize) * 4);
+                if r2 != CUresult::CUDA_SUCCESS {
+                    return Err(RvllmError::cuda(
+                        "cuMemcpyDtoH_v2(logits)",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx { stream: stream_u64,
+                            kernel: "smoke_logits_dtoh", launch: None, device: -1 },
+                    ));
+                }
+            }
+            let mut indexed: Vec<(u32, f32)> = logits_host.iter().enumerate()
+                .map(|(i, &v)| (i as u32, v)).collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            indexed.into_iter().take(8).collect()
+        } else {
+            Vec::new()
+        };
 
         Ok(SmokeStageDump {
             post_embed, post_rmsnorm,
@@ -1673,6 +1696,105 @@ impl Mistral35Bringup {
             logits_top8, predicted_token,
         })
     }
+
+    /// Multi-token autoregressive generation. Processes the prompt
+    /// through `forward_smoke_q_proj` at positions 0..prompt.len(),
+    /// then loops up to `max_new` decode steps feeding each predicted
+    /// token back as the next input. KV cache is persistent across
+    /// calls (the bring-up's per-layer cache); the arena scratch is
+    /// rewound between calls via `arena.checkpoint() + restore` so
+    /// per-token allocations don't accumulate.
+    ///
+    /// `eos_ids` causes early termination (typical Mistral EOS = 2).
+    /// Returns the full sequence (prompt + generated) and the
+    /// last-step `SmokeStageDump` for diagnostics.
+    pub unsafe fn generate_smoke(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        eos_ids: &[u32],
+    ) -> Result<GenerateSmokeResult> {
+        if prompt.is_empty() {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                "generate_smoke: empty prompt".into(),
+            ));
+        }
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "generate_smoke: arena absent".into(),
+        ))?;
+        let kv_cache = self.kv_cache.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "generate_smoke: kv_cache absent".into(),
+        ))?;
+        let total_max = prompt.len() + max_new;
+        if total_max > kv_cache.max_pos {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                format!("generate_smoke: total_len={total_max} > kv_max_pos={}",
+                    kv_cache.max_pos),
+            ));
+        }
+        // Capture arena state right before the first per-token forward;
+        // each call's transient scratch lives between checkpoint and
+        // restore so the arena footprint doesn't grow with sequence
+        // length. RVLLM_SMOKE_NO_RESTORE=1 keeps every call's scratch
+        // around (debug only, will OOM eventually).
+        let ck = arena.checkpoint();
+        let do_restore = std::env::var_os("RVLLM_SMOKE_NO_RESTORE").is_none();
+
+        let mut tokens: Vec<u32> = prompt.to_vec();
+        let mut last_dump: Option<SmokeStageDump> = None;
+        let mut last_predicted: u32 = 0;
+
+        // Prefill: feed each prompt token at its position.
+        for (i, &tok) in prompt.iter().enumerate() {
+            let dump = self.forward_smoke_q_proj(tok, i as i32)?;
+            last_predicted = dump.predicted_token;
+            // Keep only the LAST prompt's full dump. Earlier ones
+            // would just balloon the response.
+            if i == prompt.len() - 1 {
+                last_dump = Some(dump);
+            }
+            if do_restore { unsafe { arena.restore(ck); } }
+        }
+
+        // Decode: feed the previous predicted token at position
+        // prompt.len() + step. The last iteration appends but does
+        // NOT run a wasted forward (we already have the token).
+        for step in 0..max_new {
+            tokens.push(last_predicted);
+            if eos_ids.contains(&last_predicted) {
+                break;
+            }
+            if step + 1 >= max_new {
+                break;
+            }
+            let pos = (prompt.len() + step) as i32;
+            let dump = self.forward_smoke_q_proj(last_predicted, pos)?;
+            last_predicted = dump.predicted_token;
+            last_dump = Some(dump);
+            if do_restore { unsafe { arena.restore(ck); } }
+        }
+
+        Ok(GenerateSmokeResult {
+            tokens,
+            last_dump,
+            prompt_len: prompt.len(),
+        })
+    }
+}
+
+/// Result of [`Mistral35Bringup::generate_smoke`]. `tokens` includes
+/// the prompt followed by all generated tokens up to (and including)
+/// the first EOS hit.
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub struct GenerateSmokeResult {
+    pub tokens: Vec<u32>,
+    pub last_dump: Option<SmokeStageDump>,
+    pub prompt_len: usize,
 }
 
 #[cfg(test)]

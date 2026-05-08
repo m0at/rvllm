@@ -132,16 +132,25 @@ pub async fn spawn_cuda_worker(
                 }
 
                 while let Some(req) = req_rx.blocking_recv() {
-                    // Default: use the LAST tokenized prompt id, falling
-                    // back to RVLLM_SMOKE_TOKEN env (default 1=BOS) when
-                    // the prompt is empty. The full-attention / KV-cache
-                    // path is still pending, so the smoke only exercises
-                    // "what does Mistral predict after seeing this single
-                    // token" — useful for poking at the model interactively.
+                    // Multi-token autoregressive generation. Tokenize
+                    // → prefill (one forward per prompt token, KV cache
+                    // built up) → decode max_new tokens. Empty prompt
+                    // falls back to RVLLM_SMOKE_TOKEN as a single seed.
                     let env_token: u32 = std::env::var("RVLLM_SMOKE_TOKEN")
                         .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-                    let token_id: u32 = req.prompt_ids.last().copied().unwrap_or(env_token);
-                    let smoke = unsafe { bringup.forward_smoke_q_proj(token_id) };
+                    let prompt: Vec<u32> = if req.prompt_ids.is_empty() {
+                        vec![env_token]
+                    } else {
+                        req.prompt_ids.clone()
+                    };
+                    let max_new: usize = std::env::var("RVLLM_SMOKE_MAX_NEW")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+                    let eos: Vec<u32> = vec![2];
+                    let gen = unsafe {
+                        bringup.generate_smoke(&prompt, max_new, &eos)
+                    };
+                    let smoke = gen.map(|r| r.last_dump.expect("at least one forward"));
+                    let token_id: u32 = *prompt.last().unwrap();
                     let summary = match smoke {
                         Ok(d) => {
                             stage_stats("post_embed", &d.post_embed);
