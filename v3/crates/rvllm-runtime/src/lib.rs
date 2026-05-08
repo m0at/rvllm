@@ -75,6 +75,7 @@ pub mod layer_exec;
 pub mod qwen36_arch;
 pub mod mistral35_bring_up;
 pub mod mistral35_layer_ref;
+pub mod mistral35_load;
 pub mod mistral35_math;
 pub mod mistral35_yarn;
 pub mod qwen36_bring_up;

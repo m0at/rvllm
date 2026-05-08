@@ -27,12 +27,13 @@ use rvllm_core::{DType, LoaderCtx, LoaderError, Result, RvllmError};
 
 use crate::mistral35_arch::Mistral35Arch;
 use crate::safetensors::TensorEntry;
+use crate::weights::F16Weight;
 
 /// Logical shape of one NVFP4-packed linear, plus the validated
 /// dtypes/shapes of its three companion tensors. Returned by
 /// [`Mistral35WeightInventory::resolve_linear`] so the loader and the
 /// CUTLASS backend share a single source of truth for shape math.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Nvfp4LinearShape {
     /// Output dimension (rows). For Mistral 3.5: 12288 for q/o,
     /// 1024 for k/v, 28672 for gate/up, 12288 for down.
@@ -313,6 +314,90 @@ fn corrupt(detail: String) -> RvllmError {
         },
         bt: std::backtrace::Backtrace::capture(),
     }
+}
+
+// ─── Device-resident loaded model (post-upload) ────────────────────
+//
+// Populated by the rvllm-runtime side `mistral35_load`, since the
+// SFB-transform step requires the CUTLASS backend and the DAG keeps
+// rvllm-loader at a lower layer than rvllm-cutlass. The structs
+// themselves stay here so the loader can construct the natural-
+// layout intermediates without crossing the DAG line.
+
+/// One per-layer NVFP4 linear after weight upload + SFB layout
+/// transform. All pointers are absolute device addresses; the
+/// caller (the bring-up) owns the arena that backs them.
+#[derive(Debug, Clone, Copy)]
+pub struct Nvfp4LinearLoaded {
+    pub shape: Nvfp4LinearShape,
+    /// `[N, K/2]` U8 NVFP4-packed weight bytes.
+    pub packed_ptr: u64,
+    /// CUTLASS-interleaved E4M3 SFB scratch (sized via
+    /// `cutlass_nvfp4_gemm_sm120_sfb_bytes`). Persistent for the
+    /// life of the model.
+    pub sfb_cutlass_ptr: u64,
+    /// `[1]` F32 device scalar; passed to the GEMM epilogue's
+    /// `alpha_ptr` (no host stall).
+    pub global_scale_ptr: u64,
+    pub packed_bytes: usize,
+    pub sfb_bytes: usize,
+}
+
+/// "Outside-the-stack" weights — embedding table, final RMSNorm,
+/// lm_head. Per Mistral 3.5 (`tie_word_embeddings = false`),
+/// `lm_head.weight` is a separate tensor, not aliased to embed.
+#[derive(Debug)]
+pub struct Mistral35Outside {
+    /// `[vocab=131072, hidden=12288]` BF16 (uploaded as 2-byte
+    /// half-class memory; the kernel-side loader interprets it as
+    /// BF16 via the matching kernel signature).
+    pub embed_tokens: F16Weight,
+    /// `[hidden=12288]` BF16.
+    pub final_norm: F16Weight,
+    /// `[vocab=131072, hidden=12288]` BF16. Untied from
+    /// `embed_tokens`.
+    pub lm_head: F16Weight,
+}
+
+/// Per-decoder-layer weights, post-upload + post-SFB-transform.
+/// Mirrors the per-layer structure in
+/// `rvllm-runtime::mistral35_layer_ref::LayerWeightsF32` but with
+/// device pointers + NVFP4 representation.
+#[derive(Debug)]
+pub struct Mistral35LayerLoaded {
+    pub input_layernorm: F16Weight,           // BF16 [hidden]
+    pub post_attention_layernorm: F16Weight,  // BF16 [hidden]
+    pub q_proj: Nvfp4LinearLoaded,
+    pub k_proj: Nvfp4LinearLoaded,
+    pub v_proj: Nvfp4LinearLoaded,
+    pub o_proj: Nvfp4LinearLoaded,
+    pub gate_proj: Nvfp4LinearLoaded,
+    pub up_proj: Nvfp4LinearLoaded,
+    pub down_proj: Nvfp4LinearLoaded,
+}
+
+impl Mistral35LayerLoaded {
+    /// Iterate the per-layer NVFP4 linears in canonical
+    /// `Mistral35LinearKind` order: q, k, v, o, gate, up, down.
+    /// Used by the forward path to thread per-projection device
+    /// pointers in step with the layer flow documented in
+    /// `mistral35_layer_ref::mistral_layer_step`.
+    pub fn linears(&self) -> [&Nvfp4LinearLoaded; 7] {
+        [
+            &self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj,
+            &self.gate_proj, &self.up_proj, &self.down_proj,
+        ]
+    }
+}
+
+/// Fully-loaded Mistral 3.5 NVFP4 model. The CUDA forward path
+/// reads device pointers directly off this struct; nothing in here
+/// owns the arena, so the bring-up that built this MUST keep the
+/// arena alive for the lifetime of `Mistral35LoadedModel`.
+#[derive(Debug)]
+pub struct Mistral35LoadedModel {
+    pub outside: Mistral35Outside,
+    pub layers: Vec<Mistral35LayerLoaded>,
 }
 
 #[cfg(test)]

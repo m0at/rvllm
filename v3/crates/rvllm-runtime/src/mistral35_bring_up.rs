@@ -83,21 +83,34 @@ pub struct Mistral35Bringup {
     pub paths: Mistral35EnginePaths,
     pub arch: Mistral35Arch,
     pub inventory: Mistral35WeightInventory,
-    /// Reserved for the device-upload pass (Step 4-CUDA): bytes the
-    /// caller asked us to allocate for the arena. We keep it on the
-    /// struct so the run-loop can size scratch consistently with
-    /// the value `cuda_worker` was started with.
+    /// Bytes the caller asked us to allocate for the arena. The
+    /// upload pass uses ~72 GiB at production scale; the arena is
+    /// owned by the bring-up via `arena: Box<HbmArena<'static>>`.
     pub arena_bytes: usize,
-    /// Whether every required NVFP4 CUTLASS symbol resolved. Always
-    /// true on the `Ok` path — `load` refuses startup otherwise.
     pub nvfp4_active: bool,
-    /// Resolved CUTLASS backend handle (only populated under the
-    /// `cuda` feature; the .so + fn-pointer cache lives here so the
-    /// forward path doesn't have to re-open it). The struct is
-    /// `Send + Sync` per its own unsafe impl, so the worker thread
-    /// can hold the bring-up across the whole request loop.
+    /// Resolved CUTLASS backend handle. The forward path uses it
+    /// directly without re-opening the `.so`.
     #[cfg(feature = "cuda")]
     pub cutlass_backend: Option<rvllm_cutlass::lib_so::CutlassBackend>,
+    /// CUDA primary-context handle. Holds the device alive for the
+    /// life of the bring-up.
+    #[cfg(feature = "cuda")]
+    pub ctx: Option<std::sync::Arc<rvllm_mem::context::CudaContextHandle>>,
+    /// Compute stream that the upload pass + forward path enqueue
+    /// onto.
+    #[cfg(feature = "cuda")]
+    pub stream: Option<rvllm_mem::stream::Stream>,
+    /// HBM arena backing every device-resident weight + scratch
+    /// region. `'static` is a lie — the arena's actual lifetime is
+    /// tied to `ctx` above; we transmute on construction the same
+    /// way Qwen36Bringup does.
+    #[cfg(feature = "cuda")]
+    pub arena: Option<Box<rvllm_mem::HbmArena<'static>>>,
+    /// Loaded model — populated when `Mistral35Bringup::load`
+    /// completes the upload pass. `None` only on the no-cuda path
+    /// (which short-circuits before upload).
+    #[cfg(feature = "cuda")]
+    pub model: Option<rvllm_loader::mistral35_weights::Mistral35LoadedModel>,
 }
 
 #[derive(Debug)]
@@ -484,9 +497,65 @@ impl Mistral35Bringup {
         #[cfg(not(feature = "cuda"))]
         let nvfp4_active = false;
 
+        // (4) CUDA init + arena + stream + weight upload (cuda feature only).
+        //     Mirrors the Qwen36Bringup pattern. The arena's '_ lifetime
+        //     gets transmuted to 'static so the bring-up can own it via
+        //     a `Box<HbmArena<'static>>` field; safe because `ctx` is
+        //     stored alongside and ensures the device context outlives
+        //     the arena.
+        #[cfg(feature = "cuda")]
+        let (ctx, stream, arena, model) = {
+            use std::sync::Arc;
+            let ctx = Arc::new(rvllm_mem::context::CudaContextHandle::init(0)?);
+            let compile_target: Option<rvllm_core::CompileTarget> = {
+                let (major, minor) = ctx.compute_capability();
+                rvllm_core::CompileTarget::from_compute_capability(major, minor)
+            };
+            let arena_dyn: rvllm_mem::HbmArena<'_> = {
+                #[cfg(feature = "gb10")]
+                {
+                    if matches!(compile_target, Some(rvllm_core::CompileTarget::Sm121)) {
+                        rvllm_mem::UnifiedArena::new(&ctx, arena_bytes)?.into_inner()
+                    } else {
+                        rvllm_mem::HbmArena::new(&ctx, arena_bytes)?
+                    }
+                }
+                #[cfg(not(feature = "gb10"))]
+                {
+                    rvllm_mem::HbmArena::new(&ctx, arena_bytes)?
+                }
+            };
+            // SAFETY: `ctx` is stored on the bring-up alongside the
+            // arena, so the device context outlives every reference
+            // into the arena. The Qwen path uses the same transmute.
+            let arena_static: rvllm_mem::HbmArena<'static> =
+                unsafe { std::mem::transmute(arena_dyn) };
+            let arena_box = Box::new(arena_static);
+            let stream = rvllm_mem::stream::Stream::new(&ctx)?;
+
+            let backend_ref = cutlass_backend.as_ref().unwrap();
+            eprintln!("[mistral35-load] starting weight upload (this can take ~30-90s)…");
+            let t0 = std::time::Instant::now();
+            let model = crate::mistral35_load::load_mistral35_model(
+                &paths,
+                &arch,
+                arena_box.as_ref(),
+                backend_ref,
+                stream.raw(),
+            )?;
+            eprintln!(
+                "[mistral35-load] weight upload complete in {:.1}s ({} layers loaded)",
+                t0.elapsed().as_secs_f32(),
+                model.layers.len(),
+            );
+
+            (Some(ctx), Some(stream), Some(arena_box), Some(model))
+        };
+
         #[cfg(feature = "cuda")]
         let bringup = Self {
-            paths, arch, inventory, arena_bytes, nvfp4_active, cutlass_backend,
+            paths, arch, inventory, arena_bytes, nvfp4_active,
+            cutlass_backend, ctx, stream, arena, model,
         };
         #[cfg(not(feature = "cuda"))]
         let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
