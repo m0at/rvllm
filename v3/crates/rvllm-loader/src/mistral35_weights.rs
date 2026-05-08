@@ -398,6 +398,49 @@ impl Mistral35LayerLoaded {
 pub struct Mistral35LoadedModel {
     pub outside: Mistral35Outside,
     pub layers: Vec<Mistral35LayerLoaded>,
+    /// Pixtral vision tower (BF16). Optional — non-multimodal
+    /// requests can run with `None`. When present, the bring-up
+    /// has uploaded all 434 vision + 4 projector tensors.
+    pub vision: Option<Mistral35Vision>,
+}
+
+/// One ViT block in the Pixtral vision tower (Llama-style: pre-norm,
+/// SwiGLU MLP, RMSNorm). All weights BF16.
+#[derive(Debug)]
+pub struct VisionLayerLoaded {
+    pub attention_norm: F16Weight,         // [v_hidden=1664]
+    pub q_proj: F16Weight,                  // [v_hidden, v_hidden]
+    pub k_proj: F16Weight,
+    pub v_proj: F16Weight,
+    pub o_proj: F16Weight,
+    pub ffn_norm: F16Weight,                // [v_hidden]
+    pub gate_proj: F16Weight,               // [v_intermediate=8192, v_hidden]
+    pub up_proj: F16Weight,
+    pub down_proj: F16Weight,               // [v_hidden, v_intermediate]
+}
+
+/// Pixtral vision tower + projector to text-embedding space.
+/// All BF16 row-major. Patch embedding is a Conv2D (`patch_conv`)
+/// of stride=patch_size=14, in_channels=3, out_channels=v_hidden.
+#[derive(Debug)]
+pub struct Mistral35Vision {
+    /// `[v_hidden, 3, patch_size, patch_size]` BF16 conv kernel.
+    pub patch_conv: F16Weight,
+    /// `[v_hidden]` BF16 — pre-transformer RMSNorm.
+    pub ln_pre: F16Weight,
+    /// 48 transformer blocks.
+    pub layers: Vec<VisionLayerLoaded>,
+    /// Projector: norm → linear_1 → SiLU·linear_2-like activation
+    /// → text_hidden. Exact ordering set by the projector forward
+    /// kernel (TBD).
+    pub projector_norm: F16Weight,
+    /// `[merge_dim, v_hidden * spatial_merge_size^2]` —
+    /// patch-merger linear layer.
+    pub projector_patch_merger: F16Weight,
+    /// `[text_hidden, merge_dim]` — first projector linear.
+    pub projector_linear_1: F16Weight,
+    /// `[text_hidden, text_hidden]` — second projector linear.
+    pub projector_linear_2: F16Weight,
 }
 
 #[cfg(test)]

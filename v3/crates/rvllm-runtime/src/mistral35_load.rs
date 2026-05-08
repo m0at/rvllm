@@ -311,9 +311,105 @@ pub fn load_mistral35_model(
         }
         layers.push(layer);
     }
-    eprintln!("[mistral35-load] all weights resident on device");
+    eprintln!("[mistral35-load] all language weights resident on device");
 
-    Ok(Mistral35LoadedModel { outside, layers })
+    // Pixtral vision tower (BF16). Optional — controlled by env
+    // RVLLM_LOAD_VISION (default on for mistral35; allows skip for
+    // text-only smoke).
+    let vision = if std::env::var("RVLLM_LOAD_VISION").as_deref() == Ok("0") {
+        None
+    } else {
+        Some(upload_mistral35_vision(arena, &pool, arch)?)
+    };
+
+    Ok(Mistral35LoadedModel { outside, layers, vision })
+}
+
+#[cfg(feature = "cuda")]
+fn upload_mistral35_vision(
+    arena: &HbmArena<'_>,
+    pool: &ShardPool,
+    arch: &Mistral35Arch,
+) -> Result<rvllm_loader::mistral35_weights::Mistral35Vision> {
+    use rvllm_loader::mistral35_weights::{Mistral35Vision, VisionLayerLoaded};
+
+    eprintln!(
+        "[mistral35-load] uploading vision tower (Pixtral, {} layers)…",
+        arch.vision.num_hidden_layers,
+    );
+
+    // The checkpoint stores vision tensors under the *direct*
+    // `model.vision_tower.*` prefix (not nested under language_model).
+    // Mistral checkpoints sometimes use `model.vision_tower.` and
+    // older variants used bare `vision_tower.`; the inventory
+    // validator already accepts both. The shard pool's
+    // BTreeMap doesn't care — names are exact.
+    let vt = "model.vision_tower";
+    let mmp = "model.multi_modal_projector";
+
+    let patch_conv = upload_tensor_verbatim(
+        arena, pool, "mistral35_v_patch_conv",
+        &format!("{vt}.patch_conv.weight"),
+    )?;
+    let ln_pre = upload_tensor_verbatim(
+        arena, pool, "mistral35_v_ln_pre",
+        &format!("{vt}.ln_pre.weight"),
+    )?;
+
+    let mut vlayers = Vec::with_capacity(arch.vision.num_hidden_layers);
+    let log_step = (arch.vision.num_hidden_layers / 6).max(1);
+    for li in 0..arch.vision.num_hidden_layers {
+        let lb = format!("{vt}.transformer.layers.{li}");
+        let layer = VisionLayerLoaded {
+            attention_norm: upload_tensor_verbatim(arena, pool, "v_attn_norm",
+                &format!("{lb}.attention_norm.weight"))?,
+            q_proj: upload_tensor_verbatim(arena, pool, "v_q",
+                &format!("{lb}.attention.q_proj.weight"))?,
+            k_proj: upload_tensor_verbatim(arena, pool, "v_k",
+                &format!("{lb}.attention.k_proj.weight"))?,
+            v_proj: upload_tensor_verbatim(arena, pool, "v_v",
+                &format!("{lb}.attention.v_proj.weight"))?,
+            o_proj: upload_tensor_verbatim(arena, pool, "v_o",
+                &format!("{lb}.attention.o_proj.weight"))?,
+            ffn_norm: upload_tensor_verbatim(arena, pool, "v_ffn_norm",
+                &format!("{lb}.ffn_norm.weight"))?,
+            gate_proj: upload_tensor_verbatim(arena, pool, "v_gate",
+                &format!("{lb}.feed_forward.gate_proj.weight"))?,
+            up_proj: upload_tensor_verbatim(arena, pool, "v_up",
+                &format!("{lb}.feed_forward.up_proj.weight"))?,
+            down_proj: upload_tensor_verbatim(arena, pool, "v_down",
+                &format!("{lb}.feed_forward.down_proj.weight"))?,
+        };
+        vlayers.push(layer);
+        if li % log_step == 0 || li + 1 == arch.vision.num_hidden_layers {
+            eprintln!("[mistral35-load]   vision layer {li}/{} done",
+                arch.vision.num_hidden_layers);
+        }
+    }
+
+    let projector_norm = upload_tensor_verbatim(
+        arena, pool, "v_proj_norm", &format!("{mmp}.norm.weight"))?;
+    let projector_patch_merger = upload_tensor_verbatim(
+        arena, pool, "v_patch_merger",
+        &format!("{mmp}.patch_merger.merging_layer.weight"))?;
+    let projector_linear_1 = upload_tensor_verbatim(
+        arena, pool, "v_proj_l1", &format!("{mmp}.linear_1.weight"))?;
+    let projector_linear_2 = upload_tensor_verbatim(
+        arena, pool, "v_proj_l2", &format!("{mmp}.linear_2.weight"))?;
+
+    eprintln!(
+        "[mistral35-load] vision tower uploaded: patch_conv={:?} \
+         ln_pre={:?} layers={} projector(norm/merger/l1/l2)={:?}/{:?}/{:?}/{:?}",
+        patch_conv.shape, ln_pre.shape, vlayers.len(),
+        projector_norm.shape, projector_patch_merger.shape,
+        projector_linear_1.shape, projector_linear_2.shape,
+    );
+
+    Ok(Mistral35Vision {
+        patch_conv, ln_pre, layers: vlayers,
+        projector_norm, projector_patch_merger,
+        projector_linear_1, projector_linear_2,
+    })
 }
 
 #[cfg(feature = "cuda")]
