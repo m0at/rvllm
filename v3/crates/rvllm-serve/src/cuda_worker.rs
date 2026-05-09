@@ -110,6 +110,17 @@ pub async fn spawn_cuda_worker(
 
                 fn stage_stats(label: &str, v: &[f32]) {
                     let n = v.len();
+                    // Round-9 #4 fix: stage dumps are only populated
+                    // when RVLLM_SMOKE_FULL_DUMP=1 (or boundary dump).
+                    // For normal runs they're empty, so the previous
+                    // `(sumsq / 0).sqrt()` produced NaN min / -Inf max
+                    // / NaN rms in the diagnostic log. Emit a single
+                    // "not collected" line instead.
+                    if n == 0 {
+                        tracing::debug!(stage = label,
+                            "stage not collected (RVLLM_SMOKE_FULL_DUMP=0)");
+                        return;
+                    }
                     let any_nan = v.iter().any(|x| x.is_nan());
                     let any_inf = v.iter().any(|x| x.is_infinite());
                     let mut min = f32::INFINITY;
@@ -181,15 +192,44 @@ pub async fn spawn_cuda_worker(
                     // disconnects + request_timeout actually halt the
                     // 88-layer-per-token loop instead of waiting for it
                     // to finish.
+                    // Round-9 #3: emit Token events from the on_token
+                    // callback immediately (mirrors the Qwen / Gemma
+                    // worker shape). Without this stream=true was
+                    // effectively batched: the user only saw output
+                    // once `generate` returned. Closing the SSE
+                    // channel or hitting a stop token now flips
+                    // `req.cancelled` so the next forward bails.
+                    let stop_set: std::collections::HashSet<u32> =
+                        req.stop_token_ids.iter().copied().collect();
+                    let prompt_len_u32 = prompt.len() as u32;
+                    let events_tx_inner = req.events_tx.clone();
+                    let cancel_inner = std::sync::Arc::clone(&req.cancelled);
+                    let mut emitted_in_closure: u32 = 0;
+                    let mut step_in_closure: u32 = 0;
+                    let mut hit_stop_in_closure = false;
                     let cancel_ref: &std::sync::atomic::AtomicBool = &*req.cancelled;
                     let gen = unsafe {
                         bringup.generate(
                             &prompt, max_new, &eos,
                             Some(cancel_ref),
-                            |_t| {/* per-token hook reserved for
-                                     future SSE early-flush; the
-                                     post-loop emit below already
-                                     covers max_tokens=N */},
+                            |tok: u32| {
+                                let pos = prompt_len_u32 + step_in_closure;
+                                step_in_closure += 1;
+                                if stop_set.contains(&tok) {
+                                    hit_stop_in_closure = true;
+                                    cancel_inner.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+                                if events_tx_inner.send(GenerateEvent::Token {
+                                    id: tok, position: pos,
+                                }).is_err() {
+                                    // Receiver dropped — short-circuit
+                                    // the rest of generate().
+                                    cancel_inner.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+                                emitted_in_closure += 1;
+                            },
                         )
                     };
                     let (gen_tokens, prompt_len_for_log, last_dump_opt, gen_err) = match gen {
@@ -293,12 +333,17 @@ pub async fn spawn_cuda_worker(
                                 ("h_l0", &d.h_after_layer0[..]),
                                 ("h_fnorm", &d.h_after_final_norm[..]),
                             ];
-                            let parts: Vec<String> = stages.iter().map(|(name, v)| {
+                            // Round-9 #4: skip stages that weren't
+                            // collected (n=0 → previous code emitted
+                            // NaN). Empty stages are the default unless
+                            // RVLLM_SMOKE_FULL_DUMP=1.
+                            let parts: Vec<String> = stages.iter().filter_map(|(name, v)| {
                                 let n = v.len();
+                                if n == 0 { return None; }
                                 let mut sumsq = 0.0f64;
                                 for &x in *v { sumsq += (x as f64) * (x as f64); }
                                 let rms = (sumsq / (n as f64)).sqrt();
-                                format!("{name}={rms:.3}")
+                                Some(format!("{name}={rms:.3}"))
                             }).collect();
                             format!(
                                 "in={token_id} predicted={} rms[{}]",
@@ -310,44 +355,29 @@ pub async fn spawn_cuda_worker(
                             "in={token_id} cancelled before any forward completed"
                         ),
                     };
-                    // P1a fix: stream actual generated tokens to the
-                    // client as Token events, then a Done event. The
-                    // smoke debug summary still goes to the tracing
-                    // log for diagnostics; production callers see real
-                    // completions instead of a hardcoded error.
-                    if let Some(toks) = gen_tokens.get(prompt_len_for_log..)
-                        .filter(|s| !s.is_empty())
-                    {
-                        let stop_set: std::collections::HashSet<u32> =
-                            req.stop_token_ids.iter().copied().collect();
-                        let mut completion: u32 = 0;
-                        let mut finish = FinishReason::Length;
-                        for (step, &tok) in toks.iter().enumerate() {
-                            if stop_set.contains(&tok) {
-                                finish = FinishReason::Stop;
-                                break;
-                            }
-                            let _ = req.events_tx.send(GenerateEvent::Token {
-                                id: tok,
-                                position: (prompt_len_for_log + step) as u32,
-                            });
-                            completion += 1;
-                            if req.cancelled.load(Ordering::Relaxed) {
-                                finish = FinishReason::Cancelled;
-                                break;
-                            }
-                        }
+                    // Round-9 #3 fix: tokens were already streamed by
+                    // the on_token closure above. Only Done / Error
+                    // remains.
+                    if gen_err.is_none() && (emitted_in_closure > 0 || hit_stop_in_closure) {
+                        let finish = if hit_stop_in_closure {
+                            FinishReason::Stop
+                        } else if req.cancelled.load(Ordering::Relaxed) {
+                            FinishReason::Cancelled
+                        } else {
+                            FinishReason::Length
+                        };
                         let _ = req.events_tx.send(GenerateEvent::Done {
                             finish,
-                            completion_tokens: completion,
+                            completion_tokens: emitted_in_closure,
                             prompt_tokens: prompt_len_for_log as u32,
                         });
-                        tracing::debug!("[mistral35-smoke debug] {summary}");
+                        tracing::debug!("[mistral35 debug] {summary}");
                     } else {
-                        // Generation failed or produced no new tokens —
-                        // surface the smoke summary as an error.
+                        // Generation failed before the first emitted
+                        // token, or hit cancellation before any forward
+                        // completed. Surface the diagnostic summary.
                         let _ = req.events_tx.send(GenerateEvent::Error(format!(
-                            "[mistral35-smoke debug] {summary}"
+                            "[mistral35] {summary}"
                         )));
                     }
                 }

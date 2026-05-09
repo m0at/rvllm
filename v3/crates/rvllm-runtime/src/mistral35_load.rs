@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rvllm_core::{LoaderCtx, LoaderError, Result, RvllmError};
+use rvllm_core::{DType, LoaderCtx, LoaderError, Result, RvllmError};
 use rvllm_loader::mistral35_arch::Mistral35Arch;
 use rvllm_loader::mistral35_weights::{
     Mistral35LayerLoaded, Mistral35LinearKind, Mistral35LoadedModel, Mistral35Outside,
@@ -107,25 +107,109 @@ impl ShardPool {
     }
 }
 
-/// Upload a tensor verbatim (bytes-as-stored, no dtype conversion)
-/// into the arena and return the resulting `F16Weight`. Despite
-/// the name — F16Weight is the workspace's canonical 16-bit-class
-/// half holder — this is also the carrier for BF16 tensors. The
-/// kernel side reads via the matching dtype'd kernel signature.
-fn upload_tensor_verbatim(
+/// Upload a BF16 tensor with full dtype + shape validation.
+///
+/// Round-9 #2 fix: the previous `upload_tensor_verbatim` accepted any
+/// dtype and any shape, so a quantized or wrong-rank tensor named
+/// `lm_head.weight` (or any of the BF16-class tensors — embeddings,
+/// final norm, layernorms, vision, projector) could be uploaded
+/// silently and then reinterpreted as BF16 by the kernel side,
+/// triggering OOB reads in the GEMM. This helper enforces:
+///  * dtype matches the caller's `expected_dtype` (BF16 in practice).
+///  * shape matches `expected_shape` exactly.
+///  * mmap byte length equals `product(shape) * bytes_per_elem`.
+///
+/// `expected_shape = None` keeps the loader flexible for tensors
+/// whose first dim depends on the checkpoint (e.g. `[vocab, hidden]`
+/// when the loader has not threaded `vocab` to this call site yet).
+/// In that case only dtype + a `nbytes % bytes_per_elem == 0` check
+/// runs — still strictly stronger than the verbatim fallback.
+fn upload_typed_tensor(
     arena: &HbmArena<'_>,
     pool: &ShardPool,
     region_name: &'static str,
     tensor_name: &str,
+    expected_dtype: DType,
+    expected_shape: Option<&[usize]>,
 ) -> Result<F16Weight> {
     let (si, e) = pool.must_get(tensor_name)?;
+    let bytes_per_elem: usize = match expected_dtype {
+        DType::Bf16 | DType::F16 => 2,
+        DType::F32 => 4,
+        DType::Fp8E4M3 | DType::U8 => 1,
+        other => return Err(RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!(
+                    "upload_typed_tensor: dtype {:?} not supported for {tensor_name}", other,
+                ),
+            },
+            ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(tensor_name.to_string()) },
+            bt: std::backtrace::Backtrace::capture(),
+        }),
+    };
+    if e.dtype != expected_dtype {
+        return Err(RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!(
+                    "Mistral 3.5 tensor {tensor_name}: dtype={:?} but \
+                     loader expected {:?}",
+                    e.dtype, expected_dtype,
+                ),
+            },
+            ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(tensor_name.to_string()) },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    if let Some(want) = expected_shape {
+        if e.shape != want {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "Mistral 3.5 tensor {tensor_name}: shape={:?} but \
+                         loader expected {:?}",
+                        e.shape, want,
+                    ),
+                },
+                ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(tensor_name.to_string()) },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+    }
+    let elem_count: usize = e.shape.iter().product();
+    let expect_bytes = elem_count * bytes_per_elem;
     let raw = pool.bytes_of(si, e);
+    if raw.len() != expect_bytes {
+        return Err(RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!(
+                    "Mistral 3.5 tensor {tensor_name}: mmap len={} but \
+                     shape={:?} × {} = {} bytes",
+                    raw.len(), e.shape, bytes_per_elem, expect_bytes,
+                ),
+            },
+            ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(tensor_name.to_string()) },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
     let region = arena.region(region_name, raw.len(), 16)?;
     unsafe { region.copy_from_host(raw)? };
     Ok(F16Weight {
         offset_bytes: region.device_ptr(),
         shape: e.shape.clone(),
     })
+}
+
+/// Convenience wrapper: BF16 only.
+fn upload_bf16_tensor(
+    arena: &HbmArena<'_>,
+    pool: &ShardPool,
+    region_name: &'static str,
+    tensor_name: &str,
+    expected_shape: Option<&[usize]>,
+) -> Result<F16Weight> {
+    upload_typed_tensor(
+        arena, pool, region_name, tensor_name, DType::Bf16, expected_shape,
+    )
 }
 
 /// Upload one Mistral 3.5 NVFP4 linear, run the SFB transform, and
@@ -160,14 +244,37 @@ fn upload_nvfp4_linear(
     let scale_name = format!("{base}.weight_scale");
     let (ssi, se) = pool.must_get(&scale_name)?;
     let scale_raw = pool.bytes_of(ssi, se);
-    let nat_bytes = backend.nvfp4_sfb_natural_bytes(shape.n as i32, shape.k as i32);
+    // Round-9 #1 fix: derive the natural [N, K/16] e4m3 size directly from
+    // the Mistral shape. Previously we asked the CUTLASS backend for it,
+    // which returns 0 when `CutlassBackend::Absent` (or when libcutlass is
+    // built without NVFP4 symbols), making the *default* fused W4A16 GEMV
+    // path falsely depend on CUTLASS. The fused kernel never reads any
+    // CUTLASS-interleaved layout — it consumes the natural scale bytes
+    // verbatim — so the validation must work without a live backend.
+    if shape.k % 16 != 0 {
+        return Err(RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!(
+                    "Mistral 3.5 weight_scale {scale_name}: shape K={} is not a \
+                     multiple of the NVFP4 group size (16)",
+                    shape.k,
+                ),
+            },
+            ctx: LoaderCtx {
+                path: pool.model_dir.clone(),
+                tensor: Some(scale_name.clone()),
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    let nat_bytes = (shape.n as usize) * (shape.k as usize / 16); // e4m3 = 1 byte
     if nat_bytes != scale_raw.len() {
         return Err(RvllmError::Loader {
             err: LoaderError::Corrupt {
                 detail: format!(
                     "Mistral 3.5 weight_scale {scale_name}: mmap len={} \
-                     but cutlass nvfp4_sfb_natural_bytes(n={}, k={}) = {}",
-                    scale_raw.len(), shape.n, shape.k, nat_bytes,
+                     but expected n*(k/16) = {}*{} = {}",
+                    scale_raw.len(), shape.n, shape.k / 16, nat_bytes,
                 ),
             },
             ctx: LoaderCtx {
@@ -345,19 +452,24 @@ pub fn load_mistral35_model(
 
     let prefix = arch.weight_prefix.as_str();
     eprintln!("[mistral35-load] uploading outside tensors (embed + norm + lm_head)…");
+    let hidden = arch.text.hidden_size;
+    let vocab = arch.text.vocab_size;
     let outside = Mistral35Outside {
-        embed_tokens: upload_tensor_verbatim(
+        embed_tokens: upload_bf16_tensor(
             arena, &pool, "mistral35_embed",
             &format!("{prefix}.embed_tokens.weight"),
+            Some(&[vocab, hidden]),
         )?,
-        final_norm: upload_tensor_verbatim(
+        final_norm: upload_bf16_tensor(
             arena, &pool, "mistral35_final_norm",
             &format!("{prefix}.norm.weight"),
+            Some(&[hidden]),
         )?,
         // Mistral 3.5: tie_word_embeddings = false → separate
         // lm_head tensor at top level.
-        lm_head: upload_tensor_verbatim(
+        lm_head: upload_bf16_tensor(
             arena, &pool, "mistral35_lm_head", "lm_head.weight",
+            Some(&[vocab, hidden]),
         )?,
     };
     eprintln!(
@@ -414,13 +526,13 @@ fn upload_mistral35_vision(
     let vt = "model.vision_tower";
     let mmp = "model.multi_modal_projector";
 
-    let patch_conv = upload_tensor_verbatim(
+    let patch_conv = upload_bf16_tensor(
         arena, pool, "mistral35_v_patch_conv",
-        &format!("{vt}.patch_conv.weight"),
+        &format!("{vt}.patch_conv.weight"), None,
     )?;
-    let ln_pre = upload_tensor_verbatim(
+    let ln_pre = upload_bf16_tensor(
         arena, pool, "mistral35_v_ln_pre",
-        &format!("{vt}.ln_pre.weight"),
+        &format!("{vt}.ln_pre.weight"), None,
     )?;
 
     let mut vlayers = Vec::with_capacity(arch.vision.num_hidden_layers);
@@ -428,24 +540,24 @@ fn upload_mistral35_vision(
     for li in 0..arch.vision.num_hidden_layers {
         let lb = format!("{vt}.transformer.layers.{li}");
         let layer = VisionLayerLoaded {
-            attention_norm: upload_tensor_verbatim(arena, pool, "v_attn_norm",
-                &format!("{lb}.attention_norm.weight"))?,
-            q_proj: upload_tensor_verbatim(arena, pool, "v_q",
-                &format!("{lb}.attention.q_proj.weight"))?,
-            k_proj: upload_tensor_verbatim(arena, pool, "v_k",
-                &format!("{lb}.attention.k_proj.weight"))?,
-            v_proj: upload_tensor_verbatim(arena, pool, "v_v",
-                &format!("{lb}.attention.v_proj.weight"))?,
-            o_proj: upload_tensor_verbatim(arena, pool, "v_o",
-                &format!("{lb}.attention.o_proj.weight"))?,
-            ffn_norm: upload_tensor_verbatim(arena, pool, "v_ffn_norm",
-                &format!("{lb}.ffn_norm.weight"))?,
-            gate_proj: upload_tensor_verbatim(arena, pool, "v_gate",
-                &format!("{lb}.feed_forward.gate_proj.weight"))?,
-            up_proj: upload_tensor_verbatim(arena, pool, "v_up",
-                &format!("{lb}.feed_forward.up_proj.weight"))?,
-            down_proj: upload_tensor_verbatim(arena, pool, "v_down",
-                &format!("{lb}.feed_forward.down_proj.weight"))?,
+            attention_norm: upload_bf16_tensor(arena, pool, "v_attn_norm",
+                &format!("{lb}.attention_norm.weight"), None)?,
+            q_proj: upload_bf16_tensor(arena, pool, "v_q",
+                &format!("{lb}.attention.q_proj.weight"), None)?,
+            k_proj: upload_bf16_tensor(arena, pool, "v_k",
+                &format!("{lb}.attention.k_proj.weight"), None)?,
+            v_proj: upload_bf16_tensor(arena, pool, "v_v",
+                &format!("{lb}.attention.v_proj.weight"), None)?,
+            o_proj: upload_bf16_tensor(arena, pool, "v_o",
+                &format!("{lb}.attention.o_proj.weight"), None)?,
+            ffn_norm: upload_bf16_tensor(arena, pool, "v_ffn_norm",
+                &format!("{lb}.ffn_norm.weight"), None)?,
+            gate_proj: upload_bf16_tensor(arena, pool, "v_gate",
+                &format!("{lb}.feed_forward.gate_proj.weight"), None)?,
+            up_proj: upload_bf16_tensor(arena, pool, "v_up",
+                &format!("{lb}.feed_forward.up_proj.weight"), None)?,
+            down_proj: upload_bf16_tensor(arena, pool, "v_down",
+                &format!("{lb}.feed_forward.down_proj.weight"), None)?,
         };
         vlayers.push(layer);
         if li % log_step == 0 || li + 1 == arch.vision.num_hidden_layers {
@@ -454,15 +566,15 @@ fn upload_mistral35_vision(
         }
     }
 
-    let projector_norm = upload_tensor_verbatim(
-        arena, pool, "v_proj_norm", &format!("{mmp}.norm.weight"))?;
-    let projector_patch_merger = upload_tensor_verbatim(
+    let projector_norm = upload_bf16_tensor(
+        arena, pool, "v_proj_norm", &format!("{mmp}.norm.weight"), None)?;
+    let projector_patch_merger = upload_bf16_tensor(
         arena, pool, "v_patch_merger",
-        &format!("{mmp}.patch_merger.merging_layer.weight"))?;
-    let projector_linear_1 = upload_tensor_verbatim(
-        arena, pool, "v_proj_l1", &format!("{mmp}.linear_1.weight"))?;
-    let projector_linear_2 = upload_tensor_verbatim(
-        arena, pool, "v_proj_l2", &format!("{mmp}.linear_2.weight"))?;
+        &format!("{mmp}.patch_merger.merging_layer.weight"), None)?;
+    let projector_linear_1 = upload_bf16_tensor(
+        arena, pool, "v_proj_l1", &format!("{mmp}.linear_1.weight"), None)?;
+    let projector_linear_2 = upload_bf16_tensor(
+        arena, pool, "v_proj_l2", &format!("{mmp}.linear_2.weight"), None)?;
 
     eprintln!(
         "[mistral35-load] vision tower uploaded: patch_conv={:?} \
@@ -490,14 +602,17 @@ fn upload_one_layer(
     arch: &Mistral35Arch,
 ) -> Result<Mistral35LayerLoaded> {
     let layer_base = format!("{prefix}.layers.{li}");
-    // Norms — bytes verbatim (BF16 [hidden]).
-    let input_layernorm = upload_tensor_verbatim(
+    // Norms — BF16 [hidden] with full dtype + shape validation.
+    let hidden = arch.text.hidden_size;
+    let input_layernorm = upload_bf16_tensor(
         arena, pool, "mistral35_in_norm",
         &format!("{layer_base}.input_layernorm.weight"),
+        Some(&[hidden]),
     )?;
-    let post_attention_layernorm = upload_tensor_verbatim(
+    let post_attention_layernorm = upload_bf16_tensor(
         arena, pool, "mistral35_post_norm",
         &format!("{layer_base}.post_attention_layernorm.weight"),
+        Some(&[hidden]),
     )?;
 
     // Resolve the seven NVFP4 linears.

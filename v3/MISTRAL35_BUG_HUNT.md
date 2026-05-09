@@ -15,25 +15,38 @@ before treating them as load-bearing.
 
 ## Current state
 
-The forward path is byte-faithful at every layer/op verified so far
-**versus a numpy oracle that dequantizes the W4A16 weights to F32 and
-runs the same arithmetic in F32**. End-to-end the model still
-produces a universal token attractor (`\n\n\n` or `'aimerais` for
-every prompt at greedy temperature=0).
+The kernel `mistral35_w4a16_gemv_bf16.cu` and `nvfp4_dequant_weights_bf16.cu`
+both used to apply an extra `* (1.0/6.0)` factor on top of the
+true e2m1 lookup; on 2026-05-10 the factor was removed (commit
+`58ef825`) after `v3/tools/mistral35_marlin_oracle_check.py` showed
+that the rvllm dequant magnitude was 6× smaller than the contract
+documented in vllm 0.20.2's new `ModelOptNvFp4W4A16LinearMethod`
+(PR #41769). After the change, greedy completions produce
+plausible-looking text where every prompt previously emitted
+`\n\n\n` / `'aimerais`:
 
-Two interpretations remain on the table; we have NOT distinguished
-between them yet:
+  "Hello"                          → " Abstract Wikipedia Update — Volume 100…"
+  "The capital of France is"       → " Paris. This is a well-known fact…"
+  "Berlin ist die Hauptstadt von"  → " Deutschland und eine der lebendigsten…"
 
-1. The W4A16-quantized Mistral 3.5 checkpoint genuinely behaves this
-   way under greedy decoding. (Plausible — heavy quantization can
-   collapse generation to mode-locked attractors.)
-2. There is a small systematic numerical bias in our forward that
-   accumulates across 88 layers into a wrong-mode attractor.
+**This is empirical evidence that the `/6` was a real bug, not a
+proof of full correctness.** We have NOT yet re-run the same prompts
++ same sampler against vllm 0.20.2's W4A16 NVFP4 path or against an
+HF transformers reference loading the same checkpoint. Until that
+external reference exists, the following remain open:
 
-The next concrete step to settle this is a **W4A16-equivalent
-reference run** — vllm or HF transformers loading the same NVFP4
-checkpoint, decoding the same prompt with the same sampler. We do
-not yet have that reference up and running on this machine.
+1. The unmodified Mistral 3.5 W4A16 NVFP4 checkpoint may still drift
+   from vllm/HF token-by-token at greedy decode despite producing
+   plausible English/German.
+2. There may be smaller numerical biases (RoPE phase, layernorm
+   epsilon, softmax accumulation, etc) that the magnitude oracle
+   did not exercise.
+
+The next concrete step is a **W4A16-equivalent reference run** —
+vllm 0.20.2 or HF transformers loading the same NVFP4 checkpoint,
+decoding identical prompt-IDs with the same sampler, then a
+layer-by-layer diff at layers 0, 1, 40, 80, 87. We do not yet have
+that reference up and running on this machine.
 
 ## Verified oracles (2026-05-10)
 
