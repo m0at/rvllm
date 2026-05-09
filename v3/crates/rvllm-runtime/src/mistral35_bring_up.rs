@@ -1742,6 +1742,33 @@ impl Mistral35Bringup {
             model.outside.final_norm.offset_bytes,
             stream_u64,
         )?;
+        // Diagnostic: also dump the LAST LAYER's qk-dot scores
+        // (n_q_heads × past_len F32) so we can inspect the attention
+        // distribution numerically. The scores_f32 buffer is overwritten
+        // each layer; this captures whatever was last left there
+        // (= layer 87's scores for the LAST prefill token).
+        if full_dump {
+            let bytes = (n_q_heads_attn as usize) * (past_len as usize) * 4;
+            let mut buf = vec![0u8; bytes];
+            stream.fence()?;
+            unsafe {
+                use cudarc::driver::sys::*;
+                let r = cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    kv_cache.scores_f32_ptr as CUdeviceptr,
+                    bytes,
+                );
+                if r == CUresult::CUDA_SUCCESS {
+                    if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                        let path = std::path::PathBuf::from(dir).join("scores_layer87.f32");
+                        let _ = std::fs::write(&path, &buf);
+                        eprintln!("[mistral35] dumped scores layer87: {} bytes ({}x{})",
+                            bytes, n_q_heads_attn, past_len);
+                    }
+                }
+            }
+        }
+
         let h_after_final_norm = dump_bf16(stream, stream_u64,
             scr.h_work_ptr, hidden as usize, "smoke_h_after_final_norm")?;
 

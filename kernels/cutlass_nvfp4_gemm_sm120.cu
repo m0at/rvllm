@@ -445,6 +445,9 @@ int cutlass_nvfp4_gemm_sm120_sfb_natural_to_interleaved(
 
     // Same layout-helper trick as the SFA path: pass an n-independent
     // m_dummy so the cute layout deduces correctly.
+    // VERIFIED 2026-05-09: setting m=1 reduces q_proj cosine to 0.50
+    // (was 0.993 with m_dummy=n) — m_dummy=n IS the right choice here
+    // despite docs claiming SFB is M-independent.
     const int m_dummy = (n > 0) ? n : 1;
     auto layout = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
         cute::make_shape(m_dummy, n, k, 1));
