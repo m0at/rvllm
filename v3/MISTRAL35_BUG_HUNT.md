@@ -1,53 +1,118 @@
-**Short Answer**
-Your #2 is probably not the bug. HF and vLLM both apply YaRN’s attention factor by multiplying both `cos` and `sin`, so Q and K both get scaled and attention scores effectively get `mscale^2 / sqrt(d)`. For this checkpoint, that is expected behavior, not a double-application bug.
+# Mistral 3.5 NVFP4 forward bug — investigation log
 
-The top suspects now are: attention/KV path at nonzero positions, a later-layer projection/dequant issue, or lm_head orientation/data mismatch. RoPE convention and YaRN table math look mostly correct.
+**Status (2026-05-09):** rvllm produces predicted token 101484
+(' Greco') vs vllm reference "Hello" for the chat-templated 'hi'
+prompt. Output is deterministic but wrong; magnitudes are mostly
+right, direction drifts via compound per-layer error.
 
-**Candidate Ranking**
-1. **Layer-by-layer divergence after layer 0**: most likely. Layer-0 scalar ranges are plausible, but that does not prove all 88 layers or all projection kinds are correct.
-2. **KV cache / attention scores at last prompt token**: very plausible. The first place where sequential prefill differs from the trivial BOS test is layer-0 attention over `past_len > 1`.
-3. **lm_head BF16 GEMM/layout**: plausible if `h_after_final_norm` cosine against vLLM is good but logits are wrong.
-4. **RoPE interleaving mismatch**: unlikely. vLLM initializes Llama-family RoPE with `is_neox_style = True`, which is split-half.
-5. **YaRN mscale “double application”**: unlikely. vLLM’s YaRN cache does `cos = cos(...) * self.mscale` and `sin = sin(...) * self.mscale`; HF applies `attention_scaling` to both cos and sin.
+## Verified correct
 
-**Source Findings**
-Local rvllm YaRN tables:
-- [mistral35_yarn.rs](/home/r00t/workspace/upstream/rvllm-serve/v3/crates/rvllm-runtime/src/mistral35_yarn.rs:91): `yarn_mscale()` computes `0.1 * scale * ln(factor) + 1`.
-- [mistral35_yarn.rs](/home/r00t/workspace/upstream/rvllm-serve/v3/crates/rvllm-runtime/src/mistral35_yarn.rs:125): base inv-freq exponent is `2*i/head_dim`, matching HF/vLLM.
-- [mistral35_yarn.rs](/home/r00t/workspace/upstream/rvllm-serve/v3/crates/rvllm-runtime/src/mistral35_yarn.rs:293): tables multiply both `cos` and `sin` by `mscale`.
+| Stage                      | Verification                              | Result        |
+|----------------------------|-------------------------------------------|---------------|
+| Embed gather               | rvllm post_embed vs HF embed[token]       | byte-identical |
+| Layer 0 RMSNorm (input)    | rvllm post_rmsnorm vs numpy RMSNorm       | cos = 0.999999 |
+| Layer 0 q_proj (NVFP4 GEMM)| rvllm q_out vs numpy dequant + matmul     | cos = 0.993, magnitude 0.45×|
+| Layer 0 attention output   | rvllm attn_out vs numpy multi-key attn    | cos = 0.82, rms 0.5×|
 
-Local RoPE kernel:
-- [rope_split_half_bf16.cu](/home/r00t/workspace/upstream/rvllm-serve/kernels/rope_split_half_bf16.cu:37): pairs `i` with `i + half`, i.e. NeoX/split-half.
+The 0.45× magnitude on q_proj is consistent (K and V projections
+also at ~0.64× of numpy reference). cos = 0.993 reflects NVFP4
+quantization noise; the magnitude difference appears systematic
+but uniform across all NVFP4 GEMMs so it doesn't affect direction
+within a single op.
 
-Forward path:
-- [mistral35_bring_up.rs](/home/r00t/workspace/upstream/rvllm-serve/v3/crates/rvllm-runtime/src/mistral35_bring_up.rs:1281): `past_len = position + 1`.
-- [mistral35_bring_up.rs](/home/r00t/workspace/upstream/rvllm-serve/v3/crates/rvllm-runtime/src/mistral35_bring_up.rs:1289): attention scale is `1/sqrt(head_dim)`.
-- [mistral35_bring_up.rs](/home/r00t/workspace/upstream/rvllm-serve/v3/crates/rvllm-runtime/src/mistral35_bring_up.rs:1458): RoPE is applied to Q and K before dumps.
-- [mistral35_bring_up.rs](/home/r00t/workspace/upstream/rvllm-serve/v3/crates/rvllm-runtime/src/mistral35_bring_up.rs:1719): lm_head path is separate BF16 GEMM.
+## Verified working
 
-Reference behavior:
-- HF RoPE docs say YaRN has an `attention_factor` applied to computed cos/sin: https://huggingface.co/docs/transformers/main/internal/rope_utils
-- HF `modeling_rope_utils.py` computes YaRN `attention_factor` from `factor/mscale/mscale_all_dim`, then returns it separately; Llama/Mistral rotary forward multiplies both cos and sin by that scaling.
-- vLLM `YaRNScalingRotaryEmbedding` computes `self.mscale`, then multiplies both `cos` and `sin`: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.py
-- vLLM Llama/Mistral-family attention uses `is_neox_style = True`: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/llama.py
+- async-copy race fix on token_in_ptr (cuMemsetD32Async on the
+  compute stream, mirrors Qwen 3.6 round-26 pattern)
+- KV cache layout [max_pos, n_kv_heads, head_dim]
+- GQA mapping: q_head / gqa_ratio = kv_head (matches HF/vllm)
+- RoPE split-half (NeoX-style) with mscale baked into cos AND sin
+- attn_no_past=1 mode produces identical output to single-token
+  broadcast hack (predicted=1775)
 
-**Concrete Next Dumps**
-Add dumps for the **last prompt token**, layer 0:
+## Layer-0 attention isn't where the bug lives
 
-1. `q_pre_rope`, `k_pre_rope`, `v`
-2. `q_post_rope`, `k_post_rope`
-3. layer-0 `K_cache[0..position]`, `V_cache[0..position]`
-4. `scores[head, 0..position]` before softmax
-5. softmax weights for a few heads
-6. `attn_out`, `o_out`, `h_after_attn`, `h_after_layer0`
+Numpy reproduction of layer 0 (build K_cache from all 364 prompt
+tokens via HF-dequantized weights → full multi-key attention for
+last token):
 
-In numpy, dequant layer-0 weights and reproduce exactly:
-`embed -> rmsnorm -> q/k/v -> rope -> qk scores -> softmax_v -> o_proj -> residual -> mlp`.
+- numpy reference: scores rms=0.41, softmax H/H_unif=0.995
+- rvllm:           scores rms=0.38, softmax H/H_unif=0.997
 
-The fastest discriminator is:
+**Trained Mistral attention IS roughly uniform-ish at layer 0**
+(numpy ref confirms). Not a bug. Mid-to-late layers do the
+sharpening; rvllm fails to reach that sharpening.
 
-- If `q_pre_rope/k_pre_rope/v` mismatch: NVFP4 GEMM/dequant or tensor layout.
-- If pre-RoPE matches but post-RoPE mismatches: RoPE table/convention.
-- If post-RoPE matches but scores mismatch: KV cache layout, GQA mapping, or scale.
-- If scores match but `attn_out` mismatches: softmax/V cache.
-- If layer 0 matches, dump only `h_after_layerN` cosine for all 88 layers and bisect the first bad layer.
+## Hypotheses tried & ruled out
+
+1. **mscale double-application** — codex confirmed vllm/HF do
+   exactly the same baking; not a bug.
+2. **RoPE convention (interleaved vs split-half)** — Mistral uses
+   split-half (NeoX), matches my kernel.
+3. **SFB transform layout (m=N vs m=1)** — both worse; m_dummy=N
+   is correct (cos drops 0.993→0.50 if changed).
+4. **alpha = 1/(global*6)** — predicted shifted but cos got worse
+   (FP4_MAX factor not the missing piece).
+5. **alpha = 2/global** — predicted shifted, cos unchanged
+   (uniform scaling doesn't fix direction).
+
+## What's left
+
+The bug is in the **per-layer math compounding** — each layer
+introduces small systematic error that cumulatively rotates the
+hidden state away from what trained Mistral expects. Layer 0
+cos vs reference = 0.82; over 88 layers compounded that's far
+from the trained-model trajectory.
+
+To bisect properly:
+1. Hook into vllm's loaded Mistral3 model via collective_rpc to
+   capture per-layer hidden states for the same prompt.
+2. Run rvllm with per-layer-N hidden state dump (extend the
+   existing scores dump to per-layer h_residual).
+3. Compute cosine(rvllm[L], vllm[L]) for L=0..87. First L where
+   cosine drops below 0.95 is the divergence point.
+
+That's where the next debugging session needs to start. Without
+that, every attempted fix is a guess.
+
+## Diagnostic env knobs (committed)
+
+- `RVLLM_SMOKE_DUMP_DIR=…`        persist 14 stage dumps + scores_layer87
+- `RVLLM_SMOKE_FULL_DUMP=1`       gate the dumps (LAST call only)
+- `RVLLM_SMOKE_LAYER_RMS=1`       per-layer residual rms
+- `RVLLM_SMOKE_SINGLE=1`          skip prefill, run 1 forward
+- `RVLLM_SMOKE_ATTN_NO_PAST=1`    every layer attends to current token only
+- `RVLLM_SMOKE_ROPE_POS_OVERRIDE=N`  fix RoPE position at every layer
+- `RVLLM_NVFP4_ALPHA_MULT=K`      scale uploaded 1/global by K
+
+## Numpy diagnostic scripts in /tmp/
+
+- `cmp_embed.py`        post_embed vs HF embed[token]
+- `cmp_norm.py`         post_rmsnorm vs numpy RMSNorm
+- `cmp_q_proj.py`       q_out vs numpy NVFP4 dequant + matmul
+- `cmp_lm_head.py`      h_after_final_norm × HF lm_head → top-K
+- `cmp_scores.py`       layer-87 attention distribution health
+- `cmp_layer0.py`       full layer-0 attention via HF weights
+
+---
+
+## Earlier codex consult (kept for reference)
+
+The previous file contents from codex's first review are below for
+the historical record.
+
+**Short Answer (codex 2026-05-09 round 1)**
+Your #2 is probably not the bug. HF and vLLM both apply YaRN's
+attention factor by multiplying both `cos` and `sin`, so Q and K
+both get scaled and attention scores effectively get
+`mscale^2 / sqrt(d)`. For this checkpoint, that is expected
+behavior, not a double-application bug.
+
+The top suspects now are: attention/KV path at nonzero positions,
+a later-layer projection/dequant issue, or lm_head orientation/
+data mismatch. RoPE convention and YaRN table math look mostly
+correct.
+
+(Codex's full layer-0 dump diagnostic plan was the foundation for
+the bisect work above. The result confirmed his hypothesis #1 —
+layer-by-layer divergence — over hypothesis #4 RoPE or #5 mscale.)
