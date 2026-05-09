@@ -153,6 +153,41 @@ pub async fn spawn_cuda_worker(
                     let token_id: u32 = *prompt.last().unwrap();
                     let summary = match smoke {
                         Ok(d) => {
+                            // Optional: persist all stage vectors to disk
+                            // for offline compare against a vllm reference.
+                            // RVLLM_SMOKE_DUMP_DIR=/tmp/rvllm-mistral35-dump
+                            if let Some(dir) = std::env::var_os("RVLLM_SMOKE_DUMP_DIR") {
+                                let dir = std::path::PathBuf::from(dir);
+                                let _ = std::fs::create_dir_all(&dir);
+                                let dumps: &[(&str, &[f32])] = &[
+                                    ("post_embed", &d.post_embed),
+                                    ("post_rmsnorm", &d.post_rmsnorm),
+                                    ("q_out", &d.q_out),
+                                    ("k_out", &d.k_out),
+                                    ("v_out", &d.v_out),
+                                    ("attn_out", &d.attn_out),
+                                    ("o_out", &d.o_out),
+                                    ("h_after_attn", &d.h_after_attn),
+                                    ("post_attn_norm", &d.post_attn_norm),
+                                    ("gate_out", &d.gate_out),
+                                    ("up_out", &d.up_out),
+                                    ("silu_mid", &d.silu_mid),
+                                    ("down_out", &d.down_out),
+                                    ("h_after_layer0", &d.h_after_layer0),
+                                    ("h_after_final_norm", &d.h_after_final_norm),
+                                ];
+                                for (name, v) in dumps {
+                                    if v.is_empty() { continue; }
+                                    let path = dir.join(format!("{name}.f32"));
+                                    let bytes: Vec<u8> = v.iter()
+                                        .flat_map(|x| x.to_le_bytes()).collect();
+                                    if let Err(e) = std::fs::write(&path, &bytes) {
+                                        tracing::error!("dump write {path:?}: {e}");
+                                    }
+                                }
+                                tracing::info!(?dir,
+                                    "mistral35 smoke stages written");
+                            }
                             stage_stats("post_embed", &d.post_embed);
                             stage_stats("post_rmsnorm", &d.post_rmsnorm);
                             stage_stats("q_out", &d.q_out);

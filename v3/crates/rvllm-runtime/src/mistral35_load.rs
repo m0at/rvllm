@@ -240,8 +240,10 @@ fn upload_nvfp4_linear(
     // Therefore the device scalar passed to CUTLASS must be the decode
     // scale, `1 / weight_global_scale`, not the checkpoint value.
     let gs_f32: f32 = f32::from_le_bytes([gs_raw[0], gs_raw[1], gs_raw[2], gs_raw[3]]);
+    let alpha_mult: f32 = std::env::var("RVLLM_NVFP4_ALPHA_MULT")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let alpha_f32 = if gs_f32.is_finite() && gs_f32 != 0.0 {
-        1.0_f32 / gs_f32
+        alpha_mult / gs_f32
     } else {
         gs_f32
     };

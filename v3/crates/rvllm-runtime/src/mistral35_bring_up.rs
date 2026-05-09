@@ -1131,23 +1131,31 @@ impl Mistral35Bringup {
             "forward_smoke_layer0: scratch absent".into(),
         ))?;
         let hidden_bytes = (hidden as usize) * 2; // BF16
-        // Refresh the input-token slot. 4 bytes HtoD per call; we still
-        // do this since the token id changes every step.
+        // Refresh the input-token slot via cuMemsetD32Async ON OUR
+        // CUSTOM STREAM. This is the same race-fix pattern Qwen 3.6
+        // landed: sync `cuMemcpyHtoD_v2` synchronizes only with the
+        // DEFAULT stream — our compute stream is non-blocking, so
+        // sync HtoD doesn't wait for prior kernels on it, which means
+        // a freshly-written token_in_ptr can be overwritten BEFORE
+        // the prior call's embed_gather has read it. cuMemsetD32Async
+        // queues on our stream so it serializes naturally with
+        // embed_gather (which runs after it on the same stream).
+        // Single-token mode worked because there was no prior call
+        // to race with.
         unsafe {
             use cudarc::driver::sys::*;
-            let bytes = token_id.to_le_bytes();
-            let r = cuMemcpyHtoDAsync_v2(
+            let r = cuMemsetD32Async(
                 scr.token_in_ptr as CUdeviceptr,
-                bytes.as_ptr() as *const std::ffi::c_void,
-                4,
+                token_id, // u32 broadcast
+                1,        // count
                 stream_u64 as CUstream,
             );
             if r != CUresult::CUDA_SUCCESS {
                 return Err(RvllmError::cuda(
-                    "cuMemcpyHtoDAsync(token_in)",
+                    "cuMemsetD32Async(token_in)",
                     rvllm_core::CudaErrorKind::MemcpyFailed,
                     rvllm_core::CudaCtx { stream: stream_u64,
-                        kernel: "token_in_htod", launch: None, device: -1 },
+                        kernel: "token_in_d32async", launch: None, device: -1 },
                 ));
             }
         }
@@ -1156,7 +1164,12 @@ impl Mistral35Bringup {
         // Per-stage dumps cost a fence + DtoH each. Off by default in
         // multi-token generation paths; turn on with
         // RVLLM_SMOKE_FULL_DUMP=1 for one-shot diagnostics.
-        let full_dump = std::env::var_os("RVLLM_SMOKE_FULL_DUMP").is_some();
+        // Stage dumps cost a fence + DtoH each (huge per prefill step).
+        // Only enable when explicitly asked AND only on the LAST call
+        // of generate_smoke (= compute_logits=true) so a 364-token
+        // prefill doesn't trigger 364×14 dumps.
+        let full_dump = std::env::var_os("RVLLM_SMOKE_FULL_DUMP").is_some()
+            && compute_logits;
 
         // Helper: fence + DtoH a bf16 region of `count` elements, widen to f32.
         // Returns empty Vec when full_dump is off.
@@ -1278,7 +1291,12 @@ impl Mistral35Bringup {
         ))?;
         // For now: position=0, past_len=1. Decode loop will increment.
         let attn_position: i32 = rope_position;
-        let past_len: i32 = attn_position + 1;
+        // Diagnostic: RVLLM_SMOKE_ATTN_NO_PAST=1 makes attention only
+        // see the current token (single key, broadcast V) — i.e.
+        // ignore the KV cache. If predictions stop being garbage with
+        // this on, multi-key attention is the bug.
+        let attn_no_past = std::env::var_os("RVLLM_SMOKE_ATTN_NO_PAST").is_some();
+        let past_len: i32 = if attn_no_past { 1 } else { attn_position + 1 };
         if (past_len as usize) > kv_cache.max_pos {
             return Err(corrupt(
                 self.paths.model_dir.clone(),
@@ -1304,7 +1322,12 @@ impl Mistral35Bringup {
                 let mut v_cache = layer_kv.v_ptr;
                 let mut nkv = n_kv_heads_attn;
                 let mut hd = head_dim_attn;
-                let mut pos = attn_position;
+                // With attn_no_past, KV cache write goes to slot 0
+                // (overwriting prior tokens), and qk_dot reads only
+                // slot 0 (past_len=1). This degenerates to "current
+                // token attends to itself" — same as the broadcast
+                // hack baseline.
+                let mut pos = if attn_no_past { 0 } else { attn_position };
                 let args = [
                     (&mut kin) as *mut u64 as *mut std::ffi::c_void,
                     (&mut vin) as *mut u64 as *mut std::ffi::c_void,
@@ -1385,12 +1408,18 @@ impl Mistral35Bringup {
             }
             Ok(())
         };
+        // Diagnostic knob: RVLLM_SMOKE_ROPE_POS_OVERRIDE=0 forces every
+        // layer's RoPE to position=0. If the model's output changes
+        // with this on, the bug touches RoPE; if it stays at the same
+        // wrong predicted token, RoPE is not the issue.
+        let rope_pos_override: Option<i32> = std::env::var("RVLLM_SMOKE_ROPE_POS_OVERRIDE")
+            .ok().and_then(|s| s.parse().ok());
         let rope = |buf_ptr: u64, n_heads: u32| -> Result<()> {
             let mut ptr = buf_ptr;
             let mut cos_ptr = rope_tables.cos_ptr;
             let mut sin_ptr = rope_tables.sin_ptr;
             let mut head_dim_arg = head_dim_for_rope;
-            let mut pos_arg = rope_position;
+            let mut pos_arg = rope_pos_override.unwrap_or(rope_position);
             let args = [
                 (&mut ptr) as *mut u64 as *mut std::ffi::c_void,
                 (&mut cos_ptr) as *mut u64 as *mut std::ffi::c_void,
@@ -1840,6 +1869,20 @@ impl Mistral35Bringup {
                     kv_cache.max_pos),
             ));
         }
+        // RVLLM_SMOKE_SINGLE=1: skip the prefill loop entirely and run
+        // only ONE forward with the LAST prompt token at position 0.
+        // Diagnostic mode for isolating embed/forward bugs without
+        // KV-cache state from prior steps.
+        if std::env::var_os("RVLLM_SMOKE_SINGLE").is_some() {
+            let tok = *prompt.last().unwrap();
+            let dump = self.forward_smoke_q_proj_inner(tok, 0, true)?;
+            return Ok(GenerateSmokeResult {
+                tokens: vec![tok, dump.predicted_token],
+                last_dump: Some(dump),
+                prompt_len: 1,
+            });
+        }
+
         // Capture arena state right before the first per-token forward;
         // each call's transient scratch lives between checkpoint and
         // restore so the arena footprint doesn't grow with sequence
