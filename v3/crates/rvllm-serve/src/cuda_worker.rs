@@ -143,16 +143,74 @@ pub async fn spawn_cuda_worker(
                     } else {
                         req.prompt_ids.clone()
                     };
-                    let max_new: usize = std::env::var("RVLLM_SMOKE_MAX_NEW")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-                    let eos: Vec<u32> = vec![2];
-                    let gen = unsafe {
-                        bringup.generate_smoke(&prompt, max_new, &eos)
+                    // Respect the API's max_tokens; cap at
+                    // RVLLM_SMOKE_MAX_NEW (env diagnostic ceiling) when
+                    // set, else just use the request value with a sane
+                    // upper bound so a forgotten max_tokens doesn't hang
+                    // the worker forever.
+                    let env_max: Option<usize> = std::env::var("RVLLM_SMOKE_MAX_NEW")
+                        .ok().and_then(|s| s.parse().ok());
+                    let req_max = (req.max_new_tokens as usize).max(1);
+                    let max_new: usize = match env_max {
+                        Some(em) => req_max.min(em),
+                        None => req_max,
                     };
-                    let smoke = gen.map(|r| r.last_dump.expect("at least one forward"));
+                    // F1#1 fix: use the request's resolved stop_token_ids
+                    // (handler already merged tokenizer EOS + user
+                    // `stop` strings) so user stops actually halt
+                    // generation. Falls back to canonical Mistral EOS=2
+                    // if the handler somehow passed an empty list.
+                    let eos: Vec<u32> = if req.stop_token_ids.is_empty() {
+                        vec![2]
+                    } else {
+                        req.stop_token_ids.clone()
+                    };
+                    // F1#2 fix: rebind the CUDA context to this OS
+                    // thread before each request. Mirrors the Qwen
+                    // path's GB10 fix — after a long idle the worker
+                    // thread otherwise hits cuLaunchKernel errors.
+                    #[cfg(feature = "cuda")]
+                    if let Some(ctx) = bringup.ctx.as_ref() {
+                        if let Err(e) = ctx.bind_to_current_thread() {
+                            let _ = req.events_tx.send(GenerateEvent::Error(
+                                format!("mistral35 ctx rebind: {e:?}")));
+                            continue;
+                        }
+                    }
+                    // F1#1 fix: pass cancellation flag so client
+                    // disconnects + request_timeout actually halt the
+                    // 88-layer-per-token loop instead of waiting for it
+                    // to finish.
+                    let cancel_ref: &std::sync::atomic::AtomicBool = &*req.cancelled;
+                    let gen = unsafe {
+                        bringup.generate(
+                            &prompt, max_new, &eos,
+                            Some(cancel_ref),
+                            |_t| {/* per-token hook reserved for
+                                     future SSE early-flush; the
+                                     post-loop emit below already
+                                     covers max_tokens=N */},
+                        )
+                    };
+                    let (gen_tokens, prompt_len_for_log, last_dump_opt, gen_err) = match gen {
+                        Ok(r) => (r.tokens, r.prompt_len, r.last_dump, None),
+                        Err(e) => (Vec::new(), prompt.len(), None, Some(e)),
+                    };
+                    if !gen_tokens.is_empty() {
+                        tracing::info!(
+                            "mistral35 generated tokens: prompt_len={} all={:?} new={:?}",
+                            prompt_len_for_log,
+                            &gen_tokens[..],
+                            &gen_tokens.get(prompt_len_for_log..).unwrap_or(&[]));
+                    }
                     let token_id: u32 = *prompt.last().unwrap();
-                    let summary = match smoke {
-                        Ok(d) => {
+                    // #3 fix: last_dump is Optional now (cancellation
+                    // before the first forward leaves it None instead
+                    // of panicking via .expect("at least one forward")).
+                    // The dump-stages summary is purely diagnostic —
+                    // skip it cleanly when missing.
+                    let summary = match (&last_dump_opt, &gen_err) {
+                        (Some(d), _) => {
                             // Optional: persist all stage vectors to disk
                             // for offline compare against a vllm reference.
                             // RVLLM_SMOKE_DUMP_DIR=/tmp/rvllm-mistral35-dump
@@ -247,11 +305,51 @@ pub async fn spawn_cuda_worker(
                                 d.predicted_token, parts.join(",")
                             )
                         }
-                        Err(e) => format!("smoke FAILED: {e:?}"),
+                        (None, Some(e)) => format!("generate FAILED: {e:?}"),
+                        (None, None) => format!(
+                            "in={token_id} cancelled before any forward completed"
+                        ),
                     };
-                    let _ = req.events_tx.send(GenerateEvent::Error(format!(
-                        "[mistral35-smoke debug] {summary}"
-                    )));
+                    // P1a fix: stream actual generated tokens to the
+                    // client as Token events, then a Done event. The
+                    // smoke debug summary still goes to the tracing
+                    // log for diagnostics; production callers see real
+                    // completions instead of a hardcoded error.
+                    if let Some(toks) = gen_tokens.get(prompt_len_for_log..)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let stop_set: std::collections::HashSet<u32> =
+                            req.stop_token_ids.iter().copied().collect();
+                        let mut completion: u32 = 0;
+                        let mut finish = FinishReason::Length;
+                        for (step, &tok) in toks.iter().enumerate() {
+                            if stop_set.contains(&tok) {
+                                finish = FinishReason::Stop;
+                                break;
+                            }
+                            let _ = req.events_tx.send(GenerateEvent::Token {
+                                id: tok,
+                                position: (prompt_len_for_log + step) as u32,
+                            });
+                            completion += 1;
+                            if req.cancelled.load(Ordering::Relaxed) {
+                                finish = FinishReason::Cancelled;
+                                break;
+                            }
+                        }
+                        let _ = req.events_tx.send(GenerateEvent::Done {
+                            finish,
+                            completion_tokens: completion,
+                            prompt_tokens: prompt_len_for_log as u32,
+                        });
+                        tracing::debug!("[mistral35-smoke debug] {summary}");
+                    } else {
+                        // Generation failed or produced no new tokens —
+                        // surface the smoke summary as an error.
+                        let _ = req.events_tx.send(GenerateEvent::Error(format!(
+                            "[mistral35-smoke debug] {summary}"
+                        )));
+                    }
                 }
                 tracing::info!("Mistral 3.5 cuda worker queue closed, exiting");
                 return;

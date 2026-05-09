@@ -521,6 +521,13 @@ impl CublasLt {
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("cublasLtMatmul(bf16)"));
         }
+        // F3#4: removed `cuCtxSynchronize()` — was needed when
+        // `Stream::new` used `CU_STREAM_NON_BLOCKING` and cublasLt's
+        // legacy-default-stream work slipped past `cuStreamSynchronize`.
+        // Stream::new now uses `CU_STREAM_DEFAULT`, which serializes
+        // with the legacy NULL stream, so a per-call `stream.fence()`
+        // (= cuStreamSynchronize) is sufficient. Keeping the heavy
+        // ctx-wide barrier here would crater Mistral's latency.
         Ok(())
     }
 

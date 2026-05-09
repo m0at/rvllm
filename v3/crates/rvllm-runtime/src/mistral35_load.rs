@@ -179,36 +179,48 @@ fn upload_nvfp4_linear(
     }
     let nat_region = arena.region("mistral35_w_sfb_natural", scale_raw.len(), 16)?;
     unsafe { nat_region.copy_from_host(scale_raw)? };
+    let sfb_natural_ptr = nat_region.device_ptr();
 
-    // (3) Persistent CUTLASS-interleaved SFB target.
-    let sfb_bytes = backend.nvfp4_sfb_bytes(shape.n as i32, shape.k as i32);
-    if sfb_bytes == 0 {
-        return Err(RvllmError::Loader {
-            err: LoaderError::Corrupt {
-                detail: format!(
-                    "cutlass nvfp4_sfb_bytes(n={}, k={}) = 0 — backend not \
-                     active or shape rejected",
-                    shape.n, shape.k,
-                ),
-            },
-            ctx: LoaderCtx {
-                path: pool.model_dir.clone(),
-                tensor: Some(scale_name.clone()),
-            },
-            bt: std::backtrace::Backtrace::capture(),
-        });
-    }
-    let sfb_region = arena.region("mistral35_w_sfb_cutlass", sfb_bytes, 16)?;
-    unsafe {
-        backend.launch_nvfp4_sfb_transform(
-            nat_region.device_ptr(),
-            sfb_region.device_ptr(),
-            shape.n as i32,
-            shape.k as i32,
-            stream,
-        )?;
-    }
-    let sfb_cutlass_ptr = sfb_region.device_ptr();
+    // (3) Persistent CUTLASS-interleaved SFB target — only built for
+    // the legacy W4A4 NVFP4 tensor-core GEMM path. The default fused
+    // W4A16 GEMV (`RVLLM_W4A16_GEMV` ≠ "0") consumes
+    // `sfb_natural_ptr` directly and never reads `sfb_cutlass_ptr`, so
+    // building it would waste ~10 MiB × 7 × 88 ≈ 6 GiB of arena and
+    // 616 transform launches per bring-up.
+    let want_legacy_cutlass = std::env::var("RVLLM_W4A16_GEMV")
+        .map(|s| matches!(s.as_str(), "0" | "false" | "FALSE")).unwrap_or(false);
+    let (sfb_cutlass_ptr, sfb_bytes) = if want_legacy_cutlass {
+        let sfb_bytes = backend.nvfp4_sfb_bytes(shape.n as i32, shape.k as i32);
+        if sfb_bytes == 0 {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "cutlass nvfp4_sfb_bytes(n={}, k={}) = 0 — backend not \
+                         active or shape rejected",
+                        shape.n, shape.k,
+                    ),
+                },
+                ctx: LoaderCtx {
+                    path: pool.model_dir.clone(),
+                    tensor: Some(scale_name.clone()),
+                },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let sfb_region = arena.region("mistral35_w_sfb_cutlass", sfb_bytes, 16)?;
+        unsafe {
+            backend.launch_nvfp4_sfb_transform(
+                nat_region.device_ptr(),
+                sfb_region.device_ptr(),
+                shape.n as i32,
+                shape.k as i32,
+                stream,
+            )?;
+        }
+        (sfb_region.device_ptr(), sfb_bytes)
+    } else {
+        (0u64, 0usize)
+    };
 
     // (4) weight_global_scale  F32 [1]
     let gs_name = format!("{base}.weight_global_scale");
@@ -240,8 +252,49 @@ fn upload_nvfp4_linear(
     // Therefore the device scalar passed to CUTLASS must be the decode
     // scale, `1 / weight_global_scale`, not the checkpoint value.
     let gs_f32: f32 = f32::from_le_bytes([gs_raw[0], gs_raw[1], gs_raw[2], gs_raw[3]]);
-    let alpha_mult: f32 = std::env::var("RVLLM_NVFP4_ALPHA_MULT")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    // F4#3 fix: `RVLLM_NVFP4_ALPHA_MULT` was an unguarded debug knob
+    // that silently scaled every NVFP4 weight by `alpha_mult` if set,
+    // which would corrupt all 616 projections at once. Now gated
+    // behind `RVLLM_DEBUG_NVFP4=1` and loudly warned at startup so
+    // an operator can't accidentally inherit it from a stale shell.
+    let alpha_mult: f32 = match (
+        std::env::var("RVLLM_NVFP4_ALPHA_MULT").ok().and_then(|s| s.parse::<f32>().ok()),
+        std::env::var_os("RVLLM_DEBUG_NVFP4").is_some(),
+    ) {
+        (Some(m), true) if (m - 1.0).abs() > f32::EPSILON => {
+            // Print only once per process by stamping a static flag
+            // via the load path (this fn runs N=616 times per startup,
+            // so guard the eprint).
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::SeqCst) {
+                eprintln!(
+                    "[mistral35-load] WARNING: RVLLM_NVFP4_ALPHA_MULT={} \
+                     × every weight scale (RVLLM_DEBUG_NVFP4 set). \
+                     Use only for one-shot quantization-noise probes; \
+                     unset for production.",
+                    m,
+                );
+            }
+            m
+        }
+        (Some(m), false) if (m - 1.0).abs() > f32::EPSILON => {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "RVLLM_NVFP4_ALPHA_MULT={} silently rescales every \
+                         NVFP4 weight; refusing to load. Set \
+                         RVLLM_DEBUG_NVFP4=1 to opt in to the diagnostic, \
+                         or unset RVLLM_NVFP4_ALPHA_MULT for production.",
+                        m
+                    ),
+                },
+                ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: None },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        _ => 1.0,
+    };
     let alpha_f32 = if gs_f32.is_finite() && gs_f32 != 0.0 {
         alpha_mult / gs_f32
     } else {
@@ -254,10 +307,12 @@ fn upload_nvfp4_linear(
     Ok(Nvfp4LinearLoaded {
         shape,
         packed_ptr,
+        sfb_natural_ptr,
         sfb_cutlass_ptr,
         global_scale_ptr,
         packed_bytes,
         sfb_bytes,
+        bf16_ptr: 0,
     })
 }
 
@@ -275,7 +330,17 @@ pub fn load_mistral35_model(
     cutlass_backend: &rvllm_cutlass::lib_so::CutlassBackend,
     stream: u64,
 ) -> Result<Mistral35LoadedModel> {
-    cutlass_backend.require_nvfp4()?;
+    // F2#1 fix: only the legacy W4A4 NVFP4 tensor-core path needs the
+    // CUTLASS NVFP4 entry-point set. The default fused W4A16 GEMV
+    // never calls those symbols, so a stale / missing
+    // libcutlass_sm120.so should not block startup. Validate the
+    // weight_scale shape downstream regardless (per-projection size
+    // check is in upload_nvfp4_linear).
+    let want_legacy_cutlass = std::env::var("RVLLM_W4A16_GEMV")
+        .map(|s| matches!(s.as_str(), "0" | "false" | "FALSE")).unwrap_or(false);
+    if want_legacy_cutlass {
+        cutlass_backend.require_nvfp4()?;
+    }
     let pool = ShardPool::open(&paths.model_dir)?;
 
     let prefix = arch.weight_prefix.as_str();

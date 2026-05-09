@@ -359,7 +359,18 @@ pub async fn chat_completions(
             // post-render scan in tokenize.rs uses to splice vision
             // embeddings — letting them through would let one text part
             // consume a real image's vision slot.
-            for marker in ["<|image|>", "<|image_pad|>"] {
+            //
+            // P3 fix: include Mistral 3.5's [IMG]/[IMG_BREAK]/[IMG_END]
+            // (token ids 10/12/13) when running on that family. They
+            // are real special tokens that the Pixtral pipeline expects
+            // to appear only via the vision-attachment path.
+            let qwen_gemma_markers: &[&str] = &["<|image|>", "<|image_pad|>"];
+            let mistral_markers: &[&str] = &["[IMG]", "[IMG_BREAK]", "[IMG_END]"];
+            let markers: &[&str] = match state.vision_arch {
+                crate::router::VisionArch::Mistral35 => mistral_markers,
+                _ => qwen_gemma_markers,
+            };
+            for marker in markers {
                 if c.text_contains(marker) {
                     return Err(ApiError::invalid_param(
                         format!(
@@ -564,6 +575,20 @@ pub async fn chat_completions(
         .iter()
         .filter_map(|m| m.content.as_ref())
         .any(|c| c.image_urls().next().is_some());
+    // P1#2 fix: Mistral 3.5's worker does not yet wire vision_items
+    // into the forward (the Pixtral splice is unimplemented), so the
+    // handler used to silently swallow the image attachment and pass
+    // only repeated `[IMG]` token-id-10s as text. Reject upfront so
+    // callers see "not yet supported" instead of degenerate output.
+    if has_image_parts && matches!(state.vision_arch,
+        crate::router::VisionArch::Mistral35) {
+        return Err(ApiError::invalid_param(
+            "image input is not yet supported on the Mistral 3.5 path \
+             (Pixtral vision forward + splice is not wired in this build).",
+            "messages",
+            "image_unsupported_for_arch",
+        ));
+    }
     let vision_items: Vec<crate::worker::VisionItem> = if !has_image_parts {
         Vec::new()
     } else {
@@ -655,11 +680,22 @@ pub async fn chat_completions(
     let render_tokenizer = state.tokenizer.clone();
     let render_admission = _admission.clone();
     let render_vision_arch = state.vision_arch;
+    // P2 fix: propagate reasoning_effort to the chat template. Mistral
+    // 3.5's template reads it directly and emits the
+    // `[MODEL_SETTINGS]{"reasoning_effort": "..."}[/MODEL_SETTINGS]`
+    // block inline; values must be "none" or "high" (validated at
+    // admission). For non-Mistral families this string is just an
+    // unused jinja context value.
+    let render_reasoning_effort: String = req.reasoning_effort
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "none".to_string());
     type RenderOut = (Vec<u32>, Vec<crate::tokenize::VisionSlot>, Vec<crate::worker::VisionItem>);
     let render_join = tokio::task::spawn_blocking(move || -> ApiResult<RenderOut> {
         let _admission = render_admission;
+        let eff = render_reasoning_effort.as_str();
         if vision_items.is_empty() {
-            Ok((render_tokenizer.render_chat(&render_messages, render_tools.as_ref())?,
+            Ok((render_tokenizer.render_chat(&render_messages, render_tools.as_ref(), eff)?,
                 Vec::new(),
                 vision_items))
         } else {
@@ -668,6 +704,7 @@ pub async fn chat_completions(
                 render_tools.as_ref(),
                 &vision_items,
                 render_vision_arch,
+                eff,
             )?;
             Ok((ids, slots, vision_items))
         }
@@ -2550,21 +2587,21 @@ fn reject_oversized_prompt(
             (cap, format!("RVLLM_NUM_BLOCKS={num_blocks} × block_size={BLOCK_SIZE}"))
         }
         crate::router::VisionArch::Mistral35 => {
-            // Mistral 3.5 uses the same paged NVFP4 KV layout as the
-            // existing NVFP4 path. Until the worker is wired through
-            // (Phase 5), reuse `RVLLM_NUM_BLOCKS × block_size=32` as
-            // the same admission ceiling Gemma 4 uses; once the real
-            // bring-up reports its KV capacity this branch reads from
-            // it directly.
-            const BLOCK_SIZE: u32 = 32;
-            let num_blocks: u32 = std::env::var("RVLLM_NUM_BLOCKS")
+            // P1b fix: Mistral 3.5 KV cache is sized at bring-up by
+            // `RVLLM_KV_CACHE_MAX_POS` (fallback = config's
+            // original_max_position_embeddings = 4096 for this
+            // checkpoint). The handler used to admit up to
+            // RVLLM_NUM_BLOCKS × 32 (= 32768) which let 4097..32768
+            // token requests pass admission and burn GPU work before
+            // erroring inside `generate_smoke`. Cap at the actual KV
+            // capacity instead.
+            let kv_max_pos: u64 = std::env::var("RVLLM_KV_CACHE_MAX_POS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(1024);
-            let cap = num_blocks as u64 * BLOCK_SIZE as u64;
+                .unwrap_or(4096);
             (
-                cap,
-                format!("RVLLM_NUM_BLOCKS={num_blocks} × block_size={BLOCK_SIZE} (mistral35)"),
+                kv_max_pos,
+                format!("RVLLM_KV_CACHE_MAX_POS={kv_max_pos} (mistral35)"),
             )
         }
     };
@@ -2614,6 +2651,20 @@ fn reject_unsupported_sampling_for_arch(
     if matches!(arch, VisionArch::Qwen36) && !sampling.is_greedy() {
         return Err(ApiError::invalid_param(
             "qwen3-6 path is greedy-only today: non-greedy sampling \
+             (temperature>0 / top_p<1 / top_k / seed) is not supported. \
+             Set temperature=0 explicitly, or omit it to take the \
+             greedy default.",
+            "temperature",
+            "sampling_unsupported_for_arch",
+        ));
+    }
+    // P1#1 fix: Mistral 3.5 worker uses argmax_kernel directly (see
+    // mistral35_bring_up.rs::forward_smoke_q_proj_inner). Non-greedy
+    // sampling would silently be ignored; reject upfront so callers
+    // see a real error instead of unexpected greedy output.
+    if matches!(arch, VisionArch::Mistral35) && !sampling.is_greedy() {
+        return Err(ApiError::invalid_param(
+            "mistral 3.5 path is greedy-only today: non-greedy sampling \
              (temperature>0 / top_p<1 / top_k / seed) is not supported. \
              Set temperature=0 explicitly, or omit it to take the \
              greedy default.",

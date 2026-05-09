@@ -202,7 +202,9 @@ for arch in $ARCHS; do
             logit_softcap|hadamard_unrotate_f16|\
             scale_cols_f16|scale_cols_f32|scale_rows_f32_ratio|\
             argmax|rmsnorm_inplace_*|residual_scale_f16|vnorm_f16|\
-            vector_add_*|f32_to_*|f16_to_*|bf16_to_*) return 0 ;;
+            vector_add_*|f32_to_*|f16_to_*|bf16_to_*|\
+            mistral35_*|nvfp4_dequant_weights_bf16|\
+            rope_split_half_bf16) return 0 ;;
             *) return 1 ;;
         esac
     }

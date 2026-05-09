@@ -94,6 +94,16 @@ pub struct Mistral35ForwardKernels {
     pub fn_qk_dot_bf16: KernelFn,
     pub softmax_v_bf16_mod: LoadedModule,
     pub fn_softmax_v_bf16: KernelFn,
+    // W4A16 NVFP4 path (Mistral 3.5 checkpoint format): dequantize
+    // weight blocks to BF16 then run `cublasLt bf16_gemm_f32`. The
+    // legacy W4A4 (CUTLASS NVFP4 tensor-core) path is kept compiled
+    // but no longer wired in `gemm` — see MISTRAL35_BUG_HUNT.md.
+    pub nvfp4_dequant_weights_bf16_mod: LoadedModule,
+    pub fn_nvfp4_dequant_weights_bf16: KernelFn,
+    pub f32_to_bf16_mod: LoadedModule,
+    pub fn_f32_to_bf16: KernelFn,
+    pub mistral35_w4a16_gemv_bf16_mod: LoadedModule,
+    pub fn_mistral35_w4a16_gemv_bf16: KernelFn,
 }
 
 /// Pre-allocated per-token forward scratch — sized for m=1 across
@@ -122,6 +132,11 @@ pub struct Mistral35Scratch {
     pub silu_mid_ptr: u64,        // BF16 [intermediate]
     pub down_out_ptr: u64,        // BF16 [hidden]
     pub workspace_ptr: u64,       // CUTLASS GEMM scratch
+    pub w_bf16_scratch_ptr: u64,  // BF16 dequantized weight tile,
+                                  //   sized to max(n*k) across projections
+    pub w_bf16_scratch_bytes: usize,
+    pub out_f32_scratch_ptr: u64, // F32 [1, max_n] for cublasLt output
+                                  //   before f32_to_bf16 cast
     pub workspace_bytes: usize,
     pub logits_ptr: u64,          // F32 [vocab]
     pub token_out_ptr: u64,       // i32 [1] — argmax target
@@ -131,7 +146,37 @@ pub struct Mistral35Scratch {
 /// `[max_pos, n_kv_heads, head_dim]` row-major. Allocated
 /// up-front in the arena at bring-up time, one (K, V) pair per
 /// transformer layer. The `position`-th token's K and V are
-/// written at slot `position` by the kv_cache_write kernel.
+/// written at slot `position` by the `mistral35_kv_cache_write_bf16`
+/// kernel and read back by `mistral35_qk_dot_bf16` /
+/// `mistral35_softmax_v_bf16`. No NVFP4-KV path is wired in
+/// Mistral today.
+///
+/// ## Lifetime invariant (#4 — explicit)
+///
+/// The cache is **persistent across requests** — only one request
+/// runs at a time today and there is no `reset()` between them.
+/// Correctness rests on a single load-bearing invariant enforced
+/// by the forward path:
+///
+/// **For every (layer, position) read at slot `s`, the same
+/// (layer, position=s) was written earlier in the SAME request.**
+///
+/// `attention_step` only reads slots `0 .. past_len`, where
+/// `past_len = position + 1` and every prior `position` in
+/// `[0, position]` was written by an earlier `prefill_token` /
+/// `decode_token` call within the current `generate()` call.
+/// Slots `≥ past_len` are never read, so any stale state from a
+/// previous request at those positions is unobservable.
+///
+/// Cancellation cannot violate this: a cancelled request leaves
+/// stale state at positions it had written, but the next request
+/// starts at `position=0` and overwrites those slots before reading
+/// them. Slots beyond the new request's max position are not read.
+///
+/// Anything that wants to violate this rule (paged batching,
+/// prefix-cache reuse, speculative decode) MUST first switch to
+/// per-request seq-id tagging or an explicit length-bounded slice;
+/// it is not safe to silently relax `past_len = position + 1`.
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct LayerKvCache {
@@ -237,67 +282,18 @@ pub enum Mistral35Error {
     NoCudaFeature,
 }
 
-/// Which NVFP4-KV decode kernel can serve a given GQA ratio.
-///
-/// The existing NVFP4-KV decode kernel set has compile-time caps:
-///
-/// - `kernels/flash_attention_nvfp4kv.cu::MAX_GQA_DECODE = 4`
-///   (also `..._bf16out.cu`) — fused per-`(seq, kv_head)` decode that
-///   loads K/V exactly once per tile and computes Q·Kᵀ for all q-heads
-///   sharing that kv-head. Gemma 4 sliding (GQA=2) fits.
-/// - `kernels/flash_attention_split_decode_nvfp4kv.cu::MAX_GQA_SPLIT = 8`
-///   (also `..._bf16out.cu`) — paged_attention_v2-style split decode.
-///   Qwen 3.6 (GQA=8) fits.
-/// - Per-head fallback (`flash_attention_2_decode_nvfp4kv_kernel`) — one
-///   block per `(seq, head)`. Loads K/V once per tile per Q-HEAD
-///   instead of per (seq, kv_head); ~`gqa_ratio×` bandwidth waste vs
-///   the fused path, but works for any GQA.
-///
-/// Mistral 3.5 has GQA=12. The kernel-side fix is to raise both
-/// constants to ≥12 (q_reg / row_max / acc / s_score allocations
-/// scale linearly; sm_121 has the register + smem headroom). Until
-/// that lands, Mistral routes through the per-head fallback —
-/// correct, just slower. The gate lives here so a future kernel
-/// rebuild flips the strategy without changing the runtime.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum KvDecodeStrategy {
-    /// `flash_attention_2_decode_nvfp4kv_gqa_kernel` — fused
-    /// per-(seq, kv_head), MAX_GQA_DECODE=4. Tightest path.
-    FusedGqa,
-    /// `paged_attention_v2_split_decode_nvfp4kv_kernel` —
-    /// MAX_GQA_SPLIT=8. Used for Qwen 3.6's GQA=8.
-    SplitDecode,
-    /// `flash_attention_2_decode_nvfp4kv_kernel` — one block per
-    /// (seq, head). Works for any GQA at the cost of `gqa_ratio×`
-    /// duplicated K/V load. Mistral 3.5 (GQA=12) currently routes
-    /// here.
-    PerHeadFallback,
-}
-
-impl KvDecodeStrategy {
-    /// Pick a strategy from the model's GQA ratio. The per-head
-    /// fallback is universal; we prefer the fused / split paths
-    /// whenever the kernel cap covers the requested ratio.
-    pub fn for_gqa_ratio(gqa_ratio: usize) -> Self {
-        // Match the kernel-side caps exactly. Bumping these here
-        // without bumping MAX_GQA_DECODE / MAX_GQA_SPLIT in the .cu
-        // sources would silently route Mistral through a kernel
-        // that returns early on `GQA > MAX_*`.
-        const MAX_GQA_DECODE_FUSED: usize = 4;
-        const MAX_GQA_SPLIT: usize = 8;
-
-        if gqa_ratio == 0 {
-            return Self::PerHeadFallback;
-        }
-        if gqa_ratio <= MAX_GQA_DECODE_FUSED {
-            Self::FusedGqa
-        } else if gqa_ratio <= MAX_GQA_SPLIT {
-            Self::SplitDecode
-        } else {
-            Self::PerHeadFallback
-        }
-    }
-}
+// F4#1 fix: the legacy `KvDecodeStrategy` enum + GQA routing logic
+// was inherited from Gemma 4 / Qwen 3.6 NVFP4-KV decode kernels and
+// did NOT describe what Mistral 3.5 actually executes. Mistral
+// allocates a BF16 KV cache and runs dedicated
+// `mistral35_qk_dot_bf16` / `mistral35_softmax_v_bf16` kernels in
+// `attention_step`. The enum was logged at startup ("legacy
+// nvfp4_kv_decode_strategy={:?} unused") which lied about the
+// runtime path. Removed entirely. If Mistral is ever switched onto
+// a real NVFP4-KV path, raise `MAX_GQA_DECODE`/`MAX_GQA_SPLIT` in
+// `kernels/flash_attention*nvfp4kv.cu` to ≥12 AND pack/write/read
+// KV via the NVFP4 path — at that point reintroduce a Mistral-
+// specific strategy enum that actually branches in the forward.
 
 /// Per-layer scratch budget for one Mistral 3.5 prefill chunk of
 /// `m` tokens. Outputs are byte counts the runtime needs to reserve
@@ -458,17 +454,6 @@ impl Mistral35Bringup {
 }
 
 impl Mistral35Bringup {
-    /// Decode-strategy gate. Surfaced at startup so the operator
-    /// log line records exactly which path each request will take.
-    pub fn kv_decode_strategy(&self) -> KvDecodeStrategy {
-        let q = self.arch.text.num_attention_heads;
-        let kv = self.arch.text.num_key_value_heads;
-        if kv == 0 {
-            return KvDecodeStrategy::PerHeadFallback;
-        }
-        KvDecodeStrategy::for_gqa_ratio(q / kv)
-    }
-
     /// Resolved batched-prefill phase configuration. Read once at
     /// startup so individual layer-launches can branch in O(1) on
     /// the cached struct rather than touching env vars per launch.
@@ -648,10 +633,52 @@ impl Mistral35Bringup {
             let arena_box = Box::new(arena_static);
             let stream = rvllm_mem::stream::Stream::new(&ctx)?;
 
+            // F2#4 fix: validate the kernel manifest BEFORE the 60-90 s
+            // weight upload so a stale build (kernels/build.sh not
+            // re-run after a Mistral kernel edit) fails fast instead
+            // of burning a minute of upload before erroring.
+            {
+                let kernels_dir =
+                    crate::bring_up::resolve_kernels_dir(&ctx, &paths.kernels_dir)?;
+                let manifest_path = kernels_dir.join("manifest.json");
+                let manifest_pre = rvllm_kernels::manifest::KernelManifest
+                    ::load_and_verify(&manifest_path)?;
+                if let Some(t) = compile_target {
+                    manifest_pre.assert_arch(t.as_sm_str())?;
+                }
+                const MISTRAL_REQUIRED_PTX: &[&str] = &[
+                    "argmax",
+                    "embedding_gather_bf16",
+                    "f32_to_bf16",
+                    "mistral35_attn_m1_gqa_broadcast_bf16",
+                    "mistral35_kv_cache_write_bf16",
+                    "mistral35_qk_dot_bf16",
+                    "mistral35_softmax_v_bf16",
+                    "mistral35_w4a16_gemv_bf16",
+                    "nvfp4_dequant_weights_bf16",
+                    "rmsnorm_inplace_bf16_gbf16",
+                    "rope_split_half_bf16",
+                    "silu_mul_bf16",
+                    "vector_add_bf16",
+                ];
+                let missing: Vec<&&str> = MISTRAL_REQUIRED_PTX.iter()
+                    .filter(|name| manifest_pre.path_of(name).is_none())
+                    .collect();
+                if !missing.is_empty() {
+                    let names: Vec<&str> = missing.iter().map(|s| **s).collect();
+                    return Err(corrupt(
+                        paths.model_dir.clone(),
+                        format!("Mistral 3.5 bring-up: PTX manifest missing required kernels {:?}. \
+                                 Re-run `kernels/build.sh sm_121` to regenerate.",
+                                names),
+                    ));
+                }
+            }
+
             let backend_ref = cutlass_backend.as_ref().unwrap();
             eprintln!("[mistral35-load] starting weight upload (this can take ~30-90s)…");
             let t0 = std::time::Instant::now();
-            let model = crate::mistral35_load::load_mistral35_model(
+            let mut model = crate::mistral35_load::load_mistral35_model(
                 &paths,
                 &arch,
                 arena_box.as_ref(),
@@ -684,6 +711,9 @@ impl Mistral35Bringup {
             if let Some(t) = compile_target {
                 manifest.assert_arch(t.as_sm_str())?;
             }
+            // (Pre-upload manifest check above already verified the
+            // Mistral PTX set is present; this load is just for the
+            // KernelLoader handle.)
             let kernels = std::sync::Arc::new(KernelLoader::new(manifest));
             let embedding_gather_bf16_mod = kernels.load_ptx("embedding_gather_bf16")?;
             let fn_embedding_gather_bf16 = embedding_gather_bf16_mod
@@ -716,6 +746,17 @@ impl Mistral35Bringup {
             let softmax_v_bf16_mod = kernels.load_ptx("mistral35_softmax_v_bf16")?;
             let fn_softmax_v_bf16 = softmax_v_bf16_mod
                 .get_function("mistral35_softmax_v_bf16_kernel")?;
+            let nvfp4_dequant_weights_bf16_mod =
+                kernels.load_ptx("nvfp4_dequant_weights_bf16")?;
+            let fn_nvfp4_dequant_weights_bf16 = nvfp4_dequant_weights_bf16_mod
+                .get_function("nvfp4_dequant_weights_bf16_kernel")?;
+            let f32_to_bf16_mod = kernels.load_ptx("f32_to_bf16")?;
+            let fn_f32_to_bf16 = f32_to_bf16_mod
+                .get_function("f32_to_bf16_kernel")?;
+            let mistral35_w4a16_gemv_bf16_mod =
+                kernels.load_ptx("mistral35_w4a16_gemv_bf16")?;
+            let fn_mistral35_w4a16_gemv_bf16 = mistral35_w4a16_gemv_bf16_mod
+                .get_function("mistral35_w4a16_gemv_bf16_kernel")?;
             let forward_kernels = Mistral35ForwardKernels {
                 embedding_gather_bf16_mod,
                 fn_embedding_gather_bf16,
@@ -737,15 +778,44 @@ impl Mistral35Bringup {
                 fn_qk_dot_bf16,
                 softmax_v_bf16_mod,
                 fn_softmax_v_bf16,
+                nvfp4_dequant_weights_bf16_mod,
+                fn_nvfp4_dequant_weights_bf16,
+                f32_to_bf16_mod,
+                fn_f32_to_bf16,
+                mistral35_w4a16_gemv_bf16_mod,
+                fn_mistral35_w4a16_gemv_bf16,
             };
 
-            // YaRN cos/sin tables — build host-side (4096 positions ×
-            // head_dim/2 = 64 floats each, ~1 MiB per table) and upload
-            // to device as F32. Position 0 is identity (cos=1, sin=0).
+            // W4A16 pre-dequantization is NOT viable for Mistral 3.5:
+            // the model is 121B params (88 layers × 1.38B/layer), so
+            // BF16-dequantized weights would need 243 GB — exceeds the
+            // 128 GB unified-memory budget. The on-the-fly per-call
+            // dequant in `gemm` works for tests with 1–8 prompt tokens
+            // but exceeds the 600 s gateway timeout for the 364-token
+            // chat-templated prompt (224K dequant launches per request).
+            // Correct production answer: a fused m=1 W4A16 GEMV kernel
+            // (analogue of the existing fp8_gemv_blockwise family) that
+            // streams dequant inside the GEMM tile. Tracked in
+            // MISTRAL35_BUG_HUNT.md.
+
+            // P1#3 fix: RoPE tables must cover whatever positions the
+            // KV cache will be asked to fill. The HTTP admission caps
+            // requests at RVLLM_KV_CACHE_MAX_POS (default = config's
+            // original_max_position_embeddings = 4096); if an operator
+            // raises that env to e.g. 8192, attention at slot ≥ 4096
+            // would index out of the RoPE table. Pre-resolve the same
+            // fallback chain bring-up will use for kv_max_pos and
+            // build the YaRN tables to that ceiling.
+            let yarn_max_pos: usize = std::env::var("RVLLM_KV_CACHE_MAX_POS")
+                .ok().and_then(|s| s.parse().ok())
+                .unwrap_or(arch.text.yarn.original_max_position_embeddings);
+            // YaRN cos/sin tables — `yarn_max_pos` positions ×
+            // head_dim/2 = 64 floats each, ~16 B per position;
+            // upload to device as F32. Position 0 is identity (cos=1, sin=0).
             let yarn_tables = crate::mistral35_yarn::build_yarn_rope_tables(
                 &arch.text.yarn,
                 arch.text.head_dim,
-                arch.text.yarn.original_max_position_embeddings,
+                yarn_max_pos,
             );
             let cos_bytes = yarn_tables.cos.len() * 4;
             let sin_bytes = yarn_tables.sin.len() * 4;
@@ -837,6 +907,36 @@ impl Mistral35Bringup {
                 if w > max_workspace { max_workspace = w; }
             }
             let max_workspace = max_workspace.max(16);
+            // F2#3 fix: only the legacy `RVLLM_W4A16_GEMV=0`
+            // (dequant-then-cublasLt) path needs `w_bf16_scratch` (~705
+            // MB) and `out_f32_scratch` (~115 KB). Default fused W4A16
+            // GEMV reads weights direct via lin.sfb_natural_ptr and
+            // writes BF16 directly to `q_out_ptr` etc. Sizing them at
+            // 0 under fused mode reclaims real arena budget on GB10.
+            let want_legacy_dequant = std::env::var("RVLLM_W4A16_GEMV")
+                .map(|s| matches!(s.as_str(), "0" | "false" | "FALSE"))
+                .unwrap_or(false);
+            // W4A16 path scratch sizing: max BF16 dequantized weight tile
+            // across all projections. Mistral 3.5 layer projections:
+            //   q_proj/o_proj: hidden×hidden            (= 12288²)
+            //   k/v_proj:      n_kv_dim×hidden          (= 1024×12288)
+            //   gate/up_proj:  intermediate×hidden      (= 28672×12288)
+            //   down_proj:     hidden×intermediate      (= 12288×28672)
+            // → max(N*K) = max(h*h, n_q_dim*h, n_kv_dim*h, i_s*h, h*i_s).
+            let max_w_elems_legacy = (n_q_dim * h)
+                .max(n_kv_dim * h)
+                .max(h * h)
+                .max(i_s * h)
+                .max(h * i_s);
+            let max_w_bf16_bytes = if want_legacy_dequant {
+                max_w_elems_legacy * 2
+            } else { 0 };
+            // F32 output staging for cublasLt bf16_gemm_f32 — sized to
+            // max(N) across projections, m=1.
+            let max_out_n_legacy = n_q_dim.max(n_kv_dim).max(h).max(i_s);
+            let max_out_f32_bytes = if want_legacy_dequant {
+                max_out_n_legacy * 4
+            } else { 0 };
             let scratch = Mistral35Scratch {
                 token_in_ptr:   arena_box.region("mistral35_token_in", 4, 4)?.device_ptr(),
                 h_residual_ptr: arena_box.region("mistral35_h_residual", h_bytes, 16)?.device_ptr(),
@@ -857,6 +957,15 @@ impl Mistral35Bringup {
                 down_out_ptr:   arena_box.region("mistral35_down_out", h_bytes, 16)?.device_ptr(),
                 workspace_ptr:  arena_box.region("mistral35_workspace", max_workspace, 256)?.device_ptr(),
                 workspace_bytes: max_workspace,
+                w_bf16_scratch_ptr: if max_w_bf16_bytes > 0 {
+                    arena_box.region(
+                        "mistral35_w_bf16_scratch", max_w_bf16_bytes, 256)?.device_ptr()
+                } else { 0 },
+                w_bf16_scratch_bytes: max_w_bf16_bytes,
+                out_f32_scratch_ptr: if max_out_f32_bytes > 0 {
+                    arena_box.region(
+                        "mistral35_out_f32_scratch", max_out_f32_bytes, 16)?.device_ptr()
+                } else { 0 },
                 logits_ptr:     arena_box.region("mistral35_logits_f32", vocab * 4, 16)?.device_ptr(),
                 token_out_ptr:  arena_box.region("mistral35_token_out", 4, 4)?.device_ptr(),
             };
@@ -882,21 +991,17 @@ impl Mistral35Bringup {
         };
         #[cfg(not(feature = "cuda"))]
         let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
-        let strategy = bringup.kv_decode_strategy();
+        // F4#1 fix: log the actual KV path. Mistral 3.5 runs BF16 KV
+        // through `mistral35_qk_dot_bf16` + `mistral35_softmax_v_bf16`
+        // in `attention_step`; no NVFP4-KV path is wired today.
         eprintln!(
-            "[mistral35] kv_decode_strategy={:?} (gqa_ratio={})",
-            strategy,
-            bringup.arch.gqa_ratio()
+            "[mistral35] kv=bf16 (per-head BF16 attention via \
+             mistral35_qk_dot_bf16 / mistral35_softmax_v_bf16), \
+             n_q={} n_kv={} gqa_ratio={}",
+            bringup.arch.text.num_attention_heads,
+            bringup.arch.text.num_key_value_heads,
+            bringup.arch.gqa_ratio(),
         );
-        if matches!(strategy, KvDecodeStrategy::PerHeadFallback) {
-            eprintln!(
-                "[mistral35] note: Mistral 3.5's GQA=12 exceeds the existing \
-                 NVFP4-KV fused (MAX_GQA_DECODE=4) and split-decode \
-                 (MAX_GQA_SPLIT=8) kernel caps; per-head fallback is \
-                 correct but ~12x duplicated K/V load. Raise both .cu \
-                 constants to >=12 to flip onto the fused path."
-            );
-        }
         // YaRN cos/sin tables for the original-max window. The
         // device upload happens later (CUDA forward path); for now
         // we just log the table size + the mscale value so the
@@ -1009,7 +1114,15 @@ fn load_and_require_nvfp4(
         paths.cutlass_so.clone(),
         &[],
     )?;
-    backend.require_nvfp4()?;
+    // F1#3 fix: only the legacy W4A4 NVFP4 tensor-core GEMM path needs
+    // the CUTLASS NVFP4 entry-point set. The default fused W4A16 GEMV
+    // doesn't call any of those symbols, so a stale / missing
+    // libcutlass_sm120.so should not block startup.
+    let want_legacy_cutlass = std::env::var("RVLLM_W4A16_GEMV")
+        .map(|s| matches!(s.as_str(), "0" | "false" | "FALSE")).unwrap_or(false);
+    if want_legacy_cutlass {
+        backend.require_nvfp4()?;
+    }
     Ok(backend)
 }
 
@@ -1222,38 +1335,204 @@ impl Mistral35Bringup {
             Ok(())
         }
 
-        // Helper: prep_act + sfa_transform (NVFP4 activation staging).
-        let stage_act = |src_bf16_ptr: u64, k_dim: i32| -> Result<()> {
-            backend.launch_nvfp4_prep_act(
-                src_bf16_ptr,
-                scr.a_packed_ptr,
-                scr.sfa_natural_ptr,
-                m, k_dim, 1 /* BF16 */, stream_u64,
-            )?;
-            backend.launch_nvfp4_sfa_transform(
-                scr.sfa_natural_ptr,
-                scr.sfa_cutlass_ptr,
-                m, k_dim, stream_u64,
-            )
-        };
-
-        // Helper: NVFP4 GEMM using the staged a_packed + sfa_cutlass.
-        let gemm = |out_ptr: u64,
+        // W4A16 GEMM path (Mistral 3.5 NVFP4 checkpoint) —
+        //   1) dequantize the weight tile to BF16 in `w_bf16_scratch`,
+        //   2) cublasLt bf16_gemm_f32 with the BF16 activation,
+        //   3) cast f32 → bf16 into `out_ptr`.
+        // The legacy `stage_act` (NVFP4 activation prep) and the
+        // CUTLASS NVFP4 tensor-core GEMM (`backend.launch_nvfp4_gemm`)
+        // are no longer reachable on this path; see
+        // MISTRAL35_BUG_HUNT.md ROOT CAUSE for why.
+        let cublaslt_inner = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_smoke_layer0: cublaslt absent".into(),
+        ))?;
+        let kernels_inner = kernels;
+        // Fast path: fused m=1 W4A16 GEMV. Single kernel launch per
+        // projection instead of dequant→cublasLt→cast (3 launches +
+        // 705 MB scratch traffic). Default-on; opt out with
+        // RVLLM_W4A16_GEMV=0 to use the legacy dequant path.
+        let use_fused_gemv = !std::env::var("RVLLM_W4A16_GEMV")
+            .map(|s| matches!(s.as_str(), "0" | "false" | "FALSE")).unwrap_or(false);
+        let gemm = |out_bf16_ptr: u64,
+                    act_bf16_ptr: u64,
                     lin: &rvllm_loader::mistral35_weights::Nvfp4LinearLoaded|
          -> Result<()> {
-            backend.launch_nvfp4_gemm(
-                out_ptr,
-                scr.a_packed_ptr,
-                lin.packed_ptr,
-                scr.sfa_cutlass_ptr,
-                lin.sfb_cutlass_ptr,
-                lin.global_scale_ptr,
-                m, lin.shape.n as i32, lin.shape.k as i32,
-                scr.workspace_ptr,
-                workspace_bytes,
-                stream_u64,
-            )
+            let n = lin.shape.n as i32;
+            let k = lin.shape.k as i32;
+            if use_fused_gemv {
+                unsafe {
+                    let mut o   = out_bf16_ptr;
+                    let mut wp  = lin.packed_ptr;
+                    let mut ws  = lin.sfb_natural_ptr;
+                    let mut gs  = lin.global_scale_ptr;
+                    let mut a   = act_bf16_ptr;
+                    let mut narg = n;
+                    let mut karg = k;
+                    let args: [*mut std::ffi::c_void; 7] = [
+                        (&mut o)    as *mut u64 as *mut _,
+                        (&mut wp)   as *mut u64 as *mut _,
+                        (&mut ws)   as *mut u64 as *mut _,
+                        (&mut gs)   as *mut u64 as *mut _,
+                        (&mut a)    as *mut u64 as *mut _,
+                        (&mut narg) as *mut i32 as *mut _,
+                        (&mut karg) as *mut i32 as *mut _,
+                    ];
+                    rvllm_fused::launch_raw(
+                        kernels_inner.fn_mistral35_w4a16_gemv_bf16,
+                        (n as u32, 1, 1),
+                        (256, 1, 1),
+                        0, stream_u64,
+                        &args,
+                    )?;
+                }
+                return Ok(());
+            }
+            let w_elems = (n as usize) * (k as usize);
+            if w_elems * 2 > scr.w_bf16_scratch_bytes {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("gemm: w_bf16_scratch too small: \
+                             need {} bytes for n={} k={}, have {}",
+                        w_elems * 2, n, k, scr.w_bf16_scratch_bytes),
+                ));
+            }
+            // (1) Per-call dequant w_packed → BF16 scratch.
+            //     Per-token cost: 88 × 7 = 616 launches per forward.
+            //     Acceptable for short prompts (≤ a few tokens); for
+            //     full prefill of 100s of tokens, a fused m=1 W4A16
+            //     GEMV kernel is required (see MISTRAL35_BUG_HUNT.md).
+            unsafe {
+                let mut wp = lin.packed_ptr;
+                let mut ws = lin.sfb_natural_ptr;
+                let mut gs = lin.global_scale_ptr;
+                let mut wb = scr.w_bf16_scratch_ptr;
+                let mut n_arg = n;
+                let mut k_arg = k;
+                let args: [*mut std::ffi::c_void; 6] = [
+                    (&mut wp)    as *mut u64 as *mut _,
+                    (&mut ws)    as *mut u64 as *mut _,
+                    (&mut gs)    as *mut u64 as *mut _,
+                    (&mut wb)    as *mut u64 as *mut _,
+                    (&mut n_arg) as *mut i32 as *mut _,
+                    (&mut k_arg) as *mut i32 as *mut _,
+                ];
+                let blocks_x = (((k as u32) + 255) / 256).max(1);
+                rvllm_fused::launch_raw(
+                    kernels_inner.fn_nvfp4_dequant_weights_bf16,
+                    (blocks_x, n as u32, 1),
+                    (256, 1, 1),
+                    0, stream_u64,
+                    &args,
+                )?;
+            }
+            // Codex round 3 boundary-dump #1: first 256 rows of the
+            // dequantized BF16 weight tile, before the GEMM consumes it.
+            // Triggered ONCE — first gemm call when RVLLM_BOUNDARY_DUMP=1
+            // and RVLLM_SMOKE_DUMP_DIR is set. That call is layer-0 q_proj.
+            static BOUNDARY_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let do_boundary = std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some()
+                && BOUNDARY_DUMPED.compare_exchange(false, true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst).is_ok();
+            let dump_dir = if do_boundary {
+                std::env::var("RVLLM_SMOKE_DUMP_DIR").ok()
+            } else { None };
+            if let Some(ref dir) = dump_dir {
+                stream.fence()?;
+                let rows = 256.min(n as usize);
+                let bytes = rows * (k as usize) * 2;
+                let mut buf = vec![0u8; bytes];
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        scr.w_bf16_scratch_ptr as CUdeviceptr,
+                        bytes);
+                }
+                let p = std::path::PathBuf::from(dir).join("boundary_w_bf16_first256rows.bf16");
+                let _ = std::fs::write(&p, &buf);
+                eprintln!("[mistral35] boundary dump #1: w_bf16 {} rows × {} cols ({} B)",
+                    rows, k, bytes);
+            }
+            // (2) cublasLt bf16 × bf16 → f32: out[1, n] = act[1, k] · w[n, k]^T.
+            unsafe {
+                cublaslt_inner.bf16_gemm_f32(
+                    act_bf16_ptr,                // a [1, k]
+                    scr.w_bf16_scratch_ptr,      // b [n, k] BF16
+                    scr.out_f32_scratch_ptr,     // d [1, n] f32
+                    m, n, k, stream_u64,
+                )?;
+            }
+            // Codex round 3 boundary-dump #2: pre-cast F32 GEMM output.
+            if let Some(ref dir) = dump_dir {
+                stream.fence()?;
+                let bytes = (n as usize) * 4;
+                let mut buf = vec![0u8; bytes];
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        scr.out_f32_scratch_ptr as CUdeviceptr,
+                        bytes);
+                }
+                let p = std::path::PathBuf::from(dir).join("boundary_qproj_f32_pre_cast.f32");
+                let _ = std::fs::write(&p, &buf);
+                eprintln!("[mistral35] boundary dump #2: qproj F32 pre-cast ({} B)", bytes);
+            }
+            // (3) f32 → bf16 cast into the caller's output buffer.
+            unsafe {
+                let mut dst = out_bf16_ptr;
+                let mut src = scr.out_f32_scratch_ptr;
+                let mut count = n;
+                let args: [*mut std::ffi::c_void; 3] = [
+                    (&mut dst)   as *mut u64 as *mut _,
+                    (&mut src)   as *mut u64 as *mut _,
+                    (&mut count) as *mut i32 as *mut _,
+                ];
+                let blocks = ((n as u32) + 1023) / 1024;
+                rvllm_fused::launch_raw(
+                    kernels_inner.fn_f32_to_bf16,
+                    (blocks, 1, 1),
+                    (1024, 1, 1),
+                    0, stream_u64,
+                    &args,
+                )?;
+            }
+            // Codex round 3 boundary-dump #3: post-cast BF16, pre-RoPE.
+            if let Some(ref dir) = dump_dir {
+                stream.fence()?;
+                let bytes = (n as usize) * 2;
+                let mut buf = vec![0u8; bytes];
+                let mut buf2 = vec![0u8; bytes];
+                eprintln!("[mistral35-debug] in-closure: out_bf16_ptr=0x{:x}  scr.q_out_ptr=0x{:x}",
+                    out_bf16_ptr, scr.q_out_ptr);
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        out_bf16_ptr as CUdeviceptr,
+                        bytes);
+                    // Also read via scr.q_out_ptr directly to compare
+                    let _ = cuMemcpyDtoH_v2(
+                        buf2.as_mut_ptr() as *mut std::ffi::c_void,
+                        scr.q_out_ptr as CUdeviceptr,
+                        bytes);
+                }
+                let p = std::path::PathBuf::from(dir).join("boundary_qproj_bf16_post_cast.bf16");
+                let _ = std::fs::write(&p, &buf);
+                let p2 = std::path::PathBuf::from(dir).join("boundary_qproj_via_scr_q_out.bf16");
+                let _ = std::fs::write(&p2, &buf2);
+                eprintln!("[mistral35] boundary dump #3: qproj BF16 post-cast pre-RoPE ({} B)",
+                    bytes);
+            }
+            Ok(())
         };
+        // Suppress dead_code on the NVFP4 W4A4 staging — kept compiled so
+        // the CUTLASS path remains buildable for diagnostic ablations.
+        let _ = (backend, m, scr.a_packed_ptr, scr.sfa_natural_ptr,
+                 scr.sfa_cutlass_ptr, scr.workspace_ptr, workspace_bytes);
 
         // Helper: launch a kernel via the rvllm-fused launch_raw path.
         unsafe fn launch_kernel(
@@ -1311,6 +1590,12 @@ impl Mistral35Bringup {
             / self.arch.text.num_key_value_heads) as i32;
         let head_dim_attn: i32 = self.arch.text.head_dim as i32;
 
+        // Codex round-7 boundary-dump env (read once before closures
+        // so attention_step can reference them).
+        let bd_layer: Option<usize> = std::env::var("RVLLM_BOUNDARY_DUMP_LAYER")
+            .ok().and_then(|s| s.parse().ok());
+        let bd_dir: Option<String> = std::env::var("RVLLM_SMOKE_DUMP_DIR").ok();
+
         // Attention closure: KV write + qk_dot + softmax_v.
         let attention_step = |layer_idx: usize| -> Result<()> {
             let layer_kv = &kv_cache.layers[layer_idx];
@@ -1344,6 +1629,25 @@ impl Mistral35Bringup {
                         (head_dim_attn as u32, 1, 1),
                         &args, stream_u64,
                     )?;
+                }
+                // Diagnostic bypass: if RVLLM_KV_BYPASS=1, ALSO do the
+                // copy via cuMemcpyDtoDAsync to verify whether the
+                // kernel above is a no-op. Slot offset = position * nkv * hd * 2.
+                if std::env::var_os("RVLLM_KV_BYPASS").is_some() {
+                    use cudarc::driver::sys::*;
+                    let bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
+                    let pos_off = (pos as usize) * bytes;
+                    eprintln!("[mistral35-debug] bypass: kin=0x{:x} vin=0x{:x} k_dst=0x{:x} v_dst=0x{:x} bytes={} stream=0x{:x}",
+                        kin, vin, k_cache + pos_off as u64, v_cache + pos_off as u64, bytes, stream_u64);
+                    let r1 = cuMemcpyDtoDAsync_v2(
+                        (k_cache + pos_off as u64) as CUdeviceptr,
+                        kin as CUdeviceptr, bytes,
+                        stream_u64 as CUstream);
+                    let r2 = cuMemcpyDtoDAsync_v2(
+                        (v_cache + pos_off as u64) as CUdeviceptr,
+                        vin as CUdeviceptr, bytes,
+                        stream_u64 as CUstream);
+                    eprintln!("[mistral35-debug] bypass results: k={:?} v={:?}", r1, r2);
                 }
             }
 
@@ -1406,6 +1710,51 @@ impl Mistral35Bringup {
                     )?;
                 }
             }
+            // Codex round-7: layer-selectable K/V/scores/attn_out dump
+            // at the LAST forward (compute_logits=true → full_dump path
+            // is the user's expectation). For prefill of N tokens at
+            // max_new=1, that's position=N-1 with past_len=N → cache
+            // slots [0..N-1] are populated.
+            if let (Some(L), Some(ref dir)) = (bd_layer, bd_dir.as_ref()) {
+                if L == layer_idx && full_dump {
+                    stream.fence()?;
+                    let slot_bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
+                    let n_slots = past_len as usize;
+                    let kv_total = slot_bytes * n_slots;
+                    let mut buf_k = vec![0u8; kv_total];
+                    let mut buf_v = vec![0u8; kv_total];
+                    let scores_bytes = (n_q_heads_attn as usize) * n_slots * 4;
+                    let mut buf_s = vec![0u8; scores_bytes];
+                    unsafe { use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(buf_k.as_mut_ptr() as *mut std::ffi::c_void,
+                            layer_kv.k_ptr as CUdeviceptr, kv_total);
+                        let _ = cuMemcpyDtoH_v2(buf_v.as_mut_ptr() as *mut std::ffi::c_void,
+                            layer_kv.v_ptr as CUdeviceptr, kv_total);
+                        let _ = cuMemcpyDtoH_v2(buf_s.as_mut_ptr() as *mut std::ffi::c_void,
+                            kv_cache.scores_f32_ptr as CUdeviceptr, scores_bytes);
+                    }
+                    let p = std::path::PathBuf::from(dir);
+                    let _ = std::fs::write(p.join(format!("k_cache_layer{}_all_slots.bf16", L)), &buf_k);
+                    let _ = std::fs::write(p.join(format!("v_cache_layer{}_all_slots.bf16", L)), &buf_v);
+                    let _ = std::fs::write(p.join(format!("scores_layer{}_all_slots.f32", L)), &buf_s);
+                    // attn_out dump (BF16, n_q_heads*head_dim)
+                    let attn_bytes = (n_q_heads_attn as usize) * (head_dim_attn as usize) * 2;
+                    let mut buf_a = vec![0u8; attn_bytes];
+                    unsafe { use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(buf_a.as_mut_ptr() as *mut std::ffi::c_void,
+                            scr.attn_out_ptr as CUdeviceptr, attn_bytes); }
+                    let _ = std::fs::write(p.join(format!("attn_out_layer{}.bf16", L)), &buf_a);
+                    // q_out dump (post-RoPE)
+                    let q_bytes = (n_q_heads_attn as usize) * (head_dim_attn as usize) * 2;
+                    let mut buf_q = vec![0u8; q_bytes];
+                    unsafe { use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(buf_q.as_mut_ptr() as *mut std::ffi::c_void,
+                            scr.q_out_ptr as CUdeviceptr, q_bytes); }
+                    let _ = std::fs::write(p.join(format!("q_out_layer{}.bf16", L)), &buf_q);
+                    eprintln!("[mistral35-debug] layer {} dump: {} kv slots, scores stride {}",
+                        L, n_slots, n_slots);
+                }
+            }
             Ok(())
         };
         // Diagnostic knob: RVLLM_SMOKE_ROPE_POS_OVERRIDE=0 forces every
@@ -1443,6 +1792,30 @@ impl Mistral35Bringup {
         // because softmax over a single key is 1.0).
         // ============================================================
 
+        // Codex round-7: layer-selectable per-position dump of
+        // h_residual_{L-1} at the entry of layer L's processing.
+        // Triggered on EVERY forward (not just last) when env
+        // RVLLM_BOUNDARY_DUMP_LAYER=L is set.
+        let dump_h_resid_pre_layer = |target_layer: usize| -> Result<()> {
+            if let (Some(L), Some(ref dir)) = (bd_layer, bd_dir.as_ref()) {
+                if L == target_layer {
+                    stream.fence()?;
+                    let bytes = (hidden as usize) * 2;
+                    let mut buf = vec![0u8; bytes];
+                    unsafe { use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut std::ffi::c_void,
+                            scr.h_residual_ptr as CUdeviceptr, bytes); }
+                    let prev = if L == 0 { -1 } else { (L as i32) - 1 };
+                    let label = if L == 0 {
+                        format!("h_residual_pre_layer0_pos{}.bf16", attn_position)
+                    } else {
+                        format!("h_residual_layer{}_pos{}.bf16", prev, attn_position)
+                    };
+                    let _ = std::fs::write(std::path::PathBuf::from(dir).join(&label), &buf);
+                }
+            }
+            Ok(())
+        };
         // (1) Embed gather → h_residual.
         rvllm_fused::EmbeddingGatherLaunch { num_tokens: 1, hidden, vocab }
             .launch(
@@ -1458,6 +1831,8 @@ impl Mistral35Bringup {
             "smoke_post_embed",
         )?;
 
+        // pre-layer-0 dump (h_residual at entry of layer 0 = post_embed)
+        dump_h_resid_pre_layer(0)?;
         // (2) DtoD copy h_residual → h_work, then RMSNorm in-place
         //     with input_layernorm gamma.
         dtod(stream_u64, scr.h_work_ptr,
@@ -1476,11 +1851,77 @@ impl Mistral35Bringup {
             "smoke_post_rmsnorm",
         )?;
 
-        // (3) NVFP4 prep h_work, then Q/K/V projections.
-        stage_act(scr.h_work_ptr, h_k)?;
-        gemm(scr.q_out_ptr, &layer0.q_proj)?;
-        gemm(scr.k_out_ptr, &layer0.k_proj)?;
-        gemm(scr.v_out_ptr, &layer0.v_proj)?;
+        // (3) Q/K/V projections — W4A16 dequant + bf16 GEMM.
+        gemm(scr.q_out_ptr, scr.h_work_ptr, &layer0.q_proj)?;
+        // Dump A: q_out_ptr + out_f32_scratch right after q_proj returns
+        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                stream.fence()?;
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuCtxSynchronize();
+                }
+                let n = layer0.q_proj.shape.n;
+                let bytes_bf = n * 2;
+                let bytes_f32 = n * 4;
+                let mut buf_bf = vec![0u8; bytes_bf];
+                let mut buf_f32 = vec![0u8; bytes_f32];
+                unsafe { use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(buf_bf.as_mut_ptr() as *mut std::ffi::c_void,
+                        scr.q_out_ptr as CUdeviceptr, bytes_bf);
+                    let _ = cuMemcpyDtoH_v2(buf_f32.as_mut_ptr() as *mut std::ffi::c_void,
+                        scr.out_f32_scratch_ptr as CUdeviceptr, bytes_f32);
+                }
+                let dirp = std::path::PathBuf::from(&dir);
+                let _ = std::fs::write(dirp.join("boundary_A_after_qproj.bf16"), &buf_bf);
+                let _ = std::fs::write(dirp.join("boundary_A_f32_scratch.f32"), &buf_f32);
+            }
+        }
+        gemm(scr.k_out_ptr, scr.h_work_ptr, &layer0.k_proj)?;
+        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                stream.fence()?;
+                let bytes = (layer0.q_proj.shape.n as usize) * 2;
+                let mut buf = vec![0u8; bytes];
+                unsafe { use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        scr.q_out_ptr as CUdeviceptr, bytes); }
+                let _ = std::fs::write(std::path::PathBuf::from(&dir)
+                    .join("boundary_B_after_kproj.bf16"), &buf);
+            }
+        }
+        gemm(scr.v_out_ptr, scr.h_work_ptr, &layer0.v_proj)?;
+        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                stream.fence()?;
+                let bytes = (layer0.q_proj.shape.n as usize) * 2;
+                let mut buf = vec![0u8; bytes];
+                unsafe { use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        scr.q_out_ptr as CUdeviceptr, bytes); }
+                let _ = std::fs::write(std::path::PathBuf::from(&dir)
+                    .join("boundary_C_after_vproj.bf16"), &buf);
+            }
+        }
+        // Boundary dump #4: q_out_ptr just before RoPE — does k/v
+        // gemm corrupt it, or does rope itself flip the output?
+        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                stream.fence()?;
+                let bytes = (layer0.q_proj.shape.n as usize) * 2;
+                let mut buf = vec![0u8; bytes];
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(
+                        buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        scr.q_out_ptr as CUdeviceptr,
+                        bytes);
+                }
+                let p = std::path::PathBuf::from(&dir).join("boundary_qproj_pre_rope.bf16");
+                let _ = std::fs::write(&p, &buf);
+                eprintln!("[mistral35] boundary dump #4: q pre-rope ({} B)", bytes);
+            }
+        }
         // RoPE on Q and K (V never gets rotated). Identity at pos=0.
         let n_q_heads_u: u32 = self.arch.text.num_attention_heads as u32;
         let n_kv_heads_u: u32 = self.arch.text.num_key_value_heads as u32;
@@ -1493,6 +1934,36 @@ impl Mistral35Bringup {
         let v_out = dump_bf16(stream, stream_u64,
             scr.v_out_ptr, layer0.v_proj.shape.n, "smoke_v_out")?;
 
+        // Sentinel removed — earlier diagnosis confused me because the
+        // smoke runs forward twice (input token at pos=0, predicted
+        // token at pos=1). Each run memsets slot 0 to 0xAA, but run 2
+        // writes to slot 1, so slot 0 ends as sentinel-from-run-2.
+        // Verify sentinel landed in v_cache before attention_step.
+        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            stream.fence()?;
+            let bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
+            let mut buf = vec![0u8; bytes];
+            unsafe { use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    kv_cache.layers[0].v_ptr as CUdeviceptr, bytes); }
+            eprintln!("[mistral35-debug] PRE-attn v_cache slot0 first 8 bytes: {:?}",
+                &buf[..8]);
+        }
+        // Boundary dump #6: v_out_ptr immediately before attention_step,
+        // to check whether anything modifies it between the v_out.f32
+        // dump above and the kv_cache_write read.
+        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                stream.fence()?;
+                let bytes = (layer0.v_proj.shape.n) * 2;
+                let mut buf = vec![0u8; bytes];
+                unsafe { use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        scr.v_out_ptr as CUdeviceptr, bytes); }
+                let _ = std::fs::write(std::path::PathBuf::from(&dir)
+                    .join("boundary_v_out_pre_attn.bf16"), &buf);
+            }
+        }
         // (4) Attention: write K/V to layer-0 cache @ pos=position,
         //     compute scores via qk_dot, softmax · V into attn_out.
         attention_step(0)?;
@@ -1502,9 +1973,67 @@ impl Mistral35Bringup {
         let attn_out = dump_bf16(stream, stream_u64,
             scr.attn_out_ptr, hidden as usize, "smoke_attn_out")?;
 
-        // (5) O-projection: NVFP4 prep_act on attn_out, then o_proj.
-        stage_act(scr.attn_out_ptr, h_k)?;
-        gemm(scr.o_out_ptr, &layer0.o_proj)?;
+        // Boundary dump K-cache slot 0 too, to compare with K-out.
+        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                stream.fence()?;
+                let bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
+                let mut buf = vec![0u8; bytes];
+                unsafe { use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        kv_cache.layers[0].k_ptr as CUdeviceptr, bytes); }
+                let _ = std::fs::write(std::path::PathBuf::from(&dir)
+                    .join("boundary_k_cache_slot0.bf16"), &buf);
+                eprintln!("[mistral35-debug] kv_cache.layers[0]: k_ptr=0x{:x} v_ptr=0x{:x}  scr.k_out_ptr=0x{:x} scr.v_out_ptr=0x{:x}",
+                    kv_cache.layers[0].k_ptr, kv_cache.layers[0].v_ptr,
+                    scr.k_out_ptr, scr.v_out_ptr);
+            }
+        }
+        // Boundary dump #5: dump V-cache for slots 0..=position so we
+        // can match against whichever slot kv_cache_write touched in
+        // the current call.
+        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                stream.fence()?;
+                let slot_bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
+                let n_slots = (rope_position as usize) + 1;
+                let total = slot_bytes * n_slots;
+                let mut buf = vec![0u8; total];
+                unsafe { use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        kv_cache.layers[0].v_ptr as CUdeviceptr, total); }
+                let _ = std::fs::write(std::path::PathBuf::from(&dir)
+                    .join("boundary_v_cache_all_slots.bf16"), &buf);
+                eprintln!("[mistral35-debug] dumped {} v-cache slots ({} bytes)", n_slots, total);
+            }
+        }
+        // Codex round-6: K-cache-all-slots + scores dump for past_len=3+ bisect.
+        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                stream.fence()?;
+                let slot_bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
+                let n_slots = (rope_position as usize) + 1;
+                let total_kv = slot_bytes * n_slots;
+                let mut buf_k = vec![0u8; total_kv];
+                unsafe { use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(buf_k.as_mut_ptr() as *mut std::ffi::c_void,
+                        kv_cache.layers[0].k_ptr as CUdeviceptr, total_kv); }
+                let _ = std::fs::write(std::path::PathBuf::from(&dir)
+                    .join("boundary_k_cache_all_slots.bf16"), &buf_k);
+                // Scores: f32 [n_q_heads, past_len], packed with stride past_len.
+                let scores_bytes = (n_q_heads_attn as usize) * n_slots * 4;
+                let mut buf_s = vec![0u8; scores_bytes];
+                unsafe { use cudarc::driver::sys::*;
+                    let _ = cuMemcpyDtoH_v2(buf_s.as_mut_ptr() as *mut std::ffi::c_void,
+                        kv_cache.scores_f32_ptr as CUdeviceptr, scores_bytes); }
+                let _ = std::fs::write(std::path::PathBuf::from(&dir)
+                    .join("boundary_scores_layer0_all_slots.f32"), &buf_s);
+                eprintln!("[mistral35-debug] dumped {} k-cache slots + scores stride {}",
+                    n_slots, n_slots);
+            }
+        }
+        // (5) O-projection (W4A16): bf16 attn_out × o_proj weights.
+        gemm(scr.o_out_ptr, scr.attn_out_ptr, &layer0.o_proj)?;
         let o_out = dump_bf16(stream, stream_u64,
             scr.o_out_ptr, layer0.o_proj.shape.n, "smoke_o_out")?;
 
@@ -1533,10 +2062,9 @@ impl Mistral35Bringup {
         let post_attn_norm = dump_bf16(stream, stream_u64,
             scr.h_work_ptr, hidden as usize, "smoke_post_attn_norm")?;
 
-        // (8) NVFP4 prep h_work, then gate / up projections.
-        stage_act(scr.h_work_ptr, h_k)?;
-        gemm(scr.gate_out_ptr, &layer0.gate_proj)?;
-        gemm(scr.up_out_ptr,   &layer0.up_proj)?;
+        // (8) gate / up projections (W4A16).
+        gemm(scr.gate_out_ptr, scr.h_work_ptr, &layer0.gate_proj)?;
+        gemm(scr.up_out_ptr,   scr.h_work_ptr, &layer0.up_proj)?;
         let gate_out = dump_bf16(stream, stream_u64,
             scr.gate_out_ptr, layer0.gate_proj.shape.n, "smoke_gate_out")?;
         let up_out = dump_bf16(stream, stream_u64,
@@ -1567,10 +2095,8 @@ impl Mistral35Bringup {
             scr.silu_mid_ptr,
             self.arch.text.intermediate_size, "smoke_silu_mid")?;
 
-        // (10) Down projection: NVFP4 prep_act on silu_mid (K=intermediate),
-        //      then down_proj GEMM.
-        stage_act(scr.silu_mid_ptr, i_k)?;
-        gemm(scr.down_out_ptr, &layer0.down_proj)?;
+        // (10) Down projection (W4A16): bf16 silu_mid × down_proj weights.
+        gemm(scr.down_out_ptr, scr.silu_mid_ptr, &layer0.down_proj)?;
         let down_out = dump_bf16(stream, stream_u64,
             scr.down_out_ptr,
             layer0.down_proj.shape.n, "smoke_down_out")?;
@@ -1604,6 +2130,9 @@ impl Mistral35Bringup {
         for layer_idx in 1..model.layers.len() {
             let layer = &model.layers[layer_idx];
 
+            // Codex round-7: pre-layer-L h_residual dump (= layer L-1's
+            // output residual). One file per (layer, position).
+            dump_h_resid_pre_layer(layer_idx)?;
             // Pre-attn norm.
             dtod(stream_u64, scr.h_work_ptr,
                  scr.h_residual_ptr, hidden_bytes)?;
@@ -1616,20 +2145,18 @@ impl Mistral35Bringup {
                 stream_u64,
             )?;
 
-            // Q/K/V + RoPE on Q and K.
-            stage_act(scr.h_work_ptr, h_k)?;
-            gemm(scr.q_out_ptr, &layer.q_proj)?;
-            gemm(scr.k_out_ptr, &layer.k_proj)?;
-            gemm(scr.v_out_ptr, &layer.v_proj)?;
+            // Q/K/V + RoPE on Q and K (W4A16 dequant + bf16 GEMM).
+            gemm(scr.q_out_ptr, scr.h_work_ptr, &layer.q_proj)?;
+            gemm(scr.k_out_ptr, scr.h_work_ptr, &layer.k_proj)?;
+            gemm(scr.v_out_ptr, scr.h_work_ptr, &layer.v_proj)?;
             rope(scr.q_out_ptr, n_q_heads_u)?;
             rope(scr.k_out_ptr, n_kv_heads_u)?;
 
             // Attention via KV cache (write + qk_dot + softmax_v).
             attention_step(layer_idx)?;
 
-            // O proj + residual.
-            stage_act(scr.attn_out_ptr, h_k)?;
-            gemm(scr.o_out_ptr, &layer.o_proj)?;
+            // O proj + residual (W4A16).
+            gemm(scr.o_out_ptr, scr.attn_out_ptr, &layer.o_proj)?;
             rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
                 kernels.fn_vector_add_bf16,
                 scr.h_residual_ptr,
@@ -1649,10 +2176,9 @@ impl Mistral35Bringup {
                 stream_u64,
             )?;
 
-            // gate / up / silu_mul.
-            stage_act(scr.h_work_ptr, h_k)?;
-            gemm(scr.gate_out_ptr, &layer.gate_proj)?;
-            gemm(scr.up_out_ptr,   &layer.up_proj)?;
+            // gate / up / silu_mul (W4A16).
+            gemm(scr.gate_out_ptr, scr.h_work_ptr, &layer.gate_proj)?;
+            gemm(scr.up_out_ptr,   scr.h_work_ptr, &layer.up_proj)?;
             {
                 let mut out_ptr = scr.silu_mid_ptr;
                 let mut g_ptr = scr.gate_out_ptr;
@@ -1673,9 +2199,8 @@ impl Mistral35Bringup {
                 )?;
             }
 
-            // down + residual.
-            stage_act(scr.silu_mid_ptr, i_k)?;
-            gemm(scr.down_out_ptr, &layer.down_proj)?;
+            // down + residual (W4A16).
+            gemm(scr.down_out_ptr, scr.silu_mid_ptr, &layer.down_proj)?;
             rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
                 kernels.fn_vector_add_bf16,
                 scr.h_residual_ptr,
@@ -1683,6 +2208,23 @@ impl Mistral35Bringup {
                 stream_u64,
             )?;
 
+            // Per-layer h_residual dump for compounding bisect.
+            // Triggered only when RVLLM_BISECT_DUMP_LAYERS lists the
+            // current layer_idx as a comma-separated decimal int.
+            if let Ok(list) = std::env::var("RVLLM_BISECT_DUMP_LAYERS") {
+                if list.split(',').any(|s| s.trim().parse::<usize>().ok() == Some(layer_idx)) {
+                    if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                        stream.fence()?;
+                        let bytes = (hidden as usize) * 2;
+                        let mut buf = vec![0u8; bytes];
+                        unsafe { use cudarc::driver::sys::*;
+                            let _ = cuMemcpyDtoH_v2(buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                scr.h_residual_ptr as CUdeviceptr, bytes); }
+                        let _ = std::fs::write(std::path::PathBuf::from(&dir)
+                            .join(format!("h_residual_layer{}.bf16", layer_idx)), &buf);
+                    }
+                }
+            }
             // Per-layer residual rms costs a stream fence + DtoH per
             // layer × 88 layers × N prefill steps. Off by default;
             // RVLLM_SMOKE_LAYER_RMS=1 turns it on for one-shot
@@ -1866,36 +2408,77 @@ impl Mistral35Bringup {
     /// per-token allocations don't accumulate.
     ///
     /// `eos_ids` causes early termination (typical Mistral EOS = 2).
-    /// Returns the full sequence (prompt + generated) and the
-    /// last-step `SmokeStageDump` for diagnostics.
+    /// Backward-compatibility shim. New code should call
+    /// [`generate`](Self::generate) directly. Kept so existing test
+    /// fixtures (and any out-of-tree caller that pinned the old
+    /// "smoke" name) continue to compile after the F4#2 rename.
     pub unsafe fn generate_smoke(
         &self,
         prompt: &[u32],
         max_new: usize,
         eos_ids: &[u32],
-    ) -> Result<GenerateSmokeResult> {
-        if prompt.is_empty() {
-            return Err(corrupt(
-                self.paths.model_dir.clone(),
-                "generate_smoke: empty prompt".into(),
-            ));
-        }
-        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
-            self.paths.model_dir.clone(),
-            "generate_smoke: arena absent".into(),
-        ))?;
-        let kv_cache = self.kv_cache.as_ref().ok_or_else(|| corrupt(
-            self.paths.model_dir.clone(),
-            "generate_smoke: kv_cache absent".into(),
-        ))?;
-        let total_max = prompt.len() + max_new;
-        if total_max > kv_cache.max_pos {
-            return Err(corrupt(
-                self.paths.model_dir.clone(),
-                format!("generate_smoke: total_len={total_max} > kv_max_pos={}",
-                    kv_cache.max_pos),
-            ));
-        }
+    ) -> Result<GenerateResult> {
+        self.generate(prompt, max_new, eos_ids, None, |_| ())
+    }
+
+    /// Backward-compatibility shim — see [`generate`](Self::generate).
+    pub unsafe fn generate_smoke_cancellable<F>(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        eos_ids: &[u32],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        on_token: F,
+    ) -> Result<GenerateResult>
+    where
+        F: FnMut(u32),
+    {
+        self.generate(prompt, max_new, eos_ids, cancelled, on_token)
+    }
+
+    /// Run a Mistral 3.5 prefill+decode generation.
+    ///
+    /// **Stages** (each split into a named helper for readability;
+    /// F4#2 cleanup):
+    ///
+    /// 1. `validate_generate_inputs` — non-empty prompt, arena +
+    ///    kv_cache present, total_len within KV cap.
+    /// 2. `RVLLM_SMOKE_SINGLE=1` short-circuit (one diagnostic
+    ///    forward, no prefill loop, no decode loop).
+    /// 3. `prefill_token` × prompt.len() — feed each prompt token
+    ///    at its position. Only the last token's forward computes
+    ///    logits + LM-head argmax; earlier tokens skip that work.
+    /// 4. `decode_token` × max_new — feed the previously predicted
+    ///    token at the next position. Each call computes logits
+    ///    and runs LM-head argmax.
+    ///
+    /// `cancelled` is checked between every stage; on trip the
+    /// partial token list is returned with `last_dump = None`. The
+    /// `on_token` callback fires for every newly emitted decode
+    /// token so a streaming SSE path can flush it before the next
+    /// step.
+    pub unsafe fn generate<F>(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        eos_ids: &[u32],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        mut on_token: F,
+    ) -> Result<GenerateResult>
+    where
+        F: FnMut(u32),
+    {
+        let is_cancelled = || cancelled
+            .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false);
+
+        let arena = self.validate_generate_inputs(prompt, max_new)?;
+        // #4 fix: explicit per-request KV-lifetime hand-shake. Today
+        // a no-op marker; documents the load-bearing invariant and
+        // gives future paged/seq-id work a single seam to plumb
+        // through.
+        self.kv_request_begin(prompt.len() + max_new)?;
+
         // RVLLM_SMOKE_SINGLE=1: skip the prefill loop entirely and run
         // only ONE forward with the LAST prompt token at position 0.
         // Diagnostic mode for isolating embed/forward bugs without
@@ -1903,7 +2486,7 @@ impl Mistral35Bringup {
         if std::env::var_os("RVLLM_SMOKE_SINGLE").is_some() {
             let tok = *prompt.last().unwrap();
             let dump = self.forward_smoke_q_proj_inner(tok, 0, true)?;
-            return Ok(GenerateSmokeResult {
+            return Ok(GenerateResult {
                 tokens: vec![tok, dump.predicted_token],
                 last_dump: Some(dump),
                 prompt_len: 1,
@@ -1922,41 +2505,39 @@ impl Mistral35Bringup {
         let mut last_dump: Option<SmokeStageDump> = None;
         let mut last_predicted: u32 = 0;
 
-        // Prefill: feed each prompt token at its position. Skip the
-        // expensive lm_head + argmax + per-call DtoH-fence on every
-        // step except the last — those steps' predicted tokens are
-        // discarded anyway.
+        // Stage 3: prefill.
         for (i, &tok) in prompt.iter().enumerate() {
+            if is_cancelled() {
+                return Ok(GenerateResult {
+                    tokens, last_dump, prompt_len: prompt.len(),
+                });
+            }
             let is_last = i == prompt.len() - 1;
-            let dump = self.forward_smoke_q_proj_inner(
-                tok, i as i32, is_last,
-            )?;
-            if is_last {
+            if let Some(dump) = self.prefill_token(
+                tok, i as i32, is_last, arena, ck, do_restore,
+            )? {
                 last_predicted = dump.predicted_token;
                 last_dump = Some(dump);
             }
-            // Restore between calls is now safe: the inner path
-            // does a stream.fence() before returning when compute_logits
-            // is false, and the public path fences via DtoH on logits.
-            if do_restore { unsafe { arena.restore(ck); } }
         }
 
-        // Decode: feed the previous predicted token at position
-        // prompt.len() + step. The last iteration appends but does
-        // NOT run a wasted forward (we already have the token).
+        // Stage 4: decode.
         for step in 0..max_new {
             tokens.push(last_predicted);
+            on_token(last_predicted);
             if eos_ids.contains(&last_predicted) {
                 break;
             }
             if step + 1 >= max_new {
                 break;
             }
+            if is_cancelled() {
+                break;
+            }
             let pos = (prompt.len() + step) as i32;
-            let dump = self.forward_smoke_q_proj(last_predicted, pos)?;
+            let dump = self.decode_token(last_predicted, pos, arena, ck, do_restore)?;
             last_predicted = dump.predicted_token;
             last_dump = Some(dump);
-            if do_restore { unsafe { arena.restore(ck); } }
         }
 
         // Free all per-step scratch in one shot. The last forward
@@ -1964,24 +2545,132 @@ impl Mistral35Bringup {
         // so all in-flight kernels are guaranteed complete by here.
         if do_restore { unsafe { arena.restore(ck); } }
 
-        Ok(GenerateSmokeResult {
+        Ok(GenerateResult {
             tokens,
             last_dump,
             prompt_len: prompt.len(),
         })
     }
+
+    /// Stage 0 helper (#4 — explicit KV lifetime).
+    ///
+    /// Marks the start of a request's window into the persistent
+    /// KV cache. Today this is a logical hand-shake — no zeroing
+    /// is performed because the load-bearing invariant
+    /// (every read at slot `s` was preceded by a write at the same
+    /// slot in the same request) is enforced by the forward path.
+    /// The hand-shake exists so future code that wants to relax
+    /// that invariant (paged batching, prefix-cache reuse,
+    /// speculative decode) has a single seam to plumb a real
+    /// reset / seq-id mask through.
+    ///
+    /// `RVLLM_DEBUG_KV_LIFETIME=1` makes the hand-shake log every
+    /// request; left off in production.
+    fn kv_request_begin(&self, used_slots: usize) -> Result<()> {
+        let kv = self.kv_cache.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "kv_request_begin: kv_cache absent".into(),
+        ))?;
+        if used_slots > kv.max_pos {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                format!("kv_request_begin: used_slots={used_slots} > max_pos={}",
+                    kv.max_pos),
+            ));
+        }
+        if std::env::var_os("RVLLM_DEBUG_KV_LIFETIME").is_some() {
+            eprintln!(
+                "[mistral35] kv_request_begin: used_slots={used_slots} \
+                 / max_pos={} (per-request lifetime via past_len = position + 1)",
+                kv.max_pos,
+            );
+        }
+        Ok(())
+    }
+
+    /// Stage 1 helper: validate inputs + return a borrow of the arena.
+    fn validate_generate_inputs(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+    ) -> Result<&rvllm_mem::HbmArena<'static>> {
+        if prompt.is_empty() {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                "generate: empty prompt".into(),
+            ));
+        }
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "generate: arena absent".into(),
+        ))?;
+        let kv_cache = self.kv_cache.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "generate: kv_cache absent".into(),
+        ))?;
+        let total_max = prompt.len() + max_new;
+        if total_max > kv_cache.max_pos {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                format!("generate: total_len={total_max} > kv_max_pos={}",
+                    kv_cache.max_pos),
+            ));
+        }
+        Ok(arena)
+    }
+
+    /// Stage 3 helper: feed one prompt token through the forward.
+    /// Only `is_last == true` computes logits + LM-head argmax;
+    /// earlier prompt tokens skip the expensive tail and return
+    /// `None`. Restores the arena scratch between calls.
+    unsafe fn prefill_token(
+        &self,
+        tok: u32,
+        pos: i32,
+        is_last: bool,
+        arena: &rvllm_mem::HbmArena<'static>,
+        ck: usize,
+        do_restore: bool,
+    ) -> Result<Option<SmokeStageDump>> {
+        let dump = self.forward_smoke_q_proj_inner(tok, pos, is_last)?;
+        let out = if is_last { Some(dump) } else { None };
+        // Safe: the inner path fences via stream.fence() when
+        // compute_logits=false, and DtoH on logits when true.
+        if do_restore { arena.restore(ck); }
+        Ok(out)
+    }
+
+    /// Stage 4 helper: feed one decode token through the forward
+    /// (always with `compute_logits = true`).
+    unsafe fn decode_token(
+        &self,
+        tok: u32,
+        pos: i32,
+        arena: &rvllm_mem::HbmArena<'static>,
+        ck: usize,
+        do_restore: bool,
+    ) -> Result<SmokeStageDump> {
+        let dump = self.forward_smoke_q_proj(tok, pos)?;
+        if do_restore { arena.restore(ck); }
+        Ok(dump)
+    }
 }
 
-/// Result of [`Mistral35Bringup::generate_smoke`]. `tokens` includes
-/// the prompt followed by all generated tokens up to (and including)
-/// the first EOS hit.
+/// Result of [`Mistral35Bringup::generate`]. `tokens` includes the
+/// prompt followed by all generated tokens up to (and including) the
+/// first EOS hit.
 #[cfg(feature = "cuda")]
 #[derive(Debug)]
-pub struct GenerateSmokeResult {
+pub struct GenerateResult {
     pub tokens: Vec<u32>,
     pub last_dump: Option<SmokeStageDump>,
     pub prompt_len: usize,
 }
+
+/// Backward-compatibility alias for the pre-F4#2 type name. New code
+/// should refer to [`GenerateResult`] directly.
+#[cfg(feature = "cuda")]
+pub type GenerateSmokeResult = GenerateResult;
 
 #[cfg(test)]
 mod tests {
@@ -2108,52 +2797,10 @@ mod tests {
         assert!(matches!(e, Mistral35Error::ForwardNotImplemented));
     }
 
-    #[test]
-    fn kv_decode_strategy_picks_fused_for_low_gqa() {
-        // Gemma 4 sliding has GQA=2; falls under MAX_GQA_DECODE=4.
-        assert_eq!(
-            KvDecodeStrategy::for_gqa_ratio(2),
-            KvDecodeStrategy::FusedGqa
-        );
-        assert_eq!(
-            KvDecodeStrategy::for_gqa_ratio(4),
-            KvDecodeStrategy::FusedGqa
-        );
-    }
-
-    #[test]
-    fn kv_decode_strategy_picks_split_for_qwen_ratio() {
-        // Qwen 3.6 full attention has GQA=8; below MAX_GQA_SPLIT=8.
-        assert_eq!(
-            KvDecodeStrategy::for_gqa_ratio(5),
-            KvDecodeStrategy::SplitDecode
-        );
-        assert_eq!(
-            KvDecodeStrategy::for_gqa_ratio(8),
-            KvDecodeStrategy::SplitDecode
-        );
-    }
-
-    #[test]
-    fn kv_decode_strategy_falls_back_for_mistral() {
-        // Mistral 3.5 has GQA=12; both fused and split caps blown.
-        assert_eq!(
-            KvDecodeStrategy::for_gqa_ratio(12),
-            KvDecodeStrategy::PerHeadFallback
-        );
-        assert_eq!(
-            KvDecodeStrategy::for_gqa_ratio(16),
-            KvDecodeStrategy::PerHeadFallback
-        );
-    }
-
-    #[test]
-    fn kv_decode_strategy_safe_on_zero_ratio() {
-        assert_eq!(
-            KvDecodeStrategy::for_gqa_ratio(0),
-            KvDecodeStrategy::PerHeadFallback
-        );
-    }
+    // F4#1 fix: KvDecodeStrategy enum + tests deleted. The enum was
+    // never branched on by the Mistral forward (BF16-KV path is
+    // hard-wired); the tests pinned its `for_gqa_ratio` mapping
+    // which now has no caller.
 
     /// Serialise the env-var-touching tests so cargo's parallel
     /// runner doesn't make them race. (Tests that don't touch env

@@ -231,16 +231,17 @@ pub fn validate_mistral35_inventory(
         // Real Mistral 3.5 NVFP4 checkpoint prefixes (verified
         // against the public zdy1995love/Mistral-Medium-3.5-128B-NVFP4
         // index.json on 2026-05-08): vision tensors live under
-        // `model.vision_tower.*` (NOT bare `vision_tower.*`), and
-        // the projector under `model.multi_modal_projector.*`. We
-        // accept both spellings so a future repackage that drops
-        // the `model.` outer namespace still validates.
-        if name.starts_with("model.vision_tower.") || name.starts_with("vision_tower.") {
+        // `model.vision_tower.*`, projector under
+        // `model.multi_modal_projector.*`. P1#4 fix: previously we
+        // also accepted bare `vision_tower.*` / `multi_modal_projector.*`
+        // here, but mistral35_load.rs hardcodes the `model.` prefix at
+        // upload time — a bare-prefix checkpoint would pass validation
+        // and then fail at upload. Reject the bare form to fail fast.
+        if name.starts_with("model.vision_tower.") {
             if entry.dtype == DType::Bf16 {
                 counts.vision_bf16 += 1;
             }
-        } else if name.starts_with("model.multi_modal_projector.")
-            || name.starts_with("multi_modal_projector.") {
+        } else if name.starts_with("model.multi_modal_projector.") {
             if entry.dtype == DType::Bf16 {
                 counts.projector_bf16 += 1;
             }
@@ -332,15 +333,26 @@ pub struct Nvfp4LinearLoaded {
     pub shape: Nvfp4LinearShape,
     /// `[N, K/2]` U8 NVFP4-packed weight bytes.
     pub packed_ptr: u64,
+    /// `[N, K/16]` E4M3 weight scale, row-major natural layout. Used
+    /// by the W4A16 dequant-then-bf16-GEMM path
+    /// (`nvfp4_dequant_weights_bf16_kernel`). Persistent for the life
+    /// of the model alongside `sfb_cutlass_ptr`.
+    pub sfb_natural_ptr: u64,
     /// CUTLASS-interleaved E4M3 SFB scratch (sized via
     /// `cutlass_nvfp4_gemm_sm120_sfb_bytes`). Persistent for the
-    /// life of the model.
+    /// life of the model. Used by the legacy W4A4 NVFP4 tensor-core
+    /// GEMM path (no longer wired in `gemm`, kept compiled).
     pub sfb_cutlass_ptr: u64,
     /// `[1]` F32 device scalar; passed to the GEMM epilogue's
     /// `alpha_ptr` (no host stall).
     pub global_scale_ptr: u64,
     pub packed_bytes: usize,
     pub sfb_bytes: usize,
+    /// `[N, K]` BF16 dequantized weight, populated by a one-shot
+    /// post-load pass in the bring-up. Zero until that pass runs.
+    /// The W4A16 GEMM path reads from this pointer; the legacy W4A4
+    /// CUTLASS path uses `packed_ptr` + `sfb_cutlass_ptr` instead.
+    pub bf16_ptr: u64,
 }
 
 /// "Outside-the-stack" weights — embedding table, final RMSNorm,
@@ -561,14 +573,14 @@ mod tests {
         // count check, no shape validation on these here.
         for i in 0..434 {
             tensors.insert(
-                format!("vision_tower.t{i}"),
-                fake_entry(&format!("vision_tower.t{i}"), DType::Bf16, &[1]),
+                format!("model.vision_tower.t{i}"),
+                fake_entry(&format!("model.vision_tower.t{i}"), DType::Bf16, &[1]),
             );
         }
         for i in 0..4 {
             tensors.insert(
-                format!("multi_modal_projector.p{i}"),
-                fake_entry(&format!("multi_modal_projector.p{i}"), DType::Bf16, &[1]),
+                format!("model.multi_modal_projector.p{i}"),
+                fake_entry(&format!("model.multi_modal_projector.p{i}"), DType::Bf16, &[1]),
             );
         }
 
@@ -649,8 +661,8 @@ mod tests {
         populate_layers(&mut tensors, &arch);
         for i in 0..3 {
             tensors.insert(
-                format!("vision_tower.x{i}"),
-                fake_entry(&format!("vision_tower.x{i}"), DType::Bf16, &[1]),
+                format!("model.vision_tower.x{i}"),
+                fake_entry(&format!("model.vision_tower.x{i}"), DType::Bf16, &[1]),
             );
         }
         let inv = validate_mistral35_inventory(&arch, &tensors).expect("valid");

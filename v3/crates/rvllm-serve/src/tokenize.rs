@@ -229,6 +229,7 @@ impl TokenizerHandle {
         tools: Option<&serde_json::Value>,
         vision_items: &[crate::worker::VisionItem],
         vision_arch: crate::router::VisionArch,
+        reasoning_effort: &str,
     ) -> Result<(Vec<u32>, Vec<VisionSlot>), ApiError> {
         // Render via the existing template path. Build per-message
         // content as a typed list when image parts are present, so the
@@ -313,7 +314,13 @@ impl TokenizerHandle {
                 bos_token => self.inner.bos_token_str.as_deref().unwrap_or(""),
                 add_generation_prompt => true,
                 tools => tools,
-                enable_thinking => false,
+                // Mistral 3.5 chat template reads `reasoning_effort` directly
+                // (values "none" or "high") and emits the
+                // `[MODEL_SETTINGS]{"reasoning_effort": "..."}[/MODEL_SETTINGS]`
+                // block inline. Templates that don't use it just ignore the
+                // extra context value.
+                reasoning_effort => reasoning_effort,
+                enable_thinking => reasoning_effort != "none",
             })
             .map_err(|e| ApiError::Tokenize(format!("chat template render: {e}")))?;
 
@@ -398,6 +405,7 @@ impl TokenizerHandle {
         &self,
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
+        reasoning_effort: &str,
     ) -> Result<Vec<u32>, ApiError> {
         // The Environment is built once at TokenizerHandle::load with
         // the pycompat shim already wired in (HF chat templates use
@@ -468,7 +476,8 @@ impl TokenizerHandle {
                 // Without this the model improvises Python-style `brain(...)`
                 // calls as plain text — zeroclaw saw exactly that on prefill.
                 tools => tools,
-                enable_thinking => false,
+                reasoning_effort => reasoning_effort,
+                enable_thinking => reasoning_effort != "none",
             })
             .map_err(|e| ApiError::Tokenize(format!("chat template render: {e}")))?;
 
@@ -781,7 +790,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        let ids = t.render_chat(&msgs, None).expect("render");
+        let ids = t.render_chat(&msgs, None, "none").expect("render");
         assert!(!ids.is_empty(), "empty prompt — template render produced nothing");
         // Should start with BOS — Gemma 4 bos id is 2.
         eprintln!("first 5 ids: {:?}", &ids[..ids.len().min(5)]);
@@ -888,7 +897,7 @@ mod tests {
                 name: None, tool_calls: None, tool_call_id: Some("c1".into()),
             },
         ];
-        let ids = t.render_chat(&msgs, Some(&tools)).expect("render");
+        let ids = t.render_chat(&msgs, Some(&tools), "none").expect("render");
         let back = t.decode_raw(&ids).expect("decode_raw");
         assert!(
             back.contains("call:weather{city:"),
