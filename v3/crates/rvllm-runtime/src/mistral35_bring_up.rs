@@ -2803,41 +2803,75 @@ impl Mistral35Bringup {
     /// Round-12 (Pixtral vision phase 2 — signature landed; the
     /// implementation lands per-stage in phase 3+ via the order
     /// described in MISTRAL35_PIXTRAL_VISION_PLAN.md).
+    /// Backward-compat host path: runs the Pixtral forward and DtoH
+    /// the BF16 soft-token output into a `Vec<u8>`. New callers
+    /// should prefer [`Mistral35Bringup::forward_pixtral_vision_into`]
+    /// to avoid the round-trip (Round-12 phase 5c codex review #3).
     pub fn forward_pixtral_vision(
         &self,
         image_bytes: &[u8],
     ) -> Result<Mistral35VisionForwardOutput> {
-        // Pre-flight: vision tower must be loaded. Default since
-        // Round-10 #1 is OFF; opt in with `RVLLM_LOAD_VISION=1`.
-        let model = self.model.as_ref().ok_or_else(|| corrupt(
-            self.paths.model_dir.clone(),
-            "forward_pixtral_vision: model not loaded".into(),
-        ))?;
-        let vision = model.vision.as_ref().ok_or_else(|| corrupt(
-            self.paths.model_dir.clone(),
-            "forward_pixtral_vision: vision tower not loaded; set \
-             RVLLM_LOAD_VISION=1 in the rvllm profile to enable. \
-             Note: even when loaded, the splice into the language \
-             decoder is not yet wired (Pixtral vision phase 3+).".into(),
-        ))?;
-
-        // Decode + preprocess. Pure host work; if it fails, the
-        // request is malformed (corrupt image, dimension overflow,
-        // etc.) — propagate cleanly.
-        let img = image::load_from_memory(image_bytes).map_err(|e| corrupt(
-            self.paths.model_dir.clone(),
-            format!("forward_pixtral_vision: image decode failed: {e}"),
-        ))?.to_rgb8();
-        let cfg = crate::vision_preprocess::Mistral35PreprocessConfig::default();
-        let pp = crate::vision_preprocess::preprocess_mistral35_pixtral(&img, &cfg)
-            .map_err(|e| corrupt(
-                self.paths.model_dir.clone(),
-                format!("forward_pixtral_vision: preprocess failed: {e:?}"),
-            ))?;
+        let (model, vision) = self.vision_preflight()?;
+        let pp = self.vision_preprocess(image_bytes)?;
+        let _ = model;
 
         #[cfg(feature = "cuda")]
         {
-            self.forward_pixtral_vision_cuda(vision, pp)
+            // Allocate own arena scratch for the device output, run
+            // forward_into, DtoH, free.
+            let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+                self.paths.model_dir.clone(),
+                "forward_pixtral_vision: arena absent".into(),
+            ))?;
+            let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+                self.paths.model_dir.clone(),
+                "forward_pixtral_vision: stream absent".into(),
+            ))?;
+            let nt = pp.num_soft_tokens;
+            let text_hidden = self.arch.text.hidden_size;
+            let bytes = nt * text_hidden * 2;
+            let ck_outer = arena.checkpoint();
+            let dst_region = arena.region("pixtral_compat_output", bytes, 16)?;
+            self.forward_pixtral_vision_cuda(vision, pp, dst_region.device_ptr())?;
+            stream.fence()?;
+            let mut data = vec![0u8; bytes];
+            unsafe {
+                use cudarc::driver::sys::*;
+                let r = cuMemcpyDtoH_v2(
+                    data.as_mut_ptr() as *mut _,
+                    dst_region.device_ptr(),
+                    bytes,
+                );
+                if r != CUresult::CUDA_SUCCESS {
+                    unsafe { arena.restore(ck_outer); }
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "pixtral: DtoH soft tokens",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            unsafe { arena.restore(ck_outer); }
+            // Compute the grids again (cheap, host work) for the
+            // returned struct — alternative was to thread them out of
+            // the cuda fn, but they're already in `pp`.
+            let img = image::load_from_memory(image_bytes).map_err(|e| corrupt(
+                self.paths.model_dir.clone(),
+                format!("forward_pixtral_vision: image decode failed: {e}"),
+            ))?.to_rgb8();
+            let cfg = crate::vision_preprocess::Mistral35PreprocessConfig::default();
+            let pp2 = crate::vision_preprocess::preprocess_mistral35_pixtral(&img, &cfg)
+                .map_err(|e| corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("forward_pixtral_vision: re-preprocess failed: {e:?}"),
+                ))?;
+            Ok(Mistral35VisionForwardOutput {
+                data,
+                num_tokens: pp2.num_soft_tokens,
+                hidden_dim: text_hidden,
+                patch_grid: pp2.patch_grid,
+                merged_grid: pp2.merged_grid,
+            })
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -2847,6 +2881,80 @@ impl Mistral35Bringup {
                 "forward_pixtral_vision: cuda feature not enabled".into(),
             ))
         }
+    }
+
+    /// Round-12 phase 5c codex review #3: device-resident vision
+    /// forward. Runs the full Pixtral pipeline + writes the
+    /// `[num_soft_tokens, text_hidden]` BF16 soft-token output
+    /// directly into `dst_dev_ptr` (caller-provided). No DtoH
+    /// round-trip.
+    ///
+    /// `dst_dev_ptr` must point at a device buffer of at least
+    /// `expected_num_tokens * text_hidden * 2` bytes that is alive
+    /// for the duration of this call. The intermediate scratch is
+    /// allocated inside this function's own arena checkpoint and
+    /// freed before return.
+    ///
+    /// Returns the actual number of soft tokens produced (= the
+    /// host preprocess's `num_soft_tokens`). The caller should
+    /// ensure `expected_num_tokens` matches what the renderer
+    /// reserved in the prompt; mismatches log a warning but are not
+    /// fatal here (the caller handles slot sizing).
+    #[cfg(feature = "cuda")]
+    pub fn forward_pixtral_vision_into(
+        &self,
+        image_bytes: &[u8],
+        dst_dev_ptr: u64,
+        expected_num_tokens: usize,
+    ) -> Result<usize> {
+        let (_model, vision) = self.vision_preflight()?;
+        let pp = self.vision_preprocess(image_bytes)?;
+        let nt = pp.num_soft_tokens;
+        if expected_num_tokens != 0 && nt != expected_num_tokens {
+            tracing::warn!(
+                "[mistral35-vision] forward_pixtral_vision_into: \
+                 produced num_soft_tokens={} but caller expected {}",
+                nt, expected_num_tokens,
+            );
+        }
+        self.forward_pixtral_vision_cuda(vision, pp, dst_dev_ptr)?;
+        Ok(nt)
+    }
+
+    /// Pre-flight: vision tower loaded? Default `RVLLM_LOAD_VISION` is
+    /// OFF (Round-10 #1); opt in via the rvllm profile.
+    fn vision_preflight(
+        &self,
+    ) -> Result<(
+        &rvllm_loader::mistral35_weights::Mistral35LoadedModel,
+        &rvllm_loader::mistral35_weights::Mistral35Vision,
+    )> {
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_pixtral_vision: model not loaded".into(),
+        ))?;
+        let vision = model.vision.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_pixtral_vision: vision tower not loaded; set \
+             RVLLM_LOAD_VISION=1 in the rvllm profile to enable.".into(),
+        ))?;
+        Ok((model, vision))
+    }
+
+    fn vision_preprocess(
+        &self,
+        image_bytes: &[u8],
+    ) -> Result<crate::vision_preprocess::Mistral35Patches> {
+        let img = image::load_from_memory(image_bytes).map_err(|e| corrupt(
+            self.paths.model_dir.clone(),
+            format!("forward_pixtral_vision: image decode failed: {e}"),
+        ))?.to_rgb8();
+        let cfg = crate::vision_preprocess::Mistral35PreprocessConfig::default();
+        crate::vision_preprocess::preprocess_mistral35_pixtral(&img, &cfg)
+            .map_err(|e| corrupt(
+                self.paths.model_dir.clone(),
+                format!("forward_pixtral_vision: preprocess failed: {e:?}"),
+            ))
     }
 
     /// CUDA-only Pixtral ViT forward (Round-12 phase 3b).
@@ -2873,7 +2981,12 @@ impl Mistral35Bringup {
         &self,
         vision: &rvllm_loader::mistral35_weights::Mistral35Vision,
         pp: crate::vision_preprocess::Mistral35Patches,
-    ) -> Result<Mistral35VisionForwardOutput> {
+        // Round-12 phase 5c #3: caller's [num_soft_tokens, text_hidden]
+        // BF16 device buffer that the final BF16 cast writes into.
+        // Eliminates the DtoH→HtoD round-trip the prior
+        // Vec<u8>-returning interface required.
+        output_dst_ptr: u64,
+    ) -> Result<()> {
         let arena = self.arena.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "forward_pixtral_vision_cuda: arena absent".into(),
@@ -3621,10 +3734,9 @@ impl Mistral35Bringup {
             )?;
         }
 
-        // 5.6 linear_2: [merged_n, text_hidden] @ W_l2^T → [merged_n, text_hidden].
-        let post_l2_bytes = merged_n * text_hidden * 2;
-        let post_l2_region = arena.region(
-            "pixtral_post_linear2", post_l2_bytes, 16)?;
+        // 5.6 linear_2: [merged_n, text_hidden] @ W_l2^T directly into
+        //     the caller's `output_dst_ptr`. No more local
+        //     `post_l2_region` allocation; no DtoH.
         unsafe {
             cublaslt.bf16_gemm_f32(
                 post_l1_region.device_ptr(),
@@ -3634,7 +3746,7 @@ impl Mistral35Bringup {
                 stream_u64,
             )?;
             let total = (merged_n * text_hidden) as i32;
-            let mut dst = post_l2_region.device_ptr();
+            let mut dst = output_dst_ptr;
             let mut src = f32_big_scratch.device_ptr();
             let mut count = total;
             let args: [*mut std::ffi::c_void; 3] = [
@@ -3650,39 +3762,28 @@ impl Mistral35Bringup {
             )?;
         }
 
-        // ── Stage 6: DtoH the BF16 soft-token output. ─────────────────
-        stream.fence()?;
-        let mut data = vec![0u8; post_l2_bytes];
-        unsafe {
-            use cudarc::driver::sys::*;
-            let r = cuMemcpyDtoH_v2(
-                data.as_mut_ptr() as *mut _,
-                post_l2_region.device_ptr(),
-                post_l2_bytes,
-            );
-            if r != CUresult::CUDA_SUCCESS {
-                unsafe { arena.restore(ck); }
-                return Err(rvllm_core::RvllmError::cuda(
-                    "pixtral: DtoH soft tokens",
-                    rvllm_core::CudaErrorKind::LaunchFailed,
-                    rvllm_core::CudaCtx::setup(),
-                ));
-            }
-        }
+        // ── Stage 6: optional dump of the (now device-resident) output.
         if let Some(ref d) = dump_dir {
-            let _ = std::fs::write(d.join("output.bin"), &data);
+            stream.fence()?;
+            let post_l2_bytes = merged_n * text_hidden * 2;
+            let mut host = vec![0u8; post_l2_bytes];
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut _,
+                    output_dst_ptr,
+                    post_l2_bytes,
+                );
+            }
+            let _ = std::fs::write(d.join("output.bin"), &host);
         }
 
-        // Restore arena now that the data is host-side.
+        // Free intermediate scratch. `output_dst_ptr` lives in the
+        // caller's arena scope, NOT under our checkpoint, so it
+        // survives the restore.
+        stream.fence()?;
         unsafe { arena.restore(ck); }
-
-        Ok(Mistral35VisionForwardOutput {
-            data,
-            num_tokens: merged_n,
-            hidden_dim: text_hidden,
-            patch_grid: (grid_h, grid_w),
-            merged_grid: (merged_h, merged_w),
-        })
+        Ok(())
     }
 
     pub unsafe fn generate<F>(
@@ -3862,6 +3963,138 @@ impl Mistral35Bringup {
             last_dump,
             prompt_len: prompt.len(),
         })
+    }
+
+    /// Round-12 phase 5c codex review #3 — KNOWN BROKEN.
+    ///
+    /// Designed to eliminate the DtoH→HtoD round-trip by running the
+    /// Pixtral forward INLINE in the prefill arena and DtoD-splicing
+    /// directly. Empirically regresses semantic correctness on real
+    /// images ("orange ball" → "I need to see the image to describe
+    /// it.") even though `forward_pixtral_vision_into` produces
+    /// byte-identical output to the round-trip path when invoked
+    /// in isolation (verified via the compat shim
+    /// `forward_pixtral_vision`).
+    ///
+    /// The exact regression cause is unidentified — candidates
+    /// include arena-bump-pointer interaction across the inner
+    /// cuda fn's checkpoint+restore vs the outer splice_region
+    /// allocation, or a stream-ordering subtlety. Production
+    /// (`cuda_worker`) uses `generate_with_vision` (Vec<u8>) until
+    /// the bug is rooted out.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    pub unsafe fn generate_with_images<F>(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        eos_ids: &[u32],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        mut on_token: F,
+        vision_images: &[(usize, Vec<u8>)],
+    ) -> Result<GenerateResult>
+    where
+        F: FnMut(u32),
+    {
+        let is_cancelled = || cancelled
+            .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false);
+
+        let arena = self.validate_generate_inputs(prompt, max_new)?;
+        self.kv_request_begin(prompt.len() + max_new)?;
+
+        if debug_env_os("RVLLM_SMOKE_SINGLE").is_some() {
+            let tok = *prompt.last().unwrap();
+            let dump = self.forward_smoke_q_proj_inner(tok, 0, true, None)?;
+            return Ok(GenerateResult {
+                tokens: vec![tok, dump.predicted_token],
+                last_dump: Some(dump),
+                prompt_len: 1,
+            });
+        }
+
+        let ck_outer = arena.checkpoint();
+        let do_restore = debug_env_os("RVLLM_SMOKE_NO_RESTORE").is_none();
+        let hidden_bytes = (self.arch.text.hidden_size as usize) * 2;
+
+        // Pre-flight all images (host preprocess) to compute the splice
+        // region byte budget BEFORE allocating it.
+        let mut prepped: Vec<(usize, usize)> =
+            Vec::with_capacity(vision_images.len());
+        let mut total_splice_bytes = 0usize;
+        for (start, image_bytes) in vision_images {
+            let pp = self.vision_preprocess(image_bytes)?;
+            let nt = pp.num_soft_tokens;
+            prepped.push((*start, nt));
+            total_splice_bytes += nt * hidden_bytes;
+        }
+
+        let mut pos_to_dev_ptr: std::collections::HashMap<i32, u64> =
+            std::collections::HashMap::new();
+        let mut _splice_region_keepalive: Option<rvllm_mem::Region> = None;
+        if total_splice_bytes > 0 {
+            let region = arena.region(
+                "mistral35_vision_splices_inline", total_splice_bytes, 16)?;
+            let base = region.device_ptr();
+            let mut cursor: usize = 0;
+            for ((start, nt), (_, image_bytes)) in prepped.iter().zip(vision_images.iter()) {
+                let dst = base + cursor as u64;
+                self.forward_pixtral_vision_into(image_bytes, dst, *nt)?;
+                for t in 0..*nt {
+                    let pos = (*start + t) as i32;
+                    let ptr = base + (cursor + t * hidden_bytes) as u64;
+                    pos_to_dev_ptr.insert(pos, ptr);
+                }
+                cursor += nt * hidden_bytes;
+            }
+            _splice_region_keepalive = Some(region);
+        }
+        let ck_after_splices = arena.checkpoint();
+
+        let mut tokens: Vec<u32> = prompt.to_vec();
+        let mut last_dump: Option<SmokeStageDump> = None;
+        let mut last_predicted: u32 = 0;
+
+        for (i, &tok) in prompt.iter().enumerate() {
+            if is_cancelled() {
+                return Ok(GenerateResult {
+                    tokens, last_dump, prompt_len: prompt.len(),
+                });
+            }
+            let is_last = i == prompt.len() - 1;
+            let splice_ptr = pos_to_dev_ptr.get(&(i as i32)).copied();
+            if let Some(dump) = self.prefill_token(
+                tok, i as i32, is_last, arena, ck_after_splices,
+                do_restore, splice_ptr,
+            )? {
+                last_predicted = dump.predicted_token;
+                last_dump = Some(dump);
+            }
+        }
+        for step in 0..max_new {
+            tokens.push(last_predicted);
+            on_token(last_predicted);
+            if eos_ids.contains(&last_predicted) {
+                break;
+            }
+            if step + 1 >= max_new {
+                break;
+            }
+            if is_cancelled() {
+                break;
+            }
+            let pos = (prompt.len() + step) as i32;
+            let dump = self.decode_token(
+                last_predicted, pos, arena, ck_after_splices, do_restore,
+            )?;
+            last_predicted = dump.predicted_token;
+            last_dump = Some(dump);
+        }
+
+        if do_restore { unsafe { arena.restore(ck_outer); } }
+        drop(_splice_region_keepalive);
+
+        Ok(GenerateResult { tokens, last_dump, prompt_len: prompt.len() })
     }
 
     /// Stage 0 helper (#4 — explicit KV lifetime).

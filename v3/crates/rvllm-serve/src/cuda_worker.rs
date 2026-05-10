@@ -143,26 +143,25 @@ pub async fn spawn_cuda_worker(
                 }
 
                 while let Some(req) = req_rx.blocking_recv() {
-                    // Round-12 phase 5a: vision is now production-
-                    // accessible. Run forward_pixtral_vision per image
-                    // and SPLICE the BF16 soft-tokens into the
-                    // language-decoder embed buffer at the slot
-                    // positions the renderer reserved (see
-                    // tokenize.rs::render_chat_with_vision and
-                    // worker.rs::vision_slots).
+                    // Round-12 phase 5c codex review #3 — REVERTED.
+                    // Reverted to the round-trip path
+                    // (generate_with_vision + Vec<u8>) because the
+                    // device-resident generate_with_images path
+                    // regressed semantic correctness on real images
+                    // ("orange ball" → "I need to see the image").
+                    // Root cause needs more investigation. The
+                    // forward_pixtral_vision_into helper stays available
+                    // for future use; the cuda_worker uses the old
+                    // forward_pixtral_vision (DtoH) + generate_with_vision
+                    // (HtoD) for now to keep production correct.
                     let mut vision_splices: Vec<(usize, usize, Vec<u8>)> = Vec::new();
                     if !req.vision_items.is_empty() {
-                        // Build splice list aligned to the renderer's
-                        // slots. `req.vision_slots[i]` carries the
-                        // token_start + num_tokens that
-                        // `vision_items[slot.vision_item_idx]` should
-                        // overwrite.
                         for slot in req.vision_slots.iter() {
                             let vi_idx = slot.vision_item_idx;
                             let item = &req.vision_items[vi_idx];
                             tracing::info!(
                                 "[mistral35-vision] image {}/{} ({} bytes, \
-                                 {}x{}, slot.token_start={} num_tokens={})…",
+                                 {}x{}, slot.token_start={} num_tokens={})",
                                 vi_idx + 1, req.vision_items.len(),
                                 item.bytes.len(), item.width, item.height,
                                 slot.token_start, slot.num_tokens,
@@ -173,8 +172,7 @@ pub async fn spawn_cuda_worker(
                                         tracing::warn!(
                                             "[mistral35-vision] image {} \
                                              produced {} soft tokens but slot \
-                                             reserved {} — admission predictor \
-                                             mismatch, splice may be partial",
+                                             reserved {}",
                                             vi_idx + 1, out.num_tokens,
                                             slot.num_tokens,
                                         );
@@ -190,9 +188,7 @@ pub async fn spawn_cuda_worker(
                                 Err(e) => {
                                     tracing::warn!(
                                         "[mistral35-vision] image {} forward \
-                                         failed, generation will fall back to \
-                                         text-only: {e:?}",
-                                        vi_idx + 1,
+                                         failed: {e:?}", vi_idx + 1,
                                     );
                                 }
                             }
@@ -281,8 +277,6 @@ pub async fn spawn_cuda_worker(
                                 if events_tx_inner.send(GenerateEvent::Token {
                                     id: tok, position: pos,
                                 }).is_err() {
-                                    // Receiver dropped — short-circuit
-                                    // the rest of generate().
                                     cancel_inner.store(true, Ordering::Relaxed);
                                     return;
                                 }
