@@ -171,6 +171,37 @@ pub struct Mistral35Scratch {
     pub workspace_bytes: usize,
     pub logits_ptr: u64,          // F32 [vocab]
     pub token_out_ptr: u64,       // i32 [1] — argmax target
+
+    // ── chunked-prefill scratch (allocated only when
+    //    RVLLM_MISTRAL35_BATCH_PREFILL=1; zero otherwise) ──
+    /// Maximum chunk length (rows) the T-row scratch can hold.
+    /// 0 when batched prefill is off. Shape multiplier for all the
+    /// `*_t_ptr` buffers below.
+    pub chunk_t_max: usize,
+    /// i32 [T_max] — token-id buffer for batched embed gather.
+    pub token_in_t_ptr: u64,
+    /// BF16 [T_max, hidden] — running residual stream.
+    pub h_residual_t_ptr: u64,
+    /// BF16 [T_max, hidden] — post-RMSNorm working buffer.
+    pub h_work_t_ptr: u64,
+    /// BF16 [T_max, n_q_heads * head_dim] — Q projection output.
+    pub q_out_t_ptr: u64,
+    /// BF16 [T_max, n_kv_heads * head_dim] — K projection output.
+    pub k_out_t_ptr: u64,
+    /// BF16 [T_max, n_kv_heads * head_dim] — V projection output.
+    pub v_out_t_ptr: u64,
+    /// BF16 [T_max, hidden] — attention finisher output, one row per query.
+    pub attn_out_t_ptr: u64,
+    /// BF16 [T_max, hidden] — O projection output.
+    pub o_out_t_ptr: u64,
+    /// BF16 [T_max, intermediate] — MLP gate projection.
+    pub gate_out_t_ptr: u64,
+    /// BF16 [T_max, intermediate] — MLP up projection.
+    pub up_out_t_ptr: u64,
+    /// BF16 [T_max, intermediate] — SiLU(gate) * up.
+    pub silu_mid_t_ptr: u64,
+    /// BF16 [T_max, hidden] — MLP down projection.
+    pub down_out_t_ptr: u64,
 }
 
 /// Per-layer KV cache (BF16). Stored as
@@ -1287,6 +1318,60 @@ impl Mistral35Bringup {
                 } else { 0 },
                 logits_ptr:     arena_box.region("mistral35_logits_f32", vocab * 4, 16)?.device_ptr(),
                 token_out_ptr:  arena_box.region("mistral35_token_out", 4, 4)?.device_ptr(),
+
+                // Chunked-prefill T-row scratch. Sized for the
+                // largest projection on each axis. Allocated only
+                // when the gate is on so the M=1 hot path keeps
+                // its tight arena budget.
+                chunk_t_max: if want_batched_prefill { chunk_t_max } else { 0 },
+                token_in_t_ptr:    if want_batched_prefill {
+                    arena_box.region("mistral35_token_in_t",
+                        chunk_t_max * 4, 4)?.device_ptr()
+                } else { 0 },
+                h_residual_t_ptr:  if want_batched_prefill {
+                    arena_box.region("mistral35_h_residual_t",
+                        chunk_t_max * h_bytes, 16)?.device_ptr()
+                } else { 0 },
+                h_work_t_ptr:      if want_batched_prefill {
+                    arena_box.region("mistral35_h_work_t",
+                        chunk_t_max * h_bytes, 16)?.device_ptr()
+                } else { 0 },
+                q_out_t_ptr:       if want_batched_prefill {
+                    arena_box.region("mistral35_q_out_t",
+                        chunk_t_max * n_q_dim * 2, 16)?.device_ptr()
+                } else { 0 },
+                k_out_t_ptr:       if want_batched_prefill {
+                    arena_box.region("mistral35_k_out_t",
+                        chunk_t_max * n_kv_dim * 2, 16)?.device_ptr()
+                } else { 0 },
+                v_out_t_ptr:       if want_batched_prefill {
+                    arena_box.region("mistral35_v_out_t",
+                        chunk_t_max * n_kv_dim * 2, 16)?.device_ptr()
+                } else { 0 },
+                attn_out_t_ptr:    if want_batched_prefill {
+                    arena_box.region("mistral35_attn_out_t",
+                        chunk_t_max * h_bytes, 16)?.device_ptr()
+                } else { 0 },
+                o_out_t_ptr:       if want_batched_prefill {
+                    arena_box.region("mistral35_o_out_t",
+                        chunk_t_max * h_bytes, 16)?.device_ptr()
+                } else { 0 },
+                gate_out_t_ptr:    if want_batched_prefill {
+                    arena_box.region("mistral35_gate_out_t",
+                        chunk_t_max * i_bytes, 16)?.device_ptr()
+                } else { 0 },
+                up_out_t_ptr:      if want_batched_prefill {
+                    arena_box.region("mistral35_up_out_t",
+                        chunk_t_max * i_bytes, 16)?.device_ptr()
+                } else { 0 },
+                silu_mid_t_ptr:    if want_batched_prefill {
+                    arena_box.region("mistral35_silu_mid_t",
+                        chunk_t_max * i_bytes, 16)?.device_ptr()
+                } else { 0 },
+                down_out_t_ptr:    if want_batched_prefill {
+                    arena_box.region("mistral35_down_out_t",
+                        chunk_t_max * h_bytes, 16)?.device_ptr()
+                } else { 0 },
             };
             eprintln!(
                 "[mistral35] scratch hoisted to bring-up: max_workspace={} bytes",
