@@ -2686,7 +2686,7 @@ impl Mistral35Bringup {
             self.paths.model_dir.clone(),
             "forward_pixtral_vision: model not loaded".into(),
         ))?;
-        let _vision = model.vision.as_ref().ok_or_else(|| corrupt(
+        let vision = model.vision.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(),
             "forward_pixtral_vision: vision tower not loaded; set \
              RVLLM_LOAD_VISION=1 in the rvllm profile to enable. \
@@ -2707,31 +2707,209 @@ impl Mistral35Bringup {
                 self.paths.model_dir.clone(),
                 format!("forward_pixtral_vision: preprocess failed: {e:?}"),
             ))?;
-        let _ = pp;  // hush unused while phase 3 lands.
 
-        // Phase 3 onward (per MISTRAL35_PIXTRAL_VISION_PLAN.md
-        // implementation order):
-        //   3a. Upload `pixel_values` as BF16 → patch_conv (cublasLt)
-        //       → ln_pre (rmsnorm_inplace_bf16_gbf16).
-        //   3b. Per-block forward (48×): norm1 → fused QKV GEMM →
-        //       pixtral_rotary_2d_bf16 on Q+K → FA2 prefill → O proj
-        //       → residual → norm2 → gate/up → gelu_tanh_mul → down
-        //       → residual.
-        //   3c. patch_merger_pixtral_2x2 over the [grid_h, grid_w]
-        //       output → [merged_h * merged_w, 4*hidden].
-        //   3d. projector_norm + linear_1 + gelu_tanh + linear_2 →
-        //       [merged_tokens, text_hidden_size = 12288] BF16.
-        //   3e. DtoH the BF16 bytes into Mistral35VisionForwardOutput.
+        #[cfg(feature = "cuda")]
+        {
+            self.forward_pixtral_vision_cuda(vision, pp)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = vision; let _ = pp;
+            Err(corrupt(
+                self.paths.model_dir.clone(),
+                "forward_pixtral_vision: cuda feature not enabled".into(),
+            ))
+        }
+    }
+
+    /// CUDA-only Pixtral ViT forward (Round-12 phase 3b).
+    ///
+    /// Stages implemented today:
+    ///   1. Upload `pp.pixel_values` (f32 HWC) → BF16 device buffer.
+    ///   2. patch_conv: cublasLt bf16_gemm_f32 + f32→bf16 cast →
+    ///      `[N, v_hidden]` BF16.
+    ///   3. ln_pre: rmsnorm_inplace_bf16_gbf16.
+    ///
+    /// Stages NOT YET implemented (per
+    /// MISTRAL35_PIXTRAL_VISION_PLAN.md, future phases):
+    ///   4. 48 ViT blocks (norm + QKV + 2D RoPE + FA2 + O + residual
+    ///      + norm + MLP + residual).
+    ///   5. patch_merger_2x2 reshape + projector linear_1 / linear_2.
+    ///   6. DtoH and return Mistral35VisionForwardOutput.
+    ///
+    /// The function returns Err with a stage marker when the next
+    /// unimplemented stage is hit; intermediates can be dumped under
+    /// `RVLLM_DEBUG_MISTRAL35=1 RVLLM_PIXTRAL_DUMP_DIR=<path>` for
+    /// the cosine-vs-HF gate harness (lands with phase 3-test).
+    #[cfg(feature = "cuda")]
+    fn forward_pixtral_vision_cuda(
+        &self,
+        vision: &rvllm_loader::mistral35_weights::Mistral35Vision,
+        pp: crate::vision_preprocess::Mistral35Patches,
+    ) -> Result<Mistral35VisionForwardOutput> {
+        let arena = self.arena.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_pixtral_vision_cuda: arena absent".into(),
+        ))?;
+        let kernels = self.forward_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_pixtral_vision_cuda: forward_kernels absent".into(),
+        ))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_pixtral_vision_cuda: cublaslt absent".into(),
+        ))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_pixtral_vision_cuda: stream absent".into(),
+        ))?;
+        let stream_u64 = stream.raw() as u64;
+
+        let n = pp.num_patches();
+        let v_hidden = self.arch.vision.hidden_size;
+        let inner = (self.arch.vision.patch_size as usize)
+            * (self.arch.vision.patch_size as usize)
+            * (self.arch.vision.num_channels as usize);
+        debug_assert_eq!(pp.pixel_values.len(), n * inner);
+
+        // Optional intermediate-dump dir for cosine gates.
+        let dump_dir: Option<std::path::PathBuf> = debug_env_str(
+            "RVLLM_PIXTRAL_DUMP_DIR",
+        ).map(std::path::PathBuf::from);
+        if let Some(ref d) = dump_dir { let _ = std::fs::create_dir_all(d); }
+
+        // Use a checkpoint so the per-image scratch frees after this
+        // forward completes.
+        let ck = arena.checkpoint();
+
+        // Allocate working regions.
+        let patches_bf16_bytes = n * inner * 2;
+        let patches_region = arena.region(
+            "pixtral_patches_bf16", patches_bf16_bytes, 16)?;
+        // f32 GEMM scratch — `m * v_hidden` floats.
+        let f32_scratch_bytes = n * v_hidden * 4;
+        let f32_scratch = arena.region(
+            "pixtral_f32_scratch", f32_scratch_bytes, 16)?;
+        // BF16 hidden buffer — `[N, v_hidden]`.
+        let hidden_bytes = n * v_hidden * 2;
+        let hidden_region = arena.region(
+            "pixtral_hidden", hidden_bytes, 16)?;
+
+        // ── Stage 1: upload patches as BF16 ────────────────────────────
+        // Round-trip through a host BF16 buffer (no device-side f32→bf16
+        // kernel needed for the upload; we already pay one cast on
+        // patch_conv's output).
+        let patches_bf16_host: Vec<u8> = pp.pixel_values_to_f16_bytes_bf16();
+        debug_assert_eq!(patches_bf16_host.len(), patches_bf16_bytes);
+        unsafe { patches_region.copy_from_host(&patches_bf16_host)? };
+        if let Some(ref d) = dump_dir {
+            let _ = std::fs::write(d.join("patches_bf16.bin"), &patches_bf16_host);
+        }
+
+        // ── Stage 2: patch_conv = patches @ W_pc^T ────────────────────
+        // patches: [N, inner]   BF16
+        // W_pc:    [v_hidden, inner]   BF16 (already permuted to HWC at load)
+        // out:     [N, v_hidden]      BF16
+        unsafe {
+            cublaslt.bf16_gemm_f32(
+                patches_region.device_ptr(),
+                vision.patch_conv.offset_bytes,
+                f32_scratch.device_ptr(),
+                n as i32, v_hidden as i32, inner as i32,
+                stream_u64,
+            )?;
+        }
+        // Cast f32 → bf16 in-place into hidden_region.
+        {
+            let total = (n * v_hidden) as i32;
+            let mut dst = hidden_region.device_ptr();
+            let mut src = f32_scratch.device_ptr();
+            let mut count = total;
+            let args: [*mut std::ffi::c_void; 3] = [
+                (&mut dst)   as *mut u64 as *mut _,
+                (&mut src)   as *mut u64 as *mut _,
+                (&mut count) as *mut i32 as *mut _,
+            ];
+            let blocks = ((total as u32) + 1023) / 1024;
+            unsafe {
+                rvllm_fused::launch_raw(
+                    kernels.fn_f32_to_bf16,
+                    (blocks, 1, 1),
+                    (1024, 1, 1),
+                    0, stream_u64,
+                    &args,
+                )?;
+            }
+        }
+        if let Some(ref d) = dump_dir {
+            stream.fence()?;
+            let mut host = vec![0u8; hidden_bytes];
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut _,
+                    hidden_region.device_ptr(), hidden_bytes);
+            }
+            let _ = std::fs::write(d.join("post_patch_conv.bin"), &host);
+        }
+
+        // ── Stage 3: ln_pre RMSNorm (in-place on hidden_region) ────────
+        // rmsnorm_inplace_bf16_gbf16 ABI:
+        //   args: (x, gamma, n_tokens, hidden, eps)
+        //   grid: (n_tokens, 1, 1), block: (256, 1, 1)
+        {
+            let mut x = hidden_region.device_ptr();
+            let mut g = vision.ln_pre.offset_bytes;
+            let mut nt = n as i32;
+            let mut hd = v_hidden as i32;
+            let mut eps: f32 = 1.0e-5;
+            let args: [*mut std::ffi::c_void; 5] = [
+                (&mut x)   as *mut u64 as *mut _,
+                (&mut g)   as *mut u64 as *mut _,
+                (&mut nt)  as *mut i32 as *mut _,
+                (&mut hd)  as *mut i32 as *mut _,
+                (&mut eps) as *mut f32 as *mut _,
+            ];
+            unsafe {
+                rvllm_fused::launch_raw(
+                    kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                    (n as u32, 1, 1),
+                    (256, 1, 1),
+                    0, stream_u64,
+                    &args,
+                )?;
+            }
+        }
+        if let Some(ref d) = dump_dir {
+            stream.fence()?;
+            let mut host = vec![0u8; hidden_bytes];
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut _,
+                    hidden_region.device_ptr(), hidden_bytes);
+            }
+            let _ = std::fs::write(d.join("post_ln_pre.bin"), &host);
+        }
+
+        // Ensure all launches complete before scratch is reclaimed.
+        stream.fence()?;
+        unsafe { arena.restore(ck); }
+
+        // Stages 4-6 (48 blocks + projector + DtoH) are the next
+        // wedge. Until they land, the call cleanly returns
+        // Err(stage marker).
         Err(corrupt(
             self.paths.model_dir.clone(),
-            "forward_pixtral_vision: ViT GPU forward not yet wired \
-             (Pixtral vision phase 3 — patch_conv + 48 blocks + \
-             projector lands incrementally with per-stage cosine \
-             gates against an HF reference dump). The infrastructure \
-             (kernels, RoPE tables, patch merger ref, weight upload) \
-             is in place; this stub keeps the type and admission \
-             paths honest until the per-block forward is filled in."
-                .into(),
+            format!(
+                "forward_pixtral_vision: stages 1-3 (upload, patch_conv, \
+                 ln_pre) executed for [n={}, v_hidden={}, inner={}]. \
+                 Stages 4-6 (48 ViT blocks + patch_merger + projector) \
+                 are the next phase. Set RVLLM_DEBUG_MISTRAL35=1 \
+                 RVLLM_PIXTRAL_DUMP_DIR=<path> to dump intermediates \
+                 for cosine validation.",
+                n, v_hidden, inner,
+            ),
         ))
     }
 

@@ -504,6 +504,26 @@ impl Mistral35Patches {
         }
         out
     }
+    /// Round-12 phase 3b: BF16 variant. Pixtral activations stay BF16
+    /// throughout the ViT (decoder hidden activations are also BF16).
+    pub fn pixel_values_to_f16_bytes_bf16(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.pixel_values.len() * 2);
+        for &x in &self.pixel_values {
+            // f32 → bf16 = high 16 bits with round-to-nearest-even.
+            let bits = x.to_bits();
+            // Round-to-nearest-even (handle NaN/Inf as identity).
+            let rounded = if (bits & 0x7F80_0000) == 0x7F80_0000 {
+                // NaN/Inf — pass through high 16 bits.
+                bits
+            } else {
+                let lsb = (bits >> 16) & 1;
+                bits.wrapping_add(0x7FFF + lsb)
+            };
+            let bf16 = (rounded >> 16) as u16;
+            out.extend_from_slice(&bf16.to_le_bytes());
+        }
+        out
+    }
     pub fn num_patches(&self) -> usize {
         let (gh, gw) = self.patch_grid;
         (gh as usize) * (gw as usize)
@@ -1073,6 +1093,28 @@ mod tests {
         // bottom-right = in[(3,1,:)]
         let off_br = (3 * g + 1) * h;
         assert_eq!(&out[base+3*h..base+4*h], &input[off_br..off_br+h]);
+    }
+
+    #[test]
+    fn pixel_values_to_bf16_round_trip() {
+        // For values exactly representable in BF16 (powers of two,
+        // 0, simple integers), the round-trip should be exact.
+        let pp = Mistral35Patches {
+            pixel_values: vec![0.0, 1.0, -1.0, 2.0, 0.5, -0.5, 4.0, -4.0],
+            resized: (28, 28), patch_grid: (2, 2), merged_grid: (1, 1),
+            num_soft_tokens: 1,
+        };
+        let bytes = pp.pixel_values_to_f16_bytes_bf16();
+        assert_eq!(bytes.len(), pp.pixel_values.len() * 2);
+        for (i, &v) in pp.pixel_values.iter().enumerate() {
+            let lo = bytes[i * 2] as u32;
+            let hi = bytes[i * 2 + 1] as u32;
+            let bf16 = (hi << 8) | lo;
+            // BF16 → F32: shift left by 16.
+            let f = f32::from_bits(bf16 << 16);
+            assert!((f - v).abs() < 1e-6,
+                "round-trip {v} → {f} differs at idx {i}");
+        }
     }
 
     #[test]
