@@ -367,14 +367,19 @@
       "sha256": "099ba929763771bbf075b755d917aea0ee770e3bcf6bf26c99d9caddf9760a85"
     },
     "mistral35_fa_decode_gqa_bf16": {
-      "bytes": 641007,
+      "bytes": 968613,
       "path": "mistral35_fa_decode_gqa_bf16.ptx",
-      "sha256": "a7bdc74ffd00bc4cb68055a8728d6b44b24b00626641a0392406addecc09555d"
+      "sha256": "7cc074246a0bd8909fb606cfcc55c5dad6fabed8cfdedbf8714eaae555b64a51"
     },
     "mistral35_kv_cache_write_bf16": {
       "bytes": 1989,
       "path": "mistral35_kv_cache_write_bf16.ptx",
       "sha256": "2cc846430e8701e5efd283744d97b82d03d33e0ac8fd0b3ac089112340f51881"
+    },
+    "mistral35_kv_cache_write_nvfp4_bf16": {
+      "bytes": 18707,
+      "path": "mistral35_kv_cache_write_nvfp4_bf16.ptx",
+      "sha256": "900dd263451696418370900b20c9a63c9e2dc4722e0ad2fb24d5dc445210add5"
     },
     "mistral35_qk_dot_bf16": {
       "bytes": 2893,
@@ -722,5 +727,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "7de5fb0"
+  "revision": "8d21e39"
 }

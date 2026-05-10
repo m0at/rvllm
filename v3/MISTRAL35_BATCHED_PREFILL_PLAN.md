@@ -270,7 +270,74 @@ Once the byte-identical equivalence test passes for prompts of
 length 1, 16, 128, 383, flip `RVLLM_MISTRAL35_BATCH_PREFILL` to
 default ON. Acceptance gate: prefill tok/s ≥ 8 (≥ 3.5× current),
 greedy "Hallo!" + 64-tok German GQA decode + vision E2E all
-byte-identical.
+byte-identical. **Done — `7de5fb0`.**
+
+---
+
+## Decode side — fused FA-decode + NVFP4-KV (codex review #3)
+
+### Status
+
+Two CUDA kernels landed as opt-in building blocks; full
+end-to-end NVFP4-KV decode path is multi-session.
+
+* `mistral35_fa_decode_gqa_bf16` (`9ffe799`, `8d21e39`) —
+  fused FlashAttention-2 m=1 decode. Online softmax in
+  registers, scores/probs never in DRAM, Q loaded once,
+  K/V tiles streamed per kv_head. Currently 19 % slower
+  than the split-kernel default; left opt-in via
+  `RVLLM_MISTRAL35_FA_DECODE=1`. Correctness verified —
+  text "Hallo!", 64-tok German GQA, vision orange-ball E2E
+  all byte-identical to baseline. Warp-shuffle reduction
+  + UB fix landed in `8d21e39`.
+
+* `mistral35_kv_cache_write_nvfp4_bf16` (this commit) —
+  converts BF16 K/V row to NVFP4 packed nibbles + E4M3
+  per-16-element scale, writes at cache slot `pos`.
+  3.55× smaller storage (0.5625 vs 2 bytes/elem). Building
+  block; not yet wired into the production write path.
+
+### What's still missing for end-to-end NVFP4-KV
+
+1. **NVFP4 KV cache buffers** — allocate `packed`
+   `[max_pos, n_kv, head_dim/2]` + `scale`
+   `[max_pos, n_kv, head_dim/16]` per layer, gated on
+   `RVLLM_MISTRAL35_NVFP4_KV=1`.
+2. **Write dispatch** — when the gate is on, switch
+   `attention_step`'s KV-write call to the new NVFP4 kernel
+   instead of `mistral35_kv_cache_write_bf16`.
+3. **FA-decode NVFP4 read variant** — second variant of
+   `mistral35_fa_decode_gqa_bf16` that reads NVFP4 packed +
+   scale, dequant-in-kernel inside the K/V tile load. Same
+   online-softmax body, ~80 LOC delta.
+4. **Equivalence check** — confirm
+   `dequant(write_nvfp4(bf16_x))` returns the BF16 K/V used
+   downstream (cosine ≥ 0.999 per slot, by far the most
+   important validation step). Use the existing weight-side
+   `nvfp4_dequant_weights_bf16` decode logic as the
+   ground-truth reference for the FP4 LUT.
+5. **Acceptance gate** — vision orange-ball + 64-tok German
+   GQA byte-identical (allowing for the ~0.1 % NVFP4 quant
+   noise; if drift is too high, the K-scale policy may need
+   the existing `mse` variant rather than the plain
+   `amax/6` used in the write kernel today).
+
+### Why it's worth doing
+
+At past_len ≈ 400 (current Mistral 3.5 workloads):
+* BF16 KV bytes per decode token: ≈ 70 MB across 88 layers
+* NVFP4 KV bytes:                   ≈ 20 MB
+* Weight bytes (unchanged):         ≈ 530 MB
+* Total decode-bandwidth saving:    ≈ 8 %
+
+At past_len ≈ 4000 (long-context decoding):
+* BF16 KV bytes: ≈ 700 MB     →  total 1230 MB
+* NVFP4 KV bytes: ≈ 200 MB    →  total 730 MB
+* Saving:        ≈ 40 % decode tok/s
+
+So the win is small at current short-context use but
+transformative for long-context decoding — the regime where
+KV bandwidth surpasses weight bandwidth.
 
 ---
 
