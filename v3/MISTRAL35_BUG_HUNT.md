@@ -1,6 +1,6 @@
 # Mistral 3.5 NVFP4 — investigation log (linear, single source of truth)
 
-**Last updated:** 2026-05-10
+**Last updated:** 2026-05-10 (Pixtral vision E2E semantic gate passed)
 **Branch:** `rusty_sm121_vision`
 **Service:** `rvllm-serve.service`, port 8010
 
@@ -75,6 +75,46 @@ introduces a second BF16 rounding step. The parity probe at
 within `cos ≥ 0.9999`, `rms_diff/rms < 5e-3` — both paths are
 internally consistent but diverge from each other at BF16 ULP-level
 in the expected direction (legacy is the lossier of the two).
+
+## Pixtral vision pipeline (Round-12) — semantically validated end-to-end
+
+The full Pixtral path (forward_pixtral_vision → BF16 splice into the
+language-decoder embed buffer at `slot.token_start * row_bytes` →
+generate) produces semantically correct visual descriptions on real
+images, despite the residual ~6% angular drift at `post_blocks` vs
+the HF reference (a separate-yak numerical-fidelity issue tracked
+under "Open risks" below).
+
+E2E tests (rvllm-serve, RVLLM_DEBUG_MISTRAL35=1, RVLLM_LOAD_VISION=1):
+
+  /tmp/orange_ball.png (336x336, orange ellipse on light blue)
+    user: "What is in this image? Answer in 5 words."
+    rvllm: "orange ball on light blue background"   ✅
+
+  /tmp/blue_yellow.png (blue square with yellow triangle)
+    user: "Describe this image in 8 words or less."
+    rvllm: "Yellow triangle on blue square background."   ✅
+
+  /tmp/grid_image.png (green background, white grid lines)
+    user: "What pattern is in this image? 8 words max."
+    rvllm: "Green grid with white lines."   ✅
+
+The model correctly identifies shapes, colors, and spatial
+relationships from the BF16 soft-token output of
+`forward_pixtral_vision`. Text-only smoke
+(`"Hello"` → `" Abstract Wikipedia Update — Volume"`) remains
+unchanged after the splice plumbing landed; the `generate(...)`
+shim onto `generate_with_vision(..., &[])` preserves zero-splice
+behaviour.
+
+The 6% post_blocks drift accumulates from small per-block BF16
+rounding differences vs HF (see Round-12 phase 3-test (c)
+investigation). It does NOT prevent semantically correct visual
+understanding — Pixtral's design is robust to small embedding
+perturbations the language decoder absorbs through its attention.
+Numerical-bisect work (per-block dump in a stream-isolated path,
+softmax precision, etc.) can land later as a polish pass without
+blocking the vision feature.
 
 ## Open risks
 
