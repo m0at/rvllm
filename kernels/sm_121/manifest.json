@@ -381,10 +381,20 @@
       "path": "mistral35_qk_dot_gqa_bf16.ptx",
       "sha256": "24ff0c2670d567d16d175252abb5a60e5c213d147aaa5ce3b528a96d1525078f"
     },
+    "mistral35_softmax_inplace_f32": {
+      "bytes": 8173,
+      "path": "mistral35_softmax_inplace_f32.ptx",
+      "sha256": "e4c6fbff513e639cfbb106ff492d987440781f47b70c9472a754de8fb0a39127"
+    },
     "mistral35_softmax_v_bf16": {
       "bytes": 26427,
       "path": "mistral35_softmax_v_bf16.ptx",
       "sha256": "445546dff54a12f11b72b0847533fd42c5dc904bc727904e0d4f2b489c88f62f"
+    },
+    "mistral35_v_dot_gqa_bf16": {
+      "bytes": 58082,
+      "path": "mistral35_v_dot_gqa_bf16.ptx",
+      "sha256": "c9f9bf7a2a61344e26c71499412ad0ba6d7c0f64f516bc2206ec9cde37a30025"
     },
     "mistral35_w4a16_gemv_bf16": {
       "bytes": 24589,
@@ -707,5 +717,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "9e9f771"
+  "revision": "9027bf5"
 }

@@ -96,6 +96,10 @@ pub struct Mistral35ForwardKernels {
     pub fn_qk_dot_gqa_bf16: KernelFn,
     pub softmax_v_bf16_mod: LoadedModule,
     pub fn_softmax_v_bf16: KernelFn,
+    pub softmax_inplace_f32_mod: LoadedModule,
+    pub fn_softmax_inplace_f32: KernelFn,
+    pub v_dot_gqa_bf16_mod: LoadedModule,
+    pub fn_v_dot_gqa_bf16: KernelFn,
     // W4A16 NVFP4 path (Mistral 3.5 checkpoint format): dequantize
     // weight blocks to BF16 then run `cublasLt bf16_gemm_f32`. The
     // legacy W4A4 (CUTLASS NVFP4 tensor-core) path is kept compiled
@@ -962,6 +966,13 @@ impl Mistral35Bringup {
             let softmax_v_bf16_mod = kernels.load_ptx("mistral35_softmax_v_bf16")?;
             let fn_softmax_v_bf16 = softmax_v_bf16_mod
                 .get_function("mistral35_softmax_v_bf16_kernel")?;
+            let softmax_inplace_f32_mod =
+                kernels.load_ptx("mistral35_softmax_inplace_f32")?;
+            let fn_softmax_inplace_f32 = softmax_inplace_f32_mod
+                .get_function("mistral35_softmax_inplace_f32_kernel")?;
+            let v_dot_gqa_bf16_mod = kernels.load_ptx("mistral35_v_dot_gqa_bf16")?;
+            let fn_v_dot_gqa_bf16 = v_dot_gqa_bf16_mod
+                .get_function("mistral35_v_dot_gqa_bf16_kernel")?;
             let nvfp4_dequant_weights_bf16_mod =
                 kernels.load_ptx("nvfp4_dequant_weights_bf16")?;
             let fn_nvfp4_dequant_weights_bf16 = nvfp4_dequant_weights_bf16_mod
@@ -1032,6 +1043,10 @@ impl Mistral35Bringup {
                 fn_qk_dot_gqa_bf16,
                 softmax_v_bf16_mod,
                 fn_softmax_v_bf16,
+                softmax_inplace_f32_mod,
+                fn_softmax_inplace_f32,
+                v_dot_gqa_bf16_mod,
+                fn_v_dot_gqa_bf16,
                 nvfp4_dequant_weights_bf16_mod,
                 fn_nvfp4_dequant_weights_bf16,
                 f32_to_bf16_mod,
@@ -2028,7 +2043,85 @@ impl Mistral35Bringup {
             }
 
             // (c) softmax_v: out[n_q_heads, head_dim] = softmax(scores) · V[0..past_len]
-            {
+            //
+            // Two paths:
+            //   * Legacy fused kernel (`mistral35_softmax_v_bf16`):
+            //     serial-in-thread-0 softmax + per-q_head V dot.
+            //   * GQA fast path (default-on for Mistral 3.5):
+            //     parallel softmax in-place into `scores`, then
+            //     `mistral35_v_dot_gqa_bf16` shares each V tile across
+            //     all `gqa_ratio` Q-heads of one kv_head. Cuts V
+            //     bandwidth by `gqa_ratio` (12×) and parallelises the
+            //     softmax stage across `head_dim` threads.
+            //
+            // Gate: opt-in via `RVLLM_MISTRAL35_V_DOT_GQA=1`. The
+            // two-kernel split is bit-identical to the legacy fused
+            // kernel but ~2% SLOWER end-to-end at typical Mistral 3.5
+            // decode shapes (past_len ≈ 400) — the extra kernel
+            // launch + DRAM round-trip for the in-place softmax probs
+            // outweighs the V-bandwidth saving from the GQA tiling.
+            // The kernels stay in tree as a building block for the
+            // proper fused FlashAttention-decode kernel that keeps
+            // softmax stats in shared memory and never materialises
+            // probs to DRAM. Until that lands, default OFF.
+            let use_v_gqa = std::env::var("RVLLM_MISTRAL35_V_DOT_GQA")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(false)
+                && gqa_ratio_attn == 12;
+            if use_v_gqa {
+                // Pass A: parallel softmax in-place on scores[n_q_heads, past_len].
+                {
+                    let mut sc_ptr = kv_cache.scores_f32_ptr;
+                    let mut nq = n_q_heads_attn as i32;
+                    let mut pl = past_len;
+                    let args_sm = [
+                        (&mut sc_ptr) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut nq) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                    ];
+                    let tpb = head_dim_attn as u32;
+                    let smem = tpb * 4;
+                    unsafe {
+                        rvllm_fused::launch_raw(
+                            kernels.fn_softmax_inplace_f32,
+                            (n_q_heads_attn, 1, 1),
+                            (tpb, 1, 1),
+                            smem, stream_u64, &args_sm,
+                        )?;
+                    }
+                }
+                // Pass B: GQA V-dot. Smem layout matches the kernel's
+                // declaration: TILE_T*head_dim BF16 + 12*TILE_T F32.
+                {
+                    const TILE_T: u32 = 32;
+                    const G: u32 = 12;
+                    let mut sc_ptr = kv_cache.scores_f32_ptr;
+                    let mut v_cache = layer_kv.v_ptr;
+                    let mut out_ptr = scr.attn_out_ptr;
+                    let mut hd = head_dim_attn;
+                    let mut nkv = n_kv_heads_attn;
+                    let mut gr = gqa_ratio_attn;
+                    let mut pl = past_len;
+                    let args_v = [
+                        (&mut sc_ptr) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                    ];
+                    let smem = TILE_T * (head_dim_attn as u32) * 2 + G * TILE_T * 4;
+                    unsafe {
+                        rvllm_fused::launch_raw(
+                            kernels.fn_v_dot_gqa_bf16,
+                            (n_kv_heads_attn as u32, 1, 1),
+                            (head_dim_attn as u32, 1, 1),
+                            smem, stream_u64, &args_v,
+                        )?;
+                    }
+                }
+            } else {
                 let mut sc_ptr = kv_cache.scores_f32_ptr;
                 let mut v_cache = layer_kv.v_ptr;
                 let mut out_ptr = scr.attn_out_ptr;
