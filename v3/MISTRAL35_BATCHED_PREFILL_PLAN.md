@@ -271,3 +271,84 @@ length 1, 16, 128, 383, flip `RVLLM_MISTRAL35_BATCH_PREFILL` to
 default ON. Acceptance gate: prefill tok/s ≥ 8 (≥ 3.5× current),
 greedy "Hallo!" + 64-tok German GQA decode + vision E2E all
 byte-identical.
+
+---
+
+## 2026-05-10 — refined scope after kernel audit + per-stage timing
+
+`RVLLM_MISTRAL35_LAYER_TIMING=1` per-token forward (87 layers):
+
+  norm + QKV + RoPE   58.4 ms   13.1 %
+  attention            9.2 ms    2.1 %
+  O proj + post-norm  48.3 ms   10.9 %
+  MLP                329.7 ms   74.0 %
+
+So Phase C should land MLP first (gate / up / down at M=T) — that
+captures three quarters of the per-token time on its own. Then
+QKV + O at M=T captures another 24 %. Attention at 2 % is barely
+worth a fused prefill kernel.
+
+### Kernel-readiness inventory
+
+Walked the kernel set against the [T, hidden] flow this iteration.
+Most of the building blocks are already batch-capable:
+
+| Kernel | Status | Notes |
+|---|---|---|
+| `embedding_gather_bf16` | ✅ batched | grid = (num_tokens, 1, 1) |
+| `RmsnormInplaceLaunch` | ✅ batched | num_tokens param, grid stride |
+| `vector_add_bf16` | ✅ batched-equivalent | 1-D over `n = T * hidden` |
+| `silu_mul_bf16` | ✅ batched-equivalent | 1-D over `n = T * intermediate` |
+| `nvfp4_dequant_weights_bf16` | ✅ weight-only | M-independent |
+| `cublasLt bf16_gemm_f32` | ✅ M param native | already takes M, n, k |
+| `mistral35_w4a16_gemv_bf16` | ⊘ M=1 only (correct) | stays as decode fast path |
+| `f32_to_bf16` cast | ⚠ hardcoded `count = n` | needs `count = m*n` for M>1 |
+| `rope_split_half_bf16` | ⚠ per-call num_tokens param | call sites loop, easy fix |
+| `kv_cache_write_bf16` | ⚠ per-call slot | call sites loop, easy fix |
+| **causal prefill attention** | ❌ no kernel | the only real new-kernel blocker |
+
+### Pragmatic intermediate — Phase C-light (no new attention kernel)
+
+Build a chunked path that batches everything *except* attention:
+
+  embed_gather_t_bf16 → [T, hidden]
+  for layer in 0..N:
+      rmsnorm           num_tokens=T
+      qkv  M=T          legacy dequant + bf16_gemm_f32
+      rope_t            existing kernel × T (still cheap)
+      kv_write_t        existing kernel × T (still cheap)
+      for t in 0..T:    PER-QUERY ATTENTION LOOP
+          attention_step at past_len = pos_start + t + 1
+      o    M=T          legacy path
+      residual + rmsnorm
+      gate, up   M=T
+      silu_mul          n = T * intermediate
+      down  M=T
+      residual
+
+Attention per-query loop costs ≈ 2 % of per-token time × T calls
+≈ 2 % of total. Net of the M=T GEMM win (74 % MLP + 24 % QKV/O
+moving from bandwidth-bound GEMV to GEMM-throughput): expected
+prefill 3–5× speedup matches the original plan without writing a
+new attention kernel.
+
+### Concrete TODO list, in commit-sized chunks
+
+1. **Bump `out_f32_scratch` to T·N_max·4 bytes** at bring-up.
+   Pick `T_max` = the existing `RVLLM_MAX_TOKENS_CAP` (=64) or a
+   profile-knob; rejecting longer chunks at the entry point.
+2. **Generalise `f32_to_bf16` call site to count = M*N** in the
+   legacy `gemm` helper.
+3. **Wire MLP at M=T** (gate/up/down). Smallest reachable speedup:
+   the 74 % bucket. Test on a 4-token prompt with the chunk path,
+   byte-compare logits at position T-1 vs the per-token loop.
+4. **Wire QKV + O at M=T**. Adds the 24 % bucket.
+5. **Per-query attention loop** in the chunk path. Reuse the
+   existing M=1 attention kernels.
+6. **Embed gather + post-norm + LM head row pick**. The "outer
+   shell" of the forward, mostly already batched-friendly.
+7. **Acceptance suite**: token-equivalence at prompt lengths
+   1 / 4 / 16 / 64 / 372, vision E2E unchanged.
+8. **Phase E (later, optional)**: causal prefill attention
+   kernel. Only worth doing if attention's 2 % share becomes the
+   new bottleneck once the GEMVs are batched.
