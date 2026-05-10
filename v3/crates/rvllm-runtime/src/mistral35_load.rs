@@ -199,6 +199,84 @@ fn upload_typed_tensor(
     })
 }
 
+/// Round-12 phase 5b: read several BF16 tensors, validate dtype +
+/// per-tensor shape, concat them along the OUTER axis (axis 0), and
+/// upload as one device region. Reserved for a future fused-QKV /
+/// fused-gate-up GEMM in the Pixtral vision tower.
+///
+/// All input tensors must have identical shape `[rows_per, cols]`.
+/// Output device buffer has shape `[count * rows_per, cols]`.
+///
+/// Currently unused: cuBLAS's stride-batched output for the
+/// per-block forward would need to land in [3*N, v_hidden] head-major
+/// (= 3 vertically-stacked [N, v_hidden] slabs) to keep the
+/// downstream RoPE / attention kernels stride-correct, but the
+/// natural cuBLAS row-major output is [N, 3*v_hidden] interleaved.
+/// Using this helper would require either (a) a transpose kernel
+/// after the fused GEMM (defeats purpose), (b) a stride_a=0
+/// broadcast batched-strided variant whose support on this driver
+/// is unverified, or (c) RoPE/attention kernel rewrites with a
+/// stride parameter. Tracked in MISTRAL35_VISION_TODO.md under
+/// "Performance — batched Q/K/V GEMMs".
+#[allow(dead_code)]
+fn upload_bf16_concat_axis0(
+    arena: &HbmArena<'_>,
+    pool: &ShardPool,
+    region_name: &'static str,
+    tensor_names: &[String],
+    rows_per: usize,
+    cols: usize,
+) -> Result<F16Weight> {
+    let bytes_per_elem = 2;
+    let single_bytes = rows_per * cols * bytes_per_elem;
+    let total_bytes = single_bytes * tensor_names.len();
+    let mut staging = vec![0u8; total_bytes];
+    for (i, name) in tensor_names.iter().enumerate() {
+        let (si, e) = pool.must_get(name)?;
+        if e.dtype != DType::Bf16 {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "concat tensor {name}: dtype={:?} but Bf16 required",
+                        e.dtype),
+                },
+                ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(name.clone()) },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        if e.shape != vec![rows_per, cols] {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "concat tensor {name}: shape={:?} but [{rows_per}, {cols}] required",
+                        e.shape),
+                },
+                ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(name.clone()) },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        let raw = pool.bytes_of(si, e);
+        if raw.len() != single_bytes {
+            return Err(RvllmError::Loader {
+                err: LoaderError::Corrupt {
+                    detail: format!(
+                        "concat tensor {name}: raw bytes {} != {}",
+                        raw.len(), single_bytes),
+                },
+                ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(name.clone()) },
+                bt: std::backtrace::Backtrace::capture(),
+            });
+        }
+        staging[i * single_bytes..(i + 1) * single_bytes].copy_from_slice(raw);
+    }
+    let region = arena.region(region_name, total_bytes, 16)?;
+    unsafe { region.copy_from_host(&staging)? };
+    Ok(F16Weight {
+        offset_bytes: region.device_ptr(),
+        shape: vec![tensor_names.len() * rows_per, cols],
+    })
+}
+
 /// Convenience wrapper: BF16 only.
 fn upload_bf16_tensor(
     arena: &HbmArena<'_>,
