@@ -204,7 +204,8 @@ for arch in $ARCHS; do
             argmax|rmsnorm_inplace_*|residual_scale_f16|vnorm_f16|\
             vector_add_*|f32_to_*|f16_to_*|bf16_to_*|\
             mistral35_*|nvfp4_dequant_weights_bf16|\
-            rope_split_half_bf16) return 0 ;;
+            rope_split_half_bf16|\
+            pixtral_rotary_2d_bf16|patch_merger_pixtral_2x2) return 0 ;;
             *) return 1 ;;
         esac
     }

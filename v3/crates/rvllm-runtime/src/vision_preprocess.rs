@@ -621,6 +621,58 @@ pub fn preprocess_mistral35_pixtral(
     })
 }
 
+/// Pixtral 2x2 spatial patch merger — host reference.
+///
+/// Mirrors `kernels/patch_merger_pixtral_2x2.cu` byte-for-byte:
+///
+/// ```text
+/// in:  [grid_h, grid_w, hidden]   row-major
+/// out: [grid_h/2, grid_w/2, 4*hidden]
+///
+/// out[mh, mw, 0..H]   = in[2*mh,   2*mw,   :]   // top-left
+/// out[mh, mw, H..2H]  = in[2*mh,   2*mw+1, :]   // top-right
+/// out[mh, mw, 2H..3H] = in[2*mh+1, 2*mw,   :]   // bottom-left
+/// out[mh, mw, 3H..4H] = in[2*mh+1, 2*mw+1, :]   // bottom-right
+/// ```
+///
+/// Used by the GPU-forward CPU validation harness; the kernel diff
+/// gate compares device output to this function's f32 result.
+///
+/// Round-12 (Pixtral vision phase 1).
+pub fn patch_merger_pixtral_2x2_ref(
+    input: &[f32],
+    grid_h: usize,
+    grid_w: usize,
+    hidden: usize,
+) -> Vec<f32> {
+    assert_eq!(grid_h % 2, 0, "grid_h must be even, got {grid_h}");
+    assert_eq!(grid_w % 2, 0, "grid_w must be even, got {grid_w}");
+    assert_eq!(input.len(), grid_h * grid_w * hidden);
+    let merged_h = grid_h / 2;
+    let merged_w = grid_w / 2;
+    let mut out = vec![0.0f32; merged_h * merged_w * 4 * hidden];
+    let h = hidden;
+    for mh in 0..merged_h {
+        for mw in 0..merged_w {
+            let merged_idx = mh * merged_w + mw;
+            let base_out = merged_idx * 4 * h;
+            let in_tl = ((2*mh)   * grid_w + (2*mw))   * h;
+            let in_tr = ((2*mh)   * grid_w + (2*mw+1)) * h;
+            let in_bl = ((2*mh+1) * grid_w + (2*mw))   * h;
+            let in_br = ((2*mh+1) * grid_w + (2*mw+1)) * h;
+            out[base_out + 0*h .. base_out + 1*h]
+                .copy_from_slice(&input[in_tl .. in_tl + h]);
+            out[base_out + 1*h .. base_out + 2*h]
+                .copy_from_slice(&input[in_tr .. in_tr + h]);
+            out[base_out + 2*h .. base_out + 3*h]
+                .copy_from_slice(&input[in_bl .. in_bl + h]);
+            out[base_out + 3*h .. base_out + 4*h]
+                .copy_from_slice(&input[in_br .. in_br + h]);
+        }
+    }
+    out
+}
+
 // ─── Tests vs HF reference fixtures ───────────────────────────────────
 
 #[cfg(test)]
@@ -893,6 +945,70 @@ mod tests {
                     "patch {patch_idx} px {px}: b={b} expected {eb}");
             }
         }
+    }
+
+    /// Round-12 patch-merger CPU reference tests.
+    /// The kernel byte-for-byte mirrors this; if these tests pass and
+    /// the GPU diff harness later passes against this reference, the
+    /// kernel is considered correct.
+    #[test]
+    fn patch_merger_2x2_smallest_grid() {
+        // 2x2 grid, hidden=3 — distinct values per (h, w, c) so any
+        // index swap shows up as a value mismatch.
+        let h = 3;
+        let g = 2;
+        let mut input = vec![0.0f32; g * g * h];
+        for y in 0..g {
+            for x in 0..g {
+                for c in 0..h {
+                    input[(y * g + x) * h + c] =
+                        (100*y + 10*x + c) as f32;
+                }
+            }
+        }
+        let out = patch_merger_pixtral_2x2_ref(&input, g, g, h);
+        // 1 merged token of width 4*h
+        assert_eq!(out.len(), 4 * h);
+        // Top-left (y=0,x=0), values 0, 1, 2.
+        assert_eq!(&out[0..h], &[0.0, 1.0, 2.0]);
+        // Top-right (y=0,x=1), values 10, 11, 12.
+        assert_eq!(&out[h..2*h], &[10.0, 11.0, 12.0]);
+        // Bottom-left (y=1,x=0), values 100, 101, 102.
+        assert_eq!(&out[2*h..3*h], &[100.0, 101.0, 102.0]);
+        // Bottom-right (y=1,x=1), values 110, 111, 112.
+        assert_eq!(&out[3*h..4*h], &[110.0, 111.0, 112.0]);
+    }
+
+    #[test]
+    fn patch_merger_2x2_4x4_grid_has_4_merged_tokens() {
+        // 4x4 grid → 2x2 merged.
+        let h = 5;
+        let g = 4;
+        let input: Vec<f32> = (0..g*g*h).map(|i| i as f32).collect();
+        let out = patch_merger_pixtral_2x2_ref(&input, g, g, h);
+        assert_eq!(out.len(), 4 * 4 * h);
+
+        // Token (mh=1, mw=0): merges (y=2,x=0), (y=2,x=1), (y=3,x=0), (y=3,x=1).
+        let merged_idx = 1 * 2 + 0;
+        let base = merged_idx * 4 * h;
+        // top-left = in[(2,0,:)] = at offset 2*4*h .. 2*4*h + h
+        let off_tl = (2 * g + 0) * h;
+        assert_eq!(&out[base..base+h], &input[off_tl..off_tl+h]);
+        // top-right = in[(2,1,:)]
+        let off_tr = (2 * g + 1) * h;
+        assert_eq!(&out[base+h..base+2*h], &input[off_tr..off_tr+h]);
+        // bottom-left = in[(3,0,:)]
+        let off_bl = (3 * g + 0) * h;
+        assert_eq!(&out[base+2*h..base+3*h], &input[off_bl..off_bl+h]);
+        // bottom-right = in[(3,1,:)]
+        let off_br = (3 * g + 1) * h;
+        assert_eq!(&out[base+3*h..base+4*h], &input[off_br..off_br+h]);
+    }
+
+    #[test]
+    #[should_panic(expected = "grid_h must be even")]
+    fn patch_merger_2x2_rejects_odd_grid_h() {
+        let _ = patch_merger_pixtral_2x2_ref(&[0.0; 3*4*1], 3, 4, 1);
     }
 
     #[test]
