@@ -689,15 +689,22 @@ pub struct BatchedPrefillConfig {
 
 impl Default for BatchedPrefillConfig {
     fn default() -> Self {
-        // Production default once the kernels land: every prefill
-        // gate ON, decode-graph still off. Until then `load()`
-        // ignores the config because `run_generate` is a stub.
+        // Round-12 phase 5c fix: defaults reflect what the runtime
+        // ACTUALLY executes today, not the aspirational plan. Every
+        // batched phase is OFF until the kernels land; the logger and
+        // any downstream branch on `outer_loop_deleted` see the same
+        // truth as the executor.
+        //
+        // To opt into a future batched phase, set the corresponding
+        // env (RVLLM_MISTRAL35_BATCH_*) to 1 — bring-up will refuse
+        // to start until the kernel is wired (see the env-set guard
+        // in `Mistral35Bringup::load`).
         Self {
-            batch_projections: true,
+            batch_projections: false,
             fused_qkv: false,
-            batch_rope: true,
-            batch_full_prefill: true,
-            outer_loop_deleted: true,
+            batch_rope: false,
+            batch_full_prefill: false,
+            outer_loop_deleted: false,
             decode_graph_capture: false,
         }
     }
@@ -712,10 +719,14 @@ impl BatchedPrefillConfig {
                 _ => default,
             }
         };
-        let batch_projections = on("RVLLM_MISTRAL35_BATCH_PROJ_PREFILL", true);
+        // Round-12 phase 5c fix: every batched gate defaults to false
+        // because none of the M-A/B/C/D/E phases are wired into the
+        // executor yet. Setting any of these to 1 explicitly is
+        // rejected at bring-up start (see Mistral35Bringup::load).
+        let batch_projections = on("RVLLM_MISTRAL35_BATCH_PROJ_PREFILL", false);
         let fused_qkv = on("RVLLM_MISTRAL35_FUSED_QKV", false);
-        let batch_rope = on("RVLLM_MISTRAL35_BATCH_ROPE_PREFILL", true);
-        let batch_full_prefill = on("RVLLM_MISTRAL35_BATCH_FULL_PREFILL", true);
+        let batch_rope = on("RVLLM_MISTRAL35_BATCH_ROPE_PREFILL", false);
+        let batch_full_prefill = on("RVLLM_MISTRAL35_BATCH_FULL_PREFILL", false);
         let decode_graph_capture = on("RVLLM_MISTRAL35_DECODE_GRAPH", false);
         // Phase M-D collapses when its predecessors are all on.
         let outer_loop_deleted =
@@ -1273,16 +1284,46 @@ impl Mistral35Bringup {
                 bringup.arch.text.yarn.beta_slow,
             );
         }
-        let prefill = bringup.batched_prefill_config();
+        // Round-12 phase 5c (codex review #1): the BatchedPrefillConfig
+        // is plan documentation — none of its phases (M-A/M-B/M-C/M-D/
+        // M-E) are wired into `generate_with_vision`'s executor today.
+        // The forward path iterates token-major over `prompt`. Logging
+        // `outer_loop_deleted=true` here was a load-bearing lie that
+        // produced false operator expectations about scaling. Replaced
+        // with an honest one-liner.
+        //
+        // If the operator explicitly opted into a batched gate
+        // (RVLLM_MISTRAL35_BATCH_PROJ_PREFILL=1 etc), fail fast — they
+        // expect batched execution, the runtime can't deliver it.
+        let env_set_batched = [
+            "RVLLM_MISTRAL35_BATCH_PROJ_PREFILL",
+            "RVLLM_MISTRAL35_FUSED_QKV",
+            "RVLLM_MISTRAL35_BATCH_ROPE_PREFILL",
+            "RVLLM_MISTRAL35_BATCH_FULL_PREFILL",
+            "RVLLM_MISTRAL35_DECODE_GRAPH",
+        ].iter().filter(|k| {
+            matches!(std::env::var(k).ok().as_deref(),
+                     Some("1") | Some("true") | Some("TRUE") | Some("on"))
+        }).copied().collect::<Vec<_>>();
+        if !env_set_batched.is_empty() {
+            return Err(corrupt(
+                bringup.paths.model_dir.clone(),
+                format!(
+                    "[mistral35] {} requested but the runtime executor \
+                     is token-major (batched-prefill phases M-A/B/C/D/E \
+                     are plan-doc only, not wired into \
+                     generate_with_vision). Unset these envs or wait \
+                     for the batched-prefill landing tracked in \
+                     v3/MISTRAL35_BATCHED_PREFILL_PLAN.md.",
+                    env_set_batched.join(", "),
+                ),
+            ));
+        }
         eprintln!(
-            "[mistral35] batched-prefill: proj={} fused_qkv={} rope={} \
-             full_prefill={} outer_loop_deleted={} decode_graph={}",
-            prefill.batch_projections,
-            prefill.fused_qkv,
-            prefill.batch_rope,
-            prefill.batch_full_prefill,
-            prefill.outer_loop_deleted,
-            prefill.decode_graph_capture,
+            "[mistral35] executor: token-major (per-prompt-token \
+             forward via forward_smoke_q_proj_inner). batched-prefill \
+             phases (M-A/B/C/D/E) are plan-doc only — see \
+             MISTRAL35_BATCHED_PREFILL_PLAN.md."
         );
         // Indicative scratch-budget at a few common prefill chunk
         // sizes so the operator can see whether the requested
@@ -4084,9 +4125,12 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn batched_prefill_default_is_full_on_except_decode_graph_and_qkv() {
+    fn batched_prefill_default_is_all_off_until_executor_lands() {
+        // Round-12 phase 5c: until generate_with_vision actually
+        // runs a layer-major batched prefill, all phase gates must
+        // default OFF so the startup log + downstream branches see
+        // honest reality (codex review #1 — "lying log" finding).
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // Ensure no env vars from a previous test leak in.
         for v in [
             "RVLLM_MISTRAL35_BATCH_PROJ_PREFILL",
             "RVLLM_MISTRAL35_FUSED_QKV",
@@ -4097,10 +4141,10 @@ mod tests {
             std::env::remove_var(v);
         }
         let cfg = BatchedPrefillConfig::from_env();
-        assert!(cfg.batch_projections);
-        assert!(cfg.batch_rope);
-        assert!(cfg.batch_full_prefill);
-        assert!(cfg.outer_loop_deleted);
+        assert!(!cfg.batch_projections);
+        assert!(!cfg.batch_rope);
+        assert!(!cfg.batch_full_prefill);
+        assert!(!cfg.outer_loop_deleted);
         assert!(!cfg.fused_qkv);
         assert!(!cfg.decode_graph_capture);
     }
