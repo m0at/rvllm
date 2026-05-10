@@ -316,6 +316,11 @@
       "path": "gated_delta_state_update_f16.ptx",
       "sha256": "e2a0f2f1112912353f23f6d7e11a259da1a0150be67b4665fde5d80b004dbacc"
     },
+    "gelu_tanh_bf16": {
+      "bytes": 1885,
+      "path": "gelu_tanh_bf16.ptx",
+      "sha256": "769869c424e5fa27ac4d3ec50e9811822105e15a29f57ccafcf8fbf9c55a5cc5"
+    },
     "gelu_tanh_f16": {
       "bytes": 1878,
       "path": "gelu_tanh_f16.ptx",
@@ -697,5 +702,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "246a547"
+  "revision": "c24f30f"
 }

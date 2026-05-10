@@ -208,7 +208,8 @@ for arch in $ARCHS; do
             pixtral_rotary_2d_bf16|patch_merger_pixtral_2x2|\
             extract_head_bf16|scatter_heads_bf16|\
             softmax_row_f32_to_bf16|gelu_tanh_mul_bf16|\
-            scale_inplace_f32|transpose_heads_v_bf16) return 0 ;;
+            scale_inplace_f32|transpose_heads_v_bf16|\
+            gelu_tanh_bf16) return 0 ;;
             *) return 1 ;;
         esac
     }

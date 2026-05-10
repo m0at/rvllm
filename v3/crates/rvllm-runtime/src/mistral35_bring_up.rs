@@ -127,6 +127,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_scale_inplace_f32: KernelFn,
     pub transpose_heads_v_bf16_mod: LoadedModule,
     pub fn_transpose_heads_v_bf16: KernelFn,
+    pub gelu_tanh_bf16_mod: LoadedModule,
+    pub fn_gelu_tanh_bf16: KernelFn,
 }
 
 /// Pre-allocated per-token forward scratch — sized for m=1 across
@@ -988,6 +990,9 @@ impl Mistral35Bringup {
                 kernels.load_ptx("transpose_heads_v_bf16")?;
             let fn_transpose_heads_v_bf16 = transpose_heads_v_bf16_mod
                 .get_function("transpose_heads_v_bf16_kernel")?;
+            let gelu_tanh_bf16_mod = kernels.load_ptx("gelu_tanh_bf16")?;
+            let fn_gelu_tanh_bf16 = gelu_tanh_bf16_mod
+                .get_function("gelu_tanh_bf16_kernel")?;
             let forward_kernels = Mistral35ForwardKernels {
                 embedding_gather_bf16_mod,
                 fn_embedding_gather_bf16,
@@ -1031,6 +1036,8 @@ impl Mistral35Bringup {
                 fn_scale_inplace_f32,
                 transpose_heads_v_bf16_mod,
                 fn_transpose_heads_v_bf16,
+                gelu_tanh_bf16_mod,
+                fn_gelu_tanh_bf16,
             };
 
             // W4A16 pre-dequantization is NOT viable for Mistral 3.5:
@@ -3358,24 +3365,228 @@ impl Mistral35Bringup {
             let _ = std::fs::write(d.join("post_blocks.bin"), &host);
         }
 
-        // Ensure all 48-block launches complete before scratch is reclaimed.
+        // ── Stage 5: projector ─────────────────────────────────────────
+        //
+        // HF Mistral3MultiModalProjector pipeline:
+        //   x [N, v_hidden]
+        //   → norm (RMSNorm with [v_hidden] gamma)
+        //   → patch_merger:   spatial 2x2 concat to [N/4, 4*v_hidden]
+        //                     then merging_layer Linear → [N/4, v_hidden]
+        //   → linear_1: v_hidden → text_hidden  ([N/4, text_hidden])
+        //   → GeLU (tanh approximation)
+        //   → linear_2: text_hidden → text_hidden
+        //   → output [N/4, text_hidden]
+        //
+        // Note ordering: norm comes BEFORE the 2x2 spatial merge (per HF
+        // source), so the RMS is computed over the v_hidden=1664 channels
+        // of each pre-merge token.
+
+        // 5.1 RMSNorm in-place on hidden_region [N, v_hidden].
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: n as u32,
+                hidden: v_hidden as u32,
+                eps: 1.0e-5,
+            }.launch(
+                kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                hidden_region.device_ptr(),
+                vision.projector_norm.offset_bytes,
+                stream_u64,
+            )?;
+        }
+        if let Some(ref d) = dump_dir {
+            stream.fence()?;
+            let mut host = vec![0u8; hidden_bytes];
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut _,
+                    hidden_region.device_ptr(), hidden_bytes);
+            }
+            let _ = std::fs::write(d.join("post_proj_norm.bin"), &host);
+        }
+
+        // 5.2 Spatial 2x2 patch merge: [grid_h, grid_w, v_hidden] →
+        //     [merged_h, merged_w, 4*v_hidden]. Pure permutation; the
+        //     subsequent Linear collapses the 4*v_hidden axis to v_hidden.
+        let (merged_h, merged_w) = pp.merged_grid;
+        let merged_n = (merged_h as usize) * (merged_w as usize);
+        let inner_4h = 4 * v_hidden;
+        let merged_bytes = merged_n * inner_4h * 2;
+        let merged_region = arena.region(
+            "pixtral_merged_concat", merged_bytes, 16)?;
+        unsafe {
+            let mut out = merged_region.device_ptr();
+            let mut in_p = hidden_region.device_ptr();
+            let mut gh = grid_h as i32;
+            let mut gw = grid_w as i32;
+            let mut hd = v_hidden as i32;
+            let args: [*mut std::ffi::c_void; 5] = [
+                (&mut out) as *mut u64 as *mut _,
+                (&mut in_p) as *mut u64 as *mut _,
+                (&mut gh) as *mut i32 as *mut _,
+                (&mut gw) as *mut i32 as *mut _,
+                (&mut hd) as *mut i32 as *mut _,
+            ];
+            rvllm_fused::launch_raw(
+                kernels.fn_patch_merger_pixtral_2x2,
+                (merged_n as u32, 1, 1),
+                (256, 1, 1),
+                0, stream_u64, &args,
+            )?;
+        }
+
+        // 5.3 merging_layer Linear: [merged_n, 4*v_hidden] @
+        //     merging_layer_weight^T [v_hidden, 4*v_hidden] →
+        //     [merged_n, v_hidden] BF16.
+        let post_merge_bytes = merged_n * v_hidden * 2;
+        let post_merge_region = arena.region(
+            "pixtral_post_merge", post_merge_bytes, 16)?;
+        unsafe {
+            cublaslt.bf16_gemm_f32(
+                merged_region.device_ptr(),
+                vision.projector_patch_merger.offset_bytes,
+                f32_big_scratch.device_ptr(),
+                merged_n as i32, v_hidden as i32, inner_4h as i32,
+                stream_u64,
+            )?;
+            let total = (merged_n * v_hidden) as i32;
+            let mut dst = post_merge_region.device_ptr();
+            let mut src = f32_big_scratch.device_ptr();
+            let mut count = total;
+            let args: [*mut std::ffi::c_void; 3] = [
+                (&mut dst) as *mut u64 as *mut _,
+                (&mut src) as *mut u64 as *mut _,
+                (&mut count) as *mut i32 as *mut _,
+            ];
+            let blocks = ((total as u32) + 1023) / 1024;
+            rvllm_fused::launch_raw(
+                kernels.fn_f32_to_bf16,
+                (blocks, 1, 1), (1024, 1, 1),
+                0, stream_u64, &args,
+            )?;
+        }
+        if let Some(ref d) = dump_dir {
+            stream.fence()?;
+            let mut host = vec![0u8; post_merge_bytes];
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut _,
+                    post_merge_region.device_ptr(), post_merge_bytes);
+            }
+            let _ = std::fs::write(d.join("post_merge.bin"), &host);
+        }
+
+        // 5.4 linear_1: [merged_n, v_hidden] @ W_l1^T [text_hidden, v_hidden]
+        //     → [merged_n, text_hidden] BF16.
+        let text_hidden = self.arch.text.hidden_size;
+        let post_l1_bytes = merged_n * text_hidden * 2;
+        let post_l1_region = arena.region(
+            "pixtral_post_linear1", post_l1_bytes, 16)?;
+        unsafe {
+            cublaslt.bf16_gemm_f32(
+                post_merge_region.device_ptr(),
+                vision.projector_linear_1.offset_bytes,
+                f32_big_scratch.device_ptr(),
+                merged_n as i32, text_hidden as i32, v_hidden as i32,
+                stream_u64,
+            )?;
+            let total = (merged_n * text_hidden) as i32;
+            let mut dst = post_l1_region.device_ptr();
+            let mut src = f32_big_scratch.device_ptr();
+            let mut count = total;
+            let args: [*mut std::ffi::c_void; 3] = [
+                (&mut dst) as *mut u64 as *mut _,
+                (&mut src) as *mut u64 as *mut _,
+                (&mut count) as *mut i32 as *mut _,
+            ];
+            let blocks = ((total as u32) + 1023) / 1024;
+            rvllm_fused::launch_raw(
+                kernels.fn_f32_to_bf16,
+                (blocks, 1, 1), (1024, 1, 1),
+                0, stream_u64, &args,
+            )?;
+        }
+
+        // 5.5 GeLU (tanh approximation) in-place on post_l1_region.
+        unsafe {
+            let mut x = post_l1_region.device_ptr();
+            let mut count = (merged_n * text_hidden) as i32;
+            let args: [*mut std::ffi::c_void; 2] = [
+                (&mut x) as *mut u64 as *mut _,
+                (&mut count) as *mut i32 as *mut _,
+            ];
+            let blocks = ((count as u32) + 1023) / 1024;
+            rvllm_fused::launch_raw(
+                kernels.fn_gelu_tanh_bf16,
+                (blocks, 1, 1), (1024, 1, 1),
+                0, stream_u64, &args,
+            )?;
+        }
+
+        // 5.6 linear_2: [merged_n, text_hidden] @ W_l2^T → [merged_n, text_hidden].
+        let post_l2_bytes = merged_n * text_hidden * 2;
+        let post_l2_region = arena.region(
+            "pixtral_post_linear2", post_l2_bytes, 16)?;
+        unsafe {
+            cublaslt.bf16_gemm_f32(
+                post_l1_region.device_ptr(),
+                vision.projector_linear_2.offset_bytes,
+                f32_big_scratch.device_ptr(),
+                merged_n as i32, text_hidden as i32, text_hidden as i32,
+                stream_u64,
+            )?;
+            let total = (merged_n * text_hidden) as i32;
+            let mut dst = post_l2_region.device_ptr();
+            let mut src = f32_big_scratch.device_ptr();
+            let mut count = total;
+            let args: [*mut std::ffi::c_void; 3] = [
+                (&mut dst) as *mut u64 as *mut _,
+                (&mut src) as *mut u64 as *mut _,
+                (&mut count) as *mut i32 as *mut _,
+            ];
+            let blocks = ((total as u32) + 1023) / 1024;
+            rvllm_fused::launch_raw(
+                kernels.fn_f32_to_bf16,
+                (blocks, 1, 1), (1024, 1, 1),
+                0, stream_u64, &args,
+            )?;
+        }
+
+        // ── Stage 6: DtoH the BF16 soft-token output. ─────────────────
         stream.fence()?;
+        let mut data = vec![0u8; post_l2_bytes];
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoH_v2(
+                data.as_mut_ptr() as *mut _,
+                post_l2_region.device_ptr(),
+                post_l2_bytes,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                unsafe { arena.restore(ck); }
+                return Err(rvllm_core::RvllmError::cuda(
+                    "pixtral: DtoH soft tokens",
+                    rvllm_core::CudaErrorKind::LaunchFailed,
+                    rvllm_core::CudaCtx::setup(),
+                ));
+            }
+        }
+        if let Some(ref d) = dump_dir {
+            let _ = std::fs::write(d.join("output.bin"), &data);
+        }
+
+        // Restore arena now that the data is host-side.
         unsafe { arena.restore(ck); }
 
-        // Stages 5 (patch_merger + projector) and 6 (DtoH) are the
-        // next wedge.
-        Err(corrupt(
-            self.paths.model_dir.clone(),
-            format!(
-                "forward_pixtral_vision: stages 1-4 (upload, patch_conv, \
-                 ln_pre, 48 ViT blocks) executed for [n={}, v_hidden={}, \
-                 inner={}]. Stage 5 (patch_merger + projector) is the \
-                 next phase. Set RVLLM_DEBUG_MISTRAL35=1 \
-                 RVLLM_PIXTRAL_DUMP_DIR=<path> to dump intermediates \
-                 for the cosine-vs-HF gate.",
-                n, v_hidden, inner,
-            ),
-        ))
+        Ok(Mistral35VisionForwardOutput {
+            data,
+            num_tokens: merged_n,
+            hidden_dim: text_hidden,
+            patch_grid: (grid_h, grid_w),
+            merged_grid: (merged_h, merged_w),
+        })
     }
 
     pub unsafe fn generate<F>(
