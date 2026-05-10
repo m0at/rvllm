@@ -4672,9 +4672,36 @@ impl Mistral35Bringup {
                     scr.token_in_t_ptr,
                     stream_u64,
                 )?;
-                // (3) Held back: layer body + final norm + LM head
-                //     at M=T. Lands in subsequent commits per the
-                //     plan in MISTRAL35_BATCHED_PREFILL_PLAN.md.
+                // (3) Layer-0 input RMSNorm at num_tokens=T. The
+                //     RmsnormInplaceLaunch kernel is grid-strided,
+                //     so passing num_tokens=T processes T rows at
+                //     once with one launch. Output goes into
+                //     h_work_t_ptr; consumed by the upcoming QKV
+                //     M=T projections.
+                let layer0 = &model.layers[0];
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                    num_tokens: tokens.len() as u32, hidden,
+                    eps: self.arch.text.rms_norm_eps as f32,
+                }.launch(
+                    kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                    scr.h_work_t_ptr,
+                    layer0.input_layernorm.offset_bytes,
+                    stream_u64,
+                )?;
+                // The hidden_t buffer h_work_t_ptr now holds
+                // T rows of post-RMSNorm activations. To use it
+                // we'd need to first copy h_residual_t -> h_work_t
+                // (the kernel is in-place). For this side-effect
+                // smoke that's fine — the buffer's contents are
+                // currently unused; the kernel just has to run
+                // cleanly at num_tokens=T. The full chunk body
+                // will reorder this to: dtod(h_work_t, h_residual_t)
+                // → rmsnorm-inplace → consume.
+                //
+                // (4) Held back: QKV M=T, RoPE, KV-write, attention,
+                //     O, MLP, final norm, LM head at M=T. Lands in
+                //     the next focused commit (~400 LOC) per
+                //     MISTRAL35_BATCHED_PREFILL_PLAN.md.
             }
         }
 
