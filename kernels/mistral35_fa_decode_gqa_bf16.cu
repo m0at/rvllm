@@ -138,8 +138,17 @@ extern "C" __global__ void mistral35_fa_decode_gqa_bf16_kernel(
         __syncthreads();
 
         // (c) Compute S[g][t] = Q[g, :] · K[t, :] * inv_sqrt_d for
-        //     all (g in 0..G, t in 0..tile). Use one parallel
-        //     reduction per (g, t) over head_dim threads.
+        //     all (g in 0..G, t in 0..tile). Warp-shuffle reduction
+        //     across head_dim=128 threads (= 4 warps): five
+        //     `__shfl_xor_sync` within each warp to fold 32 lanes
+        //     to one, then a single cross-warp reduction over 4
+        //     warp partials. Cuts sync-overhead ~5× vs the legacy
+        //     tree-reduce-with-syncthreads form (which was the
+        //     dominant cost in the previous revision — ~3500
+        //     `__syncthreads` per tile per layer; this revision
+        //     drops it to ~770).
+        const int warp_id = d >> 5;            // 0..3
+        const int lane_id = d & 31;            // 0..31
         #pragma unroll
         for (int g = 0; g < G; ++g) {
             for (int t = 0; t < TILE_T; ++t) {
@@ -147,15 +156,28 @@ extern "C" __global__ void mistral35_fa_decode_gqa_bf16_kernel(
                 const float qv = __bfloat162float(q_sh[g * head_dim + d]);
                 const float kv_val = __bfloat162float(k_sh[t * head_dim + d]);
                 float prod = qv * kv_val;
-                // Block reduce over `d` threads via shared `red`.
-                red[d] = prod;
+                // Intra-warp reduction (no sync inside warp).
+                prod += __shfl_xor_sync(0xFFFFFFFFu, prod, 16);
+                prod += __shfl_xor_sync(0xFFFFFFFFu, prod, 8);
+                prod += __shfl_xor_sync(0xFFFFFFFFu, prod, 4);
+                prod += __shfl_xor_sync(0xFFFFFFFFu, prod, 2);
+                prod += __shfl_xor_sync(0xFFFFFFFFu, prod, 1);
+                // Lane 0 of each warp writes its partial to red[].
+                if (lane_id == 0) red[warp_id] = prod;
                 __syncthreads();
-                for (int s = tpb >> 1; s > 0; s >>= 1) {
-                    if (d < s) red[d] += red[d + s];
-                    __syncthreads();
+                // Warp 0 reduces the 4 warp partials. ALL 32 lanes
+                // of warp 0 must call __shfl_xor_sync with the same
+                // mask — lanes 4..31 contribute 0 to keep the sum
+                // correct. (Conditional shuffle without all lanes
+                // calling is UB on modern GPUs.)
+                if (warp_id == 0) {
+                    float reduced = (lane_id < 4) ? red[lane_id] : 0.0f;
+                    reduced += __shfl_xor_sync(0xFFFFFFFFu, reduced, 2);
+                    reduced += __shfl_xor_sync(0xFFFFFFFFu, reduced, 1);
+                    if (lane_id == 0) red[0] = reduced;
                 }
+                __syncthreads();
                 S_tile[g][t] = red[0] * inv_sqrt_d;
-                __syncthreads();  // reuse `red` next iteration
             }
         }
 
