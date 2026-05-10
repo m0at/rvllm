@@ -123,6 +123,10 @@ pub struct Mistral35ForwardKernels {
     pub fn_softmax_row_f32_to_bf16: KernelFn,
     pub gelu_tanh_mul_bf16_mod: LoadedModule,
     pub fn_gelu_tanh_mul_bf16: KernelFn,
+    pub scale_inplace_f32_mod: LoadedModule,
+    pub fn_scale_inplace_f32: KernelFn,
+    pub transpose_heads_v_bf16_mod: LoadedModule,
+    pub fn_transpose_heads_v_bf16: KernelFn,
 }
 
 /// Pre-allocated per-token forward scratch — sized for m=1 across
@@ -977,6 +981,13 @@ impl Mistral35Bringup {
             let gelu_tanh_mul_bf16_mod = kernels.load_ptx("gelu_tanh_mul_bf16")?;
             let fn_gelu_tanh_mul_bf16 = gelu_tanh_mul_bf16_mod
                 .get_function("gelu_tanh_mul_bf16_kernel")?;
+            let scale_inplace_f32_mod = kernels.load_ptx("scale_inplace_f32")?;
+            let fn_scale_inplace_f32 = scale_inplace_f32_mod
+                .get_function("scale_inplace_f32_kernel")?;
+            let transpose_heads_v_bf16_mod =
+                kernels.load_ptx("transpose_heads_v_bf16")?;
+            let fn_transpose_heads_v_bf16 = transpose_heads_v_bf16_mod
+                .get_function("transpose_heads_v_bf16_kernel")?;
             let forward_kernels = Mistral35ForwardKernels {
                 embedding_gather_bf16_mod,
                 fn_embedding_gather_bf16,
@@ -1016,6 +1027,10 @@ impl Mistral35Bringup {
                 fn_softmax_row_f32_to_bf16,
                 gelu_tanh_mul_bf16_mod,
                 fn_gelu_tanh_mul_bf16,
+                scale_inplace_f32_mod,
+                fn_scale_inplace_f32,
+                transpose_heads_v_bf16_mod,
+                fn_transpose_heads_v_bf16,
             };
 
             // W4A16 pre-dequantization is NOT viable for Mistral 3.5:
@@ -2913,22 +2928,451 @@ impl Mistral35Bringup {
             let _ = std::fs::write(d.join("post_ln_pre.bin"), &host);
         }
 
-        // Ensure all launches complete before scratch is reclaimed.
+        // ── Stage 4: 48 ViT block stack ───────────────────────────────
+        //
+        // Per-block sequence (Llama-style ViT, bidirectional attn):
+        //   residual = x
+        //   x = norm1(x)
+        //   q,k,v = x @ Wq^T / Wk^T / Wv^T            (3 BF16 GEMMs)
+        //   apply 2D RoPE on q, k                      (full rotary)
+        //   scores = q @ k^T  / sqrt(D)                (batched-strided)
+        //   p      = softmax(scores)                   (per-row)
+        //   v_t    = transpose V to [H, D, N]
+        //   attn   = p @ v_t^T                          (batched-strided)
+        //   attn_out = scatter_heads(attn, [H,N,D] → [N,H*D])
+        //   x = residual + attn_out @ Wo^T
+        //   residual = x
+        //   x = norm2(x)
+        //   gate, up = x @ Wg^T, x @ Wu^T              (2 BF16 GEMMs)
+        //   m  = gelu_tanh(gate) * up
+        //   x = residual + m @ Wd^T
+        //
+        // All scratch lives between an inner checkpoint so memory is
+        // bounded and reused across the 48 blocks.
+
+        let head_dim = self.arch.vision.head_dim;
+        let n_heads = self.arch.vision.num_attention_heads;
+        let intermediate = self.arch.vision.intermediate_size;
+        debug_assert_eq!(n_heads * head_dim, v_hidden,
+            "n_heads * head_dim == v_hidden invariant violated");
+        let attn_scale: f32 = 1.0 / (head_dim as f32).sqrt();
+
+        // ── 4.0 Pre-compute + upload Pixtral 2D RoPE cos/sin tables ───
+        let (grid_h, grid_w) = pp.patch_grid;
+        let rope_tables = crate::mistral35_pixtral_rope::PixtralRopeTables::build(
+            grid_h, grid_w, head_dim, self.arch.vision.rope_theta,
+        );
+        let cos_bytes = rope_tables.cos.len() * 4;
+        let sin_bytes = rope_tables.sin.len() * 4;
+        let cos_region = arena.region("pixtral_rope_cos", cos_bytes, 16)?;
+        let sin_region = arena.region("pixtral_rope_sin", sin_bytes, 16)?;
+        // f32 → little-endian bytes.
+        let cos_host: Vec<u8> = rope_tables.cos.iter()
+            .flat_map(|f| f.to_le_bytes()).collect();
+        let sin_host: Vec<u8> = rope_tables.sin.iter()
+            .flat_map(|f| f.to_le_bytes()).collect();
+        unsafe { cos_region.copy_from_host(&cos_host)? };
+        unsafe { sin_region.copy_from_host(&sin_host)? };
+        let cos_ptr = cos_region.device_ptr();
+        let sin_ptr = sin_region.device_ptr();
+
+        // ── 4.1 Allocate per-block scratch (reused across all 48) ─────
+        let residual_region = arena.region(
+            "pixtral_residual", hidden_bytes, 16)?;
+        let q_region = arena.region("pixtral_q", hidden_bytes, 16)?;
+        let k_region = arena.region("pixtral_k", hidden_bytes, 16)?;
+        let v_region = arena.region("pixtral_v", hidden_bytes, 16)?;
+        let attn_out_region = arena.region(
+            "pixtral_attn_out", hidden_bytes, 16)?;
+        let attn_hmajor_region = arena.region(
+            "pixtral_attn_hmajor", hidden_bytes, 16)?;
+        let v_t_region = arena.region("pixtral_v_t", hidden_bytes, 16)?;
+        let scores_f32_region = arena.region(
+            "pixtral_scores_f32", n * n * n_heads * 4, 16)?;
+        let scores_bf16_region = arena.region(
+            "pixtral_scores_bf16", n * n * n_heads * 2, 16)?;
+        let mlp_gate_region = arena.region(
+            "pixtral_mlp_gate", n * intermediate * 2, 16)?;
+        let mlp_up_region = arena.region(
+            "pixtral_mlp_up", n * intermediate * 2, 16)?;
+        // The big f32 scratch must cover both
+        // [N, v_hidden]*4 (Q/K/V/O/down output) and
+        // [N, intermediate]*4 (gate/up output). Allocate the larger.
+        let f32_big_scratch_bytes = n * intermediate.max(v_hidden) * 4;
+        let f32_big_scratch = arena.region(
+            "pixtral_f32_big_scratch", f32_big_scratch_bytes, 16)?;
+
+        // Helper closures over the kernels + cublasLt.
+        let do_gemm = |in_bf16: u64, w_bf16: u64, out_bf16: u64,
+                       m: i32, n_dim: i32, k: i32| -> Result<()> {
+            unsafe {
+                cublaslt.bf16_gemm_f32(
+                    in_bf16, w_bf16, f32_big_scratch.device_ptr(),
+                    m, n_dim, k, stream_u64,
+                )?;
+                let total = m * n_dim;
+                let mut dst = out_bf16;
+                let mut src = f32_big_scratch.device_ptr();
+                let mut count = total;
+                let args: [*mut std::ffi::c_void; 3] = [
+                    (&mut dst) as *mut u64 as *mut _,
+                    (&mut src) as *mut u64 as *mut _,
+                    (&mut count) as *mut i32 as *mut _,
+                ];
+                let blocks = ((total as u32) + 1023) / 1024;
+                rvllm_fused::launch_raw(
+                    kernels.fn_f32_to_bf16,
+                    (blocks, 1, 1), (1024, 1, 1),
+                    0, stream_u64, &args,
+                )
+            }
+        };
+
+        let do_pixtral_rotary = |buf_bf16: u64| -> Result<()> {
+            unsafe {
+                let mut qk = buf_bf16;
+                let mut cos_p = cos_ptr;
+                let mut sin_p = sin_ptr;
+                let mut nh = n_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut rd = head_dim as i32;
+                let args: [*mut std::ffi::c_void; 6] = [
+                    (&mut qk) as *mut u64 as *mut _,
+                    (&mut cos_p) as *mut u64 as *mut _,
+                    (&mut sin_p) as *mut u64 as *mut _,
+                    (&mut nh) as *mut i32 as *mut _,
+                    (&mut hd) as *mut i32 as *mut _,
+                    (&mut rd) as *mut i32 as *mut _,
+                ];
+                rvllm_fused::launch_raw(
+                    kernels.fn_pixtral_rotary_2d_bf16,
+                    (n as u32, n_heads as u32, 1),
+                    ((head_dim / 2) as u32, 1, 1),
+                    0, stream_u64, &args,
+                )
+            }
+        };
+
+        let do_vector_add_bf16 = |dst: u64, a: u64, b: u64| -> Result<()> {
+            unsafe {
+                let mut d = dst;
+                let mut aa = a;
+                let mut bb = b;
+                let mut count = (n * v_hidden) as i32;
+                let args: [*mut std::ffi::c_void; 4] = [
+                    (&mut d) as *mut u64 as *mut _,
+                    (&mut aa) as *mut u64 as *mut _,
+                    (&mut bb) as *mut u64 as *mut _,
+                    (&mut count) as *mut i32 as *mut _,
+                ];
+                let blocks = ((count as u32) + 1023) / 1024;
+                rvllm_fused::launch_raw(
+                    kernels.fn_vector_add_bf16,
+                    (blocks, 1, 1), (1024, 1, 1),
+                    0, stream_u64, &args,
+                )
+            }
+        };
+
+        let do_copy_bf16 = |dst: u64, src: u64, count_elem: usize| -> Result<()> {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                let r = cuMemcpyDtoDAsync_v2(
+                    dst, src, count_elem * 2,
+                    stream.raw() as CUstream);
+                if r != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "pixtral: dev→dev copy",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+            Ok(())
+        };
+
+        // ── 4.2 Run all 48 blocks ─────────────────────────────────────
+        for block_idx in 0..self.arch.vision.num_hidden_layers {
+            let layer = &vision.layers[block_idx];
+
+            // Save residual (= h_io before norm1).
+            do_copy_bf16(
+                residual_region.device_ptr(),
+                hidden_region.device_ptr(),
+                n * v_hidden,
+            )?;
+
+            // norm1 in-place on h_io.
+            unsafe {
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                    num_tokens: n as u32,
+                    hidden: v_hidden as u32,
+                    eps: 1.0e-5,
+                }.launch(
+                    kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                    hidden_region.device_ptr(),
+                    layer.attention_norm.offset_bytes,
+                    stream_u64,
+                )?;
+            }
+
+            // q,k,v projections.
+            do_gemm(hidden_region.device_ptr(), layer.q_proj.offset_bytes,
+                    q_region.device_ptr(),
+                    n as i32, v_hidden as i32, v_hidden as i32)?;
+            do_gemm(hidden_region.device_ptr(), layer.k_proj.offset_bytes,
+                    k_region.device_ptr(),
+                    n as i32, v_hidden as i32, v_hidden as i32)?;
+            do_gemm(hidden_region.device_ptr(), layer.v_proj.offset_bytes,
+                    v_region.device_ptr(),
+                    n as i32, v_hidden as i32, v_hidden as i32)?;
+
+            // 2D RoPE on Q + K (in-place).
+            do_pixtral_rotary(q_region.device_ptr())?;
+            do_pixtral_rotary(k_region.device_ptr())?;
+
+            // QK^T batched-strided over heads → scores_f32 [H, N, N].
+            unsafe {
+                cublaslt.bf16_gemm_f32_batched_strided(
+                    q_region.device_ptr(),
+                    k_region.device_ptr(),
+                    scores_f32_region.device_ptr(),
+                    n as i32, n as i32, head_dim as i32,
+                    n_heads as i32,
+                    (n_heads * head_dim) as i32,    // lda = H*D (interleaved)
+                    (n_heads * head_dim) as i32,    // ldb = H*D
+                    n as i32,                        // ldd = N
+                    head_dim as i64,                 // stride_a = D
+                    head_dim as i64,                 // stride_b = D
+                    (n * n) as i64,                  // stride_d = N*N
+                    stream_u64,
+                )?;
+            }
+
+            // Scale scores by 1/sqrt(head_dim).
+            unsafe {
+                let mut x = scores_f32_region.device_ptr();
+                let mut scale = attn_scale;
+                let mut count = (n_heads * n * n) as i32;
+                let args: [*mut std::ffi::c_void; 3] = [
+                    (&mut x) as *mut u64 as *mut _,
+                    (&mut scale) as *mut f32 as *mut _,
+                    (&mut count) as *mut i32 as *mut _,
+                ];
+                let blocks = ((count as u32) + 255) / 256;
+                rvllm_fused::launch_raw(
+                    kernels.fn_scale_inplace_f32,
+                    (blocks, 1, 1), (256, 1, 1),
+                    0, stream_u64, &args,
+                )?;
+            }
+
+            // Per-row softmax → scores_bf16 [H, N, N]. Launch grid =
+            // H*N rows; the kernel handles each row independently.
+            unsafe {
+                let mut out = scores_bf16_region.device_ptr();
+                let mut input = scores_f32_region.device_ptr();
+                let mut sl = n as i32;
+                let args: [*mut std::ffi::c_void; 3] = [
+                    (&mut out) as *mut u64 as *mut _,
+                    (&mut input) as *mut u64 as *mut _,
+                    (&mut sl) as *mut i32 as *mut _,
+                ];
+                let block: u32 = (n as u32).min(1024);
+                rvllm_fused::launch_raw(
+                    kernels.fn_softmax_row_f32_to_bf16,
+                    ((n_heads * n) as u32, 1, 1),
+                    (block, 1, 1),
+                    0, stream_u64, &args,
+                )?;
+            }
+
+            // Transpose V from [N, H*D] → [H, D, N] head-major.
+            unsafe {
+                let mut out = v_t_region.device_ptr();
+                let mut in_p = v_region.device_ptr();
+                let mut nh = n_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut nt = n as i32;
+                let args: [*mut std::ffi::c_void; 5] = [
+                    (&mut out) as *mut u64 as *mut _,
+                    (&mut in_p) as *mut u64 as *mut _,
+                    (&mut nh) as *mut i32 as *mut _,
+                    (&mut hd) as *mut i32 as *mut _,
+                    (&mut nt) as *mut i32 as *mut _,
+                ];
+                rvllm_fused::launch_raw(
+                    kernels.fn_transpose_heads_v_bf16,
+                    (n as u32, n_heads as u32, 1),
+                    (head_dim as u32, 1, 1),
+                    0, stream_u64, &args,
+                )?;
+            }
+
+            // scores @ V_T → out_f32 [H, N, D] batched-strided.
+            // Per head: scores [N, N] (lda = N, stride_a = N²) @
+            //           V_T [D, N] (ldb = N, stride_b = D*N) →
+            //           out [N, D] (ldd = D, stride_d = N*D).
+            unsafe {
+                cublaslt.bf16_gemm_f32_batched_strided(
+                    scores_bf16_region.device_ptr(),
+                    v_t_region.device_ptr(),
+                    f32_big_scratch.device_ptr(),
+                    n as i32, head_dim as i32, n as i32,
+                    n_heads as i32,
+                    n as i32,                        // lda = N
+                    n as i32,                        // ldb = N
+                    head_dim as i32,                 // ldd = D
+                    (n * n) as i64,                  // stride_a = N²
+                    (head_dim * n) as i64,           // stride_b = D*N
+                    (n * head_dim) as i64,           // stride_d = N*D
+                    stream_u64,
+                )?;
+            }
+
+            // Cast f32 → bf16 (head-major out_hmajor [H, N, D]).
+            unsafe {
+                let mut dst = attn_hmajor_region.device_ptr();
+                let mut src = f32_big_scratch.device_ptr();
+                let mut count = (n_heads * n * head_dim) as i32;
+                let args: [*mut std::ffi::c_void; 3] = [
+                    (&mut dst) as *mut u64 as *mut _,
+                    (&mut src) as *mut u64 as *mut _,
+                    (&mut count) as *mut i32 as *mut _,
+                ];
+                let blocks = ((count as u32) + 1023) / 1024;
+                rvllm_fused::launch_raw(
+                    kernels.fn_f32_to_bf16,
+                    (blocks, 1, 1), (1024, 1, 1),
+                    0, stream_u64, &args,
+                )?;
+            }
+
+            // Scatter [H, N, D] head-major → [N, H*D] interleaved.
+            unsafe {
+                let mut out = attn_out_region.device_ptr();
+                let mut in_p = attn_hmajor_region.device_ptr();
+                let mut nh = n_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut nt = n as i32;
+                let args: [*mut std::ffi::c_void; 5] = [
+                    (&mut out) as *mut u64 as *mut _,
+                    (&mut in_p) as *mut u64 as *mut _,
+                    (&mut nh) as *mut i32 as *mut _,
+                    (&mut hd) as *mut i32 as *mut _,
+                    (&mut nt) as *mut i32 as *mut _,
+                ];
+                rvllm_fused::launch_raw(
+                    kernels.fn_scatter_heads_bf16,
+                    (n as u32, n_heads as u32, 1),
+                    (head_dim as u32, 1, 1),
+                    0, stream_u64, &args,
+                )?;
+            }
+
+            // O proj: hidden = attn_out @ W_o^T (overwrite hidden_region).
+            do_gemm(attn_out_region.device_ptr(), layer.o_proj.offset_bytes,
+                    hidden_region.device_ptr(),
+                    n as i32, v_hidden as i32, v_hidden as i32)?;
+
+            // residual += hidden  (= residual + attn_out @ W_o^T)
+            // hidden_region = residual + hidden_region
+            do_vector_add_bf16(
+                hidden_region.device_ptr(),
+                residual_region.device_ptr(),
+                hidden_region.device_ptr(),
+            )?;
+
+            // Save residual2.
+            do_copy_bf16(
+                residual_region.device_ptr(),
+                hidden_region.device_ptr(),
+                n * v_hidden,
+            )?;
+
+            // norm2 in-place on h.
+            unsafe {
+                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                    num_tokens: n as u32,
+                    hidden: v_hidden as u32,
+                    eps: 1.0e-5,
+                }.launch(
+                    kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                    hidden_region.device_ptr(),
+                    layer.ffn_norm.offset_bytes,
+                    stream_u64,
+                )?;
+            }
+
+            // gate / up GEMMs (out shape [N, intermediate]).
+            do_gemm(hidden_region.device_ptr(), layer.gate_proj.offset_bytes,
+                    mlp_gate_region.device_ptr(),
+                    n as i32, intermediate as i32, v_hidden as i32)?;
+            do_gemm(hidden_region.device_ptr(), layer.up_proj.offset_bytes,
+                    mlp_up_region.device_ptr(),
+                    n as i32, intermediate as i32, v_hidden as i32)?;
+
+            // GeLU·gate * up → mlp_gate (in place).
+            unsafe {
+                let mut out = mlp_gate_region.device_ptr();
+                let mut a   = mlp_gate_region.device_ptr();
+                let mut b   = mlp_up_region.device_ptr();
+                let mut count = (n * intermediate) as i32;
+                let args: [*mut std::ffi::c_void; 4] = [
+                    (&mut out)  as *mut u64 as *mut _,
+                    (&mut a)    as *mut u64 as *mut _,
+                    (&mut b)    as *mut u64 as *mut _,
+                    (&mut count) as *mut i32 as *mut _,
+                ];
+                let blocks = ((count as u32) + 1023) / 1024;
+                rvllm_fused::launch_raw(
+                    kernels.fn_gelu_tanh_mul_bf16,
+                    (blocks, 1, 1), (1024, 1, 1),
+                    0, stream_u64, &args,
+                )?;
+            }
+
+            // down: hidden = mlp_gate @ W_d^T.
+            do_gemm(mlp_gate_region.device_ptr(), layer.down_proj.offset_bytes,
+                    hidden_region.device_ptr(),
+                    n as i32, v_hidden as i32, intermediate as i32)?;
+
+            // residual += hidden (final block output).
+            do_vector_add_bf16(
+                hidden_region.device_ptr(),
+                residual_region.device_ptr(),
+                hidden_region.device_ptr(),
+            )?;
+        }
+
+        if let Some(ref d) = dump_dir {
+            stream.fence()?;
+            let mut host = vec![0u8; hidden_bytes];
+            unsafe {
+                use cudarc::driver::sys::*;
+                let _ = cuMemcpyDtoH_v2(
+                    host.as_mut_ptr() as *mut _,
+                    hidden_region.device_ptr(), hidden_bytes);
+            }
+            let _ = std::fs::write(d.join("post_blocks.bin"), &host);
+        }
+
+        // Ensure all 48-block launches complete before scratch is reclaimed.
         stream.fence()?;
         unsafe { arena.restore(ck); }
 
-        // Stages 4-6 (48 blocks + projector + DtoH) are the next
-        // wedge. Until they land, the call cleanly returns
-        // Err(stage marker).
+        // Stages 5 (patch_merger + projector) and 6 (DtoH) are the
+        // next wedge.
         Err(corrupt(
             self.paths.model_dir.clone(),
             format!(
-                "forward_pixtral_vision: stages 1-3 (upload, patch_conv, \
-                 ln_pre) executed for [n={}, v_hidden={}, inner={}]. \
-                 Stages 4-6 (48 ViT blocks + patch_merger + projector) \
-                 are the next phase. Set RVLLM_DEBUG_MISTRAL35=1 \
+                "forward_pixtral_vision: stages 1-4 (upload, patch_conv, \
+                 ln_pre, 48 ViT blocks) executed for [n={}, v_hidden={}, \
+                 inner={}]. Stage 5 (patch_merger + projector) is the \
+                 next phase. Set RVLLM_DEBUG_MISTRAL35=1 \
                  RVLLM_PIXTRAL_DUMP_DIR=<path> to dump intermediates \
-                 for cosine validation.",
+                 for the cosine-vs-HF gate.",
                 n, v_hidden, inner,
             ),
         ))
