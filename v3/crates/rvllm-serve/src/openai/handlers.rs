@@ -575,16 +575,24 @@ pub async fn chat_completions(
         .iter()
         .filter_map(|m| m.content.as_ref())
         .any(|c| c.image_urls().next().is_some());
-    // P1#2 fix: Mistral 3.5's worker does not yet wire vision_items
-    // into the forward (the Pixtral splice is unimplemented), so the
-    // handler used to silently swallow the image attachment and pass
-    // only repeated `[IMG]` token-id-10s as text. Reject upfront so
-    // callers see "not yet supported" instead of degenerate output.
+    // P1#2 fix: Mistral 3.5's worker does not yet splice the Pixtral
+    // vision output into the language-decoder embed buffer (forward
+    // runs end-to-end through the projector but the splice point is
+    // not wired), so production rejects image inputs upfront.
+    //
+    // Round-12 phase 3-test: under `RVLLM_DEBUG_MISTRAL35=1` the
+    // handler accepts the request so the vision-tower forward can
+    // be exercised in dump-only mode (cuda_worker dumps stages but
+    // continues with text-only generation, no garbage spliced).
     if has_image_parts && matches!(state.vision_arch,
-        crate::router::VisionArch::Mistral35 { .. }) {
+        crate::router::VisionArch::Mistral35 { .. })
+        && !rvllm_runtime::mistral35_bring_up::mistral35_debug_active()
+    {
         return Err(ApiError::invalid_param(
             "image input is not yet supported on the Mistral 3.5 path \
-             (Pixtral vision forward + splice is not wired in this build).",
+             (Pixtral vision forward + splice is not wired in this build). \
+             Set RVLLM_DEBUG_MISTRAL35=1 in the rvllm profile to enable \
+             the dump-only debug path for cosine validation.",
             "messages",
             "image_unsupported_for_arch",
         ));

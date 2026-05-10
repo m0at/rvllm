@@ -143,6 +143,53 @@ pub async fn spawn_cuda_worker(
                 }
 
                 while let Some(req) = req_rx.blocking_recv() {
+                    // Round-12 phase 3-test: under
+                    // RVLLM_DEBUG_MISTRAL35=1 the admission layer
+                    // forwards image-bearing requests through to here.
+                    // Run forward_pixtral_vision in dump-only mode (no
+                    // splice — text-only generation continues
+                    // afterward). Production reject still applies
+                    // without the gate, so this branch is unreachable
+                    // outside debug mode.
+                    if !req.vision_items.is_empty()
+                        && rvllm_runtime::mistral35_bring_up
+                            ::mistral35_debug_active()
+                    {
+                        for (vi_idx, item) in req.vision_items.iter().enumerate() {
+                            tracing::info!(
+                                "[mistral35-vision-debug] running forward \
+                                 for image {}/{} ({} bytes, {}x{}, predicted \
+                                 num_tokens={})…",
+                                vi_idx + 1, req.vision_items.len(),
+                                item.bytes.len(), item.width, item.height,
+                                item.num_tokens,
+                            );
+                            match bringup.forward_pixtral_vision(&item.bytes) {
+                                Ok(out) => {
+                                    tracing::info!(
+                                        "[mistral35-vision-debug] image {}: \
+                                         num_tokens={} hidden_dim={} \
+                                         patch_grid={:?} merged_grid={:?} \
+                                         data_bytes={}",
+                                        vi_idx + 1, out.num_tokens,
+                                        out.hidden_dim, out.patch_grid,
+                                        out.merged_grid, out.data.len(),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[mistral35-vision-debug] image {} \
+                                         forward failed: {e:?}",
+                                        vi_idx + 1,
+                                    );
+                                }
+                            }
+                        }
+                        tracing::info!(
+                            "[mistral35-vision-debug] continuing with \
+                             text-only generation (splice not yet wired)"
+                        );
+                    }
                     // Multi-token autoregressive generation. Tokenize
                     // → prefill (one forward per prompt token, KV cache
                     // built up) → decode max_new tokens. Empty prompt
