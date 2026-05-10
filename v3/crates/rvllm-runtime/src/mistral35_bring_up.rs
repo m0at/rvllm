@@ -100,6 +100,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_softmax_inplace_f32: KernelFn,
     pub v_dot_gqa_bf16_mod: LoadedModule,
     pub fn_v_dot_gqa_bf16: KernelFn,
+    pub fa_decode_gqa_bf16_mod: LoadedModule,
+    pub fn_fa_decode_gqa_bf16: KernelFn,
     // W4A16 NVFP4 path (Mistral 3.5 checkpoint format): dequantize
     // weight blocks to BF16 then run `cublasLt bf16_gemm_f32`. The
     // legacy W4A4 (CUTLASS NVFP4 tensor-core) path is kept compiled
@@ -1004,6 +1006,10 @@ impl Mistral35Bringup {
             let v_dot_gqa_bf16_mod = kernels.load_ptx("mistral35_v_dot_gqa_bf16")?;
             let fn_v_dot_gqa_bf16 = v_dot_gqa_bf16_mod
                 .get_function("mistral35_v_dot_gqa_bf16_kernel")?;
+            let fa_decode_gqa_bf16_mod =
+                kernels.load_ptx("mistral35_fa_decode_gqa_bf16")?;
+            let fn_fa_decode_gqa_bf16 = fa_decode_gqa_bf16_mod
+                .get_function("mistral35_fa_decode_gqa_bf16_kernel")?;
             let nvfp4_dequant_weights_bf16_mod =
                 kernels.load_ptx("nvfp4_dequant_weights_bf16")?;
             let fn_nvfp4_dequant_weights_bf16 = nvfp4_dequant_weights_bf16_mod
@@ -1078,6 +1084,8 @@ impl Mistral35Bringup {
                 fn_softmax_inplace_f32,
                 v_dot_gqa_bf16_mod,
                 fn_v_dot_gqa_bf16,
+                fa_decode_gqa_bf16_mod,
+                fn_fa_decode_gqa_bf16,
                 nvfp4_dequant_weights_bf16_mod,
                 fn_nvfp4_dequant_weights_bf16,
                 f32_to_bf16_mod,
@@ -2110,6 +2118,58 @@ impl Mistral35Bringup {
                         stream_u64 as CUstream);
                     eprintln!("[mistral35-debug] bypass results: k={:?} v={:?}", r1, r2);
                 }
+            }
+
+            // Fast path: fused FlashAttention-2 decode kernel (m=1).
+            // Runs qk_dot + online softmax + V-fold in one kernel,
+            // never materialises scores/probs in DRAM. Replaces both
+            // (b) qk_dot and (c) softmax_v entirely. Opt-in via
+            // `RVLLM_MISTRAL35_FA_DECODE=1`; default OFF until
+            // byte-identical smoke matrix passes.
+            let use_fa_decode = std::env::var("RVLLM_MISTRAL35_FA_DECODE")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(false)
+                && gqa_ratio_attn == 12;
+            if use_fa_decode {
+                let mut q_ptr = scr.q_out_ptr;
+                let mut k_cache = layer_kv.k_ptr;
+                let mut v_cache = layer_kv.v_ptr;
+                let mut out_ptr = scr.attn_out_ptr;
+                let mut hd = head_dim_attn;
+                let mut nkv = n_kv_heads_attn;
+                let mut gr = gqa_ratio_attn;
+                let mut pl = past_len;
+                let mut isd = inv_sqrt_d;
+                let args_fa = [
+                    (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                ];
+                // Smem layout matches kernel: Q[12 * head_dim] BF16 +
+                // K_tile[32 * head_dim] BF16 + V_tile[32 * head_dim]
+                // BF16 + reduction scratch[head_dim] f32.
+                const TILE_T: u32 = 32;
+                const G: u32 = 12;
+                let hd_u = head_dim_attn as u32;
+                let smem = G * hd_u * 2
+                         + TILE_T * hd_u * 2
+                         + TILE_T * hd_u * 2
+                         + hd_u * 4;
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_fa_decode_gqa_bf16,
+                        (n_kv_heads_attn as u32, 1, 1),
+                        (hd_u, 1, 1),
+                        smem, stream_u64, &args_fa,
+                    )?;
+                }
+                return Ok(());
             }
 
             // (b) qk_dot: scores[n_q_heads, past_len] = Q · K[0..past_len]^T / sqrt(d)

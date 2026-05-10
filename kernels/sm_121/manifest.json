@@ -366,6 +366,11 @@
       "path": "mistral35_attn_m1_gqa_broadcast_bf16.ptx",
       "sha256": "099ba929763771bbf075b755d917aea0ee770e3bcf6bf26c99d9caddf9760a85"
     },
+    "mistral35_fa_decode_gqa_bf16": {
+      "bytes": 641007,
+      "path": "mistral35_fa_decode_gqa_bf16.ptx",
+      "sha256": "a7bdc74ffd00bc4cb68055a8728d6b44b24b00626641a0392406addecc09555d"
+    },
     "mistral35_kv_cache_write_bf16": {
       "bytes": 1989,
       "path": "mistral35_kv_cache_write_bf16.ptx",
@@ -717,5 +722,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "9027bf5"
+  "revision": "7de5fb0"
 }
