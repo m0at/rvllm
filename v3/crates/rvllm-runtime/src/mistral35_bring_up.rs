@@ -1213,9 +1213,25 @@ impl Mistral35Bringup {
             //   max_pos * n_kv * head_dim / 16 bytes scale
             //   = 4096 * 8 * 128 / 16 = 256 KB
             // → ~2.25 MB per layer × 88 layers = ~200 MB extra arena.
+            // Codex review #5: `RVLLM_MISTRAL35_NVFP4_KV=1` is
+            // accepted at bring-up but the read/write dispatch is
+            // still gated off in `attention_step`, so setting the
+            // env without the read path would silently waste ~400 MB
+            // of arena. Fail-fast until the FA-decode-NVFP4 read
+            // variant lands together with the dispatch wiring.
             let want_nvfp4_kv = std::env::var("RVLLM_MISTRAL35_NVFP4_KV")
                 .ok().as_deref().map(|s| s != "0" && !s.is_empty())
                 .unwrap_or(false);
+            if want_nvfp4_kv {
+                return Err(corrupt(
+                    paths.model_dir.clone(),
+                    "RVLLM_MISTRAL35_NVFP4_KV is set but the read/write \
+                     dispatch is not yet wired (the FA-decode-NVFP4 read \
+                     variant is the pending piece — see \
+                     MISTRAL35_BATCHED_PREFILL_PLAN.md). Unset the env or \
+                     wait for the integration commit.".into(),
+                ));
+            }
             let per_layer_packed_bytes =
                 kv_max_pos * kv_n_heads * (kv_head_dim / 2);
             let per_layer_scale_bytes =
@@ -4417,22 +4433,42 @@ impl Mistral35Bringup {
         let use_batched_prefill = std::env::var("RVLLM_MISTRAL35_BATCH_PREFILL")
             .ok().as_deref().map(|s| s != "0" && !s.is_empty())
             .unwrap_or(true);
-        let chunk_can_handle = self.scratch.as_ref()
-            .map(|s| s.chunk_t_max > 0 && prompt.len() <= s.chunk_t_max)
-            .unwrap_or(false);
-        if use_batched_prefill && chunk_can_handle && !prompt.is_empty() {
-            // pos_to_dev_ptr currently holds vision splices keyed by
-            // absolute prompt position; the chunk path will pick them
-            // up the same way the per-token path does.
-            let dump = self.forward_smoke_chunk(
-                prompt, 0, Some(prompt.len() - 1),
-                arena, ck_after_splices, do_restore,
-                &pos_to_dev_ptr,
-                &is_cancelled,
-            )?;
-            if let Some(d) = dump {
-                last_predicted = d.predicted_token;
-                last_dump = Some(d);
+        let chunk_t_max = self.scratch.as_ref()
+            .map(|s| s.chunk_t_max).unwrap_or(0);
+        // Codex review #3: long prompts no longer fall hard back to
+        // the per-token path. The prompt is sliced into
+        // `chunk_t_max`-sized layer-major chunks. Each chunk builds
+        // its own KV-cache slots starting at `pos_start` and reads
+        // from earlier chunks' slots via the per-query attention
+        // loop in `forward_chunk_body`. Only the LAST chunk's
+        // logits matter; earlier chunks still run the LM-head at
+        // their last token but the result is discarded (M=1 cost,
+        // negligible vs the layer body savings).
+        if use_batched_prefill && chunk_t_max > 0 && !prompt.is_empty() {
+            let total = prompt.len();
+            let mut pos: usize = 0;
+            while pos < total {
+                if is_cancelled() {
+                    return Ok(GenerateResult {
+                        tokens, last_dump, prompt_len: prompt.len(),
+                    });
+                }
+                let chunk_end = (pos + chunk_t_max).min(total);
+                let chunk = &prompt[pos..chunk_end];
+                let is_last_chunk = chunk_end == total;
+                let dump = self.forward_smoke_chunk(
+                    chunk, pos as i32, Some(chunk.len() - 1),
+                    arena, ck_after_splices, do_restore,
+                    &pos_to_dev_ptr,
+                    &is_cancelled,
+                )?;
+                if is_last_chunk {
+                    if let Some(d) = dump {
+                        last_predicted = d.predicted_token;
+                        last_dump = Some(d);
+                    }
+                }
+                pos = chunk_end;
             }
         } else {
             for (i, &tok) in prompt.iter().enumerate() {
@@ -5271,104 +5307,15 @@ impl Mistral35Bringup {
         if tokens.is_empty() {
             return Ok(None);
         }
-        // Smoke-test the chunk path's foundation kernels by running
-        // the batched embed gather over all T tokens into the T-row
-        // scratch BEFORE falling through to the per-token loop. The
-        // result is currently UNUSED — its purpose is to validate
-        // that token_in_t_ptr / h_residual_t_ptr / chunk_t_max are
-        // correctly wired and that `embedding_gather_bf16` runs at
-        // num_tokens > 1 against this pointer set. A kernel-level
-        // error here would surface immediately; a silent miswire
-        // would not, so a future commit will add a row-cosine check
-        // vs the per-token gather of token 0.
-        if let (Some(scr), Some(model), Some(stream)) = (
-            self.scratch.as_ref(),
-            self.model.as_ref(),
-            self.stream.as_ref(),
-        ) {
-            if scr.chunk_t_max > 0 {
-                if tokens.len() > scr.chunk_t_max {
-                    return Err(corrupt(
-                        self.paths.model_dir.clone(),
-                        format!(
-                            "forward_smoke_chunk: T={} exceeds chunk_t_max={} \
-                             (set RVLLM_MISTRAL35_PREFILL_CHUNK_SIZE higher \
-                             at bring-up)",
-                            tokens.len(), scr.chunk_t_max,
-                        ),
-                    ));
-                }
-                let stream_u64 = stream.raw();
-                // (1) HtoD the prompt token-ids as i32 into
-                //     token_in_t_ptr. Tokenizer already produced u32;
-                //     cast once on the host because the embed kernel
-                //     reads i32.
-                let token_ids_i32: Vec<i32> =
-                    tokens.iter().map(|&t| t as i32).collect();
-                unsafe {
-                    use cudarc::driver::sys::*;
-                    let r = cuMemcpyHtoDAsync_v2(
-                        scr.token_in_t_ptr as CUdeviceptr,
-                        token_ids_i32.as_ptr() as *const _,
-                        tokens.len() * 4,
-                        stream_u64 as CUstream,
-                    );
-                    if r != CUresult::CUDA_SUCCESS {
-                        return Err(rvllm_core::RvllmError::cuda(
-                            "forward_smoke_chunk: HtoD token_in_t",
-                            rvllm_core::CudaErrorKind::MemcpyFailed,
-                            rvllm_core::CudaCtx::setup(),
-                        ));
-                    }
-                }
-                // (2) Batched embed gather → h_residual_t_ptr.
-                let hidden = self.arch.text.hidden_size as u32;
-                let vocab = self.arch.text.vocab_size as u32;
-                let kernels = self.forward_kernels.as_ref().ok_or_else(|| {
-                    corrupt(self.paths.model_dir.clone(),
-                        "forward_smoke_chunk: forward_kernels absent".into())
-                })?;
-                rvllm_fused::EmbeddingGatherLaunch {
-                    num_tokens: tokens.len() as u32, hidden, vocab,
-                }.launch(
-                    kernels.fn_embedding_gather_bf16,
-                    scr.h_residual_t_ptr,
-                    model.outside.embed_tokens.offset_bytes,
-                    scr.token_in_t_ptr,
-                    stream_u64,
-                )?;
-                // (3) Layer-0 input RMSNorm at num_tokens=T. The
-                //     RmsnormInplaceLaunch kernel is grid-strided,
-                //     so passing num_tokens=T processes T rows at
-                //     once with one launch. Output goes into
-                //     h_work_t_ptr; consumed by the upcoming QKV
-                //     M=T projections.
-                let layer0 = &model.layers[0];
-                rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
-                    num_tokens: tokens.len() as u32, hidden,
-                    eps: self.arch.text.rms_norm_eps as f32,
-                }.launch(
-                    kernels.fn_rmsnorm_inplace_bf16_gbf16,
-                    scr.h_work_t_ptr,
-                    layer0.input_layernorm.offset_bytes,
-                    stream_u64,
-                )?;
-                // The hidden_t buffer h_work_t_ptr now holds
-                // T rows of post-RMSNorm activations. To use it
-                // we'd need to first copy h_residual_t -> h_work_t
-                // (the kernel is in-place). For this side-effect
-                // smoke that's fine — the buffer's contents are
-                // currently unused; the kernel just has to run
-                // cleanly at num_tokens=T. The full chunk body
-                // will reorder this to: dtod(h_work_t, h_residual_t)
-                // → rmsnorm-inplace → consume.
-                //
-                // (4) Held back: QKV M=T, RoPE, KV-write, attention,
-                //     O, MLP, final norm, LM head at M=T. Lands in
-                //     the next focused commit (~400 LOC) per
-                //     MISTRAL35_BATCHED_PREFILL_PLAN.md.
-            }
-        }
+        // Codex review #4: removed the foundation-smoke prelude
+        // (HtoD token_in_t + batched embed_gather + RMSNorm into the
+        // T-row scratch) that used to run BEFORE the chunk body.
+        // The real `forward_chunk_body` repeats all of those steps
+        // itself — keeping the prelude was pure hot-path waste once
+        // the body landed in `ea7ef36`. The kernel-mechanics smoke
+        // it provided is now structurally covered by the body's
+        // first stages, so removing it changes neither correctness
+        // nor production output.
 
         let logits_at = compute_logits_at.unwrap_or(tokens.len() - 1);
 
