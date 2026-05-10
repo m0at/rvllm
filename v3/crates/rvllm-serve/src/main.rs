@@ -157,7 +157,23 @@ async fn main() -> anyhow_compat::Result<()> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let state = AppState { config: config.clone(), tokenizer, worker, started_at, vision_arch };
+    // Round-12 phase 5a: vision_loaded reflects whether the worker
+    // will have BF16 vision weights resident on device when the
+    // first request arrives. Mistral gates its vision tower on
+    // RVLLM_LOAD_VISION (default off — see Round-10 #1); other
+    // archs always load vision.
+    let vision_loaded = match resolved.family {
+        ModelFamily::Mistral35 => {
+            std::env::var("RVLLM_LOAD_VISION")
+                .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
+                .unwrap_or(false)
+        }
+        ModelFamily::Auto | ModelFamily::Qwen36 | ModelFamily::Gemma4 => true,
+    };
+    let state = AppState {
+        config: config.clone(), tokenizer, worker, started_at,
+        vision_arch, vision_loaded,
+    };
     let router = build_router(state);
 
     tracing::info!(bind = %config.bind, model = %config.model_id, "rvllm-server listening");

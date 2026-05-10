@@ -575,26 +575,27 @@ pub async fn chat_completions(
         .iter()
         .filter_map(|m| m.content.as_ref())
         .any(|c| c.image_urls().next().is_some());
-    // P1#2 fix: Mistral 3.5's worker does not yet splice the Pixtral
-    // vision output into the language-decoder embed buffer (forward
-    // runs end-to-end through the projector but the splice point is
-    // not wired), so production rejects image inputs upfront.
+    // Round-12 phase 5a: vision admission for Mistral 3.5 is now
+    // production-accessible. The full pipeline (preprocess →
+    // patch_conv → ln_pre → 48 ViT blocks → projector → BF16 splice
+    // into the language-decoder embed buffer) was semantically
+    // validated against three real images in phase 4
+    // (`MISTRAL35_BUG_HUNT.md`).
     //
-    // Round-12 phase 3-test: under `RVLLM_DEBUG_MISTRAL35=1` the
-    // handler accepts the request so the vision-tower forward can
-    // be exercised in dump-only mode (cuda_worker dumps stages but
-    // continues with text-only generation, no garbage spliced).
+    // The vision tower must still be loaded at startup
+    // (RVLLM_LOAD_VISION=1 in the rvllm profile) — we cannot serve
+    // images without the BF16 vision weights resident on device.
+    // Reject up-front with a clear error if the operator forgot.
     if has_image_parts && matches!(state.vision_arch,
         crate::router::VisionArch::Mistral35 { .. })
-        && !rvllm_runtime::mistral35_bring_up::mistral35_debug_active()
+        && !state.vision_loaded
     {
         return Err(ApiError::invalid_param(
-            "image input is not yet supported on the Mistral 3.5 path \
-             (Pixtral vision forward + splice is not wired in this build). \
-             Set RVLLM_DEBUG_MISTRAL35=1 in the rvllm profile to enable \
-             the dump-only debug path for cosine validation.",
+            "image input requires the Pixtral vision tower to be \
+             loaded; set RVLLM_LOAD_VISION=1 in the rvllm profile and \
+             restart the service.",
             "messages",
-            "image_unsupported_for_arch",
+            "vision_not_loaded",
         ));
     }
     let vision_items: Vec<crate::worker::VisionItem> = if !has_image_parts {

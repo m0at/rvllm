@@ -143,21 +143,15 @@ pub async fn spawn_cuda_worker(
                 }
 
                 while let Some(req) = req_rx.blocking_recv() {
-                    // Round-12 phase 3e: under RVLLM_DEBUG_MISTRAL35=1
-                    // the admission layer forwards image-bearing
-                    // requests here. We run forward_pixtral_vision per
-                    // image, then SPLICE the BF16 soft-tokens into the
+                    // Round-12 phase 5a: vision is now production-
+                    // accessible. Run forward_pixtral_vision per image
+                    // and SPLICE the BF16 soft-tokens into the
                     // language-decoder embed buffer at the slot
                     // positions the renderer reserved (see
                     // tokenize.rs::render_chat_with_vision and
-                    // worker.rs::vision_slots). Production reject
-                    // still applies without the gate, so this branch
-                    // is unreachable outside debug mode.
+                    // worker.rs::vision_slots).
                     let mut vision_splices: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-                    if !req.vision_items.is_empty()
-                        && rvllm_runtime::mistral35_bring_up
-                            ::mistral35_debug_active()
-                    {
+                    if !req.vision_items.is_empty() {
                         // Build splice list aligned to the renderer's
                         // slots. `req.vision_slots[i]` carries the
                         // token_start + num_tokens that

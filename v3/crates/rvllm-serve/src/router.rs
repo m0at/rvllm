@@ -42,6 +42,14 @@ pub struct AppState {
     /// dispatch off this. Codex review #2 (round 4) caught the
     /// model-id heuristic as a real correctness risk.
     pub vision_arch: VisionArch,
+    /// Round-12 phase 5a: did the worker actually load vision-tower
+    /// weights? Mistral with `RVLLM_LOAD_VISION=0` keeps the
+    /// VisionArch tag (so chat-template token mapping still works
+    /// correctly when the operator later turns vision on without
+    /// changing the family) but rejects image-bearing requests at
+    /// admission. Other archs (Qwen 3.6, Gemma 4) load vision
+    /// unconditionally so this is always true for them.
+    pub vision_loaded: bool,
 }
 
 /// Which vision tower the worker has loaded. Set once at startup
