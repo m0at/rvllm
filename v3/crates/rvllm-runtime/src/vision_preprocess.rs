@@ -673,6 +673,76 @@ pub fn patch_merger_pixtral_2x2_ref(
     out
 }
 
+/// Pixtral patch_conv host reference.
+///
+/// `patches` are HWC-flattened (`[N, kh*kw*in_c]`, inner row layout
+/// `[ip, jp, c]` — the layout `preprocess_mistral35_pixtral`
+/// produces). `weight` matches the device-side layout post the
+/// load-time permute (`[out_c, kh, kw, in_c]`).
+///
+/// Output: `[N, out_c]` row-major. No bias (Pixtral's patch_conv
+/// has bias=False per the canonical checkpoint).
+///
+/// Round-12 phase 3a.
+pub fn pixtral_patch_conv_ref(
+    patches: &[f32],
+    weight: &[f32],
+    n_patches: usize,
+    out_c: usize,
+    in_c: usize,
+    kh: usize,
+    kw: usize,
+) -> Vec<f32> {
+    let inner = kh * kw * in_c;
+    assert_eq!(patches.len(), n_patches * inner);
+    assert_eq!(weight.len(), out_c * inner);
+    let mut out = vec![0.0f32; n_patches * out_c];
+    for pi in 0..n_patches {
+        let p_off = pi * inner;
+        let o_off = pi * out_c;
+        for oi in 0..out_c {
+            let w_off = oi * inner;
+            let mut acc = 0.0f64;
+            for k in 0..inner {
+                acc += (patches[p_off + k] as f64) * (weight[w_off + k] as f64);
+            }
+            out[o_off + oi] = acc as f32;
+        }
+    }
+    out
+}
+
+/// Pixtral RMSNorm host reference (matches the kernel
+/// `rmsnorm_inplace_bf16_gbf16`).
+///
+/// `x[t, c]` and `gamma[c]` row-major, in-place is mirrored as a
+/// returned new buffer for testability.
+pub fn pixtral_rmsnorm_ref(
+    x: &[f32],
+    gamma: &[f32],
+    n_tokens: usize,
+    hidden: usize,
+    eps: f32,
+) -> Vec<f32> {
+    assert_eq!(x.len(), n_tokens * hidden);
+    assert_eq!(gamma.len(), hidden);
+    let mut out = vec![0.0f32; x.len()];
+    for t in 0..n_tokens {
+        let off = t * hidden;
+        let mut sumsq = 0.0f64;
+        for c in 0..hidden {
+            let v = x[off + c] as f64;
+            sumsq += v * v;
+        }
+        let mean_sq = sumsq / (hidden as f64);
+        let rrms = (mean_sq + eps as f64).sqrt().recip() as f32;
+        for c in 0..hidden {
+            out[off + c] = x[off + c] * rrms * gamma[c];
+        }
+    }
+    out
+}
+
 // ─── Tests vs HF reference fixtures ───────────────────────────────────
 
 #[cfg(test)]
@@ -1003,6 +1073,67 @@ mod tests {
         // bottom-right = in[(3,1,:)]
         let off_br = (3 * g + 1) * h;
         assert_eq!(&out[base+3*h..base+4*h], &input[off_br..off_br+h]);
+    }
+
+    #[test]
+    fn pixtral_patch_conv_ref_matches_naive_gemm() {
+        // 1 patch, in_c=2, kh=2, kw=3 → inner=12. out_c=4.
+        // patches[0, k] = k+1, weight[o, k] = (o+1) * 0.5 for sanity.
+        let inner = 12;
+        let out_c = 4;
+        let patches: Vec<f32> = (1..=inner).map(|k| k as f32).collect();
+        let mut weight = vec![0.0f32; out_c * inner];
+        for oi in 0..out_c {
+            for k in 0..inner {
+                weight[oi * inner + k] = (oi as f32 + 1.0) * 0.5;
+            }
+        }
+        let out = pixtral_patch_conv_ref(&patches, &weight, 1, out_c, 2, 2, 3);
+        // Inner sum = 1+2+...+12 = 78. Each output = (oi+1)*0.5 * 78.
+        for oi in 0..out_c {
+            let want = (oi as f32 + 1.0) * 0.5 * 78.0;
+            assert!((out[oi] - want).abs() < 1e-3, "oi={oi} got={} want={}", out[oi], want);
+        }
+    }
+
+    #[test]
+    fn pixtral_patch_conv_ref_distinguishes_channels() {
+        // 1 patch, in_c=3, kh=1, kw=1 → inner=3 = [c0, c1, c2].
+        // weight[0] picks c0, weight[1] picks c1, weight[2] picks c2.
+        let inner = 3;
+        let out_c = 3;
+        let patches = vec![10.0_f32, 20.0, 30.0];
+        let weight = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        let out = pixtral_patch_conv_ref(&patches, &weight, 1, out_c, 3, 1, 1);
+        assert_eq!(out, vec![10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn pixtral_rmsnorm_ref_zero_mean_unit_gamma_identity_scale() {
+        // For x = [a, -a], rms = a. With gamma=1, eps=0:
+        // out = x / a = [1, -1].
+        let a = 2.5_f32;
+        let x = vec![a, -a];
+        let g = vec![1.0_f32, 1.0_f32];
+        let out = pixtral_rmsnorm_ref(&x, &g, 1, 2, 0.0);
+        assert!((out[0] - 1.0).abs() < 1e-5, "got {}", out[0]);
+        assert!((out[1] + 1.0).abs() < 1e-5, "got {}", out[1]);
+    }
+
+    #[test]
+    fn pixtral_rmsnorm_ref_per_token_independence() {
+        // Two tokens with different scales must normalize independently.
+        let x = vec![1.0, 1.0, 100.0, 100.0]; // [token0, token1]
+        let g = vec![1.0, 1.0];
+        let out = pixtral_rmsnorm_ref(&x, &g, 2, 2, 0.0);
+        // Each row's rms = its single magnitude → out = [1.0, 1.0, 1.0, 1.0].
+        for v in out.iter() {
+            assert!((v - 1.0).abs() < 1e-5);
+        }
     }
 
     #[test]

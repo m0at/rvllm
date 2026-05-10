@@ -212,6 +212,92 @@ fn upload_bf16_tensor(
     )
 }
 
+/// Round-12 phase 3a: upload a `[O, C, H, W]` BF16 conv weight as
+/// `[O, H, W, C]` row-major.
+///
+/// Pixtral's `patch_conv.weight` ships in PyTorch's natural Conv2d
+/// layout (`[out_c, in_c, kh, kw]` = `[1664, 3, 14, 14]`). The
+/// per-image patches our preprocessor produces are HWC-flattened
+/// (`[N, kh*kw*in_c]` with the inner row laid out
+/// `[ip, jp, c]`). To make the patch_conv a plain GEMM
+/// `[N, C*H*W] @ [O, C*H*W]^T` we permute the conv weight to
+/// `[O, kh, kw, in_c]` once at load time so the inner orderings
+/// match.
+///
+/// This avoids a per-request permute at forward time (cheaper) and
+/// keeps the GPU forward purely a single bf16_gemm_f32 launch.
+#[cfg(feature = "cuda")]
+fn upload_bf16_conv_weight_chw_to_hwc(
+    arena: &HbmArena<'_>,
+    pool: &ShardPool,
+    region_name: &'static str,
+    tensor_name: &str,
+    expected_shape: &[usize; 4],
+) -> Result<F16Weight> {
+    let (si, e) = pool.must_get(tensor_name)?;
+    if e.dtype != DType::Bf16 {
+        return Err(RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!(
+                    "patch_conv {tensor_name}: dtype={:?} but expected Bf16",
+                    e.dtype),
+            },
+            ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(tensor_name.to_string()) },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    if e.shape != expected_shape {
+        return Err(RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!(
+                    "patch_conv {tensor_name}: shape={:?} but expected {:?}",
+                    e.shape, expected_shape),
+            },
+            ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(tensor_name.to_string()) },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    let [o, c, h, w] = *expected_shape;
+    let total = o * c * h * w;
+    let raw = pool.bytes_of(si, e);
+    if raw.len() != total * 2 {
+        return Err(RvllmError::Loader {
+            err: LoaderError::Corrupt {
+                detail: format!(
+                    "patch_conv {tensor_name}: raw bytes {} ≠ {} * 2",
+                    raw.len(), total),
+            },
+            ctx: LoaderCtx { path: pool.model_dir.clone(), tensor: Some(tensor_name.to_string()) },
+            bt: std::backtrace::Backtrace::capture(),
+        });
+    }
+    // Permute on host: src[o, c, h, w] -> dst[o, h, w, c].
+    let mut permuted = vec![0u8; raw.len()];
+    let chw = c * h * w;
+    for oi in 0..o {
+        let src_o = oi * chw * 2;
+        let dst_o = oi * chw * 2;
+        for hi in 0..h {
+            for wi in 0..w {
+                for ci in 0..c {
+                    let src_off = src_o + (((ci * h) + hi) * w + wi) * 2;
+                    let dst_off = dst_o + (((hi * w) + wi) * c + ci) * 2;
+                    permuted[dst_off]     = raw[src_off];
+                    permuted[dst_off + 1] = raw[src_off + 1];
+                }
+            }
+        }
+    }
+    let region = arena.region(region_name, permuted.len(), 16)?;
+    unsafe { region.copy_from_host(&permuted)? };
+    // Report the *permuted* shape so the GEMM caller sees a flat
+    // `[O, H*W*C]` weight: stash as `[O, H, W, C]`.
+    Ok(F16Weight {
+        offset_bytes: region.device_ptr(),
+        shape: vec![o, h, w, c],
+    })
+}
+
 /// Upload one Mistral 3.5 NVFP4 linear, run the SFB transform, and
 /// produce the device-resident `Nvfp4LinearLoaded` triple.
 ///
@@ -546,9 +632,17 @@ fn upload_mistral35_vision(
     let vt = "model.vision_tower";
     let mmp = "model.multi_modal_projector";
 
-    let patch_conv = upload_bf16_tensor(
+    // Round-12 #3a: permute patch_conv from CHW inner to HWC inner so
+    // it can multiply our HWC-flattened patches as a plain GEMM. The
+    // expected on-disk shape is [v_hidden, num_channels, patch, patch]
+    // = [1664, 3, 14, 14] for the canonical Mistral 3.5 / Pixtral.
+    let v_hidden = arch.vision.hidden_size;
+    let p = arch.vision.patch_size;
+    let nc = arch.vision.num_channels;
+    let patch_conv = upload_bf16_conv_weight_chw_to_hwc(
         arena, pool, "mistral35_v_patch_conv",
-        &format!("{vt}.patch_conv.weight"), None,
+        &format!("{vt}.patch_conv.weight"),
+        &[v_hidden, nc, p, p],
     )?;
     let ln_pre = upload_bf16_tensor(
         arena, pool, "mistral35_v_ln_pre",
