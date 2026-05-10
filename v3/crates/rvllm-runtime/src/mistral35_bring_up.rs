@@ -1518,46 +1518,26 @@ impl Mistral35Bringup {
                 bringup.arch.text.yarn.beta_slow,
             );
         }
-        // Round-12 phase 5c (codex review #1): the BatchedPrefillConfig
-        // is plan documentation — none of its phases (M-A/M-B/M-C/M-D/
-        // M-E) are wired into `generate_with_vision`'s executor today.
-        // The forward path iterates token-major over `prompt`. Logging
-        // `outer_loop_deleted=true` here was a load-bearing lie that
-        // produced false operator expectations about scaling. Replaced
-        // with an honest one-liner.
+        // Stale-log fix (codex review): the earlier "token-major /
+        // plan-doc only" startup banner described the pre-`ea7ef36`
+        // executor. With chunk-path default-on (`7de5fb0`) the live
+        // executor is layer-major for prompts ≥ `chunk_t_min`, and
+        // token-major only for very short prompts where chunk
+        // overhead (per-request 244 GB BF16 weight scratch traffic
+        // — codex review #1) exceeds the per-token savings. Log the
+        // actual dispatch so profiling/operations don't see a lie.
         //
-        // If the operator explicitly opted into a batched gate
-        // (RVLLM_MISTRAL35_BATCH_PROJ_PREFILL=1 etc), fail fast — they
-        // expect batched execution, the runtime can't deliver it.
-        let env_set_batched = [
-            "RVLLM_MISTRAL35_BATCH_PROJ_PREFILL",
-            "RVLLM_MISTRAL35_FUSED_QKV",
-            "RVLLM_MISTRAL35_BATCH_ROPE_PREFILL",
-            "RVLLM_MISTRAL35_BATCH_FULL_PREFILL",
-            "RVLLM_MISTRAL35_DECODE_GRAPH",
-        ].iter().filter(|k| {
-            matches!(std::env::var(k).ok().as_deref(),
-                     Some("1") | Some("true") | Some("TRUE") | Some("on"))
-        }).copied().collect::<Vec<_>>();
-        if !env_set_batched.is_empty() {
-            return Err(corrupt(
-                bringup.paths.model_dir.clone(),
-                format!(
-                    "[mistral35] {} requested but the runtime executor \
-                     is token-major (batched-prefill phases M-A/B/C/D/E \
-                     are plan-doc only, not wired into \
-                     generate_with_vision). Unset these envs or wait \
-                     for the batched-prefill landing tracked in \
-                     v3/MISTRAL35_BATCHED_PREFILL_PLAN.md.",
-                    env_set_batched.join(", "),
-                ),
-            ));
-        }
+        // The old fail-fast env gates (RVLLM_MISTRAL35_BATCH_*) were
+        // tied to a never-landed plan; they're retired alongside the
+        // log.
         eprintln!(
-            "[mistral35] executor: token-major (per-prompt-token \
-             forward via forward_smoke_q_proj_inner). batched-prefill \
-             phases (M-A/B/C/D/E) are plan-doc only — see \
-             MISTRAL35_BATCHED_PREFILL_PLAN.md."
+            "[mistral35] executor: layer-major chunk-path \
+             default-on for T ≥ chunk_t_min (default 16); \
+             per-token fused-GEMV path for T < chunk_t_min. \
+             Chunk size capped at `RVLLM_MISTRAL35_PREFILL_CHUNK_SIZE` \
+             (default 4096) — longer prompts auto-slice. \
+             Set RVLLM_MISTRAL35_BATCH_PREFILL=0 to force token-major \
+             regardless of T."
         );
         // Indicative scratch-budget at a few common prefill chunk
         // sizes so the operator can see whether the requested
@@ -4435,6 +4415,18 @@ impl Mistral35Bringup {
             .unwrap_or(true);
         let chunk_t_max = self.scratch.as_ref()
             .map(|s| s.chunk_t_max).unwrap_or(0);
+        // Codex review #1: chunk-path has a fixed ~2.5 s per-request
+        // dequant + cuBLASLt scratch-traffic overhead (244 GB BF16
+        // weight materialisation across all 88 × 7 projections).
+        // The per-token fused-GEMV path has zero scratch cost. The
+        // chunk wins once T × per_token_cost (~0.45 s/tok) exceeds
+        // the overhead — empirically T ≈ 6. Default threshold 16
+        // for safety margin; override via
+        // `RVLLM_MISTRAL35_PREFILL_CHUNK_MIN`. Short prompts route
+        // through the per-token path automatically.
+        let chunk_t_min: usize = std::env::var("RVLLM_MISTRAL35_PREFILL_CHUNK_MIN")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(16usize);
         // Codex review #3: long prompts no longer fall hard back to
         // the per-token path. The prompt is sliced into
         // `chunk_t_max`-sized layer-major chunks. Each chunk builds
@@ -4444,7 +4436,11 @@ impl Mistral35Bringup {
         // logits matter; earlier chunks still run the LM-head at
         // their last token but the result is discarded (M=1 cost,
         // negligible vs the layer body savings).
-        if use_batched_prefill && chunk_t_max > 0 && !prompt.is_empty() {
+        if use_batched_prefill
+            && chunk_t_max > 0
+            && prompt.len() >= chunk_t_min
+            && !prompt.is_empty()
+        {
             let total = prompt.len();
             let mut pos: usize = 0;
             while pos < total {
