@@ -143,52 +143,66 @@ pub async fn spawn_cuda_worker(
                 }
 
                 while let Some(req) = req_rx.blocking_recv() {
-                    // Round-12 phase 3-test: under
-                    // RVLLM_DEBUG_MISTRAL35=1 the admission layer
-                    // forwards image-bearing requests through to here.
-                    // Run forward_pixtral_vision in dump-only mode (no
-                    // splice — text-only generation continues
-                    // afterward). Production reject still applies
-                    // without the gate, so this branch is unreachable
-                    // outside debug mode.
+                    // Round-12 phase 3e: under RVLLM_DEBUG_MISTRAL35=1
+                    // the admission layer forwards image-bearing
+                    // requests here. We run forward_pixtral_vision per
+                    // image, then SPLICE the BF16 soft-tokens into the
+                    // language-decoder embed buffer at the slot
+                    // positions the renderer reserved (see
+                    // tokenize.rs::render_chat_with_vision and
+                    // worker.rs::vision_slots). Production reject
+                    // still applies without the gate, so this branch
+                    // is unreachable outside debug mode.
+                    let mut vision_splices: Vec<(usize, usize, Vec<u8>)> = Vec::new();
                     if !req.vision_items.is_empty()
                         && rvllm_runtime::mistral35_bring_up
                             ::mistral35_debug_active()
                     {
-                        for (vi_idx, item) in req.vision_items.iter().enumerate() {
+                        // Build splice list aligned to the renderer's
+                        // slots. `req.vision_slots[i]` carries the
+                        // token_start + num_tokens that
+                        // `vision_items[slot.vision_item_idx]` should
+                        // overwrite.
+                        for slot in req.vision_slots.iter() {
+                            let vi_idx = slot.vision_item_idx;
+                            let item = &req.vision_items[vi_idx];
                             tracing::info!(
-                                "[mistral35-vision-debug] running forward \
-                                 for image {}/{} ({} bytes, {}x{}, predicted \
-                                 num_tokens={})…",
+                                "[mistral35-vision] image {}/{} ({} bytes, \
+                                 {}x{}, slot.token_start={} num_tokens={})…",
                                 vi_idx + 1, req.vision_items.len(),
                                 item.bytes.len(), item.width, item.height,
-                                item.num_tokens,
+                                slot.token_start, slot.num_tokens,
                             );
                             match bringup.forward_pixtral_vision(&item.bytes) {
                                 Ok(out) => {
-                                    tracing::info!(
-                                        "[mistral35-vision-debug] image {}: \
-                                         num_tokens={} hidden_dim={} \
-                                         patch_grid={:?} merged_grid={:?} \
-                                         data_bytes={}",
-                                        vi_idx + 1, out.num_tokens,
-                                        out.hidden_dim, out.patch_grid,
-                                        out.merged_grid, out.data.len(),
-                                    );
+                                    if out.num_tokens != slot.num_tokens {
+                                        tracing::warn!(
+                                            "[mistral35-vision] image {} \
+                                             produced {} soft tokens but slot \
+                                             reserved {} — admission predictor \
+                                             mismatch, splice may be partial",
+                                            vi_idx + 1, out.num_tokens,
+                                            slot.num_tokens,
+                                        );
+                                    }
+                                    let n = out.num_tokens.min(slot.num_tokens);
+                                    let bytes_per_tok = out.hidden_dim * 2;
+                                    let take = n * bytes_per_tok;
+                                    vision_splices.push((
+                                        slot.token_start, n,
+                                        out.data[..take].to_vec(),
+                                    ));
                                 }
                                 Err(e) => {
                                     tracing::warn!(
-                                        "[mistral35-vision-debug] image {} \
-                                         forward failed: {e:?}",
+                                        "[mistral35-vision] image {} forward \
+                                         failed, generation will fall back to \
+                                         text-only: {e:?}",
                                         vi_idx + 1,
                                     );
                                 }
                             }
                         }
-                        tracing::info!(
-                            "[mistral35-vision-debug] continuing with \
-                             text-only generation (splice not yet wired)"
-                        );
                     }
                     // Multi-token autoregressive generation. Tokenize
                     // → prefill (one forward per prompt token, KV cache
@@ -259,7 +273,7 @@ pub async fn spawn_cuda_worker(
                     let mut hit_stop_in_closure = false;
                     let cancel_ref: &std::sync::atomic::AtomicBool = &*req.cancelled;
                     let gen = unsafe {
-                        bringup.generate(
+                        bringup.generate_with_vision(
                             &prompt, max_new, &eos,
                             Some(cancel_ref),
                             |tok: u32| {
@@ -280,6 +294,7 @@ pub async fn spawn_cuda_worker(
                                 }
                                 emitted_in_closure += 1;
                             },
+                            &vision_splices,
                         )
                     };
                     let (gen_tokens, prompt_len_for_log, last_dump_opt, gen_err) = match gen {

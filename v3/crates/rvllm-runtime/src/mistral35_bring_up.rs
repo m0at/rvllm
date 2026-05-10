@@ -1429,7 +1429,7 @@ impl Mistral35Bringup {
     pub unsafe fn forward_smoke_q_proj(&self, token_id: u32, position: i32) -> Result<SmokeStageDump> {
         // Default to computing logits + argmax + DtoH on every call —
         // backwards-compatible for the smoke endpoint.
-        self.forward_smoke_q_proj_inner(token_id, position, true)
+        self.forward_smoke_q_proj_inner(token_id, position, true, None)
     }
 
     /// Same as [`forward_smoke_q_proj`] with optional skip of the
@@ -1449,6 +1449,12 @@ impl Mistral35Bringup {
         token_id: u32,
         position: i32,
         compute_logits: bool,
+        // Round-12 phase 3e: optional vision splice. If provided,
+        // points at a BF16 [hidden] device buffer that overrides the
+        // result of `embed_gather` for this token. The pointer is
+        // owned by the caller (typically a per-request scratch
+        // region built once in `generate`).
+        vision_splice_dev_ptr: Option<u64>,
     ) -> Result<SmokeStageDump> {
         use rvllm_cutlass::lib_so::CutlassBackend;
 
@@ -2079,6 +2085,31 @@ impl Mistral35Bringup {
                 scr.token_in_ptr,
                 stream_u64,
             )?;
+        // (1b) Round-12 phase 3e — vision splice override. If the
+        // caller marked this position as a vision-soft-token slot,
+        // overwrite the embed-gathered hidden state with the
+        // pre-computed BF16 vision-tower output. The text-side
+        // embed_gather above still runs (cheap), so logging /
+        // diagnostics see a consistent baseline; the splice is
+        // observed by everything downstream of this DtoD copy.
+        if let Some(splice_ptr) = vision_splice_dev_ptr {
+            unsafe {
+                use cudarc::driver::sys::*;
+                let r = cuMemcpyDtoDAsync_v2(
+                    scr.h_residual_ptr,
+                    splice_ptr,
+                    (hidden as usize) * 2,
+                    stream.raw() as CUstream,
+                );
+                if r != CUresult::CUDA_SUCCESS {
+                    return Err(rvllm_core::RvllmError::cuda(
+                        "mistral35: vision splice DtoD",
+                        rvllm_core::CudaErrorKind::LaunchFailed,
+                        rvllm_core::CudaCtx::setup(),
+                    ));
+                }
+            }
+        }
         let post_embed = dump_bf16(
             stream, stream_u64,
             scr.h_residual_ptr, hidden as usize,
@@ -3624,6 +3655,30 @@ impl Mistral35Bringup {
     where
         F: FnMut(u32),
     {
+        self.generate_with_vision(
+            prompt, max_new, eos_ids, cancelled, on_token, &[],
+        )
+    }
+
+    /// Round-12 phase 3e: vision-aware generate. `vision_splices` is
+    /// `[(token_start, num_tokens, embed_bf16_bytes)]` — the splice
+    /// data already produced by `forward_pixtral_vision` (BF16 row-
+    /// major `[num_tokens, hidden]`). Each splice covers
+    /// `[token_start .. token_start + num_tokens)` in the prompt.
+    /// Decode tokens (positions ≥ `prompt.len()`) never carry
+    /// splices.
+    pub unsafe fn generate_with_vision<F>(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        eos_ids: &[u32],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        mut on_token: F,
+        vision_splices: &[(usize, usize, Vec<u8>)],
+    ) -> Result<GenerateResult>
+    where
+        F: FnMut(u32),
+    {
         let is_cancelled = || cancelled
             .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(false);
@@ -3641,7 +3696,7 @@ impl Mistral35Bringup {
         // KV-cache state from prior steps.
         if debug_env_os("RVLLM_SMOKE_SINGLE").is_some() {
             let tok = *prompt.last().unwrap();
-            let dump = self.forward_smoke_q_proj_inner(tok, 0, true)?;
+            let dump = self.forward_smoke_q_proj_inner(tok, 0, true, None)?;
             return Ok(GenerateResult {
                 tokens: vec![tok, dump.predicted_token],
                 last_dump: Some(dump),
@@ -3649,13 +3704,68 @@ impl Mistral35Bringup {
             });
         }
 
-        // Capture arena state right before the first per-token forward;
-        // each call's transient scratch lives between checkpoint and
-        // restore so the arena footprint doesn't grow with sequence
-        // length. RVLLM_SMOKE_NO_RESTORE=1 keeps every call's scratch
-        // around (debug only, will OOM eventually).
-        let ck = arena.checkpoint();
+        // Round-12 phase 3e: allocate splice region BEFORE the
+        // per-token checkpoint so its device pointers stay valid
+        // across the prefill loop's per-iteration arena.restore.
+        // The outer checkpoint (`ck_outer`) frees both the splice
+        // region and any leftover per-token scratch at the very end
+        // of generate.
+        let ck_outer = arena.checkpoint();
         let do_restore = debug_env_os("RVLLM_SMOKE_NO_RESTORE").is_none();
+
+        let hidden_bytes = (self.arch.text.hidden_size as usize) * 2;
+        let mut pos_to_dev_ptr: std::collections::HashMap<i32, u64> =
+            std::collections::HashMap::new();
+        let mut _splice_region_keepalive: Option<rvllm_mem::Region> = None;
+        if !vision_splices.is_empty() {
+            // Sanity-check: each splice's data length matches num_tokens * hidden_bytes.
+            let mut total = 0usize;
+            for (_, n_tok, data) in vision_splices {
+                let want = n_tok * hidden_bytes;
+                if data.len() != want {
+                    return Err(corrupt(
+                        self.paths.model_dir.clone(),
+                        format!(
+                            "generate_with_vision: splice byte len {} != {} (num_tokens={n_tok}, hidden_bytes={hidden_bytes})",
+                            data.len(), want,
+                        ),
+                    ));
+                }
+                total += data.len();
+            }
+            // Allocate a region BEFORE the per-token checkpoint so
+            // its device-pointer values stay valid across prefill
+            // iterations.
+            let region = arena.region("mistral35_vision_splices", total, 16)?;
+            let base = region.device_ptr();
+            let mut cursor: usize = 0;
+            for (start, n_tok, data) in vision_splices {
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let r = cuMemcpyHtoDAsync_v2(
+                        base + cursor as u64,
+                        data.as_ptr() as *const _,
+                        data.len(),
+                        self.stream.as_ref().unwrap().raw() as CUstream,
+                    );
+                    if r != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "mistral35: vision splice HtoD",
+                            rvllm_core::CudaErrorKind::LaunchFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                for t in 0..*n_tok {
+                    let pos = (*start + t) as i32;
+                    let ptr = base + (cursor + t * hidden_bytes) as u64;
+                    pos_to_dev_ptr.insert(pos, ptr);
+                }
+                cursor += data.len();
+            }
+            _splice_region_keepalive = Some(region);
+        }
+        let ck_after_splices = arena.checkpoint();
 
         let mut tokens: Vec<u32> = prompt.to_vec();
         let mut last_dump: Option<SmokeStageDump> = None;
@@ -3669,14 +3779,15 @@ impl Mistral35Bringup {
                 });
             }
             let is_last = i == prompt.len() - 1;
+            let splice_ptr = pos_to_dev_ptr.get(&(i as i32)).copied();
             if let Some(dump) = self.prefill_token(
-                tok, i as i32, is_last, arena, ck, do_restore,
+                tok, i as i32, is_last, arena, ck_after_splices,
+                do_restore, splice_ptr,
             )? {
                 last_predicted = dump.predicted_token;
                 last_dump = Some(dump);
             }
         }
-
         // Stage 4: decode.
         for step in 0..max_new {
             tokens.push(last_predicted);
@@ -3691,15 +3802,19 @@ impl Mistral35Bringup {
                 break;
             }
             let pos = (prompt.len() + step) as i32;
-            let dump = self.decode_token(last_predicted, pos, arena, ck, do_restore)?;
+            let dump = self.decode_token(
+                last_predicted, pos, arena, ck_after_splices, do_restore,
+            )?;
             last_predicted = dump.predicted_token;
             last_dump = Some(dump);
         }
 
-        // Free all per-step scratch in one shot. The last forward
-        // (whichever path took it) finished with a stream fence + DtoH
-        // so all in-flight kernels are guaranteed complete by here.
-        if do_restore { unsafe { arena.restore(ck); } }
+        // Free all per-step scratch in one shot — including the
+        // vision-splice region allocated above the inner checkpoint.
+        // The last forward finished with a stream fence + DtoH so all
+        // in-flight kernels are complete by here.
+        if do_restore { unsafe { arena.restore(ck_outer); } }
+        drop(_splice_region_keepalive);
 
         Ok(GenerateResult {
             tokens,
@@ -3787,8 +3902,11 @@ impl Mistral35Bringup {
         arena: &rvllm_mem::HbmArena<'static>,
         ck: usize,
         do_restore: bool,
+        vision_splice_dev_ptr: Option<u64>,
     ) -> Result<Option<SmokeStageDump>> {
-        let dump = self.forward_smoke_q_proj_inner(tok, pos, is_last)?;
+        let dump = self.forward_smoke_q_proj_inner(
+            tok, pos, is_last, vision_splice_dev_ptr,
+        )?;
         let out = if is_last { Some(dump) } else { None };
         // Safe: the inner path fences via stream.fence() when
         // compute_logits=false, and DtoH on logits when true.
@@ -3797,7 +3915,9 @@ impl Mistral35Bringup {
     }
 
     /// Stage 4 helper: feed one decode token through the forward
-    /// (always with `compute_logits = true`).
+    /// (always with `compute_logits = true`). Decode tokens never
+    /// carry vision splices — by construction, vision-soft-token
+    /// slots only appear in the prompt.
     unsafe fn decode_token(
         &self,
         tok: u32,
@@ -3806,7 +3926,7 @@ impl Mistral35Bringup {
         ck: usize,
         do_restore: bool,
     ) -> Result<SmokeStageDump> {
-        let dump = self.forward_smoke_q_proj(tok, pos)?;
+        let dump = self.forward_smoke_q_proj_inner(tok, pos, true, None)?;
         if do_restore { arena.restore(ck); }
         Ok(dump)
     }
