@@ -1196,13 +1196,33 @@ impl Mistral35Bringup {
             let max_workspace = max_workspace.max(16);
             // F2#3 fix: only the legacy `RVLLM_W4A16_GEMV=0`
             // (dequant-then-cublasLt) path needs `w_bf16_scratch` (~705
-            // MB) and `out_f32_scratch` (~115 KB). Default fused W4A16
-            // GEMV reads weights direct via lin.sfb_natural_ptr and
-            // writes BF16 directly to `q_out_ptr` etc. Sizing them at
-            // 0 under fused mode reclaims real arena budget on GB10.
+            // MB) and `out_f32_scratch` (~115 KB at M=1). Default fused
+            // W4A16 GEMV reads weights direct via lin.sfb_natural_ptr
+            // and writes BF16 directly to `q_out_ptr` etc.
+            //
+            // Layer-major batched prefill (`RVLLM_MISTRAL35_BATCH_PREFILL`)
+            // ALSO needs the legacy scratch — the chunk path runs the
+            // existing `gemm` helper at M=T against `bf16_gemm_f32`,
+            // which writes a `[T, n] f32` result the cast then narrows
+            // to BF16. Treat both gates as triggers for the legacy
+            // scratch budget so the operator only sets one knob.
             let want_legacy_dequant = std::env::var("RVLLM_W4A16_GEMV")
                 .map(|s| matches!(s.as_str(), "0" | "false" | "FALSE"))
                 .unwrap_or(false);
+            let want_batched_prefill = std::env::var("RVLLM_MISTRAL35_BATCH_PREFILL")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(false);
+            let want_legacy_scratch = want_legacy_dequant || want_batched_prefill;
+            // Chunk path's per-call max prompt-row count. For full
+            // bring-up of long prompts (~thousands of tokens) we
+            // pre-reserve enough `out_f32_scratch` to fit the largest
+            // single GEMM call. Tunable via env so a tight budget can
+            // shrink it. Default 4096 covers the typical Mistral 3.5
+            // prefill prompts (≤ a few hundred tokens) with margin.
+            let chunk_t_max: usize = std::env::var("RVLLM_MISTRAL35_PREFILL_CHUNK_SIZE")
+                .ok().and_then(|s| s.parse().ok())
+                .unwrap_or(4096usize)
+                .max(1);
             // W4A16 path scratch sizing: max BF16 dequantized weight tile
             // across all projections. Mistral 3.5 layer projections:
             //   q_proj/o_proj: hidden×hidden            (= 12288²)
@@ -1215,15 +1235,27 @@ impl Mistral35Bringup {
                 .max(h * h)
                 .max(i_s * h)
                 .max(h * i_s);
-            let max_w_bf16_bytes = if want_legacy_dequant {
+            let max_w_bf16_bytes = if want_legacy_scratch {
                 max_w_elems_legacy * 2
             } else { 0 };
-            // F32 output staging for cublasLt bf16_gemm_f32 — sized to
-            // max(N) across projections, m=1.
+            // F32 output staging for cublasLt bf16_gemm_f32. For M=1
+            // the buffer is `N_max * 4`. For chunked prefill at M=T
+            // the buffer must hold `T_max * N_max * 4` (the cublasLt
+            // call writes `[m, n]` f32 row-major). Largest N is
+            // `intermediate = 28672`; at chunk_t_max=4096 that's
+            // 4096 × 28672 × 4 ≈ 470 MB — sizeable but within the
+            // 100 GiB Mistral 3.5 arena budget.
             let max_out_n_legacy = n_q_dim.max(n_kv_dim).max(h).max(i_s);
-            let max_out_f32_bytes = if want_legacy_dequant {
-                max_out_n_legacy * 4
+            let m_for_scratch = if want_batched_prefill { chunk_t_max } else { 1 };
+            let max_out_f32_bytes = if want_legacy_scratch {
+                m_for_scratch * max_out_n_legacy * 4
             } else { 0 };
+            if want_batched_prefill {
+                tracing::info!(
+                    chunk_t_max, max_out_n_legacy, max_out_f32_bytes,
+                    "[mistral35] batched-prefill scratch reserved"
+                );
+            }
             let scratch = Mistral35Scratch {
                 token_in_ptr:   arena_box.region("mistral35_token_in", 4, 4)?.device_ptr(),
                 h_residual_ptr: arena_box.region("mistral35_h_residual", h_bytes, 16)?.device_ptr(),
@@ -1806,18 +1838,31 @@ impl Mistral35Bringup {
             }
             // (3) f32 → bf16 cast into the caller's output buffer.
             unsafe {
+                // f32 → bf16 cast covers ALL output rows the GEMM
+                // produced. cublasLt wrote `[m, n]` row-major into
+                // `out_f32_scratch_ptr`; the cast must walk all
+                // `m * n` elements. The previous `count = n` was
+                // correct for the M=1 hot path but truncates row 1+
+                // when called at M>1 (chunked-prefill path).
                 let mut dst = out_bf16_ptr;
                 let mut src = scr.out_f32_scratch_ptr;
-                let mut count = n;
+                let mut count = (m as i64) * (n as i64);
+                if count <= 0 || count > i32::MAX as i64 {
+                    return Err(corrupt(
+                        self.paths.model_dir.clone(),
+                        format!("gemm: m*n overflow or non-positive: m={m} n={n}"),
+                    ));
+                }
+                let mut count_i32 = count as i32;
                 let args: [*mut std::ffi::c_void; 3] = [
                     (&mut dst)   as *mut u64 as *mut _,
                     (&mut src)   as *mut u64 as *mut _,
-                    (&mut count) as *mut i32 as *mut _,
+                    (&mut count_i32) as *mut i32 as *mut _,
                 ];
-                let blocks = ((n as u32) + 1023) / 1024;
+                let blocks = ((count as u32) + 1023) / 1024;
                 rvllm_fused::launch_raw(
                     kernels_inner.fn_f32_to_bf16,
-                    (blocks, 1, 1),
+                    (blocks.max(1), 1, 1),
                     (1024, 1, 1),
                     0, stream_u64,
                     &args,
