@@ -92,6 +92,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_kv_cache_write_bf16: KernelFn,
     pub qk_dot_bf16_mod: LoadedModule,
     pub fn_qk_dot_bf16: KernelFn,
+    pub qk_dot_gqa_bf16_mod: LoadedModule,
+    pub fn_qk_dot_gqa_bf16: KernelFn,
     pub softmax_v_bf16_mod: LoadedModule,
     pub fn_softmax_v_bf16: KernelFn,
     // W4A16 NVFP4 path (Mistral 3.5 checkpoint format): dequantize
@@ -952,6 +954,9 @@ impl Mistral35Bringup {
             let fn_kv_cache_write_bf16 = kv_cache_write_bf16_mod
                 .get_function("mistral35_kv_cache_write_bf16_kernel")?;
             let qk_dot_bf16_mod = kernels.load_ptx("mistral35_qk_dot_bf16")?;
+            let qk_dot_gqa_bf16_mod = kernels.load_ptx("mistral35_qk_dot_gqa_bf16")?;
+            let fn_qk_dot_gqa_bf16 = qk_dot_gqa_bf16_mod
+                .get_function("mistral35_qk_dot_gqa_bf16_kernel")?;
             let fn_qk_dot_bf16 = qk_dot_bf16_mod
                 .get_function("mistral35_qk_dot_bf16_kernel")?;
             let softmax_v_bf16_mod = kernels.load_ptx("mistral35_softmax_v_bf16")?;
@@ -1023,6 +1028,8 @@ impl Mistral35Bringup {
                 fn_kv_cache_write_bf16,
                 qk_dot_bf16_mod,
                 fn_qk_dot_bf16,
+                qk_dot_gqa_bf16_mod,
+                fn_qk_dot_gqa_bf16,
                 softmax_v_bf16_mod,
                 fn_softmax_v_bf16,
                 nvfp4_dequant_weights_bf16_mod,
@@ -1973,13 +1980,46 @@ impl Mistral35Bringup {
                     (&mut isd) as *mut f32 as *mut std::ffi::c_void,
                 ];
                 let smem = (head_dim_attn as u32) * 4;
-                unsafe {
-                    rvllm_fused::launch_raw(
-                        kernels.fn_qk_dot_bf16,
-                        (n_q_heads_attn, past_len as u32, 1),
-                        (head_dim_attn as u32, 1, 1),
-                        smem, stream_u64, &args,
-                    )?;
+                // GQA-aware fast path: 1 CTA per (kv_head, t) with K
+                // loaded once and reused across `gqa_ratio` Q-heads.
+                // K-cache bandwidth drops by `gqa_ratio` (12× for
+                // Mistral 3.5). Same output ABI as the legacy
+                // `mistral35_qk_dot_bf16` kernel — no other call
+                // sites touched. Opt-in via env until the smoke
+                // matrix is green.
+                let use_gqa = std::env::var("RVLLM_MISTRAL35_QK_DOT_GQA")
+                    .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                    .unwrap_or(false);
+                if use_gqa && gqa_ratio_attn > 1 {
+                    let mut nq = n_q_heads_attn as i32;
+                    let args_gqa = [
+                        (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut sc_ptr) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut nq) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                    ];
+                    unsafe {
+                        rvllm_fused::launch_raw(
+                            kernels.fn_qk_dot_gqa_bf16,
+                            (n_kv_heads_attn as u32, past_len as u32, 1),
+                            (head_dim_attn as u32, 1, 1),
+                            smem, stream_u64, &args_gqa,
+                        )?;
+                    }
+                } else {
+                    unsafe {
+                        rvllm_fused::launch_raw(
+                            kernels.fn_qk_dot_bf16,
+                            (n_q_heads_attn, past_len as u32, 1),
+                            (head_dim_attn as u32, 1, 1),
+                            smem, stream_u64, &args,
+                        )?;
+                    }
                 }
             }
 
