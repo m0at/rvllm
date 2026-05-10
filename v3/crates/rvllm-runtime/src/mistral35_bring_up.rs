@@ -3351,6 +3351,30 @@ impl Mistral35Bringup {
                 residual_region.device_ptr(),
                 hidden_region.device_ptr(),
             )?;
+
+            // Round-12 phase 3-test (c): per-block dump for the bisect.
+            // Writes to blocks/block_NN.bin under the dump dir. Gated
+            // separately from the top-level dump_dir (RVLLM_PIXTRAL_PER_BLOCK_DUMP=1)
+            // so the cosine harness can run the cheap path without
+            // forcing 48 stream-fences per request.
+            if let Some(ref d) = dump_dir {
+                if debug_env_str("RVLLM_PIXTRAL_PER_BLOCK_DUMP").is_some() {
+                    stream.fence()?;
+                    let mut host = vec![0u8; hidden_bytes];
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(
+                            host.as_mut_ptr() as *mut _,
+                            hidden_region.device_ptr(), hidden_bytes);
+                    }
+                    let blocks_dir = d.join("blocks");
+                    let _ = std::fs::create_dir_all(&blocks_dir);
+                    let _ = std::fs::write(
+                        blocks_dir.join(format!("block_{:02}.bin", block_idx)),
+                        &host,
+                    );
+                }
+            }
         }
 
         if let Some(ref d) = dump_dir {

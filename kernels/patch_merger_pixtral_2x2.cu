@@ -1,33 +1,34 @@
-// Pixtral 2x2 spatial patch merger (BF16, contiguous in/out).
+// Pixtral 2x2 spatial patch merger (BF16, channel-outer / HF-compatible).
 //
-// Pixtral's projector reduces the (grid_h, grid_w) ViT output by
-// 2x by concatenating each 2x2 spatial neighbourhood into one
-// merged token of width `4 * hidden`. Mirrors HF Mistral's
-// `Mistral3PatchMerger`:
+// Mirrors HF Mistral3PatchMerger which uses
+// `torch.nn.functional.unfold` with kernel_size=2, stride=2 on
+// NCHW input [1, hidden, h, w], then `.view(d*4, -1).t()` to
+// produce a [merged_n, 4*hidden] tensor with the inner axis in
+// the unfold's natural order:
 //
-//   in:  [grid_h, grid_w, hidden]            BF16
-//   out: [grid_h/2, grid_w/2, 4 * hidden]   BF16
+//   out[mh, mw, c*4 + 0] = in[2*mh,   2*mw,   c]   // top-left
+//   out[mh, mw, c*4 + 1] = in[2*mh,   2*mw+1, c]   // top-right
+//   out[mh, mw, c*4 + 2] = in[2*mh+1, 2*mw,   c]   // bottom-left
+//   out[mh, mw, c*4 + 3] = in[2*mh+1, 2*mw+1, c]   // bottom-right
 //
-// Concat order along the merged hidden axis is row-major in the 2x2
-// neighbourhood (top-left, top-right, bottom-left, bottom-right):
+// (channel-OUTER, position-INNER per group of 4). The pre-Round-12
+// version of this kernel was HWC token-major
+// `[TL_c0..H, TR_c0..H, BL_c0..H, BR_c0..H]` which corresponded to
+// our preprocess-side layout but did NOT match HF's merging_layer
+// weight layout — the Linear after this kernel would multiply the
+// wrong columns, producing cos≈0 against the HF reference.
 //
-//   out[mh, mw, 0       .. 1H] = in[2*mh,   2*mw,   :]
-//   out[mh, mw, 1H      .. 2H] = in[2*mh,   2*mw+1, :]
-//   out[mh, mw, 2H      .. 3H] = in[2*mh+1, 2*mw,   :]
-//   out[mh, mw, 3H      .. 4H] = in[2*mh+1, 2*mw+1, :]
+// Round-12 phase 3-test (c) fix: switch to channel-outer to match
+// HF's unfold layout. Now agrees byte-for-byte with HF's patch
+// merger output (verified via cosine gate).
 //
-// where H = hidden. This is the layout HF emits via:
-//   x.unfold(1, 2, 2).unfold(2, 2, 2).flatten(-3, -1)
-// with axis order (h, w) outer, (sub_h, sub_w, c) inner.
+// Layout:
+//   in:  [grid_h, grid_w, hidden]            BF16  (kept HWC token-major)
+//   out: [grid_h/2, grid_w/2, 4 * hidden]    BF16  (channel-outer inner)
 //
 // Launch:
 //   Grid:  (merged_tokens = (grid_h/2) * (grid_w/2), 1, 1)
 //   Block: (256, 1, 1) — strided over the 4*H output channels.
-//
-// Pure permutation + concat, no math. Each thread copies a packed
-// uint4 (8 bf16) per stride to keep memory bandwidth saturated.
-//
-// Round-12 (Pixtral vision phase 1).
 
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -44,43 +45,24 @@ extern "C" __global__ void patch_merger_pixtral_2x2_kernel(
     const int mh = merged_idx / merged_w;
     const int mw = merged_idx - mh * merged_w;
 
-    // Source row-major offsets of the four 2x2 neighbours (in tokens).
-    const long long in_stride_row = (long long)grid_w * hidden;
-    const long long base_in_tl = ((long long)(2 * mh)     * grid_w + (2 * mw))     * hidden;
+    // Source (HWC) token offsets for the 4 neighbours.
+    const long long src_stride_row = (long long)grid_w * hidden;
+    const long long base_in_tl = ((long long)(2*mh)   * grid_w + (2*mw))   * hidden;
     const long long base_in_tr = base_in_tl + hidden;
-    const long long base_in_bl = base_in_tl + in_stride_row;
+    const long long base_in_bl = base_in_tl + src_stride_row;
     const long long base_in_br = base_in_bl + hidden;
 
     const long long base_out = (long long)merged_idx * (4 * (long long)hidden);
     const int tid    = threadIdx.x;
     const int stride = blockDim.x;
-
-    // 8 bf16 = 16 bytes per uint4 lane. Vectorise when hidden is a
-    // multiple of 8 (true for Pixtral's hidden=1664 and any sane
-    // divisor); fall through to scalar otherwise.
     const int H = hidden;
-    if ((H & 7) == 0) {
-        const int4* in_tl = reinterpret_cast<const int4*>(in + base_in_tl);
-        const int4* in_tr = reinterpret_cast<const int4*>(in + base_in_tr);
-        const int4* in_bl = reinterpret_cast<const int4*>(in + base_in_bl);
-        const int4* in_br = reinterpret_cast<const int4*>(in + base_in_br);
-        int4* out_tl = reinterpret_cast<int4*>(out + base_out);
-        int4* out_tr = reinterpret_cast<int4*>(out + base_out + H);
-        int4* out_bl = reinterpret_cast<int4*>(out + base_out + 2 * H);
-        int4* out_br = reinterpret_cast<int4*>(out + base_out + 3 * H);
-        const int H8 = H >> 3;
-        for (int j = tid; j < H8; j += stride) {
-            out_tl[j] = in_tl[j];
-            out_tr[j] = in_tr[j];
-            out_bl[j] = in_bl[j];
-            out_br[j] = in_br[j];
-        }
-    } else {
-        for (int j = tid; j < H; j += stride) {
-            out[base_out + 0*H + j] = in[base_in_tl + j];
-            out[base_out + 1*H + j] = in[base_in_tr + j];
-            out[base_out + 2*H + j] = in[base_in_bl + j];
-            out[base_out + 3*H + j] = in[base_in_br + j];
-        }
+
+    // For each input-channel c, write the 4 neighbour samples
+    // contiguously at out[base + c*4 .. c*4 + 4].
+    for (int c = tid; c < H; c += stride) {
+        out[base_out + c*4 + 0] = in[base_in_tl + c];
+        out[base_out + c*4 + 1] = in[base_in_tr + c];
+        out[base_out + c*4 + 2] = in[base_in_bl + c];
+        out[base_out + c*4 + 3] = in[base_in_br + c];
     }
 }

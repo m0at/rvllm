@@ -38,28 +38,53 @@ pub struct PixtralRopeTables {
 }
 
 impl PixtralRopeTables {
+    /// Mirrors HF transformers PixtralRotaryEmbedding (verified against
+    /// `transformers.models.pixtral.modeling_pixtral`):
+    ///
+    /// ```text
+    /// freqs = 1 / base^(arange(0, dim, 2) / dim)               # [dim/2]
+    /// row_freqs = freqs[::2]                                    # [dim/4]
+    /// col_freqs = freqs[1::2]                                   # [dim/4]
+    /// freqs_h[h, k]  = h * row_freqs[k]
+    /// freqs_w[w, k]  = w * col_freqs[k]
+    /// inv_freq_2d[h, w, :] = cat(freqs_h[h], freqs_w[w])        # [dim/2]
+    /// inv_freq      = inv_freq_2d.reshape(-1, dim/2)            # [N, dim/2]
+    /// inv_freq      = cat([inv_freq, inv_freq], dim=-1)         # [N, dim]
+    /// cos = cos(inv_freq)
+    /// sin = sin(inv_freq)
+    /// ```
+    ///
+    /// For dim=104 this yields 26 row freqs + 26 col freqs (= 52
+    /// distinct per token) with the second-half [dim/2, dim) being a
+    /// byte-identical copy of the first-half [0, dim/2). The repeat
+    /// supports the NeoX rotate_half pairing the kernel implements
+    /// (channel i pairs with channel i + dim/2).
+    ///
+    /// Round-12 phase 3-test (c) fix: the previous implementation used
+    /// 52 row + 52 col distinct freqs (from `inv_freq[i]` for
+    /// i in [0..52)), which produced cos=0.999 per block but
+    /// accumulated to cos=0.69 over 48 blocks vs HF reference.
     pub fn build(grid_h: u32, grid_w: u32, head_dim: usize, rope_theta: f32) -> Self {
-        // Pixtral applies rotary to the full head_dim; the kernel's
-        // first-R/2 channels carry row info, the second-R/2 carry col.
-        // R/2 must be even so the NeoX rotate_half paring works inside
-        // each half — head_dim=104 → R/2=52 (even). Future Pixtral
-        // checkpoints with non-even half would need a kernel rewrite.
         let r = head_dim;
         assert!(r % 2 == 0, "rotary_dim must be even, got {r}");
         assert!((r / 2) % 2 == 0,
             "rotary_dim/2 must be even for NeoX rotate_half (got {})", r/2);
         let half = r / 2;
+        let quarter = r / 4;
         let seq_len = (grid_h as usize) * (grid_w as usize);
 
-        // theta_i = base ** (-2*i / R) for i in [0, half).
-        // The same theta_i is reused for the row half and the col half;
-        // the position multiplier (row vs col) is what differs.
-        let mut inv_freq = Vec::with_capacity(half);
+        // freqs = 1.0 / base ** (arange(0, R, 2) / R)  → length R/2
+        let mut freqs = Vec::with_capacity(half);
         let inv_r = 1.0 / (r as f32);
-        for i in 0..half {
-            let exp = (-2.0_f32) * (i as f32) * inv_r;
-            inv_freq.push(rope_theta.powf(exp));
+        for i in (0..r).step_by(2) {
+            let exp = (i as f32) * inv_r;
+            freqs.push(rope_theta.powf(-exp));
         }
+        // row_freqs = freqs[::2], col_freqs = freqs[1::2]  → each R/4 long
+        let row_freqs: Vec<f32> = freqs.iter().step_by(2).copied().collect();
+        let col_freqs: Vec<f32> = freqs.iter().skip(1).step_by(2).copied().collect();
+        debug_assert_eq!(row_freqs.len(), quarter);
+        debug_assert_eq!(col_freqs.len(), quarter);
 
         let mut cos = vec![0.0f32; seq_len * r];
         let mut sin = vec![0.0f32; seq_len * r];
@@ -68,15 +93,24 @@ impl PixtralRopeTables {
             let row = (t / grid_w as usize) as f32;
             let col = (t % grid_w as usize) as f32;
             let row_off = t * r;
-            for i in 0..half {
-                let phase_row = row * inv_freq[i];
-                cos[row_off + i] = phase_row.cos();
-                sin[row_off + i] = phase_row.sin();
+            // First half: [0..R/4) row freqs, [R/4..R/2) col freqs.
+            for k in 0..quarter {
+                let phase = row * row_freqs[k];
+                cos[row_off + k] = phase.cos();
+                sin[row_off + k] = phase.sin();
             }
-            for i in 0..half {
-                let phase_col = col * inv_freq[i];
-                cos[row_off + half + i] = phase_col.cos();
-                sin[row_off + half + i] = phase_col.sin();
+            for k in 0..quarter {
+                let phase = col * col_freqs[k];
+                cos[row_off + quarter + k] = phase.cos();
+                sin[row_off + quarter + k] = phase.sin();
+            }
+            // Second half [R/2..R): byte-identical copy of [0..R/2).
+            // This satisfies the NeoX rotate_half pairing: channel i in
+            // [0, R/2) pairs with channel i + R/2 in [R/2, R), and
+            // they share the same cos/sin values.
+            for k in 0..half {
+                cos[row_off + half + k] = cos[row_off + k];
+                sin[row_off + half + k] = sin[row_off + k];
             }
         }
 
@@ -120,45 +154,77 @@ mod tests {
     }
 
     #[test]
-    fn row_half_uses_row_position() {
-        // Tokens 0 and grid_w sit at (0,0) and (1,0). Their col
-        // halves (i ∈ [R/2, R)) must be identical (col=0 for both);
-        // their row halves must differ (row=0 vs 1).
+    fn row_quarter_uses_row_position() {
+        // Channels [0..R/4) carry row freqs. Tokens 0 and grid_w sit
+        // at (0,0) and (1,0). The row-quarter [0..R/4) must differ
+        // between them (row=0 vs 1); the col-quarter [R/4..R/2) must
+        // match (col=0 for both); the second-half [R/2..R) is a copy.
         let grid_h = 3u32;
         let grid_w = 4u32;
         let t = PixtralRopeTables::build(grid_h, grid_w, 104, 10_000.0);
         let r = 104;
+        let quarter = r / 4;
         let half = r / 2;
         let t0_off = 0 * r;
         let t1_off = (grid_w as usize) * r;
-        // Col halves identical
-        for i in 0..half {
-            let c0 = t.cos[t0_off + half + i];
-            let c1 = t.cos[t1_off + half + i];
+        // col-quarter identical (both col=0)
+        for k in quarter..half {
+            let c0 = t.cos[t0_off + k];
+            let c1 = t.cos[t1_off + k];
             assert!((c0 - c1).abs() < 1e-6,
-                "col half differs at i={i}: t0={c0} t1={c1}");
+                "col-quarter differs at k={k}: t0={c0} t1={c1}");
         }
-        // Row halves: at row=1 cos(theta_0 * 1) ≠ 1 (theta_0 = 1.0,
-        // so cos(1) ≈ 0.5403).
-        let row_cos_t1_i0 = t.cos[t1_off + 0];
-        assert!((row_cos_t1_i0 - (1.0_f32).cos()).abs() < 1e-5,
-            "row cos at t=grid_w, i=0 should be cos(1)={}; got {}",
-            (1.0_f32).cos(), row_cos_t1_i0);
+        // row-quarter at k=0: row_freqs[0] = freqs[0] = 1.0, so at
+        // row=1 we expect cos(1).
+        let row_cos_t1_k0 = t.cos[t1_off + 0];
+        assert!((row_cos_t1_k0 - (1.0_f32).cos()).abs() < 1e-5,
+            "row cos at t=grid_w, k=0 should be cos(1)={}, got {}",
+            (1.0_f32).cos(), row_cos_t1_k0);
     }
 
     #[test]
-    fn col_half_uses_col_position() {
-        // Tokens 0 and 1 sit at (0,0) and (0,1). Row halves identical
-        // (row=0); col halves differ (col=0 vs 1).
+    fn col_quarter_uses_col_position() {
+        // Tokens 0 and 1 sit at (0,0) and (0,1). row-quarter
+        // identical; col-quarter differs.
         let t = PixtralRopeTables::build(2, 4, 104, 10_000.0);
         let r = 104;
-        let half = r / 2;
-        for i in 0..half {
-            assert!((t.cos[0 * r + i] - t.cos[1 * r + i]).abs() < 1e-6,
-                "row half differs between t=0 and t=1 at i={i}");
+        let quarter = r / 4;
+        // row-quarter [0..R/4) — row=0 for both → all cos=1.
+        for k in 0..quarter {
+            assert!((t.cos[0 * r + k] - t.cos[1 * r + k]).abs() < 1e-6,
+                "row-quarter differs between t=0 and t=1 at k={k}");
+            assert!((t.cos[0 * r + k] - 1.0).abs() < 1e-6,
+                "row=0 row-quarter should be cos(0)=1, got {}", t.cos[k]);
         }
-        let col_cos_t1_i0 = t.cos[1 * r + half + 0];
-        assert!((col_cos_t1_i0 - (1.0_f32).cos()).abs() < 1e-5);
+        // col-quarter at k=R/4: col_freqs[0] = freqs[1] = 1/base^(2/R).
+        // For R=104, base=10000: col_freqs[0] = 10000^(-2/104) ≈ 0.8385.
+        // At col=1: cos(0.8385) ≈ 0.6688.
+        let col_freq_0 = (10_000.0_f32).powf(-2.0 / 104.0);
+        let expected = (col_freq_0).cos();
+        let col_cos_t1_k0 = t.cos[1 * r + quarter + 0];
+        assert!((col_cos_t1_k0 - expected).abs() < 1e-5,
+            "col cos at t=(0,1), k=R/4 should be cos({col_freq_0})={expected}, got {col_cos_t1_k0}");
+    }
+
+    #[test]
+    fn second_half_mirrors_first_half() {
+        // The HF Pixtral convention duplicates [0..R/2) into [R/2..R)
+        // so the NeoX rotate_half pairing (channel i pairs with i+R/2)
+        // sees the same cos/sin in both. Verify byte-equal copy.
+        let t = PixtralRopeTables::build(3, 5, 104, 10_000.0);
+        let r = 104;
+        let half = r / 2;
+        for tok in 0..t.seq_len {
+            for k in 0..half {
+                let lo = t.cos[tok * r + k];
+                let hi = t.cos[tok * r + half + k];
+                assert!((lo - hi).abs() < 1e-9,
+                    "second-half mismatch at tok={tok} k={k}: {lo} vs {hi}");
+                let slo = t.sin[tok * r + k];
+                let shi = t.sin[tok * r + half + k];
+                assert!((slo - shi).abs() < 1e-9);
+            }
+        }
     }
 
     #[test]

@@ -171,6 +171,17 @@ def main():
     handles.append(projector.linear_1.register_forward_hook(
         stage_hook_dumper(out_dir, "post_linear_1")))
 
+    # Round-12 phase 3-test (c): per-block dumps for the bisect.
+    # Hooks the residual stream after each PixtralAttentionLayer so the
+    # compare script can locate the first block where rvllm drifts
+    # from HF.
+    blocks_dir = out_dir / "blocks"
+    blocks_dir.mkdir(exist_ok=True)
+    for layer_idx, block in enumerate(vision_tower.transformer.layers):
+        name = f"blocks/block_{layer_idx:02}"
+        handles.append(block.register_forward_hook(
+            stage_hook_dumper(out_dir, name)))
+
     # ── 5. Run the forward.
     print("Running HF Pixtral vision forward…")
     with torch.no_grad():

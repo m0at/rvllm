@@ -643,22 +643,25 @@ pub fn preprocess_mistral35_pixtral(
 
 /// Pixtral 2x2 spatial patch merger — host reference.
 ///
-/// Mirrors `kernels/patch_merger_pixtral_2x2.cu` byte-for-byte:
+/// Mirrors `kernels/patch_merger_pixtral_2x2.cu` byte-for-byte and
+/// matches HF Mistral3PatchMerger's `unfold(kernel=2, stride=2) →
+/// view(d*4, -1).t()` ordering:
 ///
 /// ```text
-/// in:  [grid_h, grid_w, hidden]   row-major
-/// out: [grid_h/2, grid_w/2, 4*hidden]
+/// in:  [grid_h, grid_w, hidden]            row-major (HWC token-major)
+/// out: [grid_h/2, grid_w/2, 4*hidden]      channel-outer inner
 ///
-/// out[mh, mw, 0..H]   = in[2*mh,   2*mw,   :]   // top-left
-/// out[mh, mw, H..2H]  = in[2*mh,   2*mw+1, :]   // top-right
-/// out[mh, mw, 2H..3H] = in[2*mh+1, 2*mw,   :]   // bottom-left
-/// out[mh, mw, 3H..4H] = in[2*mh+1, 2*mw+1, :]   // bottom-right
+/// out[mh, mw, c*4 + 0] = in[2*mh,   2*mw,   c]   // top-left
+/// out[mh, mw, c*4 + 1] = in[2*mh,   2*mw+1, c]   // top-right
+/// out[mh, mw, c*4 + 2] = in[2*mh+1, 2*mw,   c]   // bottom-left
+/// out[mh, mw, c*4 + 3] = in[2*mh+1, 2*mw+1, c]   // bottom-right
 /// ```
 ///
-/// Used by the GPU-forward CPU validation harness; the kernel diff
-/// gate compares device output to this function's f32 result.
-///
-/// Round-12 (Pixtral vision phase 1).
+/// Round-12 phase 3-test (c) fix: switched from HWC token-major
+/// inner ordering (`[TL_c0..H, TR_c0..H, BL_c0..H, BR_c0..H]`) to
+/// channel-outer to match HF's unfold convention. The merging_layer
+/// Linear that follows expects channel-outer, so the previous
+/// layout produced cos≈0 against HF.
 pub fn patch_merger_pixtral_2x2_ref(
     input: &[f32],
     grid_h: usize,
@@ -680,14 +683,12 @@ pub fn patch_merger_pixtral_2x2_ref(
             let in_tr = ((2*mh)   * grid_w + (2*mw+1)) * h;
             let in_bl = ((2*mh+1) * grid_w + (2*mw))   * h;
             let in_br = ((2*mh+1) * grid_w + (2*mw+1)) * h;
-            out[base_out + 0*h .. base_out + 1*h]
-                .copy_from_slice(&input[in_tl .. in_tl + h]);
-            out[base_out + 1*h .. base_out + 2*h]
-                .copy_from_slice(&input[in_tr .. in_tr + h]);
-            out[base_out + 2*h .. base_out + 3*h]
-                .copy_from_slice(&input[in_bl .. in_bl + h]);
-            out[base_out + 3*h .. base_out + 4*h]
-                .copy_from_slice(&input[in_br .. in_br + h]);
+            for c in 0..h {
+                out[base_out + c*4 + 0] = input[in_tl + c];
+                out[base_out + c*4 + 1] = input[in_tr + c];
+                out[base_out + c*4 + 2] = input[in_bl + c];
+                out[base_out + c*4 + 3] = input[in_br + c];
+            }
         }
     }
     out
@@ -1037,12 +1038,10 @@ mod tests {
         }
     }
 
-    /// Round-12 patch-merger CPU reference tests.
-    /// The kernel byte-for-byte mirrors this; if these tests pass and
-    /// the GPU diff harness later passes against this reference, the
-    /// kernel is considered correct.
+    /// Round-12 patch-merger CPU reference tests (channel-outer
+    /// after the phase 3-test (c) HF-compatibility fix).
     #[test]
-    fn patch_merger_2x2_smallest_grid() {
+    fn patch_merger_2x2_smallest_grid_channel_outer() {
         // 2x2 grid, hidden=3 — distinct values per (h, w, c) so any
         // index swap shows up as a value mismatch.
         let h = 3;
@@ -1057,21 +1056,20 @@ mod tests {
             }
         }
         let out = patch_merger_pixtral_2x2_ref(&input, g, g, h);
-        // 1 merged token of width 4*h
+        // 1 merged token of width 4*h. Channel-outer layout:
+        //   [c0_TL, c0_TR, c0_BL, c0_BR, c1_TL, c1_TR, c1_BL, c1_BR, c2_*]
         assert_eq!(out.len(), 4 * h);
-        // Top-left (y=0,x=0), values 0, 1, 2.
-        assert_eq!(&out[0..h], &[0.0, 1.0, 2.0]);
-        // Top-right (y=0,x=1), values 10, 11, 12.
-        assert_eq!(&out[h..2*h], &[10.0, 11.0, 12.0]);
-        // Bottom-left (y=1,x=0), values 100, 101, 102.
-        assert_eq!(&out[2*h..3*h], &[100.0, 101.0, 102.0]);
-        // Bottom-right (y=1,x=1), values 110, 111, 112.
-        assert_eq!(&out[3*h..4*h], &[110.0, 111.0, 112.0]);
+        // Channel 0 quadruplet: TL=0, TR=10, BL=100, BR=110.
+        assert_eq!(&out[0..4], &[0.0, 10.0, 100.0, 110.0]);
+        // Channel 1: TL=1, TR=11, BL=101, BR=111.
+        assert_eq!(&out[4..8], &[1.0, 11.0, 101.0, 111.0]);
+        // Channel 2: TL=2, TR=12, BL=102, BR=112.
+        assert_eq!(&out[8..12], &[2.0, 12.0, 102.0, 112.0]);
     }
 
     #[test]
-    fn patch_merger_2x2_4x4_grid_has_4_merged_tokens() {
-        // 4x4 grid → 2x2 merged.
+    fn patch_merger_2x2_4x4_grid_channel_outer() {
+        // 4x4 grid → 2x2 merged, hidden=5.
         let h = 5;
         let g = 4;
         let input: Vec<f32> = (0..g*g*h).map(|i| i as f32).collect();
@@ -1081,18 +1079,19 @@ mod tests {
         // Token (mh=1, mw=0): merges (y=2,x=0), (y=2,x=1), (y=3,x=0), (y=3,x=1).
         let merged_idx = 1 * 2 + 0;
         let base = merged_idx * 4 * h;
-        // top-left = in[(2,0,:)] = at offset 2*4*h .. 2*4*h + h
         let off_tl = (2 * g + 0) * h;
-        assert_eq!(&out[base..base+h], &input[off_tl..off_tl+h]);
-        // top-right = in[(2,1,:)]
         let off_tr = (2 * g + 1) * h;
-        assert_eq!(&out[base+h..base+2*h], &input[off_tr..off_tr+h]);
-        // bottom-left = in[(3,0,:)]
         let off_bl = (3 * g + 0) * h;
-        assert_eq!(&out[base+2*h..base+3*h], &input[off_bl..off_bl+h]);
-        // bottom-right = in[(3,1,:)]
         let off_br = (3 * g + 1) * h;
-        assert_eq!(&out[base+3*h..base+4*h], &input[off_br..off_br+h]);
+        // For each channel c, expect [TL[c], TR[c], BL[c], BR[c]] at
+        // base + c*4 .. c*4 + 4.
+        for c in 0..h {
+            assert_eq!(out[base + c*4 + 0], input[off_tl + c],
+                "channel {c} TL mismatch");
+            assert_eq!(out[base + c*4 + 1], input[off_tr + c]);
+            assert_eq!(out[base + c*4 + 2], input[off_bl + c]);
+            assert_eq!(out[base + c*4 + 3], input[off_br + c]);
+        }
     }
 
     #[test]

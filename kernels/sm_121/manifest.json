@@ -417,9 +417,9 @@
       "sha256": "b9c9cb0326069a19ce1945a5c64fcbc630d98912663a6a67ce3be8d4024ca52b"
     },
     "patch_merger_pixtral_2x2": {
-      "bytes": 12293,
+      "bytes": 5767,
       "path": "patch_merger_pixtral_2x2.ptx",
-      "sha256": "e587349d1bf8cebcc5ce5b49ef0e6f141d2c65897f5f385aec4cb04a243c7f57"
+      "sha256": "fef8e4271ec5fd0ddec52a399d16c6b805e0b46a9b0a60dba6710b15783bfcb2"
     },
     "pixtral_rotary_2d_bf16": {
       "bytes": 2833,
@@ -702,5 +702,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "c24f30f"
+  "revision": "1775731"
 }
