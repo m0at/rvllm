@@ -4592,6 +4592,516 @@ impl Mistral35Bringup {
     /// With this stub in place, gate ON vs gate OFF must produce
     /// byte-identical token sequences.
     #[allow(clippy::too_many_arguments)]
+    /// Layer-major chunked forward. Returns `Ok(predicted_token)`
+    /// for the row at `compute_logits_at`. WIP: gated behind
+    /// `RVLLM_MISTRAL35_CHUNK_BODY=1`; default OFF until the full
+    /// pipeline reaches the byte-equivalence acceptance gate.
+    ///
+    /// Pipeline at M=T:
+    ///   embed_gather_t → splice → for each layer:
+    ///     dtod h_resid_t → h_work_t
+    ///     rmsnorm_inplace_t (input_layernorm)
+    ///     QKV M=T (dequant + bf16_gemm_f32 + cast)
+    ///     RoPE per-position loop (T calls on q_t, T calls on k_t)
+    ///     KV-write per-position loop
+    ///     per-query attention loop (T iters, copy to/from M=1 bufs)
+    ///     O M=T → residual add
+    ///     dtod h_resid_t → h_work_t
+    ///     rmsnorm_inplace_t (post_attention_layernorm)
+    ///     gate / up M=T, silu_mul over T*intermediate, down M=T
+    ///     residual add
+    ///   row pick row[logits_at] → h_residual_ptr (M=1)
+    ///   final RMSNorm + LM head + argmax (existing M=1 path)
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn forward_chunk_body(
+        &self,
+        tokens: &[u32],
+        pos_start: i32,
+        compute_logits_at: usize,
+        pos_to_dev_ptr: &std::collections::HashMap<i32, u64>,
+    ) -> Result<u32> {
+        use rvllm_core::RvllmError;
+        let t_count = tokens.len();
+        if t_count == 0 {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                "forward_chunk_body: empty tokens".into(),
+            ));
+        }
+        if compute_logits_at >= t_count {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                format!("forward_chunk_body: compute_logits_at={} >= T={}",
+                        compute_logits_at, t_count),
+            ));
+        }
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(), "model absent".into()))?;
+        let kernels = self.forward_kernels.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(), "forward_kernels absent".into()))?;
+        let scr = self.scratch.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(), "scratch absent".into()))?;
+        let stream = self.stream.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(), "stream absent".into()))?;
+        let cublaslt = self.cublaslt.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(), "cublaslt absent".into()))?;
+        let rope_tables = self.rope_tables.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(), "rope_tables absent".into()))?;
+        let kv_cache = self.kv_cache.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(), "kv_cache absent".into()))?;
+        if scr.chunk_t_max < t_count {
+            return Err(corrupt(
+                self.paths.model_dir.clone(),
+                format!("forward_chunk_body: T={} > chunk_t_max={}",
+                        t_count, scr.chunk_t_max),
+            ));
+        }
+        let stream_u64 = stream.raw();
+        let hidden = self.arch.text.hidden_size as u32;
+        let vocab = self.arch.text.vocab_size as u32;
+        let head_dim = self.arch.text.head_dim as i32;
+        let n_q_heads = self.arch.text.num_attention_heads as i32;
+        let n_kv_heads = self.arch.text.num_key_value_heads as i32;
+        let n_q_dim = (n_q_heads * head_dim) as usize;
+        let n_kv_dim = (n_kv_heads * head_dim) as usize;
+        let i_size = self.arch.text.intermediate_size as i32;
+        let h_i32 = self.arch.text.hidden_size as i32;
+        let gqa_ratio = (n_q_heads / n_kv_heads) as i32;
+        let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+        let hidden_bytes = (hidden as usize) * 2;
+        let h_intermediate_bytes = (i_size as usize) * 2;
+        let n_q_bytes_per_row = n_q_dim * 2;
+        let n_kv_bytes_per_row = n_kv_dim * 2;
+        let m_t = t_count as i32;
+
+        // ── HtoD token-ids ─────────────────────────────────────
+        let token_ids_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyHtoDAsync_v2(
+                scr.token_in_t_ptr as CUdeviceptr,
+                token_ids_i32.as_ptr() as *const _,
+                t_count * 4,
+                stream_u64 as CUstream,
+            );
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda("HtoD token_in_t",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+
+        // ── (1) Embed gather → h_residual_t ────────────────────
+        rvllm_fused::EmbeddingGatherLaunch {
+            num_tokens: m_t as u32, hidden, vocab,
+        }.launch(
+            kernels.fn_embedding_gather_bf16,
+            scr.h_residual_t_ptr,
+            model.outside.embed_tokens.offset_bytes,
+            scr.token_in_t_ptr,
+            stream_u64,
+        )?;
+
+        // ── (2) Vision splices: overwrite per-position rows ────
+        for (pos, src_ptr) in pos_to_dev_ptr.iter() {
+            let local = *pos - pos_start;
+            if local < 0 || local >= m_t { continue; }
+            unsafe {
+                use cudarc::driver::sys::*;
+                let dst = scr.h_residual_t_ptr + (local as u64) * (hidden_bytes as u64);
+                let r = cuMemcpyDtoDAsync_v2(
+                    dst as CUdeviceptr, *src_ptr as CUdeviceptr,
+                    hidden_bytes, stream_u64 as CUstream,
+                );
+                if r != CUresult::CUDA_SUCCESS {
+                    return Err(RvllmError::cuda("vision splice DtoD chunk",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            }
+        }
+
+        // ── Helpers (capture-light closures) ───────────────────
+        // Legacy W4A16 GEMM at arbitrary M: dequant W → bf16_gemm_f32
+        // → f32_to_bf16 cast over m*n elements.
+        let gemm_at_m = |out_bf16_ptr: u64,
+                        act_bf16_ptr: u64,
+                        lin: &rvllm_loader::mistral35_weights::Nvfp4LinearLoaded,
+                        m: i32| -> Result<()> {
+            let n = lin.shape.n as i32;
+            let k = lin.shape.k as i32;
+            let w_elems = (n as usize) * (k as usize);
+            if w_elems * 2 > scr.w_bf16_scratch_bytes {
+                return Err(corrupt(self.paths.model_dir.clone(),
+                    format!("chunk gemm: w_bf16 too small for n={n} k={k}")));
+            }
+            // (a) Dequant W4A16 → BF16 weight tile.
+            unsafe {
+                let mut wp = lin.packed_ptr;
+                let mut ws = lin.sfb_natural_ptr;
+                let mut gs = lin.global_scale_ptr;
+                let mut wb = scr.w_bf16_scratch_ptr;
+                let mut narg = n;
+                let mut karg = k;
+                let args: [*mut std::ffi::c_void; 6] = [
+                    (&mut wp) as *mut u64 as *mut _,
+                    (&mut ws) as *mut u64 as *mut _,
+                    (&mut gs) as *mut u64 as *mut _,
+                    (&mut wb) as *mut u64 as *mut _,
+                    (&mut narg) as *mut i32 as *mut _,
+                    (&mut karg) as *mut i32 as *mut _,
+                ];
+                let blocks_x = (((k as u32) + 255) / 256).max(1);
+                rvllm_fused::launch_raw(
+                    kernels.fn_nvfp4_dequant_weights_bf16,
+                    (blocks_x, n as u32, 1), (256, 1, 1),
+                    0, stream_u64, &args,
+                )?;
+            }
+            // (b) cublasLt bf16_gemm_f32 — out_f32[m, n].
+            unsafe {
+                cublaslt.bf16_gemm_f32(
+                    act_bf16_ptr, scr.w_bf16_scratch_ptr,
+                    scr.out_f32_scratch_ptr, m, n, k, stream_u64,
+                )?;
+            }
+            // (c) f32 → bf16 cast over m * n elements.
+            unsafe {
+                let mut dst = out_bf16_ptr;
+                let mut src = scr.out_f32_scratch_ptr;
+                let count = (m as i64) * (n as i64);
+                if count <= 0 || count > i32::MAX as i64 {
+                    return Err(corrupt(self.paths.model_dir.clone(),
+                        format!("chunk cast: m*n out of range m={m} n={n}")));
+                }
+                let mut count_i32 = count as i32;
+                let args: [*mut std::ffi::c_void; 3] = [
+                    (&mut dst) as *mut u64 as *mut _,
+                    (&mut src) as *mut u64 as *mut _,
+                    (&mut count_i32) as *mut i32 as *mut _,
+                ];
+                let blocks = ((count as u32) + 1023) / 1024;
+                rvllm_fused::launch_raw(
+                    kernels.fn_f32_to_bf16,
+                    (blocks.max(1), 1, 1), (1024, 1, 1),
+                    0, stream_u64, &args,
+                )?;
+            }
+            Ok(())
+        };
+
+        // RoPE one position at a time on a [n_heads, head_dim] BF16
+        // buffer. Caller offsets `buf_ptr` per-row.
+        let rope_pos = |buf_ptr: u64, n_heads: u32, pos: i32| -> Result<()> {
+            let mut p = buf_ptr;
+            let mut cos_ptr = rope_tables.cos_ptr;
+            let mut sin_ptr = rope_tables.sin_ptr;
+            let mut hd_arg = head_dim;
+            let mut pos_arg = pos;
+            let args = [
+                (&mut p) as *mut u64 as *mut std::ffi::c_void,
+                (&mut cos_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut sin_ptr) as *mut u64 as *mut std::ffi::c_void,
+                (&mut hd_arg) as *mut i32 as *mut std::ffi::c_void,
+                (&mut pos_arg) as *mut i32 as *mut std::ffi::c_void,
+            ];
+            unsafe {
+                rvllm_fused::launch_raw(
+                    kernels.fn_rope_split_half_bf16,
+                    (n_heads, 1, 1),
+                    ((head_dim as u32) / 2, 1, 1),
+                    0, stream_u64, &args,
+                )
+            }
+        };
+
+        // KV-write one slot from BF16 [n_kv_heads, head_dim] inputs.
+        let kv_write = |layer_idx: usize, k_in: u64, v_in: u64,
+                        slot_pos: i32| -> Result<()> {
+            let layer_kv = &kv_cache.layers[layer_idx];
+            let mut kin = k_in;
+            let mut vin = v_in;
+            let mut k_cache = layer_kv.k_ptr;
+            let mut v_cache = layer_kv.v_ptr;
+            let mut nkv = n_kv_heads;
+            let mut hd = head_dim;
+            let mut pos = slot_pos;
+            let args = [
+                (&mut kin) as *mut u64 as *mut std::ffi::c_void,
+                (&mut vin) as *mut u64 as *mut std::ffi::c_void,
+                (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                (&mut pos) as *mut i32 as *mut std::ffi::c_void,
+            ];
+            unsafe {
+                rvllm_fused::launch_raw(
+                    kernels.fn_kv_cache_write_bf16,
+                    (n_kv_heads as u32, 1, 1),
+                    (head_dim as u32, 1, 1),
+                    0, stream_u64, &args,
+                )
+            }
+        };
+
+        // Per-query attention (M=1) reading slots [0..past_len) of
+        // KV cache, against query stored in q_in and writing to
+        // attn_out. Reuses the existing qk_dot + parallel softmax
+        // + V-dot scheme to keep this commit self-contained.
+        let attn_one = |layer_idx: usize, q_in: u64, attn_out: u64,
+                        past_len: i32| -> Result<()> {
+            let layer_kv = &kv_cache.layers[layer_idx];
+            // (a) qk_dot GQA: scores[n_q_heads, past_len].
+            {
+                let mut q_ptr = q_in;
+                let mut k_cache = layer_kv.k_ptr;
+                let mut sc_ptr = kv_cache.scores_f32_ptr;
+                let mut hd = head_dim;
+                let mut nq = n_q_heads;
+                let mut nkv = n_kv_heads;
+                let mut gr = gqa_ratio;
+                let mut pl = past_len;
+                let mut isd = inv_sqrt_d;
+                let args = [
+                    (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut sc_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut nq) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                ];
+                let smem = (head_dim as u32) * 4;
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_qk_dot_gqa_bf16,
+                        (n_kv_heads as u32, past_len as u32, 1),
+                        (head_dim as u32, 1, 1),
+                        smem, stream_u64, &args,
+                    )?;
+                }
+            }
+            // (b) softmax_v (legacy fused, M=1 path is correct here).
+            {
+                let mut sc_ptr = kv_cache.scores_f32_ptr;
+                let mut v_cache = layer_kv.v_ptr;
+                let mut out_ptr = attn_out;
+                let mut hd = head_dim;
+                let mut nkv = n_kv_heads;
+                let mut gr = gqa_ratio;
+                let mut pl = past_len;
+                let args = [
+                    (&mut sc_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                let smem = (past_len as u32) * 4;
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_softmax_v_bf16,
+                        (n_q_heads as u32, 1, 1),
+                        (head_dim as u32, 1, 1),
+                        smem, stream_u64, &args,
+                    )?;
+                }
+            }
+            Ok(())
+        };
+
+        // dtod helper.
+        let dtod = |dst: u64, src: u64, n_bytes: usize| -> Result<()> {
+            unsafe {
+                use cudarc::driver::sys::*;
+                let r = cuMemcpyDtoDAsync_v2(
+                    dst as CUdeviceptr, src as CUdeviceptr,
+                    n_bytes, stream_u64 as CUstream);
+                if r != CUresult::CUDA_SUCCESS {
+                    return Err(RvllmError::cuda("chunk dtod",
+                        rvllm_core::CudaErrorKind::MemcpyFailed,
+                        rvllm_core::CudaCtx::setup()));
+                }
+            }
+            Ok(())
+        };
+
+        // ── (3) Layer loop ─────────────────────────────────────
+        for layer_idx in 0..model.layers.len() {
+            let layer = &model.layers[layer_idx];
+            // Pre-attn: dtod h_resid_t → h_work_t, rmsnorm-T inplace.
+            dtod(scr.h_work_t_ptr, scr.h_residual_t_ptr,
+                 t_count * hidden_bytes)?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: m_t as u32, hidden,
+                eps: self.arch.text.rms_norm_eps as f32,
+            }.launch(
+                kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                scr.h_work_t_ptr,
+                layer.input_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+
+            // QKV at M=T.
+            gemm_at_m(scr.q_out_t_ptr, scr.h_work_t_ptr, &layer.q_proj, m_t)?;
+            gemm_at_m(scr.k_out_t_ptr, scr.h_work_t_ptr, &layer.k_proj, m_t)?;
+            gemm_at_m(scr.v_out_t_ptr, scr.h_work_t_ptr, &layer.v_proj, m_t)?;
+
+            // RoPE per-position on q_t and k_t.
+            for t in 0..t_count {
+                let pos = pos_start + t as i32;
+                let q_row = scr.q_out_t_ptr + (t * n_q_bytes_per_row) as u64;
+                let k_row = scr.k_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
+                rope_pos(q_row, n_q_heads as u32, pos)?;
+                rope_pos(k_row, n_kv_heads as u32, pos)?;
+            }
+            // KV-write per-position.
+            for t in 0..t_count {
+                let pos = pos_start + t as i32;
+                let k_row = scr.k_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
+                let v_row = scr.v_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
+                kv_write(layer_idx, k_row, v_row, pos)?;
+            }
+            // Per-query attention loop, writing to attn_out_t row t.
+            for t in 0..t_count {
+                let pos = pos_start + t as i32;
+                let past_len = pos + 1;
+                let q_row = scr.q_out_t_ptr + (t * n_q_bytes_per_row) as u64;
+                let attn_row = scr.attn_out_t_ptr
+                    + (t * hidden_bytes) as u64;
+                attn_one(layer_idx, q_row, attn_row, past_len)?;
+            }
+            // O at M=T.
+            gemm_at_m(scr.o_out_t_ptr, scr.attn_out_t_ptr, &layer.o_proj, m_t)?;
+            // Residual: h_resid_t += o_t (1-D vector_add over T*hidden).
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch {
+                n: (t_count * hidden as usize) as u32,
+            }.launch(
+                kernels.fn_vector_add_bf16,
+                scr.h_residual_t_ptr, scr.o_out_t_ptr, stream_u64,
+            )?;
+
+            // Post-attn: dtod h_resid_t → h_work_t, rmsnorm-T inplace.
+            dtod(scr.h_work_t_ptr, scr.h_residual_t_ptr,
+                 t_count * hidden_bytes)?;
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: m_t as u32, hidden,
+                eps: self.arch.text.rms_norm_eps as f32,
+            }.launch(
+                kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                scr.h_work_t_ptr,
+                layer.post_attention_layernorm.offset_bytes,
+                stream_u64,
+            )?;
+
+            // MLP gate/up at M=T.
+            gemm_at_m(scr.gate_out_t_ptr, scr.h_work_t_ptr,
+                      &layer.gate_proj, m_t)?;
+            gemm_at_m(scr.up_out_t_ptr, scr.h_work_t_ptr,
+                      &layer.up_proj, m_t)?;
+            // SiLU·gate — 1D over T * intermediate.
+            {
+                let mut out_ptr = scr.silu_mid_t_ptr;
+                let mut g_ptr = scr.gate_out_t_ptr;
+                let mut u_ptr = scr.up_out_t_ptr;
+                let mut n_arg = (t_count * (i_size as usize)) as i32;
+                let args = [
+                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut g_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut u_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut n_arg) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                const BLOCK: u32 = 256;
+                let n = n_arg as u32;
+                let grid = ((n + BLOCK - 1) / BLOCK, 1, 1);
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_silu_mul_bf16,
+                        grid, (BLOCK, 1, 1),
+                        0, stream_u64, &args,
+                    )?;
+                }
+            }
+            // MLP down at M=T.
+            gemm_at_m(scr.down_out_t_ptr, scr.silu_mid_t_ptr,
+                      &layer.down_proj, m_t)?;
+            // Residual: h_resid_t += down_t.
+            rvllm_fused::gemma4_launcher::VectorAddF16Launch {
+                n: (t_count * hidden as usize) as u32,
+            }.launch(
+                kernels.fn_vector_add_bf16,
+                scr.h_residual_t_ptr, scr.down_out_t_ptr, stream_u64,
+            )?;
+        }
+
+        // ── (4) Row pick: copy row [logits_at] → h_residual_ptr ─
+        let row_src = scr.h_residual_t_ptr
+            + (compute_logits_at * hidden_bytes) as u64;
+        dtod(scr.h_residual_ptr, row_src, hidden_bytes)?;
+
+        // ── (5) Final RMSNorm → h_work_ptr (M=1) ───────────────
+        // Same kernel/path as the existing per-token forward.
+        dtod(scr.h_work_ptr, scr.h_residual_ptr, hidden_bytes)?;
+        rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: 1, hidden,
+            eps: self.arch.text.rms_norm_eps as f32,
+        }.launch(
+            kernels.fn_rmsnorm_inplace_bf16_gbf16,
+            scr.h_work_ptr,
+            model.outside.final_norm.offset_bytes,
+            stream_u64,
+        )?;
+
+        // ── (6) LM head BF16 GEMM at M=1 → logits_f32 ─────────
+        unsafe {
+            cublaslt.bf16_gemm_f32(
+                scr.h_work_ptr,
+                model.outside.lm_head.offset_bytes,
+                scr.logits_ptr,
+                1, vocab as i32, h_i32,
+                stream_u64,
+            )?;
+        }
+
+        // ── (7) argmax + DtoH the predicted token ──────────────
+        {
+            let mut logits = scr.logits_ptr;
+            let mut out_tok = scr.token_out_ptr;
+            let mut vsz = vocab as i32;
+            let args = [
+                (&mut logits) as *mut u64 as *mut std::ffi::c_void,
+                (&mut out_tok) as *mut u64 as *mut std::ffi::c_void,
+                (&mut vsz) as *mut i32 as *mut std::ffi::c_void,
+            ];
+            unsafe {
+                rvllm_fused::launch_raw(
+                    kernels.fn_argmax_f32,
+                    (1, 1, 1), (1024, 1, 1),
+                    0, stream_u64, &args,
+                )?;
+            }
+        }
+        stream.fence()?;
+        let mut predicted: u32 = 0;
+        unsafe {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyDtoH_v2(
+                &mut predicted as *mut u32 as *mut _,
+                scr.token_out_ptr as CUdeviceptr, 4);
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda("DtoH predicted",
+                    rvllm_core::CudaErrorKind::MemcpyFailed,
+                    rvllm_core::CudaCtx::setup()));
+            }
+        }
+        Ok(predicted)
+    }
+
     unsafe fn forward_smoke_chunk(
         &self,
         tokens: &[u32],
@@ -4706,6 +5216,42 @@ impl Mistral35Bringup {
         }
 
         let logits_at = compute_logits_at.unwrap_or(tokens.len() - 1);
+
+        // Layer-major chunked forward, gated separately so the
+        // foundation work can land + be verified before the body
+        // refactor. Returns a synthesized minimal SmokeStageDump
+        // (predicted_token set; other diagnostic fields empty —
+        // chunk path skips per-stage dumps for now).
+        let use_chunk_body = std::env::var("RVLLM_MISTRAL35_CHUNK_BODY")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false);
+        if use_chunk_body {
+            let predicted = self.forward_chunk_body(
+                tokens, pos_start, logits_at, pos_to_dev_ptr,
+            )?;
+            if do_restore { arena.restore(ck); }
+            return Ok(Some(SmokeStageDump {
+                post_embed: Vec::new(),
+                post_rmsnorm: Vec::new(),
+                q_out: Vec::new(),
+                k_out: Vec::new(),
+                v_out: Vec::new(),
+                attn_out: Vec::new(),
+                o_out: Vec::new(),
+                h_after_attn: Vec::new(),
+                post_attn_norm: Vec::new(),
+                gate_out: Vec::new(),
+                up_out: Vec::new(),
+                silu_mid: Vec::new(),
+                down_out: Vec::new(),
+                h_after_layer0: Vec::new(),
+                layer_residual_rms: Vec::new(),
+                h_after_final_norm: Vec::new(),
+                logits_top8: Vec::new(),
+                predicted_token: predicted,
+            }));
+        }
+
         let mut dump_out: Option<SmokeStageDump> = None;
         for (i, &tok) in tokens.iter().enumerate() {
             if is_cancelled() {
