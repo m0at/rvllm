@@ -2597,12 +2597,32 @@ impl Mistral35Bringup {
         let n_q_heads_arg = n_q_heads;
         let gqa_ratio_arg = gqa_ratio;
         let i_size = i_size;
+        // Per-stage layer timing — opt-in via
+        // `RVLLM_MISTRAL35_LAYER_TIMING=1`. Fires only on the
+        // `compute_logits = true` call so prefill of N tokens does
+        // not amplify the cost N×. Each stage is fenced so the
+        // timing reflects GPU work, not just driver dispatch.
+        // Stages summed across all 87 layers (the loop runs from
+        // layer 1, layer 0 went through `forward_smoke_q_proj_inner`'s
+        // bring-up path above).
+        let layer_timing_on = compute_logits
+            && std::env::var("RVLLM_MISTRAL35_LAYER_TIMING")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(false);
+        let mut t_norm_qkv_us: u64 = 0;
+        let mut t_attn_us: u64 = 0;
+        let mut t_o_post_us: u64 = 0;
+        let mut t_mlp_us: u64 = 0;
         for layer_idx in 1..model.layers.len() {
             let layer = &model.layers[layer_idx];
 
             // Codex round-7: pre-layer-L h_residual dump (= layer L-1's
             // output residual). One file per (layer, position).
             dump_h_resid_pre_layer(layer_idx)?;
+            let t_stage = if layer_timing_on {
+                stream.fence()?;
+                Some(std::time::Instant::now())
+            } else { None };
             // Pre-attn norm.
             dtod(stream_u64, scr.h_work_ptr,
                  scr.h_residual_ptr, hidden_bytes)?;
@@ -2621,10 +2641,24 @@ impl Mistral35Bringup {
             gemm(scr.v_out_ptr, scr.h_work_ptr, &layer.v_proj)?;
             rope(scr.q_out_ptr, n_q_heads_u)?;
             rope(scr.k_out_ptr, n_kv_heads_u)?;
+            if let Some(t0) = t_stage {
+                stream.fence()?;
+                t_norm_qkv_us += t0.elapsed().as_micros() as u64;
+            }
 
+            let t_stage = if layer_timing_on {
+                Some(std::time::Instant::now())
+            } else { None };
             // Attention via KV cache (write + qk_dot + softmax_v).
             attention_step(layer_idx)?;
+            if let Some(t0) = t_stage {
+                stream.fence()?;
+                t_attn_us += t0.elapsed().as_micros() as u64;
+            }
 
+            let t_stage = if layer_timing_on {
+                Some(std::time::Instant::now())
+            } else { None };
             // O proj + residual (W4A16).
             gemm(scr.o_out_ptr, scr.attn_out_ptr, &layer.o_proj)?;
             rvllm_fused::gemma4_launcher::VectorAddF16Launch { n: hidden }.launch(
@@ -2646,6 +2680,13 @@ impl Mistral35Bringup {
                 stream_u64,
             )?;
 
+            if let Some(t0) = t_stage {
+                stream.fence()?;
+                t_o_post_us += t0.elapsed().as_micros() as u64;
+            }
+            let t_stage = if layer_timing_on {
+                Some(std::time::Instant::now())
+            } else { None };
             // gate / up / silu_mul (W4A16).
             gemm(scr.gate_out_ptr, scr.h_work_ptr, &layer.gate_proj)?;
             gemm(scr.up_out_ptr,   scr.h_work_ptr, &layer.up_proj)?;
@@ -2677,6 +2718,10 @@ impl Mistral35Bringup {
                 scr.down_out_ptr,
                 stream_u64,
             )?;
+            if let Some(t0) = t_stage {
+                stream.fence()?;
+                t_mlp_us += t0.elapsed().as_micros() as u64;
+            }
 
             // Per-layer h_residual dump for compounding bisect.
             // Triggered only when RVLLM_BISECT_DUMP_LAYERS lists the
@@ -2709,6 +2754,25 @@ impl Mistral35Bringup {
             } else {
                 layer_residual_rms.push(0.0);
             }
+        }
+
+        if layer_timing_on {
+            let nlayers = (model.layers.len() - 1) as u64;
+            let total = t_norm_qkv_us + t_attn_us + t_o_post_us + t_mlp_us;
+            let pct = |x: u64| if total > 0 { (x as f64 * 100.0) / total as f64 } else { 0.0 };
+            tracing::info!(
+                layers = nlayers,
+                total_ms = format!("{:.1}", total as f64 / 1e3),
+                norm_qkv_rope_ms = format!("{:.1}", t_norm_qkv_us as f64 / 1e3),
+                norm_qkv_rope_pct = format!("{:.1}", pct(t_norm_qkv_us)),
+                attn_ms = format!("{:.1}", t_attn_us as f64 / 1e3),
+                attn_pct = format!("{:.1}", pct(t_attn_us)),
+                o_post_norm_ms = format!("{:.1}", t_o_post_us as f64 / 1e3),
+                o_post_norm_pct = format!("{:.1}", pct(t_o_post_us)),
+                mlp_ms = format!("{:.1}", t_mlp_us as f64 / 1e3),
+                mlp_pct = format!("{:.1}", pct(t_mlp_us)),
+                "[mistral35-layer-timing]"
+            );
         }
 
         // ============================================================
