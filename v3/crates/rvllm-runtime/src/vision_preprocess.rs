@@ -471,10 +471,15 @@ impl Default for Mistral35PreprocessConfig {
 /// patch tensor + the merged grid the GPU forward needs.
 #[derive(Debug)]
 pub struct Mistral35Patches {
-    /// `[num_patches, 3 * patch_size * patch_size]` f32 row-major,
+    /// `[num_patches, patch_size * patch_size * 3]` f32 row-major,
     /// in `(patch_row, patch_col)` document order. Inner row layout
-    /// is `[c, ip, jp]` flattened — same shape every Pixtral
-    /// implementation expects.
+    /// is **HWC** — `[ip, jp, c]` flattened, matching the patch-conv
+    /// kernel ABI shared with the Qwen / Gemma vision paths
+    /// (channels-last, fastest-varying). Round-10 #3 fix: the
+    /// pre-existing doc said `[c, ip, jp]` (CHW) which contradicted
+    /// the implementation at line 596 (`col = ip*p*3 + jp*3 + c`).
+    /// The implementation is what the kernel expects; the doc was
+    /// the lie.
     pub pixel_values: Vec<f32>,
     /// Resized dimensions in pixels (height, width). Always a
     /// multiple of `patch_size * spatial_merge_size`.
@@ -819,6 +824,75 @@ mod tests {
         assert!((p0[0] - expect(mid, 0.48145466, 0.26862954)).abs() < 1e-3);
         assert!((p0[1] - expect(mid, 0.4578275, 0.26130258)).abs() < 1e-3);
         assert!((p0[2] - expect(mid, 0.40821073, 0.27577711)).abs() < 1e-3);
+    }
+
+    /// Round-10 #3 layout-sensitive test.
+    ///
+    /// Builds a 28×28 image where the four 14×14 patches are each a
+    /// solid distinct colour. The expected HWC output is
+    /// `[num_patches=4, patch_pixels=14*14, channels=3]`. Walks each
+    /// patch and asserts that *every* one of the 196 inner pixels
+    /// holds the patch's colour after CLIP normalisation. This is
+    /// stride-sensitive: a CHW-stored implementation (the pre-fix
+    /// doc) would interleave the channels at the wrong stride and
+    /// the channel triplet would not match the patch colour.
+    #[test]
+    fn mistral35_preprocess_patch_layout_is_hwc() {
+        use image::Rgb;
+        let cfg = Mistral35PreprocessConfig::default();
+
+        // 4 patches at 14×14, top-left red, top-right green,
+        // bottom-left blue, bottom-right yellow.
+        let mut img = image::ImageBuffer::new(28, 28);
+        for y in 0..28u32 {
+            for x in 0..28u32 {
+                let (qy, qx) = (y / 14, x / 14);
+                let rgb = match (qy, qx) {
+                    (0, 0) => [200u8, 10, 10],   // red-ish
+                    (0, 1) => [10, 200, 10],     // green-ish
+                    (1, 0) => [10, 10, 200],     // blue-ish
+                    (1, 1) => [200, 200, 10],    // yellow-ish
+                    _ => unreachable!(),
+                };
+                img.put_pixel(x, y, Rgb(rgb));
+            }
+        }
+        let pp = preprocess_mistral35_pixtral(&img, &cfg).unwrap();
+        assert_eq!(pp.patch_grid, (2, 2));
+        assert_eq!(pp.num_patches(), 4);
+        assert_eq!(pp.pixel_values.len(), 4 * 14 * 14 * 3);
+
+        // Patch order is (ph, pw) document-order, so:
+        //   row 0 = (0,0) red    row 2 = (1,0) blue
+        //   row 1 = (0,1) green  row 3 = (1,1) yellow
+        let expected_rgb_per_patch = [
+            [200u8, 10, 10],
+            [10, 200, 10],
+            [10, 10, 200],
+            [200, 200, 10],
+        ];
+        let norm = |v: u8, m: f32, s: f32| ((v as f32) / 255.0 - m) / s;
+        let mean = cfg.image_mean;
+        let std = cfg.image_std;
+        let patch_dim = 14 * 14 * 3;
+        for (patch_idx, rgb) in expected_rgb_per_patch.iter().enumerate() {
+            let er = norm(rgb[0], mean[0], std[0]);
+            let eg = norm(rgb[1], mean[1], std[1]);
+            let eb = norm(rgb[2], mean[2], std[2]);
+            let row = &pp.pixel_values[patch_idx * patch_dim ..(patch_idx + 1) * patch_dim];
+            // HWC layout: triplets at offsets 0,3,6,...
+            for px in 0..14 * 14 {
+                let r = row[px * 3];
+                let g = row[px * 3 + 1];
+                let b = row[px * 3 + 2];
+                assert!((r - er).abs() < 1e-3,
+                    "patch {patch_idx} px {px}: r={r} expected {er}");
+                assert!((g - eg).abs() < 1e-3,
+                    "patch {patch_idx} px {px}: g={g} expected {eg}");
+                assert!((b - eb).abs() < 1e-3,
+                    "patch {patch_idx} px {px}: b={b} expected {eb}");
+            }
+        }
     }
 
     #[test]

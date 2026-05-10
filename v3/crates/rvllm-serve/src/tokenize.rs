@@ -340,11 +340,16 @@ impl TokenizerHandle {
         // Mistral model is loaded.
         //   Qwen 3.6:    `<|image_pad|>` = 248056
         //   Gemma 4:     `<|image|>`     = 258880
-        //   Mistral 3.5: `[IMG]`         = 10
+        //   Mistral 3.5: id read from config.json::image_token_index
+        //                (Round-10 #2; previously hard-coded to 10)
+        let mistral_id_holder: [u32; 1];
         let image_token_ids: &[u32] = match vision_arch {
             crate::router::VisionArch::Qwen36 => &[248056],
             crate::router::VisionArch::Gemma4 => &[258880],
-            crate::router::VisionArch::Mistral35 => &[10],
+            crate::router::VisionArch::Mistral35 { image_token_id } => {
+                mistral_id_holder = [image_token_id];
+                &mistral_id_holder
+            }
         };
         let is_image_token = |t: u32| -> bool { image_token_ids.contains(&t) };
         let mut expanded: Vec<u32> = Vec::with_capacity(

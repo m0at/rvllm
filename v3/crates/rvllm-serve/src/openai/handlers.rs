@@ -367,7 +367,7 @@ pub async fn chat_completions(
             let qwen_gemma_markers: &[&str] = &["<|image|>", "<|image_pad|>"];
             let mistral_markers: &[&str] = &["[IMG]", "[IMG_BREAK]", "[IMG_END]"];
             let markers: &[&str] = match state.vision_arch {
-                crate::router::VisionArch::Mistral35 => mistral_markers,
+                crate::router::VisionArch::Mistral35 { .. } => mistral_markers,
                 _ => qwen_gemma_markers,
             };
             for marker in markers {
@@ -581,7 +581,7 @@ pub async fn chat_completions(
     // only repeated `[IMG]` token-id-10s as text. Reject upfront so
     // callers see "not yet supported" instead of degenerate output.
     if has_image_parts && matches!(state.vision_arch,
-        crate::router::VisionArch::Mistral35) {
+        crate::router::VisionArch::Mistral35 { .. }) {
         return Err(ApiError::invalid_param(
             "image input is not yet supported on the Mistral 3.5 path \
              (Pixtral vision forward + splice is not wired in this build).",
@@ -2173,7 +2173,7 @@ fn reject_v1_unsupported_chat(
     if let Some(eff) = req.reasoning_effort.as_deref() {
         let normalised = eff.trim().to_ascii_lowercase();
         match vision_arch {
-            crate::router::VisionArch::Mistral35 => {
+            crate::router::VisionArch::Mistral35 { .. } => {
                 if !matches!(normalised.as_str(), "none" | "high") {
                     return Err(ApiError::invalid_param(
                         "reasoning_effort must be \"none\" or \"high\" for Mistral 3.5",
@@ -2502,7 +2502,7 @@ fn collect_vision_items(
             let num_tokens = match vision_arch {
                 crate::router::VisionArch::Gemma4 => predict_gemma_num_tokens(w, h),
                 crate::router::VisionArch::Qwen36 => predict_qwen_num_tokens(w, h),
-                crate::router::VisionArch::Mistral35 => predict_mistral35_num_tokens(w, h),
+                crate::router::VisionArch::Mistral35 { .. } => predict_mistral35_num_tokens(w, h),
             }
             .map_err(|e| {
                 ApiError::invalid_param(
@@ -2586,7 +2586,7 @@ fn reject_oversized_prompt(
             let cap = num_blocks as u64 * BLOCK_SIZE as u64;
             (cap, format!("RVLLM_NUM_BLOCKS={num_blocks} × block_size={BLOCK_SIZE}"))
         }
-        crate::router::VisionArch::Mistral35 => {
+        crate::router::VisionArch::Mistral35 { .. } => {
             // P1b fix: Mistral 3.5 KV cache is sized at bring-up by
             // `RVLLM_KV_CACHE_MAX_POS` (fallback = config's
             // original_max_position_embeddings = 4096 for this
@@ -2662,7 +2662,7 @@ fn reject_unsupported_sampling_for_arch(
     // mistral35_bring_up.rs::forward_smoke_q_proj_inner). Non-greedy
     // sampling would silently be ignored; reject upfront so callers
     // see a real error instead of unexpected greedy output.
-    if matches!(arch, VisionArch::Mistral35) && !sampling.is_greedy() {
+    if matches!(arch, VisionArch::Mistral35 { .. }) && !sampling.is_greedy() {
         return Err(ApiError::invalid_param(
             "mistral 3.5 path is greedy-only today: non-greedy sampling \
              (temperature>0 / top_p<1 / top_k / seed) is not supported. \

@@ -83,15 +83,16 @@ pub fn resolve_model_family(
 ) -> Result<ResolvedFamily, FamilyResolveError> {
     // Cheap probes first (don't fail just because there's no
     // config.json — Qwen probe handles its own absence gracefully).
-    let mistral_match = is_mistral35(model_dir)?;
+    let mistral_image_token = is_mistral35(model_dir)?;
+    let mistral_match = mistral_image_token.is_some();
     let qwen_match = is_qwen36(model_dir);
 
     match selected {
         ModelFamily::Auto => {
-            if mistral_match {
+            if let Some(image_token_id) = mistral_image_token {
                 Ok(ResolvedFamily {
                     family: ModelFamily::Mistral35,
-                    vision_arch: VisionArch::Mistral35,
+                    vision_arch: VisionArch::Mistral35 { image_token_id },
                 })
             } else if qwen_match {
                 Ok(ResolvedFamily {
@@ -106,10 +107,10 @@ pub fn resolve_model_family(
             }
         }
         ModelFamily::Mistral35 => {
-            if mistral_match {
+            if let Some(image_token_id) = mistral_image_token {
                 Ok(ResolvedFamily {
                     family: ModelFamily::Mistral35,
-                    vision_arch: VisionArch::Mistral35,
+                    vision_arch: VisionArch::Mistral35 { image_token_id },
                 })
             } else {
                 Err(FamilyResolveError::Mismatch {
@@ -167,7 +168,11 @@ fn read_config(model_dir: &Path) -> Result<Option<serde_json::Value>, FamilyReso
     Ok(Some(v))
 }
 
-fn is_mistral35(model_dir: &Path) -> Result<bool, FamilyResolveError> {
+/// Round-10 #2: returns `Some(image_token_id)` when this is a Mistral
+/// 3.5 NVFP4 checkpoint, `None` otherwise. `image_token_id` is read
+/// from `config.json::image_token_index` so the renderer + handlers
+/// can no longer rely on a hard-coded `[IMG] = 10`.
+fn is_mistral35(model_dir: &Path) -> Result<Option<u32>, FamilyResolveError> {
     // Cheap marker probe first so a Gemma / Qwen dir doesn't pull in
     // the full Mistral arch parser (which validates YaRN, GQA ratio,
     // pixtral vision, etc.). Only when the three Mistral markers
@@ -175,7 +180,7 @@ fn is_mistral35(model_dir: &Path) -> Result<bool, FamilyResolveError> {
     // failure surfaces as `FamilyResolveError::Mistral{...}`.
     let v = match read_config(model_dir)? {
         Some(v) => v,
-        None => return Ok(false),
+        None => return Ok(None),
     };
     let arch_match = v["architectures"][0]
         .as_str()
@@ -187,7 +192,7 @@ fn is_mistral35(model_dir: &Path) -> Result<bool, FamilyResolveError> {
         .map(|s| s == "nvfp4-pack-quantized")
         .unwrap_or(false);
     if !(arch_match && model_type_match && quant_match) {
-        return Ok(false);
+        return Ok(None);
     }
 
     // Markers say Mistral 3.5 — run the full arch parser so YaRN /
@@ -195,12 +200,12 @@ fn is_mistral35(model_dir: &Path) -> Result<bool, FamilyResolveError> {
     // even starts. Any error here propagates so the operator sees
     // the field-level reason rather than a generic "wrong family".
     match rvllm_runtime::mistral35_arch::Mistral35Arch::from_dir(model_dir) {
-        Ok(Some(_)) => Ok(true),
+        Ok(Some(arch)) => Ok(Some(arch.image_token_index)),
         Ok(None) => {
             // Markers matched but the parser returned None — should
             // not happen, treat as non-Mistral so the caller falls
             // through gracefully.
-            Ok(false)
+            Ok(None)
         }
         Err(e) => {
             // Surface the YaRN-correction case with its dedicated
@@ -297,7 +302,7 @@ mod tests {
         write_config(&tmp, mistral_full());
         let r = resolve_model_family(&tmp, ModelFamily::Auto).expect("ok");
         assert_eq!(r.family, ModelFamily::Mistral35);
-        assert_eq!(r.vision_arch, VisionArch::Mistral35);
+        assert_eq!(r.vision_arch, VisionArch::Mistral35 { image_token_id: 10 });
     }
 
     #[test]

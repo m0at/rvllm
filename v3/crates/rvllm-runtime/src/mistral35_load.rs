@@ -492,13 +492,33 @@ pub fn load_mistral35_model(
     }
     eprintln!("[mistral35-load] all language weights resident on device");
 
-    // Pixtral vision tower (BF16). Optional — controlled by env
-    // RVLLM_LOAD_VISION (default on for mistral35; allows skip for
-    // text-only smoke).
-    let vision = if std::env::var("RVLLM_LOAD_VISION").as_deref() == Ok("0") {
-        None
-    } else {
+    // Round-10 #1 fix: default OFF for Mistral.
+    //
+    // The Pixtral splice / forward path is not wired into the Mistral
+    // decoder yet; vision-bearing requests are rejected at admission
+    // in v3/crates/rvllm-serve/src/openai/handlers.rs. Loading the
+    // vision tower (~2 GiB BF16 + projector) is therefore pure
+    // arena/VRAM waste and slows startup by tens of seconds. Operators
+    // wiring up the splice can opt in with RVLLM_LOAD_VISION=1.
+    //
+    // Accepted values: "1" / "true" / "TRUE"  → load
+    //                  unset / anything else  → skip
+    let load_vision = std::env::var("RVLLM_LOAD_VISION")
+        .map(|s| matches!(s.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false);
+    let vision = if load_vision {
+        eprintln!(
+            "[mistral35-load] RVLLM_LOAD_VISION=1: loading Pixtral tower \
+             (HTTP admission still rejects vision requests until splice \
+             is wired)"
+        );
         Some(upload_mistral35_vision(arena, &pool, arch)?)
+    } else {
+        eprintln!(
+            "[mistral35-load] vision tower skipped (default — set \
+             RVLLM_LOAD_VISION=1 once Pixtral splice is wired)"
+        );
+        None
     };
 
     Ok(Mistral35LoadedModel { outside, layers, vision })

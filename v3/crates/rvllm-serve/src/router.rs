@@ -58,9 +58,14 @@ pub enum VisionArch {
     Gemma4,
     /// Mistral Medium 3.5 128B NVFP4 with Pixtral vision tower
     /// (48 layers, head_dim=104, 2D RoPE, longest-edge 1540,
-    /// spatial_merge=2). Image-pad token id = 10, predictor =
+    /// spatial_merge=2). Predictor =
     /// `predict_mistral35_num_tokens`.
-    Mistral35,
+    ///
+    /// `image_token_id` is parsed from `config.json::image_token_index`
+    /// (Round-10 #2 fix — previously hard-coded to 10 in tokenize.rs,
+    /// which would silently mis-expand image-pad placeholders if a
+    /// future Mistral checkpoint moves the ID).
+    Mistral35 { image_token_id: u32 },
 }
 
 /// Build the top-level router with all endpoints attached.
