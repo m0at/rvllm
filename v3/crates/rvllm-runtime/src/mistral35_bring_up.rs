@@ -4043,6 +4043,15 @@ impl Mistral35Bringup {
         let mut last_dump: Option<SmokeStageDump> = None;
         let mut last_predicted: u32 = 0;
 
+        // Optional perf instrumentation — enable with
+        // `RVLLM_MISTRAL35_TIMING=1`. Logs prefill total ms +
+        // decode total ms + tok/s on `info!`. Cheap enough to keep
+        // wired in production (a few `Instant::now()` per request).
+        let timing_on = std::env::var("RVLLM_MISTRAL35_TIMING")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false);
+        let prefill_t0 = std::time::Instant::now();
+
         // Stage 3: prefill.
         for (i, &tok) in prompt.iter().enumerate() {
             if is_cancelled() {
@@ -4060,6 +4069,9 @@ impl Mistral35Bringup {
                 last_dump = Some(dump);
             }
         }
+        let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1e3;
+        let decode_t0 = std::time::Instant::now();
+        let mut decode_steps_done: usize = 0;
         // Stage 4: decode.
         for step in 0..max_new {
             tokens.push(last_predicted);
@@ -4079,6 +4091,25 @@ impl Mistral35Bringup {
             )?;
             last_predicted = dump.predicted_token;
             last_dump = Some(dump);
+            decode_steps_done += 1;
+        }
+        if timing_on {
+            let decode_ms = decode_t0.elapsed().as_secs_f64() * 1e3;
+            let prefill_tok_per_s = if prefill_ms > 0.0 {
+                (prompt.len() as f64) / (prefill_ms / 1e3)
+            } else { 0.0 };
+            let decode_tok_per_s = if decode_ms > 0.0 && decode_steps_done > 0 {
+                (decode_steps_done as f64) / (decode_ms / 1e3)
+            } else { 0.0 };
+            tracing::info!(
+                prompt_tokens = prompt.len(),
+                decode_steps = decode_steps_done,
+                prefill_ms = format!("{:.1}", prefill_ms),
+                decode_ms = format!("{:.1}", decode_ms),
+                prefill_tok_per_s = format!("{:.2}", prefill_tok_per_s),
+                decode_tok_per_s = format!("{:.2}", decode_tok_per_s),
+                "[mistral35-timing]"
+            );
         }
 
         // Free all per-step scratch in one shot — including the
