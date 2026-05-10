@@ -102,6 +102,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_v_dot_gqa_bf16: KernelFn,
     pub fa_decode_gqa_bf16_mod: LoadedModule,
     pub fn_fa_decode_gqa_bf16: KernelFn,
+    pub kv_cache_write_nvfp4_bf16_mod: LoadedModule,
+    pub fn_kv_cache_write_nvfp4_bf16: KernelFn,
     // W4A16 NVFP4 path (Mistral 3.5 checkpoint format): dequantize
     // weight blocks to BF16 then run `cublasLt bf16_gemm_f32`. The
     // legacy W4A4 (CUTLASS NVFP4 tensor-core) path is kept compiled
@@ -246,6 +248,16 @@ pub struct Mistral35Scratch {
 pub struct LayerKvCache {
     pub k_ptr: u64,
     pub v_ptr: u64,
+    /// NVFP4 packed K storage. Layout
+    /// `[max_pos, n_kv_heads, head_dim/2]` u8. Zero when
+    /// `RVLLM_MISTRAL35_NVFP4_KV` is off.
+    pub k_nvfp4_packed_ptr: u64,
+    /// NVFP4 K block scale (E4M3, one byte per 16-element block).
+    /// Layout `[max_pos, n_kv_heads, head_dim/16]` u8.
+    pub k_nvfp4_scale_ptr: u64,
+    /// Same for V.
+    pub v_nvfp4_packed_ptr: u64,
+    pub v_nvfp4_scale_ptr: u64,
 }
 
 #[cfg(feature = "cuda")]
@@ -1010,6 +1022,10 @@ impl Mistral35Bringup {
                 kernels.load_ptx("mistral35_fa_decode_gqa_bf16")?;
             let fn_fa_decode_gqa_bf16 = fa_decode_gqa_bf16_mod
                 .get_function("mistral35_fa_decode_gqa_bf16_kernel")?;
+            let kv_cache_write_nvfp4_bf16_mod =
+                kernels.load_ptx("mistral35_kv_cache_write_nvfp4_bf16")?;
+            let fn_kv_cache_write_nvfp4_bf16 = kv_cache_write_nvfp4_bf16_mod
+                .get_function("mistral35_kv_cache_write_nvfp4_bf16_kernel")?;
             let nvfp4_dequant_weights_bf16_mod =
                 kernels.load_ptx("nvfp4_dequant_weights_bf16")?;
             let fn_nvfp4_dequant_weights_bf16 = nvfp4_dequant_weights_bf16_mod
@@ -1086,6 +1102,8 @@ impl Mistral35Bringup {
                 fn_v_dot_gqa_bf16,
                 fa_decode_gqa_bf16_mod,
                 fn_fa_decode_gqa_bf16,
+                kv_cache_write_nvfp4_bf16_mod,
+                fn_kv_cache_write_nvfp4_bf16,
                 nvfp4_dequant_weights_bf16_mod,
                 fn_nvfp4_dequant_weights_bf16,
                 f32_to_bf16_mod,
@@ -1183,13 +1201,58 @@ impl Mistral35Bringup {
             let kv_n_heads = arch.text.num_key_value_heads;
             let kv_head_dim = arch.text.head_dim;
             let per_layer_bytes = kv_max_pos * kv_n_heads * kv_head_dim * 2;
+            // Optional NVFP4-KV cache (codex review #3). Allocated
+            // alongside the BF16 cache when
+            // `RVLLM_MISTRAL35_NVFP4_KV=1` so the operator can switch
+            // KV format on the fly. NVFP4 packing: 4-bit value + 1
+            // E4M3 scale per 16-element block → 0.5625 bytes/elem
+            // (vs 2.0 BF16). Per Mistral 3.5 layer at max_pos=4096
+            // and n_kv=8: packed ~16 MB → no, recompute:
+            //   max_pos * n_kv * head_dim / 2  bytes packed
+            //   = 4096 * 8 * 128 / 2 = 2.0 MB
+            //   max_pos * n_kv * head_dim / 16 bytes scale
+            //   = 4096 * 8 * 128 / 16 = 256 KB
+            // → ~2.25 MB per layer × 88 layers = ~200 MB extra arena.
+            let want_nvfp4_kv = std::env::var("RVLLM_MISTRAL35_NVFP4_KV")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(false);
+            let per_layer_packed_bytes =
+                kv_max_pos * kv_n_heads * (kv_head_dim / 2);
+            let per_layer_scale_bytes =
+                kv_max_pos * kv_n_heads * (kv_head_dim / 16);
             let mut kv_layers: Vec<LayerKvCache> = Vec::with_capacity(model.layers.len());
             for _ in 0..model.layers.len() {
                 let k = arena_box.region("mistral35_k_cache", per_layer_bytes, 16)?;
                 let v = arena_box.region("mistral35_v_cache", per_layer_bytes, 16)?;
+                let (k_pk, k_sc, v_pk, v_sc) = if want_nvfp4_kv {
+                    let k_pk = arena_box.region("mistral35_k_nvfp4_packed",
+                        per_layer_packed_bytes, 16)?;
+                    let k_sc = arena_box.region("mistral35_k_nvfp4_scale",
+                        per_layer_scale_bytes, 16)?;
+                    let v_pk = arena_box.region("mistral35_v_nvfp4_packed",
+                        per_layer_packed_bytes, 16)?;
+                    let v_sc = arena_box.region("mistral35_v_nvfp4_scale",
+                        per_layer_scale_bytes, 16)?;
+                    (k_pk.device_ptr(), k_sc.device_ptr(),
+                     v_pk.device_ptr(), v_sc.device_ptr())
+                } else {
+                    (0, 0, 0, 0)
+                };
                 kv_layers.push(LayerKvCache {
                     k_ptr: k.device_ptr(), v_ptr: v.device_ptr(),
+                    k_nvfp4_packed_ptr: k_pk, k_nvfp4_scale_ptr: k_sc,
+                    v_nvfp4_packed_ptr: v_pk, v_nvfp4_scale_ptr: v_sc,
                 });
+            }
+            if want_nvfp4_kv {
+                tracing::info!(
+                    layers = model.layers.len(),
+                    per_layer_packed_kb = per_layer_packed_bytes / 1024,
+                    per_layer_scale_kb = per_layer_scale_bytes / 1024,
+                    total_mb = (model.layers.len()
+                        * (per_layer_packed_bytes + per_layer_scale_bytes) * 2) / (1024 * 1024),
+                    "[mistral35] NVFP4 KV cache reserved (alongside BF16)"
+                );
             }
             // Scratch F32 [n_q_heads, max_pos] for attention scores.
             let scores_bytes = arch.text.num_attention_heads * kv_max_pos * 4;
@@ -2099,6 +2162,18 @@ impl Mistral35Bringup {
                         &args, stream_u64,
                     )?;
                 }
+                // NVFP4 KV dual-write dispatch site (codex review #3
+                // follow-up) reserved for a later commit. Disabled
+                // until the FA-decode-NVFP4 read variant is also in
+                // place; an earlier draft revealed a vision E2E
+                // regression on the orange-ball prompt when dual-write
+                // ran without the matching read path. Cause not yet
+                // root-caused: candidates are (a) silent OOB in the
+                // pack kernel, (b) stream-ordering interaction with
+                // the subsequent qk_dot read, (c) E4M3 saturation of
+                // an outlier vision-K scale. The kernel + scratch
+                // are committed so the dispatch + read-side land as
+                // one self-contained commit when ready.
                 // Diagnostic bypass: if RVLLM_KV_BYPASS=1, ALSO do the
                 // copy via cuMemcpyDtoDAsync to verify whether the
                 // kernel above is a no-op. Slot offset = position * nkv * hd * 2.
