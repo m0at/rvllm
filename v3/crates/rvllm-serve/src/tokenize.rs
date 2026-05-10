@@ -351,6 +351,40 @@ impl TokenizerHandle {
                 &mistral_id_holder
             }
         };
+        // Round-11 #3 guard: when the image-pad token id is small
+        // enough to plausibly collide with a control character
+        // (newline, tab, NUL, etc.), refuse to expand placeholders.
+        // The current renderer scans raw token-ids, so a collision
+        // would mistake an embedded newline in the chat-rendered
+        // text for an image marker. The proper structural fix is
+        // sentinel-string segmentation; this guard ensures we
+        // fail-fast until that lands.
+        if let crate::router::VisionArch::Mistral35 { image_token_id } = vision_arch {
+            if !vision_items.is_empty() && image_token_id < 256 {
+                let probe_collisions = [
+                    ("\n", "newline"),
+                    ("\r", "carriage return"),
+                    ("\t", "tab"),
+                    (" ", "space"),
+                ];
+                for (s, label) in probe_collisions {
+                    if let Ok(enc) = self.inner.tokenizer.encode(s, false) {
+                        if enc.get_ids().contains(&image_token_id) {
+                            return Err(ApiError::Tokenize(format!(
+                                "[mistral35] refusing to render: image_token_id={} \
+                                 collides with the tokenizer encoding of {} — \
+                                 the renderer scans raw token-ids and would \
+                                 mistake an embedded {} in user text for an \
+                                 image marker. The structural fix is sentinel-\
+                                 string segmentation; until that lands, vision \
+                                 input on this checkpoint is unsafe.",
+                                image_token_id, label, label,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         let is_image_token = |t: u32| -> bool { image_token_ids.contains(&t) };
         let mut expanded: Vec<u32> = Vec::with_capacity(
             raw_ids.len()

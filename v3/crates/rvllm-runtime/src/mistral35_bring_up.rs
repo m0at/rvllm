@@ -407,6 +407,143 @@ impl LayerScratchBudget {
     }
 }
 
+// =====================================================================
+//  Round-11 #1: debug-env gate.
+//
+//  The Mistral generate() path used to read `RVLLM_SMOKE_*` and
+//  `RVLLM_KV_BYPASS` directly. Those knobs change forward behaviour
+//  (skip prefill, override RoPE pos, bypass KV cache, truncate
+//  max_tokens, dump intermediates) and a stale entry in a server
+//  profile would silently corrupt every request. The fix:
+//
+//   * `mistral35_debug_active()` — returns true only when
+//     `RVLLM_DEBUG_MISTRAL35=1` is explicitly set.
+//   * `debug_env_os` / `debug_env_str` — wrappers that return None
+//     unless the gate is active. Forward-path call sites use these
+//     instead of `std::env::var(...)`.
+//   * `validate_no_stale_debug_envs()` — invoked from
+//     `Mistral35Bringup::load`. If any `RVLLM_SMOKE_*` /
+//     `RVLLM_KV_BYPASS` is set without the gate, startup aborts
+//     with a clear loader error pointing at the offending key.
+// =====================================================================
+
+/// Whether the operator has explicitly opted into Mistral 3.5
+/// debug mode. Required for any `RVLLM_SMOKE_*` / `RVLLM_KV_BYPASS`
+/// to take effect.
+#[inline]
+pub fn mistral35_debug_active() -> bool {
+    matches!(
+        std::env::var("RVLLM_DEBUG_MISTRAL35").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Read an env var only when the Mistral 3.5 debug gate is active.
+/// Production callers always see `None`; debug callers see whatever
+/// the operator set.
+#[inline]
+pub fn debug_env_os(key: &str) -> Option<std::ffi::OsString> {
+    if mistral35_debug_active() { std::env::var_os(key) } else { None }
+}
+
+/// String variant of [`debug_env_os`].
+#[inline]
+pub fn debug_env_str(key: &str) -> Option<String> {
+    if mistral35_debug_active() { std::env::var(key).ok() } else { None }
+}
+
+/// Mistral-prefixed env-keys whose presence in a non-debug profile
+/// indicates a stale debug session leaking into production. Loader
+/// startup aborts when any of these is set without
+/// `RVLLM_DEBUG_MISTRAL35=1`.
+const STALE_DEBUG_KEYS: &[&str] = &[
+    "RVLLM_SMOKE_SINGLE",
+    "RVLLM_SMOKE_MAX_NEW",
+    "RVLLM_SMOKE_ATTN_NO_PAST",
+    "RVLLM_SMOKE_ROPE_POS_OVERRIDE",
+    "RVLLM_SMOKE_FULL_DUMP",
+    "RVLLM_SMOKE_LAYER_RMS",
+    "RVLLM_SMOKE_DUMP_DIR",
+    "RVLLM_SMOKE_NO_RESTORE",
+    "RVLLM_KV_BYPASS",
+    "RVLLM_BOUNDARY_DUMP",
+    "RVLLM_BOUNDARY_DUMP_LAYER",
+];
+
+fn validate_no_stale_debug_envs(model_dir: &std::path::Path) -> Result<()> {
+    if mistral35_debug_active() { return Ok(()); }
+    for key in STALE_DEBUG_KEYS {
+        if std::env::var_os(key).is_some() {
+            return Err(corrupt(
+                model_dir.to_path_buf(),
+                format!(
+                    "[mistral35] refusing to start: {key} is set but \
+                     RVLLM_DEBUG_MISTRAL35=1 is not. These knobs change \
+                     the forward-path behaviour silently (skipped \
+                     prefill, overridden RoPE position, KV bypass, \
+                     truncated max_tokens). Set RVLLM_DEBUG_MISTRAL35=1 \
+                     to opt in, or unset {key} for a production run."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod debug_gate_tests {
+    use super::*;
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn debug_inactive_when_var_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("RVLLM_DEBUG_MISTRAL35");
+        assert!(!mistral35_debug_active());
+    }
+
+    #[test]
+    fn debug_active_when_var_one() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("RVLLM_DEBUG_MISTRAL35", "1");
+        assert!(mistral35_debug_active());
+        std::env::remove_var("RVLLM_DEBUG_MISTRAL35");
+    }
+
+    #[test]
+    fn validate_rejects_smoke_envs_without_gate() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("RVLLM_DEBUG_MISTRAL35");
+        std::env::set_var("RVLLM_SMOKE_SINGLE", "1");
+        let r = validate_no_stale_debug_envs(std::path::Path::new("/x"));
+        std::env::remove_var("RVLLM_SMOKE_SINGLE");
+        assert!(r.is_err(), "must reject leaked smoke env in production");
+    }
+
+    #[test]
+    fn validate_passes_in_debug_mode() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("RVLLM_DEBUG_MISTRAL35", "1");
+        std::env::set_var("RVLLM_SMOKE_SINGLE", "1");
+        let r = validate_no_stale_debug_envs(std::path::Path::new("/x"));
+        std::env::remove_var("RVLLM_SMOKE_SINGLE");
+        std::env::remove_var("RVLLM_DEBUG_MISTRAL35");
+        assert!(r.is_ok(), "must accept debug knobs under explicit gate");
+    }
+
+    #[test]
+    fn debug_env_returns_none_without_gate() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("RVLLM_DEBUG_MISTRAL35");
+        std::env::set_var("RVLLM_SMOKE_DUMP_DIR", "/tmp/x");
+        let v = debug_env_str("RVLLM_SMOKE_DUMP_DIR");
+        std::env::remove_var("RVLLM_SMOKE_DUMP_DIR");
+        assert!(v.is_none(),
+            "production code must never see smoke env values");
+    }
+}
+
 impl Mistral35Bringup {
     /// Pre-compute the per-layer scratch budget for a prefill chunk
     /// of `m` tokens, using pure arithmetic (no CUTLASS backend
@@ -550,6 +687,14 @@ impl Mistral35Bringup {
     ///   `cuda` feature; on default builds this branch is skipped
     ///   because no `.so` is opened).
     pub fn load(paths: Mistral35EnginePaths, arena_bytes: usize) -> Result<Self> {
+        // Round-11 #1: fail-fast at startup if any RVLLM_SMOKE_* /
+        // RVLLM_KV_BYPASS env is set without the explicit debug
+        // opt-in. These knobs change generate() behaviour silently
+        // (skip prefill, override RoPE position, bypass KV cache,
+        // truncate max_tokens) and must NOT leak from a debug
+        // session into a production server profile.
+        validate_no_stale_debug_envs(&paths.model_dir)?;
+
         // (1) Arch — already gated by family resolver, but re-parse
         //     here so failures point at the actual model_dir even
         //     when the operator passed `--model-family auto`.
@@ -1281,7 +1426,7 @@ impl Mistral35Bringup {
         // Only enable when explicitly asked AND only on the LAST call
         // of generate_smoke (= compute_logits=true) so a 364-token
         // prefill doesn't trigger 364×14 dumps.
-        let full_dump = std::env::var_os("RVLLM_SMOKE_FULL_DUMP").is_some()
+        let full_dump = debug_env_os("RVLLM_SMOKE_FULL_DUMP").is_some()
             && compute_logits;
 
         // Helper: fence + DtoH a bf16 region of `count` elements, widen to f32.
@@ -1432,12 +1577,12 @@ impl Mistral35Bringup {
             // and RVLLM_SMOKE_DUMP_DIR is set. That call is layer-0 q_proj.
             static BOUNDARY_DUMPED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            let do_boundary = std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some()
+            let do_boundary = debug_env_os("RVLLM_BOUNDARY_DUMP").is_some()
                 && BOUNDARY_DUMPED.compare_exchange(false, true,
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst).is_ok();
             let dump_dir = if do_boundary {
-                std::env::var("RVLLM_SMOKE_DUMP_DIR").ok()
+                debug_env_str("RVLLM_SMOKE_DUMP_DIR")
             } else { None };
             if let Some(ref dir) = dump_dir {
                 stream.fence()?;
@@ -1574,7 +1719,7 @@ impl Mistral35Bringup {
         // see the current token (single key, broadcast V) — i.e.
         // ignore the KV cache. If predictions stop being garbage with
         // this on, multi-key attention is the bug.
-        let attn_no_past = std::env::var_os("RVLLM_SMOKE_ATTN_NO_PAST").is_some();
+        let attn_no_past = debug_env_os("RVLLM_SMOKE_ATTN_NO_PAST").is_some();
         let past_len: i32 = if attn_no_past { 1 } else { attn_position + 1 };
         if (past_len as usize) > kv_cache.max_pos {
             return Err(corrupt(
@@ -1592,9 +1737,9 @@ impl Mistral35Bringup {
 
         // Codex round-7 boundary-dump env (read once before closures
         // so attention_step can reference them).
-        let bd_layer: Option<usize> = std::env::var("RVLLM_BOUNDARY_DUMP_LAYER")
-            .ok().and_then(|s| s.parse().ok());
-        let bd_dir: Option<String> = std::env::var("RVLLM_SMOKE_DUMP_DIR").ok();
+        let bd_layer: Option<usize> = debug_env_str("RVLLM_BOUNDARY_DUMP_LAYER")
+            .and_then(|s| s.parse().ok());
+        let bd_dir: Option<String> = debug_env_str("RVLLM_SMOKE_DUMP_DIR");
 
         // Attention closure: KV write + qk_dot + softmax_v.
         let attention_step = |layer_idx: usize| -> Result<()> {
@@ -1633,7 +1778,7 @@ impl Mistral35Bringup {
                 // Diagnostic bypass: if RVLLM_KV_BYPASS=1, ALSO do the
                 // copy via cuMemcpyDtoDAsync to verify whether the
                 // kernel above is a no-op. Slot offset = position * nkv * hd * 2.
-                if std::env::var_os("RVLLM_KV_BYPASS").is_some() {
+                if debug_env_os("RVLLM_KV_BYPASS").is_some() {
                     use cudarc::driver::sys::*;
                     let bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
                     let pos_off = (pos as usize) * bytes;
@@ -1761,8 +1906,8 @@ impl Mistral35Bringup {
         // layer's RoPE to position=0. If the model's output changes
         // with this on, the bug touches RoPE; if it stays at the same
         // wrong predicted token, RoPE is not the issue.
-        let rope_pos_override: Option<i32> = std::env::var("RVLLM_SMOKE_ROPE_POS_OVERRIDE")
-            .ok().and_then(|s| s.parse().ok());
+        let rope_pos_override: Option<i32> = debug_env_str("RVLLM_SMOKE_ROPE_POS_OVERRIDE")
+            .and_then(|s| s.parse().ok());
         let rope = |buf_ptr: u64, n_heads: u32| -> Result<()> {
             let mut ptr = buf_ptr;
             let mut cos_ptr = rope_tables.cos_ptr;
@@ -1854,8 +1999,8 @@ impl Mistral35Bringup {
         // (3) Q/K/V projections — W4A16 dequant + bf16 GEMM.
         gemm(scr.q_out_ptr, scr.h_work_ptr, &layer0.q_proj)?;
         // Dump A: q_out_ptr + out_f32_scratch right after q_proj returns
-        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
-            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+        if debug_env_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                 stream.fence()?;
                 unsafe {
                     use cudarc::driver::sys::*;
@@ -1878,8 +2023,8 @@ impl Mistral35Bringup {
             }
         }
         gemm(scr.k_out_ptr, scr.h_work_ptr, &layer0.k_proj)?;
-        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
-            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+        if debug_env_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                 stream.fence()?;
                 let bytes = (layer0.q_proj.shape.n as usize) * 2;
                 let mut buf = vec![0u8; bytes];
@@ -1891,8 +2036,8 @@ impl Mistral35Bringup {
             }
         }
         gemm(scr.v_out_ptr, scr.h_work_ptr, &layer0.v_proj)?;
-        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
-            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+        if debug_env_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                 stream.fence()?;
                 let bytes = (layer0.q_proj.shape.n as usize) * 2;
                 let mut buf = vec![0u8; bytes];
@@ -1905,8 +2050,8 @@ impl Mistral35Bringup {
         }
         // Boundary dump #4: q_out_ptr just before RoPE — does k/v
         // gemm corrupt it, or does rope itself flip the output?
-        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
-            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+        if debug_env_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                 stream.fence()?;
                 let bytes = (layer0.q_proj.shape.n as usize) * 2;
                 let mut buf = vec![0u8; bytes];
@@ -1939,7 +2084,7 @@ impl Mistral35Bringup {
         // token at pos=1). Each run memsets slot 0 to 0xAA, but run 2
         // writes to slot 1, so slot 0 ends as sentinel-from-run-2.
         // Verify sentinel landed in v_cache before attention_step.
-        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+        if debug_env_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
             stream.fence()?;
             let bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
             let mut buf = vec![0u8; bytes];
@@ -1952,8 +2097,8 @@ impl Mistral35Bringup {
         // Boundary dump #6: v_out_ptr immediately before attention_step,
         // to check whether anything modifies it between the v_out.f32
         // dump above and the kv_cache_write read.
-        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
-            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+        if debug_env_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                 stream.fence()?;
                 let bytes = (layer0.v_proj.shape.n) * 2;
                 let mut buf = vec![0u8; bytes];
@@ -1974,8 +2119,8 @@ impl Mistral35Bringup {
             scr.attn_out_ptr, hidden as usize, "smoke_attn_out")?;
 
         // Boundary dump K-cache slot 0 too, to compare with K-out.
-        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
-            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+        if debug_env_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                 stream.fence()?;
                 let bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
                 let mut buf = vec![0u8; bytes];
@@ -1992,8 +2137,8 @@ impl Mistral35Bringup {
         // Boundary dump #5: dump V-cache for slots 0..=position so we
         // can match against whichever slot kv_cache_write touched in
         // the current call.
-        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
-            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+        if debug_env_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                 stream.fence()?;
                 let slot_bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
                 let n_slots = (rope_position as usize) + 1;
@@ -2008,8 +2153,8 @@ impl Mistral35Bringup {
             }
         }
         // Codex round-6: K-cache-all-slots + scores dump for past_len=3+ bisect.
-        if std::env::var_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
-            if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+        if debug_env_os("RVLLM_BOUNDARY_DUMP").is_some() && full_dump {
+            if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                 stream.fence()?;
                 let slot_bytes = (n_kv_heads_attn as usize) * (head_dim_attn as usize) * 2;
                 let n_slots = (rope_position as usize) + 1;
@@ -2117,11 +2262,18 @@ impl Mistral35Bringup {
         // per layer (full per-stage dumps would be ~88×14 tensors).
         // ============================================================
         let mut layer_residual_rms: Vec<f32> = Vec::with_capacity(model.layers.len());
-        // Record layer-0 residual rms as the first entry.
-        let l0_sumsq: f64 = h_after_layer0.iter()
-            .map(|&x| (x as f64) * (x as f64)).sum();
-        layer_residual_rms.push(
-            (l0_sumsq / (h_after_layer0.len() as f64)).sqrt() as f32);
+        // Record layer-0 residual rms as the first entry. Round-11 #4
+        // fix: when `RVLLM_SMOKE_FULL_DUMP` is off, dump_bf16 returns
+        // an empty vec so `sumsq / 0.0` produced NaN here. Match the
+        // 0.0-placeholder convention used for layers 1..N below.
+        let l0_rms = if h_after_layer0.is_empty() {
+            0.0
+        } else {
+            let l0_sumsq: f64 = h_after_layer0.iter()
+                .map(|&x| (x as f64) * (x as f64)).sum();
+            (l0_sumsq / (h_after_layer0.len() as f64)).sqrt() as f32
+        };
+        layer_residual_rms.push(l0_rms);
 
         let head_dim_arg = head_dim;
         let n_q_heads_arg = n_q_heads;
@@ -2213,7 +2365,7 @@ impl Mistral35Bringup {
             // current layer_idx as a comma-separated decimal int.
             if let Ok(list) = std::env::var("RVLLM_BISECT_DUMP_LAYERS") {
                 if list.split(',').any(|s| s.trim().parse::<usize>().ok() == Some(layer_idx)) {
-                    if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                    if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                         stream.fence()?;
                         let bytes = (hidden as usize) * 2;
                         let mut buf = vec![0u8; bytes];
@@ -2230,7 +2382,7 @@ impl Mistral35Bringup {
             // RVLLM_SMOKE_LAYER_RMS=1 turns it on for one-shot
             // diagnostics. When off, push 0.0 placeholder so the
             // length matches num_layers.
-            if std::env::var_os("RVLLM_SMOKE_LAYER_RMS").is_some() {
+            if debug_env_os("RVLLM_SMOKE_LAYER_RMS").is_some() {
                 let v = dump_bf16(stream, stream_u64,
                     scr.h_residual_ptr, hidden as usize,
                     "smoke_layer_residual")?;
@@ -2301,7 +2453,7 @@ impl Mistral35Bringup {
                     bytes,
                 );
                 if r == CUresult::CUDA_SUCCESS {
-                    if let Ok(dir) = std::env::var("RVLLM_SMOKE_DUMP_DIR") {
+                    if let Some(dir) = debug_env_str("RVLLM_SMOKE_DUMP_DIR") {
                         let path = std::path::PathBuf::from(dir).join("scores_layer87.f32");
                         let _ = std::fs::write(&path, &buf);
                         eprintln!("[mistral35] dumped scores layer87: {} bytes ({}x{})",
@@ -2483,7 +2635,7 @@ impl Mistral35Bringup {
         // only ONE forward with the LAST prompt token at position 0.
         // Diagnostic mode for isolating embed/forward bugs without
         // KV-cache state from prior steps.
-        if std::env::var_os("RVLLM_SMOKE_SINGLE").is_some() {
+        if debug_env_os("RVLLM_SMOKE_SINGLE").is_some() {
             let tok = *prompt.last().unwrap();
             let dump = self.forward_smoke_q_proj_inner(tok, 0, true)?;
             return Ok(GenerateResult {
@@ -2499,7 +2651,7 @@ impl Mistral35Bringup {
         // length. RVLLM_SMOKE_NO_RESTORE=1 keeps every call's scratch
         // around (debug only, will OOM eventually).
         let ck = arena.checkpoint();
-        let do_restore = std::env::var_os("RVLLM_SMOKE_NO_RESTORE").is_none();
+        let do_restore = debug_env_os("RVLLM_SMOKE_NO_RESTORE").is_none();
 
         let mut tokens: Vec<u32> = prompt.to_vec();
         let mut last_dump: Option<SmokeStageDump> = None;

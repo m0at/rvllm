@@ -154,13 +154,16 @@ pub async fn spawn_cuda_worker(
                     } else {
                         req.prompt_ids.clone()
                     };
-                    // Respect the API's max_tokens; cap at
-                    // RVLLM_SMOKE_MAX_NEW (env diagnostic ceiling) when
-                    // set, else just use the request value with a sane
-                    // upper bound so a forgotten max_tokens doesn't hang
-                    // the worker forever.
-                    let env_max: Option<usize> = std::env::var("RVLLM_SMOKE_MAX_NEW")
-                        .ok().and_then(|s| s.parse().ok());
+                    // Round-11 #1: production path no longer reads
+                    // RVLLM_SMOKE_MAX_NEW. The bringup-load step
+                    // already rejected any leaked SMOKE_* env without
+                    // the explicit `RVLLM_DEBUG_MISTRAL35=1` gate, so
+                    // by the time we get here the env is either unset
+                    // (production) or the operator opted in to debug
+                    // mode and accepts a possibly-truncated max_new.
+                    let env_max: Option<usize> = rvllm_runtime::mistral35_bring_up
+                        ::debug_env_str("RVLLM_SMOKE_MAX_NEW")
+                        .and_then(|s| s.parse().ok());
                     let req_max = (req.max_new_tokens as usize).max(1);
                     let max_new: usize = match env_max {
                         Some(em) => req_max.min(em),

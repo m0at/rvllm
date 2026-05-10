@@ -238,15 +238,35 @@ fn parse_text(
         ));
     }
 
+    // Round-11 #2: critical YaRN fields are required (no defaults).
+    // The runtime YaRN tables and RoPE kernel are hard-coded for the
+    // canonical Mistral Medium 3.5 values; a config that's missing
+    // factor/beta/mscale would silently default to the canonical
+    // numbers, hiding incompatible checkpoints until they generate
+    // garbage at long context. mscale_all_dim is the one value
+    // that's explicitly checked-and-rejected below, so it can default
+    // (any non-zero rejects).
+    // The public Mistral 3.5 checkpoint nests `rope_theta` inside the
+    // YaRN block (`rope_parameters.rope_theta` / `rope_scaling.rope_theta`)
+    // rather than the top of `text_config`. Accept either location.
+    let rope_theta_value = tc["rope_theta"].as_f64()
+        .or_else(|| rope["rope_theta"].as_f64())
+        .or_else(|| tc["rope_theta"].as_u64().map(|x| x as f64))
+        .or_else(|| rope["rope_theta"].as_u64().map(|x| x as f64))
+        .ok_or_else(|| corrupt(
+            cfg_path.to_path_buf(),
+            "Mistral 3.5 config missing required numeric field \
+             rope_theta (looked in text_config and rope_scaling/\
+             rope_parameters)".into(),
+        ))?;
     let yarn = YarnRopeConfig {
-        rope_theta: tc["rope_theta"].as_f64().unwrap_or(1_000_000.0) as f32,
-        original_max_position_embeddings: rope["original_max_position_embeddings"]
-            .as_u64()
-            .unwrap_or(4096) as usize,
-        factor: rope["factor"].as_f64().unwrap_or(64.0) as f32,
-        beta_fast: rope["beta_fast"].as_f64().unwrap_or(4.0) as f32,
-        beta_slow: rope["beta_slow"].as_f64().unwrap_or(1.0) as f32,
-        mscale: rope["mscale"].as_f64().unwrap_or(1.0) as f32,
+        rope_theta: rope_theta_value as f32,
+        original_max_position_embeddings:
+            require_u64("original_max_position_embeddings", rope, cfg_path)? as usize,
+        factor: require_f64("factor", rope, cfg_path)? as f32,
+        beta_fast: require_f64("beta_fast", rope, cfg_path)? as f32,
+        beta_slow: require_f64("beta_slow", rope, cfg_path)? as f32,
+        mscale: require_f64("mscale", rope, cfg_path)? as f32,
         mscale_all_dim: rope["mscale_all_dim"].as_f64().unwrap_or(0.0) as f32,
     };
     if yarn.mscale_all_dim != 0.0 {
@@ -312,26 +332,68 @@ fn parse_vision(
         ));
     }
 
+    // Round-11 #2: every Pixtral field is required + validated against
+    // the canonical Mistral Medium 3.5 / Pixtral values the runtime
+    // kernels are hard-coded for. A future Mistral checkpoint that
+    // changes any of these would need explicit kernel work, so we
+    // refuse to load instead of silently producing wrong output.
+    let hidden_size = require_u64("hidden_size", vc, cfg_path)? as usize;
+    let num_hidden_layers = require_u64("num_hidden_layers", vc, cfg_path)? as usize;
+    let num_attention_heads = require_u64("num_attention_heads", vc, cfg_path)? as usize;
+    let head_dim = require_u64("head_dim", vc, cfg_path)? as usize;
+    let intermediate_size = require_u64("intermediate_size", vc, cfg_path)? as usize;
+    let patch_size = require_u64("patch_size", vc, cfg_path)? as usize;
+    let image_size = require_u64("image_size", vc, cfg_path)? as usize;
+    let num_channels = require_u64("num_channels", vc, cfg_path)? as usize;
+    // Pixtral nests `rope_theta` under `rope_parameters` in the public
+    // Mistral 3.5 checkpoint (vision_config.rope_parameters.rope_theta).
+    // Accept either flat or nested.
+    let rope_theta = vc["rope_theta"].as_f64()
+        .or_else(|| vc["rope_parameters"]["rope_theta"].as_f64())
+        .or_else(|| vc["rope_theta"].as_u64().map(|x| x as f64))
+        .or_else(|| vc["rope_parameters"]["rope_theta"].as_u64().map(|x| x as f64))
+        .ok_or_else(|| corrupt(
+            cfg_path.to_path_buf(),
+            "Mistral 3.5 config missing vision_config.rope_theta \
+             (looked at flat and rope_parameters.rope_theta)".into(),
+        ))? as f32;
+
+    expect_eq_usize("vision_config.hidden_size",         hidden_size,        1664, cfg_path)?;
+    expect_eq_usize("vision_config.num_hidden_layers",   num_hidden_layers,  48,   cfg_path)?;
+    expect_eq_usize("vision_config.num_attention_heads", num_attention_heads,16,   cfg_path)?;
+    expect_eq_usize("vision_config.head_dim",            head_dim,           104,  cfg_path)?;
+    expect_eq_usize("vision_config.intermediate_size",   intermediate_size,  8192, cfg_path)?;
+    expect_eq_usize("vision_config.patch_size",          patch_size,         14,   cfg_path)?;
+    expect_eq_usize("vision_config.image_size",          image_size,         1540, cfg_path)?;
+    expect_eq_usize("vision_config.num_channels",        num_channels,       3,    cfg_path)?;
+    expect_eq_f32  ("vision_config.rope_theta",          rope_theta,         10_000.0, cfg_path)?;
+
     // Processor `spatial_merge_size` is published either inside
-    // `vision_config` or one level up under `processor_config`. We
-    // accept either; default to 2 (the public checkpoint).
+    // `vision_config` or one level up under `processor_config`. The
+    // value MUST equal 2; the soft-token predictor + patch-merger
+    // kernel are coded for it.
     let spatial_merge_size = vc["spatial_merge_size"]
         .as_u64()
         .or_else(|| v["processor_config"]["spatial_merge_size"].as_u64())
         .or_else(|| v["spatial_merge_size"].as_u64())
-        .unwrap_or(2) as usize;
+        .ok_or_else(|| corrupt(
+            cfg_path.to_path_buf(),
+            "Mistral 3.5 config missing required field spatial_merge_size \
+             (vision_config / processor_config / top-level)".into(),
+        ))? as usize;
+    expect_eq_usize("spatial_merge_size", spatial_merge_size, 2, cfg_path)?;
 
     Ok(Mistral35VisionArch {
         model_type_pixtral: true,
-        hidden_size: vc["hidden_size"].as_u64().unwrap_or(1664) as usize,
-        num_hidden_layers: vc["num_hidden_layers"].as_u64().unwrap_or(48) as usize,
-        num_attention_heads: vc["num_attention_heads"].as_u64().unwrap_or(16) as usize,
-        head_dim: vc["head_dim"].as_u64().unwrap_or(104) as usize,
-        intermediate_size: vc["intermediate_size"].as_u64().unwrap_or(8192) as usize,
-        patch_size: vc["patch_size"].as_u64().unwrap_or(14) as usize,
-        image_size: vc["image_size"].as_u64().unwrap_or(1540) as usize,
-        num_channels: vc["num_channels"].as_u64().unwrap_or(3) as usize,
-        rope_theta: vc["rope_theta"].as_f64().unwrap_or(10_000.0) as f32,
+        hidden_size,
+        num_hidden_layers,
+        num_attention_heads,
+        head_dim,
+        intermediate_size,
+        patch_size,
+        image_size,
+        num_channels,
+        rope_theta,
         spatial_merge_size,
     })
 }
@@ -363,6 +425,57 @@ fn u(field: &str, v: &serde_json::Value, cfg_path: &Path) -> Result<usize> {
             format!("Mistral 3.5 config missing required u64 field {field:?}"),
         )),
     }
+}
+
+/// Round-11 #2: required-u64 in a nested object (e.g. `rope_scaling.factor`).
+fn require_u64(field: &str, obj: &serde_json::Value, cfg_path: &Path) -> Result<u64> {
+    obj[field].as_u64().ok_or_else(|| corrupt(
+        cfg_path.to_path_buf(),
+        format!("Mistral 3.5 config missing required u64 field {field:?}"),
+    ))
+}
+
+/// Round-11 #2: required-f64.
+fn require_f64(field: &str, obj: &serde_json::Value, cfg_path: &Path) -> Result<f64> {
+    // Accept ints written without a decimal point.
+    obj[field].as_f64()
+        .or_else(|| obj[field].as_u64().map(|x| x as f64))
+        .or_else(|| obj[field].as_i64().map(|x| x as f64))
+        .ok_or_else(|| corrupt(
+            cfg_path.to_path_buf(),
+            format!("Mistral 3.5 config missing required numeric field {field:?}"),
+        ))
+}
+
+/// Round-11 #2: enforce that a kernel-ABI-critical config value
+/// matches the Mistral 3.5 / Pixtral canonical value the runtime is
+/// hard-coded for.
+fn expect_eq_usize(field: &str, got: usize, expect: usize, cfg_path: &Path) -> Result<()> {
+    if got != expect {
+        return Err(corrupt(
+            cfg_path.to_path_buf(),
+            format!(
+                "Mistral 3.5 expects {field}={expect} (got {got}); the \
+                 runtime kernels and weight shapes are hard-coded for \
+                 the Mistral Medium 3.5 / Pixtral canonical values"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn expect_eq_f32(field: &str, got: f32, expect: f32, cfg_path: &Path) -> Result<()> {
+    if (got - expect).abs() > 1e-3 {
+        return Err(corrupt(
+            cfg_path.to_path_buf(),
+            format!(
+                "Mistral 3.5 expects {field}={expect} (got {got}); the \
+                 runtime kernels and weight shapes are hard-coded for \
+                 the Mistral Medium 3.5 / Pixtral canonical values"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn corrupt(path: PathBuf, detail: String) -> RvllmError {
@@ -528,5 +641,91 @@ mod tests {
         write(&tmp, &body);
         let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
         assert!(format!("{err:?}").contains("GQA"));
+    }
+
+    // Round-11 #2 strict-validation tests.
+
+    #[test]
+    fn rejects_missing_yarn_factor() {
+        let tmp = tempdir();
+        let body = full_config().replace("\"factor\": 64.0,", "");
+        write(&tmp, &body);
+        let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("factor"), "want factor mention, got: {msg}");
+    }
+
+    #[test]
+    fn rejects_missing_yarn_mscale() {
+        let tmp = tempdir();
+        let body = full_config().replace("\"mscale\": 1.0,", "");
+        write(&tmp, &body);
+        let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
+        assert!(format!("{err:?}").contains("mscale"));
+    }
+
+    #[test]
+    fn rejects_missing_yarn_original_max() {
+        let tmp = tempdir();
+        let body = full_config().replace("\"original_max_position_embeddings\": 4096,", "");
+        write(&tmp, &body);
+        let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
+        assert!(format!("{err:?}").contains("original_max_position_embeddings"));
+    }
+
+    #[test]
+    fn rejects_wrong_vision_head_dim() {
+        let tmp = tempdir();
+        let body = full_config().replace("\"head_dim\": 104", "\"head_dim\": 128");
+        write(&tmp, &body);
+        let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("head_dim") && msg.contains("104"),
+            "want head_dim+104 mention, got: {msg}");
+    }
+
+    #[test]
+    fn rejects_wrong_patch_size() {
+        let tmp = tempdir();
+        let body = full_config().replace("\"patch_size\": 14", "\"patch_size\": 16");
+        write(&tmp, &body);
+        let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
+        assert!(format!("{err:?}").contains("patch_size"));
+    }
+
+    #[test]
+    fn rejects_wrong_spatial_merge() {
+        let tmp = tempdir();
+        let body = full_config().replace("\"spatial_merge_size\": 2", "\"spatial_merge_size\": 3");
+        write(&tmp, &body);
+        let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
+        assert!(format!("{err:?}").contains("spatial_merge_size"));
+    }
+
+    #[test]
+    fn rejects_missing_spatial_merge() {
+        let tmp = tempdir();
+        let body = full_config().replace(",\n            \"spatial_merge_size\": 2", "");
+        write(&tmp, &body);
+        let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
+        assert!(format!("{err:?}").contains("spatial_merge_size"));
+    }
+
+    #[test]
+    fn rejects_wrong_vision_image_size() {
+        let tmp = tempdir();
+        let body = full_config().replace("\"image_size\": 1540", "\"image_size\": 1024");
+        write(&tmp, &body);
+        let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
+        assert!(format!("{err:?}").contains("image_size"));
+    }
+
+    #[test]
+    fn rejects_missing_rope_theta() {
+        let tmp = tempdir();
+        let body = full_config().replace("\"rope_theta\": 1000000.0,", "");
+        write(&tmp, &body);
+        let err = Mistral35Arch::from_dir(&tmp).unwrap_err();
+        assert!(format!("{err:?}").contains("rope_theta"));
     }
 }
