@@ -1985,11 +1985,15 @@ impl Mistral35Bringup {
                 // K-cache bandwidth drops by `gqa_ratio` (12× for
                 // Mistral 3.5). Same output ABI as the legacy
                 // `mistral35_qk_dot_bf16` kernel — no other call
-                // sites touched. Opt-in via env until the smoke
-                // matrix is green.
+                // sites touched. Default-on after the byte-identical
+                // smoke matrix passed (text-only greedy + long
+                // German decode + vision E2E all match the legacy
+                // path bit-for-bit). `RVLLM_MISTRAL35_QK_DOT_GQA=0`
+                // explicitly opts back to the legacy kernel for
+                // debugging.
                 let use_gqa = std::env::var("RVLLM_MISTRAL35_QK_DOT_GQA")
                     .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 if use_gqa && gqa_ratio_attn > 1 {
                     let mut nq = n_q_heads_attn as i32;
                     let args_gqa = [
@@ -2868,6 +2872,8 @@ impl Mistral35Bringup {
                 "forward_pixtral_vision: stream absent".into(),
             ))?;
             let nt = pp.num_soft_tokens;
+            let patch_grid = pp.patch_grid;
+            let merged_grid = pp.merged_grid;
             let text_hidden = self.arch.text.hidden_size;
             let bytes = nt * text_hidden * 2;
             let ck_outer = arena.checkpoint();
@@ -2892,25 +2898,16 @@ impl Mistral35Bringup {
                 }
             }
             unsafe { arena.restore(ck_outer); }
-            // Compute the grids again (cheap, host work) for the
-            // returned struct — alternative was to thread them out of
-            // the cuda fn, but they're already in `pp`.
-            let img = image::load_from_memory(image_bytes).map_err(|e| corrupt(
-                self.paths.model_dir.clone(),
-                format!("forward_pixtral_vision: image decode failed: {e}"),
-            ))?.to_rgb8();
-            let cfg = crate::vision_preprocess::Mistral35PreprocessConfig::default();
-            let pp2 = crate::vision_preprocess::preprocess_mistral35_pixtral(&img, &cfg)
-                .map_err(|e| corrupt(
-                    self.paths.model_dir.clone(),
-                    format!("forward_pixtral_vision: re-preprocess failed: {e:?}"),
-                ))?;
+            // Codex review #4: reuse the `pp` already computed above
+            // instead of re-decoding the image and re-running
+            // preprocess just to ship grid metadata. The CUDA forward
+            // already consumed `pp` so the values are still in scope.
             Ok(Mistral35VisionForwardOutput {
                 data,
-                num_tokens: pp2.num_soft_tokens,
+                num_tokens: nt,
                 hidden_dim: text_hidden,
-                patch_grid: pp2.patch_grid,
-                merged_grid: pp2.merged_grid,
+                patch_grid,
+                merged_grid,
             })
         }
         #[cfg(not(feature = "cuda"))]
