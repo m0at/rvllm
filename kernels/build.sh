@@ -205,7 +205,9 @@ for arch in $ARCHS; do
             vector_add_*|f32_to_*|f16_to_*|bf16_to_*|\
             mistral35_*|nvfp4_dequant_weights_bf16|\
             rope_split_half_bf16|\
-            pixtral_rotary_2d_bf16|patch_merger_pixtral_2x2) return 0 ;;
+            pixtral_rotary_2d_bf16|patch_merger_pixtral_2x2|\
+            extract_head_bf16|scatter_heads_bf16|\
+            softmax_row_f32_to_bf16|gelu_tanh_mul_bf16) return 0 ;;
             *) return 1 ;;
         esac
     }

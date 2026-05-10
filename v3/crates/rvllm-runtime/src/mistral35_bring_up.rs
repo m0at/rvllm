@@ -112,6 +112,17 @@ pub struct Mistral35ForwardKernels {
     pub fn_pixtral_rotary_2d_bf16: KernelFn,
     pub patch_merger_pixtral_2x2_mod: LoadedModule,
     pub fn_patch_merger_pixtral_2x2: KernelFn,
+    // Round-12 phase 3c — additional kernels for the per-block ViT
+    // forward (already built for Qwen/Gemma vision; share without
+    // duplication).
+    pub extract_head_bf16_mod: LoadedModule,
+    pub fn_extract_head_bf16: KernelFn,
+    pub scatter_heads_bf16_mod: LoadedModule,
+    pub fn_scatter_heads_bf16: KernelFn,
+    pub softmax_row_f32_to_bf16_mod: LoadedModule,
+    pub fn_softmax_row_f32_to_bf16: KernelFn,
+    pub gelu_tanh_mul_bf16_mod: LoadedModule,
+    pub fn_gelu_tanh_mul_bf16: KernelFn,
 }
 
 /// Pre-allocated per-token forward scratch — sized for m=1 across
@@ -952,6 +963,20 @@ impl Mistral35Bringup {
                 kernels.load_ptx("patch_merger_pixtral_2x2")?;
             let fn_patch_merger_pixtral_2x2 = patch_merger_pixtral_2x2_mod
                 .get_function("patch_merger_pixtral_2x2_kernel")?;
+            // Phase 3c shared vision kernels.
+            let extract_head_bf16_mod = kernels.load_ptx("extract_head_bf16")?;
+            let fn_extract_head_bf16 = extract_head_bf16_mod
+                .get_function("extract_head_bf16_kernel")?;
+            let scatter_heads_bf16_mod = kernels.load_ptx("scatter_heads_bf16")?;
+            let fn_scatter_heads_bf16 = scatter_heads_bf16_mod
+                .get_function("scatter_heads_bf16_kernel")?;
+            let softmax_row_f32_to_bf16_mod =
+                kernels.load_ptx("softmax_row_f32_to_bf16")?;
+            let fn_softmax_row_f32_to_bf16 = softmax_row_f32_to_bf16_mod
+                .get_function("softmax_row_f32_to_bf16_kernel")?;
+            let gelu_tanh_mul_bf16_mod = kernels.load_ptx("gelu_tanh_mul_bf16")?;
+            let fn_gelu_tanh_mul_bf16 = gelu_tanh_mul_bf16_mod
+                .get_function("gelu_tanh_mul_bf16_kernel")?;
             let forward_kernels = Mistral35ForwardKernels {
                 embedding_gather_bf16_mod,
                 fn_embedding_gather_bf16,
@@ -983,6 +1008,14 @@ impl Mistral35Bringup {
                 fn_pixtral_rotary_2d_bf16,
                 patch_merger_pixtral_2x2_mod,
                 fn_patch_merger_pixtral_2x2,
+                extract_head_bf16_mod,
+                fn_extract_head_bf16,
+                scatter_heads_bf16_mod,
+                fn_scatter_heads_bf16,
+                softmax_row_f32_to_bf16_mod,
+                fn_softmax_row_f32_to_bf16,
+                gelu_tanh_mul_bf16_mod,
+                fn_gelu_tanh_mul_bf16,
             };
 
             // W4A16 pre-dequantization is NOT viable for Mistral 3.5:
@@ -2853,32 +2886,20 @@ impl Mistral35Bringup {
             let _ = std::fs::write(d.join("post_patch_conv.bin"), &host);
         }
 
-        // ── Stage 3: ln_pre RMSNorm (in-place on hidden_region) ────────
-        // rmsnorm_inplace_bf16_gbf16 ABI:
-        //   args: (x, gamma, n_tokens, hidden, eps)
-        //   grid: (n_tokens, 1, 1), block: (256, 1, 1)
-        {
-            let mut x = hidden_region.device_ptr();
-            let mut g = vision.ln_pre.offset_bytes;
-            let mut nt = n as i32;
-            let mut hd = v_hidden as i32;
-            let mut eps: f32 = 1.0e-5;
-            let args: [*mut std::ffi::c_void; 5] = [
-                (&mut x)   as *mut u64 as *mut _,
-                (&mut g)   as *mut u64 as *mut _,
-                (&mut nt)  as *mut i32 as *mut _,
-                (&mut hd)  as *mut i32 as *mut _,
-                (&mut eps) as *mut f32 as *mut _,
-            ];
-            unsafe {
-                rvllm_fused::launch_raw(
-                    kernels.fn_rmsnorm_inplace_bf16_gbf16,
-                    (n as u32, 1, 1),
-                    (256, 1, 1),
-                    0, stream_u64,
-                    &args,
-                )?;
-            }
+        // ── Stage 3: ln_pre RMSNorm (in-place on hidden_region) ───────
+        // Use the established RmsnormInplaceLaunch wrapper (it picks
+        // smem + block size correctly and validates the args).
+        unsafe {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
+                num_tokens: n as u32,
+                hidden: v_hidden as u32,
+                eps: 1.0e-5,
+            }.launch(
+                kernels.fn_rmsnorm_inplace_bf16_gbf16,
+                hidden_region.device_ptr(),
+                vision.ln_pre.offset_bytes,
+                stream_u64,
+            )?;
         }
         if let Some(ref d) = dump_dir {
             stream.fence()?;
