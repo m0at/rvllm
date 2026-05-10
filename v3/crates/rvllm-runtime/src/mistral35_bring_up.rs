@@ -4606,6 +4606,78 @@ impl Mistral35Bringup {
         if tokens.is_empty() {
             return Ok(None);
         }
+        // Smoke-test the chunk path's foundation kernels by running
+        // the batched embed gather over all T tokens into the T-row
+        // scratch BEFORE falling through to the per-token loop. The
+        // result is currently UNUSED — its purpose is to validate
+        // that token_in_t_ptr / h_residual_t_ptr / chunk_t_max are
+        // correctly wired and that `embedding_gather_bf16` runs at
+        // num_tokens > 1 against this pointer set. A kernel-level
+        // error here would surface immediately; a silent miswire
+        // would not, so a future commit will add a row-cosine check
+        // vs the per-token gather of token 0.
+        if let (Some(scr), Some(model), Some(stream)) = (
+            self.scratch.as_ref(),
+            self.model.as_ref(),
+            self.stream.as_ref(),
+        ) {
+            if scr.chunk_t_max > 0 {
+                if tokens.len() > scr.chunk_t_max {
+                    return Err(corrupt(
+                        self.paths.model_dir.clone(),
+                        format!(
+                            "forward_smoke_chunk: T={} exceeds chunk_t_max={} \
+                             (set RVLLM_MISTRAL35_PREFILL_CHUNK_SIZE higher \
+                             at bring-up)",
+                            tokens.len(), scr.chunk_t_max,
+                        ),
+                    ));
+                }
+                let stream_u64 = stream.raw();
+                // (1) HtoD the prompt token-ids as i32 into
+                //     token_in_t_ptr. Tokenizer already produced u32;
+                //     cast once on the host because the embed kernel
+                //     reads i32.
+                let token_ids_i32: Vec<i32> =
+                    tokens.iter().map(|&t| t as i32).collect();
+                unsafe {
+                    use cudarc::driver::sys::*;
+                    let r = cuMemcpyHtoDAsync_v2(
+                        scr.token_in_t_ptr as CUdeviceptr,
+                        token_ids_i32.as_ptr() as *const _,
+                        tokens.len() * 4,
+                        stream_u64 as CUstream,
+                    );
+                    if r != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "forward_smoke_chunk: HtoD token_in_t",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+                // (2) Batched embed gather → h_residual_t_ptr.
+                let hidden = self.arch.text.hidden_size as u32;
+                let vocab = self.arch.text.vocab_size as u32;
+                let kernels = self.forward_kernels.as_ref().ok_or_else(|| {
+                    corrupt(self.paths.model_dir.clone(),
+                        "forward_smoke_chunk: forward_kernels absent".into())
+                })?;
+                rvllm_fused::EmbeddingGatherLaunch {
+                    num_tokens: tokens.len() as u32, hidden, vocab,
+                }.launch(
+                    kernels.fn_embedding_gather_bf16,
+                    scr.h_residual_t_ptr,
+                    model.outside.embed_tokens.offset_bytes,
+                    scr.token_in_t_ptr,
+                    stream_u64,
+                )?;
+                // (3) Held back: layer body + final norm + LM head
+                //     at M=T. Lands in subsequent commits per the
+                //     plan in MISTRAL35_BATCHED_PREFILL_PLAN.md.
+            }
+        }
+
         let logits_at = compute_logits_at.unwrap_or(tokens.len() - 1);
         let mut dump_out: Option<SmokeStageDump> = None;
         for (i, &tok) in tokens.iter().enumerate() {
