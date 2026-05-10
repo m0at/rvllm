@@ -393,7 +393,47 @@ impl TokenizerHandle {
                     .map(|v| v.num_tokens.saturating_sub(1))
                     .sum::<usize>(),
         );
+        // For Mistral 3.5 each image expands to H sub-slots (one per
+        // merged-grid row), each W tokens long. For Qwen / Gemma each
+        // image is a single contiguous slot.
         let mut slots: Vec<VisionSlot> = Vec::with_capacity(vision_items.len());
+
+        // Resolve the Pixtral row-separator token ids on demand.
+        // `[IMG_BREAK]` / `[IMG_END]` are special control tokens
+        // (rank 12 / 13 on the tekken tokenizer) that separate
+        // patch-merger rows and terminate the image. We encode the
+        // literal strings to avoid hard-coding ranks.
+        let (mistral_img_break, mistral_img_end) =
+            if matches!(vision_arch, crate::router::VisionArch::Mistral35 { .. })
+                && !vision_items.is_empty()
+            {
+                let break_id = self
+                    .inner
+                    .tokenizer
+                    .encode("[IMG_BREAK]", false)
+                    .ok()
+                    .and_then(|e| e.get_ids().first().copied())
+                    .ok_or_else(|| {
+                        ApiError::Tokenize(
+                            "[mistral35] could not resolve [IMG_BREAK] token id".into(),
+                        )
+                    })?;
+                let end_id = self
+                    .inner
+                    .tokenizer
+                    .encode("[IMG_END]", false)
+                    .ok()
+                    .and_then(|e| e.get_ids().first().copied())
+                    .ok_or_else(|| {
+                        ApiError::Tokenize(
+                            "[mistral35] could not resolve [IMG_END] token id".into(),
+                        )
+                    })?;
+                (Some(break_id), Some(end_id))
+            } else {
+                (None, None)
+            };
+
         let mut next_image = 0usize;
         for tok in &raw_ids {
             if is_image_token(*tok) {
@@ -411,13 +451,60 @@ impl TokenizerHandle {
                         "vision item with num_tokens=0".into(),
                     ));
                 }
-                let token_start = expanded.len();
-                expanded.extend(std::iter::repeat(*tok).take(n));
-                slots.push(VisionSlot {
-                    token_start,
-                    num_tokens: n,
-                    vision_item_idx: next_image,
-                });
+                match vision_arch {
+                    crate::router::VisionArch::Mistral35 { .. } => {
+                        // Pixtral row-major expansion. Each row r in
+                        // 0..H emits W copies of [IMG] followed by
+                        // either [IMG_BREAK] (r < H-1) or [IMG_END]
+                        // (r == H-1). VisionSlot per row carries the
+                        // row offset into the flat `[H*W, hidden]`
+                        // vision-tower output buffer.
+                        let h = item.merged_h as usize;
+                        let w = item.merged_w as usize;
+                        if h == 0 || w == 0 {
+                            return Err(ApiError::Tokenize(format!(
+                                "[mistral35] vision item {} has zero merged grid \
+                                 ({}x{}); admission must populate merged_h/merged_w",
+                                next_image + 1, item.merged_h, item.merged_w,
+                            )));
+                        }
+                        if h * (w + 1) != n {
+                            return Err(ApiError::Tokenize(format!(
+                                "[mistral35] vision item {}: predicted num_tokens \
+                                 {} != merged_h*(merged_w+1) = {}*{} = {}",
+                                next_image + 1, n, h, w + 1, h * (w + 1),
+                            )));
+                        }
+                        let break_id = mistral_img_break.expect("set in mistral arm");
+                        let end_id = mistral_img_end.expect("set in mistral arm");
+                        for r in 0..h {
+                            let row_start = expanded.len();
+                            expanded.extend(std::iter::repeat(*tok).take(w));
+                            slots.push(VisionSlot {
+                                token_start: row_start,
+                                num_tokens: w,
+                                vision_item_idx: next_image,
+                                vision_row_offset: r * w,
+                            });
+                            if r + 1 < h {
+                                expanded.push(break_id);
+                            } else {
+                                expanded.push(end_id);
+                            }
+                        }
+                    }
+                    _ => {
+                        // Qwen / Gemma: single contiguous slot.
+                        let token_start = expanded.len();
+                        expanded.extend(std::iter::repeat(*tok).take(n));
+                        slots.push(VisionSlot {
+                            token_start,
+                            num_tokens: n,
+                            vision_item_idx: next_image,
+                            vision_row_offset: 0,
+                        });
+                    }
+                }
                 next_image += 1;
             } else {
                 expanded.push(*tok);
@@ -636,12 +723,22 @@ struct TemplateMsg<'a> {
 
 /// One vision slot in the rendered prompt. Aligns to a contiguous run
 /// of `num_tokens` placeholder tokens that the cuda_worker overwrites
-/// with the vision-tower output for `vision_item_idx`.
+/// with `num_tokens` rows of the vision-tower output for
+/// `vision_item_idx`, starting at row `vision_row_offset` of that
+/// image's flat `[H*W, hidden]` output buffer.
+///
+/// For Qwen 3.6 / Gemma 4 each image emits exactly one slot covering
+/// the full soft-token run (`vision_row_offset == 0`,
+/// `num_tokens == H*W`). For Mistral 3.5 / Pixtral the chat-template
+/// interleaves `[IMG_BREAK]` between rows and a `[IMG_END]` after the
+/// last row, so each image emits H slots — one per row — each of
+/// length W and with `vision_row_offset = r * W`.
 #[derive(Debug, Clone, Copy)]
 pub struct VisionSlot {
     pub token_start: usize,
     pub num_tokens: usize,
     pub vision_item_idx: usize,
+    pub vision_row_offset: usize,
 }
 
 fn extract_token_str(cfg: &serde_json::Value, key: &str) -> Option<String> {

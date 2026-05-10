@@ -2508,10 +2508,18 @@ fn collect_vision_items(
                     "image_fetch_failed",
                 ),
             })?;
-            let num_tokens = match vision_arch {
-                crate::router::VisionArch::Gemma4 => predict_gemma_num_tokens(w, h),
-                crate::router::VisionArch::Qwen36 => predict_qwen_num_tokens(w, h),
-                crate::router::VisionArch::Mistral35 { .. } => predict_mistral35_num_tokens(w, h),
+            // Predicted token shape: `(num_tokens, num_soft_tokens,
+            // merged_h, merged_w)`. For Qwen / Gemma all four
+            // collapse to the same scalar — the soft-token count and
+            // the chat-template length match because there are no
+            // row-separator tokens in those archs.
+            let (num_tokens, num_soft_tokens, merged_h, merged_w) = match vision_arch {
+                crate::router::VisionArch::Gemma4 => predict_gemma_num_tokens(w, h)
+                    .map(|n| (n, n, 0u32, 0u32)),
+                crate::router::VisionArch::Qwen36 => predict_qwen_num_tokens(w, h)
+                    .map(|n| (n, n, 0u32, 0u32)),
+                crate::router::VisionArch::Mistral35 { .. } => predict_mistral35_num_tokens(w, h)
+                    .map(|s| (s.total_tokens, s.num_soft_tokens, s.merged_h, s.merged_w)),
             }
             .map_err(|e| {
                 ApiError::invalid_param(
@@ -2554,6 +2562,9 @@ fn collect_vision_items(
                 width: w,
                 height: h,
                 num_tokens,
+                num_soft_tokens,
+                merged_h,
+                merged_w,
             });
         }
     }

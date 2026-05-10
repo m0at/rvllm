@@ -63,7 +63,22 @@ pub struct VisionItem {
     /// Number of placeholder tokens this image takes in `prompt_ids`
     /// (= post-PatchMerger embedding count, predicted host-side from
     /// image dims). Actual splice slots live in `vision_slots`.
+    ///
+    /// For Qwen 3.6 / Gemma 4 this equals the number of soft tokens
+    /// produced by the patch merger. For Mistral 3.5 / Pixtral this
+    /// is the *total* template length including row-separator
+    /// `[IMG_BREAK]` and trailing `[IMG_END]` tokens
+    /// (`merged_h*(merged_w+1)`); the soft-token count itself is
+    /// `num_soft_tokens` below.
     pub num_tokens: usize,
+    /// Pixtral patch-merger output rows (`merged_h * merged_w`).
+    /// For non-Mistral arches this equals `num_tokens`.
+    pub num_soft_tokens: usize,
+    /// Pixtral merged-grid height. Zero for non-Mistral arches.
+    /// Used by the renderer to interleave `[IMG_BREAK]` separators.
+    pub merged_h: u32,
+    /// Pixtral merged-grid width. Zero for non-Mistral arches.
+    pub merged_w: u32,
 }
 
 /// Events produced by the worker, consumed by the handler for

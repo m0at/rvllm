@@ -156,34 +156,38 @@ pub async fn spawn_cuda_worker(
                     // (HtoD) for now to keep production correct.
                     let mut vision_splices: Vec<(usize, usize, Vec<u8>)> = Vec::new();
                     if !req.vision_items.is_empty() {
+                        // Run the Pixtral vision tower ONCE per image
+                        // and reuse the output across the H per-row
+                        // VisionSlots. Without dedup the H slots emitted
+                        // by the tokenizer for one Pixtral image would
+                        // each trigger their own forward pass — H×
+                        // wasted work.
+                        let mut outputs: Vec<Option<rvllm_runtime::mistral35_bring_up
+                            ::Mistral35VisionForwardOutput>> =
+                            (0..req.vision_items.len()).map(|_| None).collect();
                         for slot in req.vision_slots.iter() {
                             let vi_idx = slot.vision_item_idx;
+                            if outputs[vi_idx].is_some() { continue; }
                             let item = &req.vision_items[vi_idx];
                             tracing::info!(
                                 "[mistral35-vision] image {}/{} ({} bytes, \
-                                 {}x{}, slot.token_start={} num_tokens={})",
+                                 {}x{}, merged={}x{} num_soft_tokens={})",
                                 vi_idx + 1, req.vision_items.len(),
                                 item.bytes.len(), item.width, item.height,
-                                slot.token_start, slot.num_tokens,
+                                item.merged_h, item.merged_w, item.num_soft_tokens,
                             );
                             match bringup.forward_pixtral_vision(&item.bytes) {
                                 Ok(out) => {
-                                    if out.num_tokens != slot.num_tokens {
+                                    if out.num_tokens != item.num_soft_tokens {
                                         tracing::warn!(
                                             "[mistral35-vision] image {} \
-                                             produced {} soft tokens but slot \
-                                             reserved {}",
+                                             produced {} soft tokens but \
+                                             admission predicted {}",
                                             vi_idx + 1, out.num_tokens,
-                                            slot.num_tokens,
+                                            item.num_soft_tokens,
                                         );
                                     }
-                                    let n = out.num_tokens.min(slot.num_tokens);
-                                    let bytes_per_tok = out.hidden_dim * 2;
-                                    let take = n * bytes_per_tok;
-                                    vision_splices.push((
-                                        slot.token_start, n,
-                                        out.data[..take].to_vec(),
-                                    ));
+                                    outputs[vi_idx] = Some(out);
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -192,6 +196,34 @@ pub async fn spawn_cuda_worker(
                                     );
                                 }
                             }
+                        }
+                        // Emit one splice per VisionSlot, slicing the
+                        // shared image output by `vision_row_offset`.
+                        for slot in req.vision_slots.iter() {
+                            let vi_idx = slot.vision_item_idx;
+                            let Some(out) = outputs[vi_idx].as_ref() else { continue };
+                            let bytes_per_tok = out.hidden_dim * 2;
+                            let row_start_bytes = slot.vision_row_offset * bytes_per_tok;
+                            let take = slot.num_tokens * bytes_per_tok;
+                            // Bounds check — admission predicts the
+                            // grid, but a mismatch would silently splice
+                            // garbage. Clamp + log instead of panic.
+                            let avail_bytes = out.data.len();
+                            if row_start_bytes + take > avail_bytes {
+                                tracing::warn!(
+                                    "[mistral35-vision] slot row_offset={} num_tokens={} \
+                                     would read {}..{} of vision output ({} bytes); \
+                                     skipping this slot",
+                                    slot.vision_row_offset, slot.num_tokens,
+                                    row_start_bytes, row_start_bytes + take, avail_bytes,
+                                );
+                                continue;
+                            }
+                            vision_splices.push((
+                                slot.token_start,
+                                slot.num_tokens,
+                                out.data[row_start_bytes..row_start_bytes + take].to_vec(),
+                            ));
                         }
                     }
                     // Multi-token autoregressive generation. Tokenize

@@ -473,7 +473,32 @@ impl Default for Mistral35PixtralPredictConfig {
 ///   4. `merged_h = resized_h / (patch_size * spatial_merge_size)`,
 ///      `merged_w = resized_w / (patch_size * spatial_merge_size)`.
 ///   5. `num_tokens = merged_h * merged_w`.
-pub fn predict_mistral35_num_tokens(width: u32, height: u32) -> Result<usize, VisionError> {
+/// Outcome of the Mistral 3.5 / Pixtral token-shape prediction.
+///
+/// Pixtral represents an image as a 2-D grid of merged patches with
+/// row separators in the chat-template token stream:
+///   row r in 0..H:   [IMG] * W
+///   between rows:    [IMG_BREAK]
+///   end of image:    [IMG_END]
+/// So total_tokens = H*W + (H-1) + 1 = H*(W+1) and the soft-token
+/// count (= patch-merger output rows) is H*W. Callers that need to
+/// reserve placeholder space in the rendered prompt use
+/// `total_tokens`; the splice copies `merged_h * merged_w` rows of
+/// the vision-tower output into the [IMG] positions, skipping the
+/// [IMG_BREAK]/[IMG_END] positions which carry their own
+/// language-model embeddings.
+#[derive(Clone, Copy, Debug)]
+pub struct Mistral35TokenShape {
+    pub total_tokens: usize,
+    pub num_soft_tokens: usize,
+    pub merged_h: u32,
+    pub merged_w: u32,
+}
+
+pub fn predict_mistral35_num_tokens(
+    width: u32,
+    height: u32,
+) -> Result<Mistral35TokenShape, VisionError> {
     predict_mistral35_num_tokens_with(
         width,
         height,
@@ -485,7 +510,7 @@ pub fn predict_mistral35_num_tokens_with(
     width: u32,
     height: u32,
     cfg: Mistral35PixtralPredictConfig,
-) -> Result<usize, VisionError> {
+) -> Result<Mistral35TokenShape, VisionError> {
     if width == 0 || height == 0 {
         return Err(VisionError::Predict(format!(
             "mistral35: zero-pixel image ({width}x{height})"
@@ -526,13 +551,22 @@ pub fn predict_mistral35_num_tokens_with(
 
     let merged_h = resized_h / factor;
     let merged_w = resized_w / factor;
-    let num_tokens = (merged_h as usize) * (merged_w as usize);
-    if num_tokens == 0 {
+    let num_soft_tokens = (merged_h as usize) * (merged_w as usize);
+    if num_soft_tokens == 0 {
         return Err(VisionError::Predict(format!(
             "mistral35: predicted zero tokens for {width}x{height}"
         )));
     }
-    Ok(num_tokens)
+    // Pixtral chat-template length: H*(W+1)  (W IMGs per row + 1
+    // separator per row, with the trailing separator being
+    // [IMG_END] instead of [IMG_BREAK]).
+    let total_tokens = (merged_h as usize) * (merged_w as usize + 1);
+    Ok(Mistral35TokenShape {
+        total_tokens,
+        num_soft_tokens,
+        merged_h,
+        merged_w,
+    })
 }
 
 #[cfg(test)]
@@ -578,32 +612,39 @@ mod tests {
 
     #[test]
     fn mistral35_predict_square_at_longest_edge() {
-        // 1540x1540 fits exactly. factor=28, merged grid 55x55 = 3025.
-        let n = predict_mistral35_num_tokens(1540, 1540).unwrap();
-        assert_eq!(n, 55 * 55);
+        // 1540x1540 fits exactly. factor=28, merged grid 55x55.
+        let s = predict_mistral35_num_tokens(1540, 1540).unwrap();
+        assert_eq!(s.merged_h, 55);
+        assert_eq!(s.merged_w, 55);
+        assert_eq!(s.num_soft_tokens, 55 * 55);
+        // Pixtral chat-template length: H*(W+1) = 55*56.
+        assert_eq!(s.total_tokens, 55 * 56);
     }
 
     #[test]
     fn mistral35_predict_wide_image_scales_down() {
-        // 3080x1540 → scale 0.5 → 1540x770 → factor-28 round →
-        // 1540x756 → merged 55x27 = 1485.
-        let n = predict_mistral35_num_tokens(3080, 1540).unwrap();
-        assert_eq!(n, 55 * 27);
+        // 3080x1540 → 1540x770 → 1540x756 → merged 55x27.
+        let s = predict_mistral35_num_tokens(3080, 1540).unwrap();
+        assert_eq!((s.merged_h, s.merged_w), (27, 55));
+        assert_eq!(s.num_soft_tokens, 55 * 27);
+        assert_eq!(s.total_tokens, 27 * 56);
     }
 
     #[test]
     fn mistral35_predict_tall_image_scales_down() {
-        // Symmetric to wide.
-        let n = predict_mistral35_num_tokens(1540, 3080).unwrap();
-        assert_eq!(n, 27 * 55);
+        let s = predict_mistral35_num_tokens(1540, 3080).unwrap();
+        assert_eq!((s.merged_h, s.merged_w), (55, 27));
+        assert_eq!(s.num_soft_tokens, 55 * 27);
+        assert_eq!(s.total_tokens, 55 * 28);
     }
 
     #[test]
     fn mistral35_predict_tiny_image_snaps_to_one_factor() {
-        // 10x10 < factor=28, rounds down to 0 then snaps up to 28
-        // so merged = 1x1 = 1 token.
-        let n = predict_mistral35_num_tokens(10, 10).unwrap();
-        assert_eq!(n, 1);
+        let s = predict_mistral35_num_tokens(10, 10).unwrap();
+        assert_eq!((s.merged_h, s.merged_w), (1, 1));
+        assert_eq!(s.num_soft_tokens, 1);
+        // 1*(1+1) = 2 (one [IMG] + one [IMG_END]).
+        assert_eq!(s.total_tokens, 2);
     }
 
     #[test]
@@ -614,9 +655,10 @@ mod tests {
 
     #[test]
     fn mistral35_predict_under_longest_edge_no_upscale() {
-        // 100x200 stays at 100x200 (no upscale) → factor-28 →
-        // 84x196 → merged 3x7 = 21.
-        let n = predict_mistral35_num_tokens(100, 200).unwrap();
-        assert_eq!(n, 3 * 7);
+        // 100x200 → 84x196 → merged 3x7.
+        let s = predict_mistral35_num_tokens(100, 200).unwrap();
+        assert_eq!((s.merged_h, s.merged_w), (7, 3));
+        assert_eq!(s.num_soft_tokens, 3 * 7);
+        assert_eq!(s.total_tokens, 7 * 4);
     }
 }
