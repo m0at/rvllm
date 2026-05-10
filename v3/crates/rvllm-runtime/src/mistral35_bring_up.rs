@@ -104,6 +104,14 @@ pub struct Mistral35ForwardKernels {
     pub fn_f32_to_bf16: KernelFn,
     pub mistral35_w4a16_gemv_bf16_mod: LoadedModule,
     pub fn_mistral35_w4a16_gemv_bf16: KernelFn,
+
+    // ── Pixtral vision (Round-12 phase 2) ─────────────────────────────
+    // The vision tower runs entirely in BF16 (decoder weights are
+    // NVFP4, vision weights are BF16 from the checkpoint).
+    pub pixtral_rotary_2d_bf16_mod: LoadedModule,
+    pub fn_pixtral_rotary_2d_bf16: KernelFn,
+    pub patch_merger_pixtral_2x2_mod: LoadedModule,
+    pub fn_patch_merger_pixtral_2x2: KernelFn,
 }
 
 /// Pre-allocated per-token forward scratch — sized for m=1 across
@@ -280,6 +288,36 @@ pub enum Mistral35Error {
     Nvfp4SymbolsMissing,
     /// `cuda` feature not enabled at compile time.
     NoCudaFeature,
+}
+
+/// Output of [`Mistral35Bringup::forward_pixtral_vision`].
+///
+/// `data` holds little-endian BF16 bytes — `[num_tokens, hidden_dim]`
+/// row-major — already projected through the multi-modal projector
+/// to the language-decoder hidden width (`text_config.hidden_size`,
+/// 12288 for the canonical Mistral 3.5 NVFP4 checkpoint). The
+/// generate path splices these bytes verbatim into the prefill
+/// embed buffer at `slot.token_start * row_bytes`, mirroring the
+/// Qwen 3.6 / Gemma 4 vision splice.
+///
+/// Round-12 (Pixtral vision phase 2 — struct landed; the producer
+/// stub returns ForwardNotImplemented until phase 3 fills the
+/// 48-block forward).
+#[derive(Debug)]
+pub struct Mistral35VisionForwardOutput {
+    /// Little-endian BF16 bytes, length `num_tokens * hidden_dim * 2`.
+    pub data: Vec<u8>,
+    /// Soft-token count = `merged_h * merged_w` from preprocessing.
+    pub num_tokens: usize,
+    /// = `arch.text.hidden_size` (12288 for Mistral 3.5).
+    pub hidden_dim: usize,
+    /// `(grid_h, grid_w)` of the pre-merge ViT output, useful for
+    /// debug logs + diff harness.
+    pub patch_grid: (u32, u32),
+    /// `(merged_h, merged_w)` of the post-merge tensor, equal to
+    /// `patch_grid / spatial_merge_size`. `merged_h * merged_w =
+    /// num_tokens` always.
+    pub merged_grid: (u32, u32),
 }
 
 // F4#1 fix: the legacy `KvDecodeStrategy` enum + GQA routing logic
@@ -902,6 +940,18 @@ impl Mistral35Bringup {
                 kernels.load_ptx("mistral35_w4a16_gemv_bf16")?;
             let fn_mistral35_w4a16_gemv_bf16 = mistral35_w4a16_gemv_bf16_mod
                 .get_function("mistral35_w4a16_gemv_bf16_kernel")?;
+            // Pixtral vision (Round-12 phase 2). Always loaded so the
+            // forward path can call them; the upload of the vision
+            // weights themselves is gated by RVLLM_LOAD_VISION=1
+            // (Round-10 #1).
+            let pixtral_rotary_2d_bf16_mod =
+                kernels.load_ptx("pixtral_rotary_2d_bf16")?;
+            let fn_pixtral_rotary_2d_bf16 = pixtral_rotary_2d_bf16_mod
+                .get_function("pixtral_rotary_2d_bf16_kernel")?;
+            let patch_merger_pixtral_2x2_mod =
+                kernels.load_ptx("patch_merger_pixtral_2x2")?;
+            let fn_patch_merger_pixtral_2x2 = patch_merger_pixtral_2x2_mod
+                .get_function("patch_merger_pixtral_2x2_kernel")?;
             let forward_kernels = Mistral35ForwardKernels {
                 embedding_gather_bf16_mod,
                 fn_embedding_gather_bf16,
@@ -929,6 +979,10 @@ impl Mistral35Bringup {
                 fn_f32_to_bf16,
                 mistral35_w4a16_gemv_bf16_mod,
                 fn_mistral35_w4a16_gemv_bf16,
+                pixtral_rotary_2d_bf16_mod,
+                fn_pixtral_rotary_2d_bf16,
+                patch_merger_pixtral_2x2_mod,
+                fn_patch_merger_pixtral_2x2,
             };
 
             // W4A16 pre-dequantization is NOT viable for Mistral 3.5:
@@ -2609,6 +2663,78 @@ impl Mistral35Bringup {
     /// `on_token` callback fires for every newly emitted decode
     /// token so a streaming SSE path can flush it before the next
     /// step.
+    /// Run the Pixtral 48-block ViT + projector for a single decoded
+    /// image, producing soft tokens spliceable into the language-
+    /// decoder embed buffer.
+    ///
+    /// `image_bytes` is the raw image file (PNG/JPEG/...) the host
+    /// admission layer fetched. `preprocess_mistral35_pixtral` does
+    /// the resize + patchify + CLIP normalisation; this function
+    /// owns everything from there onward (patch_conv → 48 blocks
+    /// → patch_merger → projector → BF16 output).
+    ///
+    /// Round-12 (Pixtral vision phase 2 — signature landed; the
+    /// implementation lands per-stage in phase 3+ via the order
+    /// described in MISTRAL35_PIXTRAL_VISION_PLAN.md).
+    pub fn forward_pixtral_vision(
+        &self,
+        image_bytes: &[u8],
+    ) -> Result<Mistral35VisionForwardOutput> {
+        // Pre-flight: vision tower must be loaded. Default since
+        // Round-10 #1 is OFF; opt in with `RVLLM_LOAD_VISION=1`.
+        let model = self.model.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_pixtral_vision: model not loaded".into(),
+        ))?;
+        let _vision = model.vision.as_ref().ok_or_else(|| corrupt(
+            self.paths.model_dir.clone(),
+            "forward_pixtral_vision: vision tower not loaded; set \
+             RVLLM_LOAD_VISION=1 in the rvllm profile to enable. \
+             Note: even when loaded, the splice into the language \
+             decoder is not yet wired (Pixtral vision phase 3+).".into(),
+        ))?;
+
+        // Decode + preprocess. Pure host work; if it fails, the
+        // request is malformed (corrupt image, dimension overflow,
+        // etc.) — propagate cleanly.
+        let img = image::load_from_memory(image_bytes).map_err(|e| corrupt(
+            self.paths.model_dir.clone(),
+            format!("forward_pixtral_vision: image decode failed: {e}"),
+        ))?.to_rgb8();
+        let cfg = crate::vision_preprocess::Mistral35PreprocessConfig::default();
+        let pp = crate::vision_preprocess::preprocess_mistral35_pixtral(&img, &cfg)
+            .map_err(|e| corrupt(
+                self.paths.model_dir.clone(),
+                format!("forward_pixtral_vision: preprocess failed: {e:?}"),
+            ))?;
+        let _ = pp;  // hush unused while phase 3 lands.
+
+        // Phase 3 onward (per MISTRAL35_PIXTRAL_VISION_PLAN.md
+        // implementation order):
+        //   3a. Upload `pixel_values` as BF16 → patch_conv (cublasLt)
+        //       → ln_pre (rmsnorm_inplace_bf16_gbf16).
+        //   3b. Per-block forward (48×): norm1 → fused QKV GEMM →
+        //       pixtral_rotary_2d_bf16 on Q+K → FA2 prefill → O proj
+        //       → residual → norm2 → gate/up → gelu_tanh_mul → down
+        //       → residual.
+        //   3c. patch_merger_pixtral_2x2 over the [grid_h, grid_w]
+        //       output → [merged_h * merged_w, 4*hidden].
+        //   3d. projector_norm + linear_1 + gelu_tanh + linear_2 →
+        //       [merged_tokens, text_hidden_size = 12288] BF16.
+        //   3e. DtoH the BF16 bytes into Mistral35VisionForwardOutput.
+        Err(corrupt(
+            self.paths.model_dir.clone(),
+            "forward_pixtral_vision: ViT GPU forward not yet wired \
+             (Pixtral vision phase 3 — patch_conv + 48 blocks + \
+             projector lands incrementally with per-stage cosine \
+             gates against an HF reference dump). The infrastructure \
+             (kernels, RoPE tables, patch merger ref, weight upload) \
+             is in place; this stub keeps the type and admission \
+             paths honest until the per-block forward is filled in."
+                .into(),
+        ))
+    }
+
     pub unsafe fn generate<F>(
         &self,
         prompt: &[u32],
