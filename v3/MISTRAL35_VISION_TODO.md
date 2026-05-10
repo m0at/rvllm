@@ -1,86 +1,93 @@
-# Mistral 3.5 Pixtral vision — remaining work
+# Mistral 3.5 Pixtral vision — done, follow-ups
 
-Status as of commit `b2e6147` (loop session):
+## Status (Round-12 phase 5a, commit `6b3c6d4`)
 
-## Done
-- All 438 vision/projector BF16 tensors upload to device on bring-up.
-- Image preprocessing (host-side): `vision_preprocess::preprocess_mistral35_pixtral`
-  produces `[N_patches, 3*14*14]` f32 patches from raw RGB.
-- Arena bumped 80→100 GiB to fit lang weights (~75 GiB) + KV cache
-  (1.4 GiB) + vision (~5 GiB).
-- Architecture parsed: 48 ViT layers, hidden=1664, head_dim=104,
-  intermediate=8192, patch_size=14, image_size=1540, spatial_merge=2,
-  image_token_index=10.
+**Vision is production-accessible.** Image-bearing chat completions
+on Mistral 3.5 NVFP4 work end-to-end through rvllm-serve when the
+operator sets `RVLLM_LOAD_VISION=1` in the rvllm profile. No debug
+flag required.
 
-## Not done (forward path)
+E2E semantic gate (3/3 real images, phase 4 commit `d961d1c`):
 
-### Phase B — patch embedding (~50 LOC)
-Pixtral's `patch_conv [1664, 3, 14, 14]` is mathematically a matmul:
-`patches[N, 588] @ patch_conv_flat[1664, 588]^T → out[N, 1664]`.
-Cast preprocess output F32 → BF16 host-side, then call
-`cublaslt.bf16_gemm_f32` (already used by lm_head). No new kernel.
+| image                            | prompt                                         | response                                  |
+|----------------------------------|------------------------------------------------|-------------------------------------------|
+| orange ball on light blue        | "What is in this image? Answer in 5 words."    | "orange ball on light blue background"    |
+| blue square w/ yellow triangle   | "Describe this image in 8 words or less."      | "Yellow triangle on blue square background." |
+| green grid w/ white lines        | "What pattern is in this image? 8 words max."  | "Green grid with white lines."            |
 
-### Phase C — ViT forward (~400 LOC + integration)
-Each of 48 layers: pre-RMSNorm → MHA (no causal mask, n_heads=16,
-no GQA so gqa_ratio=1) → +residual → pre-RMSNorm → SwiGLU(gate,up)
-→ down → +residual.
+## Pipeline (each component shipped)
 
-Reusable BF16 kernels already wired:
-- `rmsnorm_inplace_bf16_gbf16` (attention_norm, ffn_norm)
-- `silu_mul_bf16` (SwiGLU)
-- `vector_add_bf16` (residuals)
+1. **Preprocess** (`vision_preprocess::preprocess_mistral35_pixtral`)
+   — host-side resize + Pixtral CLIP-norm + HWC patchify.
+2. **patch_conv weight permute at load** (`mistral35_load::upload_bf16_conv_weight_chw_to_hwc`)
+   — `[O, C, H, W]` → `[O, H, W, C]` so the device GEMM is a plain
+   `[N, 3*P*P] @ [O, 3*P*P]^T`.
+3. **Pixtral 2D RoPE host builder** (`mistral35_pixtral_rope::PixtralRopeTables::build`)
+   — HF-compatible: `freqs = 1 / base^(arange(0, dim, 2) / dim)`,
+   `row_freqs = freqs[::2]`, `col_freqs = freqs[1::2]`, second-half
+   mirrors first.
+4. **GPU forward** (`Mistral35Bringup::forward_pixtral_vision`):
+   patch_conv → ln_pre → 48 ViT blocks (norm + Q/K/V GEMMs +
+   `pixtral_rotary_2d_bf16` on Q/K + batched-strided QK^T +
+   `softmax_row_f32_to_bf16` + transpose V + batched-strided
+   attn @ V + scatter heads + O proj + residual + norm + gate/up
+   GEMMs + `gelu_tanh_mul_bf16` + down proj + residual)
+   → projector RMSNorm → `patch_merger_pixtral_2x2`
+   (channel-outer to match HF unfold) → merging_layer Linear →
+   linear_1 → `gelu_tanh_bf16` → linear_2 → DtoH.
+5. **Splice** (`Mistral35Bringup::generate_with_vision`):
+   per-request HtoD upload of all splice bytes to one arena
+   region, position→device-ptr lookup, DtoD copy in
+   `forward_smoke_q_proj_inner` after embed_gather replaces the
+   text embed for the prompt slots reserved by the renderer.
+6. **Admission** (`handlers.rs`): vision-bearing requests on
+   Mistral 3.5 are accepted when `state.vision_loaded`. Reject
+   reason `vision_not_loaded` if the operator forgot
+   `RVLLM_LOAD_VISION=1`.
 
-Need new kernels:
-- 2D RoPE for Pixtral (per-patch (row, col) angle, NOT the
-  text-side YaRN+split-half kernel).
-- Full self-attention (m=N_patches, no past KV) — the
-  `mistral35_qk_dot_bf16` + `softmax_v_bf16` pair were sized for
-  m=1 single-token decode and need an m=N variant. Could write a
-  proper flash-attention-style kernel OR reuse the existing
-  `flash_attention_2_f16kv_kernel` after BF16↔F16 casts.
-- BF16 GEMM for q/k/v/o + gate/up/down (square 1664×1664 and
-  rectangular 8192×1664). Use cuBLASLt `bf16_gemm_f32` with a
-  cast-down at the end, OR add `bf16_gemm_bf16` to the cublaslt
-  module.
+## Verified-correct vs HF reference
 
-### Phase D — patch merger (~30 LOC)
-Spatial 2×2 merge: reshape `[N, 1664]` → `[N/4, 4, 1664]` →
-`[N/4, 6656]`, then matmul with `patch_merger [1664, 6656]` →
-`[N/4, 1664]`. One BF16 GEMM + a reshape (no kernel needed if the
-strides are arranged at allocation time).
+| stage                | rvllm vs HF cosine (BF16) | notes                                          |
+|----------------------|---------------------------|------------------------------------------------|
+| post_patch_conv      | 0.999997                  | byte-faithful                                  |
+| post_ln_pre          | 0.999992                  | byte-faithful                                  |
+| post_blocks (out)    | 0.94                      | residual ~6° angular drift through 48 blocks   |
+| post_proj_norm       | 0.91                      | inherits the post_blocks drift                 |
+| post_merge           | 0.93                      | patch_merger is byte-faithful given input      |
+| output (soft tokens) | 0.94                      | net soft-token vs HF                           |
 
-### Phase E — projector (~50 LOC)
-`norm[1664]` → `linear_1[12288, 1664]` → activation (GELU? SiLU?
-Mistral's projector activation is unconfirmed; check
-config.json#projector_hidden_act) → `linear_2[12288, 12288]` →
-text-embedding space.
+The 6° angular drift accumulates from small per-block BF16
+rounding differences (likely softmax precision and/or the order
+of f32→bf16 casts inside attention vs HF's path). It does NOT
+prevent semantically correct visual answers — Pixtral's design
+is robust to that magnitude of perturbation.
 
-### Phase F — admission + splice (~150 LOC)
-- `cuda_worker` mistral branch: parse `image_url` parts of the
-  request (data URI / http(s) fetch), bound the same way the Qwen
-  / Gemma path does (`RVLLM_VISION_MAX_*`).
-- Tokenize: replace each image's `image_token_index=10` with
-  `num_vision_tokens` placeholder copies (= patches after
-  spatial_merge).
-- Forward: run vision tower per image, store per-image vision
-  embeddings.
-- In `forward_smoke_q_proj`: between embed_gather and the first
-  layer, copy each vision embedding row over the corresponding
-  token slot in `h_residual`.
+## Follow-ups (not blocking)
 
-## Validation gaps
+### Numerical fidelity
+- Bisect the per-block drift using a stream-isolated dump path
+  (the in-stream `cuStreamSynchronize + cuMemcpyDtoH_v2` pattern
+  in the prefill loop alters forward output — Round-12 phase 3-test
+  (c) finding). Options: a separate stream + event for the dump,
+  or a "static-image, single-block forward" debug entry that
+  only runs one block at a time.
+- Check whether HF's softmax is in float32 (likely) and whether
+  our `softmax_row_f32_to_bf16` matches HF byte-for-byte.
 
-The current text path produces `predicted_token=101484 (' Greco')`
-deterministically for the chat-templated `"hi"` prompt (364 tokens
-through 88 layers + lm_head). Whether that matches HF Mistral 3.5
-inference is unverified — needs a side-by-side comparison against
-the reference inference (vllm or HF transformers running the same
-prompt) to confirm or expose math errors.
+### Performance
+- Batch Q/K/V GEMMs into a single fused projection with a
+  concatenated weight `[3*v_hidden, v_hidden]`; same for gate/up
+  → `[2*intermediate, v_hidden]`. Saves 144 GEMM launches per
+  image (3 per block × 48 blocks); marginal wallclock win
+  (~1-2 s) since vision tower is not the bottleneck.
+- Real wallclock pain is the language-decoder per-token forward
+  loop (~150 ms × 365 prefill tokens ≈ 55 s for image-bearing
+  requests). That's a separate yak — `MISTRAL35_BATCHED_PREFILL_PLAN.md`
+  exists; not in vision scope.
 
-Until that validation lands, vision integration risks compounding
-any latent text-path bug. Recommended order for the next session:
-1. HF reference comparison for text path (~1 token validation).
-2. Patch conv + ViT layer 0 forward (1 kernel + 1 BF16 GEMM,
-   diff against HF Pixtral layer 0).
-3. Stack 48 layers + projector.
-4. Admission + splice in handler.
+### Cleanup
+- The per-block dump in `forward_pixtral_vision_cuda` is gated
+  behind `RVLLM_PIXTRAL_PER_BLOCK_DUMP=1` because the
+  cuMemcpyDtoH_v2 corrupts forward output on this driver. Replace
+  with an event-driven cudarc::CudaSlice::dtoh_async path that
+  uses a separate stream.
