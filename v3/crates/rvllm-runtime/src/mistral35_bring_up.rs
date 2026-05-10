@@ -4053,20 +4053,54 @@ impl Mistral35Bringup {
         let prefill_t0 = std::time::Instant::now();
 
         // Stage 3: prefill.
-        for (i, &tok) in prompt.iter().enumerate() {
-            if is_cancelled() {
-                return Ok(GenerateResult {
-                    tokens, last_dump, prompt_len: prompt.len(),
-                });
+        //
+        // Two paths sharing the same `pos_to_dev_ptr` splice map:
+        //
+        // * Token-major (today's default). Calls `prefill_token` once
+        //   per prompt token — one `forward_smoke_q_proj_inner` pass
+        //   per token, GEMV at M=1 throughout. Prefill tok/s ≈ decode
+        //   tok/s (codex review #1).
+        //
+        // * Layer-major batched (`RVLLM_MISTRAL35_BATCH_PREFILL=1`).
+        //   Single `forward_smoke_chunk(prompt, 0, Some(T-1))` call.
+        //   Today this is a stub that falls through to the per-token
+        //   loop so the path is wired but inert; future commits land
+        //   the actual `[T, hidden]` kernel set behind the same gate.
+        //   See `MISTRAL35_BATCHED_PREFILL_PLAN.md` for the staged
+        //   plan.
+        let use_batched_prefill = std::env::var("RVLLM_MISTRAL35_BATCH_PREFILL")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false);
+        if use_batched_prefill && !prompt.is_empty() {
+            // pos_to_dev_ptr currently holds vision splices keyed by
+            // absolute prompt position; the chunk path will pick them
+            // up the same way the per-token path does.
+            let dump = self.forward_smoke_chunk(
+                prompt, 0, Some(prompt.len() - 1),
+                arena, ck_after_splices, do_restore,
+                &pos_to_dev_ptr,
+                &is_cancelled,
+            )?;
+            if let Some(d) = dump {
+                last_predicted = d.predicted_token;
+                last_dump = Some(d);
             }
-            let is_last = i == prompt.len() - 1;
-            let splice_ptr = pos_to_dev_ptr.get(&(i as i32)).copied();
-            if let Some(dump) = self.prefill_token(
-                tok, i as i32, is_last, arena, ck_after_splices,
-                do_restore, splice_ptr,
-            )? {
-                last_predicted = dump.predicted_token;
-                last_dump = Some(dump);
+        } else {
+            for (i, &tok) in prompt.iter().enumerate() {
+                if is_cancelled() {
+                    return Ok(GenerateResult {
+                        tokens, last_dump, prompt_len: prompt.len(),
+                    });
+                }
+                let is_last = i == prompt.len() - 1;
+                let splice_ptr = pos_to_dev_ptr.get(&(i as i32)).copied();
+                if let Some(dump) = self.prefill_token(
+                    tok, i as i32, is_last, arena, ck_after_splices,
+                    do_restore, splice_ptr,
+                )? {
+                    last_predicted = dump.predicted_token;
+                    last_dump = Some(dump);
+                }
             }
         }
         let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1e3;
@@ -4347,6 +4381,55 @@ impl Mistral35Bringup {
         // compute_logits=false, and DtoH on logits when true.
         if do_restore { arena.restore(ck); }
         Ok(out)
+    }
+
+    /// Layer-major batched-prefill entry point. Processes `tokens`
+    /// (length `T`) starting at KV-cache slot `pos_start`. Returns
+    /// the `SmokeStageDump` at index `compute_logits_at` (defaulting
+    /// to `T-1` when `None`). Vision-soft-token splices are looked
+    /// up in `pos_to_dev_ptr` keyed by absolute prompt position
+    /// (same convention as the per-token path).
+    ///
+    /// Phase A scaffolding: this implementation is a per-token loop
+    /// of `forward_smoke_q_proj_inner`. It exists so the gate
+    /// `RVLLM_MISTRAL35_BATCH_PREFILL=1` is wired end-to-end and so
+    /// future commits (Phase B → E) can replace the loop with a
+    /// `[T, hidden]` kernel set without changing the call site.
+    /// With this stub in place, gate ON vs gate OFF must produce
+    /// byte-identical token sequences.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn forward_smoke_chunk(
+        &self,
+        tokens: &[u32],
+        pos_start: i32,
+        compute_logits_at: Option<usize>,
+        arena: &rvllm_mem::HbmArena<'static>,
+        ck: usize,
+        do_restore: bool,
+        pos_to_dev_ptr: &std::collections::HashMap<i32, u64>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<SmokeStageDump>> {
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        let logits_at = compute_logits_at.unwrap_or(tokens.len() - 1);
+        let mut dump_out: Option<SmokeStageDump> = None;
+        for (i, &tok) in tokens.iter().enumerate() {
+            if is_cancelled() {
+                return Ok(dump_out);
+            }
+            let pos = pos_start + i as i32;
+            let is_last = i == logits_at;
+            let splice_ptr = pos_to_dev_ptr.get(&pos).copied();
+            let dump = self.forward_smoke_q_proj_inner(
+                tok, pos, is_last, splice_ptr,
+            )?;
+            if is_last {
+                dump_out = Some(dump);
+            }
+            if do_restore { arena.restore(ck); }
+        }
+        Ok(dump_out)
     }
 
     /// Stage 4 helper: feed one decode token through the forward

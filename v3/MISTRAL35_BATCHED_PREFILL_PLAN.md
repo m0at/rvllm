@@ -193,3 +193,81 @@ phase rollout.
    invariant. No new infrastructure needed; just the Pixtral
    GPU forward (host side already done in
    `vision_preprocess::preprocess_mistral35_pixtral`).
+
+---
+
+## 2026-05-10 status / measured baseline
+
+`RVLLM_MISTRAL35_TIMING=1` on a 383-token German chat-templated
+prompt + 64-token greedy decode:
+
+```
+prompt_tokens=383  decode_steps=63
+prefill_ms=171691.8  prefill_tok_per_s=2.23   (86 % of request)
+decode_ms=29887.1    decode_tok_per_s=2.11    (14 % of request)
+```
+
+Two facts the timing pins down:
+
+* Prefill tok/s ≈ decode tok/s. `prefill_token` and `decode_token`
+  both call `forward_smoke_q_proj_inner` at M=1, so prefill is
+  literally per-token decode. No batched path is currently
+  reachable — the gates documented at line 1294 in
+  `mistral35_bring_up.rs` are stubs that abort if set.
+* Decode at 2.11 tok/s ≈ 70 % of the unified-memory bandwidth
+  ceiling for streaming the 67 GB W4 weight set per token. The
+  `mistral35_w4a16_gemv_bf16` kernel (default-on path, line 1678)
+  is already the Marlin-style fused dequant + GEMV — no separate
+  bf16 weight scratch, no cublasLt round-trip. Codex review #4 was
+  written against the legacy `RVLLM_W4A16_GEMV=0` opt-out path.
+
+Conclusion: the only large per-request lever left is layer-major
+batched prefill. Decode is at hardware limit for single-stream;
+further decode wins need continuous batching or speculative decode
+(out of scope here).
+
+## Concrete next phases (in commit-sized chunks)
+
+### Phase A — scaffolding, fall-through (next commit)
+
+* `forward_smoke_chunk(tokens: &[u32], pos_start: i32,
+  compute_logits_at: Option<usize>) -> Result<SmokeStageDump>` —
+  new entry point. Initial implementation: per-token loop of
+  `forward_smoke_q_proj_inner`, returning the dump at
+  `compute_logits_at` (defaults to T-1).
+* `RVLLM_MISTRAL35_BATCH_PREFILL` env gate. Default OFF. When ON,
+  `generate` calls `forward_smoke_chunk(prompt, 0, Some(T-1))`
+  instead of the per-token prefill loop.
+* No kernel changes. Greedy smoke must stay byte-identical with
+  the gate ON because the fallback path is per-token.
+
+### Phase B — batched embed + RMSNorm + residual
+
+`mistral35_embed_gather_t_bf16`, batched RMSNorm + residual launch
+shapes. Cheap kernels, mostly establishes the `[T, hidden]`
+buffer layout.
+
+### Phase C — batched W4A16 path (the big win)
+
+For each layer's 7 projections, run M=T `bf16_gemm_f32` against a
+freshly dequantized weight tile (the legacy
+`nvfp4_dequant_weights_bf16` + `cublaslt::bf16_gemm_f32` path
+already exists for M=1; M=T is just a call-site change). The
+fused M=1 GEMV stays as the decode fast path.
+
+### Phase D — batched RoPE + KV write
+
+T-strided RoPE + `mistral35_kv_cache_write_t_bf16`.
+
+### Phase E — causal prefill attention
+
+`mistral35_attn_prefill_bf16` — fused FA-2 forward, GQA-aware,
+one CTA per kv_head tile across T queries.
+
+### Phase F — flip default, retire legacy gate
+
+Once the byte-identical equivalence test passes for prompts of
+length 1, 16, 128, 383, flip `RVLLM_MISTRAL35_BATCH_PREFILL` to
+default ON. Acceptance gate: prefill tok/s ≥ 8 (≥ 3.5× current),
+greedy "Hallo!" + 64-tok German GQA decode + vision E2E all
+byte-identical.
