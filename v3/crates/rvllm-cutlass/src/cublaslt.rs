@@ -40,6 +40,32 @@ struct AlgoKey {
     batch_count: i32,
 }
 
+/// Cached bf16 GEMM plan — `MatmulDesc` + the three `MatrixLayout`
+/// objects + the heuristic-picked algo. cuBLASLt currently rebuilds
+/// these from scratch on every call (4 driver round-trips
+/// allocate, 4 destroy + descriptor `set_attr` calls × 2). For the
+/// Mistral 3.5 chunk-prefill hot path that runs 7 projections × 88
+/// layers per request, that is ~5 K driver calls of pure setup
+/// overhead per request even though only a handful of (M, N, K)
+/// shapes actually occur.
+///
+/// The cache key is `AlgoKey` (already covers M, N, K, layout
+/// strides). The plan is built lazily on first miss and reused
+/// thereafter; objects are destroyed once when `CublasLt` drops.
+#[cfg(feature = "cuda")]
+#[derive(Copy, Clone)]
+struct BfGemmPlan {
+    desc: lt::cublasLtMatmulDesc_t,
+    layout_a: lt::cublasLtMatrixLayout_t,
+    layout_b: lt::cublasLtMatrixLayout_t,
+    layout_d: lt::cublasLtMatrixLayout_t,
+    algo: lt::cublasLtMatmulAlgo_t,
+}
+#[cfg(feature = "cuda")]
+unsafe impl Send for BfGemmPlan {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for BfGemmPlan {}
+
 pub struct CublasLt {
     #[cfg(feature = "cuda")]
     handle: lt::cublasLtHandle_t,
@@ -50,6 +76,10 @@ pub struct CublasLt {
     /// calls with the same shape instead of re-running the heuristic.
     #[cfg(feature = "cuda")]
     algo_cache: Mutex<HashMap<AlgoKey, lt::cublasLtMatmulAlgo_t>>,
+    /// Per-(M,N,K) cache of the full bf16 GEMM plan
+    /// (desc + 3 layouts + algo). Codex review #5.
+    #[cfg(feature = "cuda")]
+    bf_plan_cache: Mutex<HashMap<AlgoKey, BfGemmPlan>>,
 }
 
 unsafe impl Send for CublasLt {}
@@ -72,6 +102,7 @@ impl CublasLt {
             workspace,
             workspace_bytes,
             algo_cache: Mutex::new(HashMap::new()),
+            bf_plan_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -450,38 +481,48 @@ impl CublasLt {
         k: i32,
         stream: u64,
     ) -> Result<()> {
-        let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
-        let rc = lt::cublasLtMatmulDescCreate(
-            &mut desc,
-            lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            lt::cudaDataType_t::CUDA_R_32F,
-        );
-        if rc != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return Err(cublaslt_err("cublasLtMatmulDescCreate(bf16)"));
-        }
-        let transa: i32 = 1;
-        let transb: i32 = 0;
-        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-            &transa as *const _ as *const _, std::mem::size_of_val(&transa))?;
-        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-            &transb as *const _ as *const _, std::mem::size_of_val(&transb))?;
-
-        let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let mut layout_d: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_a,
-            lt::cudaDataType_t::CUDA_R_16BF, k as u64, n as u64, k as i64);
-        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout A(bf16)")); }
-        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_b,
-            lt::cudaDataType_t::CUDA_R_16BF, k as u64, m as u64, k as i64);
-        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout B(bf16)")); }
-        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_d,
-            lt::cudaDataType_t::CUDA_R_32F, n as u64, m as u64, n as i64);
-        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout D(bf16)")); }
-
+        // Codex review #5: descriptor + layouts + algo are cached
+        // per (m, n, k). cuBLASLt rebuilds them from scratch on
+        // every call otherwise — 4 cuda-driver round-trips for
+        // alloc + 2 set_attr + 4 destroy per `bf16_gemm_f32` call.
+        // For the Mistral 3.5 chunk-prefill hot path
+        // (7 projections × 88 layers per request) that is roughly
+        // 5 K driver calls of pure setup overhead per request even
+        // though only ~5 distinct (m,n,k) shapes occur.
         let key = AlgoKey { m, n, k, kind: 21, ..Default::default() };
-        let cached_algo = self.algo_cache.lock().ok().and_then(|c| c.get(&key).copied());
-        let algo = if let Some(a) = cached_algo { a } else {
+        let cached = self.bf_plan_cache.lock().ok().and_then(|c| c.get(&key).copied());
+        let plan = if let Some(p) = cached {
+            p
+        } else {
+            let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
+            let rc = lt::cublasLtMatmulDescCreate(
+                &mut desc,
+                lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                lt::cudaDataType_t::CUDA_R_32F,
+            );
+            if rc != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(cublaslt_err("cublasLtMatmulDescCreate(bf16)"));
+            }
+            let transa: i32 = 1;
+            let transb: i32 = 0;
+            set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                &transa as *const _ as *const _, std::mem::size_of_val(&transa))?;
+            set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                &transb as *const _ as *const _, std::mem::size_of_val(&transb))?;
+
+            let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+            let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+            let mut layout_d: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+            let r = lt::cublasLtMatrixLayoutCreate(&mut layout_a,
+                lt::cudaDataType_t::CUDA_R_16BF, k as u64, n as u64, k as i64);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout A(bf16)")); }
+            let r = lt::cublasLtMatrixLayoutCreate(&mut layout_b,
+                lt::cudaDataType_t::CUDA_R_16BF, k as u64, m as u64, k as i64);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout B(bf16)")); }
+            let r = lt::cublasLtMatrixLayoutCreate(&mut layout_d,
+                lt::cudaDataType_t::CUDA_R_32F, n as u64, m as u64, n as i64);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout D(bf16)")); }
+
             let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
             lt::cublasLtMatmulPreferenceCreate(&mut pref);
             let ws = self.workspace_bytes;
@@ -497,27 +538,33 @@ impl CublasLt {
             if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
                 return Err(cublaslt_err("heuristic(bf16)"));
             }
-            let best = heur[0].algo;
-            if let Ok(mut c) = self.algo_cache.lock() { c.insert(key, best); }
-            best
+            let new_plan = BfGemmPlan {
+                desc, layout_a, layout_b, layout_d,
+                algo: heur[0].algo,
+            };
+            if let Ok(mut c) = self.bf_plan_cache.lock() {
+                c.insert(key, new_plan);
+            }
+            // Mirror into the legacy algo_cache too so any callers
+            // of the older paths still see the heuristic result.
+            if let Ok(mut c) = self.algo_cache.lock() {
+                c.insert(key, heur[0].algo);
+            }
+            new_plan
         };
 
         let one: f32 = 1.0;
         let zero: f32 = 0.0;
         let r = lt::cublasLtMatmul(
-            self.handle, desc,
+            self.handle, plan.desc,
             &one as *const _ as *const _,
-            b_bf16 as *const _, layout_a,
-            a_bf16 as *const _, layout_b,
+            b_bf16 as *const _, plan.layout_a,
+            a_bf16 as *const _, plan.layout_b,
             &zero as *const _ as *const _,
-            d_f32 as *const _, layout_d,
-            d_f32 as *mut _, layout_d,
-            &algo, self.workspace as *mut _, self.workspace_bytes, stream as _,
+            d_f32 as *const _, plan.layout_d,
+            d_f32 as *mut _, plan.layout_d,
+            &plan.algo, self.workspace as *mut _, self.workspace_bytes, stream as _,
         );
-        lt::cublasLtMatrixLayoutDestroy(layout_d);
-        lt::cublasLtMatrixLayoutDestroy(layout_b);
-        lt::cublasLtMatrixLayoutDestroy(layout_a);
-        lt::cublasLtMatmulDescDestroy(desc);
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("cublasLtMatmul(bf16)"));
         }
@@ -1206,6 +1253,17 @@ impl Drop for CublasLt {
     fn drop(&mut self) {
         #[cfg(feature = "cuda")]
         unsafe {
+            // Destroy any cached bf16 GEMM plan objects (codex
+            // review #5 — plan cache). These are cuBLASLt-allocated
+            // and must be explicitly destroyed.
+            if let Ok(c) = self.bf_plan_cache.lock() {
+                for plan in c.values() {
+                    let _ = lt::cublasLtMatrixLayoutDestroy(plan.layout_d);
+                    let _ = lt::cublasLtMatrixLayoutDestroy(plan.layout_b);
+                    let _ = lt::cublasLtMatrixLayoutDestroy(plan.layout_a);
+                    let _ = lt::cublasLtMatmulDescDestroy(plan.desc);
+                }
+            }
             if !self.handle.is_null() {
                 let _ = lt::cublasLtDestroy(self.handle);
             }
