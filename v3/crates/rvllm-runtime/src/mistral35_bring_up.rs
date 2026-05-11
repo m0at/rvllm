@@ -3754,6 +3754,56 @@ impl Mistral35Bringup {
         let f32_big_scratch = arena.region(
             "pixtral_f32_big_scratch", f32_big_scratch_bytes, 16)?;
 
+        // Vision-flakiness diagnostic: zero-init all per-block
+        // scratch regions. Hypothesis (see `860fd93`): Pixtral
+        // output alternates between two stable hashes across fresh
+        // process restarts, classic uninitialised-memory-read
+        // signature. If memsetting these buffers makes the output
+        // hash stable, an uninit read inside the per-block forward
+        // is confirmed. Opt-in via
+        // `RVLLM_MISTRAL35_PIXTRAL_ZERO_INIT=1`.
+        if std::env::var("RVLLM_MISTRAL35_PIXTRAL_ZERO_INIT").ok()
+            .as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false)
+        {
+            unsafe {
+                use cudarc::driver::sys::*;
+                let zero_pairs: &[(u64, usize)] = &[
+                    // Per-block scratch only. Earlier-allocated
+                    // buffers (patches/f32_scratch/hidden/cos/sin)
+                    // are already populated by host upload + GEMM
+                    // before this memset point; zeroing them would
+                    // wipe valid input data.
+                    (residual_region.device_ptr(), hidden_bytes),
+                    (q_region.device_ptr(), hidden_bytes),
+                    (k_region.device_ptr(), hidden_bytes),
+                    (v_region.device_ptr(), hidden_bytes),
+                    (attn_out_region.device_ptr(), hidden_bytes),
+                    (attn_hmajor_region.device_ptr(), hidden_bytes),
+                    (v_t_region.device_ptr(), hidden_bytes),
+                    (scores_f32_region.device_ptr(), n * n * n_heads * 4),
+                    (scores_bf16_region.device_ptr(), n * n * n_heads * 2),
+                    (mlp_gate_region.device_ptr(), n * intermediate * 2),
+                    (mlp_up_region.device_ptr(), n * intermediate * 2),
+                    (f32_big_scratch.device_ptr(), f32_big_scratch_bytes),
+                ];
+                for (ptr, bytes) in zero_pairs {
+                    let r = cuMemsetD8Async(
+                        *ptr as CUdeviceptr, 0u8,
+                        *bytes,
+                        stream_u64 as CUstream,
+                    );
+                    if r != CUresult::CUDA_SUCCESS {
+                        return Err(rvllm_core::RvllmError::cuda(
+                            "pixtral zero-init",
+                            rvllm_core::CudaErrorKind::MemcpyFailed,
+                            rvllm_core::CudaCtx::setup(),
+                        ));
+                    }
+                }
+            }
+        }
+
         // Helper closures over the kernels + cublasLt.
         let do_gemm = |in_bf16: u64, w_bf16: u64, out_bf16: u64,
                        m: i32, n_dim: i32, k: i32| -> Result<()> {
