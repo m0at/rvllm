@@ -386,6 +386,11 @@
       "path": "mistral35_kv_cache_write_nvfp4_bf16.ptx",
       "sha256": "900dd263451696418370900b20c9a63c9e2dc4722e0ad2fb24d5dc445210add5"
     },
+    "mistral35_kv_cache_write_t_bf16": {
+      "bytes": 2467,
+      "path": "mistral35_kv_cache_write_t_bf16.ptx",
+      "sha256": "730ef10d0f6324d0b851726079554502a976d91fef774f00f842540071bf9ef2"
+    },
     "mistral35_qk_dot_bf16": {
       "bytes": 2893,
       "path": "mistral35_qk_dot_bf16.ptx",
@@ -737,5 +742,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "bdd096f"
+  "revision": "8b3e462"
 }

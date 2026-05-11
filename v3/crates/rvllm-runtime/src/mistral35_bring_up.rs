@@ -92,6 +92,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_rope_split_half_t_bf16: KernelFn,
     pub kv_cache_write_bf16_mod: LoadedModule,
     pub fn_kv_cache_write_bf16: KernelFn,
+    pub kv_cache_write_t_bf16_mod: LoadedModule,
+    pub fn_kv_cache_write_t_bf16: KernelFn,
     pub qk_dot_bf16_mod: LoadedModule,
     pub fn_qk_dot_bf16: KernelFn,
     pub qk_dot_gqa_bf16_mod: LoadedModule,
@@ -1010,6 +1012,10 @@ impl Mistral35Bringup {
             let kv_cache_write_bf16_mod = kernels.load_ptx("mistral35_kv_cache_write_bf16")?;
             let fn_kv_cache_write_bf16 = kv_cache_write_bf16_mod
                 .get_function("mistral35_kv_cache_write_bf16_kernel")?;
+            let kv_cache_write_t_bf16_mod =
+                kernels.load_ptx("mistral35_kv_cache_write_t_bf16")?;
+            let fn_kv_cache_write_t_bf16 = kv_cache_write_t_bf16_mod
+                .get_function("mistral35_kv_cache_write_t_bf16_kernel")?;
             let qk_dot_bf16_mod = kernels.load_ptx("mistral35_qk_dot_bf16")?;
             let qk_dot_gqa_bf16_mod = kernels.load_ptx("mistral35_qk_dot_gqa_bf16")?;
             let fn_qk_dot_gqa_bf16 = qk_dot_gqa_bf16_mod
@@ -1104,6 +1110,8 @@ impl Mistral35Bringup {
                 fn_rope_split_half_t_bf16,
                 kv_cache_write_bf16_mod,
                 fn_kv_cache_write_bf16,
+                kv_cache_write_t_bf16_mod,
+                fn_kv_cache_write_t_bf16,
                 qk_dot_bf16_mod,
                 fn_qk_dot_bf16,
                 qk_dot_gqa_bf16_mod,
@@ -5465,12 +5473,52 @@ impl Mistral35Bringup {
                     rope_pos(k_row, n_kv_heads as u32, pos)?;
                 }
             }
-            // KV-write per-position.
-            for t in 0..t_count {
-                let pos = pos_start + t as i32;
-                let k_row = scr.k_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
-                let v_row = scr.v_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
-                kv_write(layer_idx, k_row, v_row, pos)?;
+            // Batched KV-write: 1 launch instead of T. Default-on
+            // via `RVLLM_MISTRAL35_BATCHED_KV_WRITE`; opt out with
+            // `=0` for bisection. The legacy per-position path
+            // also runs the NVFP4 dual-write when its env is on,
+            // but the batched path currently writes only BF16 —
+            // any caller running with `NVFP4_KV=1` should also opt
+            // out of batched KV-write until the batched NVFP4
+            // variant lands.
+            let use_batched_kv_write = std::env::var("RVLLM_MISTRAL35_BATCHED_KV_WRITE")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(true);
+            let layer_kv_for_batch = &kv_cache.layers[layer_idx];
+            if use_batched_kv_write && layer_kv_for_batch.k_nvfp4_packed_ptr == 0 {
+                let mut kin = scr.k_out_t_ptr;
+                let mut vin = scr.v_out_t_ptr;
+                let mut k_cache = layer_kv_for_batch.k_ptr;
+                let mut v_cache = layer_kv_for_batch.v_ptr;
+                let mut nkv = n_kv_heads;
+                let mut hd = head_dim;
+                let mut ps = pos_start;
+                let mut tc = t_count as i32;
+                let args = [
+                    (&mut kin) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut vin) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut ps) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut tc) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_kv_cache_write_t_bf16,
+                        (n_kv_heads as u32, t_count as u32, 1),
+                        (head_dim as u32, 1, 1),
+                        0, stream_u64, &args,
+                    )?;
+                }
+            } else {
+                for t in 0..t_count {
+                    let pos = pos_start + t as i32;
+                    let k_row = scr.k_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
+                    let v_row = scr.v_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
+                    kv_write(layer_idx, k_row, v_row, pos)?;
+                }
             }
             if let Some(t0) = t_stage {
                 stream.fence()?;
