@@ -1272,6 +1272,39 @@ impl Mistral35Bringup {
             };
             let bf16_kv_resident = matches!(kv_mode, KvMode::Bf16 | KvMode::Nvfp4ValidateDual);
             let nvfp4_kv_resident = matches!(kv_mode, KvMode::Nvfp4ValidateDual | KvMode::Nvfp4Only);
+
+            // Codex review (round-N) safety: Nvfp4Only is unsafe
+            // without the FA-decode-NVFP4 read path AND a
+            // disabled chunk-path (whose `attn_one` still reads
+            // BF16 KV). Either auto-enable the safe combo or
+            // fail-fast with a clear message — never let bring-up
+            // silently produce a configuration that crashes the
+            // first request with a null-pointer KV read.
+            if matches!(kv_mode, KvMode::Nvfp4Only) {
+                let fa_decode = std::env::var("RVLLM_MISTRAL35_FA_DECODE")
+                    .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                    .unwrap_or(false);
+                let batch_prefill = std::env::var("RVLLM_MISTRAL35_BATCH_PREFILL")
+                    .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                    .unwrap_or(true);
+                if !fa_decode || batch_prefill {
+                    return Err(corrupt(
+                        paths.model_dir.clone(),
+                        format!(
+                            "RVLLM_MISTRAL35_KV_MODE=nvfp4_only requires \
+                             RVLLM_MISTRAL35_FA_DECODE=1 (the only read \
+                             path that consumes NVFP4 KV) AND \
+                             RVLLM_MISTRAL35_BATCH_PREFILL=0 (the chunk \
+                             path's attn_one still uses split kernels \
+                             that read BF16 KV — null pointers under \
+                             Nvfp4Only would segfault). \
+                             Current: FA_DECODE={}, BATCH_PREFILL={}. \
+                             Set both gates or switch to nvfp4_dual.",
+                            fa_decode, batch_prefill,
+                        ),
+                    ));
+                }
+            }
             let per_layer_packed_bytes =
                 kv_max_pos * kv_n_heads * (kv_head_dim / 2);
             let per_layer_scale_bytes =
