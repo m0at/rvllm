@@ -1273,35 +1273,23 @@ impl Mistral35Bringup {
             let bf16_kv_resident = matches!(kv_mode, KvMode::Bf16 | KvMode::Nvfp4ValidateDual);
             let nvfp4_kv_resident = matches!(kv_mode, KvMode::Nvfp4ValidateDual | KvMode::Nvfp4Only);
 
-            // Codex review (round-N) safety: Nvfp4Only is unsafe
-            // without the FA-decode-NVFP4 read path AND a
-            // disabled chunk-path (whose `attn_one` still reads
-            // BF16 KV). Either auto-enable the safe combo or
-            // fail-fast with a clear message — never let bring-up
-            // silently produce a configuration that crashes the
-            // first request with a null-pointer KV read.
+            // Nvfp4Only safety: requires FA_DECODE=1 so the
+            // per-token decode path reads NVFP4 instead of the
+            // (now-null) BF16 KV. The chunk path's `attn_one`
+            // auto-dispatches to FA-decode-NVFP4 when k_ptr=0
+            // — so BATCH_PREFILL=1 is now safe under Nvfp4Only
+            // (the previous restriction is dropped).
             if matches!(kv_mode, KvMode::Nvfp4Only) {
                 let fa_decode = std::env::var("RVLLM_MISTRAL35_FA_DECODE")
                     .ok().as_deref().map(|s| s != "0" && !s.is_empty())
                     .unwrap_or(false);
-                let batch_prefill = std::env::var("RVLLM_MISTRAL35_BATCH_PREFILL")
-                    .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                    .unwrap_or(true);
-                if !fa_decode || batch_prefill {
+                if !fa_decode {
                     return Err(corrupt(
                         paths.model_dir.clone(),
-                        format!(
-                            "RVLLM_MISTRAL35_KV_MODE=nvfp4_only requires \
-                             RVLLM_MISTRAL35_FA_DECODE=1 (the only read \
-                             path that consumes NVFP4 KV) AND \
-                             RVLLM_MISTRAL35_BATCH_PREFILL=0 (the chunk \
-                             path's attn_one still uses split kernels \
-                             that read BF16 KV — null pointers under \
-                             Nvfp4Only would segfault). \
-                             Current: FA_DECODE={}, BATCH_PREFILL={}. \
-                             Set both gates or switch to nvfp4_dual.",
-                            fa_decode, batch_prefill,
-                        ),
+                        "RVLLM_MISTRAL35_KV_MODE=nvfp4_only requires \
+                         RVLLM_MISTRAL35_FA_DECODE=1 (the only attention \
+                         path that consumes NVFP4 KV). Set FA_DECODE=1 \
+                         or switch to nvfp4_dual.".into(),
                     ));
                 }
             }
@@ -5402,6 +5390,54 @@ impl Mistral35Bringup {
         let attn_one = |layer_idx: usize, q_in: u64, attn_out: u64,
                         past_len: i32| -> Result<()> {
             let layer_kv = &kv_cache.layers[layer_idx];
+            // Codex review follow-up: when KV is in Nvfp4Only mode
+            // (k_ptr == 0), the legacy split-kernel path is not
+            // usable — it reads BF16 KV which doesn't exist. Use
+            // the FA-decode-NVFP4 kernel instead. This decouples
+            // Nvfp4Only from the `RVLLM_MISTRAL35_BATCH_PREFILL=0`
+            // constraint that the previous fail-fast enforced.
+            if layer_kv.k_ptr == 0 && layer_kv.k_nvfp4_packed_ptr != 0 {
+                let mut q_ptr = q_in;
+                let mut k_pk = layer_kv.k_nvfp4_packed_ptr;
+                let mut k_sc = layer_kv.k_nvfp4_scale_ptr;
+                let mut v_pk = layer_kv.v_nvfp4_packed_ptr;
+                let mut v_sc = layer_kv.v_nvfp4_scale_ptr;
+                let mut out_ptr = attn_out;
+                let mut hd = head_dim;
+                let mut nkv = n_kv_heads;
+                let mut gr = gqa_ratio;
+                let mut pl = past_len;
+                let mut isd = inv_sqrt_d;
+                let args_fa_nvfp4 = [
+                    (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_pk) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_sc) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_pk) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_sc) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                ];
+                const TILE_T: u32 = 32;
+                const G: u32 = 12;
+                let hd_u = head_dim as u32;
+                let smem = G * hd_u * 2
+                         + TILE_T * hd_u * 2
+                         + TILE_T * hd_u * 2
+                         + hd_u * 4;
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_fa_decode_gqa_nvfp4kv_bf16,
+                        (n_kv_heads as u32, 1, 1),
+                        (hd_u, 1, 1),
+                        smem, stream_u64, &args_fa_nvfp4,
+                    )?;
+                }
+                return Ok(());
+            }
             // (a) qk_dot GQA: scores[n_q_heads, past_len].
             {
                 let mut q_ptr = q_in;
