@@ -106,6 +106,13 @@ pub struct Mistral35ForwardKernels {
     pub fn_v_dot_gqa_bf16: KernelFn,
     pub fa_decode_gqa_bf16_mod: LoadedModule,
     pub fn_fa_decode_gqa_bf16: KernelFn,
+    // Codex #2 graph-capture phase 1: device-pointer pos / past_len variants
+    pub rope_split_half_bf16_devp_mod: LoadedModule,
+    pub fn_rope_split_half_bf16_devp: KernelFn,
+    pub kv_cache_write_bf16_devp_mod: LoadedModule,
+    pub fn_kv_cache_write_bf16_devp: KernelFn,
+    pub fa_decode_gqa_bf16_devp_mod: LoadedModule,
+    pub fn_fa_decode_gqa_bf16_devp: KernelFn,
     pub kv_cache_write_nvfp4_bf16_mod: LoadedModule,
     pub fn_kv_cache_write_nvfp4_bf16: KernelFn,
     pub fa_decode_gqa_nvfp4kv_bf16_mod: LoadedModule,
@@ -195,6 +202,14 @@ pub struct Mistral35Scratch {
     pub workspace_bytes: usize,
     pub logits_ptr: u64,          // F32 [vocab]
     pub token_out_ptr: u64,       // i32 [1] — argmax target
+    // ── Codex #2 graph-capture phase 2 ───────────────────────
+    // Device-resident i32 holding the current decode position
+    // and past_len. Updated host→device once per decode step via
+    // a single cuMemcpyHtoDAsync; the *_devp kernels read it.
+    // Allocated unconditionally (8 bytes) so the path can be
+    // toggled at runtime with RVLLM_MISTRAL35_DECODE_DEVP=1.
+    pub pos_dev_ptr: u64,         // i32 [1]
+    pub past_len_dev_ptr: u64,    // i32 [1]
 
     // ── chunked-prefill scratch (allocated only when
     //    RVLLM_MISTRAL35_BATCH_PREFILL=1; zero otherwise) ──
@@ -1050,6 +1065,18 @@ impl Mistral35Bringup {
                 kernels.load_ptx("mistral35_fa_decode_gqa_bf16")?;
             let fn_fa_decode_gqa_bf16 = fa_decode_gqa_bf16_mod
                 .get_function("mistral35_fa_decode_gqa_bf16_kernel")?;
+            let rope_split_half_bf16_devp_mod =
+                kernels.load_ptx("rope_split_half_bf16_devp")?;
+            let fn_rope_split_half_bf16_devp = rope_split_half_bf16_devp_mod
+                .get_function("rope_split_half_bf16_devp_kernel")?;
+            let kv_cache_write_bf16_devp_mod =
+                kernels.load_ptx("mistral35_kv_cache_write_bf16_devp")?;
+            let fn_kv_cache_write_bf16_devp = kv_cache_write_bf16_devp_mod
+                .get_function("mistral35_kv_cache_write_bf16_devp_kernel")?;
+            let fa_decode_gqa_bf16_devp_mod =
+                kernels.load_ptx("mistral35_fa_decode_gqa_bf16_devp")?;
+            let fn_fa_decode_gqa_bf16_devp = fa_decode_gqa_bf16_devp_mod
+                .get_function("mistral35_fa_decode_gqa_bf16_devp_kernel")?;
             let kv_cache_write_nvfp4_bf16_mod =
                 kernels.load_ptx("mistral35_kv_cache_write_nvfp4_bf16")?;
             let fn_kv_cache_write_nvfp4_bf16 = kv_cache_write_nvfp4_bf16_mod
@@ -1169,6 +1196,12 @@ impl Mistral35Bringup {
                 fn_v_dot_gqa_bf16,
                 fa_decode_gqa_bf16_mod,
                 fn_fa_decode_gqa_bf16,
+                rope_split_half_bf16_devp_mod,
+                fn_rope_split_half_bf16_devp,
+                kv_cache_write_bf16_devp_mod,
+                fn_kv_cache_write_bf16_devp,
+                fa_decode_gqa_bf16_devp_mod,
+                fn_fa_decode_gqa_bf16_devp,
                 kv_cache_write_nvfp4_bf16_mod,
                 fn_kv_cache_write_nvfp4_bf16,
                 fa_decode_gqa_nvfp4kv_bf16_mod,
@@ -1531,6 +1564,8 @@ impl Mistral35Bringup {
                 } else { 0 },
                 logits_ptr:     arena_box.region("mistral35_logits_f32", vocab * 4, 16)?.device_ptr(),
                 token_out_ptr:  arena_box.region("mistral35_token_out", 4, 4)?.device_ptr(),
+                pos_dev_ptr:    arena_box.region("mistral35_pos_dev", 4, 4)?.device_ptr(),
+                past_len_dev_ptr: arena_box.region("mistral35_past_len_dev", 4, 4)?.device_ptr(),
 
                 // Chunked-prefill T-row scratch. Sized for the
                 // largest projection on each axis. Allocated only
@@ -2223,6 +2258,30 @@ impl Mistral35Bringup {
         // this on, multi-key attention is the bug.
         let attn_no_past = debug_env_os("RVLLM_SMOKE_ATTN_NO_PAST").is_some();
         let past_len: i32 = if attn_no_past { 1 } else { attn_position + 1 };
+        // Codex #2 graph-capture phase 2: opt-in device-pointer
+        // pos/past_len path. When enabled, HtoD the two i32s once
+        // per forward and dispatch the *_devp kernel variants
+        // (rope, kv_write, fa_decode) in place of the by-value
+        // siblings. Same math — sets up graph capture in phase 3.
+        let use_decode_devp = std::env::var("RVLLM_MISTRAL35_DECODE_DEVP")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false);
+        if use_decode_devp {
+            unsafe {
+                use cudarc::driver::sys::*;
+                let pos_v: [i32; 1] = [if attn_no_past { 0 } else { attn_position }];
+                let past_v: [i32; 1] = [past_len];
+                let _ = cuMemcpyHtoDAsync_v2(
+                    scr.pos_dev_ptr as CUdeviceptr,
+                    pos_v.as_ptr() as *const _, 4,
+                    stream_u64 as CUstream);
+                let _ = cuMemcpyHtoDAsync_v2(
+                    scr.past_len_dev_ptr as CUdeviceptr,
+                    past_v.as_ptr() as *const _, 4,
+                    stream_u64 as CUstream);
+                stream.fence()?;
+            }
+        }
         if (past_len as usize) > kv_cache.max_pos {
             return Err(corrupt(
                 self.paths.model_dir.clone(),
@@ -2264,22 +2323,43 @@ impl Mistral35Bringup {
                 // token attends to itself" — same as the broadcast
                 // hack baseline.
                 let mut pos = if attn_no_past { 0 } else { attn_position };
-                let args = [
-                    (&mut kin) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut vin) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
-                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
-                    (&mut pos) as *mut i32 as *mut std::ffi::c_void,
-                ];
-                unsafe {
-                    launch_kernel(
-                        kernels.fn_kv_cache_write_bf16,
-                        (n_kv_heads_attn as u32, 1, 1),
-                        (head_dim_attn as u32, 1, 1),
-                        &args, stream_u64,
-                    )?;
+                if use_decode_devp && !attn_no_past {
+                    let mut pos_dev = scr.pos_dev_ptr;
+                    let args = [
+                        (&mut kin) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut vin) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut pos_dev) as *mut u64 as *mut std::ffi::c_void,
+                    ];
+                    unsafe {
+                        launch_kernel(
+                            kernels.fn_kv_cache_write_bf16_devp,
+                            (n_kv_heads_attn as u32, 1, 1),
+                            (head_dim_attn as u32, 1, 1),
+                            &args, stream_u64,
+                        )?;
+                    }
+                } else {
+                    let args = [
+                        (&mut kin) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut vin) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut pos) as *mut i32 as *mut std::ffi::c_void,
+                    ];
+                    unsafe {
+                        launch_kernel(
+                            kernels.fn_kv_cache_write_bf16,
+                            (n_kv_heads_attn as u32, 1, 1),
+                            (head_dim_attn as u32, 1, 1),
+                            &args, stream_u64,
+                        )?;
+                    }
                 }
                 // NVFP4 dual-write block — kept INSIDE the BF16
                 // guard for backwards compat with the
@@ -2451,17 +2531,6 @@ impl Mistral35Bringup {
                 let mut gr = gqa_ratio_attn;
                 let mut pl = past_len;
                 let mut isd = inv_sqrt_d;
-                let args_fa = [
-                    (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
-                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
-                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
-                    (&mut gr) as *mut i32 as *mut std::ffi::c_void,
-                    (&mut pl) as *mut i32 as *mut std::ffi::c_void,
-                    (&mut isd) as *mut f32 as *mut std::ffi::c_void,
-                ];
                 // Smem layout matches kernel: Q[12 * head_dim] BF16 +
                 // K_tile[32 * head_dim] BF16 + V_tile[32 * head_dim]
                 // BF16 + reduction scratch[head_dim] f32.
@@ -2472,13 +2541,47 @@ impl Mistral35Bringup {
                          + TILE_T * hd_u * 2
                          + TILE_T * hd_u * 2
                          + hd_u * 4;
-                unsafe {
-                    rvllm_fused::launch_raw(
-                        kernels.fn_fa_decode_gqa_bf16,
-                        (n_kv_heads_attn as u32, 1, 1),
-                        (hd_u, 1, 1),
-                        smem, stream_u64, &args_fa,
-                    )?;
+                if use_decode_devp && !attn_no_past {
+                    let mut pl_dev = scr.past_len_dev_ptr;
+                    let args_fa = [
+                        (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut pl_dev) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                    ];
+                    unsafe {
+                        rvllm_fused::launch_raw(
+                            kernels.fn_fa_decode_gqa_bf16_devp,
+                            (n_kv_heads_attn as u32, 1, 1),
+                            (hd_u, 1, 1),
+                            smem, stream_u64, &args_fa,
+                        )?;
+                    }
+                } else {
+                    let args_fa = [
+                        (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                    ];
+                    unsafe {
+                        rvllm_fused::launch_raw(
+                            kernels.fn_fa_decode_gqa_bf16,
+                            (n_kv_heads_attn as u32, 1, 1),
+                            (hd_u, 1, 1),
+                            smem, stream_u64, &args_fa,
+                        )?;
+                    }
                 }
                 return Ok(());
             }
@@ -2715,6 +2818,27 @@ impl Mistral35Bringup {
             let mut cos_ptr = rope_tables.cos_ptr;
             let mut sin_ptr = rope_tables.sin_ptr;
             let mut head_dim_arg = head_dim_for_rope;
+            // Devp path: read pos from scr.pos_dev_ptr. Only safe
+            // when the rope_pos_override path is inactive (the
+            // override is a debug-only diagnostic that pins pos).
+            if use_decode_devp && rope_pos_override.is_none() {
+                let mut pos_dev = scr.pos_dev_ptr;
+                let args = [
+                    (&mut ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut cos_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut sin_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut head_dim_arg) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pos_dev) as *mut u64 as *mut std::ffi::c_void,
+                ];
+                unsafe {
+                    return launch_kernel(
+                        kernels.fn_rope_split_half_bf16_devp,
+                        (n_heads, 1, 1),
+                        ((head_dim_for_rope as u32) / 2, 1, 1),
+                        &args, stream_u64,
+                    );
+                }
+            }
             let mut pos_arg = rope_pos_override.unwrap_or(rope_position);
             let args = [
                 (&mut ptr) as *mut u64 as *mut std::ffi::c_void,
