@@ -343,6 +343,76 @@ pub type Mistral35EnginePaths = Gemma4EnginePaths;
 /// forward path lands when steps 4-CUDA / 6 / 9 are wired.
 ///
 /// `Gemma4EnginePaths` upstream is not `Debug`, so neither is this.
+/// Codex review #4: runtime flag cache. Hot-loop env reads at
+/// each per-layer / per-K-iter call site were doing the
+/// std::env::var HashMap walk + Result allocation 88×–6000×
+/// per forward; this struct lifts every gate to one parse-on-
+/// first-use call backed by `OnceLock`.
+///
+/// Flags that the engine reads exactly once per forward (or per
+/// engine init) stay inline at their call sites — caching them
+/// here would add layout pressure without saving CPU.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Mistral35RuntimeFlags {
+    // ── per-layer × per-decode-token attention/FA gates ─────
+    pub use_fa_decode: bool,
+    pub use_qk_dot_gqa: bool,
+    pub use_v_dot_gqa: bool,
+    // ── per-decode-token decode-projection fusion ───────────
+    pub use_decode_fused_qkv: bool,
+    pub use_decode_fused_gate_up: bool,
+    // ── per-layer × per-chunk prefill batched ops ───────────
+    pub use_batched_rope: bool,
+    pub use_batched_kv_write: bool,
+    pub use_fa_prefill: bool,
+    // ── per-gemm_at_m call (per-layer × per-chunk) ──────────
+    pub use_fused_w4a16: bool,
+    pub use_fused_w4a16_mma: bool,
+    pub use_fused_w4a16_mma_v2: bool,
+    pub use_fused_w4a16_mma_v3: bool,
+    pub use_fused_w4a16_mma_v4: bool,
+    pub use_fused_w4a16_mma_v5: bool,
+    pub use_fused_w4a16_mma_v6: bool,
+    pub use_fused_w4a16_mma_v7: bool,
+    pub use_fused_w4a16_mma_v8: bool,
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok().as_deref()
+        .map(|s| s != "0" && !s.is_empty())
+        .unwrap_or(default)
+}
+
+fn build_runtime_flags() -> Mistral35RuntimeFlags {
+    Mistral35RuntimeFlags {
+        use_fa_decode:             env_bool("RVLLM_MISTRAL35_FA_DECODE", true),
+        use_qk_dot_gqa:            env_bool("RVLLM_MISTRAL35_QK_DOT_GQA", true),
+        use_v_dot_gqa:             env_bool("RVLLM_MISTRAL35_V_DOT_GQA", false),
+        use_decode_fused_qkv:      env_bool("RVLLM_MISTRAL35_DECODE_FUSED_QKV", true),
+        use_decode_fused_gate_up:  env_bool("RVLLM_MISTRAL35_DECODE_FUSED_GATE_UP", true),
+        use_batched_rope:          env_bool("RVLLM_MISTRAL35_BATCHED_ROPE", true),
+        use_batched_kv_write:      env_bool("RVLLM_MISTRAL35_BATCHED_KV_WRITE", true),
+        use_fa_prefill:            env_bool("RVLLM_MISTRAL35_FA_PREFILL", false),
+        use_fused_w4a16:           env_bool("RVLLM_MISTRAL35_W4A16_FUSED", false),
+        use_fused_w4a16_mma:       env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA", false),
+        use_fused_w4a16_mma_v2:    env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V2", false),
+        use_fused_w4a16_mma_v3:    env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V3", false),
+        use_fused_w4a16_mma_v4:    env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V4", false),
+        use_fused_w4a16_mma_v5:    env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V5", false),
+        use_fused_w4a16_mma_v6:    env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V6", false),
+        use_fused_w4a16_mma_v7:    env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V7", false),
+        use_fused_w4a16_mma_v8:    env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V8", false),
+    }
+}
+
+/// Process-wide cached runtime flags, populated on first access.
+/// Mistral env knobs don't change at runtime so this is safe.
+pub fn runtime_flags() -> &'static Mistral35RuntimeFlags {
+    static FLAGS: std::sync::OnceLock<Mistral35RuntimeFlags> = std::sync::OnceLock::new();
+    FLAGS.get_or_init(build_runtime_flags)
+}
+
 pub struct Mistral35Bringup {
     pub paths: Mistral35EnginePaths,
     pub arch: Mistral35Arch,
@@ -2519,9 +2589,7 @@ impl Mistral35Bringup {
             // gates are on; falls back to BF16-KV FA-decode if only
             // FA_DECODE is set; falls all the way back to the legacy
             // split kernels if neither.
-            let use_fa_decode = std::env::var("RVLLM_MISTRAL35_FA_DECODE")
-                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                .unwrap_or(true)
+            let use_fa_decode = runtime_flags().use_fa_decode
                 && gqa_ratio_attn == 12;
             let use_nvfp4_kv = layer_kv.k_nvfp4_packed_ptr != 0;
             if use_fa_decode && use_nvfp4_kv {
@@ -2663,9 +2731,7 @@ impl Mistral35Bringup {
                 // path bit-for-bit). `RVLLM_MISTRAL35_QK_DOT_GQA=0`
                 // explicitly opts back to the legacy kernel for
                 // debugging.
-                let use_gqa = std::env::var("RVLLM_MISTRAL35_QK_DOT_GQA")
-                    .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                    .unwrap_or(true);
+                let use_gqa = runtime_flags().use_qk_dot_gqa;
                 if use_gqa && gqa_ratio_attn > 1 {
                     let mut nq = n_q_heads_attn as i32;
                     let args_gqa = [
@@ -2721,9 +2787,7 @@ impl Mistral35Bringup {
             // proper fused FlashAttention-decode kernel that keeps
             // softmax stats in shared memory and never materialises
             // probs to DRAM. Until that lands, default OFF.
-            let use_v_gqa = std::env::var("RVLLM_MISTRAL35_V_DOT_GQA")
-                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                .unwrap_or(false)
+            let use_v_gqa = runtime_flags().use_v_dot_gqa
                 && gqa_ratio_attn == 12;
             if use_v_gqa {
                 // Pass A: parallel softmax in-place on scores[n_q_heads, past_len].
@@ -3317,9 +3381,7 @@ impl Mistral35Bringup {
             // Codex review #2: optional single-launch fused QKV
             // GEMV (3 launches → 1) when env-gated. Math identical
             // to the per-projection GEMV path.
-            let use_fused_qkv = std::env::var("RVLLM_MISTRAL35_DECODE_FUSED_QKV")
-                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                .unwrap_or(true);
+            let use_fused_qkv = runtime_flags().use_decode_fused_qkv;
             if use_fused_qkv
                 && layer.q_proj.shape.k == layer.k_proj.shape.k
                 && layer.q_proj.shape.k == layer.v_proj.shape.k
@@ -3425,9 +3487,7 @@ impl Mistral35Bringup {
             // gate / up / silu_mul (W4A16).
             // Codex review #2: optional single-launch fused gate+up
             // GEMV (2 launches → 1) when env-gated.
-            let use_fused_gate_up = std::env::var("RVLLM_MISTRAL35_DECODE_FUSED_GATE_UP")
-                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                .unwrap_or(true);
+            let use_fused_gate_up = runtime_flags().use_decode_fused_gate_up;
             if use_fused_gate_up
                 && layer.gate_proj.shape.k == layer.up_proj.shape.k
                 && layer.gate_proj.shape.n == layer.up_proj.shape.n
@@ -5569,33 +5629,16 @@ impl Mistral35Bringup {
         // streams the NVFP4 dequant inside the GEMM kernel — no
         // BF16 weight scratch is materialised. Default OFF until
         // greedy parity is validated end-to-end.
-        let use_fused_w4a16 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-            .unwrap_or(false);
-        let use_fused_w4a16_mma = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-            .unwrap_or(false);
-        let use_fused_w4a16_mma_v2 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V2")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-            .unwrap_or(false);
-        let use_fused_w4a16_mma_v3 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V3")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-            .unwrap_or(false);
-        let use_fused_w4a16_mma_v4 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V4")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-            .unwrap_or(false);
-        let use_fused_w4a16_mma_v5 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V5")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-            .unwrap_or(false);
-        let use_fused_w4a16_mma_v6 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V6")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-            .unwrap_or(false);
-        let use_fused_w4a16_mma_v7 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V7")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-            .unwrap_or(false);
-        let use_fused_w4a16_mma_v8 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V8")
-            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-            .unwrap_or(false);
+        let flags = runtime_flags();
+        let use_fused_w4a16        = flags.use_fused_w4a16;
+        let use_fused_w4a16_mma    = flags.use_fused_w4a16_mma;
+        let use_fused_w4a16_mma_v2 = flags.use_fused_w4a16_mma_v2;
+        let use_fused_w4a16_mma_v3 = flags.use_fused_w4a16_mma_v3;
+        let use_fused_w4a16_mma_v4 = flags.use_fused_w4a16_mma_v4;
+        let use_fused_w4a16_mma_v5 = flags.use_fused_w4a16_mma_v5;
+        let use_fused_w4a16_mma_v6 = flags.use_fused_w4a16_mma_v6;
+        let use_fused_w4a16_mma_v7 = flags.use_fused_w4a16_mma_v7;
+        let use_fused_w4a16_mma_v8 = flags.use_fused_w4a16_mma_v8;
         // Legacy W4A16 GEMM at arbitrary M: dequant W → bf16_gemm_f32
         // → f32_to_bf16 cast over m*n elements.
         let gemm_at_m = |out_bf16_ptr: u64,
@@ -6259,9 +6302,7 @@ impl Mistral35Bringup {
             // tensor instead of T launches each. Default-on; opt
             // out via `RVLLM_MISTRAL35_BATCHED_ROPE=0` to use the
             // legacy per-position loop for bisection.
-            let use_batched_rope = std::env::var("RVLLM_MISTRAL35_BATCHED_ROPE")
-                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                .unwrap_or(true);
+            let use_batched_rope = runtime_flags().use_batched_rope;
             if use_batched_rope {
                 let rope_t = |buf: u64, n_heads_arg: i32| -> Result<()> {
                     let mut p = buf;
@@ -6308,9 +6349,7 @@ impl Mistral35Bringup {
             // any caller running with `NVFP4_KV=1` should also opt
             // out of batched KV-write until the batched NVFP4
             // variant lands.
-            let use_batched_kv_write = std::env::var("RVLLM_MISTRAL35_BATCHED_KV_WRITE")
-                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                .unwrap_or(true);
+            let use_batched_kv_write = runtime_flags().use_batched_kv_write;
             let layer_kv_for_batch = &kv_cache.layers[layer_idx];
             if use_batched_kv_write && layer_kv_for_batch.k_nvfp4_packed_ptr == 0 {
                 let mut kin = scr.k_out_t_ptr;
@@ -6375,9 +6414,7 @@ impl Mistral35Bringup {
             // RVLLM_MISTRAL35_FA_PREFILL=1 until the parity is
             // tightened or we deliberately switch the default.
             let layer_kv_for_prefill = &kv_cache.layers[layer_idx];
-            let use_fa_prefill = std::env::var("RVLLM_MISTRAL35_FA_PREFILL")
-                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                .unwrap_or(false)
+            let use_fa_prefill = runtime_flags().use_fa_prefill
                 && layer_kv_for_prefill.k_ptr != 0
                 && gqa_ratio == 12
                 && head_dim == 128
