@@ -1619,6 +1619,30 @@ impl Mistral35Bringup {
                 layers = model.layers.len(),
                 "[mistral35] KV cache mode resolved"
             );
+            // Codex review (new) #2 — perf-trap warning. The
+            // chunk-path batched KV-write + batched attention
+            // kernels currently consume BF16-resident KV only.
+            // Under Nvfp4Only, those paths fall back to per-T
+            // launches (FA-decode-NVFP4 per query row + per-T
+            // KV-write). For long prefill prompts this is
+            // launch-heavy. Until the batched NVFP4-KV variants
+            // land, surface the cliff explicitly.
+            let want_batched_prefill_warn = std::env::var("RVLLM_MISTRAL35_BATCH_PREFILL")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(true);
+            if matches!(kv_mode, KvMode::Nvfp4Only) && want_batched_prefill_warn {
+                eprintln!(
+                    "[mistral35] WARN: KV_MODE=nvfp4_only + BATCH_PREFILL=1 \
+                     active. The chunk-path KV-write and attention-prefill \
+                     kernels currently consume BF16-resident KV only; under \
+                     nvfp4_only those paths fall back to per-T launches \
+                     (FA-decode-NVFP4 + per-T KV-write). Long prefill \
+                     prompts are launch-heavy in this config. Either set \
+                     KV_MODE=nvfp4_dual (BF16+NVFP4 co-resident, ~2× KV \
+                     memory) or accept the per-T fallback. The batched \
+                     NVFP4-KV variants are a future kernel item."
+                );
+            }
             // Scratch F32 [n_q_heads, max_pos] for attention scores.
             let scores_bytes = arch.text.num_attention_heads * kv_max_pos * 4;
             let scores_region = arena_box.region(
