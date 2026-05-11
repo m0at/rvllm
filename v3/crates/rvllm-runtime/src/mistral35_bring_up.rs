@@ -147,6 +147,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_mistral35_w4a16_gemm_mma_v5_bf16: KernelFn,
     pub mistral35_w4a16_gemm_mma_v6_bf16_mod: LoadedModule,
     pub fn_mistral35_w4a16_gemm_mma_v6_bf16: KernelFn,
+    pub mistral35_w4a16_gemm_mma_v7_bf16_mod: LoadedModule,
+    pub fn_mistral35_w4a16_gemm_mma_v7_bf16: KernelFn,
 
     // ── Pixtral vision (Round-12 phase 2) ─────────────────────────────
     // The vision tower runs entirely in BF16 (decoder weights are
@@ -1148,6 +1150,11 @@ impl Mistral35Bringup {
             let fn_mistral35_w4a16_gemm_mma_v6_bf16 =
                 mistral35_w4a16_gemm_mma_v6_bf16_mod
                     .get_function("mistral35_w4a16_gemm_mma_v6_bf16_kernel")?;
+            let mistral35_w4a16_gemm_mma_v7_bf16_mod =
+                kernels.load_ptx("mistral35_w4a16_gemm_mma_v7_bf16")?;
+            let fn_mistral35_w4a16_gemm_mma_v7_bf16 =
+                mistral35_w4a16_gemm_mma_v7_bf16_mod
+                    .get_function("mistral35_w4a16_gemm_mma_v7_bf16_kernel")?;
             // Pixtral vision (Round-12 phase 2). Always loaded so the
             // forward path can call them; the upload of the vision
             // weights themselves is gated by RVLLM_LOAD_VISION=1
@@ -1253,6 +1260,8 @@ impl Mistral35Bringup {
                 fn_mistral35_w4a16_gemm_mma_v5_bf16,
                 mistral35_w4a16_gemm_mma_v6_bf16_mod,
                 fn_mistral35_w4a16_gemm_mma_v6_bf16,
+                mistral35_w4a16_gemm_mma_v7_bf16_mod,
+                fn_mistral35_w4a16_gemm_mma_v7_bf16,
                 pixtral_rotary_2d_bf16_mod,
                 fn_pixtral_rotary_2d_bf16,
                 patch_merger_pixtral_2x2_mod,
@@ -5561,6 +5570,9 @@ impl Mistral35Bringup {
         let use_fused_w4a16_mma_v6 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V6")
             .ok().as_deref().map(|s| s != "0" && !s.is_empty())
             .unwrap_or(false);
+        let use_fused_w4a16_mma_v7 = std::env::var("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V7")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false);
         // Legacy W4A16 GEMM at arbitrary M: dequant W → bf16_gemm_f32
         // → f32_to_bf16 cast over m*n elements.
         let gemm_at_m = |out_bf16_ptr: u64,
@@ -5569,6 +5581,41 @@ impl Mistral35Bringup {
                         m: i32| -> Result<()> {
             let n = lin.shape.n as i32;
             let k = lin.shape.k as i32;
+            // Fused W4A16 M>1 path — tensor-core mma v7 (BM=128,
+            // BN=32, cp.async 3-stage K-pipeline).
+            if use_fused_w4a16_mma_v7 && m > 0 && k % 16 == 0 && n % 32 == 0 {
+                unsafe {
+                    let mut out = out_bf16_ptr;
+                    let mut wp = lin.packed_ptr;
+                    let mut ws = lin.sfb_natural_ptr;
+                    let mut gs = lin.global_scale_ptr;
+                    let mut ap = act_bf16_ptr;
+                    let mut m_arg = m;
+                    let mut n_arg = n;
+                    let mut k_arg = k;
+                    let args: [*mut std::ffi::c_void; 8] = [
+                        (&mut out) as *mut u64 as *mut _,
+                        (&mut wp) as *mut u64 as *mut _,
+                        (&mut ws) as *mut u64 as *mut _,
+                        (&mut gs) as *mut u64 as *mut _,
+                        (&mut ap) as *mut u64 as *mut _,
+                        (&mut m_arg) as *mut i32 as *mut _,
+                        (&mut n_arg) as *mut i32 as *mut _,
+                        (&mut k_arg) as *mut i32 as *mut _,
+                    ];
+                    let bn = 32u32;
+                    let bm = 128u32;
+                    let n_tiles = (((n as u32) + bn - 1) / bn).max(1);
+                    let m_tiles = (((m as u32) + bm - 1) / bm).max(1);
+                    rvllm_fused::launch_raw(
+                        kernels.fn_mistral35_w4a16_gemm_mma_v7_bf16,
+                        (n_tiles, m_tiles, 1),
+                        (128, 1, 1),
+                        0, stream_u64, &args,
+                    )?;
+                }
+                return Ok(());
+            }
             // Fused W4A16 M>1 path — tensor-core mma v6 (BM=128,
             // BN=32, cp.async 2-stage K-pipeline on top of v4).
             if use_fused_w4a16_mma_v6 && m > 0 && k % 16 == 0 && n % 32 == 0 {
