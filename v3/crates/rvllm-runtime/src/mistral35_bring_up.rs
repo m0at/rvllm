@@ -88,6 +88,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_argmax_f32: KernelFn,
     pub rope_split_half_bf16_mod: LoadedModule,
     pub fn_rope_split_half_bf16: KernelFn,
+    pub rope_split_half_t_bf16_mod: LoadedModule,
+    pub fn_rope_split_half_t_bf16: KernelFn,
     pub kv_cache_write_bf16_mod: LoadedModule,
     pub fn_kv_cache_write_bf16: KernelFn,
     pub qk_dot_bf16_mod: LoadedModule,
@@ -1001,6 +1003,10 @@ impl Mistral35Bringup {
             let rope_split_half_bf16_mod = kernels.load_ptx("rope_split_half_bf16")?;
             let fn_rope_split_half_bf16 = rope_split_half_bf16_mod
                 .get_function("rope_split_half_bf16_kernel")?;
+            let rope_split_half_t_bf16_mod =
+                kernels.load_ptx("rope_split_half_t_bf16")?;
+            let fn_rope_split_half_t_bf16 = rope_split_half_t_bf16_mod
+                .get_function("rope_split_half_t_bf16_kernel")?;
             let kv_cache_write_bf16_mod = kernels.load_ptx("mistral35_kv_cache_write_bf16")?;
             let fn_kv_cache_write_bf16 = kv_cache_write_bf16_mod
                 .get_function("mistral35_kv_cache_write_bf16_kernel")?;
@@ -1094,6 +1100,8 @@ impl Mistral35Bringup {
                 fn_argmax_f32,
                 rope_split_half_bf16_mod,
                 fn_rope_split_half_bf16,
+                rope_split_half_t_bf16_mod,
+                fn_rope_split_half_t_bf16,
                 kv_cache_write_bf16_mod,
                 fn_kv_cache_write_bf16,
                 qk_dot_bf16_mod,
@@ -5412,13 +5420,50 @@ impl Mistral35Bringup {
                 Some(std::time::Instant::now())
             } else { None };
 
-            // RoPE per-position on q_t and k_t.
-            for t in 0..t_count {
-                let pos = pos_start + t as i32;
-                let q_row = scr.q_out_t_ptr + (t * n_q_bytes_per_row) as u64;
-                let k_row = scr.k_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
-                rope_pos(q_row, n_q_heads as u32, pos)?;
-                rope_pos(k_row, n_kv_heads as u32, pos)?;
+            // Batched RoPE on q_t and k_t — one kernel launch per
+            // tensor instead of T launches each. Default-on; opt
+            // out via `RVLLM_MISTRAL35_BATCHED_ROPE=0` to use the
+            // legacy per-position loop for bisection.
+            let use_batched_rope = std::env::var("RVLLM_MISTRAL35_BATCHED_ROPE")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(true);
+            if use_batched_rope {
+                let rope_t = |buf: u64, n_heads_arg: i32| -> Result<()> {
+                    let mut p = buf;
+                    let mut cos_p = rope_tables.cos_ptr;
+                    let mut sin_p = rope_tables.sin_ptr;
+                    let mut nh = n_heads_arg;
+                    let mut hd = head_dim;
+                    let mut ps = pos_start;
+                    let mut tc = t_count as i32;
+                    let args = [
+                        (&mut p) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut cos_p) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut sin_p) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut nh) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut ps) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut tc) as *mut i32 as *mut std::ffi::c_void,
+                    ];
+                    unsafe {
+                        rvllm_fused::launch_raw(
+                            kernels.fn_rope_split_half_t_bf16,
+                            (n_heads_arg as u32, t_count as u32, 1),
+                            ((head_dim as u32) / 2, 1, 1),
+                            0, stream_u64, &args,
+                        )
+                    }
+                };
+                rope_t(scr.q_out_t_ptr, n_q_heads)?;
+                rope_t(scr.k_out_t_ptr, n_kv_heads)?;
+            } else {
+                for t in 0..t_count {
+                    let pos = pos_start + t as i32;
+                    let q_row = scr.q_out_t_ptr + (t * n_q_bytes_per_row) as u64;
+                    let k_row = scr.k_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
+                    rope_pos(q_row, n_q_heads as u32, pos)?;
+                    rope_pos(k_row, n_kv_heads as u32, pos)?;
+                }
             }
             // KV-write per-position.
             for t in 0..t_count {
