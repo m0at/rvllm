@@ -110,6 +110,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_kv_cache_write_nvfp4_bf16: KernelFn,
     pub fa_decode_gqa_nvfp4kv_bf16_mod: LoadedModule,
     pub fn_fa_decode_gqa_nvfp4kv_bf16: KernelFn,
+    pub fa_prefill_gqa_bf16_mod: LoadedModule,
+    pub fn_fa_prefill_gqa_bf16: KernelFn,
     // W4A16 NVFP4 path (Mistral 3.5 checkpoint format): dequantize
     // weight blocks to BF16 then run `cublasLt bf16_gemm_f32`. The
     // legacy W4A4 (CUTLASS NVFP4 tensor-core) path is kept compiled
@@ -1044,6 +1046,10 @@ impl Mistral35Bringup {
                 kernels.load_ptx("mistral35_fa_decode_gqa_nvfp4kv_bf16")?;
             let fn_fa_decode_gqa_nvfp4kv_bf16 = fa_decode_gqa_nvfp4kv_bf16_mod
                 .get_function("mistral35_fa_decode_gqa_nvfp4kv_bf16_kernel")?;
+            let fa_prefill_gqa_bf16_mod =
+                kernels.load_ptx("mistral35_fa_prefill_gqa_bf16")?;
+            let fn_fa_prefill_gqa_bf16 = fa_prefill_gqa_bf16_mod
+                .get_function("mistral35_fa_prefill_gqa_bf16_kernel")?;
             let nvfp4_dequant_weights_bf16_mod =
                 kernels.load_ptx("nvfp4_dequant_weights_bf16")?;
             let fn_nvfp4_dequant_weights_bf16 = nvfp4_dequant_weights_bf16_mod
@@ -1128,6 +1134,8 @@ impl Mistral35Bringup {
                 fn_kv_cache_write_nvfp4_bf16,
                 fa_decode_gqa_nvfp4kv_bf16_mod,
                 fn_fa_decode_gqa_nvfp4kv_bf16,
+                fa_prefill_gqa_bf16_mod,
+                fn_fa_prefill_gqa_bf16,
                 nvfp4_dequant_weights_bf16_mod,
                 fn_nvfp4_dequant_weights_bf16,
                 f32_to_bf16_mod,
@@ -5671,14 +5679,82 @@ impl Mistral35Bringup {
             let t_stage = if chunk_timing_on {
                 Some(std::time::Instant::now())
             } else { None };
-            // Per-query attention loop, writing to attn_out_t row t.
-            for t in 0..t_count {
-                let pos = pos_start + t as i32;
-                let past_len = pos + 1;
-                let q_row = scr.q_out_t_ptr + (t * n_q_bytes_per_row) as u64;
-                let attn_row = scr.attn_out_t_ptr
-                    + (t * hidden_bytes) as u64;
-                attn_one(layer_idx, q_row, attn_row, past_len)?;
+            // Codex review #2: batched causal FA-2 prefill — single
+            // launch per layer instead of T per-query iterations. The
+            // dedicated kernel only handles BF16-resident KV with the
+            // exact gqa_ratio = 12 / head_dim = 128 invariant; fall
+            // back to the per-query loop for everything else
+            // (Nvfp4Only, custom head sizes, kernel disabled via env).
+            //
+            // Default OFF: the per-query split-kernel path
+            // (qk_dot → softmax-f32 → v_dot) and this FA-2 fused
+            // path are mathematically equivalent but produce
+            // different bf16 bit patterns at short past_len because
+            // the accumulation order differs. The codex #1 decode
+            // parity matrix validated split ≡ FA-2 at decode-tail
+            // past_lens only; the prefill range (past_len ∈
+            // [1, T-1]) shows occasional first-divergent-token
+            // shifts (e.g. T=884 case: "zu füllen" vs "aufzufüllen"
+            // — both valid German, but a behavioural change vs the
+            // production baseline). Opt-in via
+            // RVLLM_MISTRAL35_FA_PREFILL=1 until the parity is
+            // tightened or we deliberately switch the default.
+            let layer_kv_for_prefill = &kv_cache.layers[layer_idx];
+            let use_fa_prefill = std::env::var("RVLLM_MISTRAL35_FA_PREFILL")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(false)
+                && layer_kv_for_prefill.k_ptr != 0
+                && gqa_ratio == 12
+                && head_dim == 128
+                && t_count > 0;
+            if use_fa_prefill {
+                let mut q_ptr   = scr.q_out_t_ptr;
+                let mut k_cache = layer_kv_for_prefill.k_ptr;
+                let mut v_cache = layer_kv_for_prefill.v_ptr;
+                let mut out_ptr = scr.attn_out_t_ptr;
+                let mut hd = head_dim;
+                let mut nkv = n_kv_heads;
+                let mut gr = gqa_ratio;
+                let mut ps = pos_start;
+                let mut tc = t_count as i32;
+                let mut isd = inv_sqrt_d;
+                let args = [
+                    (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut ps) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut tc) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                ];
+                const TILE_T: u32 = 32;
+                const G: u32 = 12;
+                let hd_u = head_dim as u32;
+                let smem = G * hd_u * 2
+                         + TILE_T * hd_u * 2
+                         + TILE_T * hd_u * 2
+                         + hd_u * 4;
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_fa_prefill_gqa_bf16,
+                        (n_kv_heads as u32, t_count as u32, 1),
+                        (hd_u, 1, 1),
+                        smem, stream_u64, &args,
+                    )?;
+                }
+            } else {
+                // Per-query attention loop, writing to attn_out_t row t.
+                for t in 0..t_count {
+                    let pos = pos_start + t as i32;
+                    let past_len = pos + 1;
+                    let q_row = scr.q_out_t_ptr + (t * n_q_bytes_per_row) as u64;
+                    let attn_row = scr.attn_out_t_ptr
+                        + (t * hidden_bytes) as u64;
+                    attn_one(layer_idx, q_row, attn_row, past_len)?;
+                }
             }
             if let Some(t0) = t_stage {
                 stream.fence()?;
