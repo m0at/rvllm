@@ -154,8 +154,34 @@ pub async fn spawn_cuda_worker(
                     // for future use; the cuda_worker uses the old
                     // forward_pixtral_vision (DtoH) + generate_with_vision
                     // (HtoD) for now to keep production correct.
+                    //
+                    // Codex review #3 (2026-05-11): re-probing the
+                    // device-resident path under
+                    // RVLLM_MISTRAL35_VISION_DEVICE_RESIDENT=1.
+                    // ONLY enabled for single-slot-per-image cases
+                    // (H=1) until the H>1 slot-aware variant is
+                    // wired through generate_with_images. Falls
+                    // back to the DtoH path on any anomaly.
+                    let try_device_resident_vision =
+                        std::env::var("RVLLM_MISTRAL35_VISION_DEVICE_RESIDENT")
+                            .ok().as_deref()
+                            .map(|s| s != "0" && !s.is_empty())
+                            .unwrap_or(false)
+                        && !req.vision_items.is_empty()
+                        && req.vision_slots.len() == req.vision_items.len();
                     let mut vision_splices: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-                    if !req.vision_items.is_empty() {
+                    // Build (start, image_bytes) pairs for the
+                    // device-resident path when the flag is on.
+                    // Restricted to one slot per image (H=1) for now
+                    // so the row_offset slicing path stays a no-op.
+                    let mut vision_images: Vec<(usize, Vec<u8>)> = Vec::new();
+                    if try_device_resident_vision {
+                        for slot in req.vision_slots.iter() {
+                            let vi_idx = slot.vision_item_idx;
+                            let item = &req.vision_items[vi_idx];
+                            vision_images.push((slot.token_start, item.bytes.clone()));
+                        }
+                    } else if !req.vision_items.is_empty() {
                         // Run the Pixtral vision tower ONCE per image
                         // and reuse the output across the H per-row
                         // VisionSlots. Without dedup the H slots emitted
@@ -294,28 +320,38 @@ pub async fn spawn_cuda_worker(
                     let mut step_in_closure: u32 = 0;
                     let mut hit_stop_in_closure = false;
                     let cancel_ref: &std::sync::atomic::AtomicBool = &*req.cancelled;
-                    let gen = unsafe {
-                        bringup.generate_with_vision(
-                            &prompt, max_new, &eos,
-                            Some(cancel_ref),
-                            |tok: u32| {
-                                let pos = prompt_len_u32 + step_in_closure;
-                                step_in_closure += 1;
-                                if stop_set.contains(&tok) {
-                                    hit_stop_in_closure = true;
-                                    cancel_inner.store(true, Ordering::Relaxed);
-                                    return;
-                                }
-                                if events_tx_inner.send(GenerateEvent::Token {
-                                    id: tok, position: pos,
-                                }).is_err() {
-                                    cancel_inner.store(true, Ordering::Relaxed);
-                                    return;
-                                }
-                                emitted_in_closure += 1;
-                            },
-                            &vision_splices,
-                        )
+                    let on_token_cb = |tok: u32| {
+                        let pos = prompt_len_u32 + step_in_closure;
+                        step_in_closure += 1;
+                        if stop_set.contains(&tok) {
+                            hit_stop_in_closure = true;
+                            cancel_inner.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                        if events_tx_inner.send(GenerateEvent::Token {
+                            id: tok, position: pos,
+                        }).is_err() {
+                            cancel_inner.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                        emitted_in_closure += 1;
+                    };
+                    let gen = if try_device_resident_vision {
+                        unsafe {
+                            bringup.generate_with_images(
+                                &prompt, max_new, &eos,
+                                Some(cancel_ref), on_token_cb,
+                                &vision_images,
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            bringup.generate_with_vision(
+                                &prompt, max_new, &eos,
+                                Some(cancel_ref), on_token_cb,
+                                &vision_splices,
+                            )
+                        }
                     };
                     let (gen_tokens, prompt_len_for_log, last_dump_opt, gen_err) = match gen {
                         Ok(r) => (r.tokens, r.prompt_len, r.last_dump, None),
