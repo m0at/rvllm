@@ -1237,26 +1237,53 @@ impl Mistral35Bringup {
             //   max_pos * n_kv * head_dim / 16 bytes scale
             //   = 4096 * 8 * 128 / 16 = 256 KB
             // → ~2.25 MB per layer × 88 layers = ~200 MB extra arena.
-            // `RVLLM_MISTRAL35_NVFP4_KV=1` enables the end-to-end
-            // NVFP4 KV cache path (codex review #3):
-            //   * per-layer NVFP4 packed + scale buffers allocated
-            //     alongside (currently in place of) the BF16 cache
-            //   * `attention_step` dispatches the NVFP4 KV-write
-            //     kernel + the FA-decode-NVFP4 read kernel
-            // Default OFF; opt-in until soak-tested against the
-            // BF16 baseline at multiple past_len ranges.
-            let want_nvfp4_kv = std::env::var("RVLLM_MISTRAL35_NVFP4_KV")
-                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                .unwrap_or(false);
+            // KV cache mode (codex review #4):
+            //   * `Bf16`               — BF16 only (default, today's
+            //                            production path)
+            //   * `Nvfp4ValidateDual`  — BF16 authoritative + NVFP4
+            //                            dual-write for A/B validation
+            //   * `Nvfp4Only`          — NVFP4 only, no BF16 buffers
+            //                            (~700 MB arena saving). Requires
+            //                            FA-decode-NVFP4 read path.
+            //
+            // Selected via `RVLLM_MISTRAL35_KV_MODE = bf16 |
+            // nvfp4_dual | nvfp4_only`. The legacy
+            // `RVLLM_MISTRAL35_NVFP4_KV=1` maps to `nvfp4_dual` for
+            // backwards compatibility.
+            #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+            enum KvMode { Bf16, Nvfp4ValidateDual, Nvfp4Only }
+            let kv_mode: KvMode = match std::env::var("RVLLM_MISTRAL35_KV_MODE")
+                .ok().as_deref().map(str::trim).map(str::to_ascii_lowercase)
+            {
+                Some(ref s) if s == "nvfp4_only" || s == "nvfp4-only" => KvMode::Nvfp4Only,
+                Some(ref s) if s == "nvfp4_dual" || s == "nvfp4-dual" || s == "nvfp4" || s == "dual"
+                    => KvMode::Nvfp4ValidateDual,
+                Some(ref s) if s == "bf16" => KvMode::Bf16,
+                _ => {
+                    // Legacy env fallback.
+                    if std::env::var("RVLLM_MISTRAL35_NVFP4_KV").ok().as_deref()
+                        .map(|s| s != "0" && !s.is_empty()).unwrap_or(false)
+                    {
+                        KvMode::Nvfp4ValidateDual
+                    } else {
+                        KvMode::Bf16
+                    }
+                }
+            };
+            let bf16_kv_resident = matches!(kv_mode, KvMode::Bf16 | KvMode::Nvfp4ValidateDual);
+            let nvfp4_kv_resident = matches!(kv_mode, KvMode::Nvfp4ValidateDual | KvMode::Nvfp4Only);
             let per_layer_packed_bytes =
                 kv_max_pos * kv_n_heads * (kv_head_dim / 2);
             let per_layer_scale_bytes =
                 kv_max_pos * kv_n_heads * (kv_head_dim / 16);
             let mut kv_layers: Vec<LayerKvCache> = Vec::with_capacity(model.layers.len());
             for _ in 0..model.layers.len() {
-                let k = arena_box.region("mistral35_k_cache", per_layer_bytes, 16)?;
-                let v = arena_box.region("mistral35_v_cache", per_layer_bytes, 16)?;
-                let (k_pk, k_sc, v_pk, v_sc) = if want_nvfp4_kv {
+                let (k_ptr, v_ptr) = if bf16_kv_resident {
+                    let k = arena_box.region("mistral35_k_cache", per_layer_bytes, 16)?;
+                    let v = arena_box.region("mistral35_v_cache", per_layer_bytes, 16)?;
+                    (k.device_ptr(), v.device_ptr())
+                } else { (0, 0) };
+                let (k_pk, k_sc, v_pk, v_sc) = if nvfp4_kv_resident {
                     let k_pk = arena_box.region("mistral35_k_nvfp4_packed",
                         per_layer_packed_bytes, 16)?;
                     let k_sc = arena_box.region("mistral35_k_nvfp4_scale",
@@ -1267,25 +1294,20 @@ impl Mistral35Bringup {
                         per_layer_scale_bytes, 16)?;
                     (k_pk.device_ptr(), k_sc.device_ptr(),
                      v_pk.device_ptr(), v_sc.device_ptr())
-                } else {
-                    (0, 0, 0, 0)
-                };
+                } else { (0, 0, 0, 0) };
                 kv_layers.push(LayerKvCache {
-                    k_ptr: k.device_ptr(), v_ptr: v.device_ptr(),
+                    k_ptr, v_ptr,
                     k_nvfp4_packed_ptr: k_pk, k_nvfp4_scale_ptr: k_sc,
                     v_nvfp4_packed_ptr: v_pk, v_nvfp4_scale_ptr: v_sc,
                 });
             }
-            if want_nvfp4_kv {
-                tracing::info!(
-                    layers = model.layers.len(),
-                    per_layer_packed_kb = per_layer_packed_bytes / 1024,
-                    per_layer_scale_kb = per_layer_scale_bytes / 1024,
-                    total_mb = (model.layers.len()
-                        * (per_layer_packed_bytes + per_layer_scale_bytes) * 2) / (1024 * 1024),
-                    "[mistral35] NVFP4 KV cache reserved (alongside BF16)"
-                );
-            }
+            tracing::info!(
+                kv_mode = ?kv_mode,
+                bf16_kv = bf16_kv_resident,
+                nvfp4_kv = nvfp4_kv_resident,
+                layers = model.layers.len(),
+                "[mistral35] KV cache mode resolved"
+            );
             // Scratch F32 [n_q_heads, max_pos] for attention scores.
             let scores_bytes = arch.text.num_attention_heads * kv_max_pos * 4;
             let scores_region = arena_box.region(
@@ -1506,13 +1528,14 @@ impl Mistral35Bringup {
         };
         #[cfg(not(feature = "cuda"))]
         let bringup = Self { paths, arch, inventory, arena_bytes, nvfp4_active };
-        // F4#1 fix: log the actual KV path. Mistral 3.5 runs BF16 KV
-        // through `mistral35_qk_dot_bf16` + `mistral35_softmax_v_bf16`
-        // in `attention_step`; no NVFP4-KV path is wired today.
+        // Codex review #4: the attention path now has three KV
+        // modes (BF16 / NVFP4-dual / NVFP4-only). The stale `kv=bf16`
+        // log line was lying once the NVFP4 path landed; the actual
+        // resolved mode is now logged earlier from the cache-alloc
+        // site as `[mistral35] KV cache mode resolved`. Keep this
+        // line for the attention-head shape printout only.
         eprintln!(
-            "[mistral35] kv=bf16 (per-head BF16 attention via \
-             mistral35_qk_dot_bf16 / mistral35_softmax_v_bf16), \
-             n_q={} n_kv={} gqa_ratio={}",
+            "[mistral35] attention shape: n_q={} n_kv={} gqa_ratio={}",
             bringup.arch.text.num_attention_heads,
             bringup.arch.text.num_key_value_heads,
             bringup.arch.gqa_ratio(),
@@ -2144,7 +2167,11 @@ impl Mistral35Bringup {
         let attention_step = |layer_idx: usize| -> Result<()> {
             let layer_kv = &kv_cache.layers[layer_idx];
             // (a) Write K_in and V_in to slot=position of the cache.
-            {
+            //     Skip BF16 write under `KvMode::Nvfp4Only` where
+            //     `k_ptr == 0`; launching with a null device pointer
+            //     would segfault. The NVFP4 dual-write block below
+            //     handles the persistent storage for that mode.
+            if layer_kv.k_ptr != 0 {
                 let mut kin = scr.k_out_ptr;
                 let mut vin = scr.v_out_ptr;
                 let mut k_cache = layer_kv.k_ptr;
@@ -2174,12 +2201,11 @@ impl Mistral35Bringup {
                         &args, stream_u64,
                     )?;
                 }
-                // Codex review #3 — end-to-end NVFP4 KV cache.
-                // Dual-write: BF16 (above) stays authoritative so the
-                // existing split-kernel decode path keeps working
-                // when FA-decode-NVFP4 isn't picked; NVFP4 lands
-                // alongside so the fa_decode_nvfp4kv read kernel
-                // (dispatched below) sees fresh data at every slot.
+                // NVFP4 dual-write block — kept INSIDE the BF16
+                // guard for backwards compat with the
+                // Nvfp4ValidateDual path (where k_ptr != 0). Under
+                // Nvfp4Only (k_ptr == 0) the standalone NVFP4-write
+                // block landed below handles the cache population.
                 if layer_kv.k_nvfp4_packed_ptr != 0 {
                     let mut kin_p = scr.k_out_ptr;
                     let mut vin_p = scr.v_out_ptr;
@@ -2228,6 +2254,42 @@ impl Mistral35Bringup {
                         vin as CUdeviceptr, bytes,
                         stream_u64 as CUstream);
                     eprintln!("[mistral35-debug] bypass results: k={:?} v={:?}", r1, r2);
+                }
+            }
+            // Nvfp4Only mode: BF16 K/V cache is absent (k_ptr==0).
+            // Write the NVFP4 cache standalone — this is the same
+            // launch as the dual-write inside the BF16 guard, but
+            // unconditional on the BF16 cache's existence so the
+            // Nvfp4Only path is populated for the FA-decode-NVFP4
+            // read.
+            if layer_kv.k_ptr == 0 && layer_kv.k_nvfp4_packed_ptr != 0 {
+                let mut kin_p = scr.k_out_ptr;
+                let mut vin_p = scr.v_out_ptr;
+                let mut k_pk = layer_kv.k_nvfp4_packed_ptr;
+                let mut k_sc = layer_kv.k_nvfp4_scale_ptr;
+                let mut v_pk = layer_kv.v_nvfp4_packed_ptr;
+                let mut v_sc = layer_kv.v_nvfp4_scale_ptr;
+                let mut nkv2 = n_kv_heads_attn;
+                let mut hd2 = head_dim_attn;
+                let mut pos2 = if attn_no_past { 0 } else { attn_position };
+                let args_n = [
+                    (&mut kin_p) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut vin_p) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_pk) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_sc) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_pk) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_sc) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut nkv2) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut hd2) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pos2) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                unsafe {
+                    launch_kernel(
+                        kernels.fn_kv_cache_write_nvfp4_bf16,
+                        (n_kv_heads_attn as u32, 2, 1),
+                        ((head_dim_attn as u32) / 16, 1, 1),
+                        &args_n, stream_u64,
+                    )?;
                 }
             }
 
@@ -5231,29 +5293,35 @@ impl Mistral35Bringup {
         let kv_write = |layer_idx: usize, k_in: u64, v_in: u64,
                         slot_pos: i32| -> Result<()> {
             let layer_kv = &kv_cache.layers[layer_idx];
-            let mut kin = k_in;
-            let mut vin = v_in;
-            let mut k_cache = layer_kv.k_ptr;
-            let mut v_cache = layer_kv.v_ptr;
-            let mut nkv = n_kv_heads;
-            let mut hd = head_dim;
-            let mut pos = slot_pos;
-            let args = [
-                (&mut kin) as *mut u64 as *mut std::ffi::c_void,
-                (&mut vin) as *mut u64 as *mut std::ffi::c_void,
-                (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
-                (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
-                (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
-                (&mut hd) as *mut i32 as *mut std::ffi::c_void,
-                (&mut pos) as *mut i32 as *mut std::ffi::c_void,
-            ];
-            unsafe {
-                rvllm_fused::launch_raw(
-                    kernels.fn_kv_cache_write_bf16,
-                    (n_kv_heads as u32, 1, 1),
-                    (head_dim as u32, 1, 1),
-                    0, stream_u64, &args,
-                )?;
+            // Skip BF16 write under Nvfp4Only mode (k_ptr=0); the
+            // NVFP4 write below handles cache population. Without
+            // this guard, the kernel launches with a null pointer
+            // and segfaults.
+            if layer_kv.k_ptr != 0 {
+                let mut kin = k_in;
+                let mut vin = v_in;
+                let mut k_cache = layer_kv.k_ptr;
+                let mut v_cache = layer_kv.v_ptr;
+                let mut nkv = n_kv_heads;
+                let mut hd = head_dim;
+                let mut pos = slot_pos;
+                let args = [
+                    (&mut kin) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut vin) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pos) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_kv_cache_write_bf16,
+                        (n_kv_heads as u32, 1, 1),
+                        (head_dim as u32, 1, 1),
+                        0, stream_u64, &args,
+                    )?;
+                }
             }
             // Codex review #3: dual-write NVFP4 KV when the cache
             // is allocated. Required so prefill slots are populated
