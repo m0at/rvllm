@@ -98,6 +98,13 @@ pub struct Mistral35ForwardKernels {
     pub fn_qk_dot_bf16: KernelFn,
     pub qk_dot_gqa_bf16_mod: LoadedModule,
     pub fn_qk_dot_gqa_bf16: KernelFn,
+    // Codex #2 new review: batched chunk-prefill attention.
+    pub qk_dot_gqa_t_bf16_mod: LoadedModule,
+    pub fn_qk_dot_gqa_t_bf16: KernelFn,
+    pub softmax_inplace_f32_t_mod: LoadedModule,
+    pub fn_softmax_inplace_f32_t: KernelFn,
+    pub v_dot_gqa_t_bf16_mod: LoadedModule,
+    pub fn_v_dot_gqa_t_bf16: KernelFn,
     pub softmax_v_bf16_mod: LoadedModule,
     pub fn_softmax_v_bf16: KernelFn,
     pub softmax_inplace_f32_mod: LoadedModule,
@@ -315,6 +322,13 @@ pub struct Mistral35KvCache {
     /// Scratch F32 buffer for `qk_dot` output of shape
     /// `[n_q_heads, max_pos]`. Single allocation reused per layer.
     pub scores_f32_ptr: u64,
+    /// Codex #2 new review — batched chunk-prefill attention.
+    /// Scratch F32 buffer of shape `[t_strip_max, n_q_heads, max_pos]`
+    /// for the three batched-split kernels. Zero / null when the
+    /// chunked-prefill path is disabled (the legacy per-T loop still
+    /// uses `scores_f32_ptr` above).
+    pub scores_t_f32_ptr: u64,
+    pub t_strip_max: usize,
 }
 
 /// YaRN cos/sin tables resident on device (F32 layout). Built host-side
@@ -365,6 +379,11 @@ pub struct Mistral35RuntimeFlags {
     pub use_batched_rope: bool,
     pub use_batched_kv_write: bool,
     pub use_fa_prefill: bool,
+    // Codex #2 new review: batched split-kernel attention for chunk
+    // prefill. Keeps the legacy qk_dot + softmax + v_dot numerics
+    // bit-for-bit (no FA-2 reordering) but batches over a T strip
+    // so launches drop from T per layer to ceil(T/T_STRIP) × 3.
+    pub use_batched_attn_prefill: bool,
     // ── per-gemm_at_m call (per-layer × per-chunk) ──────────
     pub use_fused_w4a16: bool,
     pub use_fused_w4a16_mma: bool,
@@ -394,6 +413,7 @@ fn build_runtime_flags() -> Mistral35RuntimeFlags {
         use_batched_rope:          env_bool("RVLLM_MISTRAL35_BATCHED_ROPE", true),
         use_batched_kv_write:      env_bool("RVLLM_MISTRAL35_BATCHED_KV_WRITE", true),
         use_fa_prefill:            env_bool("RVLLM_MISTRAL35_FA_PREFILL", false),
+        use_batched_attn_prefill:  env_bool("RVLLM_MISTRAL35_BATCHED_ATTN_PREFILL", true),
         use_fused_w4a16:           env_bool("RVLLM_MISTRAL35_W4A16_FUSED", false),
         use_fused_w4a16_mma:       env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA", false),
         use_fused_w4a16_mma_v2:    env_bool("RVLLM_MISTRAL35_W4A16_FUSED_MMA_V2", false),
@@ -1129,6 +1149,17 @@ impl Mistral35Bringup {
             let qk_dot_gqa_bf16_mod = kernels.load_ptx("mistral35_qk_dot_gqa_bf16")?;
             let fn_qk_dot_gqa_bf16 = qk_dot_gqa_bf16_mod
                 .get_function("mistral35_qk_dot_gqa_bf16_kernel")?;
+            let qk_dot_gqa_t_bf16_mod = kernels.load_ptx("mistral35_qk_dot_gqa_t_bf16")?;
+            let fn_qk_dot_gqa_t_bf16 = qk_dot_gqa_t_bf16_mod
+                .get_function("mistral35_qk_dot_gqa_t_bf16_kernel")?;
+            let softmax_inplace_f32_t_mod =
+                kernels.load_ptx("mistral35_softmax_inplace_f32_t")?;
+            let fn_softmax_inplace_f32_t = softmax_inplace_f32_t_mod
+                .get_function("mistral35_softmax_inplace_f32_t_kernel")?;
+            let v_dot_gqa_t_bf16_mod =
+                kernels.load_ptx("mistral35_v_dot_gqa_t_bf16")?;
+            let fn_v_dot_gqa_t_bf16 = v_dot_gqa_t_bf16_mod
+                .get_function("mistral35_v_dot_gqa_t_bf16_kernel")?;
             let fn_qk_dot_bf16 = qk_dot_bf16_mod
                 .get_function("mistral35_qk_dot_bf16_kernel")?;
             let softmax_v_bf16_mod = kernels.load_ptx("mistral35_softmax_v_bf16")?;
@@ -1293,6 +1324,12 @@ impl Mistral35Bringup {
                 fn_qk_dot_bf16,
                 qk_dot_gqa_bf16_mod,
                 fn_qk_dot_gqa_bf16,
+                qk_dot_gqa_t_bf16_mod,
+                fn_qk_dot_gqa_t_bf16,
+                softmax_inplace_f32_t_mod,
+                fn_softmax_inplace_f32_t,
+                v_dot_gqa_t_bf16_mod,
+                fn_v_dot_gqa_t_bf16,
                 softmax_v_bf16_mod,
                 fn_softmax_v_bf16,
                 softmax_inplace_f32_mod,
@@ -1540,12 +1577,32 @@ impl Mistral35Bringup {
             let scores_bytes = arch.text.num_attention_heads * kv_max_pos * 4;
             let scores_region = arena_box.region(
                 "mistral35_scores_f32", scores_bytes, 16)?;
+            // Codex #2 new review — batched chunk-prefill attention.
+            // Allocates [t_strip_max, n_q_heads, max_pos] F32 only
+            // when batched prefill is enabled (cuts ~48 MiB of
+            // scratch for the M=1 hot path).
+            const T_STRIP_MAX: usize = 32;
+            let want_batched_prefill_local = std::env::var("RVLLM_MISTRAL35_BATCH_PREFILL")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(true);
+            let (scores_t_f32_ptr, t_strip_max) = if want_batched_prefill_local {
+                let bytes = T_STRIP_MAX
+                    * arch.text.num_attention_heads
+                    * kv_max_pos * 4;
+                let region = arena_box.region(
+                    "mistral35_scores_t_f32", bytes, 16)?;
+                (region.device_ptr(), T_STRIP_MAX)
+            } else {
+                (0u64, 0usize)
+            };
             let kv_cache_dev = Mistral35KvCache {
                 layers: kv_layers,
                 max_pos: kv_max_pos,
                 n_kv_heads: kv_n_heads,
                 head_dim: kv_head_dim,
                 scores_f32_ptr: scores_region.device_ptr(),
+                scores_t_f32_ptr,
+                t_strip_max,
             };
             eprintln!(
                 "[mistral35] kv cache allocated: layers={} max_pos={} \
@@ -6456,6 +6513,117 @@ impl Mistral35Bringup {
                         (hd_u, 1, 1),
                         smem, stream_u64, &args,
                     )?;
+                }
+            } else if runtime_flags().use_batched_attn_prefill
+                && kv_cache.scores_t_f32_ptr != 0
+                && kv_cache.t_strip_max > 0
+                && layer_kv_for_prefill.k_ptr != 0
+                && gqa_ratio == 12
+                && head_dim == 128
+                && t_count > 0
+            {
+                // Codex #2 new review: batched split-kernel attention.
+                // Numerically identical to the per-T attn_one path
+                // (same qk_dot → softmax → v_dot decomposition) but
+                // strips over T to amortise kernel launches.
+                let t_strip_max = kv_cache.t_strip_max;
+                let mut strip_start = 0usize;
+                while strip_start < t_count {
+                    let strip_len = (t_count - strip_start).min(t_strip_max);
+                    let pos_start_strip = pos_start + strip_start as i32;
+                    let max_past_len = pos_start_strip + strip_len as i32;
+
+                    // qk_dot_t: scores_t [strip_len, n_q, max_past_len]
+                    unsafe {
+                        let mut q_ptr =
+                            scr.q_out_t_ptr + (strip_start * n_q_bytes_per_row) as u64;
+                        let mut k_cache = layer_kv_for_prefill.k_ptr;
+                        let mut sc_ptr = kv_cache.scores_t_f32_ptr;
+                        let mut hd = head_dim;
+                        let mut nq = n_q_heads as i32;
+                        let mut nkv = n_kv_heads;
+                        let mut gr = gqa_ratio;
+                        let mut mp = max_past_len;
+                        let mut ps_strip = pos_start_strip;
+                        let mut tc = strip_len as i32;
+                        let mut isd = inv_sqrt_d;
+                        let args = [
+                            (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                            (&mut k_cache) as *mut u64 as *mut std::ffi::c_void,
+                            (&mut sc_ptr) as *mut u64 as *mut std::ffi::c_void,
+                            (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut nq) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut mp) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut ps_strip) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut tc) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                        ];
+                        let smem = (head_dim as u32) * 4;
+                        rvllm_fused::launch_raw(
+                            kernels.fn_qk_dot_gqa_t_bf16,
+                            (n_kv_heads as u32, max_past_len as u32, strip_len as u32),
+                            (head_dim as u32, 1, 1),
+                            smem, stream_u64, &args,
+                        )?;
+                    }
+                    // softmax_t in-place: scores_t [strip_len, n_q, max_past_len]
+                    unsafe {
+                        let mut sc_ptr = kv_cache.scores_t_f32_ptr;
+                        let mut nq = n_q_heads as i32;
+                        let mut mp = max_past_len;
+                        let mut tc = strip_len as i32;
+                        let args = [
+                            (&mut sc_ptr) as *mut u64 as *mut std::ffi::c_void,
+                            (&mut nq) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut mp) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut tc) as *mut i32 as *mut std::ffi::c_void,
+                        ];
+                        const TPB: u32 = 128;
+                        let smem = TPB * 4;
+                        rvllm_fused::launch_raw(
+                            kernels.fn_softmax_inplace_f32_t,
+                            (n_q_heads as u32, strip_len as u32, 1),
+                            (TPB, 1, 1),
+                            smem, stream_u64, &args,
+                        )?;
+                    }
+                    // v_dot_t: attn_out_t[strip_start..] [strip_len, n_q, head_dim]
+                    unsafe {
+                        let mut probs = kv_cache.scores_t_f32_ptr;
+                        let mut v_cache = layer_kv_for_prefill.v_ptr;
+                        let mut out_ptr =
+                            scr.attn_out_t_ptr + (strip_start * hidden_bytes) as u64;
+                        let mut hd = head_dim;
+                        let mut nq = n_q_heads as i32;
+                        let mut nkv = n_kv_heads;
+                        let mut gr = gqa_ratio;
+                        let mut mp = max_past_len;
+                        let mut tc = strip_len as i32;
+                        let args = [
+                            (&mut probs) as *mut u64 as *mut std::ffi::c_void,
+                            (&mut v_cache) as *mut u64 as *mut std::ffi::c_void,
+                            (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                            (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut nq) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut mp) as *mut i32 as *mut std::ffi::c_void,
+                            (&mut tc) as *mut i32 as *mut std::ffi::c_void,
+                        ];
+                        const TILE_T: u32 = 32;
+                        const G: u32 = 12;
+                        let hd_u = head_dim as u32;
+                        let smem = TILE_T * hd_u * 2 + G * TILE_T * 4;
+                        rvllm_fused::launch_raw(
+                            kernels.fn_v_dot_gqa_t_bf16,
+                            (n_kv_heads as u32, strip_len as u32, 1),
+                            (hd_u, 1, 1),
+                            smem, stream_u64, &args,
+                        )?;
+                    }
+                    strip_start += strip_len;
                 }
             } else {
                 // Per-query attention loop, writing to attn_out_t row t.
