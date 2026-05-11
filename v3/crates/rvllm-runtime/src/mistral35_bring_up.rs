@@ -104,6 +104,8 @@ pub struct Mistral35ForwardKernels {
     pub fn_fa_decode_gqa_bf16: KernelFn,
     pub kv_cache_write_nvfp4_bf16_mod: LoadedModule,
     pub fn_kv_cache_write_nvfp4_bf16: KernelFn,
+    pub fa_decode_gqa_nvfp4kv_bf16_mod: LoadedModule,
+    pub fn_fa_decode_gqa_nvfp4kv_bf16: KernelFn,
     // W4A16 NVFP4 path (Mistral 3.5 checkpoint format): dequantize
     // weight blocks to BF16 then run `cublasLt bf16_gemm_f32`. The
     // legacy W4A4 (CUTLASS NVFP4 tensor-core) path is kept compiled
@@ -1026,6 +1028,10 @@ impl Mistral35Bringup {
                 kernels.load_ptx("mistral35_kv_cache_write_nvfp4_bf16")?;
             let fn_kv_cache_write_nvfp4_bf16 = kv_cache_write_nvfp4_bf16_mod
                 .get_function("mistral35_kv_cache_write_nvfp4_bf16_kernel")?;
+            let fa_decode_gqa_nvfp4kv_bf16_mod =
+                kernels.load_ptx("mistral35_fa_decode_gqa_nvfp4kv_bf16")?;
+            let fn_fa_decode_gqa_nvfp4kv_bf16 = fa_decode_gqa_nvfp4kv_bf16_mod
+                .get_function("mistral35_fa_decode_gqa_nvfp4kv_bf16_kernel")?;
             let nvfp4_dequant_weights_bf16_mod =
                 kernels.load_ptx("nvfp4_dequant_weights_bf16")?;
             let fn_nvfp4_dequant_weights_bf16 = nvfp4_dequant_weights_bf16_mod
@@ -1104,6 +1110,8 @@ impl Mistral35Bringup {
                 fn_fa_decode_gqa_bf16,
                 kv_cache_write_nvfp4_bf16_mod,
                 fn_kv_cache_write_nvfp4_bf16,
+                fa_decode_gqa_nvfp4kv_bf16_mod,
+                fn_fa_decode_gqa_nvfp4kv_bf16,
                 nvfp4_dequant_weights_bf16_mod,
                 fn_nvfp4_dequant_weights_bf16,
                 f32_to_bf16_mod,
@@ -1213,25 +1221,17 @@ impl Mistral35Bringup {
             //   max_pos * n_kv * head_dim / 16 bytes scale
             //   = 4096 * 8 * 128 / 16 = 256 KB
             // → ~2.25 MB per layer × 88 layers = ~200 MB extra arena.
-            // Codex review #5: `RVLLM_MISTRAL35_NVFP4_KV=1` is
-            // accepted at bring-up but the read/write dispatch is
-            // still gated off in `attention_step`, so setting the
-            // env without the read path would silently waste ~400 MB
-            // of arena. Fail-fast until the FA-decode-NVFP4 read
-            // variant lands together with the dispatch wiring.
+            // `RVLLM_MISTRAL35_NVFP4_KV=1` enables the end-to-end
+            // NVFP4 KV cache path (codex review #3):
+            //   * per-layer NVFP4 packed + scale buffers allocated
+            //     alongside (currently in place of) the BF16 cache
+            //   * `attention_step` dispatches the NVFP4 KV-write
+            //     kernel + the FA-decode-NVFP4 read kernel
+            // Default OFF; opt-in until soak-tested against the
+            // BF16 baseline at multiple past_len ranges.
             let want_nvfp4_kv = std::env::var("RVLLM_MISTRAL35_NVFP4_KV")
                 .ok().as_deref().map(|s| s != "0" && !s.is_empty())
                 .unwrap_or(false);
-            if want_nvfp4_kv {
-                return Err(corrupt(
-                    paths.model_dir.clone(),
-                    "RVLLM_MISTRAL35_NVFP4_KV is set but the read/write \
-                     dispatch is not yet wired (the FA-decode-NVFP4 read \
-                     variant is the pending piece — see \
-                     MISTRAL35_BATCHED_PREFILL_PLAN.md). Unset the env or \
-                     wait for the integration commit.".into(),
-                ));
-            }
             let per_layer_packed_bytes =
                 kv_max_pos * kv_n_heads * (kv_head_dim / 2);
             let per_layer_scale_bytes =
@@ -2158,18 +2158,42 @@ impl Mistral35Bringup {
                         &args, stream_u64,
                     )?;
                 }
-                // NVFP4 KV dual-write dispatch site (codex review #3
-                // follow-up) reserved for a later commit. Disabled
-                // until the FA-decode-NVFP4 read variant is also in
-                // place; an earlier draft revealed a vision E2E
-                // regression on the orange-ball prompt when dual-write
-                // ran without the matching read path. Cause not yet
-                // root-caused: candidates are (a) silent OOB in the
-                // pack kernel, (b) stream-ordering interaction with
-                // the subsequent qk_dot read, (c) E4M3 saturation of
-                // an outlier vision-K scale. The kernel + scratch
-                // are committed so the dispatch + read-side land as
-                // one self-contained commit when ready.
+                // Codex review #3 — end-to-end NVFP4 KV cache.
+                // Dual-write: BF16 (above) stays authoritative so the
+                // existing split-kernel decode path keeps working
+                // when FA-decode-NVFP4 isn't picked; NVFP4 lands
+                // alongside so the fa_decode_nvfp4kv read kernel
+                // (dispatched below) sees fresh data at every slot.
+                if layer_kv.k_nvfp4_packed_ptr != 0 {
+                    let mut kin_p = scr.k_out_ptr;
+                    let mut vin_p = scr.v_out_ptr;
+                    let mut k_pk = layer_kv.k_nvfp4_packed_ptr;
+                    let mut k_sc = layer_kv.k_nvfp4_scale_ptr;
+                    let mut v_pk = layer_kv.v_nvfp4_packed_ptr;
+                    let mut v_sc = layer_kv.v_nvfp4_scale_ptr;
+                    let mut nkv2 = n_kv_heads_attn;
+                    let mut hd2 = head_dim_attn;
+                    let mut pos2 = if attn_no_past { 0 } else { attn_position };
+                    let args_n = [
+                        (&mut kin_p) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut vin_p) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut k_pk) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut k_sc) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut v_pk) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut v_sc) as *mut u64 as *mut std::ffi::c_void,
+                        (&mut nkv2) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut hd2) as *mut i32 as *mut std::ffi::c_void,
+                        (&mut pos2) as *mut i32 as *mut std::ffi::c_void,
+                    ];
+                    unsafe {
+                        launch_kernel(
+                            kernels.fn_kv_cache_write_nvfp4_bf16,
+                            (n_kv_heads_attn as u32, 2, 1),
+                            ((head_dim_attn as u32) / 16, 1, 1),
+                            &args_n, stream_u64,
+                        )?;
+                    }
+                }
                 // Diagnostic bypass: if RVLLM_KV_BYPASS=1, ALSO do the
                 // copy via cuMemcpyDtoDAsync to verify whether the
                 // kernel above is a no-op. Slot offset = position * nkv * hd * 2.
@@ -2197,10 +2221,61 @@ impl Mistral35Bringup {
             // (b) qk_dot and (c) softmax_v entirely. Opt-in via
             // `RVLLM_MISTRAL35_FA_DECODE=1`; default OFF until
             // byte-identical smoke matrix passes.
+            //
+            // Codex review #3: NVFP4-KV variant — when the NVFP4 KV
+            // cache is wired up (RVLLM_MISTRAL35_NVFP4_KV=1), the FA
+            // decode kernel reads from the packed cache + dequants
+            // inline instead of BF16. Picked automatically when both
+            // gates are on; falls back to BF16-KV FA-decode if only
+            // FA_DECODE is set; falls all the way back to the legacy
+            // split kernels if neither.
             let use_fa_decode = std::env::var("RVLLM_MISTRAL35_FA_DECODE")
                 .ok().as_deref().map(|s| s != "0" && !s.is_empty())
                 .unwrap_or(false)
                 && gqa_ratio_attn == 12;
+            let use_nvfp4_kv = layer_kv.k_nvfp4_packed_ptr != 0;
+            if use_fa_decode && use_nvfp4_kv {
+                let mut q_ptr = scr.q_out_ptr;
+                let mut k_pk = layer_kv.k_nvfp4_packed_ptr;
+                let mut k_sc = layer_kv.k_nvfp4_scale_ptr;
+                let mut v_pk = layer_kv.v_nvfp4_packed_ptr;
+                let mut v_sc = layer_kv.v_nvfp4_scale_ptr;
+                let mut out_ptr = scr.attn_out_ptr;
+                let mut hd = head_dim_attn;
+                let mut nkv = n_kv_heads_attn;
+                let mut gr = gqa_ratio_attn;
+                let mut pl = past_len;
+                let mut isd = inv_sqrt_d;
+                let args_fa_nvfp4 = [
+                    (&mut q_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_pk) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_sc) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_pk) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_sc) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut out_ptr) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut hd) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut nkv) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut gr) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pl) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut isd) as *mut f32 as *mut std::ffi::c_void,
+                ];
+                const TILE_T: u32 = 32;
+                const G: u32 = 12;
+                let hd_u = head_dim_attn as u32;
+                let smem = G * hd_u * 2
+                         + TILE_T * hd_u * 2
+                         + TILE_T * hd_u * 2
+                         + hd_u * 4;
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_fa_decode_gqa_nvfp4kv_bf16,
+                        (n_kv_heads_attn as u32, 1, 1),
+                        (hd_u, 1, 1),
+                        smem, stream_u64, &args_fa_nvfp4,
+                    )?;
+                }
+                return Ok(());
+            }
             if use_fa_decode {
                 let mut q_ptr = scr.q_out_ptr;
                 let mut k_cache = layer_kv.k_ptr;
@@ -5028,8 +5103,45 @@ impl Mistral35Bringup {
                     (n_kv_heads as u32, 1, 1),
                     (head_dim as u32, 1, 1),
                     0, stream_u64, &args,
-                )
+                )?;
             }
+            // Codex review #3: dual-write NVFP4 KV when the cache
+            // is allocated. Required so prefill slots are populated
+            // for the FA-decode-NVFP4 read kernel at decode time;
+            // without this the decode kernel reads zeros from
+            // pre-prefill NVFP4 slots and the model output is
+            // garbled.
+            if layer_kv.k_nvfp4_packed_ptr != 0 {
+                let mut kin_p = k_in;
+                let mut vin_p = v_in;
+                let mut k_pk = layer_kv.k_nvfp4_packed_ptr;
+                let mut k_sc = layer_kv.k_nvfp4_scale_ptr;
+                let mut v_pk = layer_kv.v_nvfp4_packed_ptr;
+                let mut v_sc = layer_kv.v_nvfp4_scale_ptr;
+                let mut nkv2 = n_kv_heads;
+                let mut hd2 = head_dim;
+                let mut pos2 = slot_pos;
+                let args_n = [
+                    (&mut kin_p) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut vin_p) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_pk) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut k_sc) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_pk) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut v_sc) as *mut u64 as *mut std::ffi::c_void,
+                    (&mut nkv2) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut hd2) as *mut i32 as *mut std::ffi::c_void,
+                    (&mut pos2) as *mut i32 as *mut std::ffi::c_void,
+                ];
+                unsafe {
+                    rvllm_fused::launch_raw(
+                        kernels.fn_kv_cache_write_nvfp4_bf16,
+                        (n_kv_heads as u32, 2, 1),
+                        ((head_dim as u32) / 16, 1, 1),
+                        0, stream_u64, &args_n,
+                    )?;
+                }
+            }
+            Ok(())
         };
 
         // Per-query attention (M=1) reading slots [0..past_len) of
