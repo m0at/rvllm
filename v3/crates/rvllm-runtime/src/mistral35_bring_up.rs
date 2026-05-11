@@ -3855,16 +3855,34 @@ impl Mistral35Bringup {
             }
         };
 
+        // FIX: `vector_add_bf16_kernel` takes only 3 args `(dst, src, n)`
+        // — it computes `dst[i] += src[i]`. The previous closure passed
+        // 4 args `(dst, a, b, count)` to a 3-arg kernel; the kernel
+        // then read `b` (a u64 device pointer) at the `int n` slot —
+        // its lower 32 bits become the element count. Every process
+        // got a different effective `n` based on the per-process arena
+        // layout of `b`, which is the root cause of the binary-mode
+        // vision-flakiness bisected via `RVLLM_PIXTRAL_BLOCK0_FINE=1`.
+        //
+        // The two existing callers both pass `dst == b` (i.e.
+        // hidden = residual + hidden), so the in-place form
+        // `dst += src` produces the same intended result.
         let do_vector_add_bf16 = |dst: u64, a: u64, b: u64| -> Result<()> {
+            // Both callers happen to satisfy `dst == b`; this is a
+            // defensive sanity check rather than a load-bearing
+            // invariant. If a future caller passes a different
+            // shape, they should either copy b → dst first or use a
+            // proper 3-buffer add kernel.
+            debug_assert_eq!(dst, b,
+                "do_vector_add_bf16: in-place semantics require dst == b");
+            let _ = b;
             unsafe {
                 let mut d = dst;
-                let mut aa = a;
-                let mut bb = b;
+                let mut s = a;
                 let mut count = (n * v_hidden) as i32;
-                let args: [*mut std::ffi::c_void; 4] = [
+                let args: [*mut std::ffi::c_void; 3] = [
                     (&mut d) as *mut u64 as *mut _,
-                    (&mut aa) as *mut u64 as *mut _,
-                    (&mut bb) as *mut u64 as *mut _,
+                    (&mut s) as *mut u64 as *mut _,
                     (&mut count) as *mut i32 as *mut _,
                 ];
                 let blocks = ((count as u32) + 1023) / 1024;
@@ -3919,20 +3937,48 @@ impl Mistral35Bringup {
                 )?;
             }
 
+            // Block-0 fine-grained dumps for the vision-flakiness
+            // bisect. Gated by `RVLLM_PIXTRAL_BLOCK0_FINE=1`.
+            let block0_fine = block_idx == 0
+                && std::env::var("RVLLM_PIXTRAL_BLOCK0_FINE").ok()
+                    .as_deref().map(|s| s != "0" && !s.is_empty())
+                    .unwrap_or(false);
+            let fine_dump_fn = |stage: &str, ptr: u64, bytes: usize| -> Result<()> {
+                if !block0_fine { return Ok(()); }
+                if let Some(ref d) = dump_dir {
+                    stream.fence()?;
+                    let mut host = vec![0u8; bytes];
+                    unsafe {
+                        use cudarc::driver::sys::*;
+                        let _ = cuMemcpyDtoH_v2(
+                            host.as_mut_ptr() as *mut _,
+                            ptr, bytes);
+                    }
+                    let _ = std::fs::write(d.join(format!("blk0_{stage}.bin")), &host);
+                }
+                Ok(())
+            };
+            fine_dump_fn("post_norm", hidden_region.device_ptr(), hidden_bytes)?;
+
             // q,k,v projections.
             do_gemm(hidden_region.device_ptr(), layer.q_proj.offset_bytes,
                     q_region.device_ptr(),
                     n as i32, v_hidden as i32, v_hidden as i32)?;
+            fine_dump_fn("post_q", q_region.device_ptr(), hidden_bytes)?;
             do_gemm(hidden_region.device_ptr(), layer.k_proj.offset_bytes,
                     k_region.device_ptr(),
                     n as i32, v_hidden as i32, v_hidden as i32)?;
+            fine_dump_fn("post_k", k_region.device_ptr(), hidden_bytes)?;
             do_gemm(hidden_region.device_ptr(), layer.v_proj.offset_bytes,
                     v_region.device_ptr(),
                     n as i32, v_hidden as i32, v_hidden as i32)?;
+            fine_dump_fn("post_v", v_region.device_ptr(), hidden_bytes)?;
 
             // 2D RoPE on Q + K (in-place).
             do_pixtral_rotary(q_region.device_ptr())?;
             do_pixtral_rotary(k_region.device_ptr())?;
+            fine_dump_fn("post_rope_q", q_region.device_ptr(), hidden_bytes)?;
+            fine_dump_fn("post_rope_k", k_region.device_ptr(), hidden_bytes)?;
 
             // QK^T batched-strided over heads → scores_f32 [H, N, N].
             unsafe {
@@ -3970,6 +4016,9 @@ impl Mistral35Bringup {
                 )?;
             }
 
+            fine_dump_fn("post_scores_f32", scores_f32_region.device_ptr(),
+                         n_heads * n * n * 4)?;
+
             // Per-row softmax → scores_bf16 [H, N, N]. Launch grid =
             // H*N rows; the kernel handles each row independently.
             unsafe {
@@ -3989,6 +4038,9 @@ impl Mistral35Bringup {
                     0, stream_u64, &args,
                 )?;
             }
+
+            fine_dump_fn("post_softmax", scores_bf16_region.device_ptr(),
+                         n_heads * n * n * 2)?;
 
             // Transpose V from [N, H*D] → [H, D, N] head-major.
             unsafe {
@@ -4073,10 +4125,13 @@ impl Mistral35Bringup {
                 )?;
             }
 
+            fine_dump_fn("post_attn_out", attn_out_region.device_ptr(), hidden_bytes)?;
+
             // O proj: hidden = attn_out @ W_o^T (overwrite hidden_region).
             do_gemm(attn_out_region.device_ptr(), layer.o_proj.offset_bytes,
                     hidden_region.device_ptr(),
                     n as i32, v_hidden as i32, v_hidden as i32)?;
+            fine_dump_fn("post_o", hidden_region.device_ptr(), hidden_bytes)?;
 
             // residual += hidden  (= residual + attn_out @ W_o^T)
             // hidden_region = residual + hidden_region
@@ -4085,6 +4140,7 @@ impl Mistral35Bringup {
                 residual_region.device_ptr(),
                 hidden_region.device_ptr(),
             )?;
+            fine_dump_fn("post_residual1", hidden_region.device_ptr(), hidden_bytes)?;
 
             // Save residual2.
             do_copy_bf16(
@@ -4107,13 +4163,19 @@ impl Mistral35Bringup {
                 )?;
             }
 
+            fine_dump_fn("post_ffn_norm", hidden_region.device_ptr(), hidden_bytes)?;
+
             // gate / up GEMMs (out shape [N, intermediate]).
             do_gemm(hidden_region.device_ptr(), layer.gate_proj.offset_bytes,
                     mlp_gate_region.device_ptr(),
                     n as i32, intermediate as i32, v_hidden as i32)?;
+            fine_dump_fn("post_gate", mlp_gate_region.device_ptr(),
+                         n * intermediate * 2)?;
             do_gemm(hidden_region.device_ptr(), layer.up_proj.offset_bytes,
                     mlp_up_region.device_ptr(),
                     n as i32, intermediate as i32, v_hidden as i32)?;
+            fine_dump_fn("post_up", mlp_up_region.device_ptr(),
+                         n * intermediate * 2)?;
 
             // GeLU·gate * up → mlp_gate (in place).
             unsafe {
