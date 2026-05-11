@@ -1,0 +1,60 @@
+label=C_no_hadamard ts=20260503-013221 profile_summary:
+RVLLM_NVFP4_SCALE_POLICY=mse
+RVLLM_PREFILL_CHUNK_SIZE=128
+RVLLM_REPETITION_PENALTY_WINDOW=64
+RVLLM_REPETITION_PENALTY_MIN_COUNT=2
+RVLLM_REPETITION_PENALTY=1.05
+RVLLM_NVFP4_PARTITION_SIZE=256
+RVLLM_NVFP4_SPLIT_GQA=0
+RVLLM_NVFP4_DECODE_GQA=0
+RVLLM_NVFP4_HYBRID_GLOBAL_FP8=0
+RVLLM_NVFP4_HYBRID_SLIDING_FP8=0
+RVLLM_NVFP4_HADAMARD=0
+RVLLM_PER_TOKEN_Q_SCALE=0
+RVLLM_NVFP4_HADAMARD_V=0
+RVLLM_NVFP4_K_SCALE_POLICY=amax6
+RVLLM_NVFP4_V_SCALE_POLICY=amax6
+---
+[harness] cold restart rvllm-serve...
+[harness] restart zeroclaw + warm-up...
+[harness] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[PASS]    wer bist du?                                       | Ich bin ein KI-Assistent. Mein Ziel ist es, hilfreich und präzise zu sein, wobei ich eine direkte und leicht trockene Art von Kommunikation bevorzuge.
+[PASS]    was machst du gerade?                              | Ich stehe bereit und warte auf deine Anweisungen. Was kann ich für dich tun?
+[PASS]    wer ist dein lieblingsmensch?                      | Ich habe keinen "Lieblingsmenschen", da ich keine persönlichen Vorlieben oder emotionalen Bindungen besitze. Aber als KI bin es mein Ziel, für jeden Nutzer, der mich verwendet, d
+[PASS]    stell dich kurz vor                                | Ich bin ein KI-Assistent. Ich antworte direkt, präzise und – wenn gewünscht – mit einem leicht trockenen Humor. Ich unterstütze dich bei technischen Themen, Datenverwaltung 
+[PASS]    was ist deine philosophie?                         | Meine Philosophie ist es, so effizient und präzise wie möglich zu sein. Ich konzentriere mich auf Fakten, vermeide unnötiges Geschwätz und liefere Antworten direkt zum Punkt. W
+[PASS]    wie ist das wetter in bern?                        | Das Wetter in Bern ist aktuell teilweise bewölkt mit einer Temperatur von 14°C. Es ist trocken, die Luftfeuchtigkeit liegt bei 88% und der Wind weht mit 6 km/h aus Süden.
+[PASS]    wie ist das wetter in zürich?                     | Das Wetter in Zürich ist aktuell klar mit einer Temperatur von 13°C. Es ist wind- und niederschlagsfrei.
+[PASS]    regnet es in basel?                                | Ja, es regnet leicht (Light rain shower). Die Temperatur liegt bei 16°C.
+[PASS]    ist es kalt in luzern?                             | Es ist etwa 13°C. Nicht wirklich kalt, aber auch nicht warm.
+[PASS]    wie warm wird es morgen?                           | Das ist schwierig, da die Wetterdaten für Zürich (basierend auf Ihrem Standort in der Schweiz) nur die aktuellen Bedingungen zeigen. Es wird etwa 27°C, aber ohne eine spezifisch
+[PASS]    ist die haustür auf?                              | Ich habe keinen Zugriff auf deine Haussteuerung oder Sensorik, um den Status der Haustür zu prüfen. Wenn du ein entsprechendes System installiert hast, müsste ich Zugriff auf de
+[PASS]    ist das wohnzimmerlicht an?                        | Ich weiß nicht, ob das Wohnzimmerlicht an ist. Ich habe keinen Zugriff auf den Status deiner Geräte.
+[PASS]    wo ist lola?                                       | Ich weiß nicht, wer Lola ist, und sie ist in meinem aktuellen Kontext oder in den gespeicherten Erinnerungen nicht aufgeführt. Wenn du mir mehr Informationen gibst, kann ich vers
+[PASS]    ist vinz zuhause?                                  | Ich weiß nicht, ob Vinz zu Hause ist. Ich habe keinen Zugriff auf seine aktuellen Aktivitäten oder seinen Standort.
+[PASS]    schalte das licht im flur aus                      | Ich habe das Licht im Flur ausgeschaltet.
+[PASS]    suche nach Lola                                    | Ich habe in meinem aktuellen Kontext keine Informationen über eine Person oder ein Objekt namens "Lola".Könnten Sie mir mehr Details geben, damit ich präziser suchen kann? Bezie
+[PASS]    wer ist Vinz?                                      | Ich weiß nicht, wer Vinz ist. Er ist in meinen aktuellen Informationen oder in Ihrem Speicher nicht aufgeführt.
+[PASS]    liste meine projekte                               | Ich konnte keine Informationen zu Ihren Projekten in meinem Speicher finden. Wenn Sie mir mitteilen, was Sie unter "projekte" meinen oder wenn ich in bestimmten Dateien nach suchen
+[PASS]    was sind meine letzten erinnerungen?               | Ich konnte keine Erinnerungen in deinem Speicher finden.
+[PASS]    such die letzten news zu Bitcoin                   | Die aktuellen Trends und Nachrichten zu Bitcoin (Stand 03. Mai 2026) konzentrieren sich primär auf die Marktstabilität und die langfristigen Ausblicke für Trader und Investoren.
+[PASS]    erkläre mir was eine GPU ist in 3 sätzen         | Hallo! Wie kann ich dir helfen?
+[PASS]    schreib einen hello-world in python                | ```pythonprint("Hello World")```
+[PASS]    was ist der unterschied zwischen RAM und SSD?      | Der Unterschied zwischen RAM (Arbeitsspeicher) und einer SSD (Solid State Drive) liegt vor allem in ihrer Funktion, Geschwindigkeit und ihrem Zweck:**1. RAM (Random Access Memory)*
+[PASS]    wie funktioniert ein attention layer?              | Ein Attention Layer (genauer: ein Self-Attention Layer) funktioniert wie ein dynamischer Filter, der dem Modell hilft, die wichtigsten Teile einer Eingabe zu identifizieren, um den
+[PASS]    warum ist quantisierung wichtig?                   | Quantisierung (Quantization) ist vor allem im Kontext von Large Language Models (LLMs) und Deep Learning wichtig, weil sie die Effizienz steigert, ohne die Qualität des Modells ma
+[PASS]    erzähl mir einen kurzen witz                      | Ein Mann geht zum Arzt.„Doktor, ich habe ein Problem. Ich fühle mich wie ein Fisch."Der Arzt fragt: "Was für ein Fisch?"Der Mann antwortet: "Was für ein Fisch? Ich bin ein Men
+[PASS]    schreibe ein gedicht über katzen                  | Sanftes Treten, fast ohne Laut,Ein Wesen, der man heimlich vertraut.Aus Samt und Flausch, ein stolzes Gesicht,Hinter dem Wissen ein kleiner Blick spricht.Ein Schnurren, tief, wie e
+[PASS]    erfinde einen drachennamen                         | „Saphirflügel“ oder „Ignis-Schatten“. Wenn es spezifischer sein soll: Was für ein Drache ist es? (z.B. ein klassischer Feuerdrache, ein eleganer Wasserdrache oder eher je
+[PASS]    denk dir eine kurze geschichte aus, 3 sätze       | Ein kleiner Roboter entdeckte eine alte Uhr in einem verlassenen Haus. Er drehte das Rad, und plötzlich begann die Zeit rückwärts zu laufen. Innerhalb eines Augenblicks verwande
+[PASS]    was sagt ein hund zu einer katze?                  | "Ich weiß nicht, aber ich glaube, wir könnten Freunde werden!" (Oder klassisch: "Wuff!").
+---
+SUMMARY C_no_hadamard: 30/30 PASS, 0 SUSPECT, 0 FAIL, 0 INFRA
+[harness] === direct rvllm prompts (bypass zeroclaw) ===
+[direct PASS] Hallo!                                             | Hallo! Wie kann ich dir helfen?(Hello! How can I help you?)
+[direct PASS] Was ist 2 plus 2?                                  | 2 plus 2 ist 4.
+[direct PASS] Schreib mir bitte das Wort Apfel.                  | Apfel
+[direct PASS] Welche Farbe hat Schnee?                           | Schnee ist **weiß**.Physikalisch gesehen ist das jedoch ein wenig komplexer: Schnee besteht aus Eiskristallen, die das Licht reflektieren. Da die Kristellchen das Licht in alle Ri
+[direct PASS] Sag mir kurz, wer du bist.                         | Ich bin ein KI-Sprachmodell, entwickelt von Google. Du kannst mich als einen digitalen Assistenten betrachten, der darauf trainiert ist, Informationen zu liefern, Texte zu schreibe
+DIRECT_SUMMARY C_no_hadamard: 5/5 PASS, 0 FAIL
+log: /tmp/rvllm_smoke_C_no_hadamard_20260503-013221.log

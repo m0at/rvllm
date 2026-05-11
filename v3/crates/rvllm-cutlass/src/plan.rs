@@ -27,14 +27,18 @@ impl Fp8GemmPlan {
         k: u32,
         dtype: DType,
     ) -> Result<Self> {
-        match policy.lookup(m as usize, n as usize, k as usize, dtype) {
-            Ok(entry) => Ok(Self {
-                variant: entry.variant,
-                m, n, k, dtype,
-                workspace_bytes: entry.workspace_bytes,
-            }),
-            Err(_) => Ok(Self::default_plan(m, n, k, dtype)),
-        }
+        // Codex28-2: lookup miss is a hard error, not a silent fallback.
+        // The previous Err(_) → default_plan() pattern contradicted the
+        // bring_up.rs:222 contract ("typed AutotuneCacheMiss; engine
+        // refuses the shape"). Falling back to VariantId(0) + 16 MiB
+        // hides missing/wrong policy data and produces hard-to-attribute
+        // launch errors instead of a clear miss at startup.
+        let entry = policy.lookup(m as usize, n as usize, k as usize, dtype)?;
+        Ok(Self {
+            variant: entry.variant,
+            m, n, k, dtype,
+            workspace_bytes: entry.workspace_bytes,
+        })
     }
 
     /// Plan for a residual-epilogue GEMM. Uses `Policy::lookup_residual`
@@ -47,22 +51,13 @@ impl Fp8GemmPlan {
         k: u32,
         dtype: DType,
     ) -> Result<Self> {
-        match policy.lookup_residual(m as usize, n as usize, k as usize, dtype) {
-            Ok(entry) => Ok(Self {
-                variant: entry.variant,
-                m, n, k, dtype,
-                workspace_bytes: entry.workspace_bytes,
-            }),
-            Err(_) => Ok(Self::default_plan(m, n, k, dtype)),
-        }
-    }
-
-    fn default_plan(m: u32, n: u32, k: u32, dtype: DType) -> Self {
-        Self {
-            variant: VariantId(0),
+        // Codex28-2: same contract as from_policy — propagate the miss.
+        let entry = policy.lookup_residual(m as usize, n as usize, k as usize, dtype)?;
+        Ok(Self {
+            variant: entry.variant,
             m, n, k, dtype,
-            workspace_bytes: 16 * 1024 * 1024,
-        }
+            workspace_bytes: entry.workspace_bytes,
+        })
     }
 
     /// Raise an error if `available` workspace is insufficient for the

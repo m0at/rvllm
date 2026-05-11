@@ -13,7 +13,37 @@ pub struct PinnedBuf<T> {
 
 unsafe impl<T: Send> Send for PinnedBuf<T> {}
 
-impl<T: Default + Clone> PinnedBuf<T> {
+/// Marker for `PinnedBuf` element types: any `T` whose all-zero bit
+/// pattern is a valid `T` value. The CUDA branch zero-fills the
+/// allocation with `cuMemAllocHost_v2` + `write_bytes(0)`, so we
+/// must NOT accept arbitrary `T: Default + Clone` (e.g. `String` or
+/// any type with a non-zero default would observe an
+/// uninitialised `T`). All numeric primitives, packed POD-like
+/// structs of numerics, and similar are valid; reference / heap-owning
+/// types are not.
+///
+/// We mirror the safety contract of `bytemuck::Zeroable` without
+/// pulling in the dep: implementer asserts zero bits = valid value.
+///
+/// # Safety
+/// Implementer asserts the all-zero bit pattern is a valid value of
+/// `Self`.
+pub unsafe trait PinnedZeroable {}
+
+unsafe impl PinnedZeroable for u8 {}
+unsafe impl PinnedZeroable for u16 {}
+unsafe impl PinnedZeroable for u32 {}
+unsafe impl PinnedZeroable for u64 {}
+unsafe impl PinnedZeroable for usize {}
+unsafe impl PinnedZeroable for i8 {}
+unsafe impl PinnedZeroable for i16 {}
+unsafe impl PinnedZeroable for i32 {}
+unsafe impl PinnedZeroable for i64 {}
+unsafe impl PinnedZeroable for isize {}
+unsafe impl PinnedZeroable for f32 {}
+unsafe impl PinnedZeroable for f64 {}
+
+impl<T: Default + Clone + PinnedZeroable> PinnedBuf<T> {
     /// Allocate via `cuMemAllocHost_v2` when cuda feature is on;
     /// otherwise a heap Box<[T]>.
     pub fn new(len: usize) -> Result<Self> {
@@ -29,6 +59,25 @@ impl<T: Default + Clone> PinnedBuf<T> {
         #[cfg(feature = "cuda")]
         {
             use cudarc::driver::sys::*;
+            // `cuMemAllocHost_v2` requires a current CUDA context on the
+            // calling thread. Callers that use this type via the engine's
+            // normal bring-up path already have one; direct consumers
+            // (including the unit tests in this crate, which is how the
+            // workspace `cargo test` tripped here — rvllm-mem tests run
+            // after rvllm-loader leaves no CUDA state behind) don't. Do
+            // a one-shot init + primary-context retain so the allocation
+            // succeeds deterministically. Both calls are idempotent and
+            // safe to run many times per process.
+            unsafe {
+                let _ = cuInit(0);
+                let mut dev: CUdevice = 0;
+                if cuDeviceGet(&mut dev, 0) == CUresult::CUDA_SUCCESS {
+                    let mut ctx: CUcontext = core::ptr::null_mut();
+                    if cuDevicePrimaryCtxRetain(&mut ctx, dev) == CUresult::CUDA_SUCCESS {
+                        let _ = cuCtxSetCurrent(ctx);
+                    }
+                }
+            }
             let bytes = len * core::mem::size_of::<T>();
             let mut p: *mut core::ffi::c_void = core::ptr::null_mut();
             let r = unsafe { cuMemAllocHost_v2(&mut p, bytes) };
@@ -123,7 +172,7 @@ pub struct PinnedPool<T> {
     write_idx: u8,
 }
 
-impl<T: Default + Clone> PinnedPool<T> {
+impl<T: Default + Clone + PinnedZeroable> PinnedPool<T> {
     pub fn new(len_per_buf: usize) -> Result<Self> {
         Ok(Self {
             buffers: [PinnedBuf::new(len_per_buf)?, PinnedBuf::new(len_per_buf)?],

@@ -45,15 +45,17 @@ if ! curl -sf "${BASE_URL}/health" > /dev/null 2>&1; then
 
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
     PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+    # The active workspace is v3/; binary is `rvllm-server`.
+    V3="${PROJECT_ROOT}/v3"
 
-    if [ -f "${PROJECT_ROOT}/target/release/rvllm" ]; then
-        BIN="${PROJECT_ROOT}/target/release/rvllm"
-    elif [ -f "${PROJECT_ROOT}/target/debug/rvllm" ]; then
-        BIN="${PROJECT_ROOT}/target/debug/rvllm"
+    if [ -f "${V3}/target/release/rvllm-server" ]; then
+        BIN="${V3}/target/release/rvllm-server"
+    elif [ -f "${V3}/target/debug/rvllm-server" ]; then
+        BIN="${V3}/target/debug/rvllm-server"
     else
-        echo "[smoke] building rvllm..."
-        (cd "$PROJECT_ROOT" && cargo build -p rvllm 2>&1)
-        BIN="${PROJECT_ROOT}/target/debug/rvllm"
+        echo "[smoke] building rvllm-server..."
+        (cd "$V3" && cargo build --bin rvllm-server 2>&1)
+        BIN="${V3}/target/debug/rvllm-server"
     fi
 
     if [ ! -x "$BIN" ]; then
@@ -61,8 +63,19 @@ if ! curl -sf "${BASE_URL}/health" > /dev/null 2>&1; then
         exit 1
     fi
 
-    echo "[smoke] starting server: $BIN serve --model mock-model --port $PORT"
-    "$BIN" serve --model mock-model --host 0.0.0.0 --port "$PORT" &
+    # The current CLI takes `--model-dir DIR --bind ADDR:PORT`, no
+    # `serve` subcommand. The smoke test needs an actual model
+    # directory; if RVLLM_SMOKE_MODEL_DIR is set, use it. Otherwise
+    # require an already-running server (the early reachability
+    # check above) — there's no mock-model for the live server path.
+    if [ -z "${RVLLM_SMOKE_MODEL_DIR:-}" ]; then
+        echo "[smoke] ERROR: no server reachable at ${BASE_URL} and \
+RVLLM_SMOKE_MODEL_DIR not set; can't auto-start. \
+Either start rvllm-server manually or export RVLLM_SMOKE_MODEL_DIR=/path/to/model."
+        exit 1
+    fi
+    echo "[smoke] starting server: $BIN --model-dir $RVLLM_SMOKE_MODEL_DIR --bind 0.0.0.0:$PORT"
+    "$BIN" --model-dir "$RVLLM_SMOKE_MODEL_DIR" --bind "0.0.0.0:$PORT" &
     SERVER_PID=$!
 
     # Wait for server to be ready (up to 10 seconds)
@@ -131,10 +144,10 @@ RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${BASE_URL}/v1/chat/completions"
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
 check "POST /v1/chat/completions" "$HTTP_CODE" 200
 
-# -- Test 5: Metrics endpoint -----------------------------------------------
-echo "--- Test 5: Metrics endpoint ---"
-HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "${BASE_URL}/metrics")
-check "GET /metrics" "$HTTP_CODE" 200
+# Test 5 was a `/metrics` HTTP probe but the current router (see
+# `v3/crates/rvllm-serve/src/router.rs`) doesn't expose one. Removed
+# rather than left as a guaranteed-fail check. If/when a metrics
+# endpoint lands, re-add the probe alongside its router registration.
 
 # -- Summary -----------------------------------------------------------------
 echo ""

@@ -174,24 +174,35 @@ impl<'ctx> HbmArena<'ctx> {
         align: usize,
     ) -> Result<Region<'a>> {
         let align = align.max(1);
-        let prev = self.used.load(Ordering::Acquire);
-        let aligned_start = prev.next_multiple_of(align);
-        let end = aligned_start.checked_add(bytes).ok_or_else(|| {
-            RvllmError::cuda(
-                "HbmArena::region",
-                CudaErrorKind::AllocFailed,
-                CudaCtx::setup(),
-            )
-        })?;
-        if end > self.capacity {
-            return Err(RvllmError::cuda(
-                "HbmArena::region",
-                CudaErrorKind::AllocFailed,
-                CudaCtx::setup(),
-            ));
-        }
-        // Monotonic bump; no contention in the single-worker model.
-        self.used.store(end, Ordering::Release);
+        // CAS-loop allocation: load the current high-water, compute
+        // an aligned new high-water, and store it only if `used` is
+        // still at the value we observed. The earlier load+store
+        // pair was racy — two concurrent callers could both see the
+        // same `prev` and hand out overlapping regions. This is a
+        // latent bug today (the worker is single-threaded), but the
+        // public type derives Send + Sync via its fields, so the
+        // borrow-checker would not stop a second consumer from
+        // calling `region` from another thread. Make the
+        // bookkeeping match the type signature.
+        let mut aligned_start = 0usize;
+        self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+                let start = prev.next_multiple_of(align);
+                let end = start.checked_add(bytes)?;
+                if end > self.capacity {
+                    return None;
+                }
+                aligned_start = start;
+                Some(end)
+            })
+            .map_err(|_| {
+                RvllmError::cuda(
+                    "HbmArena::region",
+                    CudaErrorKind::AllocFailed,
+                    CudaCtx::setup(),
+                )
+            })?;
         Ok(Region {
             arena: self,
             name,

@@ -24,7 +24,14 @@ impl Stream {
     pub fn new(ctx: &CudaContextHandle) -> Result<Self> {
         use cudarc::driver::sys::*;
         let mut s: CUstream = std::ptr::null_mut();
-        let r = unsafe { cuStreamCreate(&mut s, CUstream_flags::CU_STREAM_NON_BLOCKING as u32) };
+        // CU_STREAM_DEFAULT (blocking, serializes with legacy default
+        // stream) instead of NON_BLOCKING. cublasLt occasionally
+        // schedules internal work on the legacy default stream;
+        // NON_BLOCKING let that work race past cuStreamSynchronize on
+        // our compute stream. With DEFAULT, our stream waits on the
+        // legacy default stream and vice-versa, so cuStreamSynchronize
+        // here drains all CUDA work — no cuCtxSynchronize needed.
+        let r = unsafe { cuStreamCreate(&mut s, 0u32) };
         if r != CUresult::CUDA_SUCCESS {
             return Err(RvllmError::cuda(
                 "cuStreamCreate",

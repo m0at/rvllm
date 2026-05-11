@@ -36,7 +36,7 @@ pub struct ShapeKey {
 }
 
 /// The full policy file.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Policy {
     pub revision: String,
     pub arch: String,

@@ -14,14 +14,35 @@
 # `git submodule update --init cutlass`).
 #
 # Usage:
-#   ./kernels/build_cutlass_sm120_so.sh           # defaults below
+#   ./kernels/build_cutlass_sm120_so.sh           # auto-detect via nvidia-smi
 #   ./kernels/build_cutlass_sm120_so.sh sm_121a   # override arch
 #   CUTLASS_DIR=/path/to/cutlass ./kernels/build_cutlass_sm120_so.sh
 
 set -euo pipefail
 
-ARCH=${1:-sm_120a}
+# Codex30-1: auto-detect compute capability so the default landing
+# directory matches what the runtime loader looks at. Earlier this
+# defaulted hard to sm_120a→kernels/sm_120/, which is correct on
+# RTX 5090 / RTX 6000 Blackwell but WRONG on DGX Spark / GB10
+# (sm_121a, loader searches kernels/sm_121/ only after Codex27-1).
+# Anyone running the helper without an explicit arg on a sm_121
+# host got CutlassBackend::Absent at runtime even after a "successful"
+# build. Auto-detect first, fall back to sm_120a if nvidia-smi can't
+# tell us (cross-build / CI without GPU).
+detect_arch() {
+    local cc
+    if cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '); then
+        case "$cc" in
+            12.0) echo "sm_120a"; return 0 ;;
+            12.1) echo "sm_121a"; return 0 ;;
+            12.2) echo "sm_122a"; return 0 ;;
+        esac
+    fi
+    echo "sm_120a"  # safe fallback — matches the older default
+}
+ARCH=${1:-$(detect_arch)}
 OUT_SUBDIR=${ARCH%a}   # sm_120a -> sm_120 for the per-arch kernel dir
+echo "  target arch: $ARCH (output: $OUT_SUBDIR/)"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$DIR/.." && pwd)"
@@ -52,10 +73,19 @@ OK=0
 FAIL=0
 OBJS=""
 
-# Sources that build the Blackwell-Geforce FP8 GEMM .so. Start with
-# one — add more (autotune variants, nvfp4, etc.) here as they land.
+# Sources that build the Blackwell-Geforce FP8 + NVFP4 GEMM .so.
+#
+# NVFP4 path (Mistral 3.5, sm_121a):
+#   - cutlass_nvfp4_gemm_sm120.cu        — main GEMM + SFA/SFB transforms
+#   - cutlass_nvfp4_prep_act_sm120.cu    — BF16/F16 → NVFP4 packed +
+#                                           per-token E4M3 SFA staging
+# Standalone-compiled clean against CUTLASS 4.5 (commit ae6bccf3); now
+# linked into the production .so so `CutlassBackend::require_nvfp4()`
+# resolves the full chain.
 SOURCES=(
     cutlass_fp8_gemm_blockscale_sm120.cu
+    cutlass_nvfp4_gemm_sm120.cu
+    cutlass_nvfp4_prep_act_sm120.cu
 )
 
 for f in "${SOURCES[@]}"; do

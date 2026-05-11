@@ -228,11 +228,18 @@ impl Gemma4Arch {
             // Sliding: full rotation of head_dim_sliding (256)
             Gemma4LayerType::SlidingAttention => self.head_dim_sliding,
             // Global: partial rotation of head_dim_global (512 * 0.25 = 128)
-            Gemma4LayerType::GlobalAttention => {
-                let rd = (self.head_dim_global as f32 * self.partial_rotary_factor_global) as usize;
-                (rd / 2) * 2 // ensure even
-            }
+            Gemma4LayerType::GlobalAttention => self.rotary_dim_global(),
         }
+    }
+
+    /// Cycle 50: rotary dim for global layers, derived from arch fields
+    /// only (no `layer_types[i]` consultation). Caller for the global
+    /// RoPE table should use this rather than `rotary_dim_for_layer(0)`
+    /// — the latter walks `layer_types[0]` which is sliding on Gemma 4
+    /// 31B, returning the wrong (sliding) rotary dim.
+    pub fn rotary_dim_global(&self) -> usize {
+        let rd = (self.head_dim_global as f32 * self.partial_rotary_factor_global) as usize;
+        (rd / 2) * 2 // ensure even
     }
 
     pub fn rope_theta_for_layer(&self, layer_idx: usize) -> f32 {

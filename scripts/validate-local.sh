@@ -199,30 +199,36 @@ fi
 # --- Step 2: cargo check with CUDA features ---
 echo ""
 echo "=== Step 2: Cargo Check (CUDA features) ==="
-cd /src
-if CUDA_ARCH="${ARCH_LIST[0]}" cargo check --workspace --features rvllm/cuda 2>&1 | tail -5; then
+# Active workspace is /src/v3 (mounted from repo root v3/). The
+# old `cd /src` + `cargo check --workspace --features rvllm/cuda`
+# missed Cargo.toml entirely AND referenced an obsolete `rvllm`
+# crate. Forward the CUDA path through the rvllm-runtime feature.
+cd /src/v3
+if CUDA_ARCH="${ARCH_LIST[0]}" cargo check --workspace --features rvllm-runtime/cuda 2>&1 | tail -5; then
     report "PASS" "cargo check --features cuda"
 else
     report "FAIL" "cargo check --features cuda"
 fi
 
-# --- Step 3: cargo test (mock-gpu, unit tests) ---
+# --- Step 3: cargo test (no-CUDA crates) ---
 echo ""
-echo "=== Step 3: Cargo Test (mock-gpu) ==="
-if cargo test --workspace 2>&1 | tail -10; then
-    report "PASS" "cargo test --workspace"
+echo "=== Step 3: Cargo Test (no-CUDA crates) ==="
+# CUDA-feature crates can't run in CI without a GPU; they're
+# excluded here.
+if cargo test --workspace --exclude rvllm-runtime --exclude rvllm-bench --exclude rvllm-serve 2>&1 | tail -10; then
+    report "PASS" "cargo test --workspace (no-cuda)"
 else
-    report "FAIL" "cargo test --workspace"
+    report "FAIL" "cargo test --workspace (no-cuda)"
 fi
 
 # --- Step 4 (--full only): Full release build ---
 if [ "$MODE" = "full" ]; then
     echo ""
     echo "=== Step 4: Release Build ==="
-    if CUDA_ARCH="${ARCH_LIST[0]}" cargo build --release --features cuda -p rvllm 2>&1 | tail -5; then
-        report "PASS" "cargo build --release --features cuda"
+    if CUDA_ARCH="${ARCH_LIST[0]}" cargo build --release --features cuda --bin rvllm-server 2>&1 | tail -5; then
+        report "PASS" "cargo build --release --features cuda --bin rvllm-server"
     else
-        report "FAIL" "cargo build --release --features cuda"
+        report "FAIL" "cargo build --release --features cuda --bin rvllm-server"
     fi
 fi
 

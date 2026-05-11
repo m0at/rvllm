@@ -92,6 +92,14 @@ class K2Weights:
         self.rope_theta = self.cfg["rope_theta"]
         self.rms_norm_eps = self.cfg["rms_norm_eps"]
         self.rope_scaling = self.cfg.get("rope_scaling", {})
+        # Read the model's declared positional ceiling from config so
+        # `model.py` can size RoPE tables to match instead of the
+        # previous hard-coded `max_seq=8192`. Falls back to 8192
+        # only when the field is genuinely absent (older configs).
+        # Above this position, `apply_rope` would IndexError.
+        self.max_position_embeddings = int(
+            self.cfg.get("max_position_embeddings", 8192)
+        )
         self.expert_cache_size = expert_cache_size
 
         index_path = model_dir / "model.safetensors.index.json"

@@ -107,21 +107,25 @@ pip3 install -q requests numpy scipy aiohttp pytest 2>/dev/null || true
 # --- Verify build ---
 echo ""
 echo "=== Verifying rvLLM build ==="
-if [ -f "Cargo.toml" ]; then
-    echo "Building (mock-gpu, no CUDA required)..."
-    cargo build --release -p rvllm 2>&1 | tail -3
+# The active workspace lives in v3/. The serve binary is `rvllm-server`
+# (from the rvllm-serve crate). Earlier versions had a single `rvllm`
+# crate with a `serve` subcommand; that's gone.
+if [ -f "v3/Cargo.toml" ]; then
+    echo "Building (no CUDA — see --features cuda for the GPU path)..."
+    (cd v3 && cargo build --release --bin rvllm-server) 2>&1 | tail -3
     echo ""
-    echo "[OK] rvLLM binary: $(ls -lh target/release/rvllm 2>/dev/null | awk '{print $5, $9}')"
+    echo "[OK] rvllm-server binary: $(ls -lh v3/target/release/rvllm-server 2>/dev/null | awk '{print $5, $9}')"
 else
-    echo "Run this script from the rvllm repo root."
+    echo "Run this script from the rvllm repo root (expects v3/Cargo.toml)."
 fi
 
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
-echo "  cargo build --release -p rvllm                 # Build (mock-gpu)"
-echo "  cargo build --release --features cuda -p rvllm # Build (CUDA)"
-echo "  ./target/release/rvllm serve --model Qwen/Qwen2.5-1.5B"
-echo "  cargo test --workspace                          # Run tests"
+echo "  cd v3 && cargo build --release --bin rvllm-server                                # Build (no CUDA)"
+echo "  cd v3 && cargo build --release --features cuda --bin rvllm-server                # Build (CUDA)"
+echo "  cd v3 && cargo build --release --features cuda,gb10 --bin rvllm-server           # Build (GB10/sm_121)"
+echo "  ./v3/target/release/rvllm-server --model-dir /path/to/hf/model --bind 0.0.0.0:8010"
+echo "  cd v3 && cargo test --workspace --exclude rvllm-runtime --exclude rvllm-bench --exclude rvllm-serve"
 echo "  make bench-compare                              # Benchmark"

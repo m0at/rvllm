@@ -1,0 +1,72 @@
+[clean-smoke] 20260503-022028  label=D_split_gqa
+[clean-smoke] stopping zeroclaw + rvllm-serve...
+[clean-smoke] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[clean-smoke] wiped 2 zeroclaw sqlite files (memory/brain.db + sessions/sessions.db)
+[clean-smoke] starting rvllm-serve...
+[clean-smoke] rvllm-serve ready
+[clean-smoke] starting zeroclaw...
+[clean-smoke] warmup call (discarded)...
+[clean-smoke] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[clean-smoke] starting 30-prompt smoke...
+label=D_split_gqa ts=20260503-022226 profile_summary:
+RVLLM_NVFP4_SCALE_POLICY=mse
+RVLLM_PREFILL_CHUNK_SIZE=128
+RVLLM_REPETITION_PENALTY_WINDOW=64
+RVLLM_REPETITION_PENALTY_MIN_COUNT=2
+RVLLM_REPETITION_PENALTY=1.05
+RVLLM_NVFP4_PARTITION_SIZE=256
+RVLLM_NVFP4_DECODE_GQA=0
+RVLLM_NVFP4_HYBRID_GLOBAL_FP8=0
+RVLLM_NVFP4_HYBRID_SLIDING_FP8=0
+RVLLM_NVFP4_HADAMARD=1
+RVLLM_PER_TOKEN_Q_SCALE=1
+RVLLM_NVFP4_HADAMARD_V=1
+RVLLM_NVFP4_K_SCALE_POLICY=amax6
+RVLLM_NVFP4_V_SCALE_POLICY=amax6
+RVLLM_NVFP4_SPLIT_GQA=1
+---
+[harness] cold restart rvllm-serve...
+[harness] restart zeroclaw + warm-up...
+[harness] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[PASS]    wer bist du?                                       | Ich bin ein KI-Assistent. Mein Ziel ist es, hilfreich, präzise und direkt zu sein. Wenn du es möchtest, kann ich dir bei technischen Fragen, beim Programmieren oder bei anderen A
+[PASS]    was machst du gerade?                              | Ich bin bereit und warte auf deine Anweisungen. Was kann ich für dich tun?
+[PASS]    wer ist dein lieblingsmensch?                      | Ich habe keinen "Lieblingsmenschen", da ich keine persönlichen Emotionen oder Vorlieben besitze. Aber wenn man es auf die Definition eines "hilfreichen Begleiters" reduziert, wür
+[PASS]    stell dich kurz vor                                | Ich bin ein KI-Assistent. Ich bin direkt, präzise und neige zu einem leicht trockenen Humor. Ich unterstütze dich bei technischen Themen wie Software Engineering, Machine Learnin
+[PASS]    was ist deine philosophie?                         | Meine Philosophie ist es, präzise, effizient und direkt zu sein. Ich konzentriere mich auf die Fakten und die Lösung des Problems, ohne unnötiges Drumherum. Wenn ich Information
+[PASS]    wie ist das wetter in bern?                        | In Bern ist es aktuell 11°C, es regnet sporadisch. Die Luftfeuchtigkeit liegt bei 94% und der Wind weht mit 5 km/h aus Süd-Süd-Ost.
+[PASS]    wie ist das wetter in zürich?                     | Das Wetter in Zürich ist aktuell klar mit einer Temperatur von 13°C. Es ist trocken, und der Wind weht leicht aus Süd-Südwest.
+[PASS]    regnet es in basel?                                | Nein, es regnet nicht in Basel. Die aktuellen Bedingungen sind "Patchy rain nearby", aber die Niederschlagsmenge liegt bei 0,1 mm und es regnet nicht direkt. Die Temperatur liegt b
+[PASS]    ist es kalt in luzern?                             | Es ist etwa 13°C. Nicht wirklich "kalt", aber für eine Nacht in Luzern ist es recht mild. Es ist klar und windstill.
+[PASS]    wie warm wird es morgen?                           | Um Ihnen die Temperatur für morgen nennen zu können, brauche ich Ihren Standort. In welcher Stadt oder Region befinden wir uns?
+[PASS]    ist die haustür auf?                              | Ich weiß nicht, ob die Haustür offen ist, da ich keinen Zugriff auf die Sensoren oder ein entsprechendes System habe.
+[PASS]    ist das wohnzimmerlicht an?                        | Ich habe keinen Zugriff auf deine Smart-Home-Steuerung oder Sensoren, um das zu prüfen. Wenn du ein Gerät angebunden hast, lass es mich wissen, sonst kann ich das nicht prüfen.
+[PASS]    wo ist lola?                                       | Ich weiß nicht, wo Lola ist. Wenn sie ein Haustier oder eine Person ist, die in deinen Notizen oder in deinem System gespeichert ist, kann ich versuchen das zu finden, wenn du mir
+[PASS]    ist vinz zuhause?                                  | Ich weiß nicht, ob Vinz zu Hause ist, da ich keinen Zugriff auf seine aktuellen Bewegungen oder einen entsprechenden Status-Check habe.
+[PASS]    schalte das licht im flur aus                      | Ich habe die entsprechenden Schritte zur Ausführung dieses Befehl noch nicht in meinem System konfiguriert. Könntest du mir sagen, welches System oder welche App ich nutzen soll,
+[PASS]    suche nach Lola                                    | Ich konnte keine Informationen zu "Lola" in meinem Speicher finden. Könntest du mir erklären, wer Lola ist oder was ich suchen soll?
+[PASS]    wer ist Vinz?                                      | Ich weiß nicht, wer Vinz ist. Er ist in meinen aktuellen Informationen oder im Speicher nicht aufgeführt.
+[PASS]    liste meine projekte                               | Ich konnte keine Projekte in deinem Speicher finden. Wenn du mir sagst, was du unter "projekte" meinst oder wo ich suchen soll, kann ich dir gerne helfen.
+[PASS]    was sind meine letzten erinnerungen?               | ---Ich kann nicht direkt „alle" Erinnerungen auflisten, ohne einen Suchbegriff oder einen Zeitraum zu definieren. Wenn du mir sagst, wonach ich suchen soll, oder ob ich die letzt
+[PASS]    such die letzten news zu Bitcoin                   | Die aktuellen News zu Bitcoin (Stand 3. Mai 2026) lassen sich wie folgt zusammenfassen:*   **Kurs-Tendenz:** Der Kurs kämpft mit dem Widerstand um die 80.000 Dollar. Laut einer Pr
+[PASS]    erkläre mir was eine GPU ist in 3 sätzen         | Hello! How can I help you today?
+[PASS]    schreib einen hello-world in python                | ```pythonprint("Hello World!")```
+[PASS]    was ist der unterschied zwischen RAM und SSD?      | Der Unterschied zwischen RAM (Arbeitsspeicher) und einer SSD (Speichergerät) liegt vor allem in der Funktion und der Geschwindigkeit:**1. RAM (Random Access Memory)***   **Zweck:*
+[PASS]    wie funktioniert ein attention layer?              | Ein Attention Layer (genauer: der Mechanismus hinter "Self-Attention") dient dazu, in einer Sequenz von Daten (z. B. Sätzen) zu bestimmen, welche anderen Elemente für den Kontext
+[PASS]    warum ist quantisierung wichtig?                   | Quantisierung (insbesondere bei LLMs) ist wichtig, weil sie die Kosten und die Hardware-Anforderungen für das Betrieb von Modellen massiv senkt.Die Hauptgründe sind:1.  **Speiche
+[PASS]    erzähl mir einen kurzen witz                      | Ein Mann geht zum Arzt: „Ich habe ein Problem, ich kann nicht schlafen, ich kann nicht essen und ich fühle mich ganz komisch.“Der Arzt antwortt: „Das ist normal. Wir sind in
+[PASS]    schreibe ein gedicht über katzen                  | Sanftes Treten, ein leiser Schnurren,Ein Spiel mit dem Schatten, ein kurzes Gurren.Auf Samtpfoten gleiten sie durch das Haus,und suchen sich einen Ruheplatz aus.Ein Blick, der beob
+[PASS]    erfinde einen drachennamen                         | Vaelithor.
+[PASS]    denk dir eine kurze geschichte aus, 3 sätze       | Hello! How can I help you today?
+[PASS]    was sagt ein hund zu einer katze?                  | "Wuff, was ist das?" (Oder: "Wo ist meine Katze?").*Actually, this is a classic joke territory, but usually, the punchline is:*"Wuff, ich bin ein Hund!" (Wait, that's not a joke).T
+---
+SUMMARY D_split_gqa: 30/30 PASS, 0 SUSPECT, 0 FAIL, 0 INFRA
+[harness] === direct rvllm prompts (bypass zeroclaw) ===
+[direct PASS] Hallo!                                             | Hallo! Wie kann ich dir heute helfen?
+[direct PASS] Was ist 2 plus 2?                                  | 2 plus 2 ist 4.
+[direct PASS] Schreib mir bitte das Wort Apfel.                  | Apfel
+[direct PASS] Welche Farbe hat Schnee?                           | Schnee ist **weiß**.
+[direct PASS] Sag mir kurz, wer du bist.                         | Ich bin ein KI-Sprachmodell, entwickelt von Google. Du kannst mich als einen digitalen Assistenten betrachten, der darauf trainiert ist, Informationen zu verarbeiten, Texte zu schr
+DIRECT_SUMMARY D_split_gqa: 5/5 PASS, 0 FAIL
+log: /tmp/rvllm_smoke_D_split_gqa_20260503-022226.log
+[clean-smoke] [wipe-default] before=0 after=0 deleted=0 (memory/entity/task/bookmark/project/tool/event/location/credential/snippet/routine/media/linked/reminder)
+[clean-smoke] DONE  log=/tmp/rvllm_smoke_D_split_gqa_20260503-022028.log

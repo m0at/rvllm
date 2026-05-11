@@ -36,6 +36,33 @@ name = "probe-gemma4-load"
 path = "src/bin/probe_gemma4_load.rs"
 required-features = ["gb10"]
 
+# `bench-qwen-prefill` times the per-token Qwen 3.6 prefill loop at
+# several prompt-length buckets. Same gating reasoning as
+# probe-gemma4-load: needs a real GB10 + a Qwen3-VL fp8 checkpoint.
+# See v3/QWEN_BATCHED_PREFILL_PLAN.md (Phase 2).
+[[bin]]
+name = "bench-qwen-prefill"
+path = "src/bin/bench_qwen_prefill.rs"
+required-features = ["gb10"]
+
+# `probe-qwen-fp8-proj` validates the m=1 dispatcher path is byte-
+# identical to a direct Fp8GemvF16InLaunch call against the same
+# weight + input, plus that the m≥2 path returns the Phase-3b
+# deferral sentinel. See v3/QWEN_BATCHED_PREFILL_PLAN.md (Phase 3a).
+[[bin]]
+name = "probe-qwen-fp8-proj"
+path = "src/bin/probe_qwen_fp8_proj.rs"
+required-features = ["gb10"]
+
+# `probe-mistral35-layer-ref` runs the pure-CPU Mistral 3.5 layer
+# reference (mistral35_layer_ref::mistral_layer_step) and dumps
+# per-position hidden states + final KV cache to disk as f32 LE.
+# No CUDA / no model directory needed — the future cosine
+# validation harness uses this as a deterministic baseline.
+[[bin]]
+name = "probe-mistral35-layer-ref"
+path = "src/bin/probe_mistral35_layer_ref.rs"
+
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
@@ -49,4 +76,9 @@ rvllm-loader = { workspace = true }
 rvllm-sampling = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+half = { workspace = true }
+# Mistral 3.5 bring-up mmaps each safetensors shard for header
+# parsing without pulling the multi-GiB payload into RAM.
+memmap2 = "0.9"
+image = { workspace = true }
 cudarc = { version = "0.19", features = ["driver", "cuda-version-from-build-system"], optional = true }

@@ -23,9 +23,17 @@ pub struct Tensor<'a, T> {
 
 impl<'a, T> Tensor<'a, T> {
     /// Build a tensor view over a region. Caller is responsible that
-    /// `shape.numel() * dtype.bytes() <= region.len()` — checked here.
+    /// `shape.numel() * dtype.bytes() <= region.len()` — checked here,
+    /// with overflow guards. Without checked_mul a 4-D shape like
+    /// `[u32::MAX, 2, 2, 2]` would silently wrap in release and let
+    /// the assertion accept a 0-byte region as "fits".
     pub fn new(region: &'a Region<'a>, shape: Shape, dtype: DType) -> Self {
-        let needed = shape.numel() * dtype.bytes();
+        let numel = shape
+            .numel_checked()
+            .expect("Tensor::new shape numel overflow");
+        let needed = numel
+            .checked_mul(dtype.bytes())
+            .expect("Tensor::new byte-size overflow");
         assert!(
             needed <= region.len(),
             "Tensor: shape {:?} @ {:?} needs {} B but region '{}' is {} B",

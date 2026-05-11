@@ -1,0 +1,28 @@
+[sweep] === B_pure_mse ===
+[sweep] overrides: RVLLM_NVFP4_HADAMARD=1 RVLLM_PER_TOKEN_Q_SCALE=1 RVLLM_NVFP4_HADAMARD_V=1 RVLLM_NVFP4_K_SCALE_POLICY=amax6 RVLLM_NVFP4_V_SCALE_POLICY=mse
+[sweep] kernel rebuild for FA2_THREADS=128...
+[sweep] kernel/server rebuild done
+[sweep] B_pure_mse: SUMMARY B_pure_mse: 30/30 PASS, 0 SUSPECT, 0 FAIL, 0 INFRA / DIRECT_SUMMARY B_pure_mse: 5/5 PASS, 0 FAIL (wall 3023s)
+[sweep] === C_no_hadamard ===
+[sweep] overrides: RVLLM_NVFP4_HADAMARD=0 RVLLM_PER_TOKEN_Q_SCALE=0 RVLLM_NVFP4_HADAMARD_V=0 RVLLM_NVFP4_K_SCALE_POLICY=amax6 RVLLM_NVFP4_V_SCALE_POLICY=amax6
+[sweep] kernel rebuild for FA2_THREADS=128...
+[sweep] kernel/server rebuild done
+[sweep] C_no_hadamard: SUMMARY C_no_hadamard: 30/30 PASS, 0 SUSPECT, 0 FAIL, 0 INFRA / DIRECT_SUMMARY C_no_hadamard: 5/5 PASS, 0 FAIL (wall 2935s)
+[sweep] === D_split_gqa ===
+[sweep] overrides: RVLLM_NVFP4_HADAMARD=1 RVLLM_PER_TOKEN_Q_SCALE=1 RVLLM_NVFP4_HADAMARD_V=1 RVLLM_NVFP4_K_SCALE_POLICY=amax6 RVLLM_NVFP4_V_SCALE_POLICY=amax6 RVLLM_NVFP4_SPLIT_GQA=1
+[sweep] kernel rebuild for FA2_THREADS=128...
+[sweep] kernel/server rebuild done
+[sweep] D_split_gqa: SUMMARY D_split_gqa: 30/30 PASS, 0 SUSPECT, 0 FAIL, 0 INFRA / DIRECT_SUMMARY D_split_gqa: 5/5 PASS, 0 FAIL (wall 2931s)
+[sweep] === E_hybrid_global_fp8 ===
+[sweep] overrides: RVLLM_NVFP4_HADAMARD=1 RVLLM_PER_TOKEN_Q_SCALE=1 RVLLM_NVFP4_HADAMARD_V=1 RVLLM_NVFP4_K_SCALE_POLICY=amax6 RVLLM_NVFP4_V_SCALE_POLICY=amax6 RVLLM_NVFP4_HYBRID_GLOBAL_FP8=1
+[sweep] kernel rebuild for FA2_THREADS=128...
+[sweep] kernel/server rebuild done
+[sweep] E_hybrid_global_fp8: SUMMARY E_hybrid_global_fp8: 30/30 PASS, 0 SUSPECT, 0 FAIL, 0 INFRA / DIRECT_SUMMARY E_hybrid_global_fp8: 5/5 PASS, 0 FAIL (wall 3317s)
+[sweep] === A_prod ===
+[sweep] overrides: RVLLM_NVFP4_HADAMARD=1 RVLLM_PER_TOKEN_Q_SCALE=1 RVLLM_NVFP4_HADAMARD_V=1 RVLLM_NVFP4_K_SCALE_POLICY=amax6 RVLLM_NVFP4_V_SCALE_POLICY=amax6
+[sweep] kernel rebuild for FA2_THREADS=128...
+[sweep] kernel/server rebuild done
+[sweep] A_prod: SUMMARY A_prod: 30/30 PASS, 0 SUSPECT, 0 FAIL, 0 INFRA / DIRECT_SUMMARY A_prod: 5/5 PASS, 0 FAIL (wall 3000s)
+[sweep] kernel rebuild for FA2_THREADS=128...
+[sweep] kernel/server rebuild done
+[sweep] DONE — report: /tmp/sweep_20260503-003747.md

@@ -72,6 +72,27 @@ pub struct LayerWeights {
     pub post_attention_layernorm: F16Weight,
 }
 
+/// One transformer layer's AWQ-quantized weights. Mirrors `LayerWeights`
+/// but holds [`crate::compressed_tensors::AwqLinearWeight`] per linear.
+///
+/// Cycle 44 step 4 (scaffolding): the per-linear values come from
+/// [`crate::compressed_tensors::upload_awq_linear`]. AWQ checkpoints
+/// store the four projections un-fused (Q/K/V separate, gate/up
+/// separate), so this struct keeps them un-fused too — the GEMV kernel
+/// runs M=1 well enough that fusing along N to mirror the FP8 QKV/gate_up
+/// fused weights is not obviously a win and is deferred. A later cycle
+/// can swap this for a `qkv_packed` / `gate_up_packed` shape.
+#[derive(Debug, Clone)]
+pub struct AwqLayerWeights {
+    pub q_proj:    crate::compressed_tensors::AwqLinearWeight,
+    pub k_proj:    crate::compressed_tensors::AwqLinearWeight,
+    pub v_proj:    crate::compressed_tensors::AwqLinearWeight,
+    pub o_proj:    crate::compressed_tensors::AwqLinearWeight,
+    pub gate_proj: crate::compressed_tensors::AwqLinearWeight,
+    pub up_proj:   crate::compressed_tensors::AwqLinearWeight,
+    pub down_proj: crate::compressed_tensors::AwqLinearWeight,
+}
+
 /// The whole model's weights.
 #[derive(Debug)]
 pub struct LoadedModel {

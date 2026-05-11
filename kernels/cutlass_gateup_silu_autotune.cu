@@ -170,6 +170,21 @@ int cutlass_gateup_silu_dispatch(
     size_t gemm_ws = gemm_probe.get_workspace_size(args_probe);
     gemm_ws = (gemm_ws + 255) & ~255;
 
+    // Bounds-check the caller's workspace BEFORE we start writing
+    // through the `temp` pointer. Previously `workspace_size` was
+    // accepted as a parameter and ignored, so a too-small buffer
+    // produced silent OOB writes past the scratch region with no
+    // error escape. The required size matches the formula the
+    // sister `gateup_silu_workspace_size_*` function exports for
+    // callers (gemm_ws + 256-aligned M*N*sizeof(half)). We refuse
+    // to launch when the caller's buffer doesn't fit.
+    size_t temp_bytes = (size_t)M * (size_t)N * sizeof(__half);
+    temp_bytes = (temp_bytes + 255) & ~255;
+    size_t needed = gemm_ws + temp_bytes;
+    if (workspace_size < needed) {
+        return -22 /* -EINVAL */;
+    }
+
     char* ws_ptr = reinterpret_cast<char*>(workspace);
     void* gemm_workspace = ws_ptr;
     __half* temp = reinterpret_cast<__half*>(ws_ptr + gemm_ws);
@@ -329,6 +344,21 @@ int cutlass_gateup_silu_staged_dispatch(
     size_t gemm_ws = gemm_probe.get_workspace_size(args_probe);
     gemm_ws = (gemm_ws + 255) & ~255;
 
+    // Bounds-check the caller's workspace BEFORE we start writing
+    // through the `temp` pointer. Previously `workspace_size` was
+    // accepted as a parameter and ignored, so a too-small buffer
+    // produced silent OOB writes past the scratch region with no
+    // error escape. The required size matches the formula the
+    // sister `gateup_silu_workspace_size_*` function exports for
+    // callers (gemm_ws + 256-aligned M*N*sizeof(half)). We refuse
+    // to launch when the caller's buffer doesn't fit.
+    size_t temp_bytes = (size_t)M * (size_t)N * sizeof(__half);
+    temp_bytes = (temp_bytes + 255) & ~255;
+    size_t needed = gemm_ws + temp_bytes;
+    if (workspace_size < needed) {
+        return -22 /* -EINVAL */;
+    }
+
     char* ws_ptr = reinterpret_cast<char*>(workspace);
     void* gemm_workspace = ws_ptr;
     __half* temp = reinterpret_cast<__half*>(ws_ptr + gemm_ws);
@@ -449,6 +479,21 @@ int cutlass_gateup_silu_swizzle_dispatch(
     Gemm gemm_probe;
     size_t gemm_ws = gemm_probe.get_workspace_size(args_probe);
     gemm_ws = (gemm_ws + 255) & ~255;
+
+    // Bounds-check the caller's workspace BEFORE we start writing
+    // through the `temp` pointer. Previously `workspace_size` was
+    // accepted as a parameter and ignored, so a too-small buffer
+    // produced silent OOB writes past the scratch region with no
+    // error escape. The required size matches the formula the
+    // sister `gateup_silu_workspace_size_*` function exports for
+    // callers (gemm_ws + 256-aligned M*N*sizeof(half)). We refuse
+    // to launch when the caller's buffer doesn't fit.
+    size_t temp_bytes = (size_t)M * (size_t)N * sizeof(__half);
+    temp_bytes = (temp_bytes + 255) & ~255;
+    size_t needed = gemm_ws + temp_bytes;
+    if (workspace_size < needed) {
+        return -22 /* -EINVAL */;
+    }
 
     char* ws_ptr = reinterpret_cast<char*>(workspace);
     void* gemm_workspace = ws_ptr;
@@ -617,6 +662,21 @@ int cutlass_gateup_silu_splitk_dispatch(
     size_t gemm_ws = gemm_probe.get_workspace_size(args_probe);
     gemm_ws = (gemm_ws + 255) & ~255;
 
+    // Bounds-check the caller's workspace BEFORE we start writing
+    // through the `temp` pointer. Previously `workspace_size` was
+    // accepted as a parameter and ignored, so a too-small buffer
+    // produced silent OOB writes past the scratch region with no
+    // error escape. The required size matches the formula the
+    // sister `gateup_silu_workspace_size_*` function exports for
+    // callers (gemm_ws + 256-aligned M*N*sizeof(half)). We refuse
+    // to launch when the caller's buffer doesn't fit.
+    size_t temp_bytes = (size_t)M * (size_t)N * sizeof(__half);
+    temp_bytes = (temp_bytes + 255) & ~255;
+    size_t needed = gemm_ws + temp_bytes;
+    if (workspace_size < needed) {
+        return -22 /* -EINVAL */;
+    }
+
     char* ws_ptr = reinterpret_cast<char*>(workspace);
     void* gemm_workspace = ws_ptr;
     __half* temp = reinterpret_cast<__half*>(ws_ptr + gemm_ws);
@@ -737,6 +797,21 @@ int cutlass_gateup_silu_streamk_dispatch(
     Gemm gemm_probe;
     size_t gemm_ws = gemm_probe.get_workspace_size(args_probe);
     gemm_ws = (gemm_ws + 255) & ~255;
+
+    // Bounds-check the caller's workspace BEFORE we start writing
+    // through the `temp` pointer. Previously `workspace_size` was
+    // accepted as a parameter and ignored, so a too-small buffer
+    // produced silent OOB writes past the scratch region with no
+    // error escape. The required size matches the formula the
+    // sister `gateup_silu_workspace_size_*` function exports for
+    // callers (gemm_ws + 256-aligned M*N*sizeof(half)). We refuse
+    // to launch when the caller's buffer doesn't fit.
+    size_t temp_bytes = (size_t)M * (size_t)N * sizeof(__half);
+    temp_bytes = (temp_bytes + 255) & ~255;
+    size_t needed = gemm_ws + temp_bytes;
+    if (workspace_size < needed) {
+        return -22 /* -EINVAL */;
+    }
 
     char* ws_ptr = reinterpret_cast<char*>(workspace);
     void* gemm_workspace = ws_ptr;

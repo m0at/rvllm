@@ -1,32 +1,45 @@
 .PHONY: build build-cuda check check-cuda test test-cuda kernels bench bench-python bench-compare docker deploy-provision deploy-push deploy-bench deploy-teardown a100-bench validate validate-full validate-kernels loc clean
 
-# Local development (Mac, mock-gpu)
+# The active workspace lives in v3/. All cargo targets `cd v3`
+# first; `cargo build --release` from the repo root has no
+# Cargo.toml to find. The binary produced is `rvllm-server` in the
+# `rvllm-serve` crate. Older targets used a `rvllm` crate that no
+# longer exists.
+
+# Local development (mock-gpu, Mac / Linux without CUDA)
 build:
-	cargo build --release -p rvllm
+	cd v3 && cargo build --release --bin rvllm-server
 
 # CUDA build (Linux + NVIDIA GPU)
 build-cuda:
-	cargo build --release --features cuda -p rvllm
+	cd v3 && cargo build --release --features cuda --bin rvllm-server
 
-# Check workspace compiles (mock-gpu, Mac)
+# GB10 build (DGX Spark, sm_121 + cuda)
+build-gb10:
+	cd v3 && cargo build --release --features cuda,gb10 --bin rvllm-server
+
+# Check workspace compiles (no CUDA). Excludes runtime/bench/serve
+# which require cuda transitively; the non-cuda DAG is what this
+# target enforces. Use `make check-cuda` for the full path.
 check:
-	cargo check --workspace
+	cd v3 && cargo check --workspace --exclude rvllm-runtime --exclude rvllm-bench --exclude rvllm-serve
 
-# Check workspace compiles with CUDA features (needs cudarc, OK to fail without CUDA toolkit)
+# Check the full workspace compiles with CUDA features.
 check-cuda:
-	cargo check --workspace --features rvllm/cuda
+	cd v3 && cargo check --workspace --features rvllm-runtime/cuda
 
 # Compile .cu kernels to .ptx (requires nvcc)
 kernels:
-	bash kernels/build.sh
+	bash kernels/build.sh sm_121
 
-# Run all tests
+# Run all tests (no-CUDA crates only — most coverage lives there).
 test:
-	cargo test --workspace
+	cd v3 && cargo test --workspace --exclude rvllm-runtime --exclude rvllm-bench --exclude rvllm-serve
 
-# Run tests with CUDA features
+# Tests for the CUDA-feature path (needs a real GPU + matching driver).
 test-cuda:
-	cargo test --workspace --features rvllm/cuda
+	cd v3 && cargo test --features cuda -p rvllm-serve --lib
+	cd v3 && cargo test --features cuda -p rvllm-runtime --lib
 
 # Run benchmarks (Rust)
 bench:
