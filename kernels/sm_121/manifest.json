@@ -371,6 +371,11 @@
       "path": "mistral35_fa_decode_gqa_bf16.ptx",
       "sha256": "7cc074246a0bd8909fb606cfcc55c5dad6fabed8cfdedbf8714eaae555b64a51"
     },
+    "mistral35_fa_decode_gqa_bf16_devp": {
+      "bytes": 973229,
+      "path": "mistral35_fa_decode_gqa_bf16_devp.ptx",
+      "sha256": "395eaae553a35097ea1537a5c2e7844a619b2589919237675a2deb399d50d0a0"
+    },
     "mistral35_fa_decode_gqa_nvfp4kv_bf16": {
       "bytes": 888617,
       "path": "mistral35_fa_decode_gqa_nvfp4kv_bf16.ptx",
@@ -385,6 +390,11 @@
       "bytes": 1989,
       "path": "mistral35_kv_cache_write_bf16.ptx",
       "sha256": "2cc846430e8701e5efd283744d97b82d03d33e0ac8fd0b3ac089112340f51881"
+    },
+    "mistral35_kv_cache_write_bf16_devp": {
+      "bytes": 2154,
+      "path": "mistral35_kv_cache_write_bf16_devp.ptx",
+      "sha256": "ab51df01396b8b354bc7a8f08939d62738bb53e5564419f1fb3316400bcba71a"
     },
     "mistral35_kv_cache_write_nvfp4_bf16": {
       "bytes": 18707,
@@ -550,6 +560,11 @@
       "bytes": 2098,
       "path": "rope_split_half_bf16.ptx",
       "sha256": "2785da3f1ea9a3d22e965ef385327fd8d1222cd50cb814a1cfff187d33ced719"
+    },
+    "rope_split_half_bf16_devp": {
+      "bytes": 2242,
+      "path": "rope_split_half_bf16_devp.ptx",
+      "sha256": "3a1d95082d8567cea72fc55e06ee4102d2cdded83f3a1af805fd927e4b3c3239"
     },
     "rope_split_half_t_bf16": {
       "bytes": 2548,
@@ -777,5 +792,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "bbe555a"
+  "revision": "d7dcf55"
 }
