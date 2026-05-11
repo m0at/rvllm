@@ -5364,9 +5364,29 @@ impl Mistral35Bringup {
             Ok(())
         };
 
+        // Per-stage chunk-path timing — opt-in via
+        // `RVLLM_MISTRAL35_CHUNK_TIMING=1`. Stages summed across
+        // all 88 layers; mirrors `forward_smoke_q_proj_inner`'s
+        // layer-timing for the per-token path so the two paths
+        // can be compared side-by-side. Each stage gets one
+        // `stream.fence()` so the measurement reflects GPU work,
+        // not driver dispatch. ~440 fences per request (~5 ms
+        // host overhead) — acceptable diagnostic cost.
+        let chunk_timing_on = std::env::var("RVLLM_MISTRAL35_CHUNK_TIMING")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false);
+        let mut t_norm_qkv_us: u64 = 0;
+        let mut t_rope_kv_us: u64 = 0;
+        let mut t_attn_us: u64 = 0;
+        let mut t_o_residual_us: u64 = 0;
+        let mut t_mlp_us: u64 = 0;
+
         // ── (3) Layer loop ─────────────────────────────────────
         for layer_idx in 0..model.layers.len() {
             let layer = &model.layers[layer_idx];
+            let t_stage = if chunk_timing_on {
+                stream.fence()?; Some(std::time::Instant::now())
+            } else { None };
             // Pre-attn: dtod h_resid_t → h_work_t, rmsnorm-T inplace.
             dtod(scr.h_work_t_ptr, scr.h_residual_t_ptr,
                  t_count * hidden_bytes)?;
@@ -5384,6 +5404,13 @@ impl Mistral35Bringup {
             gemm_at_m(scr.q_out_t_ptr, scr.h_work_t_ptr, &layer.q_proj, m_t)?;
             gemm_at_m(scr.k_out_t_ptr, scr.h_work_t_ptr, &layer.k_proj, m_t)?;
             gemm_at_m(scr.v_out_t_ptr, scr.h_work_t_ptr, &layer.v_proj, m_t)?;
+            if let Some(t0) = t_stage {
+                stream.fence()?;
+                t_norm_qkv_us += t0.elapsed().as_micros() as u64;
+            }
+            let t_stage = if chunk_timing_on {
+                Some(std::time::Instant::now())
+            } else { None };
 
             // RoPE per-position on q_t and k_t.
             for t in 0..t_count {
@@ -5400,6 +5427,13 @@ impl Mistral35Bringup {
                 let v_row = scr.v_out_t_ptr + (t * n_kv_bytes_per_row) as u64;
                 kv_write(layer_idx, k_row, v_row, pos)?;
             }
+            if let Some(t0) = t_stage {
+                stream.fence()?;
+                t_rope_kv_us += t0.elapsed().as_micros() as u64;
+            }
+            let t_stage = if chunk_timing_on {
+                Some(std::time::Instant::now())
+            } else { None };
             // Per-query attention loop, writing to attn_out_t row t.
             for t in 0..t_count {
                 let pos = pos_start + t as i32;
@@ -5409,6 +5443,13 @@ impl Mistral35Bringup {
                     + (t * hidden_bytes) as u64;
                 attn_one(layer_idx, q_row, attn_row, past_len)?;
             }
+            if let Some(t0) = t_stage {
+                stream.fence()?;
+                t_attn_us += t0.elapsed().as_micros() as u64;
+            }
+            let t_stage = if chunk_timing_on {
+                Some(std::time::Instant::now())
+            } else { None };
             // O at M=T.
             gemm_at_m(scr.o_out_t_ptr, scr.attn_out_t_ptr, &layer.o_proj, m_t)?;
             // Residual: h_resid_t += o_t (1-D vector_add over T*hidden).
@@ -5432,6 +5473,13 @@ impl Mistral35Bringup {
                 stream_u64,
             )?;
 
+            if let Some(t0) = t_stage {
+                stream.fence()?;
+                t_o_residual_us += t0.elapsed().as_micros() as u64;
+            }
+            let t_stage = if chunk_timing_on {
+                Some(std::time::Instant::now())
+            } else { None };
             // MLP gate/up at M=T.
             gemm_at_m(scr.gate_out_t_ptr, scr.h_work_t_ptr,
                       &layer.gate_proj, m_t)?;
@@ -5470,6 +5518,33 @@ impl Mistral35Bringup {
                 kernels.fn_vector_add_bf16,
                 scr.h_residual_t_ptr, scr.down_out_t_ptr, stream_u64,
             )?;
+            if let Some(t0) = t_stage {
+                stream.fence()?;
+                t_mlp_us += t0.elapsed().as_micros() as u64;
+            }
+        }
+
+        if chunk_timing_on {
+            let nlayers = model.layers.len() as u64;
+            let total = t_norm_qkv_us + t_rope_kv_us + t_attn_us
+                + t_o_residual_us + t_mlp_us;
+            let pct = |x: u64| if total > 0 { (x as f64 * 100.0) / total as f64 } else { 0.0 };
+            tracing::info!(
+                T = t_count,
+                layers = nlayers,
+                total_ms = format!("{:.1}", total as f64 / 1e3),
+                norm_qkv_ms = format!("{:.1}", t_norm_qkv_us as f64 / 1e3),
+                norm_qkv_pct = format!("{:.1}", pct(t_norm_qkv_us)),
+                rope_kv_ms = format!("{:.1}", t_rope_kv_us as f64 / 1e3),
+                rope_kv_pct = format!("{:.1}", pct(t_rope_kv_us)),
+                attn_ms = format!("{:.1}", t_attn_us as f64 / 1e3),
+                attn_pct = format!("{:.1}", pct(t_attn_us)),
+                o_residual_ms = format!("{:.1}", t_o_residual_us as f64 / 1e3),
+                o_residual_pct = format!("{:.1}", pct(t_o_residual_us)),
+                mlp_ms = format!("{:.1}", t_mlp_us as f64 / 1e3),
+                mlp_pct = format!("{:.1}", pct(t_mlp_us)),
+                "[mistral35-chunk-timing]"
+            );
         }
 
         // ── (4) Row pick: copy row [logits_at] → h_residual_ptr ─
