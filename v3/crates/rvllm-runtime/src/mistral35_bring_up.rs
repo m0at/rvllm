@@ -3399,6 +3399,28 @@ impl Mistral35Bringup {
                 }
             }
             unsafe { arena.restore(ck_outer); }
+            // Vision-flakiness diagnostic: log a stable hash of the
+            // soft-token bytes so an OK process vs a WRONG process
+            // can be compared at the Pixtral-output boundary. If the
+            // hashes match, divergence is downstream (chat-template
+            // tokenisation or language-model forward). If they
+            // differ, the Pixtral forward itself is the source.
+            // Guarded by `RVLLM_MISTRAL35_VISION_HASH=1`.
+            if std::env::var("RVLLM_MISTRAL35_VISION_HASH").ok()
+                .as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(false)
+            {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                data.hash(&mut h);
+                let dh = h.finish();
+                tracing::info!(
+                    nt, hidden = text_hidden, bytes = data.len(),
+                    patch_grid = ?patch_grid, merged_grid = ?merged_grid,
+                    data_hash = format!("{:016x}", dh),
+                    "[mistral35-vision-hash] forward_pixtral_vision output"
+                );
+            }
             // Codex review #4: reuse the `pp` already computed above
             // instead of re-decoding the image and re-running
             // preprocess just to ship grid metadata. The CUDA forward
