@@ -1282,7 +1282,7 @@ impl Mistral35Bringup {
             if matches!(kv_mode, KvMode::Nvfp4Only) {
                 let fa_decode = std::env::var("RVLLM_MISTRAL35_FA_DECODE")
                     .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 if !fa_decode {
                     return Err(corrupt(
                         paths.model_dir.clone(),
@@ -2317,9 +2317,16 @@ impl Mistral35Bringup {
             // Fast path: fused FlashAttention-2 decode kernel (m=1).
             // Runs qk_dot + online softmax + V-fold in one kernel,
             // never materialises scores/probs in DRAM. Replaces both
-            // (b) qk_dot and (c) softmax_v entirely. Opt-in via
-            // `RVLLM_MISTRAL35_FA_DECODE=1`; default OFF until
-            // byte-identical smoke matrix passes.
+            // (b) qk_dot and (c) softmax_v entirely.
+            //
+            // Default ON since 2026-05-11 after the parity matrix
+            // (367 / 379 / 884 / 2964 prompt tokens, greedy seed=42)
+            // showed byte-identical content vs the split-kernel path.
+            // Opt-out with `RVLLM_MISTRAL35_FA_DECODE=0` (falls back
+            // to the legacy split kernels). Gate keeps gating
+            // `gqa_ratio_attn == 12`, which matches Mistral 3.5
+            // (96 Q heads / 8 KV heads); other ratios still take the
+            // split path automatically.
             //
             // Codex review #3: NVFP4-KV variant — when the NVFP4 KV
             // cache is wired up (RVLLM_MISTRAL35_NVFP4_KV=1), the FA
@@ -2330,7 +2337,7 @@ impl Mistral35Bringup {
             // split kernels if neither.
             let use_fa_decode = std::env::var("RVLLM_MISTRAL35_FA_DECODE")
                 .ok().as_deref().map(|s| s != "0" && !s.is_empty())
-                .unwrap_or(false)
+                .unwrap_or(true)
                 && gqa_ratio_attn == 12;
             let use_nvfp4_kv = layer_kv.k_nvfp4_packed_ptr != 0;
             if use_fa_decode && use_nvfp4_kv {
