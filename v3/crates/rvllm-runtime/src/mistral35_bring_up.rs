@@ -122,6 +122,10 @@ pub struct Mistral35ForwardKernels {
     pub fn_f32_to_bf16: KernelFn,
     pub mistral35_w4a16_gemv_bf16_mod: LoadedModule,
     pub fn_mistral35_w4a16_gemv_bf16: KernelFn,
+    pub mistral35_w4a16_qkv_gemv_bf16_mod: LoadedModule,
+    pub fn_mistral35_w4a16_qkv_gemv_bf16: KernelFn,
+    pub mistral35_w4a16_gate_up_gemv_bf16_mod: LoadedModule,
+    pub fn_mistral35_w4a16_gate_up_gemv_bf16: KernelFn,
     pub mistral35_w4a16_gemm_mn_bf16_mod: LoadedModule,
     pub fn_mistral35_w4a16_gemm_mn_bf16: KernelFn,
     pub mistral35_w4a16_gemm_mma_bf16_mod: LoadedModule,
@@ -1069,6 +1073,15 @@ impl Mistral35Bringup {
                 kernels.load_ptx("mistral35_w4a16_gemv_bf16")?;
             let fn_mistral35_w4a16_gemv_bf16 = mistral35_w4a16_gemv_bf16_mod
                 .get_function("mistral35_w4a16_gemv_bf16_kernel")?;
+            let mistral35_w4a16_qkv_gemv_bf16_mod =
+                kernels.load_ptx("mistral35_w4a16_qkv_gemv_bf16")?;
+            let fn_mistral35_w4a16_qkv_gemv_bf16 = mistral35_w4a16_qkv_gemv_bf16_mod
+                .get_function("mistral35_w4a16_qkv_gemv_bf16_kernel")?;
+            let mistral35_w4a16_gate_up_gemv_bf16_mod =
+                kernels.load_ptx("mistral35_w4a16_gate_up_gemv_bf16")?;
+            let fn_mistral35_w4a16_gate_up_gemv_bf16 =
+                mistral35_w4a16_gate_up_gemv_bf16_mod
+                    .get_function("mistral35_w4a16_gate_up_gemv_bf16_kernel")?;
             let mistral35_w4a16_gemm_mn_bf16_mod =
                 kernels.load_ptx("mistral35_w4a16_gemm_mn_bf16")?;
             let fn_mistral35_w4a16_gemm_mn_bf16 = mistral35_w4a16_gemm_mn_bf16_mod
@@ -1168,6 +1181,10 @@ impl Mistral35Bringup {
                 fn_f32_to_bf16,
                 mistral35_w4a16_gemv_bf16_mod,
                 fn_mistral35_w4a16_gemv_bf16,
+                mistral35_w4a16_qkv_gemv_bf16_mod,
+                fn_mistral35_w4a16_qkv_gemv_bf16,
+                mistral35_w4a16_gate_up_gemv_bf16_mod,
+                fn_mistral35_w4a16_gate_up_gemv_bf16,
                 mistral35_w4a16_gemm_mn_bf16_mod,
                 fn_mistral35_w4a16_gemm_mn_bf16,
                 mistral35_w4a16_gemm_mma_bf16_mod,
@@ -3128,9 +3145,66 @@ impl Mistral35Bringup {
             )?;
 
             // Q/K/V + RoPE on Q and K (W4A16 dequant + bf16 GEMM).
-            gemm(scr.q_out_ptr, scr.h_work_ptr, &layer.q_proj)?;
-            gemm(scr.k_out_ptr, scr.h_work_ptr, &layer.k_proj)?;
-            gemm(scr.v_out_ptr, scr.h_work_ptr, &layer.v_proj)?;
+            // Codex review #2: optional single-launch fused QKV
+            // GEMV (3 launches → 1) when env-gated. Math identical
+            // to the per-projection GEMV path.
+            let use_fused_qkv = std::env::var("RVLLM_MISTRAL35_DECODE_FUSED_QKV")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(true);
+            if use_fused_qkv
+                && layer.q_proj.shape.k == layer.k_proj.shape.k
+                && layer.q_proj.shape.k == layer.v_proj.shape.k
+                && layer.k_proj.shape.n == layer.v_proj.shape.n
+            {
+                unsafe {
+                    let mut o_q = scr.q_out_ptr;
+                    let mut o_k = scr.k_out_ptr;
+                    let mut o_v = scr.v_out_ptr;
+                    let mut wp_q = layer.q_proj.packed_ptr;
+                    let mut ws_q = layer.q_proj.sfb_natural_ptr;
+                    let mut gs_q = layer.q_proj.global_scale_ptr;
+                    let mut wp_k = layer.k_proj.packed_ptr;
+                    let mut ws_k = layer.k_proj.sfb_natural_ptr;
+                    let mut gs_k = layer.k_proj.global_scale_ptr;
+                    let mut wp_v = layer.v_proj.packed_ptr;
+                    let mut ws_v = layer.v_proj.sfb_natural_ptr;
+                    let mut gs_v = layer.v_proj.global_scale_ptr;
+                    let mut act = scr.h_work_ptr;
+                    let mut nq_arg = layer.q_proj.shape.n as i32;
+                    let mut nkv_arg = layer.k_proj.shape.n as i32;
+                    let mut k_arg = layer.q_proj.shape.k as i32;
+                    let args: [*mut std::ffi::c_void; 16] = [
+                        (&mut o_q)   as *mut u64 as *mut _,
+                        (&mut o_k)   as *mut u64 as *mut _,
+                        (&mut o_v)   as *mut u64 as *mut _,
+                        (&mut wp_q)  as *mut u64 as *mut _,
+                        (&mut ws_q)  as *mut u64 as *mut _,
+                        (&mut gs_q)  as *mut u64 as *mut _,
+                        (&mut wp_k)  as *mut u64 as *mut _,
+                        (&mut ws_k)  as *mut u64 as *mut _,
+                        (&mut gs_k)  as *mut u64 as *mut _,
+                        (&mut wp_v)  as *mut u64 as *mut _,
+                        (&mut ws_v)  as *mut u64 as *mut _,
+                        (&mut gs_v)  as *mut u64 as *mut _,
+                        (&mut act)   as *mut u64 as *mut _,
+                        (&mut nq_arg) as *mut i32 as *mut _,
+                        (&mut nkv_arg) as *mut i32 as *mut _,
+                        (&mut k_arg) as *mut i32 as *mut _,
+                    ];
+                    let total_rows = (nq_arg + 2 * nkv_arg) as u32;
+                    rvllm_fused::launch_raw(
+                        kernels.fn_mistral35_w4a16_qkv_gemv_bf16,
+                        (total_rows, 1, 1),
+                        (256, 1, 1),
+                        0, stream_u64,
+                        &args,
+                    )?;
+                }
+            } else {
+                gemm(scr.q_out_ptr, scr.h_work_ptr, &layer.q_proj)?;
+                gemm(scr.k_out_ptr, scr.h_work_ptr, &layer.k_proj)?;
+                gemm(scr.v_out_ptr, scr.h_work_ptr, &layer.v_proj)?;
+            }
             rope(scr.q_out_ptr, n_q_heads_u)?;
             rope(scr.k_out_ptr, n_kv_heads_u)?;
             if let Some(t0) = t_stage {
@@ -3180,8 +3254,53 @@ impl Mistral35Bringup {
                 Some(std::time::Instant::now())
             } else { None };
             // gate / up / silu_mul (W4A16).
-            gemm(scr.gate_out_ptr, scr.h_work_ptr, &layer.gate_proj)?;
-            gemm(scr.up_out_ptr,   scr.h_work_ptr, &layer.up_proj)?;
+            // Codex review #2: optional single-launch fused gate+up
+            // GEMV (2 launches → 1) when env-gated.
+            let use_fused_gate_up = std::env::var("RVLLM_MISTRAL35_DECODE_FUSED_GATE_UP")
+                .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+                .unwrap_or(true);
+            if use_fused_gate_up
+                && layer.gate_proj.shape.k == layer.up_proj.shape.k
+                && layer.gate_proj.shape.n == layer.up_proj.shape.n
+            {
+                unsafe {
+                    let mut o_g = scr.gate_out_ptr;
+                    let mut o_u = scr.up_out_ptr;
+                    let mut wp_g = layer.gate_proj.packed_ptr;
+                    let mut ws_g = layer.gate_proj.sfb_natural_ptr;
+                    let mut gs_g = layer.gate_proj.global_scale_ptr;
+                    let mut wp_u = layer.up_proj.packed_ptr;
+                    let mut ws_u = layer.up_proj.sfb_natural_ptr;
+                    let mut gs_u = layer.up_proj.global_scale_ptr;
+                    let mut act = scr.h_work_ptr;
+                    let mut isz_arg = layer.gate_proj.shape.n as i32;
+                    let mut k_arg = layer.gate_proj.shape.k as i32;
+                    let args: [*mut std::ffi::c_void; 11] = [
+                        (&mut o_g)   as *mut u64 as *mut _,
+                        (&mut o_u)   as *mut u64 as *mut _,
+                        (&mut wp_g)  as *mut u64 as *mut _,
+                        (&mut ws_g)  as *mut u64 as *mut _,
+                        (&mut gs_g)  as *mut u64 as *mut _,
+                        (&mut wp_u)  as *mut u64 as *mut _,
+                        (&mut ws_u)  as *mut u64 as *mut _,
+                        (&mut gs_u)  as *mut u64 as *mut _,
+                        (&mut act)   as *mut u64 as *mut _,
+                        (&mut isz_arg) as *mut i32 as *mut _,
+                        (&mut k_arg) as *mut i32 as *mut _,
+                    ];
+                    let total_rows = (2 * isz_arg) as u32;
+                    rvllm_fused::launch_raw(
+                        kernels.fn_mistral35_w4a16_gate_up_gemv_bf16,
+                        (total_rows, 1, 1),
+                        (256, 1, 1),
+                        0, stream_u64,
+                        &args,
+                    )?;
+                }
+            } else {
+                gemm(scr.gate_out_ptr, scr.h_work_ptr, &layer.gate_proj)?;
+                gemm(scr.up_out_ptr,   scr.h_work_ptr, &layer.up_proj)?;
+            }
             {
                 let mut out_ptr = scr.silu_mid_ptr;
                 let mut g_ptr = scr.gate_out_ptr;
