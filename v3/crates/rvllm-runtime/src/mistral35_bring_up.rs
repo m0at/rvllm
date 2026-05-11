@@ -5097,8 +5097,17 @@ impl Mistral35Bringup {
                 let chunk_end = (pos + chunk_t_max).min(total);
                 let chunk = &prompt[pos..chunk_end];
                 let is_last_chunk = chunk_end == total;
+                // Codex review #1: only the LAST chunk's logits
+                // are consumed for the predicted next token; for
+                // non-last chunks we pass None so the body skips
+                // final RMSNorm + lm_head + argmax + DtoH.
+                let logits_at = if is_last_chunk {
+                    Some(chunk.len() - 1)
+                } else {
+                    None
+                };
                 let dump = self.forward_smoke_chunk(
-                    chunk, pos as i32, Some(chunk.len() - 1),
+                    chunk, pos as i32, logits_at,
                     arena, ck_after_splices, do_restore,
                     &pos_to_dev_ptr,
                     &is_cancelled,
@@ -5449,9 +5458,9 @@ impl Mistral35Bringup {
         &self,
         tokens: &[u32],
         pos_start: i32,
-        compute_logits_at: usize,
+        compute_logits_at: Option<usize>,
         pos_to_dev_ptr: &std::collections::HashMap<i32, u64>,
-    ) -> Result<u32> {
+    ) -> Result<Option<u32>> {
         use rvllm_core::RvllmError;
         let t_count = tokens.len();
         if t_count == 0 {
@@ -5460,12 +5469,14 @@ impl Mistral35Bringup {
                 "forward_chunk_body: empty tokens".into(),
             ));
         }
-        if compute_logits_at >= t_count {
-            return Err(corrupt(
-                self.paths.model_dir.clone(),
-                format!("forward_chunk_body: compute_logits_at={} >= T={}",
-                        compute_logits_at, t_count),
-            ));
+        if let Some(at) = compute_logits_at {
+            if at >= t_count {
+                return Err(corrupt(
+                    self.paths.model_dir.clone(),
+                    format!("forward_chunk_body: compute_logits_at={} >= T={}",
+                            at, t_count),
+                ));
+            }
         }
         let model = self.model.as_ref().ok_or_else(|| corrupt(
             self.paths.model_dir.clone(), "model absent".into()))?;
@@ -6524,9 +6535,19 @@ impl Mistral35Bringup {
             );
         }
 
+        // Codex review #1: non-last chunks skip lm_head / argmax /
+        // DtoH entirely. The logits are only meaningful for the
+        // final prefill token, so previous chunks were spending a
+        // dtod + RMSNorm + vocab-wide GEMM + argmax + stream fence
+        // + DtoH per chunk for no consumer of the result.
+        let logits_at = match compute_logits_at {
+            Some(at) => at,
+            None => return Ok(None),
+        };
+
         // ── (4) Row pick: copy row [logits_at] → h_residual_ptr ─
         let row_src = scr.h_residual_t_ptr
-            + (compute_logits_at * hidden_bytes) as u64;
+            + (logits_at * hidden_bytes) as u64;
         dtod(scr.h_residual_ptr, row_src, hidden_bytes)?;
 
         // ── (5) Final RMSNorm → h_work_ptr (M=1) ───────────────
@@ -6584,7 +6605,7 @@ impl Mistral35Bringup {
                     rvllm_core::CudaCtx::setup()));
             }
         }
-        Ok(predicted)
+        Ok(Some(predicted))
     }
 
     unsafe fn forward_smoke_chunk(
@@ -6611,8 +6632,6 @@ impl Mistral35Bringup {
         // first stages, so removing it changes neither correctness
         // nor production output.
 
-        let logits_at = compute_logits_at.unwrap_or(tokens.len() - 1);
-
         // Layer-major chunked forward. Default-on after soak
         // validation (5.5–8× end-to-end speedup vs the per-token
         // path with byte-identical greedy output). Returns a
@@ -6622,15 +6641,20 @@ impl Mistral35Bringup {
         // `RVLLM_MISTRAL35_CHUNK_BODY=0` to opt back into the
         // per-token fall-through inside this same function for
         // bisection.
+        //
+        // Codex review #1: forward_chunk_body now takes
+        // `Option<usize>` — None means "skip lm_head / argmax /
+        // DtoH for this chunk". Non-last chunks of a multi-chunk
+        // prefill pass None.
         let use_chunk_body = std::env::var("RVLLM_MISTRAL35_CHUNK_BODY")
             .ok().as_deref().map(|s| s != "0" && !s.is_empty())
             .unwrap_or(true);
         if use_chunk_body {
-            let predicted = self.forward_chunk_body(
-                tokens, pos_start, logits_at, pos_to_dev_ptr,
+            let predicted_opt = self.forward_chunk_body(
+                tokens, pos_start, compute_logits_at, pos_to_dev_ptr,
             )?;
             if do_restore { arena.restore(ck); }
-            return Ok(Some(SmokeStageDump {
+            return Ok(predicted_opt.map(|predicted| SmokeStageDump {
                 post_embed: Vec::new(),
                 post_rmsnorm: Vec::new(),
                 q_out: Vec::new(),
@@ -6652,13 +6676,19 @@ impl Mistral35Bringup {
             }));
         }
 
+        // Per-token fall-through (RVLLM_MISTRAL35_CHUNK_BODY=0):
+        // honours compute_logits_at as in the body path. When the
+        // caller passes None we still need to run the layer body
+        // for every token (KV cache write etc.) but skip the
+        // last-token logits work.
+        let logits_at = compute_logits_at;
         let mut dump_out: Option<SmokeStageDump> = None;
         for (i, &tok) in tokens.iter().enumerate() {
             if is_cancelled() {
                 return Ok(dump_out);
             }
             let pos = pos_start + i as i32;
-            let is_last = i == logits_at;
+            let is_last = logits_at.map(|at| i == at).unwrap_or(false);
             let splice_ptr = pos_to_dev_ptr.get(&pos).copied();
             let dump = self.forward_smoke_q_proj_inner(
                 tok, pos, is_last, splice_ptr,
