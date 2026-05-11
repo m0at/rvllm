@@ -426,6 +426,11 @@
       "path": "mistral35_w4a16_gemm_mma_bf16.ptx",
       "sha256": "5aebf574a11edce8abdbc03607354c21cc152e2dd73c2feff48c198ba43bd56c"
     },
+    "mistral35_w4a16_gemm_mma_v2_bf16": {
+      "bytes": 11782,
+      "path": "mistral35_w4a16_gemm_mma_v2_bf16.ptx",
+      "sha256": "fdb0a13325a1c5f703f8a67ea492834352b44738e46d4b11fb8f0cce999c0b3b"
+    },
     "mistral35_w4a16_gemm_mn_bf16": {
       "bytes": 53534,
       "path": "mistral35_w4a16_gemm_mn_bf16.ptx",
@@ -757,5 +762,5 @@
       "sha256": "e296d3287e5e890126a6bcd06d6488874e33a08fe872887fe093163999e51740"
     }
   },
-  "revision": "e50221e"
+  "revision": "0b4eec4"
 }
