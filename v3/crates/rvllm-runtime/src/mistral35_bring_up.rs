@@ -947,6 +947,52 @@ impl Mistral35Bringup {
         // session into a production server profile.
         validate_no_stale_debug_envs(&paths.model_dir)?;
 
+        // Codex review (latest) finding #1 — flag the dead/legacy
+        // prefill-plan gates with a one-line startup warning if any
+        // is set in the operator's profile. They look like they
+        // should enable batched prefill but the real path uses
+        // RVLLM_MISTRAL35_BATCH_PREFILL + RVLLM_MISTRAL35_CHUNK_BODY
+        // (default-on) and the BATCHED_ATTN_PREFILL / BATCHED_ROPE
+        // / BATCHED_KV_WRITE / FUSED_QKV decode flags above.
+        // Profile-template fix is the companion to this warn.
+        for key in [
+            "RVLLM_MISTRAL35_BATCH_PROJ_PREFILL",
+            "RVLLM_MISTRAL35_BATCH_ROPE_PREFILL",
+            "RVLLM_MISTRAL35_BATCH_FULL_PREFILL",
+            "RVLLM_MISTRAL35_FUSED_QKV",
+            "RVLLM_MISTRAL35_DECODE_GRAPH",
+        ] {
+            if std::env::var(key).ok().as_deref()
+                .map(|s| s != "0" && !s.is_empty()).unwrap_or(false)
+            {
+                eprintln!(
+                    "[mistral35] WARN: env {key} is set but the current \
+                     executor does not consume it. The real gates are: \
+                     RVLLM_MISTRAL35_BATCH_PREFILL (=1 default-on), \
+                     RVLLM_MISTRAL35_BATCHED_ATTN_PREFILL, \
+                     RVLLM_MISTRAL35_BATCHED_ROPE, \
+                     RVLLM_MISTRAL35_BATCHED_KV_WRITE, \
+                     RVLLM_MISTRAL35_DECODE_FUSED_QKV, \
+                     RVLLM_MISTRAL35_DECODE_FUSED_GATE_UP. \
+                     The {key}=… line in the profile is a no-op."
+                );
+            }
+        }
+        // RVLLM_PREFILL_CHUNK_SIZE is Gemma 4's gate; Mistral 3.5
+        // reads RVLLM_MISTRAL35_PREFILL_CHUNK_SIZE (default 4096).
+        // Warn if the operator set the Gemma name expecting it to
+        // apply to Mistral.
+        if std::env::var_os("RVLLM_PREFILL_CHUNK_SIZE").is_some()
+            && std::env::var_os("RVLLM_MISTRAL35_PREFILL_CHUNK_SIZE").is_none()
+        {
+            eprintln!(
+                "[mistral35] WARN: RVLLM_PREFILL_CHUNK_SIZE is set but \
+                 Mistral 3.5 reads RVLLM_MISTRAL35_PREFILL_CHUNK_SIZE \
+                 (default 4096). The Gemma 4 name is a no-op for this \
+                 model."
+            );
+        }
+
         // (1) Arch — already gated by family resolver, but re-parse
         //     here so failures point at the actual model_dir even
         //     when the operator passed `--model-family auto`.
