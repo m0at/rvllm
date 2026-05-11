@@ -166,20 +166,27 @@ pub async fn spawn_cuda_worker(
                         std::env::var("RVLLM_MISTRAL35_VISION_DEVICE_RESIDENT")
                             .ok().as_deref()
                             .map(|s| s != "0" && !s.is_empty())
-                            .unwrap_or(false)
-                        && !req.vision_items.is_empty()
-                        && req.vision_slots.len() == req.vision_items.len();
+                            .unwrap_or(true)
+                        && !req.vision_items.is_empty();
                     let mut vision_splices: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-                    // Build (start, image_bytes) pairs for the
-                    // device-resident path when the flag is on.
-                    // Restricted to one slot per image (H=1) for now
-                    // so the row_offset slicing path stays a no-op.
-                    let mut vision_images: Vec<(usize, Vec<u8>)> = Vec::new();
+                    // Slot-aware device-resident inputs: raw image
+                    // bytes per UNIQUE image + (token_start,
+                    // num_tokens, image_idx, row_offset) tuples
+                    // honouring Pixtral H>1 row-separator layout.
+                    let mut vision_images_raw: Vec<Vec<u8>> = Vec::new();
+                    let mut vision_slot_tuples: Vec<(usize, usize, usize, usize)>
+                        = Vec::new();
                     if try_device_resident_vision {
+                        for item in req.vision_items.iter() {
+                            vision_images_raw.push(item.bytes.clone());
+                        }
                         for slot in req.vision_slots.iter() {
-                            let vi_idx = slot.vision_item_idx;
-                            let item = &req.vision_items[vi_idx];
-                            vision_images.push((slot.token_start, item.bytes.clone()));
+                            vision_slot_tuples.push((
+                                slot.token_start,
+                                slot.num_tokens,
+                                slot.vision_item_idx,
+                                slot.vision_row_offset,
+                            ));
                         }
                     } else if !req.vision_items.is_empty() {
                         // Run the Pixtral vision tower ONCE per image
@@ -338,10 +345,11 @@ pub async fn spawn_cuda_worker(
                     };
                     let gen = if try_device_resident_vision {
                         unsafe {
-                            bringup.generate_with_images(
+                            bringup.generate_with_vision_slots(
                                 &prompt, max_new, &eos,
                                 Some(cancel_ref), on_token_cb,
-                                &vision_images,
+                                &vision_images_raw,
+                                &vision_slot_tuples,
                             )
                         }
                     } else {

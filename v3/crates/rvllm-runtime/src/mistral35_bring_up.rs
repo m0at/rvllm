@@ -5312,6 +5312,261 @@ impl Mistral35Bringup {
         })
     }
 
+    /// Codex review #3 (new) — device-resident, slot-aware vision
+    /// generate. Replaces the cuda_worker DtoH→Vec<u8>→HtoD
+    /// roundtrip: each image's `forward_pixtral_vision_into`
+    /// writes BF16 directly into a per-request splice region
+    /// allocated above the prefill checkpoint, and the
+    /// pos_to_dev_ptr map is built per-slot honouring
+    /// `vision_row_offset` for multi-slot (H>1) images.
+    ///
+    /// `vision_items` lists unique raw image bytes (one entry per
+    /// distinct image admitted on the request); `vision_slots` is
+    /// a tuple stream `(token_start, num_tokens, image_idx,
+    /// vision_row_offset)` matching the cuda_worker's slot
+    /// representation. Multiple slots may reference the same
+    /// image_idx (Pixtral row-separator layout); the forward runs
+    /// exactly once per image regardless.
+    ///
+    /// All other semantics — chunked prefill, lm_head-skip on
+    /// non-last chunks, decode loop, eos / cancellation —
+    /// mirror `generate_with_vision`.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn generate_with_vision_slots<F>(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        eos_ids: &[u32],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+        mut on_token: F,
+        vision_items: &[Vec<u8>],
+        vision_slots: &[(usize, usize, usize, usize)],
+    ) -> Result<GenerateResult>
+    where
+        F: FnMut(u32),
+    {
+        let is_cancelled = || cancelled
+            .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false);
+
+        let arena = self.validate_generate_inputs(prompt, max_new)?;
+        self.kv_request_begin(prompt.len() + max_new)?;
+
+        if debug_env_os("RVLLM_SMOKE_SINGLE").is_some() {
+            let tok = *prompt.last().unwrap();
+            let dump = self.forward_smoke_q_proj_inner(tok, 0, true, None)?;
+            return Ok(GenerateResult {
+                tokens: vec![tok, dump.predicted_token],
+                last_dump: Some(dump),
+                prompt_len: 1,
+            });
+        }
+
+        let ck_outer = arena.checkpoint();
+        let do_restore = debug_env_os("RVLLM_SMOKE_NO_RESTORE").is_none();
+        let hidden_bytes = (self.arch.text.hidden_size as usize) * 2;
+
+        // ── Vision splice region (device-resident) ──────────────
+        // Pre-flight: preprocess each unique image to determine
+        // its forward-output size. Allocate one contiguous region
+        // sized for the sum, run forward once per image into the
+        // appropriate sub-range, then build pos_to_dev_ptr per
+        // slot.
+        let mut image_offsets_bytes: Vec<usize> =
+            Vec::with_capacity(vision_items.len());
+        let mut image_num_tokens: Vec<usize> =
+            Vec::with_capacity(vision_items.len());
+        let mut total_region_bytes = 0usize;
+        for image_bytes in vision_items {
+            let pp = self.vision_preprocess(image_bytes)?;
+            let nt = pp.num_soft_tokens;
+            image_offsets_bytes.push(total_region_bytes);
+            image_num_tokens.push(nt);
+            total_region_bytes += nt * hidden_bytes;
+        }
+
+        let mut pos_to_dev_ptr: std::collections::HashMap<i32, u64> =
+            std::collections::HashMap::new();
+        let mut _splice_region_keepalive: Option<rvllm_mem::Region> = None;
+        if total_region_bytes > 0 {
+            let region = arena.region(
+                "mistral35_vision_splices_devp", total_region_bytes, 16)?;
+            let base = region.device_ptr();
+            for (img_idx, image_bytes) in vision_items.iter().enumerate() {
+                let dst = base + image_offsets_bytes[img_idx] as u64;
+                let nt_got = self.forward_pixtral_vision_into(
+                    image_bytes, dst, image_num_tokens[img_idx])?;
+                if nt_got != image_num_tokens[img_idx] {
+                    return Err(corrupt(
+                        self.paths.model_dir.clone(),
+                        format!(
+                            "generate_with_vision_slots: image {} forward \
+                             produced {} tokens, pre-flight predicted {}",
+                            img_idx, nt_got, image_num_tokens[img_idx],
+                        ),
+                    ));
+                }
+            }
+            for &(token_start, num_tokens, image_idx, row_offset) in vision_slots {
+                if image_idx >= vision_items.len() {
+                    return Err(corrupt(
+                        self.paths.model_dir.clone(),
+                        format!(
+                            "generate_with_vision_slots: slot references \
+                             image_idx={} out of range [0, {})",
+                            image_idx, vision_items.len(),
+                        ),
+                    ));
+                }
+                let image_base = base + image_offsets_bytes[image_idx] as u64;
+                let image_max_tokens = image_num_tokens[image_idx];
+                if row_offset + num_tokens > image_max_tokens {
+                    return Err(corrupt(
+                        self.paths.model_dir.clone(),
+                        format!(
+                            "generate_with_vision_slots: slot \
+                             (row_offset={}, num_tokens={}) exceeds image \
+                             num_tokens={}",
+                            row_offset, num_tokens, image_max_tokens,
+                        ),
+                    ));
+                }
+                for t in 0..num_tokens {
+                    let pos = (token_start + t) as i32;
+                    let ptr = image_base
+                        + ((row_offset + t) * hidden_bytes) as u64;
+                    pos_to_dev_ptr.insert(pos, ptr);
+                }
+            }
+            _splice_region_keepalive = Some(region);
+        }
+        let ck_after_splices = arena.checkpoint();
+
+        let mut tokens: Vec<u32> = prompt.to_vec();
+        let mut last_dump: Option<SmokeStageDump> = None;
+        let mut last_predicted: u32 = 0;
+
+        let timing_on = std::env::var("RVLLM_MISTRAL35_TIMING")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(false);
+        let prefill_t0 = std::time::Instant::now();
+
+        // Stage 3: prefill — identical chunked-prefill logic to
+        // generate_with_vision, sharing pos_to_dev_ptr.
+        let use_batched_prefill = std::env::var("RVLLM_MISTRAL35_BATCH_PREFILL")
+            .ok().as_deref().map(|s| s != "0" && !s.is_empty())
+            .unwrap_or(true);
+        let chunk_t_max = self.scratch.as_ref()
+            .map(|s| s.chunk_t_max).unwrap_or(0);
+        let chunk_t_min: usize = std::env::var("RVLLM_MISTRAL35_PREFILL_CHUNK_MIN")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(16usize);
+
+        if use_batched_prefill
+            && chunk_t_max > 0
+            && prompt.len() >= chunk_t_min
+            && !prompt.is_empty()
+        {
+            let total = prompt.len();
+            let mut pos: usize = 0;
+            while pos < total {
+                if is_cancelled() {
+                    return Ok(GenerateResult {
+                        tokens, last_dump, prompt_len: prompt.len(),
+                    });
+                }
+                let chunk_end = (pos + chunk_t_max).min(total);
+                let chunk = &prompt[pos..chunk_end];
+                let is_last_chunk = chunk_end == total;
+                let logits_at = if is_last_chunk {
+                    Some(chunk.len() - 1)
+                } else {
+                    None
+                };
+                let dump = self.forward_smoke_chunk(
+                    chunk, pos as i32, logits_at,
+                    arena, ck_after_splices, do_restore,
+                    &pos_to_dev_ptr,
+                    &is_cancelled,
+                )?;
+                if is_last_chunk {
+                    if let Some(d) = dump {
+                        last_predicted = d.predicted_token;
+                        last_dump = Some(d);
+                    }
+                }
+                pos = chunk_end;
+            }
+        } else {
+            for (i, &tok) in prompt.iter().enumerate() {
+                if is_cancelled() {
+                    return Ok(GenerateResult {
+                        tokens, last_dump, prompt_len: prompt.len(),
+                    });
+                }
+                let is_last = i == prompt.len() - 1;
+                let splice_ptr = pos_to_dev_ptr.get(&(i as i32)).copied();
+                if let Some(dump) = self.prefill_token(
+                    tok, i as i32, is_last, arena, ck_after_splices,
+                    do_restore, splice_ptr,
+                )? {
+                    last_predicted = dump.predicted_token;
+                    last_dump = Some(dump);
+                }
+            }
+        }
+        let prefill_ms = prefill_t0.elapsed().as_secs_f64() * 1e3;
+        let decode_t0 = std::time::Instant::now();
+        let mut decode_steps_done: usize = 0;
+        for step in 0..max_new {
+            tokens.push(last_predicted);
+            on_token(last_predicted);
+            if eos_ids.contains(&last_predicted) {
+                break;
+            }
+            if step + 1 >= max_new {
+                break;
+            }
+            if is_cancelled() {
+                break;
+            }
+            let pos = (prompt.len() + step) as i32;
+            let dump = self.decode_token(
+                last_predicted, pos, arena, ck_after_splices, do_restore,
+            )?;
+            last_predicted = dump.predicted_token;
+            last_dump = Some(dump);
+            decode_steps_done += 1;
+        }
+        if timing_on {
+            let decode_ms = decode_t0.elapsed().as_secs_f64() * 1e3;
+            let prefill_tok_per_s = if prefill_ms > 0.0 {
+                (prompt.len() as f64) / (prefill_ms / 1e3)
+            } else { 0.0 };
+            let decode_tok_per_s = if decode_ms > 0.0 && decode_steps_done > 0 {
+                (decode_steps_done as f64) / (decode_ms / 1e3)
+            } else { 0.0 };
+            tracing::info!(
+                prompt_tokens = prompt.len(),
+                decode_steps = decode_steps_done,
+                prefill_ms = format!("{:.1}", prefill_ms),
+                decode_ms = format!("{:.1}", decode_ms),
+                prefill_tok_per_s = format!("{:.2}", prefill_tok_per_s),
+                decode_tok_per_s = format!("{:.2}", decode_tok_per_s),
+                "[mistral35-timing-slots]"
+            );
+        }
+
+        if do_restore { unsafe { arena.restore(ck_outer); } }
+        drop(_splice_region_keepalive);
+
+        Ok(GenerateResult {
+            tokens,
+            last_dump,
+            prompt_len: prompt.len(),
+        })
+    }
+
     /// Round-12 phase 5c codex review #3 — KNOWN BROKEN.
     ///
     /// Designed to eliminate the DtoH→HtoD round-trip by running the
