@@ -1413,6 +1413,10 @@ impl Gemma4Bringup {
         })
     }
 
+    /// Streaming variant of `run_generate`. Calls `on_token(tok)` for
+    /// every sampled output token (in order). Returning `false` from
+    /// the callback aborts generation early. EOS is still applied
+    /// internally; the callback fires before the EOS check.
     #[cfg(feature = "cuda")]
     pub unsafe fn run_generate(
         &self,
@@ -1422,6 +1426,31 @@ impl Gemma4Bringup {
         max_new: usize,
         eos_ids: &[u32],
     ) -> Result<Vec<u32>> {
+        let mut out: Vec<u32> = Vec::with_capacity(max_new);
+        self.run_generate_streaming(
+            fn_embed,
+            fn_argmax,
+            prompt_ids,
+            max_new,
+            eos_ids,
+            &mut |tok| {
+                out.push(tok);
+                true
+            },
+        )?;
+        Ok(out)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub unsafe fn run_generate_streaming(
+        &self,
+        fn_embed: rvllm_kernels::KernelFn,
+        fn_argmax: rvllm_kernels::KernelFn,
+        prompt_ids: &[u32],
+        max_new: usize,
+        eos_ids: &[u32],
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<()> {
         let arch = &self.arch;
         let hidden = arch.hidden_size as u32;
         let vocab = arch.vocab_size as u32;
@@ -1967,16 +1996,17 @@ impl Gemma4Bringup {
         eprintln!("[prefill] {} tokens in {:.1}ms (TTFT={:.1}ms)",
             prompt_ids.len(), prefill_ms, prefill_ms);
 
-        let mut output_ids: Vec<u32> = Vec::with_capacity(max_new);
-        output_ids.push(host_tok[0] as u32);
-        if eos_ids.contains(&(host_tok[0] as u32)) {
-            return Ok(output_ids);
+        let mut output_count: usize = 0;
+        let mut last_token: u32 = host_tok[0] as u32;
+        output_count += 1;
+        let cont = on_token(last_token);
+        if !cont || eos_ids.contains(&last_token) {
+            return Ok(());
         }
 
         // Phase 2: Decode new tokens
         for decode_step in 0..max_new - 1 {
-            let tok_id = *output_ids.last().unwrap();
-            run_one_token(tok_id, prompt_ids.len() + decode_step)?;
+            run_one_token(last_token, prompt_ids.len() + decode_step)?;
 
             rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: 1, hidden, eps: arch.rms_norm_eps,
@@ -1989,15 +2019,17 @@ impl Gemma4Bringup {
             self.stream.fence()?;
             cudarc::driver::sys::cuMemcpyDtoH_v2(host_tok.as_mut_ptr() as *mut _, sampled.device_ptr(), 4);
             let next_id = host_tok[0] as u32;
-            output_ids.push(next_id);
-            if eos_ids.contains(&next_id) { break; }
+            last_token = next_id;
+            output_count += 1;
+            let cont = on_token(next_id);
+            if !cont || eos_ids.contains(&next_id) { break; }
         }
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let decode_ms = total_ms - prefill_ms;
         eprintln!("[generate] {} tokens decoded in {:.1}ms ({:.1} tok/s)",
-            output_ids.len(), decode_ms, output_ids.len() as f64 / (decode_ms / 1000.0));
-        Ok(output_ids)
+            output_count, decode_ms, output_count as f64 / (decode_ms / 1000.0));
+        Ok(())
     }
 
     pub fn layer_kernels(&self) -> Gemma4LayerKernels {
