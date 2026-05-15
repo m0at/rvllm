@@ -6,15 +6,36 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# rvllm-serve: HTTP serving loop. Reuses step_launch/step_collect.
-# OpenAI-compatible API. See v3/specs/05-concurrency.md for the tokio -> worker channel design.
+# rvllm-serve: OpenAI-compatible HTTP frontend over rvllm-runtime.
+# One worker thread owns the Gemma4Bringup engine (CUDA stream
+# affinity); tokio side hands chat requests to it through an mpsc and
+# receives token events back per-request.
 
 [[bin]]
 name = "rvllm-server"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["rvllm-runtime/cuda"]
+gb10 = ["cuda", "rvllm-runtime/gb10"]
+
 [dependencies]
-rvllm-core = { workspace = true }
+rvllm-core    = { workspace = true }
 rvllm-runtime = { workspace = true }
-tracing = { workspace = true }
+
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+axum        = { version = "0.7", features = ["tokio", "json"] }
+tower-http  = { version = "0.5", features = ["cors", "trace"] }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+bytes       = "1"
+tokio-stream = "0.1"
+futures      = "0.3"
+tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid         = { version = "1", features = ["v4"] }
+anyhow       = "1"
+thiserror    = { workspace = true }
+minijinja    = { version = "2", features = ["loader"] }
+tokenizers   = { version = "0.20", default-features = false, features = ["onig"] }
