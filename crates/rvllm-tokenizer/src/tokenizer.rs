@@ -8,7 +8,7 @@ use rvllm_core::prelude::{hf_auth_hint, hf_token_from_env, LLMError, Result, Tok
 use tokenizers::Tokenizer as HfTokenizer;
 use tracing::{debug, info};
 
-use crate::chat::{apply_chatml, apply_harmony, ChatMessage, ChatTemplate};
+use crate::chat::{apply_chatml, apply_gemma4, apply_harmony, ChatMessage, ChatTemplate};
 use crate::incremental::IncrementalDecoder;
 
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -179,13 +179,23 @@ impl Tokenizer {
         special_tokens.sort_unstable();
         special_tokens.dedup();
 
-        // Detect Harmony template: presence of <|im_sep|> in the vocabulary distinguishes
-        // GPT-OSS/Harmony from plain ChatML which only uses <|im_start|>/<|im_end|>.
-        let chat_template = if hf.get_vocab(true).contains_key("<|im_sep|>") {
+        let vocab = hf.get_vocab(true);
+
+        // Detect Gemma 4 first; its tokenizer ships the actual template in
+        // chat_template.jinja, but tokenizers::Tokenizer only sees tokenizer.json.
+        let chat_template = if vocab.contains_key("<|turn>") && vocab.contains_key("<turn|>") {
+            ChatTemplate::Gemma4
+        } else if vocab.contains_key("<|im_sep|>") {
             ChatTemplate::Harmony
         } else {
             ChatTemplate::ChatML
         };
+
+        if chat_template == ChatTemplate::Gemma4 {
+            if let Some(id) = vocab.get("<turn|>").copied() {
+                eos_token_id = Some(id);
+            }
+        }
 
         debug!(
             vocab_size = hf.get_vocab_size(true),
@@ -272,6 +282,7 @@ impl Tokenizer {
         add_generation_prompt: bool,
     ) -> Result<String> {
         match self.chat_template {
+            ChatTemplate::Gemma4 => apply_gemma4(messages, add_generation_prompt),
             ChatTemplate::Harmony => apply_harmony(messages, add_generation_prompt),
             ChatTemplate::ChatML => apply_chatml(messages, add_generation_prompt),
         }

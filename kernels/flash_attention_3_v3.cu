@@ -115,7 +115,7 @@ __device__ __forceinline__ void v3_async_load_tile(
     const __half* cache,
     const int* block_tables, int seq_idx, int max_blocks,
     int tile_start, int tile_len, int num_kv_heads, int kv_head_idx,
-    int head_dim, int block_size, int tid
+    int head_dim, int block_size, int cache_stride, int tid
 ) {
     const int chunks_per_row = head_dim / V3_CHUNK;
     const int total_chunks = tile_len * chunks_per_row;
@@ -128,8 +128,8 @@ __device__ __forceinline__ void v3_async_load_tile(
         int page_off = kv_pos % block_size;
         int phys_block = __ldg(&block_tables[seq_idx * max_blocks + page_idx]);
 
-        const __half* src = &cache[((phys_block * block_size + page_off)
-                                    * num_kv_heads + kv_head_idx) * head_dim + ch * V3_CHUNK];
+        const __half* src = &cache[(phys_block * block_size + page_off) * cache_stride
+                                    + kv_head_idx * head_dim + ch * V3_CHUNK];
         __half* dst = &s_buf[t * head_dim + ch * V3_CHUNK];
 
         v3_cp_async_16(dst, src);
@@ -166,6 +166,7 @@ fa3_v3_decode_gqa_kernel(
     int num_kv_heads,
     int head_dim,
     int block_size,
+    int cache_stride,
     int max_context_len,
     int max_blocks_per_seq,
     int num_splits
@@ -251,7 +252,7 @@ fa3_v3_decode_gqa_kernel(
         const int tile_len = min(V3_BC, context_len - tile_start);
         v3_async_load_tile(s_K, key_cache, block_tables, seq_idx, max_blocks_per_seq,
                            tile_start, tile_len, num_kv_heads, kv_head_idx,
-                           head_dim, block_size, tid);
+                           head_dim, block_size, cache_stride, tid);
         v3_cp_async_commit();
         v3_cp_async_wait_all();
         __syncthreads();
@@ -290,7 +291,7 @@ fa3_v3_decode_gqa_kernel(
         // ---- 2. Issue async V load into s_V (overlaps with softmax) ----
         v3_async_load_tile(s_V, value_cache, block_tables, seq_idx, max_blocks_per_seq,
                            tile_start, tile_len, num_kv_heads, kv_head_idx,
-                           head_dim, block_size, tid);
+                           head_dim, block_size, cache_stride, tid);
         v3_cp_async_commit();
 
         // ---- 3. Online softmax (no KV buffer access -- V loading in background) ----
@@ -326,7 +327,7 @@ fa3_v3_decode_gqa_kernel(
             const int next_len = min(V3_BC, context_len - next_start);
             v3_async_load_tile(s_K, key_cache, block_tables, seq_idx, max_blocks_per_seq,
                                next_start, next_len, num_kv_heads, kv_head_idx,
-                               head_dim, block_size, tid);
+                               head_dim, block_size, cache_stride, tid);
             v3_cp_async_commit();
         }
 
@@ -405,6 +406,7 @@ fa3_v3_decode_kernel(
     int num_kv_heads,
     int head_dim,
     int block_size,
+    int cache_stride,
     int max_context_len,
     int max_blocks_per_seq,
     int num_splits
@@ -484,7 +486,7 @@ fa3_v3_decode_kernel(
         const int tile_len = min(V3_BC, context_len - tile_start);
         v3_async_load_tile(s_K, key_cache, block_tables, seq_idx, max_blocks_per_seq,
                            tile_start, tile_len, num_kv_heads, kv_head_idx,
-                           head_dim, block_size, tid);
+                           head_dim, block_size, cache_stride, tid);
         v3_cp_async_commit();
         v3_cp_async_wait_all();
         __syncthreads();
@@ -519,7 +521,7 @@ fa3_v3_decode_kernel(
         // 2. Issue async V load (overlaps with softmax)
         v3_async_load_tile(s_V, value_cache, block_tables, seq_idx, max_blocks_per_seq,
                            tile_start, tile_len, num_kv_heads, kv_head_idx,
-                           head_dim, block_size, tid);
+                           head_dim, block_size, cache_stride, tid);
         v3_cp_async_commit();
 
         // 3. Online softmax (V loading in background)
@@ -551,7 +553,7 @@ fa3_v3_decode_kernel(
             const int next_len = min(V3_BC, context_len - next_start);
             v3_async_load_tile(s_K, key_cache, block_tables, seq_idx, max_blocks_per_seq,
                                next_start, next_len, num_kv_heads, kv_head_idx,
-                               head_dim, block_size, tid);
+                               head_dim, block_size, cache_stride, tid);
             v3_cp_async_commit();
         }
 

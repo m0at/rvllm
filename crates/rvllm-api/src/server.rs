@@ -178,7 +178,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 }
 
 async fn metrics_placeholder() -> &'static str {
-    "# vllm-rs metrics endpoint\n"
+    "# rvllm-rust metrics endpoint\n"
 }
 
 fn cuda_gpu_available() -> bool {
@@ -276,7 +276,8 @@ fn build_mock_tokenizer() -> rvllm_tokenizer::Tokenizer {
 }
 
 pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
-    let model_name = config.model.model_path.clone();
+    let model_name = std::env::var("RVLLM_SERVED_MODEL_NAME")
+        .unwrap_or_else(|_| config.model.model_path.clone());
     let tokenizer_path = config
         .model
         .tokenizer_path

@@ -25,7 +25,7 @@
 #include <cuda_fp16.h>
 
 #define SPLIT_KV_THREADS 128
-#define SPLIT_KV_BC 64  // KV tile width (positions per tile)
+#define SPLIT_KV_BC 32  // KV tile width (positions per tile)
 
 // ============================================================================
 // Warp/block reductions (same as flash_attention.cu)
@@ -106,6 +106,7 @@ __global__ void split_kv_decode_f16kv_kernel(
     int num_kv_heads,
     int head_dim,
     int block_size,
+    int cache_stride,
     int max_blocks_per_seq,
     int num_splits
 ) {
@@ -405,6 +406,7 @@ __global__ void split_kv_decode_fp8kv_kernel(
     int num_kv_heads,
     int head_dim,
     int block_size,
+    int cache_stride,
     int max_blocks_per_seq,
     int num_splits
 ) {
@@ -742,6 +744,7 @@ __global__ void split_kv_decode_f16io_kernel(
     int num_kv_heads,
     int head_dim,
     int block_size,
+    int cache_stride,
     int max_blocks_per_seq,
     int num_splits
 ) {
@@ -819,7 +822,7 @@ __global__ void split_kv_decode_f16io_kernel(
                 int page_idx = kv_pos / block_size;
                 int page_off = kv_pos % block_size;
                 int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
-                int k_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
+                int k_base = (phys_block * block_size + page_off) * cache_stride + kv_head_idx * head_dim + v * 4;
                 half2 h01 = __ldg(reinterpret_cast<const half2*>(&key_cache[k_base]));
                 half2 h23 = __ldg(reinterpret_cast<const half2*>(&key_cache[k_base + 2]));
                 int s_base = t * head_dim + v * 4;
@@ -888,7 +891,7 @@ __global__ void split_kv_decode_f16io_kernel(
                 int page_idx = kv_pos / block_size;
                 int page_off = kv_pos % block_size;
                 int phys_block = __ldg(&block_tables[seq_idx * max_blocks_per_seq + page_idx]);
-                int v_base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + v * 4;
+                int v_base = (phys_block * block_size + page_off) * cache_stride + kv_head_idx * head_dim + v * 4;
                 half2 h01 = __ldg(reinterpret_cast<const half2*>(&value_cache[v_base]));
                 half2 h23 = __ldg(reinterpret_cast<const half2*>(&value_cache[v_base + 2]));
                 int s_base = t * head_dim + v * 4;

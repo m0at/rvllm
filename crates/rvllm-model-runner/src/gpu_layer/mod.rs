@@ -39,6 +39,10 @@ mod inner {
         pub intermediate_size: usize,
         pub rms_norm_eps: f32,
         pub layer_idx: usize,
+        pub use_gelu_mlp: bool,
+        pub use_gemma4_block: bool,
+        pub rotary_dim: usize,
+        pub attention_scale: f32,
     }
 
     /// Weight references for a single transformer layer (all f16).
@@ -49,6 +53,11 @@ mod inner {
         pub v_proj: &'a CudaSlice<f16>,
         pub o_proj: &'a CudaSlice<f16>,
         pub post_attention_layernorm: &'a CudaSlice<f16>,
+        pub pre_feedforward_layernorm: Option<&'a CudaSlice<f16>>,
+        pub post_feedforward_layernorm: Option<&'a CudaSlice<f16>>,
+        pub q_norm: Option<&'a CudaSlice<f16>>,
+        pub k_norm: Option<&'a CudaSlice<f16>>,
+        pub layer_scalar: Option<&'a CudaSlice<f16>>,
         pub gate_proj: &'a CudaSlice<f16>,
         pub up_proj: &'a CudaSlice<f16>,
         pub down_proj: &'a CudaSlice<f16>,
@@ -82,6 +91,9 @@ mod inner {
         pub seq_start_pos: CudaView<'a, i32>,
         pub rope_cos: &'a CudaSlice<f32>,
         pub rope_sin: &'a CudaSlice<f32>,
+        pub rope_stride: usize,
+        pub rotary_dim: usize,
+        pub kv_cache_stride: usize,
         pub fp8_input_scratch_ptr: u64,
         pub fp8_input_scratch_len: usize,
     }
@@ -581,6 +593,116 @@ mod inner {
             Ok(())
         }
 
+        pub(crate) fn add_f16_into(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            a: &CudaSlice<f16>,
+            b: &CudaSlice<f16>,
+            n: usize,
+            output: &mut CudaSlice<f16>,
+        ) -> Result<()> {
+            let kernel = loader.get_func("add_bias_f16", "add_f16_kernel")?;
+            unsafe {
+                stream
+                    .launch_builder(&kernel)
+                    .arg(output)
+                    .arg(a)
+                    .arg(b)
+                    .arg(&(n as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (((n as u32) + 255) / 256, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("add_f16 launch: {e}")))?;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn scale_f16_inplace(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            tensor: &mut CudaSlice<f16>,
+            scale: &CudaSlice<f16>,
+            n: usize,
+        ) -> Result<()> {
+            let kernel = loader.get_func("gemma4_ops_f16", "scale_f16_inplace_kernel")?;
+            unsafe {
+                stream
+                    .launch_builder(&kernel)
+                    .arg(tensor)
+                    .arg(scale)
+                    .arg(&(n as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (((n as u32) + 255) / 256, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("scale_f16 launch: {e}")))?;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn head_rms_norm_f16_view(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            tensor: &mut CudaViewMut<'_, f16>,
+            weight: &CudaSlice<f16>,
+            eps: f32,
+            num_tokens: usize,
+            num_heads: usize,
+            head_dim: usize,
+        ) -> Result<()> {
+            let threads = head_dim.min(1024) as u32;
+            let kernel = loader.get_func("gemma4_ops_f16", "head_rms_norm_f16_kernel")?;
+            unsafe {
+                stream
+                    .launch_builder(&kernel)
+                    .arg(tensor)
+                    .arg(weight)
+                    .arg(&eps)
+                    .arg(&(num_tokens as i32))
+                    .arg(&(num_heads as i32))
+                    .arg(&(head_dim as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (num_tokens as u32, num_heads as u32, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: threads * std::mem::size_of::<f32>() as u32,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("head_rms_norm launch: {e}")))?;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn head_rms_norm_noscale_f16_view(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            tensor: &mut CudaViewMut<'_, f16>,
+            eps: f32,
+            num_tokens: usize,
+            num_heads: usize,
+            head_dim: usize,
+        ) -> Result<()> {
+            let threads = head_dim.min(1024) as u32;
+            let kernel = loader.get_func("gemma4_ops_f16", "head_rms_norm_noscale_f16_kernel")?;
+            unsafe {
+                stream
+                    .launch_builder(&kernel)
+                    .arg(tensor)
+                    .arg(&eps)
+                    .arg(&(num_tokens as i32))
+                    .arg(&(num_heads as i32))
+                    .arg(&(head_dim as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (num_tokens as u32, num_heads as u32, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: threads * std::mem::size_of::<f32>() as u32,
+                    })
+                    .map_err(|e| LLMError::GpuError(format!("head_rms_norm_noscale launch: {e}")))?;
+            }
+            Ok(())
+        }
+
         /// hgemm dispatch: cublasLt for small/mid M, cuBLAS for larger M.
         pub(crate) fn hgemm_dispatch(
             stream: &Arc<CudaStream>,
@@ -827,6 +949,8 @@ mod inner {
             positions: &CudaView<'_, i32>,
             rope_cos: &CudaSlice<f32>,
             rope_sin: &CudaSlice<f32>,
+            rope_stride: usize,
+            rotary_dim: usize,
             num_tokens: usize,
             num_heads: usize,
             num_kv_heads: usize,
@@ -836,8 +960,8 @@ mod inner {
                 return Ok(());
             }
             let kernel = loader.get_func("rotary_embedding_f16", "rotary_embedding_f16_kernel")?;
-            let half_dim = head_dim / 2;
             let grid_y = num_heads.max(num_kv_heads) as u32;
+            let half_dim = head_dim / 2;
             let cfg = LaunchConfig {
                 grid_dim: (num_tokens as u32, grid_y, 1),
                 block_dim: (half_dim.min(1024) as u32, 1, 1),
@@ -855,6 +979,8 @@ mod inner {
                     .arg(&(num_heads as i32))
                     .arg(&(num_kv_heads as i32))
                     .arg(&(head_dim as i32))
+                    .arg(&(rope_stride as i32))
+                    .arg(&(rotary_dim as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("rope_f16 launch: {e}")))?;
             }
@@ -873,6 +999,7 @@ mod inner {
             num_tokens: usize,
             num_kv_heads: usize,
             head_dim: usize,
+            cache_stride: usize,
         ) -> Result<()> {
             let kv_dim = num_kv_heads * head_dim;
             let kernel =
@@ -894,6 +1021,7 @@ mod inner {
                     .arg(&(num_tokens as i32))
                     .arg(&(num_kv_heads as i32))
                     .arg(&(head_dim as i32))
+                    .arg(&(cache_stride as i32))
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("cache_write_f16 launch: {e}")))?;
             }
@@ -912,6 +1040,9 @@ mod inner {
             num_kv_heads: usize,
             head_dim: usize,
             num_tokens: usize,
+            rope_stride: usize,
+            rotary_dim: usize,
+            cache_stride: usize,
         ) -> Result<()> {
             let fk = loader
                 .get_func("fused_rope_cache", "fused_rope_cache_f16_kernel")
@@ -921,7 +1052,6 @@ mod inner {
             let (mut q_part, mut kv_rest) = qkv.split_at_mut(q_dim);
             let (mut k_part, v_part) = kv_rest.split_at_mut(kv_dim);
             let v_view = v_part.slice(..kv_dim);
-            let half_dim = head_dim / 2;
             let grid_y = num_heads.max(num_kv_heads) as u32;
             unsafe {
                 stream
@@ -939,9 +1069,12 @@ mod inner {
                     .arg(&(num_heads as i32))
                     .arg(&(num_kv_heads as i32))
                     .arg(&(head_dim as i32))
+                    .arg(&(rope_stride as i32))
+                    .arg(&(rotary_dim as i32))
+                    .arg(&(cache_stride as i32))
                     .launch(LaunchConfig {
                         grid_dim: (num_tokens as u32, grid_y, 1),
-                        block_dim: (half_dim.min(1024) as u32, 1, 1),
+                        block_dim: (head_dim.min(1024) as u32, 1, 1),
                         shared_mem_bytes: 0,
                     })
                     .map_err(|e| LLMError::GpuError(format!("fused rope+cache: {e}")))?;
@@ -967,6 +1100,8 @@ mod inner {
             head_dim: usize,
             max_context_len: u32,
             block_size: usize,
+            cache_stride: usize,
+            attention_scale: f32,
         ) -> Result<CudaSlice<f16>> {
             let kernel = loader
                 .get_func(
@@ -979,7 +1114,7 @@ mod inner {
             let mut output = unsafe { stream.alloc::<f16>(out_len) }
                 .map_err(|e| LLMError::GpuError(format!("prefill_attn_f16io alloc: {e}")))?;
 
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let scale = attention_scale;
             const FA3_BC: usize = 64;
             const FA3_THREADS: u32 = 256;
             let smem = FA3_BC * head_dim * std::mem::size_of::<u16>()
@@ -1022,6 +1157,7 @@ mod inner {
                     .arg(&(num_kv_heads as i32))
                     .arg(&(head_dim as i32))
                     .arg(&(block_size as i32))
+                    .arg(&(cache_stride as i32))
                     .arg(&(max_context_len as i32))
                     .arg(&max_blocks_per_seq)
                     .arg(&(num_tokens as i32))
@@ -1049,6 +1185,8 @@ mod inner {
             head_dim: usize,
             max_context_len: u32,
             block_size: usize,
+            cache_stride: usize,
+            attention_scale: f32,
         ) -> Result<CudaSlice<f16>> {
             let out_len = num_tokens * num_heads * head_dim;
             let mut output = unsafe { stream.alloc::<f16>(out_len) }
@@ -1068,6 +1206,8 @@ mod inner {
                 head_dim,
                 max_context_len,
                 block_size,
+                cache_stride,
+                attention_scale,
                 &mut output,
                 None,
                 None,
@@ -1092,12 +1232,14 @@ mod inner {
             head_dim: usize,
             max_context_len: u32,
             block_size: usize,
+            cache_stride: usize,
+            attention_scale: f32,
             output: &mut CudaSlice<f16>,
             partial_out: Option<&mut CudaSlice<f32>>,
             partial_max: Option<&mut CudaSlice<f32>>,
             partial_sum: Option<&mut CudaSlice<f32>>,
         ) -> Result<()> {
-            const DECODE_TILE_TOKENS: usize = 64;
+            const DECODE_TILE_TOKENS: usize = 32;
             let out_len = num_tokens * num_heads * head_dim;
             if output.len() < out_len {
                 return Err(LLMError::GpuError(format!(
@@ -1106,21 +1248,128 @@ mod inner {
                     out_len
                 )));
             }
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let scale = attention_scale;
             let p_num_heads = num_heads as i32;
             let p_num_kv_heads = num_kv_heads as i32;
             let p_head_dim = head_dim as i32;
             let p_block_size = block_size as i32;
+            let p_cache_stride = cache_stride as i32;
             let p_max_blocks = (block_tables.len() / num_seqs.max(1)) as i32;
             let heads_per_group = if num_kv_heads > 0 {
                 num_heads / num_kv_heads
             } else {
                 1
             };
-            let max_tiles = ((max_context_len as usize) + DECODE_TILE_TOKENS - 1) / DECODE_TILE_TOKENS;
+            let max_tiles =
+                ((max_context_len as usize) + DECODE_TILE_TOKENS - 1) / DECODE_TILE_TOKENS;
             let num_splits = choose_num_splits(max_context_len as usize)
                 .max(1)
                 .min(max_tiles.max(1)) as i32;
+
+            if head_dim > 128 {
+                let split = loader
+                    .get_func("split_kv_attention", "split_kv_decode_f16io_kernel")
+                    .map_err(|e| LLMError::GpuError(format!("split-kv f16io missing: {e}")))?;
+                let combine = loader
+                    .get_func("split_kv_attention", "split_kv_combine_f16io_kernel")
+                    .map_err(|e| LLMError::GpuError(format!("split-kv combine f16io missing: {e}")))?;
+                let ws = (num_splits as usize) * num_seqs * num_heads;
+                let p_out: &mut CudaSlice<f32> = if let Some(buf) = partial_out {
+                    if buf.len() < ws * head_dim {
+                        return Err(LLMError::GpuError(format!(
+                            "split-kv partial_out too small: have {}, need {}",
+                            buf.len(),
+                            ws * head_dim
+                        )));
+                    }
+                    buf
+                } else {
+                    return Err(LLMError::GpuError(
+                        "split-kv decode requires caller-provided partial_out".into(),
+                    ));
+                };
+                let p_max: &mut CudaSlice<f32> = if let Some(buf) = partial_max {
+                    if buf.len() < ws {
+                        return Err(LLMError::GpuError(format!(
+                            "split-kv partial_max too small: have {}, need {}",
+                            buf.len(),
+                            ws
+                        )));
+                    }
+                    buf
+                } else {
+                    return Err(LLMError::GpuError(
+                        "split-kv decode requires caller-provided partial_max".into(),
+                    ));
+                };
+                let p_sum: &mut CudaSlice<f32> = if let Some(buf) = partial_sum {
+                    if buf.len() < ws {
+                        return Err(LLMError::GpuError(format!(
+                            "split-kv partial_sum too small: have {}, need {}",
+                            buf.len(),
+                            ws
+                        )));
+                    }
+                    buf
+                } else {
+                    return Err(LLMError::GpuError(
+                        "split-kv decode requires caller-provided partial_sum".into(),
+                    ));
+                };
+                let shared_mem_bytes = (2 * DECODE_TILE_TOKENS * head_dim * std::mem::size_of::<f32>()
+                    + (DECODE_TILE_TOKENS + 8) * std::mem::size_of::<f32>()) as u32;
+                if shared_mem_bytes > 49152 {
+                    split.set_attribute(
+                        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        shared_mem_bytes as i32,
+                    ).map_err(|e| LLMError::GpuError(format!("split-kv set smem: {e}")))?;
+                }
+                unsafe {
+                    stream
+                        .launch_builder(&split)
+                        .arg(&mut *p_out)
+                        .arg(&mut *p_max)
+                        .arg(&mut *p_sum)
+                        .arg(q)
+                        .arg(key_cache)
+                        .arg(value_cache)
+                        .arg(block_tables)
+                        .arg(context_lens)
+                        .arg(&scale)
+                        .arg(&(num_seqs as i32))
+                        .arg(&p_num_heads)
+                        .arg(&p_num_kv_heads)
+                        .arg(&p_head_dim)
+                        .arg(&p_block_size)
+                        .arg(&p_cache_stride)
+                        .arg(&p_max_blocks)
+                        .arg(&num_splits)
+                        .launch(LaunchConfig {
+                            grid_dim: (num_seqs as u32, num_heads as u32, num_splits as u32),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes,
+                        })
+                        .map_err(|e| LLMError::GpuError(format!("split-kv decode: {e}")))?;
+                    stream
+                        .launch_builder(&combine)
+                        .arg(output)
+                        .arg(&*p_out)
+                        .arg(&*p_max)
+                        .arg(&*p_sum)
+                        .arg(context_lens)
+                        .arg(&(num_seqs as i32))
+                        .arg(&p_num_heads)
+                        .arg(&p_head_dim)
+                        .arg(&num_splits)
+                        .launch(LaunchConfig {
+                            grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                            block_dim: (head_dim as u32, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| LLMError::GpuError(format!("split-kv combine: {e}")))?;
+                }
+                return Ok(());
+            }
 
             // v3 GQA kernel
             if num_heads != num_kv_heads && heads_per_group <= 8 && head_dim % 8 == 0 {
@@ -1162,6 +1411,7 @@ mod inner {
                     p_num_kv_heads,
                     p_head_dim,
                     p_block_size,
+                    p_cache_stride,
                     p_max_context,
                     p_max_blocks,
                     num_splits,
@@ -1210,6 +1460,7 @@ mod inner {
                     p_num_kv_heads,
                     p_head_dim,
                     p_block_size,
+                    p_cache_stride,
                     max_context_len as i32,
                     p_max_blocks,
                     num_splits,
@@ -1249,6 +1500,7 @@ mod inner {
             p_num_kv_heads: i32,
             p_head_dim: i32,
             p_block_size: i32,
+            p_cache_stride: i32,
             p_max_context: i32,
             p_max_blocks: i32,
             num_splits: i32,
@@ -1287,6 +1539,7 @@ mod inner {
                         .arg(&p_num_kv_heads)
                         .arg(&p_head_dim)
                         .arg(&p_block_size)
+                        .arg(&p_cache_stride)
                         .arg(&p_max_context)
                         .arg(&p_max_blocks)
                         .arg(&num_splits)
@@ -1371,6 +1624,7 @@ mod inner {
                     .arg(&p_num_kv_heads)
                     .arg(&p_head_dim)
                     .arg(&p_block_size)
+                    .arg(&p_cache_stride)
                     .arg(&p_max_context)
                     .arg(&p_max_blocks)
                     .arg(&num_splits)

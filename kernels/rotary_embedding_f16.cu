@@ -19,26 +19,28 @@ __global__ void rotary_embedding_f16_kernel(
     int num_tokens,
     int num_heads,
     int num_kv_heads,
-    int head_dim
+    int head_dim,
+    int rope_stride,
+    int rotary_dim
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
     const int pair_idx  = threadIdx.x;
 
     if (token_idx >= num_tokens) return;
-    if (pair_idx >= head_dim / 2) return;
+    const int half_dim = head_dim / 2;
+    const int rotary_pairs = rotary_dim / 2;
+    if (pair_idx >= rotary_pairs) return;
 
     const int pos = positions[token_idx];
-    const int half_dim = head_dim / 2;
-
-    const float cos_val = cos_cache[pos * half_dim + pair_idx];
-    const float sin_val = sin_cache[pos * half_dim + pair_idx];
+    const float cos_val = cos_cache[pos * rope_stride + pair_idx];
+    const float sin_val = sin_cache[pos * rope_stride + pair_idx];
 
     // Apply to query
     {
         const int base = (token_idx * num_heads + head_idx) * head_dim;
-        const int i0 = base + 2 * pair_idx;
-        const int i1 = base + 2 * pair_idx + 1;
+        const int i0 = base + pair_idx;
+        const int i1 = base + half_dim + pair_idx;
 
         float x0 = __half2float(query[i0]);
         float x1 = __half2float(query[i1]);
@@ -49,8 +51,8 @@ __global__ void rotary_embedding_f16_kernel(
     // Apply to key (only if this head maps to a KV head, for GQA support)
     if (head_idx < num_kv_heads) {
         const int base = (token_idx * num_kv_heads + head_idx) * head_dim;
-        const int i0 = base + 2 * pair_idx;
-        const int i1 = base + 2 * pair_idx + 1;
+        const int i0 = base + pair_idx;
+        const int i1 = base + half_dim + pair_idx;
 
         float x0 = __half2float(key[i0]);
         float x1 = __half2float(key[i1]);

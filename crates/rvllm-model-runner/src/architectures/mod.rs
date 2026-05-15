@@ -47,7 +47,9 @@ pub fn create_model(
         )),
         "GemmaForCausalLM" => Ok(Box::new(gemma::GemmaForCausalLM::new(weights, config)?)),
         "Gemma2ForCausalLM" => Ok(Box::new(gemma::Gemma2ForCausalLM::new(weights, config)?)),
-        "Gemma4ForCausalLM" => Ok(Box::new(gemma4::Gemma4ForCausalLM::new(weights, config)?)),
+        "Gemma4ForCausalLM" | "Gemma4ForConditionalGeneration" => {
+            Ok(Box::new(gemma4::Gemma4ForCausalLM::new(weights, config)?))
+        }
         "DeepSeekV2ForCausalLM" | "DeepseekV2ForCausalLM" => Ok(Box::new(
             deepseek::DeepSeekV2ForCausalLM::new(weights, config)?,
         )),

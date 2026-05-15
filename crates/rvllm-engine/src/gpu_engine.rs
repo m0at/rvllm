@@ -997,16 +997,14 @@ use rvllm_core::prelude::{
                             } else {
                                 (None, 0.0)
                             };
-                        if !scheduled.is_prefill {
-                            Self::sync_decode_seq_data(
-                                req,
-                                seq_idx,
-                                *token_id,
-                                cumulative_logprob,
-                            );
-                            if let Some(block_table) = self.scheduler.get_block_table(seq.seq_id) {
-                                Self::sync_decode_block_table(req, seq_idx, block_table);
-                            }
+                        Self::sync_decode_seq_data(
+                            req,
+                            seq_idx,
+                            *token_id,
+                            cumulative_logprob,
+                        );
+                        if let Some(block_table) = self.scheduler.get_block_table(seq.seq_id) {
+                            Self::sync_decode_block_table(req, seq_idx, block_table);
                         }
                         if let Some(reason) = finish_reason {
                             let status = match reason {
@@ -1130,13 +1128,14 @@ use rvllm_core::prelude::{
                             } else {
                                 (None, 0.0)
                             };
-                        if !scheduled.is_prefill {
-                            Self::sync_decode_seq_data(
-                                req,
-                                seq_idx,
-                                *token_id,
-                                cumulative_logprob,
-                            );
+                        Self::sync_decode_seq_data(
+                            req,
+                            seq_idx,
+                            *token_id,
+                            cumulative_logprob,
+                        );
+                        if let Some(block_table) = self.scheduler.get_block_table(seq.seq_id) {
+                            Self::sync_decode_block_table(req, seq_idx, block_table);
                         }
                         if let Some(reason) = finish_reason {
                             let status = match reason {

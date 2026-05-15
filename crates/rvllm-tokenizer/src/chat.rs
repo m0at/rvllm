@@ -10,6 +10,8 @@ pub enum ChatTemplate {
     ChatML,
     /// Harmony (GPT-OSS): `<|im_start|>role<|im_sep|>\ncontent\n<|im_end|>\n`
     Harmony,
+    /// Gemma 4 turn format: `<|turn>user\n...<turn|>\n<|turn>model\n...`
+    Gemma4,
 }
 
 /// Role in a chat conversation.
@@ -112,6 +114,47 @@ pub(crate) fn apply_harmony(
     Ok(out)
 }
 
+/// Apply the Gemma 4 chat template for text-only OpenAI chat messages.
+pub(crate) fn apply_gemma4(
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+) -> Result<String> {
+    if messages.is_empty() {
+        return Err(LLMError::TokenizerError("empty message list".into()));
+    }
+
+    let mut out = String::from("<bos>");
+    let mut start = 0usize;
+    if matches!(messages[0].role.as_str(), "system" | "developer") {
+        out.push_str("<|turn>system\n");
+        out.push_str(messages[0].content.trim());
+        out.push_str("<turn|>\n");
+        start = 1;
+    }
+
+    for msg in &messages[start..] {
+        if msg.role == "tool" {
+            continue;
+        }
+        let role = if msg.role == "assistant" {
+            "model"
+        } else {
+            msg.role.as_str()
+        };
+        out.push_str("<|turn>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(msg.content.trim());
+        out.push_str("<turn|>\n");
+    }
+
+    if add_generation_prompt {
+        out.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +212,28 @@ mod tests {
     #[test]
     fn harmony_empty_errors() {
         assert!(apply_harmony(&[], true).is_err());
+    }
+
+    #[test]
+    fn gemma4_basic() {
+        let msgs = vec![ChatMessage::user("Hello")];
+        let result = apply_gemma4(&msgs, true).unwrap();
+        assert_eq!(
+            result,
+            "<bos><|turn>user\nHello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        );
+    }
+
+    #[test]
+    fn gemma4_system() {
+        let msgs = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("Hi"),
+        ];
+        let result = apply_gemma4(&msgs, true).unwrap();
+        assert!(result.starts_with("<bos><|turn>system\nYou are helpful.<turn|>\n"));
+        assert!(result.contains("<|turn>user\nHi<turn|>\n"));
+        assert!(result.ends_with("<|channel>thought\n<channel|>"));
     }
 
     #[test]

@@ -458,7 +458,7 @@ impl GpuWorker {
 
         let graph_runner = GraphRunner::new(GraphRunnerConfig {
             max_batch_size: 256,
-            enabled: true,
+            enabled: std::env::var("RVLLM_DISABLE_CUDA_GRAPHS").map_or(true, |v| v != "1"),
             vocab_size: config.vocab_size,
             hidden_size: config.hidden_size,
         });
@@ -722,8 +722,8 @@ impl GpuWorker {
 
         #[cfg(feature = "cuda")]
         {
-            self.raw_weight_map = Some(all_weights_f16.clone());
-            self.raw_weight_shapes = Some(all_weight_shapes.clone());
+            self.raw_weight_map = Some(all_weights_f16);
+            self.raw_weight_shapes = Some(all_weight_shapes);
         }
 
         // Weights are stored only in raw_weight_map for GpuModelRunner.

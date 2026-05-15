@@ -36,6 +36,22 @@ __global__ void fused_silu_mul_f16_kernel(
 }
 
 extern "C"
+__global__ void fused_gelu_tanh_mul_f16_kernel(
+    __half* __restrict__ output,
+    const __half* __restrict__ gate,
+    const __half* __restrict__ up,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = __half2float(gate[idx]);
+        float x3 = x * x * x;
+        float gelu = 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x3)));
+        output[idx] = __float2half(gelu * __half2float(up[idx]));
+    }
+}
+
+extern "C"
 __global__ void gelu_f16_kernel(
     __half* __restrict__ output,
     const __half* __restrict__ input,

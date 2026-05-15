@@ -21,7 +21,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRe
             id: state.model_name.clone(),
             object: "model".to_string(),
             created: now,
-            owned_by: "vllm-rs".to_string(),
+            owned_by: "rvllm-rust".to_string(),
         }],
     })
 }

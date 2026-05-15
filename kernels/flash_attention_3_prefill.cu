@@ -34,6 +34,7 @@ flash_attention_3_prefill_f16io_kernel(
     int num_kv_heads,
     int head_dim,
     int block_size,
+    int cache_stride,
     int max_context_len,
     int max_blocks_per_seq,
     int num_tokens,
@@ -107,7 +108,7 @@ flash_attention_3_prefill_f16io_kernel(
                     int page_idx = kv_pos / block_size;
                     int page_off = kv_pos % block_size;
                     int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                    int base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
+                    int base = (phys_block * block_size + page_off) * cache_stride + kv_head_idx * head_dim + d;
                     __half2 h2 = *reinterpret_cast<const __half2*>(&key_cache[base]);
                     s_kv[t * head_dim + d]     = h2.x;
                     s_kv[t * head_dim + d + 1] = h2.y;
@@ -119,7 +120,7 @@ flash_attention_3_prefill_f16io_kernel(
                     int kv_pos = tile_start + t;
                     int pi = kv_pos / block_size, po = kv_pos % block_size;
                     int pb = block_tables[seq_idx * max_blocks_per_seq + pi];
-                    s_kv[t * head_dim + d] = key_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d];
+                    s_kv[t * head_dim + d] = key_cache[(pb * block_size + po) * cache_stride + kv_head_idx * head_dim + d];
                 }
             }
             __syncthreads();
@@ -195,7 +196,7 @@ flash_attention_3_prefill_f16io_kernel(
                     int page_idx = kv_pos / block_size;
                     int page_off = kv_pos % block_size;
                     int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
-                    int base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
+                    int base = (phys_block * block_size + page_off) * cache_stride + kv_head_idx * head_dim + d;
                     __half2 h2 = *reinterpret_cast<const __half2*>(&value_cache[base]);
                     s_kv[t * head_dim + d]     = h2.x;
                     s_kv[t * head_dim + d + 1] = h2.y;
@@ -207,7 +208,7 @@ flash_attention_3_prefill_f16io_kernel(
                     int kv_pos = tile_start + t;
                     int pi = kv_pos / block_size, po = kv_pos % block_size;
                     int pb = block_tables[seq_idx * max_blocks_per_seq + pi];
-                    s_kv[t * head_dim + d] = value_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d];
+                    s_kv[t * head_dim + d] = value_cache[(pb * block_size + po) * cache_stride + kv_head_idx * head_dim + d];
                 }
             }
             __syncthreads();

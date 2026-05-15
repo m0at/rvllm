@@ -21,7 +21,8 @@ __global__ void reshape_and_cache_f16io_kernel(
     const int* __restrict__ slot_mapping,  // [num_tokens]
     int num_tokens,
     int num_kv_heads,
-    int head_dim
+    int head_dim,
+    int cache_stride
 ) {
     const int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
@@ -31,7 +32,7 @@ __global__ void reshape_and_cache_f16io_kernel(
     const int slot = slot_mapping[token_idx];
     if (slot < 0) return; // skip padded tokens
 
-    const int cache_offset = slot * kv_dim;
+    const int cache_offset = slot * cache_stride;
     const int src_offset = token_idx * kv_dim;
 
     for (int i = tid; i < kv_dim; i += blockDim.x) {

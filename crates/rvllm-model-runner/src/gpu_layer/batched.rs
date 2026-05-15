@@ -15,7 +15,10 @@ use tracing::info;
 use rvllm_core::error::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
 
-use super::{BatchedLayerPhaseTimings, GemmStrategy, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer, LayerScratchRef};
+use super::{
+    BatchedLayerPhaseTimings, GemmStrategy, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer,
+    LayerScratchRef,
+};
 
 #[derive(Clone, Copy)]
 struct BatchedPipelinePolicy {
@@ -230,7 +233,19 @@ impl GpuTransformerLayer {
 
         // 1. Pre-attention RMSNorm
         let residual_from_fused: bool;
-        if let Some(prev_mlp) = prev_mlp_out {
+        if cfg.use_gemma4_block {
+            Self::rms_norm_f16_into(
+                &self.stream,
+                &self.loader,
+                input.hidden_states,
+                weights.input_layernorm,
+                cfg.rms_norm_eps,
+                num_tokens,
+                hidden,
+                scratch.normed,
+            )?;
+            residual_from_fused = false;
+        } else if let Some(prev_mlp) = prev_mlp_out {
             Self::fused_residual_rmsnorm_f16_into(
                 &self.stream,
                 &self.loader,
@@ -304,6 +319,44 @@ impl GpuTransformerLayer {
 
         // 4-5. RoPE + KV cache write
         if num_tokens == 1 {
+            if cfg.use_gemma4_block {
+                let (mut q_part, mut kv_part) = scratch.qkv.split_at_mut(q_end);
+                let (mut k_view, mut v_part) = kv_part.split_at_mut(num_tokens * kv_dim);
+                let mut v_view = v_part.slice_mut(..num_tokens * kv_dim);
+                Self::head_rms_norm_f16_view(
+                    &self.stream,
+                    &self.loader,
+                    &mut q_part,
+                    weights
+                        .q_norm
+                        .ok_or_else(|| LLMError::GpuError("Gemma4 missing q_norm".into()))?,
+                    cfg.rms_norm_eps,
+                    num_tokens,
+                    num_heads,
+                    head_dim,
+                )?;
+                Self::head_rms_norm_f16_view(
+                    &self.stream,
+                    &self.loader,
+                    &mut k_view,
+                    weights
+                        .k_norm
+                        .ok_or_else(|| LLMError::GpuError("Gemma4 missing k_norm".into()))?,
+                    cfg.rms_norm_eps,
+                    num_tokens,
+                    num_kv_heads,
+                    head_dim,
+                )?;
+                Self::head_rms_norm_noscale_f16_view(
+                    &self.stream,
+                    &self.loader,
+                    &mut v_view,
+                    cfg.rms_norm_eps,
+                    num_tokens,
+                    num_kv_heads,
+                    head_dim,
+                )?;
+            }
             // Fused single kernel: RoPE + cache write in one launch
             Self::fused_rope_cache_write(
                 &self.stream,
@@ -316,12 +369,51 @@ impl GpuTransformerLayer {
                 num_kv_heads,
                 head_dim,
                 num_tokens,
+                input.rope_stride,
+                input.rotary_dim,
+                input.kv_cache_stride,
             )?;
         } else {
             // Separate kernels for T>1
             {
                 let (mut q_part, mut kv_part) = scratch.qkv.split_at_mut(q_end);
-                let mut k_view = kv_part.slice_mut(..num_tokens * kv_dim);
+                let (mut k_view, mut v_part) = kv_part.split_at_mut(num_tokens * kv_dim);
+                let mut v_view = v_part.slice_mut(..num_tokens * kv_dim);
+                if cfg.use_gemma4_block {
+                    Self::head_rms_norm_f16_view(
+                        &self.stream,
+                        &self.loader,
+                        &mut q_part,
+                        weights
+                            .q_norm
+                            .ok_or_else(|| LLMError::GpuError("Gemma4 missing q_norm".into()))?,
+                        cfg.rms_norm_eps,
+                        num_tokens,
+                        num_heads,
+                        head_dim,
+                    )?;
+                    Self::head_rms_norm_f16_view(
+                        &self.stream,
+                        &self.loader,
+                        &mut k_view,
+                        weights
+                            .k_norm
+                            .ok_or_else(|| LLMError::GpuError("Gemma4 missing k_norm".into()))?,
+                        cfg.rms_norm_eps,
+                        num_tokens,
+                        num_kv_heads,
+                        head_dim,
+                    )?;
+                    Self::head_rms_norm_noscale_f16_view(
+                        &self.stream,
+                        &self.loader,
+                        &mut v_view,
+                        cfg.rms_norm_eps,
+                        num_tokens,
+                        num_kv_heads,
+                        head_dim,
+                    )?;
+                }
                 Self::apply_rotary_embedding_f16_views(
                     &self.stream,
                     &self.loader,
@@ -330,6 +422,8 @@ impl GpuTransformerLayer {
                     &input.positions,
                     input.rope_cos,
                     input.rope_sin,
+                    input.rope_stride,
+                    input.rotary_dim,
                     num_tokens,
                     num_heads,
                     num_kv_heads,
@@ -350,6 +444,7 @@ impl GpuTransformerLayer {
                     num_tokens,
                     num_kv_heads,
                     head_dim,
+                    input.kv_cache_stride,
                 )?;
             }
         }
@@ -375,6 +470,8 @@ impl GpuTransformerLayer {
                 head_dim,
                 input.max_context_len,
                 input.block_size,
+                input.kv_cache_stride,
+                cfg.attention_scale,
             )?)
         } else {
             Self::decode_attention_f16io_into(
@@ -392,6 +489,8 @@ impl GpuTransformerLayer {
                 head_dim,
                 input.max_context_len,
                 input.block_size,
+                input.kv_cache_stride,
+                cfg.attention_scale,
                 scratch.attn_out,
                 Some(scratch.attn_split_out),
                 Some(scratch.attn_split_max),
@@ -478,110 +577,226 @@ impl GpuTransformerLayer {
                     scratch.o_proj,
                 )?;
             }
-            Self::fused_residual_rmsnorm_f16_into(
-                &self.stream,
-                &self.loader,
-                residual_ref,
-                &*scratch.o_proj,
-                weights.post_attention_layernorm,
-                cfg.rms_norm_eps,
-                num_tokens,
-                hidden,
-                scratch.normed,
-                scratch.residual,
-            )?;
+            if cfg.use_gemma4_block {
+                Self::rms_norm_f16_into(
+                    &self.stream,
+                    &self.loader,
+                    &*scratch.o_proj,
+                    weights.post_attention_layernorm,
+                    cfg.rms_norm_eps,
+                    num_tokens,
+                    hidden,
+                    scratch.normed,
+                )?;
+                Self::add_f16_into(
+                    &self.stream,
+                    &self.loader,
+                    residual_ref,
+                    &*scratch.normed,
+                    num_tokens * hidden,
+                    scratch.residual,
+                )?;
+            } else {
+                Self::fused_residual_rmsnorm_f16_into(
+                    &self.stream,
+                    &self.loader,
+                    residual_ref,
+                    &*scratch.o_proj,
+                    weights.post_attention_layernorm,
+                    cfg.rms_norm_eps,
+                    num_tokens,
+                    hidden,
+                    scratch.normed,
+                    scratch.residual,
+                )?;
+            }
         }
         if profile_enabled {
             mark_phase(|t| &mut t.oproj_norm)?;
         }
 
-        // 9. Gate+up GEMM + SiLU
-        let fused_gate_up = weights.fused_gate_up.ok_or_else(|| {
-            LLMError::GpuError("Batched path requires fused_gate_up weight".into())
-        })?;
+        if cfg.use_gemma4_block {
+            Self::rms_norm_f16_into(
+                &self.stream,
+                &self.loader,
+                &*scratch.residual,
+                weights
+                    .pre_feedforward_layernorm
+                    .ok_or_else(|| LLMError::GpuError("Gemma4 missing pre_feedforward_layernorm".into()))?,
+                cfg.rms_norm_eps,
+                num_tokens,
+                hidden,
+                scratch.normed,
+            )?;
+        }
+
+        // 9. Gate+up GEMM + activation
         let gate_up_dim = intermediate * 2;
-        if policy.use_cutlass_gateup {
-            let ck = cutlass.expect("GemmStrategy::Cutlass requires loaded CUTLASS kernels");
-            let m = num_tokens as i32;
-            let n = gate_up_dim as i32;
-            let k = hidden as i32;
-            let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
-            if scratch.gateup_ws.len() < ws_bytes.max(1) {
-                return Err(LLMError::GpuError(format!(
-                    "cutlass gateup workspace too small: need {} bytes, have {}",
-                    ws_bytes.max(1),
-                    scratch.gateup_ws.len()
-                )));
-            }
-            let out_ptr = {
-                let (p, _g) =
-                    DevicePtrMut::device_ptr_mut(&mut *scratch.silu_out, &self.stream);
-                p
-            };
-            let in_ptr = {
-                let (p, _g) = DevicePtr::device_ptr(&*scratch.normed, &self.stream);
-                p
-            };
-            let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
-            let ws_ptr = {
-                let mut ws = scratch.gateup_ws.slice_mut(..ws_bytes.max(1));
-                let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
-                p
-            };
-            let stream_ptr = self.stream.cu_stream() as u64;
-            ck.gateup_silu(
-                out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
-            )
-            .map_err(|e| LLMError::GpuError(e))?;
-        } else {
-            if canonical_v2 {
-                Self::hgemm_cublas_slice_into(
-                    blas,
-                    &*scratch.normed,
-                    fused_gate_up,
-                    num_tokens,
-                    gate_up_dim,
-                    hidden,
-                    scratch.gate_up,
-                )?;
+        if let Some(fused_gate_up) = weights.fused_gate_up {
+            if policy.use_cutlass_gateup {
+                let ck = cutlass.expect("GemmStrategy::Cutlass requires loaded CUTLASS kernels");
+                let m = num_tokens as i32;
+                let n = gate_up_dim as i32;
+                let k = hidden as i32;
+                let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
+                if scratch.gateup_ws.len() < ws_bytes.max(1) {
+                    return Err(LLMError::GpuError(format!(
+                        "cutlass gateup workspace too small: need {} bytes, have {}",
+                        ws_bytes.max(1),
+                        scratch.gateup_ws.len()
+                    )));
+                }
+                let out_ptr = {
+                    let (p, _g) =
+                        DevicePtrMut::device_ptr_mut(&mut *scratch.silu_out, &self.stream);
+                    p
+                };
+                let in_ptr = {
+                    let (p, _g) = DevicePtr::device_ptr(&*scratch.normed, &self.stream);
+                    p
+                };
+                let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
+                let ws_ptr = {
+                    let mut ws = scratch.gateup_ws.slice_mut(..ws_bytes.max(1));
+                    let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                    p
+                };
+                let stream_ptr = self.stream.cu_stream() as u64;
+                ck.gateup_silu(
+                    out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr,
+                )
+                .map_err(|e| LLMError::GpuError(e))?;
             } else {
-                Self::hgemm_dispatch_fp8_into(
-                    &self.stream,
-                    blas,
-                    lt,
-                    &*scratch.normed,
-                    fused_gate_up,
-                    num_tokens,
-                    gate_up_dim,
-                    hidden,
-                    &self.loader,
-                    weights.fused_gate_up_fp8,
-                    scratch.gate_up,
-                )?;
+                if canonical_v2 {
+                    Self::hgemm_cublas_slice_into(
+                        blas,
+                        &*scratch.normed,
+                        fused_gate_up,
+                        num_tokens,
+                        gate_up_dim,
+                        hidden,
+                        scratch.gate_up,
+                    )?;
+                } else {
+                    Self::hgemm_dispatch_fp8_into(
+                        &self.stream,
+                        blas,
+                        lt,
+                        &*scratch.normed,
+                        fused_gate_up,
+                        num_tokens,
+                        gate_up_dim,
+                        hidden,
+                        &self.loader,
+                        weights.fused_gate_up_fp8,
+                        scratch.gate_up,
+                    )?;
+                }
+                let silu_fn = self
+                    .loader
+                    .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
+                    .map_err(|e| {
+                        LLMError::GpuError(format!(
+                            "Required silu_mul_interleaved kernel missing: {e}"
+                        ))
+                    })?;
+                let n_elems = num_tokens * intermediate;
+                let total = n_elems as u32;
+                unsafe {
+                    self.stream
+                        .launch_builder(&silu_fn)
+                        .arg(&mut *scratch.silu_out)
+                        .arg(&*scratch.gate_up)
+                        .arg(&(num_tokens as i32))
+                        .arg(&(intermediate as i32))
+                        .launch(LaunchConfig {
+                            grid_dim: ((total + 255) / 256, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
+                }
+            }
+        } else {
+            let n_elems = num_tokens * intermediate;
+            {
+                let mut gate = scratch.gate_up.slice_mut(..n_elems);
+                if canonical_v2 {
+                    Self::hgemm_cublas_into(
+                        blas,
+                        &*scratch.normed,
+                        weights.gate_proj,
+                        num_tokens,
+                        intermediate,
+                        hidden,
+                        &mut gate,
+                    )?;
+                } else {
+                    Self::hgemm_dispatch_into(
+                        blas,
+                        lt,
+                        &*scratch.normed,
+                        weights.gate_proj,
+                        num_tokens,
+                        intermediate,
+                        hidden,
+                        &mut gate,
+                    )?;
+                }
+            }
+            {
+                let mut up = scratch.gate_up.slice_mut(n_elems..n_elems * 2);
+                if canonical_v2 {
+                    Self::hgemm_cublas_into(
+                        blas,
+                        &*scratch.normed,
+                        weights.up_proj,
+                        num_tokens,
+                        intermediate,
+                        hidden,
+                        &mut up,
+                    )?;
+                } else {
+                    Self::hgemm_dispatch_into(
+                        blas,
+                        lt,
+                        &*scratch.normed,
+                        weights.up_proj,
+                        num_tokens,
+                        intermediate,
+                        hidden,
+                        &mut up,
+                    )?;
+                }
             }
             let silu_fn = self
                 .loader
-                .get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
+                .get_func(
+                    "activation_f16",
+                    if cfg.use_gelu_mlp {
+                        "fused_gelu_tanh_mul_f16_kernel"
+                    } else {
+                        "fused_silu_mul_f16_kernel"
+                    },
+                )
                 .map_err(|e| {
-                    LLMError::GpuError(format!(
-                        "Required silu_mul_interleaved kernel missing: {e}"
-                    ))
+                    LLMError::GpuError(format!("Required fused gate/up kernel missing: {e}"))
                 })?;
-            let n_elems = num_tokens * intermediate;
-            let total = n_elems as u32;
+            let gate = scratch.gate_up.slice(..n_elems);
+            let up = scratch.gate_up.slice(n_elems..n_elems * 2);
             unsafe {
                 self.stream
                     .launch_builder(&silu_fn)
                     .arg(&mut *scratch.silu_out)
-                    .arg(&*scratch.gate_up)
-                    .arg(&(num_tokens as i32))
-                    .arg(&(intermediate as i32))
+                    .arg(&gate)
+                    .arg(&up)
+                    .arg(&(n_elems as i32))
                     .launch(LaunchConfig {
-                        grid_dim: ((total + 255) / 256, 1, 1),
+                        grid_dim: (((n_elems as u32) + 255) / 256, 1, 1),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
                     })
-                    .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
+                    .map_err(|e| LLMError::GpuError(format!("silu_split: {e}")))?;
             }
         }
 
@@ -615,6 +830,42 @@ impl GpuTransformerLayer {
         }
         if profile_enabled {
             mark_phase(|t| &mut t.down)?;
+        }
+
+        if cfg.use_gemma4_block {
+            Self::rms_norm_f16_into(
+                &self.stream,
+                &self.loader,
+                &*scratch.down,
+                weights
+                    .post_feedforward_layernorm
+                    .ok_or_else(|| LLMError::GpuError("Gemma4 missing post_feedforward_layernorm".into()))?,
+                cfg.rms_norm_eps,
+                num_tokens,
+                hidden,
+                scratch.normed,
+            )?;
+            Self::add_f16_into(
+                &self.stream,
+                &self.loader,
+                &*scratch.residual,
+                &*scratch.normed,
+                num_tokens * hidden,
+                scratch.down,
+            )?;
+            let scalar = weights
+                .layer_scalar
+                .ok_or_else(|| LLMError::GpuError("Gemma4 missing layer_scalar".into()))?;
+            Self::scale_f16_inplace(
+                &self.stream,
+                &self.loader,
+                scratch.down,
+                scalar,
+                num_tokens * hidden,
+            )?;
+            self.stream
+                .memcpy_dtod(&scratch.down.slice(..num_tokens * hidden), scratch.residual)
+                .map_err(|e| LLMError::GpuError(format!("gemma4 final copy: {e}")))?;
         }
 
         Ok(())
@@ -713,63 +964,65 @@ impl GpuTransformerLayer {
             #[cfg(feature = "cublaslt")]
             if !canonical_v2 {
                 if let (Some(lt_ops), Some(bias)) = (lt, weights.qkv_bias) {
-                if num_tokens == 1 {
-                    // N=1: write directly to qkv with bias
-                    Self::hgemm_dispatch_fp8_bias_into(
-                        &self.stream,
-                        lt_ops,
-                        &*scratch.normed,
-                        fused_qkv,
-                        bias,
-                        num_tokens,
-                        qkv_dim,
-                        hidden,
-                        scratch.qkv,
-                    )?;
-                    bias_fused = true;
-                } else {
-                    // N>1: write to gate_up (temp) with bias, then deinterleave
-                    Self::hgemm_dispatch_fp8_bias_into(
-                        &self.stream,
-                        lt_ops,
-                        &*scratch.normed,
-                        fused_qkv,
-                        bias,
-                        num_tokens,
-                        qkv_dim,
-                        hidden,
-                        scratch.gate_up,
-                    )?;
-                    bias_fused = true;
-                    let interleaved_len = num_tokens * qkv_dim;
-                    let dk = self
-                        .loader
-                        .get_func("deinterleave_qkv", "deinterleave_qkv_f16_kernel")
-                        .map_err(|e| {
-                            LLMError::GpuError(format!(
-                                "Required deinterleave_qkv kernel missing: {e}"
-                            ))
-                        })?;
-                    let total = interleaved_len as u32;
-                    let tmp_view = scratch.gate_up.slice(..interleaved_len);
-                    let mut qkv_view = scratch.qkv.slice_mut(..interleaved_len);
-                    unsafe {
-                        self.stream
-                            .launch_builder(&dk)
-                            .arg(&mut qkv_view)
-                            .arg(&tmp_view)
-                            .arg(&(num_tokens as i32))
-                            .arg(&(q_dim as i32))
-                            .arg(&(kv_dim as i32))
-                            .launch(LaunchConfig {
-                                grid_dim: ((total + 255) / 256, 1, 1),
-                                block_dim: (256, 1, 1),
-                                shared_mem_bytes: 0,
-                            })
-                            .map_err(|e| LLMError::GpuError(format!("deinterleave qkv: {e}")))?;
+                    if num_tokens == 1 {
+                        // N=1: write directly to qkv with bias
+                        Self::hgemm_dispatch_fp8_bias_into(
+                            &self.stream,
+                            lt_ops,
+                            &*scratch.normed,
+                            fused_qkv,
+                            bias,
+                            num_tokens,
+                            qkv_dim,
+                            hidden,
+                            scratch.qkv,
+                        )?;
+                        bias_fused = true;
+                    } else {
+                        // N>1: write to gate_up (temp) with bias, then deinterleave
+                        Self::hgemm_dispatch_fp8_bias_into(
+                            &self.stream,
+                            lt_ops,
+                            &*scratch.normed,
+                            fused_qkv,
+                            bias,
+                            num_tokens,
+                            qkv_dim,
+                            hidden,
+                            scratch.gate_up,
+                        )?;
+                        bias_fused = true;
+                        let interleaved_len = num_tokens * qkv_dim;
+                        let dk = self
+                            .loader
+                            .get_func("deinterleave_qkv", "deinterleave_qkv_f16_kernel")
+                            .map_err(|e| {
+                                LLMError::GpuError(format!(
+                                    "Required deinterleave_qkv kernel missing: {e}"
+                                ))
+                            })?;
+                        let total = interleaved_len as u32;
+                        let tmp_view = scratch.gate_up.slice(..interleaved_len);
+                        let mut qkv_view = scratch.qkv.slice_mut(..interleaved_len);
+                        unsafe {
+                            self.stream
+                                .launch_builder(&dk)
+                                .arg(&mut qkv_view)
+                                .arg(&tmp_view)
+                                .arg(&(num_tokens as i32))
+                                .arg(&(q_dim as i32))
+                                .arg(&(kv_dim as i32))
+                                .launch(LaunchConfig {
+                                    grid_dim: ((total + 255) / 256, 1, 1),
+                                    block_dim: (256, 1, 1),
+                                    shared_mem_bytes: 0,
+                                })
+                                .map_err(|e| {
+                                    LLMError::GpuError(format!("deinterleave qkv: {e}"))
+                                })?;
+                        }
                     }
                 }
-            }
             }
             // Fallback: GEMM without bias epilogue
             if !bias_fused {
