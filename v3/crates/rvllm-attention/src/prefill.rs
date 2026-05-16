@@ -142,9 +142,9 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         q_fp8: u64,
         k_cache_fp8: u64,
         v_cache_fp8: u64,
-        k_scale_cache: u64,    // nullable
-        v_scale_cache: u64,    // nullable
-        q_scale_cache: u64,    // nullable
+        k_scale_cache: u64, // nullable
+        v_scale_cache: u64, // nullable
+        q_scale_cache: u64, // nullable
         k_descale_fallback: u64,
         v_descale_fallback: u64,
         block_tables: u64,
@@ -291,8 +291,7 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
 
             // Grid: (total_num_q_blocks, num_kv_heads). params.num_tokens
             // is the sum of per-seq query lengths.
-            let total_num_q_blocks =
-                params.num_tokens.div_ceil(unified.block_q) + params.num_seqs;
+            let total_num_q_blocks = params.num_tokens.div_ceil(unified.block_q) + params.num_seqs;
 
             let rc = cuLaunchKernel(
                 kernel_fn.raw() as CUfunction,
@@ -326,10 +325,22 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = (
-                params, unified, o_f16, q_fp8, k_cache_fp8, v_cache_fp8,
-                k_scale_cache, v_scale_cache, q_scale_cache,
-                k_descale_fallback, v_descale_fallback, block_tables,
-                cu_seqlens_q, context_lens, q_descale_fallback, stream,
+                params,
+                unified,
+                o_f16,
+                q_fp8,
+                k_cache_fp8,
+                v_cache_fp8,
+                k_scale_cache,
+                v_scale_cache,
+                q_scale_cache,
+                k_descale_fallback,
+                v_descale_fallback,
+                block_tables,
+                cu_seqlens_q,
+                context_lens,
+                q_descale_fallback,
+                stream,
             );
             Err(RvllmError::Attention {
                 err: AttentionError::FeatureNotAvailable {
@@ -364,6 +375,9 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         context_lens: u64,
         cu_seqlens_q: u64,
         workspace: u64,
+        k_scale_cache: u64,
+        v_scale_cache: u64,
+        q_scale_cache: u64,
         q_descale_ptr: u64,
         k_descale_ptr: u64,
         v_descale_ptr: u64,
@@ -385,10 +399,21 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
                     // should route through `PagedDecodeFp8Launcher`
                     // directly; keeping this arm would just tempt them
                     // back into the less-accurate FA2 prefill.
-                    let _ = (o_f16, q_fp8, k_cache_fp8, v_cache_fp8,
-                        block_tables, context_lens, cu_seqlens_q,
-                        workspace, q_descale_ptr, k_descale_ptr,
-                        v_descale_ptr, max_seqlen_q, stream);
+                    let _ = (
+                        o_f16,
+                        q_fp8,
+                        k_cache_fp8,
+                        v_cache_fp8,
+                        block_tables,
+                        context_lens,
+                        cu_seqlens_q,
+                        workspace,
+                        q_descale_ptr,
+                        k_descale_ptr,
+                        v_descale_ptr,
+                        max_seqlen_q,
+                        stream,
+                    );
                     return Err(RvllmError::Attention {
                         err: AttentionError::FeatureNotAvailable {
                             op: "paged_prefill_fp8 Fa2Ptx (use decode-per-qi loop)",
@@ -427,6 +452,9 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
                 context_lens as *mut std::ffi::c_void,
                 cu_seqlens_q as *mut std::ffi::c_void,
                 workspace as *mut std::ffi::c_void,
+                k_scale_cache as *mut std::ffi::c_void,
+                v_scale_cache as *mut std::ffi::c_void,
+                q_scale_cache as *mut std::ffi::c_void,
                 q_descale_ptr as *mut f32,
                 k_descale_ptr as *mut f32,
                 v_descale_ptr as *mut f32,
@@ -461,9 +489,22 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = (
-                o_f16, q_fp8, k_cache_fp8, v_cache_fp8, block_tables, context_lens,
-                cu_seqlens_q, workspace, q_descale_ptr, k_descale_ptr, v_descale_ptr,
-                max_seqlen_q, stream,
+                o_f16,
+                q_fp8,
+                k_cache_fp8,
+                v_cache_fp8,
+                block_tables,
+                context_lens,
+                cu_seqlens_q,
+                workspace,
+                k_scale_cache,
+                v_scale_cache,
+                q_scale_cache,
+                q_descale_ptr,
+                k_descale_ptr,
+                v_descale_ptr,
+                max_seqlen_q,
+                stream,
             );
         }
         Ok(())

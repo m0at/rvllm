@@ -60,10 +60,7 @@ impl<'s> Event<'s> {
         unsafe {
             use cudarc::driver::sys::*;
             if self.raw != 0 {
-                let r = cuEventRecord(
-                    self.raw as CUevent,
-                    self.stream.raw() as CUstream,
-                );
+                let r = cuEventRecord(self.raw as CUevent, self.stream.raw() as CUstream);
                 if r != CUresult::CUDA_SUCCESS {
                     return Err(RvllmError::cuda(
                         "cuEventRecord",

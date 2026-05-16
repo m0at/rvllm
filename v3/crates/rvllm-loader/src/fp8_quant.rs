@@ -81,8 +81,8 @@ mod tests {
 
     #[test]
     fn gate_rejects_bad_tensor() {
-        let err = check_clamp_gate("qkv.0", 500.0, std::path::Path::new("x.safetensors"))
-            .unwrap_err();
+        let err =
+            check_clamp_gate("qkv.0", 500.0, std::path::Path::new("x.safetensors")).unwrap_err();
         let s = format!("{err}");
         assert!(s.contains("Fp8MisScaled"));
         assert!(s.contains("qkv.0"));

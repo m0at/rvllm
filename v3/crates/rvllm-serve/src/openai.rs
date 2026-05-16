@@ -197,7 +197,7 @@ pub fn render_gemma_chat(messages: &[ChatMessage]) -> Result<String, ApiError> {
         ));
     }
 
-    out.push_str("<start_of_turn>model\n");
+    out.push_str("<|turn>model\n<|channel>thought\n<channel|>");
     Ok(out)
 }
 
@@ -333,11 +333,11 @@ fn append_system(dst: &mut String, text: &str) {
 }
 
 fn push_turn(out: &mut String, role: &str, text: &str) {
-    out.push_str("<start_of_turn>");
+    out.push_str("<|turn>");
     out.push_str(role);
     out.push('\n');
     out.push_str(text.trim_end());
-    out.push_str("<end_of_turn>\n");
+    out.push_str("<turn|>\n");
 }
 
 #[cfg(test)]
@@ -356,7 +356,7 @@ mod tests {
         let prompt = render_gemma_chat(&[msg("user", "hello")]).unwrap();
         assert_eq!(
             prompt,
-            "<start_of_turn>user\nhello<end_of_turn>\n<start_of_turn>model\n"
+            "<|turn>user\nhello<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
         );
     }
 

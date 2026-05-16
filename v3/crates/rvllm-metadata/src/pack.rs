@@ -9,7 +9,7 @@
 //! runtime issues one async HtoD copy into the device region at the
 //! layout's `total_elements * 4` bytes.
 
-use rvllm_core::{Result, RvllmError, SamplingError, SampleCtx};
+use rvllm_core::{Result, RvllmError, SampleCtx, SamplingError};
 
 use crate::layout::MetadataLayout;
 use crate::plan::BatchPlan;
@@ -17,7 +17,11 @@ use crate::plan::BatchPlan;
 /// Fill `pinned_host` (i32 slice, length == layout.total_elements)
 /// with the packed metadata for this plan. Returns `Err` if the plan
 /// does not fit the layout's bucket (would be a scheduler bug).
-pub fn upload(layout: &MetadataLayout, plan: &BatchPlan<'_>, pinned_host: &mut [i32]) -> Result<()> {
+pub fn upload(
+    layout: &MetadataLayout,
+    plan: &BatchPlan<'_>,
+    pinned_host: &mut [i32],
+) -> Result<()> {
     if pinned_host.len() != layout.total_elements as usize {
         return Err(invalid(
             "pinned_host.len",
@@ -64,7 +68,10 @@ pub fn upload(layout: &MetadataLayout, plan: &BatchPlan<'_>, pinned_host: &mut [
         let src_start = s * max_in;
         let dst_start = layout.block_tables_off as usize + s * max_blocks;
         let src_end = (src_start + copy_len).min(plan.block_tables_flat.len());
-        for (i, b) in plan.block_tables_flat[src_start..src_end].iter().enumerate() {
+        for (i, b) in plan.block_tables_flat[src_start..src_end]
+            .iter()
+            .enumerate()
+        {
             pinned_host[dst_start + i] = b.0 as i32;
         }
     }
@@ -133,7 +140,7 @@ mod tests {
         assert_eq!(buf[layout.token_ids_off as usize], 10);
         assert_eq!(buf[layout.token_ids_off as usize + 1], 20);
         assert_eq!(buf[layout.token_ids_off as usize + 2], 0); // pad
-        // slot_mapping padding uses -1
+                                                               // slot_mapping padding uses -1
         let smo = layout.slot_mapping_off as usize;
         assert_eq!(buf[smo], 42);
         assert_eq!(buf[smo + 1], 43);

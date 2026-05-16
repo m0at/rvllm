@@ -131,9 +131,8 @@ impl Drop for LoadedModule {
         #[cfg(feature = "cuda")]
         unsafe {
             if self.raw != 0 {
-                let _ = cudarc::driver::sys::cuModuleUnload(
-                    self.raw as cudarc::driver::sys::CUmodule,
-                );
+                let _ =
+                    cudarc::driver::sys::cuModuleUnload(self.raw as cudarc::driver::sys::CUmodule);
             }
         }
     }

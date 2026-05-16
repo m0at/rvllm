@@ -6,7 +6,11 @@ use std::path::Path;
 
 use crate::error::{ConfigError, Result, RvllmError};
 
-pub(super) fn usize_field(v: &serde_json::Value, field: &'static str, file: &Path) -> Result<usize> {
+pub(super) fn usize_field(
+    v: &serde_json::Value,
+    field: &'static str,
+    file: &Path,
+) -> Result<usize> {
     match v.get(field) {
         Some(x) if x.is_u64() => Ok(x.as_u64().unwrap_or(0) as usize),
         Some(_) => Err(RvllmError::config(

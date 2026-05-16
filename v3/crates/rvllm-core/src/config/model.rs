@@ -79,7 +79,11 @@ impl ModelConfig {
         })?;
 
         // Gemma 3/4: text model fields nested under text_config.
-        let tc = if v["text_config"]["hidden_size"].is_u64() { &v["text_config"] } else { v };
+        let tc = if v["text_config"]["hidden_size"].is_u64() {
+            &v["text_config"]
+        } else {
+            v
+        };
 
         let hidden_size = hf::usize_field(tc, "hidden_size", file)?;
         let num_layers = hf::usize_field(tc, "num_hidden_layers", file)?;
@@ -98,7 +102,9 @@ impl ModelConfig {
             .or_else(|| hf::bool_field_opt(v, "tie_word_embeddings"))
             .unwrap_or(false);
         let torch_dtype = match hf::str_field(v, "torch_dtype", file)
-            .or_else(|_| hf::str_field(tc, "dtype", file))?.as_str() {
+            .or_else(|_| hf::str_field(tc, "dtype", file))?
+            .as_str()
+        {
             "float16" => DType::F16,
             "bfloat16" => DType::Bf16,
             other => {
@@ -122,7 +128,9 @@ impl ModelConfig {
             ));
         }
         // Gemma 4 has explicit head_dim (256) that doesn't equal hidden_size/num_heads.
-        let head_dim = tc["head_dim"].as_u64().map(|d| d as usize)
+        let head_dim = tc["head_dim"]
+            .as_u64()
+            .map(|d| d as usize)
             .unwrap_or_else(|| hidden_size / num_attention_heads);
         if tc["head_dim"].as_u64().is_none() && head_dim * num_attention_heads != hidden_size {
             return Err(RvllmError::config(

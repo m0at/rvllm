@@ -56,8 +56,9 @@ impl ShardHeader {
         }
         let header_str = std::str::from_utf8(&file_bytes[8..8 + header_bytes])
             .map_err(|_| loader_err("header is not valid utf-8".into()))?;
-        let header: serde_json::Map<String, serde_json::Value> = serde_json::from_str(header_str)
-            .map_err(|e| loader_err(format!("header json: {e}")))?;
+        let header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(header_str)
+                .map_err(|e| loader_err(format!("header json: {e}")))?;
 
         let mut tensors = BTreeMap::new();
         for (name, meta) in header.into_iter() {
@@ -170,8 +171,8 @@ impl ShardIndex {
                 path: index_path.clone(),
                 source,
             })?;
-            let obj: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|e| err_ctx(format!("index json: {e}")))?;
+            let obj: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| err_ctx(format!("index json: {e}")))?;
             let wmap = obj
                 .get("weight_map")
                 .and_then(|v| v.as_object())
@@ -272,7 +273,9 @@ mod tests {
     #[test]
     fn parses_minimal_shard() {
         let dir = tempdir();
-        let data_f32 = (0u32..4).flat_map(|i| (i as f32).to_le_bytes()).collect::<Vec<_>>();
+        let data_f32 = (0u32..4)
+            .flat_map(|i| (i as f32).to_le_bytes())
+            .collect::<Vec<_>>();
         let path = write_shard(&dir, &[("w", DType::F32, &[4], &data_f32)]);
         let body = std::fs::read(&path).unwrap();
         let hdr = ShardHeader::parse(&path, &body).unwrap();

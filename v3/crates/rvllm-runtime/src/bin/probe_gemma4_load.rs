@@ -42,9 +42,7 @@ fn env_path(name: &str) -> Result<PathBuf, String> {
 
 fn env_gb(name: &str, default_gb: u64) -> Result<u64, String> {
     match std::env::var(name) {
-        Ok(v) => v
-            .parse::<u64>()
-            .map_err(|e| format!("{name}={v:?}: {e}")),
+        Ok(v) => v.parse::<u64>().map_err(|e| format!("{name}={v:?}: {e}")),
         Err(_) => Ok(default_gb),
     }
 }
@@ -89,10 +87,9 @@ fn run() -> Result<(), String> {
     // no CUTLASS entries to look up.
     let model_dir = env_path("RVLLM_MODEL_DIR")?;
     let kernels_dir = env_path("RVLLM_KERNELS_DIR")?;
-    let cutlass_so = env_path("RVLLM_CUTLASS_SO")
-        .unwrap_or_else(|_| PathBuf::from(UNUSED_PATH_MARKER));
-    let fa3_so = env_path("RVLLM_FA3_SO")
-        .unwrap_or_else(|_| PathBuf::from(UNUSED_PATH_MARKER));
+    let cutlass_so =
+        env_path("RVLLM_CUTLASS_SO").unwrap_or_else(|_| PathBuf::from(UNUSED_PATH_MARKER));
+    let fa3_so = env_path("RVLLM_FA3_SO").unwrap_or_else(|_| PathBuf::from(UNUSED_PATH_MARKER));
     let policy_json = resolve_policy_path(&kernels_dir)?;
     let paths = Gemma4EnginePaths {
         model_dir,
@@ -114,8 +111,8 @@ fn run() -> Result<(), String> {
 
     // Fail fast if the model_dir isn't Gemma 4 — everything below
     // assumes Gemma4 architecture.
-    let config = ModelConfig::load_hf(&paths.model_dir)
-        .map_err(|e| format!("load config.json: {e}"))?;
+    let config =
+        ModelConfig::load_hf(&paths.model_dir).map_err(|e| format!("load config.json: {e}"))?;
     if !matches!(config.architecture, HfModelArch::Gemma4) {
         return Err(format!(
             "expected Gemma4 architecture in {}, got {:?}",
@@ -130,10 +127,13 @@ fn run() -> Result<(), String> {
     // ======================================================================
     eprintln!("\n... calling Gemma4Bringup::load (this takes a while — weights loading)");
     let t0 = std::time::Instant::now();
-    let bringup = Gemma4Bringup::load(paths, arena_bytes)
-        .map_err(|e| format!("Gemma4Bringup::load: {e}"))?;
+    let bringup =
+        Gemma4Bringup::load(paths, arena_bytes).map_err(|e| format!("Gemma4Bringup::load: {e}"))?;
     let elapsed = t0.elapsed();
-    eprintln!("✓ Gemma4Bringup::load succeeded in {:.2}s", elapsed.as_secs_f64());
+    eprintln!(
+        "✓ Gemma4Bringup::load succeeded in {:.2}s",
+        elapsed.as_secs_f64()
+    );
 
     // ======================================================================
     // Validate (A) — arena backing picked correctly per compute capability.
@@ -149,8 +149,14 @@ fn run() -> Result<(), String> {
     eprintln!("\n[A] arena-backing check:");
     eprintln!("    compute_cap = {cc_major}.{cc_minor}");
     eprintln!("    target      = {target:?}");
-    eprintln!("    arena.capacity = {} MiB", bringup.arena.capacity() / (1024 * 1024));
-    eprintln!("    arena.used     = {} MiB", bringup.arena.used() / (1024 * 1024));
+    eprintln!(
+        "    arena.capacity = {} MiB",
+        bringup.arena.capacity() / (1024 * 1024)
+    );
+    eprintln!(
+        "    arena.used     = {} MiB",
+        bringup.arena.used() / (1024 * 1024)
+    );
     if bringup.arena.capacity() != arena_bytes {
         return Err(format!(
             "arena capacity {} != requested {arena_bytes}",
@@ -186,14 +192,12 @@ fn run() -> Result<(), String> {
         fused.fp8_gemv_mod.path().display(),
     );
 
-    let f16in_expected = target
-        .is_some_and(|t| rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t));
+    let f16in_expected =
+        target.is_some_and(|t| rvllm_kernels::Fp8GemvVariant::WprNativeF16In.available_for(t));
     match (&fused.fn_fp8_gemv_wpr_native_f16in, f16in_expected) {
         (Some(f), true) => {
             if f.raw() == 0 {
-                return Err(
-                    "fn_fp8_gemv_wpr_native_f16in is Some but raw() == 0".into(),
-                );
+                return Err("fn_fp8_gemv_wpr_native_f16in is Some but raw() == 0".into());
             }
             eprintln!(
                 "    fn_fp8_gemv_wpr_native_f16in = resolved ({})",
@@ -201,9 +205,7 @@ fn run() -> Result<(), String> {
             );
         }
         (None, false) => {
-            eprintln!(
-                "    fn_fp8_gemv_wpr_native_f16in = None (expected: sm_100+ only)",
-            );
+            eprintln!("    fn_fp8_gemv_wpr_native_f16in = None (expected: sm_100+ only)",);
         }
         (Some(_), false) => {
             return Err(format!(
@@ -253,14 +255,12 @@ fn run() -> Result<(), String> {
             prompt_ids.push((107 + (i as u32 * 37) % 100_000).max(107));
         }
         let max_new: usize = std::env::var("RVLLM_MAX_NEW")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
         let eos_ids: Vec<u32> = vec![1, 107];
 
-        eprintln!(
-            "    prompt_len={}, max_new={}",
-            prompt_ids.len(),
-            max_new
-        );
+        eprintln!("    prompt_len={}, max_new={}", prompt_ids.len(), max_new);
 
         let t_gen = std::time::Instant::now();
         let output_ids = unsafe {

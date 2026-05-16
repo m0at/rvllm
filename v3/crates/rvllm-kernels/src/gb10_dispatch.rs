@@ -60,9 +60,7 @@ impl Fp8GemvVariant {
         match self {
             Fp8GemvVariant::WprLut => "fp8_gemv_blockwise_wpr_lut_kernel",
             Fp8GemvVariant::WprNative => "fp8_gemv_blockwise_wpr_native_kernel",
-            Fp8GemvVariant::WprNativeF16In => {
-                "fp8_gemv_blockwise_wpr_native_f16in_kernel"
-            }
+            Fp8GemvVariant::WprNativeF16In => "fp8_gemv_blockwise_wpr_native_f16in_kernel",
         }
     }
 

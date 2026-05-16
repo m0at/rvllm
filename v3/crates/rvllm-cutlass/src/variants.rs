@@ -119,20 +119,21 @@ pub const FP8_GEMM_COOP_128_256_128: Variant<crate::schedule::Coop, crate::sched
         ClusterShape::one(),
     );
 
-pub const FP8_GEMM_WS_64_128_128: Variant<crate::schedule::WS, crate::schedule::WS> =
-    Variant::new(
-        VariantId(2),
-        TileShape::new(64, 128, 128),
-        ClusterShape::one(),
-    );
+pub const FP8_GEMM_WS_64_128_128: Variant<crate::schedule::WS, crate::schedule::WS> = Variant::new(
+    VariantId(2),
+    TileShape::new(64, 128, 128),
+    ClusterShape::one(),
+);
 
 /// FP8FastAccum variants — used when autotune says they win at the shape.
-pub const FP8_GEMM_FP8COOP_128_128_128: Variant<crate::schedule::Fp8Coop, crate::schedule::Fp8Coop> =
-    Variant::new(
-        VariantId(3),
-        TileShape::new(128, 128, 128),
-        ClusterShape::one(),
-    );
+pub const FP8_GEMM_FP8COOP_128_128_128: Variant<
+    crate::schedule::Fp8Coop,
+    crate::schedule::Fp8Coop,
+> = Variant::new(
+    VariantId(3),
+    TileShape::new(128, 128, 128),
+    ClusterShape::one(),
+);
 
 pub const FP8_GEMM_FP8WS_64_128_128: Variant<crate::schedule::Fp8WS, crate::schedule::Fp8WS> =
     Variant::new(

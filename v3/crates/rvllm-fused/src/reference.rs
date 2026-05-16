@@ -36,7 +36,11 @@ pub fn quantize_fp8_per_token_ref(
     assert_eq!(out_fp8.len(), x.len());
     assert_eq!(scales.len(), rows);
     for (i, row) in x.chunks(hidden).enumerate() {
-        let amax = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-12);
+        let amax = row
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-12);
         let scale = amax / FP8_E4M3_MAX;
         let inv = 1.0 / scale;
         scales[i] = scale;
@@ -227,7 +231,7 @@ fn f32_to_fp8_e4m3(x: f32) -> u8 {
         // subnormal: shift mantissa right by -e8 positions
         let shift = 1 - e8; // 1..=7
         let m_full = (1 << 23) | f32_mant; // implicit leading 1
-        // take top 3 bits of the subnormal mantissa
+                                           // take top 3 bits of the subnormal mantissa
         let m_sub = m_full >> (23 - 3 + shift as u32).min(26);
         return sign | (m_sub as u8 & 0x7);
     }

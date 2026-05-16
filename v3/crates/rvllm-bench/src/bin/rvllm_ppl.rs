@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use rvllm_core::{ModelArch as HfModelArch, ModelConfig};
-use rvllm_runtime::{Bringup, EnginePaths};
 use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
+use rvllm_runtime::{Bringup, EnginePaths};
 
 fn env_path(k: &str) -> Result<PathBuf, String> {
     std::env::var(k)
@@ -117,7 +117,8 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("gemma4 bringup: {e}"))?;
         eprintln!("bringup: {:.2}s", t0.elapsed().as_secs_f64());
 
-        let embed_mod = g4.kernels
+        let embed_mod = g4
+            .kernels
             .load_ptx("embedding_gather_f16")
             .map_err(|e| format!("load embedding_gather_f16: {e}"))?;
         let fn_embed = embed_mod
@@ -126,13 +127,18 @@ fn run() -> Result<(), String> {
 
         let mut chunks: Vec<&[u32]> = all_ids.chunks(chunk_len).collect();
         if let Some(last) = chunks.last() {
-            if last.len() < chunk_len { chunks.pop(); }
+            if last.len() < chunk_len {
+                chunks.pop();
+            }
         }
         if max_chunks > 0 && chunks.len() > max_chunks {
             chunks.truncate(max_chunks);
         }
         if chunks.is_empty() {
-            return Err(format!("not enough tokens ({}) for chunk_len={chunk_len}", all_ids.len()));
+            return Err(format!(
+                "not enough tokens ({}) for chunk_len={chunk_len}",
+                all_ids.len()
+            ));
         }
         eprintln!("evaluating {} chunks of {} tokens", chunks.len(), chunk_len);
 
@@ -149,10 +155,15 @@ fn run() -> Result<(), String> {
             let running_ppl = (total_nll / total_tokens as f64).exp();
             let chunk_ppl = if result.n_evaluated > 0 {
                 (result.total_nll / result.n_evaluated as f64).exp()
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             eprintln!(
                 "chunk {}/{}: chunk_ppl={:.4} running_ppl={:.4} ({:.1} tok/s, {:.1}s)",
-                ci + 1, chunks.len(), chunk_ppl, running_ppl,
+                ci + 1,
+                chunks.len(),
+                chunk_ppl,
+                running_ppl,
                 chunk.len() as f64 / chunk_t0.elapsed().as_secs_f64(),
                 chunk_t0.elapsed().as_secs_f64()
             );
@@ -229,9 +240,7 @@ fn run() -> Result<(), String> {
 
     let ppl = (total_nll / total_tokens as f64).exp();
     let elapsed = t_eval.elapsed().as_secs_f64();
-    eprintln!(
-        "perplexity = {ppl:.4} ({total_tokens} tokens, {elapsed:.1}s)"
-    );
+    eprintln!("perplexity = {ppl:.4} ({total_tokens} tokens, {elapsed:.1}s)");
     println!(
         "{{\"perplexity\":{ppl:.4},\"tokens\":{total_tokens},\"chunk_len\":{chunk_len},\"elapsed_s\":{elapsed:.1}}}"
     );

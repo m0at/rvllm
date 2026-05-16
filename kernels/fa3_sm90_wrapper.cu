@@ -416,6 +416,9 @@ int fa3_sm90_paged_decode_fp8(
     int*  block_tables_ptr,
     int*  context_lens_ptr,
     void* workspace_ptr,
+    void* k_scale_cache_ptr,
+    void* v_scale_cache_ptr,
+    void* q_scale_cache_ptr,
     float* q_descale_ptr,
     float* k_descale_ptr,
     float* v_descale_ptr,
@@ -430,6 +433,9 @@ int fa3_sm90_paged_decode_fp8(
     int   window_size_left,
     cudaStream_t stream
 ) {
+    (void)k_scale_cache_ptr;
+    (void)v_scale_cache_ptr;
+    (void)q_scale_cache_ptr;
     return fa3_sm90_paged_decode_impl(
         q_fp8_ptr, k_cache_fp8_ptr, v_cache_fp8_ptr, o_f16_ptr,
         block_tables_ptr, context_lens_ptr,
@@ -456,6 +462,9 @@ int fa3_sm90_paged_prefill_fp8(
     int*  context_lens_ptr,
     int*  cu_seqlens_q_ptr,
     void* workspace_ptr,
+    void* k_scale_cache_ptr,
+    void* v_scale_cache_ptr,
+    void* q_scale_cache_ptr,
     float* q_descale_ptr,
     float* k_descale_ptr,
     float* v_descale_ptr,
@@ -472,6 +481,9 @@ int fa3_sm90_paged_prefill_fp8(
     int   window_size_left,
     cudaStream_t stream
 ) {
+    (void)k_scale_cache_ptr;
+    (void)v_scale_cache_ptr;
+    (void)q_scale_cache_ptr;
     return fa3_sm90_paged_decode_impl(
         q_fp8_ptr, k_cache_fp8_ptr, v_cache_fp8_ptr, o_f16_ptr,
         block_tables_ptr, context_lens_ptr,

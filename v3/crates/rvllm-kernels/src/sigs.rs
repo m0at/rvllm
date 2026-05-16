@@ -33,9 +33,9 @@ pub const FUSED_KERNELS: &[KernelSig] = &[
         name: "embedding_gather",
         module: "embedding",
         args: &[
-            ArgKind::DevicePtr,     // out f16 [T, H]
-            ArgKind::DevicePtr,     // weights f16 [V, H]
-            ArgKind::DevicePtr,     // token_ids i32 [T]
+            ArgKind::DevicePtr,          // out f16 [T, H]
+            ArgKind::DevicePtr,          // weights f16 [V, H]
+            ArgKind::DevicePtr,          // token_ids i32 [T]
             ArgKind::Scalar(DType::I32), // hidden_size
             ArgKind::Scalar(DType::I32), // vocab_size
         ],
@@ -44,12 +44,12 @@ pub const FUSED_KERNELS: &[KernelSig] = &[
         name: "fused_add_rmsnorm_fp8_quant",
         module: "fused_norm_quant",
         args: &[
-            ArgKind::DevicePtr, // out fp8 [T, H]
-            ArgKind::DevicePtr, // scale f32 [T]
-            ArgKind::DevicePtr, // residual_out f16 [T, H]
-            ArgKind::DevicePtr, // in hidden f16
-            ArgKind::DevicePtr, // residual_in f16
-            ArgKind::DevicePtr, // gamma f16
+            ArgKind::DevicePtr,          // out fp8 [T, H]
+            ArgKind::DevicePtr,          // scale f32 [T]
+            ArgKind::DevicePtr,          // residual_out f16 [T, H]
+            ArgKind::DevicePtr,          // in hidden f16
+            ArgKind::DevicePtr,          // residual_in f16
+            ArgKind::DevicePtr,          // gamma f16
             ArgKind::Scalar(DType::F32), // eps
             ArgKind::Scalar(DType::I32), // hidden_size
         ],
@@ -70,9 +70,9 @@ pub const FUSED_KERNELS: &[KernelSig] = &[
         name: "quantize_fp8_per_token",
         module: "fused_norm_quant",
         args: &[
-            ArgKind::DevicePtr, // out fp8
-            ArgKind::DevicePtr, // scale f32
-            ArgKind::DevicePtr, // in f16
+            ArgKind::DevicePtr,          // out fp8
+            ArgKind::DevicePtr,          // scale f32
+            ArgKind::DevicePtr,          // in f16
             ArgKind::Scalar(DType::I32), // dim
         ],
     },
@@ -80,13 +80,13 @@ pub const FUSED_KERNELS: &[KernelSig] = &[
         name: "fused_rope_kv_write",
         module: "fused_rope_kv",
         args: &[
-            ArgKind::DevicePtr, // qkv in/out (Q rotated in-place)
-            ArgKind::DevicePtr, // k_cache
-            ArgKind::DevicePtr, // v_cache
-            ArgKind::DevicePtr, // positions
-            ArgKind::DevicePtr, // cos
-            ArgKind::DevicePtr, // sin
-            ArgKind::DevicePtr, // slot_mapping
+            ArgKind::DevicePtr,          // qkv in/out (Q rotated in-place)
+            ArgKind::DevicePtr,          // k_cache
+            ArgKind::DevicePtr,          // v_cache
+            ArgKind::DevicePtr,          // positions
+            ArgKind::DevicePtr,          // cos
+            ArgKind::DevicePtr,          // sin
+            ArgKind::DevicePtr,          // slot_mapping
             ArgKind::Scalar(DType::I32), // q_dim
             ArgKind::Scalar(DType::I32), // kv_dim
             ArgKind::Scalar(DType::I32), // num_tokens
@@ -96,9 +96,9 @@ pub const FUSED_KERNELS: &[KernelSig] = &[
         name: "fused_silu_mul_fp8_quant",
         module: "fused_silu_quant",
         args: &[
-            ArgKind::DevicePtr, // out fp8
-            ArgKind::DevicePtr, // scale f32
-            ArgKind::DevicePtr, // gate_up f16
+            ArgKind::DevicePtr,          // out fp8
+            ArgKind::DevicePtr,          // scale f32
+            ArgKind::DevicePtr,          // gate_up f16
             ArgKind::Scalar(DType::I32), // num_tokens
             ArgKind::Scalar(DType::I32), // intermediate
         ],
@@ -107,8 +107,8 @@ pub const FUSED_KERNELS: &[KernelSig] = &[
         name: "argmax",
         module: "argmax",
         args: &[
-            ArgKind::DevicePtr, // logits f32 [T, V]
-            ArgKind::DevicePtr, // out i32 [T]
+            ArgKind::DevicePtr,          // logits f32 [T, V]
+            ArgKind::DevicePtr,          // out i32 [T]
             ArgKind::Scalar(DType::I32), // vocab_size
         ],
     },
@@ -116,8 +116,8 @@ pub const FUSED_KERNELS: &[KernelSig] = &[
         name: "residual_add_f16",
         module: "residual",
         args: &[
-            ArgKind::DevicePtr, // x in/out
-            ArgKind::DevicePtr, // y
+            ArgKind::DevicePtr,          // x in/out
+            ArgKind::DevicePtr,          // y
             ArgKind::Scalar(DType::I32), // n
         ],
     },

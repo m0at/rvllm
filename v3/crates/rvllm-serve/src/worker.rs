@@ -304,7 +304,7 @@ fn stop_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
     }
 
     let mut ids = Vec::new();
-    for token in ["<end_of_turn>", "<eos>", "</s>"] {
+    for token in ["<turn|>", "<eos>", "<|tool_response>", "</s>"] {
         if let Some(id) = tokenizer.token_to_id(token) {
             if !ids.contains(&id) {
                 ids.push(id);

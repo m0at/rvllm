@@ -33,7 +33,10 @@ use rvllm_fused::gemma4_launcher;
 use rvllm_fused::FusedRmsnormFp8QuantLaunch;
 use rvllm_kernels::KernelFn;
 
-use rvllm_attention::{AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams};
+use rvllm_attention::{
+    AttentionBackend, PagedDecodeFp8Launcher, PagedDecodeParams, PagedPrefillFp8Launcher,
+    PagedPrefillParams,
+};
 
 use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
@@ -235,8 +238,20 @@ pub unsafe fn gemma4_forward(
     residual: u64,
     stream: u64,
 ) -> Result<()> {
-    gemma4_forward_phase(dims, kernels, weights, scratch, meta, cublaslt, cutlass,
-        sliding_attention, global_attention, residual, stream, Gemma4Phase::Decode)
+    gemma4_forward_phase(
+        dims,
+        kernels,
+        weights,
+        scratch,
+        meta,
+        cublaslt,
+        cutlass,
+        sliding_attention,
+        global_attention,
+        residual,
+        stream,
+        Gemma4Phase::Decode,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -478,19 +493,37 @@ pub unsafe fn gemma4_forward_phase(
         )?;
     } else if weights.qkv_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
-            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
-            scratch.q_out, scratch.hidden_fp8, weights.qkv_fp8,
-            scratch.hidden_scale, weights.qkv_chscale, weights.qkv_blockscale, weights.qkv_scale,
-            dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
+            cutlass,
+            cublaslt,
+            kernels.f32_to_f16_sat,
+            kernels.scale_cols_f32,
+            kernels.scale_rows_f32_ratio,
+            scratch.q_out,
+            scratch.hidden_fp8,
+            weights.qkv_fp8,
+            scratch.hidden_scale,
+            weights.qkv_chscale,
+            weights.qkv_blockscale,
+            weights.qkv_scale,
+            dims.num_tokens as i32,
+            qkv_rows as i32,
+            dims.hidden as i32,
             scratch.gemm_f32_tmp,
-            scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+            scratch.cutlass_workspace,
+            scratch.cutlass_workspace_bytes,
             stream,
         )?;
     } else {
         cublaslt.fp8_gemm(
-            scratch.hidden_fp8, weights.qkv_fp8, scratch.q_out,
-            dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
-            scratch.hidden_scale, weights.qkv_scale, stream,
+            scratch.hidden_fp8,
+            weights.qkv_fp8,
+            scratch.q_out,
+            dims.num_tokens as i32,
+            qkv_rows as i32,
+            dims.hidden as i32,
+            scratch.hidden_scale,
+            weights.qkv_scale,
+            stream,
         )?;
     }
 
@@ -594,7 +627,12 @@ pub unsafe fn gemma4_forward_phase(
                 )?;
             } else {
                 rope_fp8kv(dims, kernels, scratch, meta, stream)?;
-                let decode = PagedDecodeFp8Launcher::new(attention);
+                // When batch prefill is active, KV is FP8 for the
+                // whole request. Use the SM89 fallback backend for FP8
+                // decode too: it supports Gemma 4 hdim 256/512 and
+                // consumes the per-slot scale caches. The SM90 FA3 ABI
+                // still only accepts scalar descales.
+                let decode = PagedDecodeFp8Launcher::new(global_attention);
                 decode.launch(
                     decode_params,
                     scratch.attn_out,
@@ -614,7 +652,11 @@ pub unsafe fn gemma4_forward_phase(
                 )?;
             }
         }
-        Gemma4Phase::Prefill { cu_seqlens_q, max_seqlen_q: _, num_seqs: _ } => {
+        Gemma4Phase::Prefill {
+            cu_seqlens_q,
+            max_seqlen_q,
+            num_seqs,
+        } => {
             // Prefill always uses FP8 KV path (no F16 prefill kernel).
             rope_fp8kv(dims, kernels, scratch, meta, stream)?;
 
@@ -690,88 +732,127 @@ pub unsafe fn gemma4_forward_phase(
                     scratch.q_scale_ptr,
                     stream,
                 )?;
-            } else {
-            // --- Decode-per-qi fallback -------------------------------
-            // Replaces batch prefill with a loop of single-query decode
-            // kernel calls — one per prompt position qi. Per-qi
-            // context_lens value is NOT rewritten via HtoD each
-            // iteration (that races against the non-default stream);
-            // instead we reuse the `cu_seqlens_q` scratch region as a
-            // pre-populated device array `[1, 2, ..., num_tokens]`
-            // and let decode read ctx = (qi+1) by pointing into it at
-            // offset qi. By construction this is bit-identical to the
-            // per-token decode path rvllm-ppl validates.
-            //
-            // Cost: prompt_len extra kernel launches per layer — the
-            // ≈30× TTFT gap against vLLM that motivated the unified
-            // kernel above.
-            let decode_params = PagedDecodeParams {
-                num_seqs: 1,
-                num_heads: dims.num_heads,
-                num_kv_heads: dims.num_kv_heads,
-                head_dim: dims.head_dim,
-                block_size: dims.block_size,
-                max_blocks_per_seq: dims.max_blocks_per_seq,
-                num_blocks_total: dims.num_blocks_total,
-                scale: dims.attn_scale,
-                window_size_left,
-            };
-            let decode = PagedDecodeFp8Launcher::new(attention);
-            let o_stride_bytes =
-                (dims.num_heads as u64) * (dims.head_dim as u64) * 2; // f16
-            let q_fp8_stride_bytes = (dims.num_heads as u64) * (dims.head_dim as u64); // fp8
-            // Per-(token, head) Q scale cache stride. Rope writes at
-            // `q_scale_cache[token_idx * num_heads + head_idx]` (see
-            // fused_rope_partial_fp8kv.cu). Per-qi decode reads at
-            // `q_scale_cache[seq_idx * num_heads + head_idx]` with
-            // seq_idx=0 (num_seqs=1 per launch), so we must advance
-            // the pointer by `qi * num_heads * sizeof::<f32>()` just
-            // like the Q FP8 pointer — otherwise token qi gets token 0's
-            // scale and prefill logits diverge from the per-token
-            // decode reference.
-            let q_scale_stride_bytes = (dims.num_heads as u64) * 4;
-
-            // Pre-populate cu_seqlens_q region with [1, 2, ..., num_tokens]
-            // via a small host→device copy on THIS stream (async with
-            // pageable src; cudarc routes through the stream handle).
-            // We reuse cu_seqlens_q because it's already sized
-            // `(num_tokens + 1) * 4 bytes` and otherwise unused once
-            // the unified attention replaces the FA2 prefill kernel.
-            let ctx_host: Vec<i32> =
-                (1..=dims.num_tokens as i32).collect();
-            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                cu_seqlens_q,
-                ctx_host.as_ptr() as *const _,
-                (ctx_host.len() * 4) as _,
-                stream as _,
-            );
-
-            for qi in 0..dims.num_tokens {
-                let q_scale_cache_qi = if scratch.q_scale_cache != 0 {
-                    scratch.q_scale_cache + (qi as u64) * q_scale_stride_bytes
-                } else {
-                    0
+            } else if matches!(global_attention, rvllm_attention::AttentionBackend::Fa3(_))
+                && dims.num_tokens > 1
+            {
+                let prefill_params = PagedPrefillParams {
+                    num_tokens: dims.num_tokens,
+                    num_seqs,
+                    num_heads: dims.num_heads,
+                    num_kv_heads: dims.num_kv_heads,
+                    head_dim: dims.head_dim,
+                    block_size: dims.block_size,
+                    max_blocks_per_seq: dims.max_blocks_per_seq,
+                    num_blocks_total: dims.num_blocks_total,
+                    scale: dims.attn_scale,
+                    window_size_left,
                 };
-                decode.launch(
-                    decode_params,
-                    scratch.attn_out + (qi as u64) * o_stride_bytes,
-                    scratch.q_fp8 + (qi as u64) * q_fp8_stride_bytes,
+                // H100 route recovered from the known-good branch:
+                // use SM90 for decode, but the SM89 paged-prefill .so
+                // for prompt prefill. The SM90 varlen kernel is tight
+                // on shared memory at Gemma 4 hdim>=256; SM89 supports
+                // 128/256/512 and is stable for the one-shot prefill
+                // path used by RVLLM_BATCH_PREFILL.
+                let prefill = PagedPrefillFp8Launcher::new(global_attention);
+                prefill.launch(
+                    prefill_params,
+                    scratch.attn_out,
+                    scratch.q_fp8,
                     scratch.k_cache,
                     scratch.v_cache,
+                    meta.block_tables,
+                    meta.context_lens,
+                    cu_seqlens_q,
+                    scratch.fa3_workspace,
                     scratch.k_scale_cache,
                     scratch.v_scale_cache,
-                    q_scale_cache_qi,
-                    0, // k_descale_fallback (unused when per-slot populated)
-                    0, // v_descale_fallback
-                    meta.block_tables,
-                    cu_seqlens_q + (qi as u64) * 4,
-                    scratch.fa3_workspace,
+                    scratch.q_scale_cache,
                     scratch.q_scale_ptr,
+                    scratch.kv_scale_ptr,
+                    scratch.kv_scale_ptr,
+                    max_seqlen_q,
                     stream,
                 )?;
-            }
-            // Ensure ctx_host lives until the stream has consumed it.
-            std::hint::black_box(&ctx_host);
+            } else {
+                // --- Decode-per-qi fallback -------------------------------
+                // Replaces batch prefill with a loop of single-query decode
+                // kernel calls — one per prompt position qi. Per-qi
+                // context_lens value is NOT rewritten via HtoD each
+                // iteration (that races against the non-default stream);
+                // instead we reuse the `cu_seqlens_q` scratch region as a
+                // pre-populated device array `[1, 2, ..., num_tokens]`
+                // and let decode read ctx = (qi+1) by pointing into it at
+                // offset qi. By construction this is bit-identical to the
+                // per-token decode path rvllm-ppl validates.
+                //
+                // Cost: prompt_len extra kernel launches per layer — the
+                // ≈30× TTFT gap against vLLM that motivated the unified
+                // kernel above.
+                let decode_params = PagedDecodeParams {
+                    num_seqs: 1,
+                    num_heads: dims.num_heads,
+                    num_kv_heads: dims.num_kv_heads,
+                    head_dim: dims.head_dim,
+                    block_size: dims.block_size,
+                    max_blocks_per_seq: dims.max_blocks_per_seq,
+                    num_blocks_total: dims.num_blocks_total,
+                    scale: dims.attn_scale,
+                    window_size_left,
+                };
+                let decode = PagedDecodeFp8Launcher::new(attention);
+                let o_stride_bytes = (dims.num_heads as u64) * (dims.head_dim as u64) * 2; // f16
+                let q_fp8_stride_bytes = (dims.num_heads as u64) * (dims.head_dim as u64); // fp8
+                                                                                           // Per-(token, head) Q scale cache stride. Rope writes at
+                                                                                           // `q_scale_cache[token_idx * num_heads + head_idx]` (see
+                                                                                           // fused_rope_partial_fp8kv.cu). Per-qi decode reads at
+                                                                                           // `q_scale_cache[seq_idx * num_heads + head_idx]` with
+                                                                                           // seq_idx=0 (num_seqs=1 per launch), so we must advance
+                                                                                           // the pointer by `qi * num_heads * sizeof::<f32>()` just
+                                                                                           // like the Q FP8 pointer — otherwise token qi gets token 0's
+                                                                                           // scale and prefill logits diverge from the per-token
+                                                                                           // decode reference.
+                let q_scale_stride_bytes = (dims.num_heads as u64) * 4;
+
+                // Pre-populate cu_seqlens_q region with [1, 2, ..., num_tokens]
+                // via a small host→device copy on THIS stream (async with
+                // pageable src; cudarc routes through the stream handle).
+                // We reuse cu_seqlens_q because it's already sized
+                // `(num_tokens + 1) * 4 bytes` and otherwise unused once
+                // the unified attention replaces the FA2 prefill kernel.
+                let ctx_host: Vec<i32> = (1..=dims.num_tokens as i32).collect();
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    cu_seqlens_q,
+                    ctx_host.as_ptr() as *const _,
+                    (ctx_host.len() * 4) as _,
+                    stream as _,
+                );
+
+                for qi in 0..dims.num_tokens {
+                    let q_scale_cache_qi = if scratch.q_scale_cache != 0 {
+                        scratch.q_scale_cache + (qi as u64) * q_scale_stride_bytes
+                    } else {
+                        0
+                    };
+                    decode.launch(
+                        decode_params,
+                        scratch.attn_out + (qi as u64) * o_stride_bytes,
+                        scratch.q_fp8 + (qi as u64) * q_fp8_stride_bytes,
+                        scratch.k_cache,
+                        scratch.v_cache,
+                        scratch.k_scale_cache,
+                        scratch.v_scale_cache,
+                        q_scale_cache_qi,
+                        0, // k_descale_fallback (unused when per-slot populated)
+                        0, // v_descale_fallback
+                        meta.block_tables,
+                        cu_seqlens_q + (qi as u64) * 4,
+                        scratch.fa3_workspace,
+                        scratch.q_scale_ptr,
+                        stream,
+                    )?;
+                }
+                // Ensure ctx_host lives until the stream has consumed it.
+                std::hint::black_box(&ctx_host);
             } // end of decode-per-qi fallback
         }
     }
@@ -810,13 +891,27 @@ pub unsafe fn gemma4_forward_phase(
     #[cfg(feature = "cuda")]
     if weights.o_f16 != 0 {
         cublaslt.f16_gemm_f32(
-            scratch.attn_out, weights.o_f16, scratch.gemm_f32_tmp,
-            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32, stream,
+            scratch.attn_out,
+            weights.o_f16,
+            scratch.gemm_f32_tmp,
+            dims.num_tokens as i32,
+            dims.hidden as i32,
+            q_dim as i32,
+            stream,
         )?;
         gemma4_launcher::FusedNormAddResidualLaunch {
-            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
-            weights.post_attn_norm_gamma, residual, 0, stream)?;
+            num_tokens: dims.num_tokens,
+            hidden: dims.hidden,
+            eps: dims.rms_eps,
+        }
+        .launch(
+            kernels.fused_norm_add_residual,
+            scratch.gemm_f32_tmp,
+            weights.post_attn_norm_gamma,
+            residual,
+            0,
+            stream,
+        )?;
     } else if let (true, Some(fn_gemv)) = (
         weights.o_blockscale != 0 && dims.num_tokens <= FAST_PATH_M_MAX,
         kernels.fp8_gemv_wpr_native_f16in,
@@ -872,28 +967,64 @@ pub unsafe fn gemma4_forward_phase(
         // in the 16 < M < 128 range, tracked as a follow-up).
         let o_out_f16 = scratch.gemm_f32_tmp; // reused as f16 staging, plenty big
         fp8_gemm_channelscale_or_fallback(
-            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
-            o_out_f16, scratch.attn_out_fp8, weights.o_fp8,
-            scratch.attn_out_scale, weights.o_chscale, weights.o_blockscale, weights.o_scale,
-            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
+            cutlass,
+            cublaslt,
+            kernels.f32_to_f16_sat,
+            kernels.scale_cols_f32,
+            kernels.scale_rows_f32_ratio,
+            o_out_f16,
+            scratch.attn_out_fp8,
+            weights.o_fp8,
+            scratch.attn_out_scale,
+            weights.o_chscale,
+            weights.o_blockscale,
+            weights.o_scale,
+            dims.num_tokens as i32,
+            dims.hidden as i32,
+            q_dim as i32,
             scratch.gemm_f32_tmp + (dims.num_tokens * dims.hidden * 2) as u64,
-            scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+            scratch.cutlass_workspace,
+            scratch.cutlass_workspace_bytes,
             stream,
         )?;
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
-            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual_f16in, o_out_f16,
-            weights.post_attn_norm_gamma, residual, 0, stream)?;
+            num_tokens: dims.num_tokens,
+            hidden: dims.hidden,
+            eps: dims.rms_eps,
+        }
+        .launch(
+            kernels.fused_norm_add_residual_f16in,
+            o_out_f16,
+            weights.post_attn_norm_gamma,
+            residual,
+            0,
+            stream,
+        )?;
     } else {
         cublaslt.fp8_gemm_f32(
-            scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
-            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
-            scratch.attn_out_scale, weights.o_scale, stream,
+            scratch.attn_out_fp8,
+            weights.o_fp8,
+            scratch.gemm_f32_tmp,
+            dims.num_tokens as i32,
+            dims.hidden as i32,
+            q_dim as i32,
+            scratch.attn_out_scale,
+            weights.o_scale,
+            stream,
         )?;
         gemma4_launcher::FusedNormAddResidualLaunch {
-            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-        }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
-            weights.post_attn_norm_gamma, residual, 0, stream)?;
+            num_tokens: dims.num_tokens,
+            hidden: dims.hidden,
+            eps: dims.rms_eps,
+        }
+        .launch(
+            kernels.fused_norm_add_residual,
+            scratch.gemm_f32_tmp,
+            weights.post_attn_norm_gamma,
+            residual,
+            0,
+            stream,
+        )?;
     }
 
     #[cfg(feature = "cuda")]
@@ -1012,19 +1143,37 @@ pub unsafe fn gemma4_forward_phase(
         )?;
     } else if weights.gate_up_chscale != 0 {
         fp8_gemm_channelscale_or_fallback(
-            cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
-            scratch.gate_up_out, scratch.hidden_fp8, weights.gate_up_fp8,
-            scratch.hidden_scale, weights.gate_up_chscale, weights.gate_up_blockscale, weights.gate_up_scale,
-            dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
+            cutlass,
+            cublaslt,
+            kernels.f32_to_f16_sat,
+            kernels.scale_cols_f32,
+            kernels.scale_rows_f32_ratio,
+            scratch.gate_up_out,
+            scratch.hidden_fp8,
+            weights.gate_up_fp8,
+            scratch.hidden_scale,
+            weights.gate_up_chscale,
+            weights.gate_up_blockscale,
+            weights.gate_up_scale,
+            dims.num_tokens as i32,
+            (2 * dims.intermediate) as i32,
+            dims.hidden as i32,
             scratch.gemm_f32_tmp,
-            scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+            scratch.cutlass_workspace,
+            scratch.cutlass_workspace_bytes,
             stream,
         )?;
     } else {
         cublaslt.fp8_gemm(
-            scratch.hidden_fp8, weights.gate_up_fp8, scratch.gate_up_out,
-            dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
-            scratch.hidden_scale, weights.gate_up_scale, stream,
+            scratch.hidden_fp8,
+            weights.gate_up_fp8,
+            scratch.gate_up_out,
+            dims.num_tokens as i32,
+            (2 * dims.intermediate) as i32,
+            dims.hidden as i32,
+            scratch.hidden_scale,
+            weights.gate_up_scale,
+            stream,
         )?;
     }
 
@@ -1128,30 +1277,64 @@ pub unsafe fn gemma4_forward_phase(
             // approximation that collapses K-block variation.
             let down_out_f16 = scratch.gemm_f32_tmp;
             fp8_gemm_channelscale_or_fallback(
-                cutlass, cublaslt, kernels.f32_to_f16_sat, kernels.scale_cols_f32, kernels.scale_rows_f32_ratio,
-                down_out_f16, scratch.mlp_out_fp8, weights.down_fp8,
-                scratch.mlp_out_scale, weights.down_chscale, weights.down_blockscale, weights.down_scale,
-                dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
+                cutlass,
+                cublaslt,
+                kernels.f32_to_f16_sat,
+                kernels.scale_cols_f32,
+                kernels.scale_rows_f32_ratio,
+                down_out_f16,
+                scratch.mlp_out_fp8,
+                weights.down_fp8,
+                scratch.mlp_out_scale,
+                weights.down_chscale,
+                weights.down_blockscale,
+                weights.down_scale,
+                dims.num_tokens as i32,
+                dims.hidden as i32,
+                dims.intermediate as i32,
                 scratch.gemm_f32_tmp + (dims.num_tokens * dims.hidden * 2) as u64,
-                scratch.cutlass_workspace, scratch.cutlass_workspace_bytes,
+                scratch.cutlass_workspace,
+                scratch.cutlass_workspace_bytes,
                 stream,
             )?;
             gemma4_launcher::FusedNormAddResidualF16InLaunch {
-                num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-            }.launch(kernels.fused_norm_add_residual_f16in, down_out_f16,
-                weights.post_ff_norm_gamma, residual,
-                weights.layer_scalar_ptr, stream)?;
+                num_tokens: dims.num_tokens,
+                hidden: dims.hidden,
+                eps: dims.rms_eps,
+            }
+            .launch(
+                kernels.fused_norm_add_residual_f16in,
+                down_out_f16,
+                weights.post_ff_norm_gamma,
+                residual,
+                weights.layer_scalar_ptr,
+                stream,
+            )?;
         } else {
             cublaslt.fp8_gemm_f32(
-                scratch.mlp_out_fp8, weights.down_fp8, scratch.gemm_f32_tmp,
-                dims.num_tokens as i32, dims.hidden as i32, dims.intermediate as i32,
-                scratch.mlp_out_scale, weights.down_scale, stream,
+                scratch.mlp_out_fp8,
+                weights.down_fp8,
+                scratch.gemm_f32_tmp,
+                dims.num_tokens as i32,
+                dims.hidden as i32,
+                dims.intermediate as i32,
+                scratch.mlp_out_scale,
+                weights.down_scale,
+                stream,
             )?;
             gemma4_launcher::FusedNormAddResidualLaunch {
-                num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
-            }.launch(kernels.fused_norm_add_residual, scratch.gemm_f32_tmp,
-                weights.post_ff_norm_gamma, residual,
-                weights.layer_scalar_ptr, stream)?;
+                num_tokens: dims.num_tokens,
+                hidden: dims.hidden,
+                eps: dims.rms_eps,
+            }
+            .launch(
+                kernels.fused_norm_add_residual,
+                scratch.gemm_f32_tmp,
+                weights.post_ff_norm_gamma,
+                residual,
+                weights.layer_scalar_ptr,
+                stream,
+            )?;
         }
     }
 
@@ -1306,7 +1489,10 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     // exactly how aa01001pftrope0 manifested).
     let cutlass_sm120_enabled = m >= 128
         && b_blockscale != 0
-        && std::env::var("RVLLM_FP8_GEMM_CUTLASS_SM120").ok().as_deref() != Some("0");
+        && std::env::var("RVLLM_FP8_GEMM_CUTLASS_SM120")
+            .ok()
+            .as_deref()
+            != Some("0");
     if cutlass_sm120_enabled {
         if let CutlassBackend::SoSm120(lib) = cutlass {
             if lib.prep_sfa.is_some() && lib.prep_sfb.is_some() {
@@ -1350,9 +1536,14 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
     // existing fp8_gemm_f32 path uses).
     let fallback_f32_scale_cast = || -> Result<()> {
         cublaslt.fp8_gemm_f32(
-            a_fp8, b_fp8, scratch_f32,
-            m, n, k,
-            a_scale, b_scale_scalar,
+            a_fp8,
+            b_fp8,
+            scratch_f32,
+            m,
+            n,
+            k,
+            a_scale,
+            b_scale_scalar,
             stream,
         )?;
         // cuBLASLt on sm_121 only supports SCALAR B_SCALE mode; the
@@ -1364,24 +1555,32 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
         if m > 1 {
             launch_scale_rows_f32_ratio(
                 fn_scale_rows_f32_ratio,
-                scratch_f32, a_scale,
-                m as u32, n as u32, stream,
+                scratch_f32,
+                a_scale,
+                m as u32,
+                n as u32,
+                stream,
             )?;
         }
         if b_chscale != 0 {
             launch_scale_cols_f32(
                 fn_scale_cols_f32,
-                scratch_f32, b_chscale,
-                m as u32, n as u32, stream,
+                scratch_f32,
+                b_chscale,
+                m as u32,
+                n as u32,
+                stream,
             )?;
         }
         // `Bf16ToF16SatLaunch` has the (dst, src, n) ABI we need;
         // name refers to the historical caller, the launched kernel
         // is `f32_to_f16_sat`.
-        gemma4_launcher::Bf16ToF16SatLaunch {
-            n: (m * n) as u32,
-        }
-        .launch(fn_f32_to_f16, output_f16, scratch_f32, stream)
+        gemma4_launcher::Bf16ToF16SatLaunch { n: (m * n) as u32 }.launch(
+            fn_f32_to_f16,
+            output_f16,
+            scratch_f32,
+            stream,
+        )
     };
 
     match cutlass {
@@ -1403,9 +1602,15 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
                 fallback_f32_scale_cast()
             } else {
                 cublaslt.fp8_gemm(
-                    a_fp8, b_fp8, output_f16,
-                    m, n, k,
-                    a_scale, b_scale_scalar, stream,
+                    a_fp8,
+                    b_fp8,
+                    output_f16,
+                    m,
+                    n,
+                    k,
+                    a_scale,
+                    b_scale_scalar,
+                    stream,
                 )
             }
         }
@@ -1423,9 +1628,15 @@ unsafe fn fp8_gemm_channelscale_or_fallback(
                 fallback_f32_scale_cast()
             } else {
                 cublaslt.fp8_gemm(
-                    a_fp8, b_fp8, output_f16,
-                    m, n, k,
-                    a_scale, b_scale_scalar, stream,
+                    a_fp8,
+                    b_fp8,
+                    output_f16,
+                    m,
+                    n,
+                    k,
+                    a_scale,
+                    b_scale_scalar,
+                    stream,
                 )
             }
         }
@@ -1489,7 +1700,14 @@ unsafe fn rope_f16kv(
     let max_heads = dims.num_heads.max(dims.num_kv_heads);
     let grid = (dims.num_tokens, max_heads, 1);
     let block = ((dims.head_dim / 2).max(32), 1, 1);
-    rvllm_fused::launch_raw(kernels.fused_rope_partial_f16kv, grid, block, 0, stream, &args)
+    rvllm_fused::launch_raw(
+        kernels.fused_rope_partial_f16kv,
+        grid,
+        block,
+        0,
+        stream,
+        &args,
+    )
 }
 
 #[cfg(feature = "cuda")]

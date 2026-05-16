@@ -71,9 +71,7 @@ pub fn load_gemma4_model(
 
     let prefix = &arch.weight_prefix;
 
-    let get_tensor = |name: &str| -> Option<(usize, TensorEntry)> {
-        tensors.get(name).cloned()
-    };
+    let get_tensor = |name: &str| -> Option<(usize, TensorEntry)> { tensors.get(name).cloned() };
 
     let must_get = |name: &str| -> Result<(usize, TensorEntry)> {
         get_tensor(name).ok_or_else(|| RvllmError::Loader {
@@ -106,21 +104,26 @@ pub fn load_gemma4_model(
         let (si, e) = must_get(&embed_name)?;
         let mut buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
         let scale = (arch.hidden_size as f32).sqrt();
-        eprintln!("[loader] Gemma embedding scale: sqrt({}) = {:.2}", arch.hidden_size, scale);
+        eprintln!(
+            "[loader] Gemma embedding scale: sqrt({}) = {:.2}",
+            arch.hidden_size, scale
+        );
         let n = buf.len() / 2;
         for i in 0..n {
-            let bits = u16::from_le_bytes([buf[2*i], buf[2*i+1]]);
+            let bits = u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
             let v = f16::from_bits(bits);
             let scaled = f16::from_f32(v.to_f32() * scale);
             let out = scaled.to_le_bytes();
-            buf[2*i] = out[0];
-            buf[2*i+1] = out[1];
+            buf[2 * i] = out[0];
+            buf[2 * i + 1] = out[1];
         }
         {
-            let first4: Vec<f32> = (0..4).map(|i| {
-                let bits = u16::from_le_bytes([buf[2*i], buf[2*i+1]]);
-                f16::from_bits(bits).to_f32()
-            }).collect();
+            let first4: Vec<f32> = (0..4)
+                .map(|i| {
+                    let bits = u16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]);
+                    f16::from_bits(bits).to_f32()
+                })
+                .collect();
             eprintln!("[loader] embed after sqrt(H) scale: first4={:.4?}", first4);
         }
         let region = arena.region("embedding", buf.len(), 16)?;
@@ -150,7 +153,11 @@ pub fn load_gemma4_model(
         if e.dtype == DType::Fp8E4M3 {
             let scale_entry = get_tensor("lm_head.weight_scale");
             upload_fp8_direct_channelscale(
-                arena, "lm_head", &(si, e), scale_entry.as_ref(), &shards,
+                arena,
+                "lm_head",
+                &(si, e),
+                scale_entry.as_ref(),
+                &shards,
             )?
         } else {
             upload_fp8(
@@ -178,12 +185,23 @@ pub fn load_gemma4_model(
     };
 
     let lm_head_f16 = {
-        let (si, e) = if let Some(t) = get_tensor("lm_head.weight") { t } else { must_get(&embed_name)? };
+        let (si, e) = if let Some(t) = get_tensor("lm_head.weight") {
+            t
+        } else {
+            must_get(&embed_name)?
+        };
         let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
-        eprintln!("[loader] lm_head_f16: {} elements ({:.1} MB)", e.shape.iter().product::<usize>(), buf.len() as f64 / 1e6);
+        eprintln!(
+            "[loader] lm_head_f16: {} elements ({:.1} MB)",
+            e.shape.iter().product::<usize>(),
+            buf.len() as f64 / 1e6
+        );
         let region = arena.region("lm_head_f16", buf.len(), 16)?;
         unsafe { region.copy_from_host(&buf)? };
-        F16Weight { offset_bytes: region.device_ptr(), shape: e.shape.clone() }
+        F16Weight {
+            offset_bytes: region.device_ptr(),
+            shape: e.shape.clone(),
+        }
     };
 
     // Sliding RoPE: theta=10000, full rotation of head_dim_sliding (256)
@@ -196,7 +214,10 @@ pub fn load_gemma4_model(
     );
     // Global RoPE: theta=1M, partial rotation (0.25 * head_dim_global = 128 of 512)
     let global_rotary_dim = arch.rotary_dim_for_layer(
-        arch.layer_types.iter().position(|t| *t == crate::gemma4_arch::Gemma4LayerType::GlobalAttention).unwrap_or(0)
+        arch.layer_types
+            .iter()
+            .position(|t| *t == crate::gemma4_arch::Gemma4LayerType::GlobalAttention)
+            .unwrap_or(0),
     );
     let (cos_g, sin_g) = rope_cos_sin_bytes(
         arch.head_dim_global,
@@ -255,7 +276,8 @@ pub fn load_gemma4_model(
                 k_scale.clone()
             };
             let qkv = fuse_fp8_direct_channelscale(
-                arena, "qkv",
+                arena,
+                "qkv",
                 &[&q_tensor, &k_tensor, &v_tensor],
                 &[q_scale.as_ref(), k_scale.as_ref(), v_scale.as_ref()],
                 &shards,
@@ -265,7 +287,11 @@ pub fn load_gemma4_model(
             let o_entry = must_get(&ln("self_attn.o_proj.weight"))?;
             let o_scale = get_tensor(&ln("self_attn.o_proj.weight_scale"));
             let o_proj = upload_fp8_direct_channelscale(
-                arena, "o_proj", &o_entry, o_scale.as_ref(), &shards,
+                arena,
+                "o_proj",
+                &o_entry,
+                o_scale.as_ref(),
+                &shards,
             )?;
 
             let gate_entry = must_get(&ln("mlp.gate_proj.weight"))?;
@@ -273,7 +299,8 @@ pub fn load_gemma4_model(
             let gate_scale = get_tensor(&ln("mlp.gate_proj.weight_scale"));
             let up_scale = get_tensor(&ln("mlp.up_proj.weight_scale"));
             let gate_up = fuse_fp8_direct_channelscale(
-                arena, "gate_up",
+                arena,
+                "gate_up",
                 &[&gate_entry, &up_entry],
                 &[gate_scale.as_ref(), up_scale.as_ref()],
                 &shards,
@@ -283,7 +310,11 @@ pub fn load_gemma4_model(
             let down_entry = must_get(&ln("mlp.down_proj.weight"))?;
             let down_scale = get_tensor(&ln("mlp.down_proj.weight_scale"));
             let down_proj = upload_fp8_direct_channelscale(
-                arena, "down_proj", &down_entry, down_scale.as_ref(), &shards,
+                arena,
+                "down_proj",
+                &down_entry,
+                down_scale.as_ref(),
+                &shards,
             )?;
 
             (qkv, o_proj, gate_up, down_proj)
@@ -292,8 +323,12 @@ pub fn load_gemma4_model(
 
             if f16_only {
                 let dummy = Fp8Weight {
-                    offset_bytes: 0, scale_ptr: 0, shape: vec![],
-                    scale: 0.0, clamp_ppm: 0.0, dtype: DType::Fp8E4M3,
+                    offset_bytes: 0,
+                    scale_ptr: 0,
+                    shape: vec![],
+                    scale: 0.0,
+                    clamp_ppm: 0.0,
+                    dtype: DType::Fp8E4M3,
                     channelscale_ptr: None,
                     blockscale_ptr: None,
                     blockscale_n_blocks: 0,
@@ -306,9 +341,21 @@ pub fn load_gemma4_model(
                 if split_fp8 {
                     // Split quantization: Q, K, V get separate per-tensor FP8 scales,
                     // then concatenate bytes + build a per-row channelscale vector.
-                    let q_f16 = tensor_to_f16_bytes(&q_tensor.1, bytes_of(q_tensor.0, &q_tensor.1), model_dir)?;
-                    let k_f16 = tensor_to_f16_bytes(&k_tensor.1, bytes_of(k_tensor.0, &k_tensor.1), model_dir)?;
-                    let v_f16 = tensor_to_f16_bytes(&v_tensor.1, bytes_of(v_tensor.0, &v_tensor.1), model_dir)?;
+                    let q_f16 = tensor_to_f16_bytes(
+                        &q_tensor.1,
+                        bytes_of(q_tensor.0, &q_tensor.1),
+                        model_dir,
+                    )?;
+                    let k_f16 = tensor_to_f16_bytes(
+                        &k_tensor.1,
+                        bytes_of(k_tensor.0, &k_tensor.1),
+                        model_dir,
+                    )?;
+                    let v_f16 = tensor_to_f16_bytes(
+                        &v_tensor.1,
+                        bytes_of(v_tensor.0, &v_tensor.1),
+                        model_dir,
+                    )?;
 
                     let q_f32 = f16_bytes_to_f32(&q_f16);
                     let k_f32 = f16_bytes_to_f32(&k_f16);
@@ -319,8 +366,10 @@ pub fn load_gemma4_model(
                     let v_q = quantize_per_tensor_ref(&v_f32);
 
                     if l == 0 {
-                        eprintln!("[loader] split QKV scales: q={:.6e} k={:.6e} v={:.6e}",
-                            q_q.scale, k_q.scale, v_q.scale);
+                        eprintln!(
+                            "[loader] split QKV scales: q={:.6e} k={:.6e} v={:.6e}",
+                            q_q.scale, k_q.scale, v_q.scale
+                        );
                     }
 
                     let q_rows = q_tensor.1.shape[0];
@@ -331,7 +380,8 @@ pub fn load_gemma4_model(
                     let k_fp8 = quantize_to_fp8_bytes(&k_f32, k_q.scale);
                     let v_fp8 = quantize_to_fp8_bytes(&v_f32, v_q.scale);
 
-                    let mut fused_bytes = Vec::with_capacity(q_fp8.len() + k_fp8.len() + v_fp8.len());
+                    let mut fused_bytes =
+                        Vec::with_capacity(q_fp8.len() + k_fp8.len() + v_fp8.len());
                     fused_bytes.extend_from_slice(&q_fp8);
                     fused_bytes.extend_from_slice(&k_fp8);
                     fused_bytes.extend_from_slice(&v_fp8);
@@ -368,8 +418,16 @@ pub fn load_gemma4_model(
                     // gate_up: same split treatment
                     let gate_entry = must_get(&ln("mlp.gate_proj.weight"))?;
                     let up_entry = must_get(&ln("mlp.up_proj.weight"))?;
-                    let gate_f16 = tensor_to_f16_bytes(&gate_entry.1, bytes_of(gate_entry.0, &gate_entry.1), model_dir)?;
-                    let up_f16 = tensor_to_f16_bytes(&up_entry.1, bytes_of(up_entry.0, &up_entry.1), model_dir)?;
+                    let gate_f16 = tensor_to_f16_bytes(
+                        &gate_entry.1,
+                        bytes_of(gate_entry.0, &gate_entry.1),
+                        model_dir,
+                    )?;
+                    let up_f16 = tensor_to_f16_bytes(
+                        &up_entry.1,
+                        bytes_of(up_entry.0, &up_entry.1),
+                        model_dir,
+                    )?;
                     let gate_f32 = f16_bytes_to_f32(&gate_f16);
                     let up_f32 = f16_bytes_to_f32(&up_f16);
                     let gate_qq = quantize_per_tensor_ref(&gate_f32);
@@ -386,7 +444,8 @@ pub fn load_gemma4_model(
                     let mut gu_scales: Vec<f32> = Vec::with_capacity(gate_rows + up_rows);
                     gu_scales.extend(std::iter::repeat(gate_qq.scale).take(gate_rows));
                     gu_scales.extend(std::iter::repeat(up_qq.scale).take(up_rows));
-                    let gus_bytes: Vec<u8> = gu_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    let gus_bytes: Vec<u8> =
+                        gu_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
                     let gus_r = arena.region("gu_chscale", gus_bytes.len(), 16)?;
                     unsafe { gus_r.copy_from_host(&gus_bytes)? };
                     let gu_one_r = arena.region("gu_scale_one", 4, 4)?;
@@ -395,7 +454,9 @@ pub fn load_gemma4_model(
                         offset_bytes: gu_r.device_ptr(),
                         scale_ptr: gu_one_r.device_ptr(),
                         shape: vec![2 * arch.intermediate_size, arch.hidden_size],
-                        scale: 1.0, clamp_ppm: 0.0, dtype: DType::Fp8E4M3,
+                        scale: 1.0,
+                        clamp_ppm: 0.0,
+                        dtype: DType::Fp8E4M3,
                         channelscale_ptr: Some(gus_r.device_ptr()),
                         blockscale_ptr: None,
                         blockscale_n_blocks: 0,
@@ -403,18 +464,64 @@ pub fn load_gemma4_model(
                     };
 
                     // O-proj and down-proj: single matrix, per-tensor is fine
-                    let o_proj = upload_fp8_from(arena, "o_proj", &must_get(&ln("self_attn.o_proj.weight"))?, &shards, model_dir)?;
-                    let down_proj = upload_fp8_from(arena, "down_proj", &must_get(&ln("mlp.down_proj.weight"))?, &shards, model_dir)?;
+                    let o_proj = upload_fp8_from(
+                        arena,
+                        "o_proj",
+                        &must_get(&ln("self_attn.o_proj.weight"))?,
+                        &shards,
+                        model_dir,
+                    )?;
+                    let down_proj = upload_fp8_from(
+                        arena,
+                        "down_proj",
+                        &must_get(&ln("mlp.down_proj.weight"))?,
+                        &shards,
+                        model_dir,
+                    )?;
 
                     (qkv, o_proj, gate_up, down_proj)
                 } else {
                     // Original fused path
-                    let qkv_f16_bytes = concat_tensors(&[&q_tensor, &k_tensor, &v_tensor], &shards, model_dir)?;
-                    let qkv = upload_fp8(arena, "qkv", &qkv_f16_bytes, &[qkv_rows, arch.hidden_size], &ln("self_attn.qkv.weight"), model_dir)?;
-                    let o_proj = upload_fp8_from(arena, "o_proj", &must_get(&ln("self_attn.o_proj.weight"))?, &shards, model_dir)?;
-                    let gate_up_f16_bytes = concat_tensors(&[&must_get(&ln("mlp.gate_proj.weight"))?, &must_get(&ln("mlp.up_proj.weight"))?], &shards, model_dir)?;
-                    let gate_up = upload_fp8(arena, "gate_up", &gate_up_f16_bytes, &[2 * arch.intermediate_size, arch.hidden_size], &ln("mlp.gate_up.weight"), model_dir)?;
-                    let down_proj = upload_fp8_from(arena, "down_proj", &must_get(&ln("mlp.down_proj.weight"))?, &shards, model_dir)?;
+                    let qkv_f16_bytes =
+                        concat_tensors(&[&q_tensor, &k_tensor, &v_tensor], &shards, model_dir)?;
+                    let qkv = upload_fp8(
+                        arena,
+                        "qkv",
+                        &qkv_f16_bytes,
+                        &[qkv_rows, arch.hidden_size],
+                        &ln("self_attn.qkv.weight"),
+                        model_dir,
+                    )?;
+                    let o_proj = upload_fp8_from(
+                        arena,
+                        "o_proj",
+                        &must_get(&ln("self_attn.o_proj.weight"))?,
+                        &shards,
+                        model_dir,
+                    )?;
+                    let gate_up_f16_bytes = concat_tensors(
+                        &[
+                            &must_get(&ln("mlp.gate_proj.weight"))?,
+                            &must_get(&ln("mlp.up_proj.weight"))?,
+                        ],
+                        &shards,
+                        model_dir,
+                    )?;
+                    let gate_up = upload_fp8(
+                        arena,
+                        "gate_up",
+                        &gate_up_f16_bytes,
+                        &[2 * arch.intermediate_size, arch.hidden_size],
+                        &ln("mlp.gate_up.weight"),
+                        model_dir,
+                    )?;
+                    let down_proj = upload_fp8_from(
+                        arena,
+                        "down_proj",
+                        &must_get(&ln("mlp.down_proj.weight"))?,
+                        &shards,
+                        model_dir,
+                    )?;
                     (qkv, o_proj, gate_up, down_proj)
                 }
             }
@@ -424,22 +531,35 @@ pub fn load_gemma4_model(
             arch.num_hidden_layers
         } else {
             std::env::var("RVLLM_F16_LAYERS")
-                .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
         };
         let f16_only = std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1");
         let (qkv_f16_w, o_proj_f16_w, gate_up_f16_w, down_proj_f16_w) = if l < f16_max {
             // Upload F16 weights directly (BF16->F16 for BF16 checkpoints, FP8->dequant->F16 for FP8)
-            let upload_concat_f16 = |parts: &[&(usize, TensorEntry)], name: &str, shape: Vec<usize>| -> Result<F16Weight> {
+            let upload_concat_f16 = |parts: &[&(usize, TensorEntry)],
+                                     name: &str,
+                                     shape: Vec<usize>|
+             -> Result<F16Weight> {
                 if f16_only || !fp8_prequant {
                     let buf = concat_tensors(parts, &shards, model_dir)?;
-                    let r = arena.region(Box::leak(format!("{name}_L{l}").into_boxed_str()), buf.len(), 16)?;
+                    let r = arena.region(
+                        Box::leak(format!("{name}_L{l}").into_boxed_str()),
+                        buf.len(),
+                        16,
+                    )?;
                     unsafe { r.copy_from_host(&buf)? };
-                    Ok(F16Weight { offset_bytes: r.device_ptr(), shape })
+                    Ok(F16Weight {
+                        offset_bytes: r.device_ptr(),
+                        shape,
+                    })
                 } else {
                     // FP8 dequant with per-channel scales
                     let mut out = Vec::new();
                     for &(si, ref entry) in parts.iter() {
-                        let raw = &shards[*si].bytes()[entry.file_offset as usize..(entry.file_offset + entry.nbytes) as usize];
+                        let raw = &shards[*si].bytes()[entry.file_offset as usize
+                            ..(entry.file_offset + entry.nbytes) as usize];
                         let rows = entry.shape[0];
                         let cols = entry.nbytes as usize / rows;
                         let scale_name = format!("{}_scale", entry.name);
@@ -451,18 +571,29 @@ pub fn load_gemma4_model(
                         for r in 0..rows {
                             let rs = ch_scales[r];
                             for c in 0..cols {
-                                out.extend_from_slice(&f16::from_f32(fp8_e4m3_to_f32(raw[r * cols + c]) * rs).to_le_bytes());
+                                out.extend_from_slice(
+                                    &f16::from_f32(fp8_e4m3_to_f32(raw[r * cols + c]) * rs)
+                                        .to_le_bytes(),
+                                );
                             }
                         }
                     }
-                    let r = arena.region(Box::leak(format!("{name}_L{l}").into_boxed_str()), out.len(), 16)?;
+                    let r = arena.region(
+                        Box::leak(format!("{name}_L{l}").into_boxed_str()),
+                        out.len(),
+                        16,
+                    )?;
                     unsafe { r.copy_from_host(&out)? };
-                    Ok(F16Weight { offset_bytes: r.device_ptr(), shape })
+                    Ok(F16Weight {
+                        offset_bytes: r.device_ptr(),
+                        shape,
+                    })
                 }
             };
 
             let qkv_w = upload_concat_f16(
-                &[&q_tensor, &k_tensor, &v_tensor], "qkv_f16",
+                &[&q_tensor, &k_tensor, &v_tensor],
+                "qkv_f16",
                 vec![qkv_rows, arch.hidden_size],
             )?;
             let o_entry = must_get(&ln("self_attn.o_proj.weight"))?;
@@ -470,20 +601,22 @@ pub fn load_gemma4_model(
             let gate_e = must_get(&ln("mlp.gate_proj.weight"))?;
             let up_e = must_get(&ln("mlp.up_proj.weight"))?;
             let gu_w = upload_concat_f16(
-                &[&gate_e, &up_e], "gu_f16",
+                &[&gate_e, &up_e],
+                "gu_f16",
                 vec![2 * arch.intermediate_size, arch.hidden_size],
             )?;
             let d_entry = must_get(&ln("mlp.down_proj.weight"))?;
             let d_w = upload_concat_f16(&[&d_entry], "d_f16", d_entry.1.shape.clone())?;
 
-            if l == 0 { eprintln!("[loader] F16 weights for layers 0..{f16_max}"); }
+            if l == 0 {
+                eprintln!("[loader] F16 weights for layers 0..{f16_max}");
+            }
             (Some(qkv_w), Some(o_w), Some(gu_w), Some(d_w))
         } else {
             (None, None, None, None)
         };
 
-        let input_layernorm =
-            upload_f16("input_ln", &ln("input_layernorm.weight"))?;
+        let input_layernorm = upload_f16("input_ln", &ln("input_layernorm.weight"))?;
         let post_attention_layernorm =
             upload_f16("post_attn_ln", &ln("post_attention_layernorm.weight"))?;
         let pre_feedforward_layernorm =
@@ -825,7 +958,9 @@ mod blockscale_tests {
         // + simple fractions).
         let src = [0.25_f32, 0.5, 1.0, 2.0, 4.0, 0.125];
         let mut raw = Vec::with_capacity(src.len() * 2);
-        for v in &src { raw.extend_from_slice(&f32_to_bf16_le(*v)); }
+        for v in &src {
+            raw.extend_from_slice(&f32_to_bf16_le(*v));
+        }
 
         let out = decode_blockscale_bytes(&raw, 2, 3).expect("shape fits");
         assert_eq!(out, src);
@@ -948,7 +1083,8 @@ fn fuse_fp8_direct_channelscale(
     let mut has_scales = false;
 
     for (i, &(si, ref entry)) in parts.iter().enumerate() {
-        let raw = &shards[*si].bytes()[entry.file_offset as usize..(entry.file_offset + entry.nbytes) as usize];
+        let raw = &shards[*si].bytes()
+            [entry.file_offset as usize..(entry.file_offset + entry.nbytes) as usize];
         fused_bytes.extend_from_slice(raw);
         let rows = entry.shape[0];
         if let Some(se) = scale_entries.get(i).and_then(|x| x.as_ref()) {
@@ -1034,8 +1170,16 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
         let full = (mant32 | (1 << 23)) as u32;
         let rshift = (20 + shift) as u32;
         let mut m = full >> rshift;
-        let round_bit = if rshift > 0 { (full >> (rshift - 1)) & 1 } else { 0 };
-        let sticky = if rshift > 1 { (full & ((1 << (rshift - 1)) - 1) != 0) as u32 } else { 0 };
+        let round_bit = if rshift > 0 {
+            (full >> (rshift - 1)) & 1
+        } else {
+            0
+        };
+        let sticky = if rshift > 1 {
+            (full & ((1 << (rshift - 1)) - 1) != 0) as u32
+        } else {
+            0
+        };
         m += round_bit & (sticky | (m & 1));
         if m >= 8 {
             return s | 0x08; // overflow to smallest normal: exp=1, m=0
@@ -1066,13 +1210,21 @@ fn fp8_e4m3_to_f32(b: u8) -> f32 {
     let e = (b >> 3) & 0xF;
     let m = b & 0x7;
     let val = if e == 0 {
-        if m == 0 { 0.0f32 } else { (m as f32) * (1.0 / 512.0) }
+        if m == 0 {
+            0.0f32
+        } else {
+            (m as f32) * (1.0 / 512.0)
+        }
     } else if e == 15 && m == 7 {
         return f32::NAN;
     } else {
         f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
     };
-    if s != 0 { -val } else { val }
+    if s != 0 {
+        -val
+    } else {
+        val
+    }
 }
 
 #[cfg(test)]
@@ -1083,24 +1235,32 @@ mod fp8_tests {
         (0..=255u8)
             .filter_map(|b| {
                 let v = fp8_e4m3_to_f32(b);
-                if v.is_nan() { None } else { Some((b, v)) }
+                if v.is_nan() {
+                    None
+                } else {
+                    Some((b, v))
+                }
             })
             .collect()
     }
 
     fn brute_nearest_fp8(x: f32) -> u8 {
-        if x.is_nan() { return 0x7f; }
+        if x.is_nan() {
+            return 0x7f;
+        }
         let vals = all_fp8_values();
         let mut best_byte = 0u8;
         let mut best_dist = f64::MAX;
         let mut best_val = 0.0f64;
         for &(b, fv) in &vals {
             let d = (x as f64 - fv as f64).abs();
-            if d < best_dist || (d == best_dist && {
-                let bm = b & 0x07;
-                let prev_m = best_byte & 0x07;
-                (bm % 2 == 0) && (prev_m % 2 != 0)
-            }) {
+            if d < best_dist
+                || (d == best_dist && {
+                    let bm = b & 0x07;
+                    let prev_m = best_byte & 0x07;
+                    (bm % 2 == 0) && (prev_m % 2 != 0)
+                })
+            {
                 best_dist = d;
                 best_byte = b;
                 best_val = fv as f64;
@@ -1115,7 +1275,9 @@ mod fp8_tests {
         let mut fails = Vec::new();
         for b in 0..=255u8 {
             let v = fp8_e4m3_to_f32(b);
-            if v.is_nan() { continue; }
+            if v.is_nan() {
+                continue;
+            }
             let re = fp8_e4m3_encode(v);
             if re != b {
                 fails.push((b, v, re));
@@ -1123,7 +1285,9 @@ mod fp8_tests {
         }
         if !fails.is_empty() {
             for (b, v, re) in &fails {
-                eprintln!("ROUNDTRIP FAIL: byte 0x{b:02x}({b}) -> f32={v} -> encode=0x{re:02x}({re})");
+                eprintln!(
+                    "ROUNDTRIP FAIL: byte 0x{b:02x}({b}) -> f32={v} -> encode=0x{re:02x}({re})"
+                );
             }
             panic!("{} of 255 roundtrips failed", fails.len());
         }
@@ -1132,17 +1296,16 @@ mod fp8_tests {
     #[test]
     fn midpoints_bankers_rounding() {
         let vals = all_fp8_values();
-        let positives: Vec<(u8, f32)> = vals.iter()
-            .filter(|(_, v)| *v > 0.0)
-            .copied()
-            .collect();
+        let positives: Vec<(u8, f32)> = vals.iter().filter(|(_, v)| *v > 0.0).copied().collect();
         let mut fails = Vec::new();
         for w in positives.windows(2) {
             let (b_lo, v_lo) = w[0];
             let (b_hi, v_hi) = w[1];
             let mid = (v_lo as f64 + v_hi as f64) / 2.0;
             let mid_f32 = mid as f32;
-            if mid_f32 as f64 != mid { continue; }
+            if mid_f32 as f64 != mid {
+                continue;
+            }
             let m_lo = b_lo & 0x07;
             let m_hi = b_hi & 0x07;
             let expected = if m_lo % 2 == 0 { b_lo } else { b_hi };
@@ -1161,7 +1324,8 @@ mod fp8_tests {
 
     #[test]
     fn sweep_all_f32_in_fp8_range() {
-        let pos_vals: Vec<(u8, f32)> = all_fp8_values().into_iter()
+        let pos_vals: Vec<(u8, f32)> = all_fp8_values()
+            .into_iter()
             .filter(|(_, v)| *v >= 0.0)
             .collect();
         let mut boundaries: Vec<(f32, u8)> = Vec::new();
@@ -1175,25 +1339,39 @@ mod fp8_tests {
         }
 
         let expected_for = |v: f32| -> u8 {
-            if v == 0.0 { return 0; }
-            if v > 448.0 { return 0x7e; }
+            if v == 0.0 {
+                return 0;
+            }
+            if v > 448.0 {
+                return 0x7e;
+            }
             for w in pos_vals.windows(2) {
                 let (b_lo, v_lo) = w[0];
                 let (b_hi, v_hi) = w[1];
                 if v >= v_lo && v <= v_hi {
-                    if v == v_lo { return b_lo; }
-                    if v == v_hi { return b_hi; }
+                    if v == v_lo {
+                        return b_lo;
+                    }
+                    if v == v_hi {
+                        return b_hi;
+                    }
                     let d_lo = (v as f64 - v_lo as f64).abs();
                     let d_hi = (v as f64 - v_hi as f64).abs();
-                    if d_lo < d_hi { return b_lo; }
-                    if d_hi < d_lo { return b_hi; }
+                    if d_lo < d_hi {
+                        return b_lo;
+                    }
+                    if d_hi < d_lo {
+                        return b_hi;
+                    }
                     let m_lo = b_lo & 0x07;
                     return if m_lo % 2 == 0 { b_lo } else { b_hi };
                 }
             }
             if v <= pos_vals[0].1 {
                 let d = (v as f64 - pos_vals[0].1 as f64).abs();
-                if d < pos_vals[0].1 as f64 / 2.0 { return pos_vals[0].0; }
+                if d < pos_vals[0].1 as f64 / 2.0 {
+                    return pos_vals[0].0;
+                }
                 return 0;
             }
             0x7e
@@ -1205,7 +1383,9 @@ mod fp8_tests {
         let max_bits = 448.0f32.to_bits();
         for bits in 0..=max_bits {
             let v = f32::from_bits(bits);
-            if v.is_nan() || v.is_infinite() || v < 0.0 { continue; }
+            if v.is_nan() || v.is_infinite() || v < 0.0 {
+                continue;
+            }
             total += 1;
             let got = fp8_e4m3_encode(v);
             let exp = expected_for(v);
@@ -1221,8 +1401,10 @@ mod fp8_tests {
             for (v, exp, got) in &first_fails {
                 let exp_v = fp8_e4m3_to_f32(*exp);
                 let got_v = fp8_e4m3_to_f32(*got);
-                eprintln!("  {v:.10} (0x{:08x}): expected 0x{exp:02x}={exp_v} got 0x{got:02x}={got_v}",
-                    v.to_bits());
+                eprintln!(
+                    "  {v:.10} (0x{:08x}): expected 0x{exp:02x}={exp_v} got 0x{got:02x}={got_v}",
+                    v.to_bits()
+                );
             }
             panic!("{fails} of {total} positive f32 values encoded wrong");
         }
@@ -1231,7 +1413,9 @@ mod fp8_tests {
 
     #[test]
     fn test_specific_mismatch_values() {
-        let vals: &[f32] = &[-10.071, -80.569, 9.352, -74.814, -63.304, -25.897, -4.316, -20.142];
+        let vals: &[f32] = &[
+            -10.071, -80.569, 9.352, -74.814, -63.304, -25.897, -4.316, -20.142,
+        ];
         let nvidia: &[u8] = &[210, 234, 81, 233, 232, 221, 201, 218];
         let mut fails = Vec::new();
         for (i, &v) in vals.iter().enumerate() {
@@ -1246,7 +1430,10 @@ mod fp8_tests {
             }
         }
         if !fails.is_empty() {
-            panic!("{} values: Rust encoder disagrees with brute-force nearest", fails.len());
+            panic!(
+                "{} values: Rust encoder disagrees with brute-force nearest",
+                fails.len()
+            );
         }
     }
 }

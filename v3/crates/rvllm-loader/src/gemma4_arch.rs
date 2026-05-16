@@ -88,9 +88,8 @@ impl Gemma4Arch {
             .or_else(|| v["vocab_size"].as_u64())
             .unwrap_or(0) as usize;
         let rms_norm_eps = tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
-        let max_position_embeddings = tc["max_position_embeddings"]
-            .as_u64()
-            .unwrap_or(262144) as usize;
+        let max_position_embeddings =
+            tc["max_position_embeddings"].as_u64().unwrap_or(262144) as usize;
         let sliding_window_size = tc["sliding_window"]
             .as_u64()
             .or_else(|| tc["sliding_window_size"].as_u64())
@@ -269,10 +268,7 @@ mod tests {
 
     #[test]
     fn default_layer_pattern_every_6th_global() {
-        let types = Gemma4Arch::parse_layer_types(
-            &serde_json::Value::Null,
-            12,
-        );
+        let types = Gemma4Arch::parse_layer_types(&serde_json::Value::Null, 12);
         // 0:s 1:s 2:s 3:s 4:s 5:g 6:s 7:s 8:s 9:s 10:s 11:g
         assert_eq!(types[0], Gemma4LayerType::SlidingAttention);
         assert_eq!(types[4], Gemma4LayerType::SlidingAttention);

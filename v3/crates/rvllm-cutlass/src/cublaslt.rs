@@ -88,7 +88,9 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0, None)
+        self.fp8_gemm_inner(
+            a_fp8, b_fp8, 0, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0, None,
+        )
     }
 
     /// Plain FP8 E4M3 matmul with bf16 output: D_bf16 = A * B^T.
@@ -106,7 +108,9 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_bf16, m, n, k, a_scale, b_scale, stream, false, 1, None)
+        self.fp8_gemm_inner(
+            a_fp8, b_fp8, 0, 0, d_bf16, m, n, k, a_scale, b_scale, stream, false, 1, None,
+        )
     }
 
     /// Plain FP8 E4M3 matmul with f32 output: D_f32 = A * B^T.
@@ -125,7 +129,9 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, b_scale, stream, false, 2, None)
+        self.fp8_gemm_inner(
+            a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, b_scale, stream, false, 2, None,
+        )
     }
 
     /// FP8 matmul with f32 output and per-channel weight scales (OUTER_VEC_32F).
@@ -143,7 +149,22 @@ impl CublasLt {
         b_channelscale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, 0, stream, false, 2, Some(b_channelscale))
+        self.fp8_gemm_inner(
+            a_fp8,
+            b_fp8,
+            0,
+            0,
+            d_f32,
+            m,
+            n,
+            k,
+            a_scale,
+            0,
+            stream,
+            false,
+            2,
+            Some(b_channelscale),
+        )
     }
 
     /// F16 x F16 matmul with F32 output: D_f32 = A_f16 * B_f16^T.
@@ -172,58 +193,113 @@ impl CublasLt {
         }
         let transa: i32 = 1;
         let transb: i32 = 0;
-        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-            &transa as *const _ as *const _, std::mem::size_of_val(&transa))?;
-        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-            &transb as *const _ as *const _, std::mem::size_of_val(&transb))?;
+        set_attr(
+            desc,
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+            &transa as *const _ as *const _,
+            std::mem::size_of_val(&transa),
+        )?;
+        set_attr(
+            desc,
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+            &transb as *const _ as *const _,
+            std::mem::size_of_val(&transb),
+        )?;
 
         let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut layout_d: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_a,
-            lt::cudaDataType_t::CUDA_R_16F, k as u64, n as u64, k as i64);
-        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout A(f16)")); }
-        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_b,
-            lt::cudaDataType_t::CUDA_R_16F, k as u64, m as u64, k as i64);
-        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout B(f16)")); }
-        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_d,
-            lt::cudaDataType_t::CUDA_R_32F, n as u64, m as u64, n as i64);
-        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout D(f16)")); }
+        let r = lt::cublasLtMatrixLayoutCreate(
+            &mut layout_a,
+            lt::cudaDataType_t::CUDA_R_16F,
+            k as u64,
+            n as u64,
+            k as i64,
+        );
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("layout A(f16)"));
+        }
+        let r = lt::cublasLtMatrixLayoutCreate(
+            &mut layout_b,
+            lt::cudaDataType_t::CUDA_R_16F,
+            k as u64,
+            m as u64,
+            k as i64,
+        );
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("layout B(f16)"));
+        }
+        let r = lt::cublasLtMatrixLayoutCreate(
+            &mut layout_d,
+            lt::cudaDataType_t::CUDA_R_32F,
+            n as u64,
+            m as u64,
+            n as i64,
+        );
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("layout D(f16)"));
+        }
 
         let key = AlgoKey { m, n, k, kind: 20 };
-        let cached_algo = self.algo_cache.lock().ok().and_then(|c| c.get(&key).copied());
-        let algo = if let Some(a) = cached_algo { a } else {
-            let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
-            lt::cublasLtMatmulPreferenceCreate(&mut pref);
-            let ws = self.workspace_bytes;
-            lt::cublasLtMatmulPreferenceSetAttribute(pref,
+        let cached_algo = self
+            .algo_cache
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&key).copied());
+        let algo =
+            if let Some(a) = cached_algo {
+                a
+            } else {
+                let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+                lt::cublasLtMatmulPreferenceCreate(&mut pref);
+                let ws = self.workspace_bytes;
+                lt::cublasLtMatmulPreferenceSetAttribute(pref,
                 lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                 &ws as *const _ as *const _, std::mem::size_of::<usize>());
-            let mut heur: [lt::cublasLtMatmulHeuristicResult_t; 1] = std::mem::zeroed();
-            let mut ret: i32 = 0;
-            let r = lt::cublasLtMatmulAlgoGetHeuristic(
-                self.handle, desc, layout_a, layout_b, layout_d, layout_d,
-                pref, 1, heur.as_mut_ptr(), &mut ret);
-            lt::cublasLtMatmulPreferenceDestroy(pref);
-            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
-                return Err(cublaslt_err("heuristic(f16)"));
-            }
-            let best = heur[0].algo;
-            if let Ok(mut c) = self.algo_cache.lock() { c.insert(key, best); }
-            best
-        };
+                let mut heur: [lt::cublasLtMatmulHeuristicResult_t; 1] = std::mem::zeroed();
+                let mut ret: i32 = 0;
+                let r = lt::cublasLtMatmulAlgoGetHeuristic(
+                    self.handle,
+                    desc,
+                    layout_a,
+                    layout_b,
+                    layout_d,
+                    layout_d,
+                    pref,
+                    1,
+                    heur.as_mut_ptr(),
+                    &mut ret,
+                );
+                lt::cublasLtMatmulPreferenceDestroy(pref);
+                if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
+                    return Err(cublaslt_err("heuristic(f16)"));
+                }
+                let best = heur[0].algo;
+                if let Ok(mut c) = self.algo_cache.lock() {
+                    c.insert(key, best);
+                }
+                best
+            };
 
         let one: f32 = 1.0;
         let zero: f32 = 0.0;
         let r = lt::cublasLtMatmul(
-            self.handle, desc,
+            self.handle,
+            desc,
             &one as *const _ as *const _,
-            b_f16 as *const _, layout_a,
-            a_f16 as *const _, layout_b,
+            b_f16 as *const _,
+            layout_a,
+            a_f16 as *const _,
+            layout_b,
             &zero as *const _ as *const _,
-            d_f32 as *const _, layout_d,
-            d_f32 as *mut _, layout_d,
-            &algo, self.workspace as *mut _, self.workspace_bytes, stream as _,
+            d_f32 as *const _,
+            layout_d,
+            d_f32 as *mut _,
+            layout_d,
+            &algo,
+            self.workspace as *mut _,
+            self.workspace_bytes,
+            stream as _,
         );
         lt::cublasLtMatrixLayoutDestroy(layout_d);
         lt::cublasLtMatrixLayoutDestroy(layout_b);
@@ -274,7 +350,20 @@ impl CublasLt {
         stream: u64,
     ) -> Result<()> {
         self.fp8_gemm_inner(
-            a_fp8, b_fp8, 0, residual_f16, d_f16, m, n, k, a_scale, b_scale, stream, true, 0, None,
+            a_fp8,
+            b_fp8,
+            0,
+            residual_f16,
+            d_f16,
+            m,
+            n,
+            k,
+            a_scale,
+            b_scale,
+            stream,
+            true,
+            0,
+            None,
         )
     }
 
@@ -297,7 +386,7 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
         beta_one: bool,
-        d_out_type: u8, // 0=f16, 1=bf16, 2=f32
+        d_out_type: u8,              // 0=f16, 1=bf16, 2=f32
         b_channelscale: Option<u64>, // per-channel weight scale (OUTER_VEC_32F)
     ) -> Result<()> {
         let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
@@ -343,7 +432,11 @@ impl CublasLt {
 
         // TN swap: cuBLAS A = our weight (b_fp8), cuBLAS B = our activation (a_fp8).
         // Scale pointers must match: A_SCALE = weight scale, B_SCALE = activation scale.
-        let cublas_a_scale = if let Some(cs) = b_channelscale { cs } else { b_scale };
+        let cublas_a_scale = if let Some(cs) = b_channelscale {
+            cs
+        } else {
+            b_scale
+        };
         let cublas_b_scale = a_scale;
         set_attr(
             desc,
@@ -363,12 +456,15 @@ impl CublasLt {
             let attr_a_scale_mode: u32 = 31; // CUBLASLT_MATMUL_DESC_A_SCALE_MODE
             set_attr(
                 desc,
-                unsafe { std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(attr_a_scale_mode) },
+                unsafe {
+                    std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(
+                        attr_a_scale_mode,
+                    )
+                },
                 &scale_mode as *const _ as *const _,
                 std::mem::size_of_val(&scale_mode),
             )?;
         }
-
 
         // Layouts: col-major view of our row-major buffers, TN.
         let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
@@ -399,13 +495,7 @@ impl CublasLt {
             2 => lt::cudaDataType_t::CUDA_R_32F,
             _ => lt::cudaDataType_t::CUDA_R_16F,
         };
-        let r = lt::cublasLtMatrixLayoutCreate(
-            &mut layout_d,
-            d_type,
-            n as u64,
-            m as u64,
-            n as i64,
-        );
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_d, d_type, n as u64, m as u64, n as i64);
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("layout D"));
         }
@@ -419,7 +509,12 @@ impl CublasLt {
             m,
             n,
             k,
-            kind: match (bias_f16 != 0, beta_one, d_out_type, b_channelscale.is_some()) {
+            kind: match (
+                bias_f16 != 0,
+                beta_one,
+                d_out_type,
+                b_channelscale.is_some(),
+            ) {
                 (true, _, _, true) => 31u8,
                 (true, _, _, false) => 1u8,
                 (_, true, _, true) => 32 + d_out_type,
@@ -451,12 +546,19 @@ impl CublasLt {
             if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                 return Err(cublaslt_err("pref set workspace"));
             }
-            let mut heur: [lt::cublasLtMatmulHeuristicResult_t; 1] =
-                std::mem::zeroed();
+            let mut heur: [lt::cublasLtMatmulHeuristicResult_t; 1] = std::mem::zeroed();
             let mut ret: i32 = 0;
             let r = lt::cublasLtMatmulAlgoGetHeuristic(
-                self.handle, desc, layout_a, layout_b, layout_d, layout_d,
-                pref, 1, heur.as_mut_ptr(), &mut ret,
+                self.handle,
+                desc,
+                layout_a,
+                layout_b,
+                layout_d,
+                layout_d,
+                pref,
+                1,
+                heur.as_mut_ptr(),
+                &mut ret,
             );
             lt::cublasLtMatmulPreferenceDestroy(pref);
             if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
@@ -516,18 +618,14 @@ impl CublasLt {
                 // Read scales
                 let mut sa = [0.0f32; 1];
                 let mut sb = [0.0f32; 1];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    sa.as_mut_ptr() as *mut _, a_scale, 4);
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    sb.as_mut_ptr() as *mut _, b_scale, 4);
+                cudarc::driver::sys::cuMemcpyDtoH_v2(sa.as_mut_ptr() as *mut _, a_scale, 4);
+                cudarc::driver::sys::cuMemcpyDtoH_v2(sb.as_mut_ptr() as *mut _, b_scale, 4);
                 // Read first K bytes of cuBLAS-A (our weight row 0) and cuBLAS-B (our act row 0)
                 let kk = k as usize;
                 let mut wa = vec![0u8; kk];
                 let mut ab = vec![0u8; kk];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    wa.as_mut_ptr() as *mut _, b_fp8, kk);
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    ab.as_mut_ptr() as *mut _, a_fp8, kk);
+                cudarc::driver::sys::cuMemcpyDtoH_v2(wa.as_mut_ptr() as *mut _, b_fp8, kk);
+                cudarc::driver::sys::cuMemcpyDtoH_v2(ab.as_mut_ptr() as *mut _, a_fp8, kk);
                 // Manual FP8 dot product for D[0][0]:
                 // cuBLAS computes D = A_SCALE * B_SCALE * op(A)^T * op(B)
                 // D[0][0] = sa * sb * sum_c( fp8(weight[0][c]) * fp8(act[0][c]) )
@@ -542,47 +640,82 @@ impl CublasLt {
                 let cublas_val: f64 = match d_out_type {
                     2 => {
                         let mut v = [0.0f32; 1];
-                        cudarc::driver::sys::cuMemcpyDtoH_v2(
-                            v.as_mut_ptr() as *mut _, d_f16, 4);
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut _, d_f16, 4);
                         v[0] as f64
                     }
                     1 => {
                         let mut v = [0u16; 1];
-                        cudarc::driver::sys::cuMemcpyDtoH_v2(
-                            v.as_mut_ptr() as *mut _, d_f16, 2);
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut _, d_f16, 2);
                         let bits = v[0] as u32;
                         let sign = (bits >> 15) & 1;
                         let exp = (bits >> 7) & 0xff;
                         let mant = bits & 0x7f;
-                        let f = if exp == 0 { (mant as f32) * (1.0 / 16384.0 / 128.0) }
-                                else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 16)) };
-                        if sign == 1 { -f.abs() as f64 } else { f as f64 }
+                        let f = if exp == 0 {
+                            (mant as f32) * (1.0 / 16384.0 / 128.0)
+                        } else {
+                            f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 16))
+                        };
+                        if sign == 1 {
+                            -f.abs() as f64
+                        } else {
+                            f as f64
+                        }
                     }
                     _ => {
                         let mut v = [0u16; 1];
-                        cudarc::driver::sys::cuMemcpyDtoH_v2(
-                            v.as_mut_ptr() as *mut _, d_f16, 2);
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut _, d_f16, 2);
                         let bits = v[0] as u32;
                         let sign = (bits >> 15) & 1;
                         let exp = (bits >> 10) & 0x1f;
                         let mant = bits & 0x3ff;
-                        let f = if exp == 0 { (mant as f32) * (1.0 / 16384.0 / 1024.0) }
-                                else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13)) };
-                        if sign == 1 { -f.abs() as f64 } else { f as f64 }
+                        let f = if exp == 0 {
+                            (mant as f32) * (1.0 / 16384.0 / 1024.0)
+                        } else {
+                            f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13))
+                        };
+                        if sign == 1 {
+                            -f.abs() as f64
+                        } else {
+                            f as f64
+                        }
                     }
                 };
-                let ratio = if expected.abs() > 1e-20 { cublas_val / expected } else { f64::NAN };
-                eprintln!("[GEMM_DIAG] M={} N={} K={} d_out_type={}", m, n, k, d_out_type);
-                eprintln!("[GEMM_DIAG] a_scale(act)={:.6e} b_scale(wt)={:.6e}", sa[0], sb[0]);
-                eprintln!("[GEMM_DIAG] weight_fp8[0..8]={:?} act_fp8[0..8]={:?}",
-                    &wa[..8.min(kk)], &ab[..8.min(kk)]);
-                eprintln!("[GEMM_DIAG] raw_dot(f64)={:.6e} expected(sa*sb*dot)={:.6e}", raw_dot, expected);
-                eprintln!("[GEMM_DIAG] cuBLASLt_D[0][0]={:.6e} ratio(cublas/expected)={:.6}", cublas_val, ratio);
+                let ratio = if expected.abs() > 1e-20 {
+                    cublas_val / expected
+                } else {
+                    f64::NAN
+                };
+                eprintln!(
+                    "[GEMM_DIAG] M={} N={} K={} d_out_type={}",
+                    m, n, k, d_out_type
+                );
+                eprintln!(
+                    "[GEMM_DIAG] a_scale(act)={:.6e} b_scale(wt)={:.6e}",
+                    sa[0], sb[0]
+                );
+                eprintln!(
+                    "[GEMM_DIAG] weight_fp8[0..8]={:?} act_fp8[0..8]={:?}",
+                    &wa[..8.min(kk)],
+                    &ab[..8.min(kk)]
+                );
+                eprintln!(
+                    "[GEMM_DIAG] raw_dot(f64)={:.6e} expected(sa*sb*dot)={:.6e}",
+                    raw_dot, expected
+                );
+                eprintln!(
+                    "[GEMM_DIAG] cuBLASLt_D[0][0]={:.6e} ratio(cublas/expected)={:.6}",
+                    cublas_val, ratio
+                );
                 if (ratio - 1.0).abs() > 0.05 {
-                    eprintln!("[GEMM_DIAG] *** MISMATCH *** ratio={:.6} -- cuBLASLt config is wrong!", ratio);
+                    eprintln!(
+                        "[GEMM_DIAG] *** MISMATCH *** ratio={:.6} -- cuBLASLt config is wrong!",
+                        ratio
+                    );
                 } else {
                     eprintln!("[GEMM_DIAG] PASS -- cuBLASLt matches manual computation");
-                    eprintln!("[GEMM_DIAG] Bug is upstream of fp8_gemm (wrong bytes or wrong scales)");
+                    eprintln!(
+                        "[GEMM_DIAG] Bug is upstream of fp8_gemm (wrong bytes or wrong scales)"
+                    );
                 }
             }
         }
@@ -597,13 +730,21 @@ fn fp8_e4m3_to_f32_inline(b: u8) -> f32 {
     let e = (b >> 3) & 0xF;
     let m = b & 0x7;
     let val = if e == 0 {
-        if m == 0 { 0.0f32 } else { (m as f32) * (1.0 / 512.0) }
+        if m == 0 {
+            0.0f32
+        } else {
+            (m as f32) * (1.0 / 512.0)
+        }
     } else if e == 15 && m == 7 {
         return f32::NAN;
     } else {
         f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
     };
-    if s != 0 { -val } else { val }
+    if s != 0 {
+        -val
+    } else {
+        val
+    }
 }
 
 #[cfg(feature = "cuda")]

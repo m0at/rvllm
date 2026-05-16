@@ -325,8 +325,7 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     const FA2_BC: i32 = 16;
                     let hd = params.head_dim as i32;
                     let kernel_fn = fa2.fn_decode_fp8kv;
-                    let smem_bytes =
-                        2 * FA2_BC * hd * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
+                    let smem_bytes = 2 * FA2_BC * hd * 4 + FA2_BC * 4 + (FA2_THREADS / 32) * 4;
                     if smem_bytes as u32 >= 48 * 1024 {
                         let _ = cuFuncSetAttribute(
                             kernel_fn.raw() as CUfunction,
@@ -410,17 +409,6 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                     return Ok(());
                 }
             };
-            // Fa3 SM90 path: takes scalar K/V descales (its ABI
-            // predates per-slot scales). Llama/Qwen callers pass
-            // their per-tensor scale via `k_descale_fallback_ptr` /
-            // `v_descale_fallback_ptr`; Gemma 4 sm_121 never reaches
-            // this arm (it goes through the Fa2Ptx branch above).
-            // If per-slot scales are populated AND an Fa3 caller
-            // somehow routes through here, that caller needs to
-            // materialize a representative scalar into the fallback
-            // pointer — the SM90 kernel can't consume per-slot.
-            let _ = k_scale_cache;
-            let _ = v_scale_cache;
             let rc = (fa3.fn_paged_decode_fp8)(
                 q_fp8 as *mut std::ffi::c_void,
                 k_cache_fp8 as *mut std::ffi::c_void,
@@ -429,6 +417,9 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                 block_tables as *mut std::ffi::c_void,
                 context_lens as *mut std::ffi::c_void,
                 workspace as *mut std::ffi::c_void,
+                k_scale_cache as *mut std::ffi::c_void,
+                v_scale_cache as *mut std::ffi::c_void,
+                q_scale_cache as *mut std::ffi::c_void,
                 q_descale_ptr as *mut f32,
                 k_descale_fallback_ptr as *mut f32,
                 v_descale_fallback_ptr as *mut f32,
@@ -461,9 +452,20 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
         #[cfg(not(feature = "cuda"))]
         {
             let _ = (
-                o_f16, q_fp8, k_cache_fp8, v_cache_fp8, block_tables, context_lens,
-                workspace, q_descale_ptr, k_descale_fallback_ptr, v_descale_fallback_ptr,
-                k_scale_cache, v_scale_cache, q_scale_cache, stream,
+                o_f16,
+                q_fp8,
+                k_cache_fp8,
+                v_cache_fp8,
+                block_tables,
+                context_lens,
+                workspace,
+                q_descale_ptr,
+                k_descale_fallback_ptr,
+                v_descale_fallback_ptr,
+                k_scale_cache,
+                v_scale_cache,
+                q_scale_cache,
+                stream,
             );
         }
         Ok(())

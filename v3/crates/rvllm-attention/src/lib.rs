@@ -15,8 +15,8 @@ pub mod prefill;
 
 pub use decode::{PagedDecodeFp8Launcher, PagedDecodeLauncher, PagedDecodeParams};
 pub use prefill::{
-    PagedPrefillFp8Launcher, PagedPrefillLauncher, PagedPrefillParams,
-    UnifiedPrefillParams, UNIFIED_PREFILL_BLOCK_M,
+    PagedPrefillFp8Launcher, PagedPrefillLauncher, PagedPrefillParams, UnifiedPrefillParams,
+    UNIFIED_PREFILL_BLOCK_M,
 };
 
 use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
@@ -29,11 +29,8 @@ const SUPPORTED_HEAD_DIMS: &[u32] = &[128, 256, 512];
 /// from the wrapper.
 /// Function pointer types for FA3 .so exports.
 #[cfg(feature = "cuda")]
-pub(crate) type WorkspaceSizeFn = unsafe extern "C" fn(
-    batch_size: i32,
-    num_heads: i32,
-    max_num_splits: i32,
-) -> i32;
+pub(crate) type WorkspaceSizeFn =
+    unsafe extern "C" fn(batch_size: i32, num_heads: i32, max_num_splits: i32) -> i32;
 
 #[cfg(feature = "cuda")]
 #[allow(clippy::type_complexity)]
@@ -70,6 +67,9 @@ pub(crate) type PagedDecodeFp8Fn = unsafe extern "C" fn(
     block_tables_ptr: *mut std::ffi::c_void,
     context_lens_ptr: *mut std::ffi::c_void,
     workspace_ptr: *mut std::ffi::c_void,
+    k_scale_cache_ptr: *mut std::ffi::c_void,
+    v_scale_cache_ptr: *mut std::ffi::c_void,
+    q_scale_cache_ptr: *mut std::ffi::c_void,
     q_descale_ptr: *mut f32,
     k_descale_ptr: *mut f32,
     v_descale_ptr: *mut f32,
@@ -99,6 +99,9 @@ pub(crate) type PagedPrefillFp8Fn = unsafe extern "C" fn(
     context_lens_ptr: *mut std::ffi::c_void,
     cu_seqlens_q_ptr: *mut std::ffi::c_void,
     workspace_ptr: *mut std::ffi::c_void,
+    k_scale_cache_ptr: *mut std::ffi::c_void,
+    v_scale_cache_ptr: *mut std::ffi::c_void,
+    q_scale_cache_ptr: *mut std::ffi::c_void,
     q_descale_ptr: *mut f32,
     k_descale_ptr: *mut f32,
     v_descale_ptr: *mut f32,
@@ -181,33 +184,52 @@ impl Fa3Kernels {
                     bt: std::backtrace::Backtrace::capture(),
                 })?;
                 // Try SM90 (FA3 Hopper) symbols first, then SM89 (Ada).
-                let is_sm89 = _lib.get::<WorkspaceSizeFn>(b"fa3_sm90_workspace_size\0").is_err()
-                    && _lib.get::<WorkspaceSizeFn>(b"fa_sm89_workspace_size\0").is_ok();
+                let is_sm89 = _lib
+                    .get::<WorkspaceSizeFn>(b"fa3_sm90_workspace_size\0")
+                    .is_err()
+                    && _lib
+                        .get::<WorkspaceSizeFn>(b"fa_sm89_workspace_size\0")
+                        .is_ok();
                 if is_sm89 {
                     eprintln!("[rvllm-attention] using SM89 (Ada) attention backend");
                 }
-                let (ws_name, dec_name, fp8_name, prefill_name): (&[u8], &[u8], &[u8], &[u8]) = if is_sm89 {
-                    (b"fa_sm89_workspace_size\0", b"fa_sm89_paged_decode\0",
-                     b"fa_sm89_paged_decode_fp8\0", b"fa_sm89_paged_prefill_fp8\0")
-                } else {
-                    (b"fa3_sm90_workspace_size\0", b"fa3_sm90_paged_decode\0",
-                     b"fa3_sm90_paged_decode_fp8\0", b"fa3_sm90_paged_prefill_fp8\0")
-                };
+                let (ws_name, dec_name, fp8_name, prefill_name): (&[u8], &[u8], &[u8], &[u8]) =
+                    if is_sm89 {
+                        (
+                            b"fa_sm89_workspace_size\0",
+                            b"fa_sm89_paged_decode\0",
+                            b"fa_sm89_paged_decode_fp8\0",
+                            b"fa_sm89_paged_prefill_fp8\0",
+                        )
+                    } else {
+                        (
+                            b"fa3_sm90_workspace_size\0",
+                            b"fa3_sm90_paged_decode\0",
+                            b"fa3_sm90_paged_decode_fp8\0",
+                            b"fa3_sm90_paged_prefill_fp8\0",
+                        )
+                    };
                 let sym_err = |name: &'static str| RvllmError::Attention {
                     err: AttentionError::Fa3SoMissing { path: path.clone() },
-                    ctx: AttnCtx { op: name, stream: 0, num_seqs: 0, head_dim },
+                    ctx: AttnCtx {
+                        op: name,
+                        stream: 0,
+                        num_seqs: 0,
+                        head_dim,
+                    },
                     bt: std::backtrace::Backtrace::capture(),
                 };
                 let ws_sym: libloading::Symbol<WorkspaceSizeFn> = _lib
-                    .get(ws_name).map_err(|_| sym_err("dlsym:workspace_size"))?;
+                    .get(ws_name)
+                    .map_err(|_| sym_err("dlsym:workspace_size"))?;
                 let dec_sym: libloading::Symbol<PagedDecodeFn> = _lib
-                    .get(dec_name).map_err(|_| sym_err("dlsym:paged_decode"))?;
+                    .get(dec_name)
+                    .map_err(|_| sym_err("dlsym:paged_decode"))?;
                 let dec_fp8_sym: libloading::Symbol<PagedDecodeFp8Fn> = _lib
-                    .get(fp8_name).map_err(|_| sym_err("dlsym:paged_decode_fp8"))?;
-                let fn_paged_prefill_fp8: Option<PagedPrefillFp8Fn> = _lib
-                    .get::<PagedPrefillFp8Fn>(prefill_name)
-                    .ok()
-                    .map(|s| *s);
+                    .get(fp8_name)
+                    .map_err(|_| sym_err("dlsym:paged_decode_fp8"))?;
+                let fn_paged_prefill_fp8: Option<PagedPrefillFp8Fn> =
+                    _lib.get::<PagedPrefillFp8Fn>(prefill_name).ok().map(|s| *s);
                 let fn_workspace_size = *ws_sym;
                 let fn_paged_decode = *dec_sym;
                 let fn_paged_decode_fp8 = *dec_fp8_sym;

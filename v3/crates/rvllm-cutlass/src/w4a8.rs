@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use rvllm_core::{CudaErrorKind, CudaCtx, Result, RvllmError};
+use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 
 #[cfg(feature = "cuda")]
 type W4a8GemmFn = unsafe extern "C" fn(
@@ -68,7 +68,12 @@ impl W4a8Lib {
             return Err(RvllmError::cuda(
                 "W4a8Lib::load missing .so",
                 CudaErrorKind::LaunchFailed,
-                CudaCtx { stream: 0, kernel: "w4a8", launch: None, device: -1 },
+                CudaCtx {
+                    stream: 0,
+                    kernel: "w4a8",
+                    launch: None,
+                    device: -1,
+                },
             ));
         }
         #[cfg(feature = "cuda")]
@@ -77,7 +82,12 @@ impl W4a8Lib {
                 RvllmError::cuda(
                     "W4a8Lib dlopen",
                     CudaErrorKind::LaunchFailed,
-                    CudaCtx { stream: 0, kernel: "w4a8", launch: None, device: -1 },
+                    CudaCtx {
+                        stream: 0,
+                        kernel: "w4a8",
+                        launch: None,
+                        device: -1,
+                    },
                 )
             })?;
             let run_sym: libloading::Symbol<W4a8GemmFn> =
@@ -85,7 +95,12 @@ impl W4a8Lib {
                     RvllmError::cuda(
                         "dlsym rvllm_w4a8_gemm_run",
                         CudaErrorKind::LaunchFailed,
-                        CudaCtx { stream: 0, kernel: "w4a8", launch: None, device: -1 },
+                        CudaCtx {
+                            stream: 0,
+                            kernel: "w4a8",
+                            launch: None,
+                            device: -1,
+                        },
                     )
                 })?;
             let ws_sym: libloading::Symbol<W4a8WorkspaceFn> =
@@ -93,7 +108,12 @@ impl W4a8Lib {
                     RvllmError::cuda(
                         "dlsym rvllm_w4a8_gemm_workspace_size",
                         CudaErrorKind::LaunchFailed,
-                        CudaCtx { stream: 0, kernel: "w4a8", launch: None, device: -1 },
+                        CudaCtx {
+                            stream: 0,
+                            kernel: "w4a8",
+                            launch: None,
+                            device: -1,
+                        },
                     )
                 })?;
             let enc_sym: libloading::Symbol<W4a8EncodeFp16Fn> =
@@ -101,13 +121,24 @@ impl W4a8Lib {
                     RvllmError::cuda(
                         "dlsym rvllm_w4a8_encode_weight_fp16",
                         CudaErrorKind::LaunchFailed,
-                        CudaCtx { stream: 0, kernel: "w4a8", launch: None, device: -1 },
+                        CudaCtx {
+                            stream: 0,
+                            kernel: "w4a8",
+                            launch: None,
+                            device: -1,
+                        },
                     )
                 })?;
             let gemm_run = *run_sym;
             let gemm_ws = *ws_sym;
             let fn_encode_fp16 = *enc_sym;
-            Ok(Self { so_path: path, _lib, gemm_run, gemm_ws, fn_encode_fp16 })
+            Ok(Self {
+                so_path: path,
+                _lib,
+                gemm_run,
+                gemm_ws,
+                fn_encode_fp16,
+            })
         }
         #[cfg(not(feature = "cuda"))]
         Ok(Self { so_path: path })

@@ -9,9 +9,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use rvllm_core::{
-    ConfigError, CutlassCtx, CutlassError, DType, IoError, Result, RvllmError,
-};
+use rvllm_core::{ConfigError, CutlassCtx, CutlassError, DType, IoError, Result, RvllmError};
 
 use crate::variants::{VariantDescriptor, VariantId};
 
@@ -105,13 +103,15 @@ impl Policy {
         suffix: &str,
     ) -> Result<&PolicyEntry> {
         let key = format!("{m}_{n}_{k}_{dtype:?}{suffix}");
-        self.entries.get(&key).ok_or_else(|| RvllmError::cutlass(
-            CutlassError::AutotuneCacheMiss { m, n, k, dtype },
-            CutlassCtx {
-                kernel: "Policy::lookup",
-                stream: 0,
-            },
-        ))
+        self.entries.get(&key).ok_or_else(|| {
+            RvllmError::cutlass(
+                CutlassError::AutotuneCacheMiss { m, n, k, dtype },
+                CutlassCtx {
+                    kernel: "Policy::lookup",
+                    stream: 0,
+                },
+            )
+        })
     }
 
     pub fn entry_key(m: usize, n: usize, k: usize, dtype: DType) -> String {

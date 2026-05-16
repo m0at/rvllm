@@ -56,7 +56,8 @@ __global__ void paged_decode_f16_kernel(
     int num_heads,
     int num_kv_heads,
     int block_size,
-    int max_blocks_per_seq
+    int max_blocks_per_seq,
+    int window_size_left
 ) {
     const int bid = blockIdx.x;
     const int batch_idx = bid / num_heads;
@@ -132,6 +133,9 @@ __global__ void paged_decode_fp8_kernel(
     __half* __restrict__ output,
     const int* __restrict__ block_tables,
     const int* __restrict__ context_lens,
+    const float* __restrict__ k_scale_cache,
+    const float* __restrict__ v_scale_cache,
+    const float* __restrict__ q_scale_cache,
     const float* __restrict__ q_descale_ptr,
     const float* __restrict__ k_descale_ptr,
     const float* __restrict__ v_descale_ptr,
@@ -139,7 +143,8 @@ __global__ void paged_decode_fp8_kernel(
     int num_heads,
     int num_kv_heads,
     int block_size,
-    int max_blocks_per_seq
+    int max_blocks_per_seq,
+    int window_size_left
 ) {
     const int bid = blockIdx.x;
     const int batch_idx = bid / num_heads;
@@ -153,9 +158,13 @@ __global__ void paged_decode_fp8_kernel(
         return;
     }
 
-    const float q_ds = *q_descale_ptr;
-    const float k_ds = *k_descale_ptr;
-    const float v_ds = *v_descale_ptr;
+    const float q_ds = (q_scale_cache != nullptr)
+        ? q_scale_cache[batch_idx * num_heads + head_idx]
+        : *q_descale_ptr;
+    const bool k_perslot = (k_scale_cache != nullptr);
+    const bool v_perslot = (v_scale_cache != nullptr);
+    const float k_ds_scalar = k_perslot ? 0.0f : *k_descale_ptr;
+    const float v_ds_scalar = v_perslot ? 0.0f : *v_descale_ptr;
 
     float q_val = fp8e4m3_to_float(q_fp8[bid * HEAD_DIM + tid]) * q_ds;
 
@@ -176,7 +185,14 @@ __global__ void paged_decode_fp8_kernel(
         int toks = min(block_size, ctx_len - p * block_size);
 
         for (int t = 0; t < toks; t++) {
-            int kv_idx = ((phys * block_size + t) * num_kv_heads + kv_head) * HEAD_DIM + tid;
+            int slot = phys * block_size + t;
+            int kv_idx = (slot * num_kv_heads + kv_head) * HEAD_DIM + tid;
+            float k_ds = k_perslot
+                ? k_scale_cache[slot * num_kv_heads + kv_head]
+                : k_ds_scalar;
+            float v_ds = v_perslot
+                ? v_scale_cache[slot * num_kv_heads + kv_head]
+                : v_ds_scalar;
             float k_val = fp8e4m3_to_float(k_cache_fp8[kv_idx]) * k_ds;
 
             float dot = q_val * k_val;
@@ -230,6 +246,9 @@ __global__ void paged_prefill_fp8_kernel(
     const int* __restrict__ block_tables,
     const int* __restrict__ context_lens,
     const int* __restrict__ cu_seqlens_q,    // [batch+1]
+    const float* __restrict__ k_scale_cache, // nullable [num_slots, num_kv_heads]
+    const float* __restrict__ v_scale_cache, // nullable [num_slots, num_kv_heads]
+    const float* __restrict__ q_scale_cache, // nullable [total_q, num_heads]
     const float* __restrict__ q_descale_ptr,
     const float* __restrict__ k_descale_ptr,
     const float* __restrict__ v_descale_ptr,
@@ -239,7 +258,8 @@ __global__ void paged_prefill_fp8_kernel(
     int num_heads,
     int num_kv_heads,
     int block_size,
-    int max_blocks_per_seq
+    int max_blocks_per_seq,
+    int window_size_left
 ) {
     const int gid = blockIdx.x;
     const int q_token_idx = gid / num_heads;
@@ -254,16 +274,25 @@ __global__ void paged_prefill_fp8_kernel(
     for (int s = 0; s < batch_size; s++) {
         if (q_token_idx < cu_seqlens_q[s + 1]) { seq_idx = s; break; }
     }
-    int q_pos_in_seq = q_token_idx - cu_seqlens_q[seq_idx];
-
-    // Causal: attend to KV positions [0, q_pos_in_seq].
-    int causal_len = q_pos_in_seq + 1;
     int ctx_len = context_lens[seq_idx];
+    int q_seq_start = cu_seqlens_q[seq_idx];
+    int q_seq_end = cu_seqlens_q[seq_idx + 1];
+    int q_pos_in_seq = q_token_idx - q_seq_start;
+    int q_len = max(0, q_seq_end - q_seq_start);
+    int prefix_len = max(0, ctx_len - q_len);
+
+    // Causal: for chunked prefill, the Q batch is the tail of an
+    // existing context. Attend to prefix plus Q positions [0, q_pos].
+    int causal_len = prefix_len + q_pos_in_seq + 1;
     int attend_len = min(causal_len, ctx_len);
 
-    const float q_ds = *q_descale_ptr;
-    const float k_ds = *k_descale_ptr;
-    const float v_ds = *v_descale_ptr;
+    const float q_ds = (q_scale_cache != nullptr)
+        ? q_scale_cache[q_token_idx * num_heads + head_idx]
+        : *q_descale_ptr;
+    const bool k_perslot = (k_scale_cache != nullptr);
+    const bool v_perslot = (v_scale_cache != nullptr);
+    const float k_ds_scalar = k_perslot ? 0.0f : *k_descale_ptr;
+    const float v_ds_scalar = v_perslot ? 0.0f : *v_descale_ptr;
 
     int q_offset = (q_token_idx * num_heads + head_idx) * HEAD_DIM + tid;
     float q_val = fp8e4m3_to_float(q_fp8[q_offset]) * q_ds;
@@ -278,14 +307,33 @@ __global__ void paged_prefill_fp8_kernel(
 
     const int warp_id = tid / 32;
     const int lane = tid % 32;
-    const int num_pages = (attend_len + block_size - 1) / block_size;
+    int attend_start = 0;
+    if (window_size_left >= 0) {
+        int window_len = window_size_left + 1;
+        if (attend_len > window_len) {
+            attend_start = attend_len - window_len;
+            attend_len = window_len;
+        }
+    }
+    const int attend_end = attend_start + attend_len;
+    const int start_page = attend_start / block_size;
+    const int end_page = (attend_end + block_size - 1) / block_size;
 
-    for (int p = 0; p < num_pages; p++) {
-        int phys = block_tables[seq_idx * max_blocks_per_seq + p];
-        int toks = min(block_size, attend_len - p * block_size);
+    for (int p = start_page; p < end_page; p++) {
+        int table_p = (window_size_left >= 0) ? (p % max_blocks_per_seq) : p;
+        int phys = block_tables[seq_idx * max_blocks_per_seq + table_p];
+        int t0 = max(0, attend_start - p * block_size);
+        int t1 = min(block_size, attend_end - p * block_size);
 
-        for (int t = 0; t < toks; t++) {
-            int kv_idx = ((phys * block_size + t) * num_kv_heads + kv_head) * HEAD_DIM + tid;
+        for (int t = t0; t < t1; t++) {
+            int slot = phys * block_size + t;
+            int kv_idx = (slot * num_kv_heads + kv_head) * HEAD_DIM + tid;
+            float k_ds = k_perslot
+                ? k_scale_cache[slot * num_kv_heads + kv_head]
+                : k_ds_scalar;
+            float v_ds = v_perslot
+                ? v_scale_cache[slot * num_kv_heads + kv_head]
+                : v_ds_scalar;
             float k_val = fp8e4m3_to_float(k_cache_fp8[kv_idx]) * k_ds;
 
             float dot = q_val * k_val;
@@ -349,7 +397,7 @@ int fa_sm89_paged_decode(
         paged_decode_f16_kernel<HD><<<grid, HD, 0, stream>>>( \
             (const __half*)q, (const __half*)k_cache, (const __half*)v_cache, \
             (__half*)output, (const int*)block_tables, (const int*)context_lens, \
-            scale, num_heads, num_kv_heads, block_size, max_blocks_per_seq)
+            scale, num_heads, num_kv_heads, block_size, max_blocks_per_seq, window_size_left)
 
     if      (head_dim == 128) { LAUNCH_F16(128); }
     else if (head_dim == 256) { LAUNCH_F16(256); }
@@ -363,6 +411,7 @@ int fa_sm89_paged_decode(
 int fa_sm89_paged_decode_fp8(
     void* q_fp8, void* k_cache_fp8, void* v_cache_fp8, void* output,
     void* block_tables, void* context_lens, void* workspace,
+    void* k_scale_cache, void* v_scale_cache, void* q_scale_cache,
     float* q_descale, float* k_descale, float* v_descale,
     float scale,
     int batch_size, int num_heads, int num_kv_heads, int head_dim,
@@ -380,9 +429,11 @@ int fa_sm89_paged_decode_fp8(
             (const uint8_t*)q_fp8, (const uint8_t*)k_cache_fp8, \
             (const uint8_t*)v_cache_fp8, (__half*)output, \
             (const int*)block_tables, (const int*)context_lens, \
+            (const float*)k_scale_cache, (const float*)v_scale_cache, \
+            (const float*)q_scale_cache, \
             (const float*)q_descale, (const float*)k_descale, \
             (const float*)v_descale, \
-            scale, num_heads, num_kv_heads, block_size, max_blocks_per_seq)
+            scale, num_heads, num_kv_heads, block_size, max_blocks_per_seq, window_size_left)
 
     if      (head_dim == 128) { LAUNCH_FP8(128); }
     else if (head_dim == 256) { LAUNCH_FP8(256); }
@@ -397,6 +448,7 @@ int fa_sm89_paged_prefill_fp8(
     void* q_fp8, void* k_cache_fp8, void* v_cache_fp8, void* output,
     void* block_tables, void* context_lens, void* cu_seqlens_q,
     void* workspace,
+    void* k_scale_cache, void* v_scale_cache, void* q_scale_cache,
     float* q_descale, float* k_descale, float* v_descale,
     float scale,
     int total_q, int max_seqlen_q,
@@ -405,7 +457,7 @@ int fa_sm89_paged_prefill_fp8(
     int window_size_left,
     void* stream_ptr
 ) {
-    (void)workspace; (void)max_seqlen_q; (void)num_blocks_total; (void)window_size_left;
+    (void)workspace; (void)max_seqlen_q; (void)num_blocks_total;
     cudaStream_t stream = (cudaStream_t)stream_ptr;
     int grid = total_q * num_heads;
     if (grid == 0) return 0;
@@ -416,10 +468,12 @@ int fa_sm89_paged_prefill_fp8(
             (const uint8_t*)v_cache_fp8, (__half*)output, \
             (const int*)block_tables, (const int*)context_lens, \
             (const int*)cu_seqlens_q, \
+            (const float*)k_scale_cache, (const float*)v_scale_cache, \
+            (const float*)q_scale_cache, \
             (const float*)q_descale, (const float*)k_descale, \
             (const float*)v_descale, \
             scale, total_q, batch_size, num_heads, num_kv_heads, \
-            block_size, max_blocks_per_seq)
+            block_size, max_blocks_per_seq, window_size_left)
 
     if      (head_dim == 128) { LAUNCH_PREFILL(128); }
     else if (head_dim == 256) { LAUNCH_PREFILL(256); }

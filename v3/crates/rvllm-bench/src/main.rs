@@ -23,8 +23,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use rvllm_core::{ModelArch as HfModelArch, ModelConfig};
-use rvllm_runtime::{Bringup, EnginePaths};
 use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
+use rvllm_runtime::{Bringup, EnginePaths};
 
 fn env_path(k: &str) -> Result<PathBuf, String> {
     std::env::var(k)
@@ -140,8 +140,8 @@ fn run() -> Result<(), String> {
         return run_sweep(&br, batch, iters, warmup);
     }
 
-    let result = unsafe { br.run_bench(batch, iters, warmup) }
-        .map_err(|e| format!("run_bench: {e}"))?;
+    let result =
+        unsafe { br.run_bench(batch, iters, warmup) }.map_err(|e| format!("run_bench: {e}"))?;
     print_result(result);
     Ok(())
 }
@@ -192,7 +192,8 @@ fn run_sweep(br: &Bringup, batch: u32, iters: u32, warmup: u32) -> Result<(), St
     for &nr in nonres {
         for &r in residuals {
             let ck = br.arena.checkpoint();
-            let res = unsafe { br.run_bench_with_variants(batch, iters, warmup, Some(nr), Some(r)) };
+            let res =
+                unsafe { br.run_bench_with_variants(batch, iters, warmup, Some(nr), Some(r)) };
             unsafe { br.arena.restore(ck) };
             match res {
                 Ok(r_) => {
@@ -220,6 +221,11 @@ fn run_sweep(br: &Bringup, batch: u32, iters: u32, warmup: u32) -> Result<(), St
             }
         }
     }
-    eprintln!("BEST: nonres={} res={} ({:.3} ms/step)", best.1, best.2, best.0 as f64 / 1.0e6);
+    eprintln!(
+        "BEST: nonres={} res={} ({:.3} ms/step)",
+        best.1,
+        best.2,
+        best.0 as f64 / 1.0e6
+    );
     Ok(())
 }

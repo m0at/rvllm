@@ -95,8 +95,7 @@ pub type Fp8GemmBlockscaleSm120Fn = unsafe extern "C" fn(
 ) -> i32;
 
 #[cfg(feature = "cuda")]
-pub type BlockscaleSm120WorkspaceFn =
-    unsafe extern "C" fn(m: i32, n: i32, k: i32) -> usize;
+pub type BlockscaleSm120WorkspaceFn = unsafe extern "C" fn(m: i32, n: i32, k: i32) -> usize;
 
 /// Scratch-sizing entry points for SFA / SFB staging tensors. Same
 /// signature shape as `BlockscaleSm120WorkspaceFn` but taking only two
@@ -189,11 +188,12 @@ impl CutlassLib {
             }
         }
 
-        let fp8_gemm_channelscale: Option<Fp8GemmChannelscaleFn> = unsafe {
-            lib.get(b"cutlass_fp8_gemm_channelscale\0").ok().map(|s| *s)
-        };
+        let fp8_gemm_channelscale: Option<Fp8GemmChannelscaleFn> =
+            unsafe { lib.get(b"cutlass_fp8_gemm_channelscale\0").ok().map(|s| *s) };
         let fp8_gemm_channelscale_ws: Option<ChannelscaleWorkspaceFn> = unsafe {
-            lib.get(b"cutlass_fp8_gemm_channelscale_workspace\0").ok().map(|s| *s)
+            lib.get(b"cutlass_fp8_gemm_channelscale_workspace\0")
+                .ok()
+                .map(|s| *s)
         };
 
         Ok(Self {
@@ -347,7 +347,10 @@ impl CutlassLib {
                     variant: 0,
                     cuda: rvllm_core::CudaErrorKind::Other,
                 },
-                CutlassCtx { kernel: "fp8_gemm_channelscale (missing from .so)", stream },
+                CutlassCtx {
+                    kernel: "fp8_gemm_channelscale (missing from .so)",
+                    stream,
+                },
             )
         })?;
         let rc = f(
@@ -356,7 +359,9 @@ impl CutlassLib {
             b as *const c_void,
             row_scale as *const c_void,
             col_scale as *const c_void,
-            m, n, k,
+            m,
+            n,
+            k,
             workspace as *mut c_void,
             workspace_size,
             stream as *mut c_void,
@@ -367,7 +372,10 @@ impl CutlassLib {
                     variant: 0,
                     cuda: rvllm_core::CudaErrorKind::LaunchFailed,
                 },
-                CutlassCtx { kernel: "fp8_gemm_channelscale", stream },
+                CutlassCtx {
+                    kernel: "fp8_gemm_channelscale",
+                    stream,
+                },
             ));
         }
         Ok(())
@@ -461,8 +469,7 @@ impl CutlassSm120Lib {
     /// is a hard error or graceful fall-through.
     #[cfg(feature = "cuda")]
     pub fn load(path: PathBuf) -> Result<Self> {
-        let lib =
-            unsafe { libloading::Library::new(&path) }.map_err(|_| cutlass_miss(&path))?;
+        let lib = unsafe { libloading::Library::new(&path) }.map_err(|_| cutlass_miss(&path))?;
         let fp8_gemm_blockscale: Option<Fp8GemmBlockscaleSm120Fn> = unsafe {
             lib.get(b"cutlass_fp8_gemm_blockscale_sm120\0")
                 .ok()
@@ -1056,10 +1063,7 @@ impl CutlassErrExt for RvllmError {
             err: rvllm_core::LoaderError::Corrupt {
                 detail: format!("libcutlass_kernels.so not at {}", path.display()),
             },
-            ctx: rvllm_core::LoaderCtx {
-                path,
-                tensor: None,
-            },
+            ctx: rvllm_core::LoaderCtx { path, tensor: None },
             bt: std::backtrace::Backtrace::capture(),
         }
     }
@@ -1072,10 +1076,7 @@ impl CutlassErrExt for RvllmError {
                     vid.0,
                 ),
             },
-            ctx: rvllm_core::LoaderCtx {
-                path,
-                tensor: None,
-            },
+            ctx: rvllm_core::LoaderCtx { path, tensor: None },
             bt: std::backtrace::Backtrace::capture(),
         }
     }

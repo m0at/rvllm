@@ -20,17 +20,14 @@ pub struct Fp8GemmPlan {
 }
 
 impl Fp8GemmPlan {
-    pub fn from_policy(
-        policy: &Policy,
-        m: u32,
-        n: u32,
-        k: u32,
-        dtype: DType,
-    ) -> Result<Self> {
+    pub fn from_policy(policy: &Policy, m: u32, n: u32, k: u32, dtype: DType) -> Result<Self> {
         match policy.lookup(m as usize, n as usize, k as usize, dtype) {
             Ok(entry) => Ok(Self {
                 variant: entry.variant,
-                m, n, k, dtype,
+                m,
+                n,
+                k,
+                dtype,
                 workspace_bytes: entry.workspace_bytes,
             }),
             Err(_) => Ok(Self::default_plan(m, n, k, dtype)),
@@ -50,7 +47,10 @@ impl Fp8GemmPlan {
         match policy.lookup_residual(m as usize, n as usize, k as usize, dtype) {
             Ok(entry) => Ok(Self {
                 variant: entry.variant,
-                m, n, k, dtype,
+                m,
+                n,
+                k,
+                dtype,
                 workspace_bytes: entry.workspace_bytes,
             }),
             Err(_) => Ok(Self::default_plan(m, n, k, dtype)),
@@ -60,7 +60,10 @@ impl Fp8GemmPlan {
     fn default_plan(m: u32, n: u32, k: u32, dtype: DType) -> Self {
         Self {
             variant: VariantId(0),
-            m, n, k, dtype,
+            m,
+            n,
+            k,
+            dtype,
             workspace_bytes: 16 * 1024 * 1024,
         }
     }

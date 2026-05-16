@@ -144,8 +144,8 @@ impl RuntimeConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dtype::DType;
     use crate::config::model::{ModelArch, ModelConfig};
+    use crate::dtype::DType;
 
     fn qwen() -> ModelConfig {
         ModelConfig {
