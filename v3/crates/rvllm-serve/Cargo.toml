@@ -13,8 +13,25 @@ authors.workspace = true
 name = "rvllm-server"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = [
+    "rvllm-runtime/cuda",
+    "rvllm-kernels/cuda",
+    "rvllm-mem/cuda",
+    "dep:cudarc",
+]
+cublaslt = ["cuda"]
+gb10 = ["cuda", "rvllm-runtime/gb10", "rvllm-mem/gb10"]
+
 [dependencies]
 rvllm-core = { workspace = true }
+rvllm-kernels = { workspace = true }
+rvllm-mem = { workspace = true, optional = true }
 rvllm-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokenizers = "0.20"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+cudarc = { version = "0.19", features = ["driver", "cuda-version-from-build-system"], optional = true }

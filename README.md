@@ -219,6 +219,61 @@ RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
   ./v3/target/release/rvllm-bench
 ```
 
+### OpenAI-compatible Gemma 4 server
+
+The server is a Rust-only Gemma 4 path with an OpenAI-compatible HTTP surface.
+It keeps CUDA execution on a single engine owner thread and accepts requests
+through `/v1/chat/completions`.
+
+```bash
+export CUDA_ARCH=sm_90
+export RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it
+export RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90
+export RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so
+export RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so
+export RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json
+export RVLLM_SERVED_MODEL_NAME=gemma4-31b
+export RUST_LOG=info
+
+bash kernels/build.sh sm_90
+bash kernels/build_cutlass_so.sh sm_90
+bash kernels/build_fa3.sh
+cargo build --release --features cuda,cublaslt --manifest-path v3/Cargo.toml -p rvllm-serve
+
+./v3/target/release/rvllm-server \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --max-model-len 8192 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 2048 \
+  --max-prefill-chunk 128
+```
+
+The server exposes `GET /health`, `GET /v1/models`, and
+`POST /v1/chat/completions` with non-stream and SSE streaming responses.
+Only greedy Gemma 4 decoding is currently enabled; set `temperature: 0`.
+
+Smoke:
+
+```bash
+curl -fsS http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:8080/v1/models
+curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4-31b","messages":[{"role":"user","content":"Reply exactly: RVLLM_RUST_OK"}],"max_tokens":16,"temperature":0}'
+curl -fsS --no-buffer http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4-31b","messages":[{"role":"user","content":"hi"}],"max_tokens":16,"temperature":0,"stream":true}'
+```
+
+For bind-only local checks without CUDA:
+
+```bash
+RVLLM_DRY_RUN=1 cargo run --manifest-path v3/Cargo.toml -p rvllm-serve -- \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
 ### Kernels
 
 Every kernel has a known purpose, a pinned variant, and a workspace contract. No dispatch fallback chains.
