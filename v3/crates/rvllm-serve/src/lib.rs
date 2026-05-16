@@ -7,6 +7,7 @@ pub struct ServeConfig {
     pub host: String,
     pub port: u16,
     pub served_model_name: String,
+    pub default_system_prompt: Option<String>,
     pub max_model_len: usize,
     pub max_num_seqs: usize,
     pub max_num_batched_tokens: usize,
@@ -24,12 +25,15 @@ impl ServeConfig {
             port: 8080,
             served_model_name: std::env::var("RVLLM_SERVED_MODEL_NAME")
                 .unwrap_or_else(|_| "gemma4-31b-solidsf".into()),
+            default_system_prompt: None,
             max_model_len: 8192,
             max_num_seqs: 1,
             max_num_batched_tokens: 2048,
             max_prefill_chunk: 128,
             dry_run: env_bool("RVLLM_DRY_RUN"),
         };
+        let mut system_prompt = non_empty_env("RVLLM_SYSTEM_PROMPT");
+        let mut system_prompt_file = non_empty_env("RVLLM_SYSTEM_PROMPT_FILE");
 
         let mut it = args.into_iter().peekable();
         while let Some(arg) = it.next() {
@@ -43,6 +47,12 @@ impl ServeConfig {
                 "--port" => cfg.port = parse_value("--port", value, &mut it)?,
                 "--model" | "--served-model-name" => {
                     cfg.served_model_name = next_value(&key, value, &mut it)?
+                }
+                "--system-prompt" => {
+                    system_prompt = Some(next_value("--system-prompt", value, &mut it)?)
+                }
+                "--system-prompt-file" => {
+                    system_prompt_file = Some(next_value("--system-prompt-file", value, &mut it)?)
                 }
                 "--max-model-len" => {
                     cfg.max_model_len = parse_value("--max-model-len", value, &mut it)?
@@ -65,6 +75,7 @@ impl ServeConfig {
         if cfg.max_num_seqs != 1 {
             return Err("rvllm-server currently supports --max-num-seqs 1".into());
         }
+        cfg.default_system_prompt = load_system_prompt(system_prompt, system_prompt_file)?;
         Ok(cfg)
     }
 
@@ -77,6 +88,25 @@ fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn load_system_prompt(
+    inline: Option<String>,
+    file: Option<String>,
+) -> Result<Option<String>, String> {
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read RVLLM_SYSTEM_PROMPT_FILE {path}: {e}"))?;
+        let text = text.trim_end().to_string();
+        return Ok((!text.is_empty()).then_some(text));
+    }
+    Ok(inline
+        .map(|s| s.trim_end().to_string())
+        .filter(|s| !s.is_empty()))
 }
 
 fn next_value<I>(

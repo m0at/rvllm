@@ -36,6 +36,7 @@ pub struct ContentPart {
     #[serde(rename = "type")]
     pub kind: Option<String>,
     pub text: Option<String>,
+    pub image_url: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +95,9 @@ impl MessageContent {
                 .iter()
                 .filter_map(|p| match p.kind.as_deref() {
                     Some("text") | None => p.text.as_deref(),
+                    Some("image_url") | Some("image") => Some(
+                        "[image attached: rvLLM text path needs a vision observer/tool result to describe pixels]",
+                    ),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -116,6 +120,7 @@ pub fn prepare_chat_request(
     req: ChatCompletionRequest,
     served_model: &str,
     default_max_tokens: usize,
+    default_system_prompt: Option<&str>,
 ) -> Result<PreparedChat, ApiError> {
     if req.model != served_model {
         return Err(ApiError::not_found(format!(
@@ -136,13 +141,38 @@ pub fn prepare_chat_request(
     if max_tokens == 0 {
         return Err(ApiError::invalid("max_tokens must be > 0"));
     }
+    if req.messages.is_empty() {
+        return Err(ApiError::invalid("messages must not be empty"));
+    }
+
+    let messages = apply_default_system_prompt(req.messages, default_system_prompt);
 
     Ok(PreparedChat {
-        prompt: render_gemma_chat(&req.messages)?,
+        prompt: render_gemma_chat(&messages)?,
         max_tokens,
         stream: req.stream.unwrap_or(false),
         stop: req.stop.map(StopSpec::into_vec).unwrap_or_default(),
     })
+}
+
+fn apply_default_system_prompt(
+    mut messages: Vec<ChatMessage>,
+    default_system_prompt: Option<&str>,
+) -> Vec<ChatMessage> {
+    let Some(prompt) = default_system_prompt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return messages;
+    };
+    messages.insert(
+        0,
+        ChatMessage {
+            role: "system".into(),
+            content: MessageContent::Text(prompt.into()),
+        },
+    );
+    messages
 }
 
 pub fn render_gemma_chat(messages: &[ChatMessage]) -> Result<String, ApiError> {
@@ -364,5 +394,22 @@ mod tests {
     fn folds_system_into_first_user() {
         let prompt = render_gemma_chat(&[msg("system", "be brief"), msg("user", "hi")]).unwrap();
         assert!(prompt.contains("be brief\n\nhi"));
+    }
+
+    #[test]
+    fn injects_default_system_prompt() {
+        let req = ChatCompletionRequest {
+            model: "served".into(),
+            messages: vec![msg("system", "request system"), msg("user", "hi")],
+            max_tokens: Some(8),
+            temperature: Some(0.0),
+            stream: None,
+            stop: None,
+            n: None,
+        };
+        let prepared = prepare_chat_request(req, "served", 16, Some("server system")).unwrap();
+        assert!(prepared
+            .prompt
+            .contains("server system\n\nrequest system\n\nhi"));
     }
 }

@@ -37,6 +37,8 @@ Environment:\n\
   RVLLM_FA3_SO               FA3 shared object\n\
   RVLLM_POLICY               CUTLASS policy.json\n\
   RVLLM_SERVED_MODEL_NAME    public model id, default gemma4-31b-solidsf\n\
+  RVLLM_SYSTEM_PROMPT        default system prompt prepended to chat requests\n\
+  RVLLM_SYSTEM_PROMPT_FILE   path to default system prompt file\n\
   RVLLM_DRY_RUN=1            bind HTTP without loading CUDA"
     );
 }

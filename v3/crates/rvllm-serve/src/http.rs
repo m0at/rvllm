@@ -101,7 +101,12 @@ fn handle_chat(mut stream: TcpStream, state: Arc<State>, req: Request) -> Result
         }
     };
 
-    let prepared = match prepare_chat_request(chat_req, &state.config.served_model_name, 256) {
+    let prepared = match prepare_chat_request(
+        chat_req,
+        &state.config.served_model_name,
+        256,
+        state.config.default_system_prompt.as_deref(),
+    ) {
         Ok(p) => p,
         Err(e) => return write_json(&mut stream, e.status, &error_response(&e)),
     };
