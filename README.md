@@ -6,6 +6,29 @@ Three Gemma 4 models on TPU v6e-4: **E4B** (16,794 tok/s peak, 78.3 tok/s B=1, P
 
 **[Full benchmarks](https://docs.solidsf.com/docs/bench.html)**
 
+## Current 31B status
+
+Gemma 4 31B is the primary served path today. On H100, rvLLM runs the
+31B FP8-Dynamic checkpoint through the native Rust server with OpenAI-compatible
+`/health`, `/v1/models`, and `/v1/chat/completions` endpoints. The measured
+GPU path is **8,786 tok/s** peak at B=512, **53 tok/s** at B=1, **PPL 14.75**,
+and **63 ms TTFT** with all 60 layers captured in a CUDA graph. The TPU path
+also supports 31B through 128K context.
+
+This branch adds the AWQ/W4A8 and RotorQuant groundwork around that 31B path:
+
+- H100-verified CUTLASS W4A8 wrapper for FP8 activations x int4 weights.
+- Safe reordered-int4 allocation sizing via `rvllm_w4a8_int4_reordered_bytes`.
+- Rust `rvllm-cutlass` bindings and dynamic loader support for the W4A8 shared object.
+- Optional runtime gate through `RVLLM_W4A8=1` and `RVLLM_W4A8_SO`.
+- Typed W4A8 weight slots in the Gemma 4 loader, ready for AWQ-packed tensors.
+- RotorQuant env/config scaffold for `rotor_cl3`, `planar2`, and `iso4` modes.
+- A 60-task integration tracker in [`docs/awq-rotorquant-task-queue.md`](docs/awq-rotorquant-task-queue.md).
+
+W4A8 is kernel-verified on H100 but not the default serving path yet. FP8 remains
+the default 31B route until AWQ tensor ingest, W4A8 dispatch, and RotorQuant
+attention coverage are fully wired and benchmarked.
+
 ## At a glance
 
 | | E4B (4B) | 26B-A4B (MoE) | 31B TPU | 31B GPU | vLLM H100 |
@@ -210,13 +233,61 @@ bash kernels/build_fa3.sh           # libfa3_kernels.so
 cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvllm-bench
 
 # Run
-RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it \
+RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic \
 RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
 RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
 RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
 RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
 RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
   ./v3/target/release/rvllm-bench
+```
+
+### Optional W4A8/AWQ kernel path
+
+The W4A8 path is opt-in while AWQ packing and dispatch land. Build it on SM90
+with CUTLASS available, then enable it explicitly:
+
+```bash
+CUTLASS_DIR=/workspace/cutlass bash kernels/build_w4a8.sh
+
+RVLLM_W4A8=1 \
+RVLLM_W4A8_SO=/workspace/rvllm/kernels/sm_90/libw4a8_gemm.so \
+RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+  ./v3/target/release/rvllm-bench
+```
+
+Kernel smoke on H100:
+
+```bash
+./kernels/w4a8_smoke
+# w4a8_smoke max_abs=0.000000 workspace=0
+
+compute-sanitizer --tool memcheck ./kernels/w4a8_smoke
+# ERROR SUMMARY: 0 errors
+```
+
+### GPU validation commands
+
+```bash
+# Perplexity
+RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
+RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
+RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
+RVLLM_ARENA_GB=74 RVLLM_PPL_CHUNK=32 RVLLM_PPL_CHUNKS=1 \
+  ./v3/target/release/rvllm-ppl
+
+# Prompt quality and B=1 generation tok/s
+RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
+RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
+RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
+RVLLM_ARENA_GB=74 RVLLM_MAX_TOKENS=96 \
+RVLLM_PROMPT="Explain angular momentum conservation using a spinning figure skater pulling in their arms." \
+  ./v3/target/release/rvllm-eval
 ```
 
 ### OpenAI-compatible Gemma 4 server
@@ -227,7 +298,7 @@ through `/v1/chat/completions`.
 
 ```bash
 export CUDA_ARCH=sm_90
-export RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it
+export RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic
 export RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90
 export RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so
 export RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so

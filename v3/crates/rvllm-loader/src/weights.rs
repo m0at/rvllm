@@ -54,6 +54,19 @@ pub struct Fp8Weight {
     pub blockscale_k_blocks: u32,
 }
 
+/// A W4A8 quantized weight tensor for the CUTLASS Hopper int4 x fp8 path.
+#[derive(Debug, Clone)]
+pub struct W4a8Weight {
+    /// Device pointer to the CUTLASS-reordered int4 payload.
+    pub int4_ptr: u64,
+    /// Device pointer to packed FP8 LUT scales, shape `[N, K/group, 8]`.
+    pub scales_ptr: u64,
+    pub shape: Vec<usize>,
+    pub group_size: usize,
+    pub int4_bytes: usize,
+    pub scales_bytes: usize,
+}
+
 /// One transformer layer's weights. Borrows into the model's HBM
 /// slab; the borrow keeps the slab alive.
 ///

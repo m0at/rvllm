@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_attention::{AttentionBackend, Fa3Kernels};
-use rvllm_core::Result;
+use rvllm_core::{ConfigError, Result, RvllmError};
 use rvllm_cutlass::{CublasLt, CutlassBackend, Policy};
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
@@ -31,6 +31,73 @@ pub use crate::bring_up::HbmArenaCheckpoint;
 /// per-model calibration.
 const DEFAULT_Q_SCALE: f32 = 0.1;
 const DEFAULT_KV_SCALE: f32 = 0.08;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RotorQuantMode {
+    Off,
+    RotorCl3,
+    Planar2,
+    Iso4,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RotorQuantConfig {
+    pub mode: RotorQuantMode,
+    pub bits: u8,
+    pub chunk_dim: u16,
+}
+
+impl RotorQuantConfig {
+    pub fn from_env() -> Result<Self> {
+        let raw_mode = std::env::var("RVLLM_ROTORQUANT").unwrap_or_else(|_| "off".into());
+        let mode = match raw_mode.as_str() {
+            "0" | "off" | "false" => RotorQuantMode::Off,
+            "1" | "rotor" | "rotor_cl3" => RotorQuantMode::RotorCl3,
+            "planar2" => RotorQuantMode::Planar2,
+            "iso4" => RotorQuantMode::Iso4,
+            other => {
+                return Err(RvllmError::config(
+                    ConfigError::InvalidField {
+                        name: "RVLLM_ROTORQUANT",
+                        reason: format!("unsupported mode {other:?}"),
+                    },
+                    "RVLLM_ROTORQUANT",
+                ))
+            }
+        };
+        let bits = std::env::var("RVLLM_ROTORQUANT_BITS")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(4);
+        if !(2..=4).contains(&bits) {
+            return Err(RvllmError::config(
+                ConfigError::InvalidField {
+                    name: "RVLLM_ROTORQUANT_BITS",
+                    reason: "expected 2, 3, or 4".into(),
+                },
+                "RVLLM_ROTORQUANT_BITS",
+            ));
+        }
+        let chunk_dim = std::env::var("RVLLM_ROTORQUANT_CHUNK_DIM")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(128);
+        if chunk_dim != 128 {
+            return Err(RvllmError::config(
+                ConfigError::InvalidField {
+                    name: "RVLLM_ROTORQUANT_CHUNK_DIM",
+                    reason: "v1 supports 128 only".into(),
+                },
+                "RVLLM_ROTORQUANT_CHUNK_DIM",
+            ));
+        }
+        Ok(Self {
+            mode,
+            bits,
+            chunk_dim,
+        })
+    }
+}
 
 pub struct Gemma4EnginePaths {
     pub model_dir: PathBuf,
@@ -118,6 +185,8 @@ pub struct Gemma4Bringup {
     pub sliding_attention: AttentionBackend,
     pub global_attention: AttentionBackend,
     pub cutlass: CutlassBackend,
+    pub w4a8: Option<rvllm_cutlass::W4a8Lib>,
+    pub rotorquant: RotorQuantConfig,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,
@@ -166,6 +235,7 @@ impl Gemma4Bringup {
         let stream = Stream::new(&ctx)?;
 
         let arch = rvllm_loader::gemma4_arch::Gemma4Arch::from_dir(&paths.model_dir)?;
+        let rotorquant = RotorQuantConfig::from_env()?;
         let model = rvllm_loader::gemma4_load::load_gemma4_model(&paths.model_dir, &arena, &arch)?;
 
         // On sm_121 the arena is `cuMemAllocManaged` pages that fault
@@ -294,6 +364,14 @@ impl Gemma4Bringup {
         // for the full rationale (sm_121 has no compatible `.so`).
         let cutlass =
             CutlassBackend::load_for(compile_target, paths.cutlass_so.clone(), &variants)?;
+        let w4a8 = if std::env::var("RVLLM_W4A8").map_or(false, |v| v == "1") {
+            let path = std::env::var_os("RVLLM_W4A8_SO")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| kernels_dir.join("libw4a8_gemm.so"));
+            Some(rvllm_cutlass::W4a8Lib::load(path)?)
+        } else {
+            None
+        };
 
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
         let cublaslt_ws_region = arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;
@@ -317,6 +395,8 @@ impl Gemma4Bringup {
             model,
             kernels,
             cutlass,
+            w4a8,
+            rotorquant,
             cublaslt,
             cublaslt_ws,
             sliding_attention,

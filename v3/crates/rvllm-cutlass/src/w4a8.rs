@@ -34,6 +34,9 @@ type W4a8GemmFn = unsafe extern "C" fn(
 #[cfg(feature = "cuda")]
 type W4a8WorkspaceFn = unsafe extern "C" fn(m: i32, n: i32, k: i32) -> usize;
 
+#[cfg(feature = "cuda")]
+type W4a8Int4BytesFn = unsafe extern "C" fn(n: i32, k: i32) -> usize;
+
 // Weight encoder: FP16 [N,K] -> unified-encoded INT4 [N,K/2] bytes + LUT
 // packed FP8 scales [N, K/g, 8] bytes.
 #[cfg(feature = "cuda")]
@@ -58,6 +61,8 @@ pub struct W4a8Lib {
     gemm_run: W4a8GemmFn,
     #[cfg(feature = "cuda")]
     gemm_ws: W4a8WorkspaceFn,
+    #[cfg(feature = "cuda")]
+    int4_bytes: W4a8Int4BytesFn,
     #[cfg(feature = "cuda")]
     fn_encode_fp16: W4a8EncodeFp16Fn,
 }
@@ -129,14 +134,29 @@ impl W4a8Lib {
                         },
                     )
                 })?;
+            let bytes_sym: libloading::Symbol<W4a8Int4BytesFn> =
+                _lib.get(b"rvllm_w4a8_int4_reordered_bytes\0").map_err(|_| {
+                    RvllmError::cuda(
+                        "dlsym rvllm_w4a8_int4_reordered_bytes",
+                        CudaErrorKind::LaunchFailed,
+                        CudaCtx {
+                            stream: 0,
+                            kernel: "w4a8",
+                            launch: None,
+                            device: -1,
+                        },
+                    )
+                })?;
             let gemm_run = *run_sym;
             let gemm_ws = *ws_sym;
+            let int4_bytes = *bytes_sym;
             let fn_encode_fp16 = *enc_sym;
             Ok(Self {
                 so_path: path,
                 _lib,
                 gemm_run,
                 gemm_ws,
+                int4_bytes,
                 fn_encode_fp16,
             })
         }
@@ -157,12 +177,25 @@ impl W4a8Lib {
         }
     }
 
+    /// Bytes required for a reordered INT4 weight tensor with shape [N, K].
+    pub fn int4_reordered_bytes(&self, n: i32, k: i32) -> usize {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            (self.int4_bytes)(n, k)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (n, k);
+            0
+        }
+    }
+
     /// D = alpha * A_fp8 * B_w4_unquant + beta * C.
     ///
     /// - `a_fp8`: `[m, k]` RowMajor E4M3 activations, device pointer.
-    /// - `b_int4_reordered`: `[k, n]` INT4 ColMajor AWQ-shuffled weights,
-    ///   device pointer. Already offline-reordered to the LayoutB_Reordered
-    ///   atom layout expected by the kernel.
+    /// - `b_int4_reordered`: INT4 weights for logical `[n, k]`, already
+    ///   offline-reordered to the LayoutB_Reordered atom layout expected by
+    ///   the kernel. Allocate with `int4_reordered_bytes(n, k)`.
     /// - `b_scales_packed`: `[n, k/group_size]` packed FP8 LUT blocks
     ///   (each block is 8 packed E4M3 scales). Device pointer.
     /// - `c_f16`: optional `[m, n]` RowMajor residual. Pass 0 if `beta==0`.
@@ -222,10 +255,11 @@ impl W4a8Lib {
         Ok(())
     }
 
-    /// Encode FP16 weights [N, K] (row-major, device ptr) to unified-
-    /// encoded INT4 [N, K/2] bytes + LUT packed FP8 scales [N, K/g, 8]
-    /// bytes. Needs a scratch buffer `scales_f32_ws` of at least
-    /// `N * K/g * 4` bytes.
+    /// Encode FP16 weights [N, K] (row-major, device ptr) to reordered
+    /// unified-encoded INT4 plus LUT packed FP8 scales [N, K/g, 8] bytes.
+    /// `w_int4_out` must be allocated with `int4_reordered_bytes(n, k)`.
+    /// Needs a scratch buffer `scales_f32_ws` of at least `N * K/g * 4`
+    /// bytes.
     ///
     /// # Safety
     /// All device pointers must be valid for the duration of the call.

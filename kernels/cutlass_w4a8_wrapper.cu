@@ -6,7 +6,7 @@
 // cutlass::Array<e4m3, 8> (LUT trick from example 55).
 //
 // A is RowMajor [M, K] FP8 E4M3.
-// B is ColMajor [K, N] int4 two's complement, AWQ-reordered offline.
+// B is logical [N, K] int4 two's complement, CUTLASS-reordered offline.
 // Scales are MN-major [N, K/group_size] as packed e4m3x8 LUT blocks.
 // D is RowMajor [M, N] fp16.
 //
@@ -44,6 +44,7 @@ using MmaType    = cutlass::float_e4m3_t;
 using QuantType  = cutlass::int4b_t;
 
 constexpr int kGroupSize = 128;
+constexpr size_t kInt4ReorderPaddingBytes = 16 * 1024;
 
 // Tile: 128 M x 128 N x 128 K (one WGMMA-friendly tile)
 constexpr int TileShapeK = 128 * 8 / cutlass::sizeof_bits<MmaType>::value; // = 128 for FP8
@@ -239,8 +240,19 @@ extern "C" size_t rvllm_w4a8_gemm_workspace_size(int m, int n, int k) {
     return Gemm::get_workspace_size(arguments);
 }
 
+static size_t w4a8_int4_reordered_bytes(int n, int k) {
+    auto shape_B = cute::make_shape(n, k, 1);
+    LayoutB_Reordered layout_B_reordered = cute::tile_to_shape(LayoutAtomQuant{}, shape_B);
+    size_t elems = static_cast<size_t>(cute::cosize(layout_B_reordered));
+    return (elems + 1) / 2 + kInt4ReorderPaddingBytes;
+}
+
+extern "C" size_t rvllm_w4a8_int4_reordered_bytes(int n, int k) {
+    return w4a8_int4_reordered_bytes(n, k);
+}
+
 // =========================================================================
-// Weight encoder: FP16/BF16 weights -> (reordered INT4 + LUT-packed FP8 scales).
+// Weight encoder: FP16 weights -> (reordered INT4 + LUT-packed FP8 scales).
 //
 // Simple symmetric per-group (g=128) quantization. For each [N, group] block
 // of K-contiguous weights:
@@ -262,11 +274,12 @@ extern "C" size_t rvllm_w4a8_gemm_workspace_size(int m, int n, int k) {
 #include <cuda_fp16.h>
 
 // Quantize FP16 weights to INT4 with per-group FP32 scales, both on device.
-// Writes unified-encoded INT4 (positive encoding == negative encoding except
-// sign bit) into w_int4_raw and per-group f32 scales into scales_f32.
+// Writes two's-complement INT4 into CUTLASS LayoutB order and per-group f32
+// scales into scales_f32. Host code applies CUTLASS's unified INT4 encoding
+// and shuffle reorder after this kernel.
 static __global__ void quantize_sym_group_kernel(
     const __half* __restrict__ w_fp16,  // [N, K] row-major (N rows)
-    int* __restrict__ w_int4_raw,        // packed int4: [N, K/8] (8 per int32)
+    int* __restrict__ w_int4_raw,        // packed int4 in LayoutB storage
     float* __restrict__ scales_f32,       // [N, K/group]
     int n, int k, int group
 ) {
@@ -293,61 +306,42 @@ static __global__ void quantize_sym_group_kernel(
 
     float inv_scale = 1.0f / scale;
 
-    // Pass 2: quantize + pack 8 int4 into one int32.
-    // Each int4 value is 4 bits; we write 8-wide chunks.
-    // Positive and negative share the same encoding except sign bit.
-    // (Example 55 expects this; 'unified_encode_int4b' from util is the
-    //  offline-safe analog for int4_t tensors. Here we bypass that helper
-    //  by storing in raw int4 bit pattern where positive v becomes -v in
-    //  the low 4 bits (hence "unified").)
-    int* row_int4 = w_int4_raw + row * (k / 8);
+    // Pass 2: quantize + pack 8 int4 elements into one int32. The swapped
+    // CUTLASS B stride is K-contiguous for shape [N,K].
     for (int i = tid; i < group; i += 32) {
         float v = __half2float(w_row[i]) * inv_scale;
         int q = __float2int_rn(v);
         if (q > 7) q = 7;
         if (q < -8) q = -8;
-        // Unified encoding: xor low-4 with bit 3 of sign.
-        // Positive q in [0..7] -> bits = q ^ 0b1000 (map to [8..15])
-        // Negative q in [-8..-1] -> bits = q & 0xF (already maps to [8..15])
-        unsigned int nib = (q & 0x7) | ((q >= 0) ? 0x8 : 0x0);
-        nib = (q < 0) ? ((unsigned int)q & 0xF) : nib;
-        // Actually easier: store two's complement 4-bit and let the kernel's
-        // LUT map to the correct value. Leave this simple for now.
-        nib = (unsigned int)(q & 0xF);
-
-        int word_idx = (grp * group + i) / 8;
-        int slot_idx = (grp * group + i) % 8;
-        atomicOr(&row_int4[word_idx], (int)(nib << (slot_idx * 4)));
+        unsigned int nib = (unsigned int)(q & 0xF);
+        size_t elem_idx = (size_t)row * k + (size_t)(grp * group + i);
+        size_t word_idx = elem_idx / 8;
+        int slot_idx = (int)(elem_idx % 8);
+        atomicOr(&w_int4_raw[word_idx], (int)(nib << (slot_idx * 4)));
     }
 }
 
-// Build packed LUT scales (Array<e4m3, 8>) from per-group f32 scales.
-// For each group, the LUT contains {scale * -8, scale * -7, ..., scale * -1}
-// stored as 8 packed e4m3 values (8 bytes total per group).
-static __global__ void build_packed_scales_kernel(
-    const float* __restrict__ scales_f32,  // [N, scale_k]
-    __nv_fp8_storage_t* __restrict__ scales_packed,  // [N, scale_k, 8] e4m3
+static __global__ void convert_scales_kernel(
+    const float* __restrict__ scales_f32,
+    ElementScale* __restrict__ scales_e4m3,
     int n, int scale_k
 ) {
     int row = blockIdx.y;
     int grp = blockIdx.x;
-    int tid = threadIdx.x;
-    if (row >= n || grp >= scale_k || tid >= 8) return;
+    if (row >= n || grp >= scale_k) return;
 
     float s = scales_f32[row * scale_k + grp];
-    // i in [0..7] maps to lut value (i - 8) * s
-    float lut_val = (float)((int)tid - 8) * s;
-    __nv_fp8_storage_t fp8 = __nv_cvt_float_to_fp8(lut_val, __NV_SATFINITE, __NV_E4M3);
-    scales_packed[(row * scale_k + grp) * 8 + tid] = fp8;
+    scales_e4m3[row * scale_k + grp] = ElementScale(s);
 }
 
 // Host entry: quantize + pack weights + reorder into the kernel-expected
 // layout. Expects:
 //   w_fp16        [N, K] row-major device ptr (input; will be read)
-//   w_int4_out    [N, K/2] bytes device ptr (output; zeroed by caller)
+//   w_int4_out    device ptr sized by rvllm_w4a8_int4_reordered_bytes(N, K)
 //   scales_out    [N, K/group, 8] bytes device ptr (output; e4m3 LUT)
 //   workspace     temporary f32 scales buffer, >= N*K/group*4 bytes
-//   shuffle       if 1, apply CUTLASS memory-reordering atom; else leave raw
+//   shuffle       reserved; output is always CUTLASS-reordered because
+//                 rvllm_w4a8_gemm_run always consumes LayoutB_Reordered.
 extern "C" int rvllm_w4a8_encode_weight_fp16(
     const void* w_fp16,
     int         n,
@@ -363,9 +357,11 @@ extern "C" int rvllm_w4a8_encode_weight_fp16(
     if (k % group_size != 0)      return -2;
     if (k % 8 != 0)               return -3;
     const int scale_k = k / group_size;
+    const size_t int4_elems = (size_t)n * k;
+    const size_t int4_output_bytes = w4a8_int4_reordered_bytes(n, k);
 
     // 1) Quantize + build f32 scales.
-    cudaMemsetAsync(w_int4_out, 0, (size_t)n * (k / 2), stream);
+    cudaMemsetAsync(w_int4_out, 0, int4_output_bytes, stream);
     dim3 grid_q(scale_k, n, 1);
     dim3 block_q(32, 1, 1);
     quantize_sym_group_kernel<<<grid_q, block_q, 0, stream>>>(
@@ -374,25 +370,57 @@ extern "C" int rvllm_w4a8_encode_weight_fp16(
         (float*)scales_f32_workspace,
         n, k, group_size
     );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return -20;
 
-    // 2) Build packed e4m3 LUT scales.
+    // 2) Convert scales to e4m3, then use CUTLASS's host-side LUT packer.
+    cutlass::DeviceAllocation<ElementScale> scales_e4m3((size_t)n * scale_k);
     dim3 grid_s(scale_k, n, 1);
-    dim3 block_s(8, 1, 1);
-    build_packed_scales_kernel<<<grid_s, block_s, 0, stream>>>(
+    dim3 block_s(1, 1, 1);
+    convert_scales_kernel<<<grid_s, block_s, 0, stream>>>(
         (const float*)scales_f32_workspace,
-        (__nv_fp8_storage_t*)scales_packed_out,
+        scales_e4m3.get(),
         n, scale_k
     );
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return -21;
 
-    // 3) (Optional) CUTLASS memory-reordering for thread-contiguous reads.
-    // Left as a follow-up: requires calling cutlass::reorder_tensor with the
-    // LayoutAtomQuant. For the v1 we pass shuffle=0 and the kernel uses the
-    // non-shuffled LayoutB_Reordered = tile_to_shape(LayoutAtomQuant{}, ...)
-    // which at runtime is just the natural col-major-K layout. When we go
-    // shuffled, we'll add a device reorder_tensor<LayoutAtomQuant>(...) call
-    // here (CUTLASS util kernel).
+    // 3) Match example 55 formatting: unify INT4 encodings, then reorder.
+    // These CUTLASS utility helpers are host-side wrappers and synchronize.
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) return -22;
+    bool scales_ok = cutlass::pack_scale_fp8<ElementScale, QuantType>(
+        scales_e4m3.get(),
+        reinterpret_cast<cutlass::Array<ElementScale, 8>*>(scales_packed_out),
+        (size_t)n * scale_k
+    );
+    if (!scales_ok) return -23;
+
+    cutlass::DeviceAllocation<ElementB> unified(
+        int4_elems + kInt4ReorderPaddingBytes * 8 / cutlass::sizeof_bits<ElementB>::value
+    );
+    cudaMemset(unified.get(), 0, unified.bytes());
+    bool ok = cutlass::unified_encode_int4b(
+        reinterpret_cast<const ElementB*>(w_int4_out),
+        unified.get(),
+        int4_elems
+    );
+    if (!ok) return -24;
+
+    auto shape_B = cute::make_shape(n, k, 1);
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, shape_B);
+    auto layout_B = cute::make_layout(shape_B, stride_B);
+    LayoutB_Reordered layout_B_reordered = cute::tile_to_shape(LayoutAtomQuant{}, shape_B);
+    cutlass::reorder_tensor(
+        unified.get(),
+        layout_B,
+        reinterpret_cast<ElementB*>(w_int4_out),
+        layout_B_reordered
+    );
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return -25;
+
     (void)shuffle;
 
     return 0;
 }
-

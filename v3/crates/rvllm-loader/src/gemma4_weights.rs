@@ -32,7 +32,7 @@
 //!   layer_scalar:  [1]
 //!   *_layernorm:   [5376]
 
-use crate::weights::{F16Weight, Fp8Weight};
+use crate::weights::{F16Weight, Fp8Weight, W4a8Weight};
 
 #[derive(Debug)]
 pub struct Gemma4LayerWeights {
@@ -44,6 +44,10 @@ pub struct Gemma4LayerWeights {
     pub o_proj_f16: Option<F16Weight>,
     pub gate_up_f16: Option<F16Weight>,
     pub down_proj_f16: Option<F16Weight>,
+    pub qkv_w4a8: Option<W4a8Weight>,
+    pub o_proj_w4a8: Option<W4a8Weight>,
+    pub gate_up_w4a8: Option<W4a8Weight>,
+    pub down_proj_w4a8: Option<W4a8Weight>,
     pub input_layernorm: F16Weight,
     pub post_attention_layernorm: F16Weight,
     pub pre_feedforward_layernorm: F16Weight,
