@@ -206,6 +206,67 @@ extern "C" int rvllm_w4a8_gemm_run(
     return 0;
 }
 
+static __global__ void rowscale_f16_kernel(
+    __half* __restrict__ data,
+    const float* __restrict__ row_scales,
+    int m,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * n;
+    if (idx >= total) return;
+    int row = idx / n;
+    float v = __half2float(data[idx]) * row_scales[row];
+    data[idx] = __float2half_rn(v);
+}
+
+extern "C" int rvllm_w4a8_gemm_run_rowscale(
+    const void* a_fp8,
+    const float* a_scales,
+    const void* b_int4_reordered,
+    const void* b_scales_packed,
+    void*       d_f16,
+    int         m,
+    int         n,
+    int         k,
+    int         group_size,
+    void*       workspace,
+    size_t      workspace_bytes,
+    cudaStream_t stream
+) {
+    if (a_scales == nullptr) return -30;
+    int rc = rvllm_w4a8_gemm_run(
+        a_fp8,
+        b_int4_reordered,
+        b_scales_packed,
+        nullptr,
+        d_f16,
+        m,
+        n,
+        k,
+        group_size,
+        1.0f,
+        0.0f,
+        workspace,
+        workspace_bytes,
+        stream
+    );
+    if (rc != 0) return rc;
+
+    int total = m * n;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    rowscale_f16_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<__half*>(d_f16),
+        a_scales,
+        m,
+        n
+    );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return -31;
+    return 0;
+}
+
 // Workspace size probe.
 extern "C" size_t rvllm_w4a8_gemm_workspace_size(int m, int n, int k) {
     using StrideC = typename Gemm::GemmKernel::StrideC;

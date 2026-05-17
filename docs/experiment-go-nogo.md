@@ -47,6 +47,9 @@ Implemented:
   and `scales` tensors for parity fixtures.
 - W4A8 shared-object loading is gated behind `RVLLM_EXPERIMENT_WEIGHT=w4a8-awq`
   or legacy `RVLLM_W4A8=1`.
+- A real-dispatch bring-up path can encode F16 source weights with
+  `RVLLM_W4A8_ENCODE_LAYERS` and route selected modules via
+  `RVLLM_W4A8_MODULES`.
 - The experiment controller rejects W4A8 under forced SM75 compatibility.
 - The H100 runner has a W4A8 preset and optional W4A8 smoke executable slot.
 
@@ -54,8 +57,11 @@ No-go blockers:
 
 - Load real AWQ tensors into the typed W4A8 weight slots.
 - Add runtime candidate checks for supported shapes, groups, and tensor coverage.
-- Thread W4A8 through QKV, O-proj, gate/up, and down-proj dispatch.
-- Add true W4A8-vs-baseline serving benchmarks after dispatch exists.
+- Replace the current symmetric F16-source encoder with calibrated AWQ packing.
+- Fix or reject real-dispatch `qkv`, `o`, and `gate_up` paths until PPL smoke is
+  sane; H100 isolation found `qkv`/`gate_up` degrade badly and `o` produced NaN.
+- Add true W4A8-vs-baseline serving benchmarks after production AWQ packing
+  exists.
 
 Metadata-only verdict:
 
@@ -64,6 +70,19 @@ Metadata-only verdict:
 - Config-only AWQ is detected but not serving-ready.
 - Mixed or partial tensor sets are inspection results, not accepted serving
   routes.
+
+Real-dispatch smoke on H100, layer 0 only:
+
+| Modules | PPL |
+| --- | ---: |
+| qkv | 134.5493 |
+| o | NaN |
+| gate_up | 136.0077 |
+| down | 34.5744 |
+
+Down-proj-only scaling stayed finite for the bounded chunk: 2 layers `32.4274`,
+4 layers `32.4160`, 8 layers `32.8167`. Throughput regressed at 8 layers
+(`46.8 tok/s` B=1, `4946.1 tok/s` B=128), so this is still a research lane.
 
 ## RotorQuant
 

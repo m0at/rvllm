@@ -13,12 +13,17 @@ use std::sync::Arc;
 
 use rvllm_attention::{AttentionBackend, Fa3Kernels};
 use rvllm_core::Result;
+#[cfg(feature = "cuda")]
+use rvllm_core::{ConfigError, CudaCtx, CudaErrorKind, RvllmError};
 use rvllm_cutlass::{CublasLt, CutlassBackend, Policy};
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
+#[cfg(feature = "cuda")]
+use rvllm_loader::weights::F16Weight;
+use rvllm_loader::weights::W4a8Weight;
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
 use crate::experiment_controller::{ExperimentController, ExperimentPlan, WeightPath};
-use crate::gemma4_layer_exec::Gemma4LayerKernels;
+use crate::gemma4_layer_exec::{Gemma4LayerKernels, W4a8WeightPtrs};
 use crate::rotorquant_config::RotorQuantConfig;
 
 pub use crate::bring_up::HbmArenaCheckpoint;
@@ -134,6 +139,222 @@ pub struct Gemma4Bringup {
     pub ctx: Arc<CudaContextHandle>,
 }
 
+fn w4a8_ptrs(weight: Option<&W4a8Weight>) -> W4a8WeightPtrs {
+    weight.map_or_else(W4a8WeightPtrs::default, |w| W4a8WeightPtrs {
+        int4: w.int4_ptr,
+        scales: w.scales_ptr,
+        group_size: w.group_size as u32,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn maybe_encode_w4a8_layers(
+    model: &mut rvllm_loader::gemma4_weights::Gemma4LoadedModel,
+    arena: &HbmArena<'static>,
+    w4a8: &rvllm_cutlass::W4a8Lib,
+    stream: u64,
+) -> Result<()> {
+    let Some(layers) = std::env::var("RVLLM_W4A8_ENCODE_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    else {
+        return Ok(());
+    };
+    let layers = layers.min(model.layers.len());
+    if layers == 0 {
+        return Ok(());
+    }
+    let modules = std::env::var("RVLLM_W4A8_MODULES")
+        .unwrap_or_else(|_| "down".into())
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    let use_qkv = modules.iter().any(|m| m == "qkv" || m == "all");
+    let use_o = modules
+        .iter()
+        .any(|m| m == "o" || m == "o_proj" || m == "all");
+    let use_gate_up = modules
+        .iter()
+        .any(|m| m == "gate_up" || m == "mlp_in" || m == "all");
+    let use_down = modules
+        .iter()
+        .any(|m| m == "down" || m == "down_proj" || m == "mlp_out" || m == "all");
+    if !(use_qkv || use_o || use_gate_up || use_down) {
+        return Err(RvllmError::config(
+            ConfigError::InvalidField {
+                name: "RVLLM_W4A8_MODULES",
+                reason: "expected qkv,o,gate_up,down,all".into(),
+            },
+            "RVLLM_W4A8_MODULES",
+        ));
+    }
+
+    for (idx, layer) in model.layers.iter().take(layers).enumerate() {
+        if (use_qkv && layer.qkv_f16.is_none())
+            || (use_o && layer.o_proj_f16.is_none())
+            || (use_gate_up && layer.gate_up_f16.is_none())
+            || (use_down && layer.down_proj_f16.is_none())
+        {
+            return Err(RvllmError::config(
+                ConfigError::InvalidField {
+                    name: "RVLLM_W4A8_ENCODE_LAYERS",
+                    reason: format!(
+                        "layer {idx} has no F16 source weights; set RVLLM_F16_LAYERS >= {layers}"
+                    ),
+                },
+                "RVLLM_W4A8_ENCODE_LAYERS",
+            ));
+        }
+    }
+
+    tracing::info!(
+        layers,
+        modules = %modules.join(","),
+        "encoding Gemma 4 F16 source weights to W4A8"
+    );
+    let mut encoded = Vec::with_capacity(layers);
+    for (idx, layer) in model.layers.iter().take(layers).enumerate() {
+        let qkv = if use_qkv {
+            Some(encode_w4a8_weight(
+                arena,
+                w4a8,
+                stream,
+                &format!("w4a8_l{idx}_qkv"),
+                layer.qkv_f16.as_ref().unwrap(),
+            )?)
+        } else {
+            None
+        };
+        let o_proj = if use_o {
+            Some(encode_w4a8_weight(
+                arena,
+                w4a8,
+                stream,
+                &format!("w4a8_l{idx}_o"),
+                layer.o_proj_f16.as_ref().unwrap(),
+            )?)
+        } else {
+            None
+        };
+        let gate_up = if use_gate_up {
+            Some(encode_w4a8_weight(
+                arena,
+                w4a8,
+                stream,
+                &format!("w4a8_l{idx}_gate_up"),
+                layer.gate_up_f16.as_ref().unwrap(),
+            )?)
+        } else {
+            None
+        };
+        let down_proj = if use_down {
+            Some(encode_w4a8_weight(
+                arena,
+                w4a8,
+                stream,
+                &format!("w4a8_l{idx}_down"),
+                layer.down_proj_f16.as_ref().unwrap(),
+            )?)
+        } else {
+            None
+        };
+        encoded.push((qkv, o_proj, gate_up, down_proj));
+    }
+
+    for (layer, (qkv, o_proj, gate_up, down_proj)) in
+        model.layers.iter_mut().take(layers).zip(encoded)
+    {
+        layer.qkv_w4a8 = qkv;
+        layer.o_proj_w4a8 = o_proj;
+        layer.gate_up_w4a8 = gate_up;
+        layer.down_proj_w4a8 = down_proj;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn maybe_encode_w4a8_layers(
+    _model: &mut rvllm_loader::gemma4_weights::Gemma4LoadedModel,
+    _arena: &HbmArena<'static>,
+    _w4a8: &rvllm_cutlass::W4a8Lib,
+    _stream: u64,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn encode_w4a8_weight(
+    arena: &HbmArena<'static>,
+    w4a8: &rvllm_cutlass::W4a8Lib,
+    stream: u64,
+    name: &str,
+    src: &F16Weight,
+) -> Result<W4a8Weight> {
+    let group_size = 128usize;
+    if src.shape.len() != 2 || src.shape[1] % group_size != 0 {
+        return Err(RvllmError::config(
+            ConfigError::InvalidField {
+                name: "RVLLM_W4A8_ENCODE_LAYERS",
+                reason: format!("{} shape {:?} is not W4A8-compatible", name, src.shape),
+            },
+            "RVLLM_W4A8_ENCODE_LAYERS",
+        ));
+    }
+    let n = src.shape[0] as i32;
+    let k = src.shape[1] as i32;
+    let int4_bytes = w4a8.int4_reordered_bytes(n, k);
+    let scales_bytes = src.shape[0] * (src.shape[1] / group_size) * 8;
+
+    let int4_name = Box::leak(format!("{name}_int4").into_boxed_str());
+    let scales_name = Box::leak(format!("{name}_scales").into_boxed_str());
+    let int4 = arena.region(int4_name, int4_bytes, 128)?;
+    let scales = arena.region(scales_name, scales_bytes, 16)?;
+
+    let ck = arena.checkpoint();
+    let ws_name = Box::leak(format!("{name}_scale_ws").into_boxed_str());
+    let scale_ws_bytes = src.shape[0] * (src.shape[1] / group_size) * 4;
+    let scale_ws = arena.region(ws_name, scale_ws_bytes, 16)?;
+    let scale_ws_ptr = scale_ws.device_ptr();
+    unsafe {
+        w4a8.encode_fp16(
+            src.offset_bytes,
+            n,
+            k,
+            group_size as i32,
+            int4.device_ptr(),
+            scales.device_ptr(),
+            scale_ws_ptr,
+            true,
+            stream,
+        )?;
+        let rc = cudarc::driver::sys::cuStreamSynchronize(stream as _);
+        if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::cuda(
+                "encode_w4a8_weight synchronize",
+                CudaErrorKind::LaunchFailed,
+                CudaCtx {
+                    stream,
+                    kernel: "rvllm_w4a8_encode_weight_fp16",
+                    launch: None,
+                    device: -1,
+                },
+            ));
+        }
+        drop(scale_ws);
+        arena.restore(ck);
+    }
+
+    Ok(W4a8Weight {
+        int4_ptr: int4.device_ptr(),
+        scales_ptr: scales.device_ptr(),
+        shape: src.shape.clone(),
+        group_size,
+        int4_bytes,
+        scales_bytes,
+    })
+}
+
 impl Gemma4Bringup {
     pub fn load(paths: Gemma4EnginePaths, arena_bytes: usize) -> Result<Self> {
         let ctx = Arc::new(CudaContextHandle::init(0)?);
@@ -175,7 +396,8 @@ impl Gemma4Bringup {
 
         let arch = rvllm_loader::gemma4_arch::Gemma4Arch::from_dir(&paths.model_dir)?;
         let rotorquant = RotorQuantConfig::from_env_for_plan(&experiment)?;
-        let model = rvllm_loader::gemma4_load::load_gemma4_model(&paths.model_dir, &arena, &arch)?;
+        let mut model =
+            rvllm_loader::gemma4_load::load_gemma4_model(&paths.model_dir, &arena, &arch)?;
 
         // On sm_121 the arena is `cuMemAllocManaged` pages that fault
         // to the GPU on first touch. After the weight upload the
@@ -311,6 +533,9 @@ impl Gemma4Bringup {
         } else {
             None
         };
+        if let Some(w4a8_lib) = w4a8.as_ref() {
+            maybe_encode_w4a8_layers(&mut model, &arena, w4a8_lib, stream.raw())?;
+        }
 
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
         let cublaslt_ws_region = arena.region("cublaslt_ws", cublaslt_ws_bytes, 256)?;
@@ -706,6 +931,10 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    qkv_w4a8: w4a8_ptrs(layer.qkv_w4a8.as_ref()),
+                    o_w4a8: w4a8_ptrs(layer.o_proj_w4a8.as_ref()),
+                    gate_up_w4a8: w4a8_ptrs(layer.gate_up_w4a8.as_ref()),
+                    down_w4a8: w4a8_ptrs(layer.down_proj_w4a8.as_ref()),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -757,6 +986,7 @@ impl Gemma4Bringup {
                     &meta,
                     &self.cublaslt,
                     &self.cutlass,
+                    self.w4a8.as_ref(),
                     &self.sliding_attention,
                     &self.global_attention,
                     residual_ptr,
@@ -1166,6 +1396,10 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    qkv_w4a8: w4a8_ptrs(layer.qkv_w4a8.as_ref()),
+                    o_w4a8: w4a8_ptrs(layer.o_proj_w4a8.as_ref()),
+                    gate_up_w4a8: w4a8_ptrs(layer.gate_up_w4a8.as_ref()),
+                    down_w4a8: w4a8_ptrs(layer.down_proj_w4a8.as_ref()),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -1217,6 +1451,7 @@ impl Gemma4Bringup {
                     &meta,
                     &self.cublaslt,
                     &self.cutlass,
+                    self.w4a8.as_ref(),
                     &self.sliding_attention,
                     &self.global_attention,
                     residual_ptr,
@@ -1841,6 +2076,10 @@ impl Gemma4Bringup {
                     o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                     gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                     down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                    qkv_w4a8: w4a8_ptrs(layer.qkv_w4a8.as_ref()),
+                    o_w4a8: w4a8_ptrs(layer.o_proj_w4a8.as_ref()),
+                    gate_up_w4a8: w4a8_ptrs(layer.gate_up_w4a8.as_ref()),
+                    down_w4a8: w4a8_ptrs(layer.down_proj_w4a8.as_ref()),
                 };
                 let k_out = q_base + (q_dim as u64) * 2;
                 let v_out = k_out + (kv_dim as u64) * 2;
@@ -1901,6 +2140,7 @@ impl Gemma4Bringup {
                     &meta,
                     &self.cublaslt,
                     &self.cutlass,
+                    self.w4a8.as_ref(),
                     &self.sliding_attention,
                     &self.global_attention,
                     residual_ptr,
@@ -2161,6 +2401,10 @@ impl Gemma4Bringup {
                         o_blockscale: layer.o_proj.blockscale_ptr.unwrap_or(0),
                         gate_up_blockscale: layer.gate_up.blockscale_ptr.unwrap_or(0),
                         down_blockscale: layer.down_proj.blockscale_ptr.unwrap_or(0),
+                        qkv_w4a8: w4a8_ptrs(layer.qkv_w4a8.as_ref()),
+                        o_w4a8: w4a8_ptrs(layer.o_proj_w4a8.as_ref()),
+                        gate_up_w4a8: w4a8_ptrs(layer.gate_up_w4a8.as_ref()),
+                        down_w4a8: w4a8_ptrs(layer.down_proj_w4a8.as_ref()),
                     };
                     // Row-major [num_tokens, q_dim+2*kv_dim]: k_out / v_out
                     // point at row 0's K / V sub-slice. The rmsnorm kernel
@@ -2227,6 +2471,7 @@ impl Gemma4Bringup {
                         &meta,
                         &self.cublaslt,
                         &self.cutlass,
+                        self.w4a8.as_ref(),
                         &self.sliding_attention,
                         &self.global_attention,
                         residual_ptr,

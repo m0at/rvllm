@@ -32,6 +32,22 @@ type W4a8GemmFn = unsafe extern "C" fn(
 ) -> i32;
 
 #[cfg(feature = "cuda")]
+type W4a8RowscaleGemmFn = unsafe extern "C" fn(
+    a_fp8: *const std::ffi::c_void,
+    a_scales: *const f32,
+    b_int4_reordered: *const std::ffi::c_void,
+    b_scales_packed: *const std::ffi::c_void,
+    d_f16: *mut std::ffi::c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    group_size: i32,
+    workspace: *mut std::ffi::c_void,
+    workspace_bytes: usize,
+    stream: *mut std::ffi::c_void,
+) -> i32;
+
+#[cfg(feature = "cuda")]
 type W4a8WorkspaceFn = unsafe extern "C" fn(m: i32, n: i32, k: i32) -> usize;
 
 #[cfg(feature = "cuda")]
@@ -59,6 +75,8 @@ pub struct W4a8Lib {
     _lib: libloading::Library,
     #[cfg(feature = "cuda")]
     gemm_run: W4a8GemmFn,
+    #[cfg(feature = "cuda")]
+    gemm_rowscale: Option<W4a8RowscaleGemmFn>,
     #[cfg(feature = "cuda")]
     gemm_ws: W4a8WorkspaceFn,
     #[cfg(feature = "cuda")]
@@ -121,6 +139,8 @@ impl W4a8Lib {
                         },
                     )
                 })?;
+            let rowscale_sym: Option<libloading::Symbol<W4a8RowscaleGemmFn>> =
+                _lib.get(b"rvllm_w4a8_gemm_run_rowscale\0").ok();
             let enc_sym: libloading::Symbol<W4a8EncodeFp16Fn> =
                 _lib.get(b"rvllm_w4a8_encode_weight_fp16\0").map_err(|_| {
                     RvllmError::cuda(
@@ -149,6 +169,7 @@ impl W4a8Lib {
                     )
                 })?;
             let gemm_run = *run_sym;
+            let gemm_rowscale = rowscale_sym.map(|sym| *sym);
             let gemm_ws = *ws_sym;
             let int4_bytes = *bytes_sym;
             let fn_encode_fp16 = *enc_sym;
@@ -156,6 +177,7 @@ impl W4a8Lib {
                 so_path: path,
                 _lib,
                 gemm_run,
+                gemm_rowscale,
                 gemm_ws,
                 int4_bytes,
                 fn_encode_fp16,
@@ -248,6 +270,67 @@ impl W4a8Lib {
                 CudaCtx {
                     stream,
                     kernel: "rvllm_w4a8_gemm_run",
+                    launch: None,
+                    device: -1,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// D_f16 = a_scales[m] * (A_fp8 * B_w4). The row scale pointer is
+    /// the per-token activation scale vector produced by rvLLM's FP8
+    /// quantizers.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn w4a8_gemm_rowscale(
+        &self,
+        a_fp8: u64,
+        a_scales: u64,
+        b_int4_reordered: u64,
+        b_scales_packed: u64,
+        d_f16: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        workspace: u64,
+        workspace_bytes: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(gemm_rowscale) = self.gemm_rowscale else {
+            return Err(RvllmError::cuda(
+                "dlsym rvllm_w4a8_gemm_run_rowscale",
+                CudaErrorKind::LaunchFailed,
+                CudaCtx {
+                    stream,
+                    kernel: "rvllm_w4a8_gemm_run_rowscale",
+                    launch: None,
+                    device: -1,
+                },
+            ));
+        };
+        let rc = gemm_rowscale(
+            a_fp8 as *const _,
+            a_scales as *const f32,
+            b_int4_reordered as *const _,
+            b_scales_packed as *const _,
+            d_f16 as *mut _,
+            m,
+            n,
+            k,
+            group_size,
+            workspace as *mut _,
+            workspace_bytes,
+            stream as *mut _,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cuda(
+                "w4a8_gemm_run_rowscale",
+                CudaErrorKind::LaunchFailed,
+                CudaCtx {
+                    stream,
+                    kernel: "rvllm_w4a8_gemm_run_rowscale",
                     launch: None,
                     device: -1,
                 },

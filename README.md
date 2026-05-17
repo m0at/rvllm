@@ -267,6 +267,22 @@ RVLLM_KERNELS_DIR=/workspace/rvllm/kernels \
   ./v3/target/release/rvllm-bench
 ```
 
+There is also a real-dispatch bring-up mode for W4A8 from F16 source weights.
+It is deliberately off by default because naive symmetric INT4 is not AWQ and
+is not production quality. Current H100 smoke results show `down` projection is
+numerically tolerable for a few early layers, while `qkv`, `o`, and `gate_up`
+need AWQ calibration/packing before serving.
+
+```bash
+RVLLM_EXPERIMENT_WEIGHT=w4a8-awq \
+RVLLM_W4A8=1 \
+RVLLM_W4A8_SO=/workspace/rvllm/kernels/sm_90/libw4a8_gemm.so \
+RVLLM_F16_LAYERS=8 \
+RVLLM_W4A8_ENCODE_LAYERS=8 \
+RVLLM_W4A8_MODULES=down \
+  ./v3/target/release/rvllm-ppl
+```
+
 Experiment controller axes:
 
 ```bash
