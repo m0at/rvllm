@@ -51,8 +51,21 @@ fn allowed_deps() -> HashMap<&'static str, HashSet<&'static str>> {
             "rvllm-sampling",
         ]),
     );
-    m.insert("rvllm-serve", s(&["rvllm-core", "rvllm-runtime"]));
-    m.insert("rvllm-bench", s(&["rvllm-core", "rvllm-runtime"]));
+    m.insert(
+        "rvllm-serve",
+        s(&["rvllm-core", "rvllm-kernels", "rvllm-mem", "rvllm-runtime"]),
+    );
+    m.insert(
+        "rvllm-bench",
+        s(&[
+            "rvllm-core",
+            "rvllm-runtime",
+            "rvllm-fused",
+            "rvllm-mem",
+            "rvllm-kernels",
+            "rvllm-cutlass",
+        ]),
+    );
     m.insert("rvllm-deploy", s(&["rvllm-core"]));
     m.insert("rvllm-invariants", s(&[]));
     m

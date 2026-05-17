@@ -31,7 +31,9 @@ rvllm-zig       — bpe.zig topk.zig metapack.zig (FFI shim in rvllm-core)
 tools/          — parity, perplexity, bench-gate, autotune (binaries, not crates)
 ```
 
-DAG enforced by `cargo deny` + `tests/dag.rs`. Cycles forbidden. No crate may import from a sibling at its own level.
+DAG enforced by `cargo deny` + `tests/dag.rs`. Cycles forbidden. Runtime stays
+the main orchestrator; `rvllm-serve` may forward CUDA feature dependencies, and
+`rvllm-bench` may depend on low-level crates used by its direct GPU harnesses.
 
 ### 1.2 Conflict resolutions
 
