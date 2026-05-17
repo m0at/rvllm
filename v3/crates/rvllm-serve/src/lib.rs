@@ -1,3 +1,4 @@
+pub mod experiment_headers;
 pub mod http;
 pub mod openai;
 pub mod worker;

@@ -134,8 +134,9 @@ impl W4a8Lib {
                         },
                     )
                 })?;
-            let bytes_sym: libloading::Symbol<W4a8Int4BytesFn> =
-                _lib.get(b"rvllm_w4a8_int4_reordered_bytes\0").map_err(|_| {
+            let bytes_sym: libloading::Symbol<W4a8Int4BytesFn> = _lib
+                .get(b"rvllm_w4a8_int4_reordered_bytes\0")
+                .map_err(|_| {
                     RvllmError::cuda(
                         "dlsym rvllm_w4a8_int4_reordered_bytes",
                         CudaErrorKind::LaunchFailed,

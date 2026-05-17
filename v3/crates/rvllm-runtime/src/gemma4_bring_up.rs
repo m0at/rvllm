@@ -17,6 +17,7 @@ use rvllm_cutlass::{CublasLt, CutlassBackend, Policy};
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
+use crate::experiment_controller::{ExperimentController, ExperimentPlan, KvPath, WeightPath};
 use crate::gemma4_layer_exec::Gemma4LayerKernels;
 
 pub use crate::bring_up::HbmArenaCheckpoint;
@@ -49,7 +50,21 @@ pub struct RotorQuantConfig {
 
 impl RotorQuantConfig {
     pub fn from_env() -> Result<Self> {
-        let raw_mode = std::env::var("RVLLM_ROTORQUANT").unwrap_or_else(|_| "off".into());
+        Self::from_env_enabled(false)
+    }
+
+    pub fn from_env_for_plan(plan: &ExperimentPlan) -> Result<Self> {
+        Self::from_env_enabled(matches!(plan.kv_path, KvPath::RotorQuant))
+    }
+
+    fn from_env_enabled(enabled_by_plan: bool) -> Result<Self> {
+        let raw_mode = if enabled_by_plan {
+            std::env::var("RVLLM_ROTORQUANT").unwrap_or_else(|_| "rotor_cl3".into())
+        } else if std::env::var(crate::experiment_controller::ENV_KV_PATH).is_ok() {
+            "off".into()
+        } else {
+            std::env::var("RVLLM_ROTORQUANT").unwrap_or_else(|_| "off".into())
+        };
         let mode = match raw_mode.as_str() {
             "0" | "off" | "false" => RotorQuantMode::Off,
             "1" | "rotor" | "rotor_cl3" => RotorQuantMode::RotorCl3,
@@ -187,6 +202,7 @@ pub struct Gemma4Bringup {
     pub cutlass: CutlassBackend,
     pub w4a8: Option<rvllm_cutlass::W4a8Lib>,
     pub rotorquant: RotorQuantConfig,
+    pub experiment: ExperimentPlan,
     pub cublaslt: CublasLt,
     pub cublaslt_ws: HbmArenaCheckpoint,
     pub policy: Policy,
@@ -214,6 +230,9 @@ impl Gemma4Bringup {
         #[cfg(not(feature = "cuda"))]
         let compile_target: Option<rvllm_core::CompileTarget> = None;
 
+        let experiment = ExperimentController::from_env()?.into_plan();
+        tracing::info!(experiment = %experiment.describe(), "rvLLM experiment plan");
+
         // Arena backing picked per compute capability — see `Bringup::load`
         // in bring_up.rs for the full rationale (GB10 has no dedicated HBM,
         // cuMemAllocManaged is the right allocator there).
@@ -235,7 +254,7 @@ impl Gemma4Bringup {
         let stream = Stream::new(&ctx)?;
 
         let arch = rvllm_loader::gemma4_arch::Gemma4Arch::from_dir(&paths.model_dir)?;
-        let rotorquant = RotorQuantConfig::from_env()?;
+        let rotorquant = RotorQuantConfig::from_env_for_plan(&experiment)?;
         let model = rvllm_loader::gemma4_load::load_gemma4_model(&paths.model_dir, &arena, &arch)?;
 
         // On sm_121 the arena is `cuMemAllocManaged` pages that fault
@@ -364,7 +383,7 @@ impl Gemma4Bringup {
         // for the full rationale (sm_121 has no compatible `.so`).
         let cutlass =
             CutlassBackend::load_for(compile_target, paths.cutlass_so.clone(), &variants)?;
-        let w4a8 = if std::env::var("RVLLM_W4A8").map_or(false, |v| v == "1") {
+        let w4a8 = if matches!(experiment.weight_path, WeightPath::W4A8Awq) {
             let path = std::env::var_os("RVLLM_W4A8_SO")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| kernels_dir.join("libw4a8_gemm.so"));
@@ -397,6 +416,7 @@ impl Gemma4Bringup {
             cutlass,
             w4a8,
             rotorquant,
+            experiment,
             cublaslt,
             cublaslt_ws,
             sliding_attention,

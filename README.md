@@ -20,10 +20,15 @@ This branch adds the AWQ/W4A8 and RotorQuant groundwork around that 31B path:
 - H100-verified CUTLASS W4A8 wrapper for FP8 activations x int4 weights.
 - Safe reordered-int4 allocation sizing via `rvllm_w4a8_int4_reordered_bytes`.
 - Rust `rvllm-cutlass` bindings and dynamic loader support for the W4A8 shared object.
-- Optional runtime gate through `RVLLM_W4A8=1` and `RVLLM_W4A8_SO`.
+- Optional runtime gate through `RVLLM_EXPERIMENT_WEIGHT=w4a8-awq` plus `RVLLM_W4A8_SO` (`RVLLM_W4A8=1` remains accepted as a legacy alias).
 - Typed W4A8 weight slots in the Gemma 4 loader, ready for AWQ-packed tensors.
-- RotorQuant env/config scaffold for `rotor_cl3`, `planar2`, and `iso4` modes.
+- AWQ metadata detection for common packed tensor names and quantization config fields.
+- RotorQuant env/config scaffold for `rotor_cl3`, `planar2`, and `iso4` modes, gated through `RVLLM_EXPERIMENT_KV=rotorquant`.
+- A top-level experiment controller covering weight, KV, attention, architecture, and validation axes, with server response headers for active lanes.
+- A bounded H100 matrix runner for W4A8 smoke, server chat, B=1/B=128 throughput, and PPL smoke.
 - A 60-task integration tracker in [`docs/awq-rotorquant-task-queue.md`](docs/awq-rotorquant-task-queue.md).
+- A focused 50-task experiment board in [`docs/experiment-50-task-board.md`](docs/experiment-50-task-board.md).
+- Focused support notes for [`SM75`](docs/sm75-support.md), [`AWQ`](docs/awq-support.md), [`RotorQuant KV`](docs/rotorquant-kv-layout.md), and lane go/no-go in [`docs/experiment-go-nogo.md`](docs/experiment-go-nogo.md).
 
 W4A8 is kernel-verified on H100 but not the default serving path yet. FP8 remains
 the default 31B route until AWQ tensor ingest, W4A8 dispatch, and RotorQuant
@@ -255,10 +260,29 @@ with CUTLASS available, then enable it explicitly:
 CUTLASS_DIR=/workspace/cutlass bash kernels/build_w4a8.sh
 
 RVLLM_W4A8=1 \
+RVLLM_EXPERIMENT_WEIGHT=w4a8-awq \
 RVLLM_W4A8_SO=/workspace/rvllm/kernels/sm_90/libw4a8_gemm.so \
 RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic \
 RVLLM_KERNELS_DIR=/workspace/rvllm/kernels \
   ./v3/target/release/rvllm-bench
+```
+
+Experiment controller axes:
+
+```bash
+RVLLM_EXPERIMENT_WEIGHT=fp8-default|w4a8-awq|awq-metadata-only
+RVLLM_EXPERIMENT_KV=f16|fp8|rotorquant
+RVLLM_EXPERIMENT_ATTENTION=auto|fa3|fa2-fallback
+RVLLM_EXPERIMENT_ARCH=auto|force-sm75-compat|force-hopper
+RVLLM_EXPERIMENT_VALIDATION=smoke|ppl|throughput|chat
+```
+
+For bounded H100 verification:
+
+```bash
+H100_MATRIX_EXPERIMENTS=baseline,w4a8,rotor_cl3 \
+H100_MATRIX_TESTS=server,bench,ppl \
+  scripts/h100_experiment_matrix.sh
 ```
 
 Kernel smoke on H100:

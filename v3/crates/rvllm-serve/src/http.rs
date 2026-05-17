@@ -273,11 +273,13 @@ fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<(), String> {
+    let experiment_headers = experiment_headers();
     let head = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\n{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\n{}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
         status_text(status),
         content_type,
         cors_headers(),
+        experiment_headers,
         body.len(),
     );
     stream
@@ -287,9 +289,11 @@ fn write_response(
 }
 
 fn write_stream_headers(stream: &mut TcpStream) -> Result<(), String> {
+    let experiment_headers = experiment_headers();
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{}\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{}\r\n{}Cache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
         cors_headers(),
+        experiment_headers,
     );
     stream
         .write_all(head.as_bytes())
@@ -323,6 +327,28 @@ fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), String> {
 
 fn cors_headers() -> &'static str {
     "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization, content-type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS"
+}
+
+fn experiment_headers() -> String {
+    let labels = crate::experiment_headers::from_env();
+    if labels.is_empty() {
+        return String::new();
+    }
+
+    let mut headers = String::new();
+    for (name, value) in crate::experiment_headers::header_pairs(&labels) {
+        headers.push_str(name);
+        headers.push_str(": ");
+        headers.push_str(&value);
+        headers.push_str("\r\n");
+    }
+    let metadata = crate::experiment_headers::metadata_value(&labels);
+    if !metadata.is_empty() {
+        headers.push_str("x-rvllm-experiment: ");
+        headers.push_str(&metadata);
+        headers.push_str("\r\n");
+    }
+    headers
 }
 
 fn status_text(status: u16) -> String {
