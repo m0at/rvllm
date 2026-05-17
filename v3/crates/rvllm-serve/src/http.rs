@@ -186,7 +186,7 @@ fn write_generate_error(stream: &mut TcpStream, err: GenerateError) -> Result<()
 fn api_error_for_generate(err: GenerateError) -> ApiError {
     match err {
         GenerateError::Busy { max_inflight } => ApiError::busy(format!(
-            "waiting for available inference slot; max_inflight_requests={max_inflight}"
+            "All {max_inflight} agent seats are in use at the moment. Please subscribe to a paid plan to help us expand the number of people who can use agents concurrently."
         )),
         GenerateError::Engine(e) => ApiError::internal(e),
     }
