@@ -150,6 +150,8 @@ fn load_cuda_engine(config: ServeConfig) -> Result<EngineState, String> {
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| format!("tokenizer load {}: {e}", tokenizer_path.display()))?;
 
+    let stop_token_ids = stop_token_ids(&tokenizer, &model_dir);
+
     let paths = Gemma4EnginePaths {
         model_dir,
         kernels_dir: env_path("RVLLM_KERNELS_DIR")?,
@@ -175,8 +177,6 @@ fn load_cuda_engine(config: ServeConfig) -> Result<EngineState, String> {
     let fn_argmax = bringup.fused.fn_argmax;
 
     let bos_id = tokenizer.token_to_id("<bos>").or(Some(2));
-    let stop_token_ids = stop_token_ids(&tokenizer);
-
     tracing::info!(
         model = %config.served_model_name,
         stop_ids = ?stop_token_ids,
@@ -292,7 +292,7 @@ fn arena_bytes() -> Result<usize, String> {
 }
 
 #[cfg(feature = "cuda")]
-fn stop_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
+fn stop_token_ids(tokenizer: &Tokenizer, model_dir: &std::path::Path) -> Vec<u32> {
     if let Ok(raw) = std::env::var("RVLLM_EOS") {
         let ids: Vec<u32> = raw
             .split(',')
@@ -304,6 +304,28 @@ fn stop_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
     }
 
     let mut ids = Vec::new();
+    let generation_config = model_dir.join("generation_config.json");
+    if let Ok(raw) = std::fs::read_to_string(&generation_config) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+            match json.get("eos_token_id") {
+                Some(serde_json::Value::Number(n)) => {
+                    if let Some(id) = n.as_u64().and_then(|v| u32::try_from(v).ok()) {
+                        ids.push(id);
+                    }
+                }
+                Some(serde_json::Value::Array(values)) => {
+                    for value in values {
+                        if let Some(id) = value.as_u64().and_then(|v| u32::try_from(v).ok()) {
+                            if !ids.contains(&id) {
+                                ids.push(id);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     for token in ["<turn|>", "<eos>", "<|tool_response>", "</s>"] {
         if let Some(id) = tokenizer.token_to_id(token) {
             if !ids.contains(&id) {

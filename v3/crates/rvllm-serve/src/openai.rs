@@ -181,32 +181,35 @@ pub fn render_gemma_chat(messages: &[ChatMessage]) -> Result<String, ApiError> {
     }
 
     let mut out = String::new();
-    let mut system = String::new();
     let mut saw_turn = false;
+    let mut pending_system = String::new();
 
     for msg in messages {
         let role = msg.role.as_str();
         let text = msg.content.text();
         match role {
             "system" | "developer" => {
-                append_system(&mut system, &text);
+                if saw_turn {
+                    return Err(ApiError::invalid(
+                        "Gemma 4 expects system/developer messages before conversation turns",
+                    ));
+                }
+                append_system(&mut pending_system, &text);
             }
             "user" => {
-                let merged = if system.is_empty() {
-                    text
-                } else {
-                    let mut s = String::new();
-                    s.push_str(system.trim_end());
-                    s.push_str("\n\n");
-                    s.push_str(text.trim_end());
-                    system.clear();
-                    s
-                };
-                push_turn(&mut out, "user", &merged);
+                if !pending_system.is_empty() {
+                    push_turn(&mut out, "system", &pending_system);
+                    pending_system.clear();
+                }
+                push_turn(&mut out, "user", &text);
                 saw_turn = true;
             }
             "assistant" => {
-                push_turn(&mut out, "model", &text);
+                if !pending_system.is_empty() {
+                    push_turn(&mut out, "system", &pending_system);
+                    pending_system.clear();
+                }
+                push_model_turn(&mut out, &text);
                 saw_turn = true;
             }
             other => {
@@ -217,8 +220,8 @@ pub fn render_gemma_chat(messages: &[ChatMessage]) -> Result<String, ApiError> {
         }
     }
 
-    if !system.is_empty() {
-        push_turn(&mut out, "user", &system);
+    if !pending_system.is_empty() {
+        push_turn(&mut out, "system", &pending_system);
         saw_turn = true;
     }
     if !saw_turn {
@@ -370,6 +373,12 @@ fn push_turn(out: &mut String, role: &str, text: &str) {
     out.push_str("<turn|>\n");
 }
 
+fn push_model_turn(out: &mut String, text: &str) {
+    out.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+    out.push_str(text.trim_end());
+    out.push_str("<turn|>\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,9 +400,20 @@ mod tests {
     }
 
     #[test]
-    fn folds_system_into_first_user() {
+    fn renders_native_system_turn() {
         let prompt = render_gemma_chat(&[msg("system", "be brief"), msg("user", "hi")]).unwrap();
-        assert!(prompt.contains("be brief\n\nhi"));
+        assert!(prompt.starts_with("<|turn>system\nbe brief<turn|>\n<|turn>user\nhi"));
+    }
+
+    #[test]
+    fn wraps_assistant_turns_with_empty_thought_channel() {
+        let prompt = render_gemma_chat(&[
+            msg("user", "hi"),
+            msg("assistant", "hello"),
+            msg("user", "again"),
+        ])
+        .unwrap();
+        assert!(prompt.contains("<|turn>model\n<|channel>thought\n<channel|>hello<turn|>\n"));
     }
 
     #[test]
@@ -410,6 +430,6 @@ mod tests {
         let prepared = prepare_chat_request(req, "served", 16, Some("server system")).unwrap();
         assert!(prepared
             .prompt
-            .contains("server system\n\nrequest system\n\nhi"));
+            .starts_with("<|turn>system\nserver system\n\nrequest system<turn|>\n"));
     }
 }

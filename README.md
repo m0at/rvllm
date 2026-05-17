@@ -228,13 +228,17 @@ The CUTLASS channelscale kernel uses a custom SM90 EVT epilogue that applies per
 bash kernels/build.sh               # fused PTX
 bash kernels/build_cutlass_so.sh    # libcutlass_kernels.so
 bash kernels/build_fa3.sh           # libfa3_kernels.so
+# Fallback attention .so for Gemma 4 global hdim=512 layers.
+nvcc -shared -o kernels/sm_90/libfa_sm89_kernels.so \
+  v3/kernels/paged_attention_sm89.cu \
+  -arch=sm_89 -O3 --use_fast_math -Xcompiler -fPIC
 
 # Build
 cargo build --release --features cuda --manifest-path v3/Cargo.toml -p rvllm-bench
 
 # Run
 RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic \
-RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels \
 RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
 RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
 RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
@@ -253,7 +257,7 @@ CUTLASS_DIR=/workspace/cutlass bash kernels/build_w4a8.sh
 RVLLM_W4A8=1 \
 RVLLM_W4A8_SO=/workspace/rvllm/kernels/sm_90/libw4a8_gemm.so \
 RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic \
-RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels \
   ./v3/target/release/rvllm-bench
 ```
 
@@ -272,7 +276,7 @@ compute-sanitizer --tool memcheck ./kernels/w4a8_smoke
 ```bash
 # Perplexity
 RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic \
-RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels \
 RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
 RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
 RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
@@ -281,7 +285,7 @@ RVLLM_ARENA_GB=74 RVLLM_PPL_CHUNK=32 RVLLM_PPL_CHUNKS=1 \
 
 # Prompt quality and B=1 generation tok/s
 RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic \
-RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90 \
+RVLLM_KERNELS_DIR=/workspace/rvllm/kernels \
 RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so \
 RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so \
 RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json \
@@ -299,7 +303,7 @@ through `/v1/chat/completions`.
 ```bash
 export CUDA_ARCH=sm_90
 export RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it-FP8-Dynamic
-export RVLLM_KERNELS_DIR=/workspace/rvllm/kernels/sm_90
+export RVLLM_KERNELS_DIR=/workspace/rvllm/kernels
 export RVLLM_CUTLASS_SO=/workspace/rvllm/kernels/sm_90/libcutlass_kernels.so
 export RVLLM_FA3_SO=/workspace/rvllm/kernels/sm_90/libfa3_kernels.so
 export RVLLM_POLICY=/workspace/rvllm/kernels/sm_90/policy.json
@@ -309,6 +313,10 @@ export RUST_LOG=info
 bash kernels/build.sh sm_90
 bash kernels/build_cutlass_so.sh sm_90
 bash kernels/build_fa3.sh
+# Fallback attention .so for Gemma 4 global hdim=512 layers.
+nvcc -shared -o kernels/sm_90/libfa_sm89_kernels.so \
+  v3/kernels/paged_attention_sm89.cu \
+  -arch=sm_89 -O3 --use_fast_math -Xcompiler -fPIC
 cargo build --release --features cuda,cublaslt --manifest-path v3/Cargo.toml -p rvllm-serve
 
 ./v3/target/release/rvllm-server \
