@@ -1,6 +1,6 @@
 # AWQ support
 
-This branch only adds AWQ metadata inspection and tiny CPU reference helpers. It does not add serving dispatch, GPU kernels, or weight loading.
+This branch adds AWQ metadata inspection, W4A8 candidate classification, and tiny CPU reference helpers. It does not add serving dispatch, GPU kernels, or weight loading.
 
 ## Supported metadata detection
 
@@ -23,6 +23,16 @@ This branch only adds AWQ metadata inspection and tiny CPU reference helpers. It
   - `symmetric` as the inverse of `zero_point`
 
 `AwqTensorSet::is_ready()` requires complete tensor names plus valid AWQ semantics. Missing `bits` or `group_size` is rejected. Missing `zero_point` is inferred from zero-point tensors: qzeros present means asymmetric zero-point AWQ; no zero-point tensor means symmetric AWQ.
+
+`AwqTensorSet::w4a8_candidate()` is the loader-side gate for the next phase. It
+returns:
+
+- `Ready` only for a complete, single-layout, 4-bit AWQ tensor set.
+- `MetadataOnly` for config-only checkpoints.
+- `MissingTensors` for partial tensor sets.
+- `UnsupportedFormat` for mixed AWQ naming/layout conventions.
+- `InvalidConfig` for unsupported bits, missing group size, or zero-point
+  contradictions.
 
 ## Supported CPU reference helpers
 

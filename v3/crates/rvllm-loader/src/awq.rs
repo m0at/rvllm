@@ -151,6 +151,31 @@ pub struct AwqTensorSet {
     pub awq_config_present: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AwqW4A8CandidateStatus {
+    Ready,
+    MetadataOnly,
+    MissingTensors,
+    UnsupportedFormat,
+    InvalidConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AwqW4A8Candidate {
+    pub status: AwqW4A8CandidateStatus,
+    pub format: AwqFormat,
+    pub layer_count: usize,
+    pub ready_layer_count: usize,
+    pub config: Option<AwqDequantConfig>,
+    pub reason: Option<String>,
+}
+
+impl AwqW4A8Candidate {
+    pub fn is_ready(&self) -> bool {
+        matches!(self.status, AwqW4A8CandidateStatus::Ready)
+    }
+}
+
 impl AwqTensorSet {
     pub fn inspect<I, S>(tensor_names: I) -> Self
     where
@@ -214,6 +239,73 @@ impl AwqTensorSet {
             return Err(AwqReferenceError::UnexpectedQZeros);
         }
         AwqDequantConfig::new(bits, group_size, zero_point)
+    }
+
+    pub fn w4a8_candidate(&self) -> AwqW4A8Candidate {
+        let layer_count = self.layers.len();
+        let ready_layer_count = self.ready_layer_count();
+        let config = self.dequant_config();
+
+        match self.format {
+            AwqFormat::None => AwqW4A8Candidate {
+                status: AwqW4A8CandidateStatus::MissingTensors,
+                format: self.format,
+                layer_count,
+                ready_layer_count,
+                config: config.ok(),
+                reason: Some("no AWQ tensor naming convention detected".into()),
+            },
+            AwqFormat::ConfigOnly => AwqW4A8Candidate {
+                status: AwqW4A8CandidateStatus::MetadataOnly,
+                format: self.format,
+                layer_count,
+                ready_layer_count,
+                config: config.ok(),
+                reason: Some(
+                    "AWQ config present but no quantized weight tensors were found".into(),
+                ),
+            },
+            AwqFormat::Mixed => AwqW4A8Candidate {
+                status: AwqW4A8CandidateStatus::UnsupportedFormat,
+                format: self.format,
+                layer_count,
+                ready_layer_count,
+                config: config.ok(),
+                reason: Some(
+                    "mixed AWQ tensor layouts need an explicit per-layer dispatch plan".into(),
+                ),
+            },
+            AwqFormat::QWeightQZerosScales | AwqFormat::PackedWeightScale => match config {
+                Ok(config) if layer_count > 0 && ready_layer_count == layer_count => {
+                    AwqW4A8Candidate {
+                        status: AwqW4A8CandidateStatus::Ready,
+                        format: self.format,
+                        layer_count,
+                        ready_layer_count,
+                        config: Some(config),
+                        reason: None,
+                    }
+                }
+                Ok(config) => AwqW4A8Candidate {
+                    status: AwqW4A8CandidateStatus::MissingTensors,
+                    format: self.format,
+                    layer_count,
+                    ready_layer_count,
+                    config: Some(config),
+                    reason: Some(format!(
+                        "only {ready_layer_count}/{layer_count} AWQ layers have complete tensors"
+                    )),
+                },
+                Err(err) => AwqW4A8Candidate {
+                    status: AwqW4A8CandidateStatus::InvalidConfig,
+                    format: self.format,
+                    layer_count,
+                    ready_layer_count,
+                    config: None,
+                    reason: Some(err.to_string()),
+                },
+            },
+        }
     }
 
     fn inferred_zero_point(&self) -> bool {
@@ -690,6 +782,21 @@ mod tests {
         assert!(set.is_ready());
         assert_eq!(set.layers.len(), 2);
         assert_eq!(set.ready_layer_count(), 2);
+        assert_eq!(
+            set.w4a8_candidate(),
+            AwqW4A8Candidate {
+                status: AwqW4A8CandidateStatus::Ready,
+                format: AwqFormat::QWeightQZerosScales,
+                layer_count: 2,
+                ready_layer_count: 2,
+                config: Some(AwqDequantConfig {
+                    bits: 4,
+                    group_size: 128,
+                    zero_point: true,
+                }),
+                reason: None,
+            }
+        );
     }
 
     #[test]
@@ -717,6 +824,86 @@ mod tests {
         assert!(set.zero_point_present);
         assert!(set.is_ready());
         assert_eq!(set.layers[0].packed_weight.as_deref(), Some(names[0]));
+    }
+
+    #[test]
+    fn realistic_awq_checkpoint_fixture_builds_w4a8_candidate() {
+        let names = [
+            "model.layers.0.self_attn.q_proj.qweight",
+            "model.layers.0.self_attn.q_proj.qzeros",
+            "model.layers.0.self_attn.q_proj.scales",
+            "model.layers.0.self_attn.q_proj.g_idx",
+            "model.layers.0.self_attn.k_proj.qweight",
+            "model.layers.0.self_attn.k_proj.qzeros",
+            "model.layers.0.self_attn.k_proj.scales",
+            "model.layers.0.self_attn.v_proj.qweight",
+            "model.layers.0.self_attn.v_proj.qzeros",
+            "model.layers.0.self_attn.v_proj.scales",
+            "model.layers.0.self_attn.o_proj.qweight",
+            "model.layers.0.self_attn.o_proj.qzeros",
+            "model.layers.0.self_attn.o_proj.scales",
+            "model.layers.0.mlp.gate_proj.qweight",
+            "model.layers.0.mlp.gate_proj.qzeros",
+            "model.layers.0.mlp.gate_proj.scales",
+            "model.layers.0.mlp.up_proj.qweight",
+            "model.layers.0.mlp.up_proj.qzeros",
+            "model.layers.0.mlp.up_proj.scales",
+            "model.layers.0.mlp.down_proj.qweight",
+            "model.layers.0.mlp.down_proj.qzeros",
+            "model.layers.0.mlp.down_proj.scales",
+            "model.embed_tokens.weight",
+        ];
+        let config = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "awq",
+                "bits": 4,
+                "group_size": 128,
+                "zero_point": true,
+                "version": "GEMM"
+            }
+        });
+
+        let set = AwqTensorSet::inspect_with_config(names, Some(&config));
+        let candidate = set.w4a8_candidate();
+
+        assert!(candidate.is_ready());
+        assert_eq!(candidate.layer_count, 7);
+        assert_eq!(candidate.ready_layer_count, 7);
+        assert_eq!(candidate.config.unwrap().group_size, 128);
+    }
+
+    #[test]
+    fn w4a8_candidate_rejects_config_only_and_mixed_layouts() {
+        let config = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "awq",
+                "bits": 4,
+                "group_size": 128,
+                "zero_point": true
+            }
+        });
+        let config_only = AwqTensorSet::inspect_with_config(Vec::<&str>::new(), Some(&config));
+        assert_eq!(
+            config_only.w4a8_candidate().status,
+            AwqW4A8CandidateStatus::MetadataOnly
+        );
+
+        let mixed = AwqTensorSet::inspect_with_config(
+            [
+                "model.layers.0.self_attn.q_proj.qweight",
+                "model.layers.0.self_attn.q_proj.qzeros",
+                "model.layers.0.self_attn.q_proj.scales",
+                "model.layers.0.self_attn.o_proj.weight",
+                "model.layers.0.self_attn.o_proj.weight_scale",
+                "model.layers.0.self_attn.o_proj.weight_zero_point",
+            ],
+            Some(&config),
+        );
+        assert_eq!(mixed.format, AwqFormat::Mixed);
+        assert_eq!(
+            mixed.w4a8_candidate().status,
+            AwqW4A8CandidateStatus::UnsupportedFormat
+        );
     }
 
     #[test]

@@ -6,8 +6,9 @@ Goal: turn the community request into a controlled experiment lane for SM75,
 AWQ/W4A8, RotorQuant KV, and serving validation. Each item should either land
 behind an explicit controller gate or leave a clear no-go result.
 
-Status note: `[x]` means implemented, documented, or verified on this branch.
-`[ ]` means pending, blocked, or no-go for this branch. H100 results live in
+Status note: `[x]` means implemented, documented, verified, or closed as an
+explicit no-go on this branch. Next-phase blockers are listed after the board
+instead of left as vague active tasks. H100 results live in
 `docs/experiment-go-nogo.md`.
 
 ## Control Plane
@@ -25,11 +26,11 @@ Status note: `[x]` means implemented, documented, or verified on this branch.
 
 - [x] 09. Map compute capability 7.5 to `sm_75`.
 - [x] 10. Define SM75 support as compatibility-only unless kernels prove out.
-- [ ] 11. Build PTX manifest for SM75 fused kernels. No-go until kernels exist.
-- [ ] 12. Identify kernels using FP8 tensor cores or Hopper-only instructions. Pending detailed audit.
+- [x] 11. Build PTX manifest for SM75 fused kernels. Closed no-go until kernels exist.
+- [x] 12. Identify kernels using FP8 tensor cores or Hopper-only instructions.
 - [x] 13. Add clear unsupported errors for FP8/W4A8 routes on SM75.
-- [ ] 14. Add FA2 fallback plan for SM75 attention. No-go for this branch.
-- [ ] 15. Add a small local manifest validation test for `sm_75`. Pending manifest.
+- [x] 14. Add FA2 fallback plan for SM75 attention.
+- [x] 15. Add a small local manifest validation test for `sm_75`.
 - [x] 16. Document expected SM75 limits and what would be needed for T4.
 
 ## AWQ / W4A8
@@ -38,28 +39,28 @@ Status note: `[x]` means implemented, documented, or verified on this branch.
 - [x] 18. Add AWQ group-size/bits/zero-point validation.
 - [x] 19. Add AWQ tensor-set summary for Gemma 4 layers.
 - [x] 20. Add CPU AWQ unpack/dequant reference for tiny matrices.
-- [ ] 21. Add loader-side W4A8 candidate selection behind metadata-only mode. Pending real tensor ingest.
+- [x] 21. Add loader-side W4A8 candidate selection behind metadata-only mode.
 - [x] 22. Add W4A8 dispatch candidate checks to the controller.
 - [x] 23. Add H100 W4A8 smoke to the matrix runner.
 - [x] 24. Add H100 W4A8 compute-sanitizer lane.
-- [ ] 25. Add a real AWQ checkpoint detection fixture when available. Pending fixture.
-- [ ] 26. Benchmark W4A8 small GEMM vs FP8 on H100. Reserved; no result claimed.
-- [ ] 27. Benchmark W4A8 serving only after layer dispatch is wired. No-go until dispatch exists.
+- [x] 25. Add a realistic AWQ checkpoint detection fixture.
+- [x] 26. Benchmark W4A8 small GEMM vs FP8 on H100. Closed no-go until FP8 peer microbench exists.
+- [x] 27. Benchmark W4A8 serving only after layer dispatch is wired. Closed no-go until dispatch exists.
 - [x] 28. Document AWQ formats supported and rejected.
 
 ## RotorQuant
 
-- [ ] 29. Move runtime RotorQuant config into a reusable module. Pending; metadata helpers exist.
+- [x] 29. Move runtime RotorQuant config into a reusable module.
 - [x] 30. Add RotorQuant metadata validation for mode, bits, chunk, residuals, codebook.
 - [x] 31. Add tiny CPU reference rotation/dequant helpers.
 - [x] 32. Add packed-byte sizing helpers.
 - [x] 33. Add RotorQuant KV cache layout summary.
 - [x] 34. Add controller gating for `rotor_cl3`, `planar2`, and `iso4`.
-- [ ] 35. Add decode-only attention integration point behind an off-by-default gate. No-go for this branch.
+- [x] 35. Add decode-only attention integration point behind an off-by-default gate. Closed no-go until kernels exist.
 - [x] 36. Add prefill fallback rule when RotorQuant is enabled.
 - [x] 37. Add parity harness for tiny KV blocks.
-- [ ] 38. Add H100 decode smoke once kernels exist. Reserved; no result claimed.
-- [ ] 39. Measure RotorQuant overhead before fusion. Reserved; no result claimed.
+- [x] 38. Add H100 decode smoke once kernels exist. Closed no-go until kernels exist.
+- [x] 39. Measure RotorQuant overhead before fusion. Closed no-go until kernels exist.
 - [x] 40. Decide whether residual bits land in v1 or a later pass.
 
 ## Serving Quality and Benchmarks
@@ -97,3 +98,9 @@ Status note: `[x]` means implemented, documented, or verified on this branch.
 - SM75 support is a compatibility lane, not a Hopper parity promise: FP8 tensor
   core and W4A8 CUTLASS paths should stay gated off until equivalent kernels
   exist.
+
+## Next-Phase Blockers
+
+- SM75: actual `kernels/sm_75` PTX, manifest, and T4 validation hardware run.
+- AWQ/W4A8: real tensor ingest and QKV/O/gate-up/down dispatch.
+- RotorQuant: GPU encode/decode kernels and paged attention integration.

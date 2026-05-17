@@ -15,6 +15,7 @@ pub mod experiment_controller;
 pub mod gemma4_bring_up;
 pub mod gemma4_layer_exec;
 pub mod layer_exec;
+pub mod rotorquant_config;
 pub mod sched_state;
 pub mod scheduler;
 
@@ -25,5 +26,6 @@ pub use experiment_controller::{
     FeatureGates, KvPath, ValidationMode, WeightPath,
 };
 pub use layer_exec::{forward, LayerDims};
+pub use rotorquant_config::RotorQuantConfig;
 pub use sched_state::{ReqState, Request};
 pub use scheduler::{bucket_for, BatchPlan, Scheduler, DECODE_BUCKETS};

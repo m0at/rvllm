@@ -12,13 +12,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_attention::{AttentionBackend, Fa3Kernels};
-use rvllm_core::{ConfigError, Result, RvllmError};
+use rvllm_core::Result;
 use rvllm_cutlass::{CublasLt, CutlassBackend, Policy};
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 use rvllm_mem::{context::CudaContextHandle, stream::Stream, HbmArena};
 
-use crate::experiment_controller::{ExperimentController, ExperimentPlan, KvPath, WeightPath};
+use crate::experiment_controller::{ExperimentController, ExperimentPlan, WeightPath};
 use crate::gemma4_layer_exec::Gemma4LayerKernels;
+use crate::rotorquant_config::RotorQuantConfig;
 
 pub use crate::bring_up::HbmArenaCheckpoint;
 
@@ -32,87 +33,6 @@ pub use crate::bring_up::HbmArenaCheckpoint;
 /// per-model calibration.
 const DEFAULT_Q_SCALE: f32 = 0.1;
 const DEFAULT_KV_SCALE: f32 = 0.08;
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RotorQuantMode {
-    Off,
-    RotorCl3,
-    Planar2,
-    Iso4,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct RotorQuantConfig {
-    pub mode: RotorQuantMode,
-    pub bits: u8,
-    pub chunk_dim: u16,
-}
-
-impl RotorQuantConfig {
-    pub fn from_env() -> Result<Self> {
-        Self::from_env_enabled(false)
-    }
-
-    pub fn from_env_for_plan(plan: &ExperimentPlan) -> Result<Self> {
-        Self::from_env_enabled(matches!(plan.kv_path, KvPath::RotorQuant))
-    }
-
-    fn from_env_enabled(enabled_by_plan: bool) -> Result<Self> {
-        let raw_mode = if enabled_by_plan {
-            std::env::var("RVLLM_ROTORQUANT").unwrap_or_else(|_| "rotor_cl3".into())
-        } else if std::env::var(crate::experiment_controller::ENV_KV_PATH).is_ok() {
-            "off".into()
-        } else {
-            std::env::var("RVLLM_ROTORQUANT").unwrap_or_else(|_| "off".into())
-        };
-        let mode = match raw_mode.as_str() {
-            "0" | "off" | "false" => RotorQuantMode::Off,
-            "1" | "rotor" | "rotor_cl3" => RotorQuantMode::RotorCl3,
-            "planar2" => RotorQuantMode::Planar2,
-            "iso4" => RotorQuantMode::Iso4,
-            other => {
-                return Err(RvllmError::config(
-                    ConfigError::InvalidField {
-                        name: "RVLLM_ROTORQUANT",
-                        reason: format!("unsupported mode {other:?}"),
-                    },
-                    "RVLLM_ROTORQUANT",
-                ))
-            }
-        };
-        let bits = std::env::var("RVLLM_ROTORQUANT_BITS")
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(4);
-        if !(2..=4).contains(&bits) {
-            return Err(RvllmError::config(
-                ConfigError::InvalidField {
-                    name: "RVLLM_ROTORQUANT_BITS",
-                    reason: "expected 2, 3, or 4".into(),
-                },
-                "RVLLM_ROTORQUANT_BITS",
-            ));
-        }
-        let chunk_dim = std::env::var("RVLLM_ROTORQUANT_CHUNK_DIM")
-            .ok()
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(128);
-        if chunk_dim != 128 {
-            return Err(RvllmError::config(
-                ConfigError::InvalidField {
-                    name: "RVLLM_ROTORQUANT_CHUNK_DIM",
-                    reason: "v1 supports 128 only".into(),
-                },
-                "RVLLM_ROTORQUANT_CHUNK_DIM",
-            ));
-        }
-        Ok(Self {
-            mode,
-            bits,
-            chunk_dim,
-        })
-    }
-}
 
 pub struct Gemma4EnginePaths {
     pub model_dir: PathBuf,

@@ -22,11 +22,11 @@ This branch adds the AWQ/W4A8 and RotorQuant groundwork around that 31B path:
 - Rust `rvllm-cutlass` bindings and dynamic loader support for the W4A8 shared object.
 - Optional runtime gate through `RVLLM_EXPERIMENT_WEIGHT=w4a8-awq` plus `RVLLM_W4A8_SO` (`RVLLM_W4A8=1` remains accepted as a legacy alias).
 - Typed W4A8 weight slots in the Gemma 4 loader, ready for AWQ-packed tensors.
-- AWQ metadata detection for common packed tensor names and quantization config fields.
-- RotorQuant env/config scaffold for `rotor_cl3`, `planar2`, and `iso4` modes, gated through `RVLLM_EXPERIMENT_KV=rotorquant`.
+- AWQ metadata detection and W4A8 candidate classification for common packed tensor names and quantization config fields.
+- RotorQuant reusable runtime config plus metadata/layout scaffolding for `rotor_cl3`, `planar2`, and `iso4` modes, gated through `RVLLM_EXPERIMENT_KV=rotorquant`.
 - A top-level experiment controller covering weight, KV, attention, architecture, and validation axes, with server response headers for active lanes.
 - A bounded H100 matrix runner for W4A8 smoke, server chat, B=1/B=128 throughput, and PPL smoke.
-- A 60-task integration tracker in [`docs/awq-rotorquant-task-queue.md`](docs/awq-rotorquant-task-queue.md).
+- A reconciled 60-task status ledger in [`docs/awq-rotorquant-task-queue.md`](docs/awq-rotorquant-task-queue.md).
 - A focused 50-task experiment board in [`docs/experiment-50-task-board.md`](docs/experiment-50-task-board.md).
 - Focused support notes for [`SM75`](docs/sm75-support.md), [`AWQ`](docs/awq-support.md), [`RotorQuant KV`](docs/rotorquant-kv-layout.md), and lane go/no-go in [`docs/experiment-go-nogo.md`](docs/experiment-go-nogo.md).
 

@@ -11,7 +11,7 @@ experiment gates, W4A8 kernel smoke, and bounded regression lanes.
 
 | Lane | Decision | Why |
 |---|---|---|
-| SM75 / T4 | No-go for serving | `sm_75` is modeled, but there is no SM75 PTX manifest, no SM75 attention fallback plan, and no non-Hopper W4A8/FP8 kernel route. |
+| SM75 / T4 | No-go for serving | `sm_75` is modeled and audited, but there is no SM75 PTX manifest, validated attention backend, or non-Hopper W4A8/FP8 kernel route. |
 | AWQ / W4A8 | No-go for production serving | AWQ metadata/reference helpers, W4A8 bindings, and env gates exist; real AWQ tensor ingest and layer dispatch do not. |
 | RotorQuant | No-go for serving | Metadata, KV layout sizing, fallback policy, and CPU reference helpers exist; attention kernels and runtime KV integration do not. |
 | Serving validation | Go for baseline and instrumentation | H100 baseline/current/W4A8-gated/RotorQuant-gated lanes pass health, models, chat, B=1/B=128 throughput, and PPL smoke. |
@@ -24,13 +24,13 @@ Implemented:
 - The capability matrix says SM75 has no native FP8 tensor cores, W4A8 CUTLASS,
   FA3, FA2 PTX, or RotorQuant KV support yet.
 - The experiment controller can label a forced SM75 compatibility lane.
+- The static kernel audit and FA2 fallback plan are documented in
+  `docs/sm75-support.md`.
 
 No-go blockers:
 
 - Build and ship an `sm_75` PTX manifest.
-- Audit kernels that rely on FP8 tensor cores, WGMMA/TMA, or Hopper-only CUTLASS
-  paths.
-- Add explicit runtime rejects for remaining FP8/RotorQuant attempts on SM75.
+- Convert the static audit into an SM75 compile matrix.
 - Define and test a T4-compatible attention fallback.
 
 ## AWQ / W4A8
@@ -41,6 +41,8 @@ Implemented:
   `weight/scale/zero_point` names, and common quantization config fields.
 - Metadata validation tracks bits, group size, zero-point presence, ready layer
   count, config-only checkpoints, and mixed formats.
+- Loader-side W4A8 candidate classification distinguishes ready, metadata-only,
+  missing, mixed-layout, and invalid-config tensor sets.
 - Tiny CPU reference helpers unpack/dequantize 4-bit AWQ `qweight`, `qzeros`,
   and `scales` tensors for parity fixtures.
 - W4A8 shared-object loading is gated behind `RVLLM_EXPERIMENT_WEIGHT=w4a8-awq`
