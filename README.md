@@ -20,9 +20,11 @@ This branch adds the AWQ/W4A8 and RotorQuant groundwork around that 31B path:
 - H100-verified CUTLASS W4A8 wrapper for FP8 activations x int4 weights.
 - Safe reordered-int4 allocation sizing via `rvllm_w4a8_int4_reordered_bytes`.
 - Rust `rvllm-cutlass` bindings and dynamic loader support for the W4A8 shared object.
-- Optional runtime gate through `RVLLM_EXPERIMENT_WEIGHT=w4a8-awq` plus `RVLLM_W4A8_SO` (`RVLLM_W4A8=1` remains accepted as a legacy alias).
-- Typed W4A8 weight slots in the Gemma 4 loader, ready for AWQ-packed tensors.
+- Experiment lane labels through `RVLLM_EXPERIMENT_WEIGHT=w4a8-awq` plus `RVLLM_W4A8_SO` (`RVLLM_W4A8=1` remains accepted as a legacy alias). Flag-only lanes verify plumbing/fallback behavior; they are not active W4A8 dispatch.
+- Typed W4A8 weight slots in the Gemma 4 loader, ready for future calibrated AWQ-packed tensors.
 - AWQ metadata detection and W4A8 candidate classification for common packed tensor names and quantization config fields.
+- Research-only W4A8 dispatch harness that encodes selected F16 source weights as symmetric INT4 for isolation tests. Symmetric INT4 is not AWQ.
+- Optional calibrated-scale W4A8 encoder ABI for offline AWQ scale experiments; full AWQ tensor ingest and asymmetric qzeros dispatch remain future work.
 - RotorQuant reusable runtime config plus metadata/layout scaffolding for `rotor_cl3`, `planar2`, and `iso4` modes, gated through `RVLLM_EXPERIMENT_KV=rotorquant`.
 - A top-level experiment controller covering weight, KV, attention, architecture, and validation axes, with server response headers for active lanes.
 - A bounded H100 matrix runner for W4A8 smoke, server chat, B=1/B=128 throughput, and PPL smoke.
@@ -30,8 +32,10 @@ This branch adds the AWQ/W4A8 and RotorQuant groundwork around that 31B path:
 - A focused 50-task experiment board in [`docs/experiment-50-task-board.md`](docs/experiment-50-task-board.md).
 - Focused support notes for [`SM75`](docs/sm75-support.md), [`AWQ`](docs/awq-support.md), [`RotorQuant KV`](docs/rotorquant-kv-layout.md), and lane go/no-go in [`docs/experiment-go-nogo.md`](docs/experiment-go-nogo.md).
 
-W4A8 is kernel-verified on H100 but not the default serving path yet. FP8 remains
-the default 31B route until AWQ tensor ingest, W4A8 dispatch, and RotorQuant
+The W4A8/AWQ direction is good, but it is not incorporated performance work yet.
+W4A8 is kernel-verified on H100, and real dispatch now exists as a research
+harness, but production messaging needs calibrated AWQ packing from real AWQ
+tensors. FP8 remains the default 31B route until that path and RotorQuant
 attention coverage are fully wired and benchmarked.
 
 ## At a glance
@@ -251,10 +255,10 @@ RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
   ./v3/target/release/rvllm-bench
 ```
 
-### Optional W4A8/AWQ kernel path
+### Optional W4A8/AWQ research path
 
-The W4A8 path is opt-in while AWQ packing and dispatch land. Build it on SM90
-with CUTLASS available, then enable it explicitly:
+The W4A8 shared object is opt-in while calibrated AWQ packing lands. Build it on
+SM90 with CUTLASS available, then enable the lane explicitly:
 
 ```bash
 CUTLASS_DIR=/workspace/cutlass bash kernels/build_w4a8.sh
@@ -267,11 +271,14 @@ RVLLM_KERNELS_DIR=/workspace/rvllm/kernels \
   ./v3/target/release/rvllm-bench
 ```
 
-There is also a real-dispatch bring-up mode for W4A8 from F16 source weights.
-It is deliberately off by default because naive symmetric INT4 is not AWQ and
-is not production quality. Current H100 smoke results show `down` projection is
-numerically tolerable for a few early layers, while `qkv`, `o`, and `gate_up`
-need AWQ calibration/packing before serving.
+Flag-only `w4a8` matrix lanes are not active W4A8 dispatch; they confirm the
+controller, env labels, and fallback behavior. Real dispatch exists separately
+as a research harness from F16 source weights. It is deliberately off by default
+because naive symmetric INT4 is not AWQ and is not production quality. Current
+H100 smoke results show the symmetric path is numerically unusable even when
+limited to one layer: `qkv`, `o`, `gate_up`, and `down` all explode PPL versus
+the FP8 baseline. Calibrated AWQ packing is required before any serving or
+performance claim.
 
 ```bash
 RVLLM_EXPERIMENT_WEIGHT=w4a8-awq \

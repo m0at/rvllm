@@ -12,9 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rvllm_attention::{AttentionBackend, Fa3Kernels};
-use rvllm_core::Result;
+use rvllm_core::{ConfigError, Result, RvllmError};
 #[cfg(feature = "cuda")]
-use rvllm_core::{ConfigError, CudaCtx, CudaErrorKind, RvllmError};
+use rvllm_core::{CudaCtx, CudaErrorKind};
 use rvllm_cutlass::{CublasLt, CutlassBackend, Policy};
 use rvllm_kernels::{KernelFn, KernelLoader, LoadedModule};
 #[cfg(feature = "cuda")]
@@ -147,6 +147,50 @@ fn w4a8_ptrs(weight: Option<&W4a8Weight>) -> W4a8WeightPtrs {
     })
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct W4a8ModuleCounts {
+    qkv: usize,
+    o_proj: usize,
+    gate_up: usize,
+    down: usize,
+}
+
+impl W4a8ModuleCounts {
+    fn total(self) -> usize {
+        self.qkv + self.o_proj + self.gate_up + self.down
+    }
+}
+
+fn w4a8_module_counts(model: &rvllm_loader::gemma4_weights::Gemma4LoadedModel) -> W4a8ModuleCounts {
+    let mut counts = W4a8ModuleCounts::default();
+    for layer in &model.layers {
+        if layer.qkv_w4a8.is_some() {
+            counts.qkv += 1;
+        }
+        if layer.o_proj_w4a8.is_some() {
+            counts.o_proj += 1;
+        }
+        if layer.gate_up_w4a8.is_some() {
+            counts.gate_up += 1;
+        }
+        if layer.down_proj_w4a8.is_some() {
+            counts.down += 1;
+        }
+    }
+    counts
+}
+
+fn w4a8_unsupported_target_error(compile_target: Option<rvllm_core::CompileTarget>) -> RvllmError {
+    RvllmError::config(
+        ConfigError::Inconsistent {
+            reasons: vec![format!(
+                "weights=w4a8-awq requested, but actual compile target {compile_target:?} has no real W4A8 dispatch support"
+            )],
+        },
+        "RVLLM_EXPERIMENT_WEIGHT",
+    )
+}
+
 #[cfg(feature = "cuda")]
 fn maybe_encode_w4a8_layers(
     model: &mut rvllm_loader::gemma4_weights::Gemma4LoadedModel,
@@ -270,6 +314,15 @@ fn maybe_encode_w4a8_layers(
         layer.gate_up_w4a8 = gate_up;
         layer.down_proj_w4a8 = down_proj;
     }
+    let counts = w4a8_module_counts(model);
+    tracing::info!(
+        layers,
+        qkv_layers = counts.qkv,
+        o_proj_layers = counts.o_proj,
+        gate_up_layers = counts.gate_up,
+        down_layers = counts.down,
+        "encoded Gemma 4 W4A8 layer/module weights"
+    );
     Ok(())
 }
 
@@ -525,16 +578,43 @@ impl Gemma4Bringup {
         // for the full rationale (sm_121 has no compatible `.so`).
         let cutlass =
             CutlassBackend::load_for(compile_target, paths.cutlass_so.clone(), &variants)?;
-        let w4a8 = if matches!(experiment.weight_path, WeightPath::W4A8Awq) {
+        let w4a8_requested = matches!(experiment.weight_path, WeightPath::W4A8Awq);
+        let w4a8 = if w4a8_requested {
+            if !matches!(compile_target, Some(rvllm_core::CompileTarget::Sm90)) {
+                return Err(w4a8_unsupported_target_error(compile_target));
+            }
             let path = std::env::var_os("RVLLM_W4A8_SO")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| kernels_dir.join("libw4a8_gemm.so"));
+            tracing::info!(
+                path = %path.display(),
+                target = ?compile_target,
+                "loading Gemma 4 W4A8 dispatch library"
+            );
             Some(rvllm_cutlass::W4a8Lib::load(path)?)
         } else {
             None
         };
         if let Some(w4a8_lib) = w4a8.as_ref() {
             maybe_encode_w4a8_layers(&mut model, &arena, w4a8_lib, stream.raw())?;
+        }
+        if w4a8_requested {
+            let counts = w4a8_module_counts(&model);
+            let real_candidates = counts.total();
+            tracing::info!(
+                target = ?compile_target,
+                real_candidates,
+                qkv_layers = counts.qkv,
+                o_proj_layers = counts.o_proj,
+                gate_up_layers = counts.gate_up,
+                down_layers = counts.down,
+                "Gemma 4 W4A8 dispatch plan"
+            );
+            if real_candidates == 0 {
+                tracing::warn!(
+                    "Gemma 4 W4A8 was requested but no W4A8 layer/module weights are present; runtime will remain in flag-only fallback mode"
+                );
+            }
         }
 
         let cublaslt_ws_bytes: usize = 32 * 1024 * 1024;
@@ -855,6 +935,7 @@ impl Gemma4Bringup {
                 };
 
                 let dims = Gemma4LayerDims {
+                    layer_idx: layer_idx as u32,
                     num_tokens: num_seqs,
                     hidden,
                     num_heads: arch.num_attention_heads as u32,
@@ -1321,6 +1402,7 @@ impl Gemma4Bringup {
                 };
 
                 let dims = Gemma4LayerDims {
+                    layer_idx: layer_idx as u32,
                     num_tokens: num_seqs,
                     hidden,
                     num_heads: arch.num_attention_heads as u32,
@@ -2032,6 +2114,7 @@ impl Gemma4Bringup {
                     (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
 
                 let dims = crate::gemma4_layer_exec::Gemma4LayerDims {
+                    layer_idx: layer_idx as u32,
                     num_tokens: 1,
                     hidden,
                     num_heads: arch.num_attention_heads as u32,
@@ -2357,6 +2440,7 @@ impl Gemma4Bringup {
                         (layer_blocks as u64) * (block_size as u64) * (nkvh as u64);
 
                     let dims = crate::gemma4_layer_exec::Gemma4LayerDims {
+                        layer_idx: layer_idx as u32,
                         num_tokens: chunk_len,
                         hidden,
                         num_heads: arch.num_attention_heads as u32,

@@ -15,7 +15,9 @@
 // sees the logical A*B^T semantics.
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 
 #include "cutlass/cutlass.h"
@@ -121,6 +123,24 @@ using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
 
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
+static bool valid_gemm_shape(int m, int n, int k, int group_size) {
+    return m > 0 && n > 0 && k > 0 &&
+           group_size == kGroupSize &&
+           (k % kGroupSize) == 0;
+}
+
+static bool valid_int4_shape(int n, int k) {
+    return n > 0 && k > 0 && (k % kGroupSize) == 0 && (k % 8) == 0;
+}
+
+static bool valid_encode_shape(int n, int k, int group_size) {
+    return group_size == kGroupSize && valid_int4_shape(n, k);
+}
+
+static bool finite_alpha_beta(float alpha, float beta) {
+    return std::isfinite(alpha) && std::isfinite(beta);
+}
+
 // =========================================================================
 // C ABI entry point
 // =========================================================================
@@ -140,6 +160,10 @@ extern "C" int rvllm_w4a8_gemm_run(
     size_t      workspace_bytes,
     cudaStream_t stream
 ) {
+    if (m <= 0 || n <= 0 || k <= 0) {
+        fprintf(stderr, "rvllm_w4a8: M/N/K must be > 0, got M=%d N=%d K=%d\n", m, n, k);
+        return -3;
+    }
     if (group_size != kGroupSize) {
         fprintf(stderr, "rvllm_w4a8: group_size must be %d, got %d\n", kGroupSize, group_size);
         return -1;
@@ -147,6 +171,22 @@ extern "C" int rvllm_w4a8_gemm_run(
     if (k % kGroupSize != 0) {
         fprintf(stderr, "rvllm_w4a8: K (%d) must be divisible by group_size (%d)\n", k, kGroupSize);
         return -2;
+    }
+    if (a_fp8 == nullptr || b_int4_reordered == nullptr || b_scales_packed == nullptr || d_f16 == nullptr) {
+        fprintf(stderr, "rvllm_w4a8: null required pointer\n");
+        return -4;
+    }
+    if (beta != 0.0f && c_f16 == nullptr) {
+        fprintf(stderr, "rvllm_w4a8: C pointer is required when beta != 0\n");
+        return -5;
+    }
+    if (!finite_alpha_beta(alpha, beta)) {
+        fprintf(stderr, "rvllm_w4a8: alpha and beta must be finite\n");
+        return -6;
+    }
+    if (workspace_bytes != 0 && workspace == nullptr) {
+        fprintf(stderr, "rvllm_w4a8: workspace pointer is null for nonzero workspace_bytes\n");
+        return -7;
     }
 
     const int scale_k = k / kGroupSize;
@@ -212,12 +252,13 @@ static __global__ void rowscale_f16_kernel(
     int m,
     int n
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = m * n;
+    uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    uint64_t total = static_cast<uint64_t>(m) * static_cast<uint64_t>(n);
     if (idx >= total) return;
-    int row = idx / n;
-    float v = __half2float(data[idx]) * row_scales[row];
-    data[idx] = __float2half_rn(v);
+    int row = static_cast<int>(idx / static_cast<uint64_t>(n));
+    size_t offset = static_cast<size_t>(idx);
+    float v = __half2float(data[offset]) * row_scales[row];
+    data[offset] = __float2half_rn(v);
 }
 
 extern "C" int rvllm_w4a8_gemm_run_rowscale(
@@ -253,9 +294,12 @@ extern "C" int rvllm_w4a8_gemm_run_rowscale(
     );
     if (rc != 0) return rc;
 
-    int total = m * n;
+    uint64_t total = static_cast<uint64_t>(m) * static_cast<uint64_t>(n);
+    if (total == 0) return -32;
     int block = 256;
-    int grid = (total + block - 1) / block;
+    uint64_t grid64 = (total + block - 1) / block;
+    if (grid64 > 2147483647ull) return -33;
+    int grid = static_cast<int>(grid64);
     rowscale_f16_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<__half*>(d_f16),
         a_scales,
@@ -269,6 +313,8 @@ extern "C" int rvllm_w4a8_gemm_run_rowscale(
 
 // Workspace size probe.
 extern "C" size_t rvllm_w4a8_gemm_workspace_size(int m, int n, int k) {
+    if (!valid_gemm_shape(m, n, k, kGroupSize)) return 0;
+
     using StrideC = typename Gemm::GemmKernel::StrideC;
     using StrideD = typename Gemm::GemmKernel::StrideD;
     using StrideS = typename CollectiveMainloop::StrideScale;
@@ -302,6 +348,8 @@ extern "C" size_t rvllm_w4a8_gemm_workspace_size(int m, int n, int k) {
 }
 
 static size_t w4a8_int4_reordered_bytes(int n, int k) {
+    if (!valid_int4_shape(n, k)) return 0;
+
     auto shape_B = cute::make_shape(n, k, 1);
     LayoutB_Reordered layout_B_reordered = cute::tile_to_shape(LayoutAtomQuant{}, shape_B);
     size_t elems = static_cast<size_t>(cute::cosize(layout_B_reordered));
@@ -325,14 +373,13 @@ extern "C" size_t rvllm_w4a8_int4_reordered_bytes(int n, int k) {
 // Finally the INT4 tensor is memory-reordered via the LayoutAtomQuant atom
 // so each thread reads 8 contiguous elements in one load.
 //
-// No AWQ activation protection in v1 — symmetric weight-only quant. Upgrade
-// path if quality suffers: compute per-channel activation max from a
-// calibration pass, multiply weights by s^alpha, divide activations by
-// s^alpha at runtime. Separate function.
+// The optional calibrated-scale entry point can replace scale_fp32 with a
+// positive per-group scale produced by an offline AWQ search. It still consumes
+// symmetric int4 values and does not implement asymmetric qzeros; callers must
+// not label plain F16-source encoding as AWQ.
 // =========================================================================
 
 #include "cutlass/util/device_memory.h"
-#include <cuda_fp16.h>
 
 // Quantize FP16 weights to INT4 with per-group FP32 scales, both on device.
 // Writes two's-complement INT4 into CUTLASS LayoutB order and per-group f32
@@ -342,6 +389,8 @@ static __global__ void quantize_sym_group_kernel(
     const __half* __restrict__ w_fp16,  // [N, K] row-major (N rows)
     int* __restrict__ w_int4_raw,        // packed int4 in LayoutB storage
     float* __restrict__ scales_f32,       // [N, K/group]
+    const float* __restrict__ calibrated_scales_f32,
+    int* __restrict__ invalid_scale,
     int n, int k, int group
 ) {
     int row = blockIdx.y;
@@ -362,6 +411,13 @@ static __global__ void quantize_sym_group_kernel(
         local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, off));
 
     float scale = local_max / 7.0f;
+    if (calibrated_scales_f32 != nullptr) {
+        scale = calibrated_scales_f32[row * (k / group) + grp];
+        if (!(scale > 0.0f) || !isfinite(scale)) {
+            if (tid == 0) atomicExch(invalid_scale, 1);
+            scale = 1e-9f;
+        }
+    }
     if (scale == 0.0f) scale = 1e-9f;  // avoid div0
     if (tid == 0) scales_f32[row * (k / group) + grp] = scale;
 
@@ -395,19 +451,21 @@ static __global__ void convert_scales_kernel(
     scales_e4m3[row * scale_k + grp] = ElementScale(s);
 }
 
-// Host entry: quantize + pack weights + reorder into the kernel-expected
-// layout. Expects:
+// Host implementation: quantize + pack weights + reorder into the
+// kernel-expected layout. Expects:
 //   w_fp16        [N, K] row-major device ptr (input; will be read)
 //   w_int4_out    device ptr sized by rvllm_w4a8_int4_reordered_bytes(N, K)
 //   scales_out    [N, K/group, 8] bytes device ptr (output; e4m3 LUT)
 //   workspace     temporary f32 scales buffer, >= N*K/group*4 bytes
 //   shuffle       reserved; output is always CUTLASS-reordered because
 //                 rvllm_w4a8_gemm_run always consumes LayoutB_Reordered.
-extern "C" int rvllm_w4a8_encode_weight_fp16(
+//   calibrated_scales_f32 optional [N, K/group] f32 positive device ptr.
+static int rvllm_w4a8_encode_weight_fp16_impl(
     const void* w_fp16,
     int         n,
     int         k,
     int         group_size,
+    const float* calibrated_scales_f32,
     void*       w_int4_out,
     void*       scales_packed_out,
     void*       scales_f32_workspace,
@@ -417,21 +475,32 @@ extern "C" int rvllm_w4a8_encode_weight_fp16(
     if (group_size != kGroupSize) return -1;
     if (k % group_size != 0)      return -2;
     if (k % 8 != 0)               return -3;
+    if (!valid_encode_shape(n, k, group_size)) return -4;
+    if (w_fp16 == nullptr || w_int4_out == nullptr ||
+        scales_packed_out == nullptr || scales_f32_workspace == nullptr) return -5;
+    if (shuffle != 0 && shuffle != 1) return -6;
     const int scale_k = k / group_size;
     const size_t int4_elems = (size_t)n * k;
     const size_t int4_output_bytes = w4a8_int4_reordered_bytes(n, k);
+    if (int4_output_bytes == 0) return -7;
 
     // 1) Quantize + build f32 scales.
-    cudaMemsetAsync(w_int4_out, 0, int4_output_bytes, stream);
+    cudaError_t err = cudaMemsetAsync(w_int4_out, 0, int4_output_bytes, stream);
+    if (err != cudaSuccess) return -18;
+    cutlass::DeviceAllocation<int> invalid_scale(1);
+    err = cudaMemsetAsync(invalid_scale.get(), 0, sizeof(int), stream);
+    if (err != cudaSuccess) return -19;
     dim3 grid_q(scale_k, n, 1);
     dim3 block_q(32, 1, 1);
     quantize_sym_group_kernel<<<grid_q, block_q, 0, stream>>>(
         (const __half*)w_fp16,
         (int*)w_int4_out,
         (float*)scales_f32_workspace,
+        calibrated_scales_f32,
+        invalid_scale.get(),
         n, k, group_size
     );
-    cudaError_t err = cudaGetLastError();
+    err = cudaGetLastError();
     if (err != cudaSuccess) return -20;
 
     // 2) Convert scales to e4m3, then use CUTLASS's host-side LUT packer.
@@ -446,10 +515,15 @@ extern "C" int rvllm_w4a8_encode_weight_fp16(
     err = cudaGetLastError();
     if (err != cudaSuccess) return -21;
 
-    // 3) Match example 55 formatting: unify INT4 encodings, then reorder.
-    // These CUTLASS utility helpers are host-side wrappers and synchronize.
+    int h_invalid_scale = 0;
+    err = cudaMemcpyAsync(&h_invalid_scale, invalid_scale.get(), sizeof(int), cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) return -26;
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) return -22;
+    if (h_invalid_scale != 0) return -27;
+
+    // 3) Match example 55 formatting: unify INT4 encodings, then reorder.
+    // These CUTLASS utility helpers are host-side wrappers and synchronize.
     bool scales_ok = cutlass::pack_scale_fp8<ElementScale, QuantType>(
         scales_e4m3.get(),
         reinterpret_cast<cutlass::Array<ElementScale, 8>*>(scales_packed_out),
@@ -484,4 +558,56 @@ extern "C" int rvllm_w4a8_encode_weight_fp16(
     (void)shuffle;
 
     return 0;
+}
+
+extern "C" int rvllm_w4a8_encode_weight_fp16(
+    const void* w_fp16,
+    int         n,
+    int         k,
+    int         group_size,
+    void*       w_int4_out,
+    void*       scales_packed_out,
+    void*       scales_f32_workspace,
+    int         shuffle,
+    cudaStream_t stream
+) {
+    return rvllm_w4a8_encode_weight_fp16_impl(
+        w_fp16,
+        n,
+        k,
+        group_size,
+        nullptr,
+        w_int4_out,
+        scales_packed_out,
+        scales_f32_workspace,
+        shuffle,
+        stream
+    );
+}
+
+extern "C" int rvllm_w4a8_encode_weight_fp16_with_scales(
+    const void* w_fp16,
+    const float* calibrated_scales_f32,
+    int         n,
+    int         k,
+    int         group_size,
+    void*       w_int4_out,
+    void*       scales_packed_out,
+    void*       scales_f32_workspace,
+    int         shuffle,
+    cudaStream_t stream
+) {
+    if (calibrated_scales_f32 == nullptr) return -30;
+    return rvllm_w4a8_encode_weight_fp16_impl(
+        w_fp16,
+        n,
+        k,
+        group_size,
+        calibrated_scales_f32,
+        w_int4_out,
+        scales_packed_out,
+        scales_f32_workspace,
+        shuffle,
+        stream
+    );
 }

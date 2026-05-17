@@ -93,6 +93,8 @@ Presets:
 - `baseline`: unsets `RVLLM_EXPERIMENT_*`, `RVLLM_W4A8`, and `RVLLM_ROTORQUANT`
 - `current`: inherits the caller's optional experiment env
 - `w4a8`: sets `RVLLM_EXPERIMENT_WEIGHT=w4a8-awq` and `RVLLM_W4A8=1`
+- `w4a8_down_smoke`: research-only real-dispatch W4A8 lane for the `down` projection, defaulting to 8 encoded/F16 source layers
+- `w4a8_iso_qkv`, `w4a8_iso_o`, `w4a8_iso_gate_up`, `w4a8_iso_down`: research-only per-module W4A8 isolation lanes, defaulting to 1 encoded/F16 source layer
 - `rotor_cl3`, `planar2`, `iso4`: set `RVLLM_EXPERIMENT_KV=rotorquant` and the corresponding `RVLLM_ROTORQUANT` mode
 - `exp:<value>`: sets `RVLLM_EXPERIMENT=<value>`
 
@@ -108,6 +110,59 @@ Controller env:
 
 The runner sets `RVLLM_EXPERIMENT_VALIDATION` per lane so server headers and logs show whether a process was launched for chat, throughput, or PPL validation.
 Those lane labels are also written to `summary.jsonl`, `summary.tsv`, and each command log.
+
+## W4A8 Research Lanes
+
+The `w4a8_down_smoke` and `w4a8_iso_*` presets are bounded H100 real-dispatch research lanes. They are not baseline behavior and are not production-quality AWQ validation. They encode selected F16 source layers into W4A8 at startup, then route only the requested module through the W4A8 dispatch path.
+
+Preset env:
+
+```text
+w4a8_down_smoke:
+  RVLLM_F16_LAYERS=${H100_MATRIX_W4A8_DOWN_SMOKE_LAYERS:-8}
+  RVLLM_W4A8_ENCODE_LAYERS=${H100_MATRIX_W4A8_DOWN_SMOKE_LAYERS:-8}
+  RVLLM_W4A8_MODULES=down
+
+w4a8_iso_qkv:
+  RVLLM_F16_LAYERS=${H100_MATRIX_W4A8_ISOLATION_LAYERS:-1}
+  RVLLM_W4A8_ENCODE_LAYERS=${H100_MATRIX_W4A8_ISOLATION_LAYERS:-1}
+  RVLLM_W4A8_MODULES=qkv
+
+w4a8_iso_o:
+  RVLLM_F16_LAYERS=${H100_MATRIX_W4A8_ISOLATION_LAYERS:-1}
+  RVLLM_W4A8_ENCODE_LAYERS=${H100_MATRIX_W4A8_ISOLATION_LAYERS:-1}
+  RVLLM_W4A8_MODULES=o
+
+w4a8_iso_gate_up:
+  RVLLM_F16_LAYERS=${H100_MATRIX_W4A8_ISOLATION_LAYERS:-1}
+  RVLLM_W4A8_ENCODE_LAYERS=${H100_MATRIX_W4A8_ISOLATION_LAYERS:-1}
+  RVLLM_W4A8_MODULES=gate_up
+
+w4a8_iso_down:
+  RVLLM_F16_LAYERS=${H100_MATRIX_W4A8_ISOLATION_LAYERS:-1}
+  RVLLM_W4A8_ENCODE_LAYERS=${H100_MATRIX_W4A8_ISOLATION_LAYERS:-1}
+  RVLLM_W4A8_MODULES=down
+```
+
+Run a bounded down-only PPL smoke:
+
+```bash
+H100_MATRIX_TESTS=ppl \
+H100_MATRIX_EXPERIMENTS=w4a8_down_smoke \
+scripts/h100_experiment_matrix.sh
+```
+
+Run per-module isolation with tiny bounds:
+
+```bash
+H100_MATRIX_TESTS=ppl \
+H100_MATRIX_EXPERIMENTS=w4a8_iso_qkv,w4a8_iso_o,w4a8_iso_gate_up,w4a8_iso_down \
+H100_MATRIX_W4A8_ISOLATION_LAYERS=1 \
+H100_MATRIX_PPL_CHUNKS=1 \
+scripts/h100_experiment_matrix.sh
+```
+
+The default `baseline` and `w4a8` presets remain unchanged. Use these research lanes only to isolate real-dispatch failures and numeric drift by module.
 
 Useful bounds:
 

@@ -27,7 +27,13 @@
 //!  13.  fused_rmsnorm                   post_feedforward_layernorm (norm only)
 //!  14.  residual_scale_f16              residual *= layer_scalar (once)
 
-use rvllm_core::Result;
+#[cfg(feature = "cuda")]
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "cuda")]
+use std::sync::{Mutex, OnceLock};
+
+use rvllm_core::{ConfigError, Result, RvllmError};
 use rvllm_cutlass::{CublasLt, CutlassBackend, Fp8GemmPlan, W4a8Lib};
 use rvllm_fused::gemma4_launcher;
 use rvllm_fused::FusedRmsnormFp8QuantLaunch;
@@ -42,6 +48,7 @@ use rvllm_loader::gemma4_arch::Gemma4LayerType;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Gemma4LayerDims {
+    pub layer_idx: u32,
     pub num_tokens: u32,
     pub hidden: u32,
     pub num_heads: u32,
@@ -113,6 +120,146 @@ pub struct W4a8WeightPtrs {
 impl W4a8WeightPtrs {
     fn is_ready(self) -> bool {
         self.int4 != 0 && self.scales != 0 && self.group_size != 0
+    }
+
+    fn has_any(self) -> bool {
+        self.int4 != 0 || self.scales != 0 || self.group_size != 0
+    }
+
+    pub fn can_dispatch_for_k(self, k: u32) -> bool {
+        self.validate_for_k(k).is_ok_and(|ready| ready)
+    }
+
+    pub fn validate_for_k(self, k: u32) -> Result<bool> {
+        if !self.has_any() {
+            return Ok(false);
+        }
+        if !self.is_ready() {
+            return Err(w4a8_config_error(format!(
+                "partial W4A8 weight ptrs int4=0x{:x} scales=0x{:x} group_size={}",
+                self.int4, self.scales, self.group_size
+            )));
+        }
+        if k == 0
+            || self.group_size > i32::MAX as u32
+            || self.group_size > k
+            || k % self.group_size != 0
+        {
+            return Err(w4a8_config_error(format!(
+                "invalid W4A8 group_size={} for K={k}",
+                self.group_size
+            )));
+        }
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct W4a8DispatchCounters {
+    pub real_dispatches: u64,
+    pub flag_only_fallbacks: u64,
+}
+
+static W4A8_REAL_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static W4A8_FLAG_ONLY_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+static W4A8_FIRST_LOGS: OnceLock<Mutex<BTreeSet<(u32, u8, u8)>>> = OnceLock::new();
+
+pub fn w4a8_dispatch_counters() -> W4a8DispatchCounters {
+    W4a8DispatchCounters {
+        real_dispatches: W4A8_REAL_DISPATCHES.load(Ordering::Relaxed),
+        flag_only_fallbacks: W4A8_FLAG_ONLY_FALLBACKS.load(Ordering::Relaxed),
+    }
+}
+
+fn w4a8_config_error(reason: String) -> RvllmError {
+    RvllmError::config(
+        ConfigError::InvalidField {
+            name: "Gemma4 W4A8 dispatch",
+            reason,
+        },
+        "Gemma4 W4A8 dispatch",
+    )
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Copy, Clone, Debug)]
+enum W4a8Module {
+    Qkv,
+    OProj,
+    GateUp,
+    Down,
+}
+
+#[cfg(feature = "cuda")]
+impl W4a8Module {
+    fn id(self) -> u8 {
+        match self {
+            Self::Qkv => 0,
+            Self::OProj => 1,
+            Self::GateUp => 2,
+            Self::Down => 3,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Qkv => "qkv",
+            Self::OProj => "o_proj",
+            Self::GateUp => "gate_up",
+            Self::Down => "down",
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn log_w4a8_once(layer_idx: u32, module: W4a8Module, mode_id: u8) -> bool {
+    let logs = W4A8_FIRST_LOGS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    logs.lock()
+        .map(|mut logged| logged.insert((layer_idx, module.id(), mode_id)))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "cuda")]
+fn note_w4a8_real(layer_idx: u32, module: W4a8Module, m: u32, n: u32, k: u32, group_size: u32) {
+    let real = W4A8_REAL_DISPATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    let flag_only = W4A8_FLAG_ONLY_FALLBACKS.load(Ordering::Relaxed);
+    if log_w4a8_once(layer_idx, module, 0) {
+        tracing::info!(
+            layer = layer_idx,
+            module = module.name(),
+            m,
+            n,
+            k,
+            group_size,
+            real_dispatches = real,
+            flag_only_fallbacks = flag_only,
+            "Gemma 4 W4A8 real dispatch"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn note_w4a8_flag_only(
+    layer_idx: u32,
+    module: W4a8Module,
+    reason: &'static str,
+    ptrs: W4a8WeightPtrs,
+) {
+    let flag_only = W4A8_FLAG_ONLY_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let real = W4A8_REAL_DISPATCHES.load(Ordering::Relaxed);
+    if log_w4a8_once(layer_idx, module, 1) {
+        tracing::info!(
+            layer = layer_idx,
+            module = module.name(),
+            reason,
+            int4 = ptrs.int4,
+            scales = ptrs.scales,
+            group_size = ptrs.group_size,
+            real_dispatches = real,
+            flag_only_fallbacks = flag_only,
+            "Gemma 4 W4A8 flag-only fallback"
+        );
     }
 }
 
@@ -241,6 +388,53 @@ pub enum Gemma4Phase {
     },
 }
 
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn try_w4a8_rowscale(
+    layer_idx: u32,
+    module: W4a8Module,
+    w4a8: Option<&W4a8Lib>,
+    ptrs: W4a8WeightPtrs,
+    a_fp8: u64,
+    a_scales: u64,
+    d_f16: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    cutlass_workspace: u64,
+    cutlass_workspace_bytes: usize,
+    stream: u64,
+) -> Result<bool> {
+    let Some(w4a8_lib) = w4a8 else {
+        if ptrs.has_any() {
+            note_w4a8_flag_only(layer_idx, module, "w4a8-lib-unavailable", ptrs);
+        }
+        return Ok(false);
+    };
+
+    if !ptrs.validate_for_k(k)? {
+        note_w4a8_flag_only(layer_idx, module, "no-w4a8-weight", ptrs);
+        return Ok(false);
+    }
+
+    w4a8_lib.w4a8_gemm_rowscale(
+        a_fp8,
+        a_scales,
+        ptrs.int4,
+        ptrs.scales,
+        d_f16,
+        m as i32,
+        n as i32,
+        k as i32,
+        ptrs.group_size as i32,
+        cutlass_workspace,
+        cutlass_workspace_bytes,
+        stream,
+    )?;
+    note_w4a8_real(layer_idx, module, m, n, k, ptrs.group_size);
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemma4_forward(
     dims: Gemma4LayerDims,
@@ -354,7 +548,7 @@ pub unsafe fn gemma4_forward_phase(
         && weights.qkv_chscale != 0
         && weights.qkv_blockscale != 0
         && weights.qkv_f16 == 0
-        && !weights.qkv_w4a8.is_ready()
+        && !weights.qkv_w4a8.can_dispatch_for_k(dims.hidden)
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
     let skip_attn_quant = false;
@@ -420,21 +614,21 @@ pub unsafe fn gemma4_forward_phase(
 
     // 2. Q||K||V projection
     #[cfg(feature = "cuda")]
-    if let Some(w4a8_lib) = w4a8.filter(|_| weights.qkv_w4a8.is_ready()) {
-        w4a8_lib.w4a8_gemm_rowscale(
-            scratch.hidden_fp8,
-            scratch.hidden_scale,
-            weights.qkv_w4a8.int4,
-            weights.qkv_w4a8.scales,
-            scratch.q_out,
-            dims.num_tokens as i32,
-            qkv_rows as i32,
-            dims.hidden as i32,
-            weights.qkv_w4a8.group_size as i32,
-            scratch.cutlass_workspace,
-            scratch.cutlass_workspace_bytes,
-            stream,
-        )?;
+    if try_w4a8_rowscale(
+        dims.layer_idx,
+        W4a8Module::Qkv,
+        w4a8,
+        weights.qkv_w4a8,
+        scratch.hidden_fp8,
+        scratch.hidden_scale,
+        scratch.q_out,
+        dims.num_tokens,
+        qkv_rows,
+        dims.hidden,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
+        stream,
+    )? {
     } else if weights.qkv_f16 != 0 {
         // F16 path: copy residual to delta_f16 scratch, apply rmsnorm in-place, use as GEMM input
         cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
@@ -904,7 +1098,7 @@ pub unsafe fn gemma4_forward_phase(
     #[cfg(feature = "cuda")]
     let skip_o_quant = dims.num_tokens <= FAST_PATH_M_MAX
         && weights.o_f16 == 0
-        && !weights.o_w4a8.is_ready()
+        && !weights.o_w4a8.can_dispatch_for_k(q_dim)
         && weights.o_chscale != 0
         && weights.o_blockscale != 0
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
@@ -926,22 +1120,22 @@ pub unsafe fn gemma4_forward_phase(
 
     // 7-8. O proj + channelscale + post_attn norm + residual add
     #[cfg(feature = "cuda")]
-    if let Some(w4a8_lib) = w4a8.filter(|_| weights.o_w4a8.is_ready()) {
+    if try_w4a8_rowscale(
+        dims.layer_idx,
+        W4a8Module::OProj,
+        w4a8,
+        weights.o_w4a8,
+        scratch.attn_out_fp8,
+        scratch.attn_out_scale,
+        scratch.gemm_f32_tmp,
+        dims.num_tokens,
+        dims.hidden,
+        q_dim,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
+        stream,
+    )? {
         let o_out_f16 = scratch.gemm_f32_tmp;
-        w4a8_lib.w4a8_gemm_rowscale(
-            scratch.attn_out_fp8,
-            scratch.attn_out_scale,
-            weights.o_w4a8.int4,
-            weights.o_w4a8.scales,
-            o_out_f16,
-            dims.num_tokens as i32,
-            dims.hidden as i32,
-            q_dim as i32,
-            weights.o_w4a8.group_size as i32,
-            scratch.cutlass_workspace,
-            scratch.cutlass_workspace_bytes,
-            stream,
-        )?;
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -1105,7 +1299,7 @@ pub unsafe fn gemma4_forward_phase(
         && weights.gate_up_chscale != 0
         && weights.gate_up_blockscale != 0
         && weights.gate_up_f16 == 0
-        && !weights.gate_up_w4a8.is_ready()
+        && !weights.gate_up_w4a8.can_dispatch_for_k(dims.hidden)
         && kernels.fp8_gemv_wpr_native_f16in.is_some();
     #[cfg(not(feature = "cuda"))]
     let skip_ff_quant = false;
@@ -1132,21 +1326,21 @@ pub unsafe fn gemma4_forward_phase(
 
     // 10. gate||up projection
     #[cfg(feature = "cuda")]
-    if let Some(w4a8_lib) = w4a8.filter(|_| weights.gate_up_w4a8.is_ready()) {
-        w4a8_lib.w4a8_gemm_rowscale(
-            scratch.hidden_fp8,
-            scratch.hidden_scale,
-            weights.gate_up_w4a8.int4,
-            weights.gate_up_w4a8.scales,
-            scratch.gate_up_out,
-            dims.num_tokens as i32,
-            (2 * dims.intermediate) as i32,
-            dims.hidden as i32,
-            weights.gate_up_w4a8.group_size as i32,
-            scratch.cutlass_workspace,
-            scratch.cutlass_workspace_bytes,
-            stream,
-        )?;
+    if try_w4a8_rowscale(
+        dims.layer_idx,
+        W4a8Module::GateUp,
+        w4a8,
+        weights.gate_up_w4a8,
+        scratch.hidden_fp8,
+        scratch.hidden_scale,
+        scratch.gate_up_out,
+        dims.num_tokens,
+        2 * dims.intermediate,
+        dims.hidden,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
+        stream,
+    )? {
     } else if weights.gate_up_f16 != 0 {
         // F16 path: norm residual into gate_up_out scratch, then F16 GEMM
         cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
@@ -1264,7 +1458,31 @@ pub unsafe fn gemma4_forward_phase(
 
     // 11-12. GELU*up + down_proj
     #[cfg(feature = "cuda")]
-    if let Some(w4a8_lib) = w4a8.filter(|_| weights.down_w4a8.is_ready()) {
+    let use_down_w4a8 = {
+        let ready = if w4a8.is_some() || weights.down_w4a8.has_any() {
+            weights.down_w4a8.validate_for_k(dims.intermediate)?
+        } else {
+            false
+        };
+        if w4a8.is_some() && !ready {
+            note_w4a8_flag_only(
+                dims.layer_idx,
+                W4a8Module::Down,
+                "no-w4a8-weight",
+                weights.down_w4a8,
+            );
+        } else if w4a8.is_none() && weights.down_w4a8.has_any() {
+            note_w4a8_flag_only(
+                dims.layer_idx,
+                W4a8Module::Down,
+                "w4a8-lib-unavailable",
+                weights.down_w4a8,
+            );
+        }
+        ready && w4a8.is_some()
+    };
+    #[cfg(feature = "cuda")]
+    if use_down_w4a8 {
         gemma4_launcher::FusedGeluMulFp8QuantLaunch {
             num_tokens: dims.num_tokens,
             intermediate: dims.intermediate,
@@ -1277,16 +1495,17 @@ pub unsafe fn gemma4_forward_phase(
             stream,
         )?;
         let down_out_f16 = scratch.gemm_f32_tmp;
-        w4a8_lib.w4a8_gemm_rowscale(
+        try_w4a8_rowscale(
+            dims.layer_idx,
+            W4a8Module::Down,
+            w4a8,
+            weights.down_w4a8,
             scratch.mlp_out_fp8,
             scratch.mlp_out_scale,
-            weights.down_w4a8.int4,
-            weights.down_w4a8.scales,
             down_out_f16,
-            dims.num_tokens as i32,
-            dims.hidden as i32,
-            dims.intermediate as i32,
-            weights.down_w4a8.group_size as i32,
+            dims.num_tokens,
+            dims.hidden,
+            dims.intermediate,
             scratch.cutlass_workspace,
             scratch.cutlass_workspace_bytes,
             stream,
@@ -1881,4 +2100,46 @@ pub unsafe fn logit_softcap(
         cap,
     }
     .launch(kernel, logits_ptr, stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w4a8_ptrs_validate_empty_as_flag_only() {
+        assert_eq!(
+            W4a8WeightPtrs::default().validate_for_k(4096).ok(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn w4a8_ptrs_validate_complete_shape() {
+        let ptrs = W4a8WeightPtrs {
+            int4: 0x1000,
+            scales: 0x2000,
+            group_size: 128,
+        };
+        assert_eq!(ptrs.validate_for_k(4096).ok(), Some(true));
+        assert!(ptrs.can_dispatch_for_k(4096));
+    }
+
+    #[test]
+    fn w4a8_ptrs_reject_partial_or_bad_group() {
+        let partial = W4a8WeightPtrs {
+            int4: 0x1000,
+            scales: 0,
+            group_size: 128,
+        };
+        assert!(partial.validate_for_k(4096).is_err());
+
+        let bad_group = W4a8WeightPtrs {
+            int4: 0x1000,
+            scales: 0x2000,
+            group_size: 96,
+        };
+        assert!(bad_group.validate_for_k(4096).is_err());
+        assert!(!bad_group.can_dispatch_for_k(4096));
+    }
 }

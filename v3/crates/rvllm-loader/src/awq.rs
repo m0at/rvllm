@@ -22,6 +22,13 @@ pub enum AwqReferenceError {
         expected: usize,
         got: usize,
     },
+    NonFinite {
+        tensor: &'static str,
+        index: usize,
+    },
+    InvalidClipRatio {
+        index: usize,
+    },
 }
 
 impl fmt::Display for AwqReferenceError {
@@ -51,6 +58,12 @@ impl fmt::Display for AwqReferenceError {
                 expected,
                 got,
             } => write!(f, "{tensor} length {got} != expected {expected}"),
+            AwqReferenceError::NonFinite { tensor, index } => {
+                write!(f, "{tensor}[{index}] is not finite")
+            }
+            AwqReferenceError::InvalidClipRatio { index } => {
+                write!(f, "AWQ clip_ratios[{index}] must be finite and > 0")
+            }
         }
     }
 }
@@ -174,6 +187,22 @@ impl AwqW4A8Candidate {
     pub fn is_ready(&self) -> bool {
         matches!(self.status, AwqW4A8CandidateStatus::Ready)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AwqProtectedLane {
+    pub group: usize,
+    pub row: usize,
+    pub score: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AwqQuantizedRef {
+    pub qweight: Vec<u32>,
+    pub qzeros: Option<Vec<u32>>,
+    pub scales: Vec<f32>,
+    pub clip_ratios: Vec<f32>,
+    pub protected_lanes: Vec<AwqProtectedLane>,
 }
 
 impl AwqTensorSet {
@@ -435,6 +464,256 @@ pub fn dequantize_awq_qweight_ref(
     Ok(out)
 }
 
+pub fn quantize_awq_groups_ref(
+    weights: &[f32],
+    activation_importance: &[f32],
+    rows: usize,
+    cols: usize,
+    config: AwqDequantConfig,
+    clip_ratios: &[f32],
+    protected_per_group: usize,
+) -> AwqRefResult<AwqQuantizedRef> {
+    let config = AwqDequantConfig::new(config.bits, config.group_size, config.zero_point)?;
+    validate_len("weights", weights.len(), rows * cols)?;
+    validate_len("activation_importance", activation_importance.len(), rows)?;
+    validate_finite("weights", weights)?;
+    validate_finite("activation_importance", activation_importance)?;
+    validate_clip_ratios(clip_ratios)?;
+
+    let groups = ceil_div(rows, config.group_size);
+    let mut qvalues = vec![0u8; rows * cols];
+    let mut scales = vec![0.0f32; groups * cols];
+    let mut zeros = if config.zero_point {
+        Some(vec![1u16; groups * cols])
+    } else {
+        None
+    };
+    let mut chosen_clips = vec![1.0f32; groups * cols];
+
+    for group in 0..groups {
+        let start = group * config.group_size;
+        let end = rows.min(start + config.group_size);
+        for col in 0..cols {
+            let best = search_awq_group_col(
+                weights,
+                activation_importance,
+                start,
+                end,
+                cols,
+                col,
+                config,
+                clip_ratios,
+            );
+            scales[group * cols + col] = best.scale;
+            chosen_clips[group * cols + col] = best.clip_ratio;
+            if let Some(zeros) = zeros.as_mut() {
+                zeros[group * cols + col] = best.zero;
+            }
+            for row in start..end {
+                qvalues[row * cols + col] =
+                    quantize_awq_value(weights[row * cols + col], best, config.bits) as u8;
+            }
+        }
+    }
+
+    let qweight = pack_awq_qweight_ref(&qvalues, rows, cols, config.bits);
+    let qzeros = zeros.map(|zeros| pack_awq_qzeros_ref(&zeros, groups, cols, config.bits));
+    let protected_lanes = select_awq_protected_lanes_ref(
+        activation_importance,
+        config.group_size,
+        protected_per_group,
+    )?;
+
+    Ok(AwqQuantizedRef {
+        qweight,
+        qzeros,
+        scales,
+        clip_ratios: chosen_clips,
+        protected_lanes,
+    })
+}
+
+pub fn select_awq_protected_lanes_ref(
+    activation_importance: &[f32],
+    group_size: usize,
+    protected_per_group: usize,
+) -> AwqRefResult<Vec<AwqProtectedLane>> {
+    if group_size == 0 {
+        return Err(AwqReferenceError::InvalidGroupSize { group_size });
+    }
+    validate_finite("activation_importance", activation_importance)?;
+
+    let groups = ceil_div(activation_importance.len(), group_size);
+    let mut out = Vec::new();
+    for group in 0..groups {
+        let start = group * group_size;
+        let end = activation_importance.len().min(start + group_size);
+        let mut lanes = (start..end)
+            .map(|row| AwqProtectedLane {
+                group,
+                row,
+                score: activation_importance[row].abs(),
+            })
+            .collect::<Vec<_>>();
+        lanes.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.row.cmp(&b.row)));
+        out.extend(lanes.into_iter().take(protected_per_group.min(end - start)));
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AwqGroupColQuant {
+    scale: f32,
+    zero: u16,
+    clip_ratio: f32,
+}
+
+fn search_awq_group_col(
+    weights: &[f32],
+    activation_importance: &[f32],
+    start: usize,
+    end: usize,
+    cols: usize,
+    col: usize,
+    config: AwqDequantConfig,
+    clip_ratios: &[f32],
+) -> AwqGroupColQuant {
+    let max_abs = (start..end)
+        .map(|row| weights[row * cols + col].abs())
+        .fold(0.0f32, f32::max);
+    if max_abs == 0.0 {
+        return AwqGroupColQuant {
+            scale: 1.0,
+            zero: 1,
+            clip_ratio: clip_ratios.first().copied().unwrap_or(1.0),
+        };
+    }
+
+    let mut best = AwqGroupColQuant {
+        scale: 1.0,
+        zero: 1,
+        clip_ratio: clip_ratios[0],
+    };
+    let mut best_loss = f32::INFINITY;
+    for &clip_ratio in clip_ratios {
+        let candidate =
+            make_awq_group_col_quant(weights, start, end, cols, col, config, max_abs, clip_ratio);
+        let loss = awq_group_col_loss(
+            weights,
+            activation_importance,
+            start,
+            end,
+            cols,
+            col,
+            candidate,
+            config.bits,
+        );
+        if loss < best_loss {
+            best_loss = loss;
+            best = candidate;
+        }
+    }
+    best
+}
+
+fn make_awq_group_col_quant(
+    weights: &[f32],
+    start: usize,
+    end: usize,
+    cols: usize,
+    col: usize,
+    config: AwqDequantConfig,
+    max_abs: f32,
+    clip_ratio: f32,
+) -> AwqGroupColQuant {
+    let qmax = ((1u32 << config.bits) - 1) as f32;
+    let clip = max_abs * clip_ratio;
+    if config.zero_point {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for row in start..end {
+            let v = weights[row * cols + col].clamp(-clip, clip);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        if lo == hi {
+            return AwqGroupColQuant {
+                scale: 1.0,
+                zero: 1,
+                clip_ratio,
+            };
+        }
+        let scale = ((hi - lo) / qmax).max(f32::MIN_POSITIVE);
+        let zero = (-lo / scale).round().clamp(1.0, qmax + 1.0) as u16;
+        AwqGroupColQuant {
+            scale,
+            zero,
+            clip_ratio,
+        }
+    } else {
+        let scale = (clip / qmax).max(f32::MIN_POSITIVE);
+        AwqGroupColQuant {
+            scale,
+            zero: 0,
+            clip_ratio,
+        }
+    }
+}
+
+fn awq_group_col_loss(
+    weights: &[f32],
+    activation_importance: &[f32],
+    start: usize,
+    end: usize,
+    cols: usize,
+    col: usize,
+    quant: AwqGroupColQuant,
+    bits: u8,
+) -> f32 {
+    let mut loss = 0.0;
+    for row in start..end {
+        let w = weights[row * cols + col];
+        let q = quantize_awq_value(w, quant, bits) as f32;
+        let dequant = (q - quant.zero as f32) * quant.scale;
+        let err = dequant - w;
+        loss += activation_importance[row].abs() * err * err;
+    }
+    loss
+}
+
+fn quantize_awq_value(value: f32, quant: AwqGroupColQuant, bits: u8) -> u32 {
+    let qmax = ((1u32 << bits) - 1) as f32;
+    (value / quant.scale + quant.zero as f32)
+        .round()
+        .clamp(0.0, qmax) as u32
+}
+
+fn pack_awq_qweight_ref(values: &[u8], rows: usize, cols: usize, bits: u8) -> Vec<u32> {
+    let pack = values_per_word(bits);
+    let mut out = vec![0; ceil_div(rows, pack) * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            let idx = (row / pack) * cols + col;
+            out[idx] |= (values[row * cols + col] as u32) << ((row % pack) * bits as usize);
+        }
+    }
+    out
+}
+
+fn pack_awq_qzeros_ref(zeros: &[u16], groups: usize, cols: usize, bits: u8) -> Vec<u32> {
+    let pack = values_per_word(bits);
+    let packed_cols = ceil_div(cols, pack);
+    let mut out = vec![0; groups * packed_cols];
+    for group in 0..groups {
+        for col in 0..cols {
+            let zero = zeros[group * cols + col].clamp(1, 1u16 << bits);
+            let idx = group * packed_cols + col / pack;
+            out[idx] |= ((zero - 1) as u32) << ((col % pack) * bits as usize);
+        }
+    }
+    out
+}
+
 fn validate_bits(bits: u8) -> AwqRefResult<()> {
     if bits == 4 {
         Ok(())
@@ -462,6 +741,27 @@ fn validate_len(tensor: &'static str, got: usize, expected: usize) -> AwqRefResu
             got,
         })
     }
+}
+
+fn validate_finite(tensor: &'static str, values: &[f32]) -> AwqRefResult<()> {
+    for (index, value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(AwqReferenceError::NonFinite { tensor, index });
+        }
+    }
+    Ok(())
+}
+
+fn validate_clip_ratios(clip_ratios: &[f32]) -> AwqRefResult<()> {
+    if clip_ratios.is_empty() {
+        return Err(AwqReferenceError::InvalidClipRatio { index: 0 });
+    }
+    for (index, ratio) in clip_ratios.iter().enumerate() {
+        if !ratio.is_finite() || *ratio <= 0.0 {
+            return Err(AwqReferenceError::InvalidClipRatio { index });
+        }
+    }
+    Ok(())
 }
 
 fn ceil_div(n: usize, d: usize) -> usize {
@@ -1163,5 +1463,136 @@ mod tests {
         let dequant = dequantize_awq_qweight_ref(&qweight, None, &scales, 2, 2, config).unwrap();
 
         assert_eq!(dequant, vec![1.0, 6.0, 2.0, 10.0]);
+    }
+
+    #[test]
+    fn activation_aware_clip_search_downweights_outliers() {
+        let weights = [1.0, 1.1, 1.2, 8.0];
+        let activation_importance = [10.0, 10.0, 10.0, 0.0001];
+        let config = AwqDequantConfig::new(4, 4, false).unwrap();
+
+        let quant = quantize_awq_groups_ref(
+            &weights,
+            &activation_importance,
+            4,
+            1,
+            config,
+            &[1.0, 0.25],
+            0,
+        )
+        .unwrap();
+        let dequant =
+            dequantize_awq_qweight_ref(&quant.qweight, None, &quant.scales, 4, 1, config).unwrap();
+
+        assert_eq!(quant.clip_ratios, vec![0.25]);
+        assert!((dequant[2] - 1.2).abs() < 1e-6);
+        assert!(dequant[3] < 2.1);
+    }
+
+    #[test]
+    fn zero_point_group_quantization_handles_signed_weights() {
+        let weights = [-1.0, 0.0, 1.0, 2.0];
+        let activation_importance = [1.0; 4];
+        let config = AwqDequantConfig::new(4, 4, true).unwrap();
+
+        let quant =
+            quantize_awq_groups_ref(&weights, &activation_importance, 4, 1, config, &[1.0], 0)
+                .unwrap();
+        let dequant = dequantize_awq_qweight_ref(
+            &quant.qweight,
+            quant.qzeros.as_deref(),
+            &quant.scales,
+            4,
+            1,
+            config,
+        )
+        .unwrap();
+
+        assert_eq!(quant.scales, vec![0.2]);
+        assert!(quant.qzeros.is_some());
+        assert_close(&dequant, &weights, 1e-6);
+    }
+
+    #[test]
+    fn protected_lanes_select_top_activation_rows_per_group() {
+        let activation_importance = [0.1, -7.0, 2.0, 9.0, 4.0];
+
+        let lanes = select_awq_protected_lanes_ref(&activation_importance, 2, 1).unwrap();
+
+        assert_eq!(
+            lanes,
+            vec![
+                AwqProtectedLane {
+                    group: 0,
+                    row: 1,
+                    score: 7.0,
+                },
+                AwqProtectedLane {
+                    group: 1,
+                    row: 3,
+                    score: 9.0,
+                },
+                AwqProtectedLane {
+                    group: 2,
+                    row: 4,
+                    score: 4.0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn quantize_ref_returns_protected_lane_metadata() {
+        let weights = [1.0, 2.0, 3.0, 4.0];
+        let activation_importance = [0.5, 3.0, 2.0, 1.0];
+        let config = AwqDequantConfig::new(4, 2, false).unwrap();
+
+        let quant =
+            quantize_awq_groups_ref(&weights, &activation_importance, 4, 1, config, &[1.0], 1)
+                .unwrap();
+
+        assert_eq!(
+            quant.protected_lanes,
+            vec![
+                AwqProtectedLane {
+                    group: 0,
+                    row: 1,
+                    score: 3.0,
+                },
+                AwqProtectedLane {
+                    group: 1,
+                    row: 2,
+                    score: 2.0,
+                },
+            ]
+        );
+        assert!(quant.qzeros.is_none());
+    }
+
+    #[test]
+    fn quantize_ref_rejects_bad_calibration_inputs() {
+        let config = AwqDequantConfig::new(4, 2, false).unwrap();
+        assert_eq!(
+            quantize_awq_groups_ref(&[1.0, f32::NAN], &[1.0, 1.0], 2, 1, config, &[1.0], 0)
+                .unwrap_err(),
+            AwqReferenceError::NonFinite {
+                tensor: "weights",
+                index: 1,
+            }
+        );
+        assert_eq!(
+            quantize_awq_groups_ref(&[1.0, 2.0], &[1.0, 1.0], 2, 1, config, &[], 0).unwrap_err(),
+            AwqReferenceError::InvalidClipRatio { index: 0 }
+        );
+    }
+
+    fn assert_close(got: &[f32], expected: &[f32], tol: f32) {
+        assert_eq!(got.len(), expected.len());
+        for (index, (got, expected)) in got.iter().zip(expected).enumerate() {
+            assert!(
+                (got - expected).abs() <= tol,
+                "index {index}: got {got}, expected {expected}"
+            );
+        }
     }
 }

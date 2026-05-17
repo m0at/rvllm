@@ -12,7 +12,7 @@ experiment gates, W4A8 kernel smoke, and bounded regression lanes.
 | Lane | Decision | Why |
 |---|---|---|
 | SM75 / T4 | No-go for serving | `sm_75` is modeled and audited, but there is no SM75 PTX manifest, validated attention backend, or non-Hopper W4A8/FP8 kernel route. |
-| AWQ / W4A8 | No-go for production serving | AWQ metadata/reference helpers, W4A8 bindings, and env gates exist; real AWQ tensor ingest and layer dispatch do not. |
+| AWQ / W4A8 | No-go for production serving | The direction is good, and W4A8 kernel/binding work plus a research dispatch harness exist. Real calibrated AWQ tensor ingest, packing, and production dispatch do not. |
 | RotorQuant | No-go for serving | Metadata, KV layout sizing, fallback policy, and CPU reference helpers exist; attention kernels and runtime KV integration do not. |
 | Serving validation | Go for baseline and instrumentation | H100 baseline/current/W4A8-gated/RotorQuant-gated lanes pass health, models, chat, B=1/B=128 throughput, and PPL smoke. |
 
@@ -35,6 +35,10 @@ No-go blockers:
 
 ## AWQ / W4A8
 
+The suggestion to add AWQ/W4A8 is good: it targets the right memory-bandwidth
+pressure point for H100. The current branch should still be read as groundwork
+and research isolation, not incorporated performance work.
+
 Implemented:
 
 - AWQ metadata detection covers `qweight/qzeros/scales/g_idx`, packed
@@ -47,7 +51,9 @@ Implemented:
   and `scales` tensors for parity fixtures.
 - W4A8 shared-object loading is gated behind `RVLLM_EXPERIMENT_WEIGHT=w4a8-awq`
   or legacy `RVLLM_W4A8=1`.
-- A real-dispatch bring-up path can encode F16 source weights with
+- Flag-only H100 `w4a8` lanes verify experiment labels and fallback behavior.
+  They were not active W4A8 layer dispatch.
+- A real-dispatch research harness can encode F16 source weights with
   `RVLLM_W4A8_ENCODE_LAYERS` and route selected modules via
   `RVLLM_W4A8_MODULES`.
 - The experiment controller rejects W4A8 under forced SM75 compatibility.
@@ -58,8 +64,8 @@ No-go blockers:
 - Load real AWQ tensors into the typed W4A8 weight slots.
 - Add runtime candidate checks for supported shapes, groups, and tensor coverage.
 - Replace the current symmetric F16-source encoder with calibrated AWQ packing.
-- Fix or reject real-dispatch `qkv`, `o`, and `gate_up` paths until PPL smoke is
-  sane; H100 isolation found `qkv`/`gate_up` degrade badly and `o` produced NaN.
+- Fix or reject the symmetric real-dispatch path until PPL smoke is sane; H100
+  isolation found all tested modules explode PPL versus baseline.
 - Add true W4A8-vs-baseline serving benchmarks after production AWQ packing
   exists.
 
@@ -70,19 +76,24 @@ Metadata-only verdict:
 - Config-only AWQ is detected but not serving-ready.
 - Mixed or partial tensor sets are inspection results, not accepted serving
   routes.
+- Symmetric INT4 from F16 source weights is an isolation tool, not AWQ.
 
-Real-dispatch smoke on H100, layer 0 only:
+Real-dispatch research smoke on H100, May 17 2026:
 
 | Modules | PPL |
 | --- | ---: |
-| qkv | 134.5493 |
-| o | NaN |
-| gate_up | 136.0077 |
-| down | 34.5744 |
+| FP8 baseline | 49.3464 |
+| qkv, 1 W4A8 layer | 39842466772750.7891 |
+| o, 1 W4A8 layer | 4765193586.1566 |
+| gate_up, 1 W4A8 layer | 15948788191217.1602 |
+| down, 1 W4A8 layer | 11196819598943.0723 |
+| down, 8 W4A8 layers | 2520490153081667.0000 |
 
-Down-proj-only scaling stayed finite for the bounded chunk: 2 layers `32.4274`,
-4 layers `32.4160`, 8 layers `32.8167`. Throughput regressed at 8 layers
-(`46.8 tok/s` B=1, `4946.1 tok/s` B=128), so this is still a research lane.
+Down-proj-only synthetic throughput was fast at 8 layers (`254.9 tok/s` B=1,
+`25468.8 tok/s` B=128), but quality is unusable, so this remains a research
+lane only.
+Calibrated AWQ packing is required before presenting this as incorporated
+W4A8/AWQ performance work.
 
 ## RotorQuant
 
@@ -160,7 +171,9 @@ Interpretation:
 
 - 31B serving is healthy on H100 for the bounded regression lanes.
 - The W4A8 and RotorQuant numbers are not quantized production serving numbers;
-  they verify experiment plumbing and fallback behavior.
+  the flag-only W4A8 lanes verify experiment plumbing and fallback behavior.
+- The separate real-dispatch W4A8 smoke is a research harness using symmetric
+  INT4, not AWQ.
 - SM75, real AWQ dispatch, and RotorQuant attention remain no-go until the
   blockers above are implemented and separately benchmarked.
 

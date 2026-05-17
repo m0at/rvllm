@@ -63,6 +63,8 @@ PPL_CHUNKS="${H100_MATRIX_PPL_CHUNKS:-1}"
 PPL_PROMPT="${H100_MATRIX_PPL_PROMPT:-Angular momentum is conserved when the net external torque on a system is zero. A spinning figure skater who pulls in their arms reduces rotational inertia, so their angular velocity rises while total angular momentum stays nearly constant. This small text is only for a bounded perplexity smoke chunk.}"
 CHAT_PROMPT="${H100_MATRIX_CHAT_PROMPT:-Explain angular momentum conservation using a spinning figure skater pulling in their arms. Keep it to one sentence.}"
 CHAT_MAX_TOKENS="${H100_MATRIX_CHAT_MAX_TOKENS:-48}"
+W4A8_ISOLATION_LAYERS="${H100_MATRIX_W4A8_ISOLATION_LAYERS:-1}"
+W4A8_DOWN_SMOKE_LAYERS="${H100_MATRIX_W4A8_DOWN_SMOKE_LAYERS:-8}"
 
 SERVER_MAX_MODEL_LEN="${H100_MATRIX_MAX_MODEL_LEN:-8192}"
 SERVER_MAX_NUM_SEQS="${H100_MATRIX_MAX_NUM_SEQS:-1}"
@@ -196,6 +198,56 @@ json_number_or_null() {
     fi
 }
 
+json_float_or_null() {
+    local value="${1:-}"
+    if [[ "$value" =~ ^[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+        printf '%s' "$value"
+    else
+        printf 'null'
+    fi
+}
+
+extract_json_metric() {
+    local key="$1"
+    local log_file="$2"
+    grep -Eo "\"${key}\":[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?" "$log_file" 2>/dev/null \
+        | tail -n 1 \
+        | sed 's/.*://' || true
+}
+
+extract_ppl_metric() {
+    local log_file="$1"
+    local value
+    value="$(extract_json_metric perplexity "$log_file")"
+    if [[ -z "$value" ]]; then
+        value="$(sed -nE 's/.*perplexity = ([-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?).*/\1/p' "$log_file" | tail -n 1)"
+    fi
+    printf '%s' "$value"
+}
+
+extract_tok_s_metric() {
+    local log_file="$1"
+    local value
+    value="$(extract_json_metric tok_per_sec "$log_file")"
+    if [[ -z "$value" ]]; then
+        value="$(sed -nE 's/.*-> ([-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?) tok\/s.*/\1/p' "$log_file" | tail -n 1)"
+    fi
+    if [[ -z "$value" ]]; then
+        value="$(sed -nE 's/.*\(([-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?) tok\/s,.*/\1/p' "$log_file" | tail -n 1)"
+    fi
+    printf '%s' "$value"
+}
+
+extract_ms_step_metric() {
+    local log_file="$1"
+    local value
+    value="$(extract_json_metric ms_per_step "$log_file")"
+    if [[ -z "$value" ]]; then
+        value="$(sed -nE 's/.*tok\/s \(([-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?) ms\/step\).*/\1/p' "$log_file" | tail -n 1)"
+    fi
+    printf '%s' "$value"
+}
+
 append_summary() {
     local variant="$1"
     local test="$2"
@@ -207,8 +259,11 @@ append_summary() {
     local lane_env="${8:-}"
     local mem_before_mib="${9:-}"
     local mem_after_mib="${10:-}"
+    local ppl="${11:-}"
+    local tok_s="${12:-}"
+    local ms_step="${13:-}"
 
-    printf '{"run_id":"%s","git_branch":"%s","git_sha":"%s","kernel_manifest":"%s","kernel_manifest_sha256":"%s","variant":"%s","test":"%s","lane_env":"%s","status":"%s","exit_code":%s,"elapsed_s":%s,"mem_before_mib":%s,"mem_after_mib":%s,"log":"%s","message":"%s"}\n' \
+    printf '{"run_id":"%s","git_branch":"%s","git_sha":"%s","kernel_manifest":"%s","kernel_manifest_sha256":"%s","variant":"%s","test":"%s","lane_env":"%s","status":"%s","exit_code":%s,"elapsed_s":%s,"mem_before_mib":%s,"mem_after_mib":%s,"ppl":%s,"tok_s":%s,"ms_step":%s,"log":"%s","message":"%s"}\n' \
         "$(json_escape "$RUN_ID")" \
         "$(json_escape "$GIT_BRANCH")" \
         "$(json_escape "$GIT_SHA")" \
@@ -222,10 +277,13 @@ append_summary() {
         "$elapsed_s" \
         "$(json_number_or_null "$mem_before_mib")" \
         "$(json_number_or_null "$mem_after_mib")" \
+        "$(json_float_or_null "$ppl")" \
+        "$(json_float_or_null "$tok_s")" \
+        "$(json_float_or_null "$ms_step")" \
         "$(json_escape "$log_file")" \
         "$(json_escape "$message")" >> "$SUMMARY_JSONL"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$(tsv_escape "$RUN_ID")" \
         "$(tsv_escape "$GIT_BRANCH")" \
         "$(tsv_escape "$GIT_SHA")" \
@@ -239,6 +297,9 @@ append_summary() {
         "$elapsed_s" \
         "$(tsv_escape "$mem_before_mib")" \
         "$(tsv_escape "$mem_after_mib")" \
+        "$(tsv_escape "$ppl")" \
+        "$(tsv_escape "$tok_s")" \
+        "$(tsv_escape "$ms_step")" \
         "$(tsv_escape "$log_file")" \
         "$(tsv_escape "$message")" >> "$SUMMARY_TSV"
 
@@ -263,7 +324,7 @@ run_command() {
     local lane_env="$5"
     shift 5
 
-    local start elapsed exit_code status message cmd_text mem_before_mib mem_after_mib
+    local start elapsed exit_code status message cmd_text mem_before_mib mem_after_mib ppl tok_s ms_step
     cmd_text="$(format_cmd "$@")"
     mem_before_mib="$(gpu_memory_used_mib)"
 
@@ -299,6 +360,12 @@ run_command() {
         status="timeout"
         message="timed out"
     fi
+    ppl="$(extract_ppl_metric "$log_file")"
+    tok_s="$(extract_tok_s_metric "$log_file")"
+    ms_step="$(extract_ms_step_metric "$log_file")"
+    if [[ -n "$ppl" || -n "$tok_s" || -n "$ms_step" ]]; then
+        message="${message} ppl=${ppl:-na} tok_s=${tok_s:-na} ms_step=${ms_step:-na}"
+    fi
 
     {
         printf '\nexit_code=%s\n' "$exit_code"
@@ -307,7 +374,7 @@ run_command() {
         printf 'memory_after_mib=%s\n' "$mem_after_mib"
     } >> "$log_file"
 
-    append_summary "$variant" "$test" "$status" "$exit_code" "$elapsed" "$log_file" "$message" "$lane_env" "$mem_before_mib" "$mem_after_mib"
+    append_summary "$variant" "$test" "$status" "$exit_code" "$elapsed" "$log_file" "$message" "$lane_env" "$mem_before_mib" "$mem_after_mib" "$ppl" "$tok_s" "$ms_step"
 }
 
 stop_server() {
@@ -357,7 +424,7 @@ require_dir() {
 init_logs() {
     mkdir -p "$LOG_DIR"
     : > "$SUMMARY_JSONL"
-    printf 'run_id\tgit_branch\tgit_sha\tkernel_manifest\tkernel_manifest_sha256\tvariant\ttest\tlane_env\tstatus\texit_code\telapsed_s\tmem_before_mib\tmem_after_mib\tlog\tmessage\n' > "$SUMMARY_TSV"
+    printf 'run_id\tgit_branch\tgit_sha\tkernel_manifest\tkernel_manifest_sha256\tvariant\ttest\tlane_env\tstatus\texit_code\telapsed_s\tmem_before_mib\tmem_after_mib\tppl\ttok_s\tms_step\tlog\tmessage\n' > "$SUMMARY_TSV"
 }
 
 write_context() {
@@ -463,6 +530,9 @@ collect_current_variant_labels() {
         RVLLM_EXPERIMENT_ARCH \
         RVLLM_W4A8 \
         RVLLM_W4A8_SO \
+        RVLLM_F16_LAYERS \
+        RVLLM_W4A8_ENCODE_LAYERS \
+        RVLLM_W4A8_MODULES \
         RVLLM_ROTORQUANT \
         RVLLM_ROTORQUANT_BITS \
         RVLLM_ROTORQUANT_CHUNK_DIM; do
@@ -471,6 +541,26 @@ collect_current_variant_labels() {
         VARIANT_LABEL_ARGS+=("${name}=${value}")
     done
     [[ "${#VARIANT_LABEL_ARGS[@]}" -gt 0 ]] || VARIANT_LABEL_ARGS=("RVLLM_EXPERIMENT=current")
+}
+
+configure_w4a8_real_dispatch_variant() {
+    local layers="$1"
+    local modules="$2"
+    local w4a8_so
+
+    w4a8_so="$(default_w4a8_so)"
+    [[ -n "$w4a8_so" ]] || die "w4a8 real-dispatch variant needs RVLLM_W4A8_SO or ${RVLLM_KERNELS_DIR:-}/sm_90/libw4a8_gemm.so"
+    require_file RVLLM_W4A8_SO "$w4a8_so"
+    VARIANT_UNSET_ARGS=(-u RVLLM_EXPERIMENT -u RVLLM_EXPERIMENT_KV -u RVLLM_EXPERIMENT_ATTENTION -u RVLLM_EXPERIMENT_ARCH -u RVLLM_EXPERIMENT_VALIDATION -u RVLLM_ROTORQUANT -u RVLLM_ROTORQUANT_BITS -u RVLLM_ROTORQUANT_CHUNK_DIM -u RVLLM_F16_ONLY)
+    VARIANT_SET_ARGS=(
+        "RVLLM_EXPERIMENT_WEIGHT=w4a8-awq"
+        "RVLLM_W4A8=1"
+        "RVLLM_W4A8_SO=${w4a8_so}"
+        "RVLLM_F16_LAYERS=${layers}"
+        "RVLLM_W4A8_ENCODE_LAYERS=${layers}"
+        "RVLLM_W4A8_MODULES=${modules}"
+    )
+    VARIANT_LABEL_ARGS=("${VARIANT_SET_ARGS[@]}")
 }
 
 configure_variant() {
@@ -496,6 +586,21 @@ configure_variant() {
             VARIANT_UNSET_ARGS=(-u RVLLM_EXPERIMENT -u RVLLM_EXPERIMENT_KV -u RVLLM_EXPERIMENT_ATTENTION -u RVLLM_EXPERIMENT_ARCH -u RVLLM_EXPERIMENT_VALIDATION -u RVLLM_ROTORQUANT -u RVLLM_ROTORQUANT_BITS -u RVLLM_ROTORQUANT_CHUNK_DIM)
             VARIANT_SET_ARGS=("RVLLM_EXPERIMENT_WEIGHT=w4a8-awq" "RVLLM_W4A8=1" "RVLLM_W4A8_SO=${w4a8_so}")
             VARIANT_LABEL_ARGS=("${VARIANT_SET_ARGS[@]}")
+            ;;
+        w4a8_down_smoke)
+            configure_w4a8_real_dispatch_variant "$W4A8_DOWN_SMOKE_LAYERS" down
+            ;;
+        w4a8_iso_qkv)
+            configure_w4a8_real_dispatch_variant "$W4A8_ISOLATION_LAYERS" qkv
+            ;;
+        w4a8_iso_o)
+            configure_w4a8_real_dispatch_variant "$W4A8_ISOLATION_LAYERS" o
+            ;;
+        w4a8_iso_gate_up)
+            configure_w4a8_real_dispatch_variant "$W4A8_ISOLATION_LAYERS" gate_up
+            ;;
+        w4a8_iso_down)
+            configure_w4a8_real_dispatch_variant "$W4A8_ISOLATION_LAYERS" down
             ;;
         rotor_cl3|rotor|rotorquant)
             VARIANT_UNSET_ARGS=(-u RVLLM_EXPERIMENT -u RVLLM_EXPERIMENT_WEIGHT -u RVLLM_EXPERIMENT_ATTENTION -u RVLLM_EXPERIMENT_ARCH -u RVLLM_EXPERIMENT_VALIDATION -u RVLLM_W4A8 -u RVLLM_W4A8_SO)
