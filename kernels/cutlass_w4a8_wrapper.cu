@@ -7,7 +7,8 @@
 //
 // A is RowMajor [M, K] FP8 E4M3.
 // B is logical [N, K] int4 two's complement, CUTLASS-reordered offline.
-// Scales are MN-major [N, K/group_size] as packed e4m3x8 LUT blocks.
+// Scales are packed in CUTLASS MN-major order: logical [N, K/group_size],
+// flattened as group * N + row.
 // D is RowMajor [M, N] fp16.
 //
 // We swap A <-> B and transpose inside CUTLASS to keep the narrow type in
@@ -146,8 +147,8 @@ static bool finite_alpha_beta(float alpha, float beta) {
 // =========================================================================
 extern "C" int rvllm_w4a8_gemm_run(
     const void* a_fp8,              // [M, K] RowMajor E4M3
-    const void* b_int4_reordered,   // [K, N] INT4 ColMajor, AWQ-shuffled offline
-    const void* b_scales_packed,    // [N, K/group_size] as Array<e4m3, 8> LUT blocks
+    const void* b_int4_reordered,   // logical [N, K] INT4, CUTLASS-reordered offline
+    const void* b_scales_packed,    // [K/group_size, N] MN-major Array<e4m3, 8> LUT blocks
     const void* c_f16,              // [M, N] RowMajor (may be nullptr; used only if beta != 0)
     void*       d_f16,              // [M, N] RowMajor output
     int         m,
@@ -448,14 +449,14 @@ static __global__ void convert_scales_kernel(
     if (row >= n || grp >= scale_k) return;
 
     float s = scales_f32[row * scale_k + grp];
-    scales_e4m3[row * scale_k + grp] = ElementScale(s);
+    scales_e4m3[grp * n + row] = ElementScale(s);
 }
 
 // Host implementation: quantize + pack weights + reorder into the
 // kernel-expected layout. Expects:
 //   w_fp16        [N, K] row-major device ptr (input; will be read)
 //   w_int4_out    device ptr sized by rvllm_w4a8_int4_reordered_bytes(N, K)
-//   scales_out    [N, K/group, 8] bytes device ptr (output; e4m3 LUT)
+//   scales_out    [K/group, N, 8] bytes device ptr (output; e4m3 LUT, MN-major)
 //   workspace     temporary f32 scales buffer, >= N*K/group*4 bytes
 //   shuffle       reserved; output is always CUTLASS-reordered because
 //                 rvllm_w4a8_gemm_run always consumes LayoutB_Reordered.

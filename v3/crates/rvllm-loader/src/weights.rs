@@ -59,7 +59,7 @@ pub struct Fp8Weight {
 pub struct W4a8Weight {
     /// Device pointer to the CUTLASS-reordered int4 payload.
     pub int4_ptr: u64,
-    /// Device pointer to packed FP8 LUT scales, shape `[N, K/group, 8]`.
+    /// Device pointer to MN-major packed FP8 LUT scales, shape `[K/group, N, 8]`.
     pub scales_ptr: u64,
     pub shape: Vec<usize>,
     pub group_size: usize,

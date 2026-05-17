@@ -190,7 +190,22 @@ pub fn load_gemma4_model(
         } else {
             must_get(&embed_name)?
         };
-        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        let scale_entry = if e.dtype == DType::Fp8E4M3 {
+            get_tensor(&format!("{}_scale", e.name))
+        } else {
+            None
+        };
+        let buf = if e.dtype == DType::Fp8E4M3 {
+            fp8_weight_to_f16_bytes(
+                &e,
+                bytes_of(si, &e),
+                scale_entry.as_ref(),
+                &shards,
+                model_dir,
+            )?
+        } else {
+            tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?
+        };
         eprintln!(
             "[loader] lm_head_f16: {} elements ({:.1} MB)",
             e.shape.iter().product::<usize>(),
@@ -555,28 +570,19 @@ pub fn load_gemma4_model(
                         shape,
                     })
                 } else {
-                    // FP8 dequant with per-channel scales
                     let mut out = Vec::new();
                     for &(si, ref entry) in parts.iter() {
                         let raw = &shards[*si].bytes()[entry.file_offset as usize
                             ..(entry.file_offset + entry.nbytes) as usize];
-                        let rows = entry.shape[0];
-                        let cols = entry.nbytes as usize / rows;
                         let scale_name = format!("{}_scale", entry.name);
-                        let ch_scales = if let Some(se) = get_tensor(&scale_name) {
-                            read_channelscale_bf16(&se, &shards, rows)
-                        } else {
-                            vec![1.0 / 448.0; rows]
-                        };
-                        for r in 0..rows {
-                            let rs = ch_scales[r];
-                            for c in 0..cols {
-                                out.extend_from_slice(
-                                    &f16::from_f32(fp8_e4m3_to_f32(raw[r * cols + c]) * rs)
-                                        .to_le_bytes(),
-                                );
-                            }
-                        }
+                        let scale_entry = get_tensor(&scale_name);
+                        out.extend_from_slice(&fp8_weight_to_f16_bytes(
+                            entry,
+                            raw,
+                            scale_entry.as_ref(),
+                            &shards,
+                            model_dir,
+                        )?);
                     }
                     let r = arena.region(
                         Box::leak(format!("{name}_L{l}").into_boxed_str()),
@@ -725,6 +731,139 @@ fn tensor_to_f16_bytes(e: &TensorEntry, raw: &[u8], model_dir: &Path) -> Result<
             bt: std::backtrace::Backtrace::capture(),
         }),
     }
+}
+
+fn loader_corrupt(e: &TensorEntry, model_dir: &Path, detail: String) -> RvllmError {
+    RvllmError::Loader {
+        err: LoaderError::Corrupt { detail },
+        ctx: LoaderCtx {
+            path: model_dir.to_path_buf(),
+            tensor: Some(e.name.clone()),
+        },
+        bt: std::backtrace::Backtrace::capture(),
+    }
+}
+
+fn fp8_weight_to_f16_bytes(
+    e: &TensorEntry,
+    raw: &[u8],
+    scale_entry: Option<&(usize, TensorEntry)>,
+    shards: &[ShardMap],
+    model_dir: &Path,
+) -> Result<Vec<u8>> {
+    if e.dtype != DType::Fp8E4M3 {
+        return tensor_to_f16_bytes(e, raw, model_dir);
+    }
+    if e.shape.len() != 2 {
+        return Err(loader_corrupt(
+            e,
+            model_dir,
+            format!("FP8 weight {} must be rank-2, got {:?}", e.name, e.shape),
+        ));
+    }
+    let rows = e.shape[0];
+    let cols = e.shape[1];
+    if raw.len() != rows * cols {
+        return Err(loader_corrupt(
+            e,
+            model_dir,
+            format!(
+                "FP8 weight {} raw bytes {} != rows {} * cols {}",
+                e.name,
+                raw.len(),
+                rows,
+                cols
+            ),
+        ));
+    }
+    let scale = scale_entry.map(|(si, se)| {
+        let s = shards[*si].bytes();
+        let start = se.file_offset as usize;
+        (&s[start..start + se.nbytes as usize], se.shape.as_slice())
+    });
+    fp8_weight_to_f16_bytes_from_scale(raw, rows, cols, scale).map_err(|detail| {
+        loader_corrupt(
+            e,
+            model_dir,
+            format!("FP8 scale materialization failed for {}: {detail}", e.name),
+        )
+    })
+}
+
+fn bf16_le_to_f32(raw: &[u8], index: usize) -> f32 {
+    f32::from_bits(u32::from_le_bytes([
+        0,
+        0,
+        raw[2 * index],
+        raw[2 * index + 1],
+    ]))
+}
+
+fn fp8_weight_to_f16_bytes_from_scale(
+    raw: &[u8],
+    rows: usize,
+    cols: usize,
+    scale: Option<(&[u8], &[usize])>,
+) -> std::result::Result<Vec<u8>, String> {
+    if raw.len() != rows * cols {
+        return Err(format!(
+            "raw bytes {} != rows {} * cols {}",
+            raw.len(),
+            rows,
+            cols
+        ));
+    }
+
+    let scale_for = |r: usize, c: usize| -> std::result::Result<f32, String> {
+        let Some((scale_raw, scale_shape)) = scale else {
+            return Ok(1.0 / 448.0);
+        };
+        if scale_raw.len() % 2 != 0 {
+            return Err(format!("bf16 scale byte length {} is odd", scale_raw.len()));
+        }
+        let n = scale_raw.len() / 2;
+        if n == rows && (scale_shape.len() == 1 || (scale_shape.len() == 2 && scale_shape[1] == 1))
+        {
+            return Ok(bf16_le_to_f32(scale_raw, r));
+        }
+        if scale_shape.len() == 2 {
+            let row_blocks = scale_shape[0];
+            let col_blocks = scale_shape[1];
+            const BLOCK: usize = 128;
+            if n != row_blocks * col_blocks {
+                return Err(format!(
+                    "block-scale flat count {n} != row_blocks {row_blocks} * col_blocks {col_blocks}"
+                ));
+            }
+            if row_blocks * BLOCK < rows {
+                return Err(format!(
+                    "block-scale rows_blocks {row_blocks} * {BLOCK} < weight rows {rows}"
+                ));
+            }
+            if col_blocks * BLOCK < cols {
+                return Err(format!(
+                    "block-scale col_blocks {col_blocks} * {BLOCK} < weight cols {cols}"
+                ));
+            }
+            let rb = r / BLOCK;
+            let cb = c / BLOCK;
+            return Ok(bf16_le_to_f32(scale_raw, rb * col_blocks + cb));
+        }
+        Err(format!(
+            "unrecognized FP8 scale layout shape={scale_shape:?}, flat_count={n}, rows={rows}, cols={cols}"
+        ))
+    };
+
+    let mut out = Vec::with_capacity(raw.len() * 2);
+    for r in 0..rows {
+        for c in 0..cols {
+            let s = scale_for(r, c)?;
+            out.extend_from_slice(
+                &f16::from_f32(fp8_e4m3_to_f32(raw[r * cols + c]) * s).to_le_bytes(),
+            );
+        }
+    }
+    Ok(out)
 }
 
 fn fp8e4m3_to_f16(raw: &[u8]) -> Vec<u8> {
@@ -955,6 +1094,11 @@ mod blockscale_tests {
         hi.to_le_bytes()
     }
 
+    fn f16_at(raw: &[u8], index: usize) -> f32 {
+        let bits = u16::from_le_bytes([raw[2 * index], raw[2 * index + 1]]);
+        f16::from_bits(bits).to_f32()
+    }
+
     #[test]
     fn decode_blockscale_roundtrips_representative_values() {
         // Two row-blocks × three col-blocks = 6 bf16 scales. Values
@@ -995,6 +1139,52 @@ mod blockscale_tests {
         assert_eq!(out[3], 1.5);
         assert_eq!(out[4], 2.0);
         assert_eq!(out[5], 2.5);
+    }
+
+    #[test]
+    fn fp8_f16_materialization_uses_per_row_scale() {
+        let raw = vec![0x38; 4];
+        let mut scale_raw = Vec::new();
+        scale_raw.extend_from_slice(&f32_to_bf16_le(2.0));
+        scale_raw.extend_from_slice(&f32_to_bf16_le(4.0));
+
+        let out = fp8_weight_to_f16_bytes_from_scale(&raw, 2, 2, Some((&scale_raw, &[2])))
+            .expect("per-row scale materializes");
+
+        assert_eq!(f16_at(&out, 0), 2.0);
+        assert_eq!(f16_at(&out, 1), 2.0);
+        assert_eq!(f16_at(&out, 2), 4.0);
+        assert_eq!(f16_at(&out, 3), 4.0);
+    }
+
+    #[test]
+    fn fp8_f16_materialization_preserves_2d_blockscale_cols() {
+        let rows = 129;
+        let cols = 129;
+        let raw = vec![0x38; rows * cols];
+        let scales = [1.0_f32, 2.0, 4.0, 8.0];
+        let scale_raw: Vec<u8> = scales.iter().flat_map(|v| f32_to_bf16_le(*v)).collect();
+
+        let out = fp8_weight_to_f16_bytes_from_scale(&raw, rows, cols, Some((&scale_raw, &[2, 2])))
+            .expect("2-D blockscale materializes");
+
+        assert_eq!(f16_at(&out, 0), 1.0);
+        assert_eq!(f16_at(&out, 128), 2.0);
+        assert_eq!(f16_at(&out, 128 * cols), 4.0);
+        assert_eq!(f16_at(&out, 128 * cols + 128), 8.0);
+    }
+
+    #[test]
+    fn fp8_f16_materialization_rejects_too_few_col_blocks() {
+        let raw = vec![0x38; 129 * 129];
+        let scale_raw: Vec<u8> = [1.0_f32, 2.0]
+            .iter()
+            .flat_map(|v| f32_to_bf16_le(*v))
+            .collect();
+
+        let err = fp8_weight_to_f16_bytes_from_scale(&raw, 129, 129, Some((&scale_raw, &[2, 1])))
+            .expect_err("col block coverage must be validated");
+        assert!(err.contains("col_blocks"));
     }
 }
 

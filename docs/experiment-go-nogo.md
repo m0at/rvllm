@@ -11,8 +11,9 @@ experiment gates, W4A8 kernel smoke, and bounded regression lanes.
 
 | Lane | Decision | Why |
 |---|---|---|
+| 31B FP8 H100 | Go / verified | The reportable H100 serving route is Gemma 4 31B FP8-Dynamic through the native Rust server, with good PPL, CUDA graph capture, and measured B=1/B=512 throughput. |
 | SM75 / T4 | No-go for serving | `sm_75` is modeled and audited, but there is no SM75 PTX manifest, validated attention backend, or non-Hopper W4A8/FP8 kernel route. |
-| AWQ / W4A8 | No-go for production serving | The direction is good, and W4A8 kernel/binding work plus a research dispatch harness exist. Real calibrated AWQ tensor ingest, packing, and production dispatch do not. |
+| AWQ / W4A8 | No-go for production serving | The direction is good, and W4A8 kernel/binding work plus a research dispatch harness exist. Real calibrated AWQ tensor ingest, calibrated packing, and matched FP8-baseline quality/throughput gates do not. |
 | RotorQuant | No-go for serving | Metadata, KV layout sizing, fallback policy, and CPU reference helpers exist; attention kernels and runtime KV integration do not. |
 | Serving validation | Go for baseline and instrumentation | H100 baseline/current/W4A8-gated/RotorQuant-gated lanes pass health, models, chat, B=1/B=128 throughput, and PPL smoke. |
 
@@ -82,16 +83,18 @@ Real-dispatch research smoke on H100, May 17 2026:
 
 | Modules | PPL |
 | --- | ---: |
-| FP8 baseline | 49.3464 |
-| qkv, 1 W4A8 layer | 39842466772750.7891 |
-| o, 1 W4A8 layer | 4765193586.1566 |
-| gate_up, 1 W4A8 layer | 15948788191217.1602 |
-| down, 1 W4A8 layer | 11196819598943.0723 |
-| down, 8 W4A8 layers | 2520490153081667.0000 |
+| FP8 baseline / flag-only controls | 2433.6324 |
+| qkv, 1 W4A8 layer | 15761.0562 |
+| o, 1 W4A8 layer | nonfinite logits at step 12 |
+| gate_up, 1 W4A8 layer | 14910.9735 |
+| down, 1 W4A8 layer | 2379.3528 |
+| down, 8 W4A8 layers | 2475.9716 |
 
-Down-proj-only synthetic throughput was fast at 8 layers (`254.9 tok/s` B=1,
-`25468.8 tok/s` B=128), but quality is unusable, so this remains a research
-lane only.
+Down-proj-only passed the short full-model PPL gate at 8 layers
+(`2475.9716` versus baseline `2433.6324`, ratio `1.0174`), but it lost
+throughput in every reportable full-model lane: B=1 was `46.7 tok/s` versus
+`48.6`, and B=128 was `4958.3 tok/s` versus `5222.6`. The truncated debug
+lanes are not reportable.
 Calibrated AWQ packing is required before presenting this as incorporated
 W4A8/AWQ performance work.
 

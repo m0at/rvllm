@@ -15,6 +15,11 @@ pub enum AwqReferenceError {
     InvalidGroupSize {
         group_size: usize,
     },
+    InvalidW4A8Shape {
+        n: usize,
+        k: usize,
+        group_size: usize,
+    },
     MissingQZeros,
     UnexpectedQZeros,
     TensorLen {
@@ -46,6 +51,12 @@ impl fmt::Display for AwqReferenceError {
             }
             AwqReferenceError::InvalidGroupSize { group_size } => {
                 write!(f, "invalid AWQ group_size={group_size}")
+            }
+            AwqReferenceError::InvalidW4A8Shape { n, k, group_size } => {
+                write!(
+                    f,
+                    "invalid W4A8 scale shape n={n} k={k} group_size={group_size}"
+                )
             }
             AwqReferenceError::MissingQZeros => {
                 write!(f, "AWQ zero_point=true requires qzeros")
@@ -203,6 +214,63 @@ pub struct AwqQuantizedRef {
     pub scales: Vec<f32>,
     pub clip_ratios: Vec<f32>,
     pub protected_lanes: Vec<AwqProtectedLane>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct W4A8CalibratedScalesRef {
+    pub scales: Vec<f32>,
+    pub clip_ratios: Vec<f32>,
+    pub group_size: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AwqActivationStatsRef {
+    sums_abs: Vec<f32>,
+    samples: usize,
+}
+
+impl AwqActivationStatsRef {
+    pub fn new(k: usize) -> AwqRefResult<Self> {
+        if k == 0 {
+            return Err(AwqReferenceError::TensorLen {
+                tensor: "activation_importance",
+                expected: 1,
+                got: 0,
+            });
+        }
+        Ok(Self {
+            sums_abs: vec![0.0; k],
+            samples: 0,
+        })
+    }
+
+    pub fn observe(&mut self, activations: &[f32], rows: usize) -> AwqRefResult<()> {
+        let k = self.sums_abs.len();
+        validate_len("activations", activations.len(), rows * k)?;
+        validate_finite("activations", activations)?;
+        for row in 0..rows {
+            let offset = row * k;
+            for col in 0..k {
+                self.sums_abs[col] += activations[offset + col].abs();
+            }
+        }
+        self.samples += rows;
+        Ok(())
+    }
+
+    pub fn mean_abs_importance(&self) -> AwqRefResult<Vec<f32>> {
+        if self.samples == 0 {
+            return Err(AwqReferenceError::TensorLen {
+                tensor: "activations",
+                expected: 1,
+                got: 0,
+            });
+        }
+        let inv = 1.0 / self.samples as f32;
+        Ok(self.sums_abs.iter().map(|v| v * inv).collect())
+    }
 }
 
 impl AwqTensorSet {
@@ -533,6 +601,56 @@ pub fn quantize_awq_groups_ref(
     })
 }
 
+pub fn calibrate_w4a8_symmetric_scales_ref(
+    weights: &[f32],
+    activation_importance: &[f32],
+    n: usize,
+    k: usize,
+    group_size: usize,
+    clip_ratios: &[f32],
+) -> AwqRefResult<W4A8CalibratedScalesRef> {
+    if group_size == 0 {
+        return Err(AwqReferenceError::InvalidGroupSize { group_size });
+    }
+    validate_len("weights", weights.len(), n * k)?;
+    validate_len("activation_importance", activation_importance.len(), k)?;
+    validate_finite("weights", weights)?;
+    validate_finite("activation_importance", activation_importance)?;
+    validate_clip_ratios(clip_ratios)?;
+    if n == 0 || k == 0 || k % group_size != 0 {
+        return Err(AwqReferenceError::InvalidW4A8Shape { n, k, group_size });
+    }
+
+    let groups = k / group_size;
+    let mut scales = vec![f32::MIN_POSITIVE; n * groups];
+    let mut chosen_clips = vec![clip_ratios[0]; n * groups];
+    for row in 0..n {
+        for group in 0..groups {
+            let start = group * group_size;
+            let end = start + group_size;
+            let best = search_w4a8_symmetric_group_scale(
+                weights,
+                activation_importance,
+                row,
+                start,
+                end,
+                k,
+                clip_ratios,
+            );
+            scales[row * groups + group] = best.scale;
+            chosen_clips[row * groups + group] = best.clip_ratio;
+        }
+    }
+
+    Ok(W4A8CalibratedScalesRef {
+        scales,
+        clip_ratios: chosen_clips,
+        group_size,
+        n,
+        k,
+    })
+}
+
 pub fn select_awq_protected_lanes_ref(
     activation_importance: &[f32],
     group_size: usize,
@@ -566,6 +684,75 @@ struct AwqGroupColQuant {
     scale: f32,
     zero: u16,
     clip_ratio: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct W4A8SymmetricGroupScale {
+    scale: f32,
+    clip_ratio: f32,
+}
+
+fn search_w4a8_symmetric_group_scale(
+    weights: &[f32],
+    activation_importance: &[f32],
+    row: usize,
+    start: usize,
+    end: usize,
+    k: usize,
+    clip_ratios: &[f32],
+) -> W4A8SymmetricGroupScale {
+    let row_offset = row * k;
+    let max_abs = weights[row_offset + start..row_offset + end]
+        .iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max);
+    if max_abs == 0.0 {
+        return W4A8SymmetricGroupScale {
+            scale: f32::MIN_POSITIVE,
+            clip_ratio: clip_ratios[0],
+        };
+    }
+
+    let mut best = W4A8SymmetricGroupScale {
+        scale: (max_abs * clip_ratios[0] / 7.0).max(f32::MIN_POSITIVE),
+        clip_ratio: clip_ratios[0],
+    };
+    let mut best_loss = f32::INFINITY;
+    for &clip_ratio in clip_ratios {
+        let scale = (max_abs * clip_ratio / 7.0).max(f32::MIN_POSITIVE);
+        let loss =
+            w4a8_symmetric_group_loss(weights, activation_importance, row, start, end, k, scale);
+        if loss < best_loss {
+            best_loss = loss;
+            best = W4A8SymmetricGroupScale { scale, clip_ratio };
+        }
+    }
+    best
+}
+
+fn w4a8_symmetric_group_loss(
+    weights: &[f32],
+    activation_importance: &[f32],
+    row: usize,
+    start: usize,
+    end: usize,
+    k: usize,
+    scale: f32,
+) -> f32 {
+    let row_offset = row * k;
+    let mut loss = 0.0;
+    for col in start..end {
+        let w = weights[row_offset + col];
+        let q = quantize_w4a8_symmetric_value(w, scale);
+        let dequant = q as f32 * scale;
+        let err = dequant - w;
+        loss += activation_importance[col].abs() * err * err;
+    }
+    loss
+}
+
+fn quantize_w4a8_symmetric_value(value: f32, scale: f32) -> i32 {
+    (value / scale).round().clamp(-8.0, 7.0) as i32
 }
 
 fn search_awq_group_col(
@@ -1487,6 +1674,116 @@ mod tests {
         assert_eq!(quant.clip_ratios, vec![0.25]);
         assert!((dequant[2] - 1.2).abs() < 1e-6);
         assert!(dequant[3] < 2.1);
+    }
+
+    #[test]
+    fn w4a8_calibrated_scales_match_encoder_shape() {
+        let weights = [1.0, 2.0, -3.0, 4.0, 8.0, -7.0, 0.0, 0.0];
+        let activation_importance = [1.0; 4];
+
+        let cal =
+            calibrate_w4a8_symmetric_scales_ref(&weights, &activation_importance, 2, 4, 2, &[1.0])
+                .unwrap();
+
+        assert_eq!(cal.n, 2);
+        assert_eq!(cal.k, 4);
+        assert_eq!(cal.group_size, 2);
+        assert_close(
+            &cal.scales,
+            &[2.0 / 7.0, 4.0 / 7.0, 8.0 / 7.0, f32::MIN_POSITIVE],
+            1e-6,
+        );
+        assert_eq!(cal.clip_ratios, vec![1.0; 4]);
+    }
+
+    #[test]
+    fn w4a8_calibrated_scales_use_activation_weighted_clip_search() {
+        let weights = [1.0, 1.1, 1.2, 8.0];
+        let activation_importance = [10.0, 10.0, 10.0, 0.0001];
+
+        let cal = calibrate_w4a8_symmetric_scales_ref(
+            &weights,
+            &activation_importance,
+            1,
+            4,
+            4,
+            &[1.0, 0.15],
+        )
+        .unwrap();
+
+        assert_eq!(cal.clip_ratios, vec![0.15]);
+        assert!((cal.scales[0] - (8.0 * 0.15 / 7.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn activation_stats_accumulate_mean_abs_importance() {
+        let mut stats = AwqActivationStatsRef::new(3).unwrap();
+        stats
+            .observe(&[1.0, -2.0, 3.0, -3.0, 4.0, -5.0], 2)
+            .unwrap();
+        stats.observe(&[2.0, 2.0, 2.0], 1).unwrap();
+
+        assert_close(
+            &stats.mean_abs_importance().unwrap(),
+            &[2.0, 8.0 / 3.0, 10.0 / 3.0],
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn activation_stats_reject_empty_or_bad_inputs() {
+        assert_eq!(
+            AwqActivationStatsRef::new(0).unwrap_err(),
+            AwqReferenceError::TensorLen {
+                tensor: "activation_importance",
+                expected: 1,
+                got: 0,
+            }
+        );
+        let mut stats = AwqActivationStatsRef::new(2).unwrap();
+        assert_eq!(
+            stats.observe(&[1.0, f32::NAN], 1).unwrap_err(),
+            AwqReferenceError::NonFinite {
+                tensor: "activations",
+                index: 1,
+            }
+        );
+        assert_eq!(
+            stats.mean_abs_importance().unwrap_err(),
+            AwqReferenceError::TensorLen {
+                tensor: "activations",
+                expected: 1,
+                got: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn w4a8_calibrated_scales_reject_bad_shapes_and_nonfinite_inputs() {
+        assert_eq!(
+            calibrate_w4a8_symmetric_scales_ref(&[1.0, 2.0], &[1.0, 1.0], 1, 2, 3, &[1.0])
+                .unwrap_err(),
+            AwqReferenceError::InvalidW4A8Shape {
+                n: 1,
+                k: 2,
+                group_size: 3,
+            }
+        );
+        assert_eq!(
+            calibrate_w4a8_symmetric_scales_ref(
+                &[1.0, f32::INFINITY],
+                &[1.0, 1.0],
+                1,
+                2,
+                2,
+                &[1.0],
+            )
+            .unwrap_err(),
+            AwqReferenceError::NonFinite {
+                tensor: "weights",
+                index: 1,
+            }
+        );
     }
 
     #[test]

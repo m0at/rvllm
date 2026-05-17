@@ -24,7 +24,7 @@ This branch adds the AWQ/W4A8 and RotorQuant groundwork around that 31B path:
 - Typed W4A8 weight slots in the Gemma 4 loader, ready for future calibrated AWQ-packed tensors.
 - AWQ metadata detection and W4A8 candidate classification for common packed tensor names and quantization config fields.
 - Research-only W4A8 dispatch harness that encodes selected F16 source weights as symmetric INT4 for isolation tests. Symmetric INT4 is not AWQ.
-- Optional calibrated-scale W4A8 encoder ABI for offline AWQ scale experiments; full AWQ tensor ingest and asymmetric qzeros dispatch remain future work.
+- Optional calibrated-scale W4A8 encoder ABI plus a loader-side calibrated symmetric scale planner for offline AWQ scale experiments; full AWQ tensor ingest and asymmetric qzeros dispatch remain future work.
 - RotorQuant reusable runtime config plus metadata/layout scaffolding for `rotor_cl3`, `planar2`, and `iso4` modes, gated through `RVLLM_EXPERIMENT_KV=rotorquant`.
 - A top-level experiment controller covering weight, KV, attention, architecture, and validation axes, with server response headers for active lanes.
 - A bounded H100 matrix runner for W4A8 smoke, server chat, B=1/B=128 throughput, and PPL smoke.
@@ -275,10 +275,11 @@ Flag-only `w4a8` matrix lanes are not active W4A8 dispatch; they confirm the
 controller, env labels, and fallback behavior. Real dispatch exists separately
 as a research harness from F16 source weights. It is deliberately off by default
 because naive symmetric INT4 is not AWQ and is not production quality. Current
-H100 smoke results show the symmetric path is numerically unusable even when
-limited to one layer: `qkv`, `o`, `gate_up`, and `down` all explode PPL versus
-the FP8 baseline. Calibrated AWQ packing is required before any serving or
-performance claim.
+H100 full-model isolation shows the symmetric path is not a reportable
+performance route: `qkv` and `gate_up` regress PPL, `o` reaches nonfinite
+logits, and `down` can pass the short PPL gate but loses B=1 and B=128
+throughput versus the matched FP8 baseline. Calibrated AWQ packing is required
+before any serving or performance claim.
 
 ```bash
 RVLLM_EXPERIMENT_WEIGHT=w4a8-awq \

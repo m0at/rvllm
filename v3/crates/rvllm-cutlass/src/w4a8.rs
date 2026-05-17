@@ -6,9 +6,10 @@
 //!
 //! Weight format on disk: INT4 two's-complement, AWQ-re-encoded,
 //! memory-reordered offline into the `LayoutB_Reordered` atom layout.
-//! Scales: per-group (g=128) FP8 E4M3 LUT blocks (8 packed scale factors
-//! per group × N). The encoder can synthesize symmetric scales or consume
-//! calibrated per-group f32 scales before packing the CUTLASS LUT ABI.
+//! Scales: per-group (g=128) FP8 E4M3 LUT blocks in CUTLASS MN-major order
+//! (`group * N + row`, 8 packed scale factors per block). The encoder can
+//! synthesize symmetric scales or consume calibrated per-group f32 scales before
+//! packing the CUTLASS LUT ABI.
 
 use std::path::PathBuf;
 
@@ -340,7 +341,7 @@ impl W4a8Lib {
         }
     }
 
-    /// Bytes required for `[N, K/group, 8]` packed FP8 scale LUT blocks.
+    /// Bytes required for `[K/group, N, 8]` MN-major packed FP8 scale LUT blocks.
     pub fn scale_packed_bytes(n: i32, k: i32, group_size: i32) -> Result<usize> {
         scale_group_count(n, k, group_size)?
             .checked_mul(W4A8_SCALE_LUT_BYTES)
@@ -360,8 +361,9 @@ impl W4a8Lib {
     /// - `b_int4_reordered`: INT4 weights for logical `[n, k]`, already
     ///   offline-reordered to the LayoutB_Reordered atom layout expected by
     ///   the kernel. Allocate with `int4_reordered_bytes(n, k)`.
-    /// - `b_scales_packed`: `[n, k/group_size]` packed FP8 LUT blocks
-    ///   (each block is 8 packed E4M3 scales). Device pointer.
+    /// - `b_scales_packed`: logical `[n, k/group_size]` packed FP8 LUT blocks,
+    ///   flattened as `group * n + row` for CUTLASS MN-major scale loading.
+    ///   Each block is 8 packed E4M3 scales. Device pointer.
     /// - `c_f16`: optional `[m, n]` RowMajor residual. Pass 0 if `beta==0`.
     /// - `d_f16`: `[m, n]` RowMajor output. Device pointer.
     /// - `workspace`/`workspace_bytes`: scratch; size via `workspace_size`.
@@ -527,7 +529,8 @@ impl W4a8Lib {
     }
 
     /// Encode FP16 weights [N, K] (row-major, device ptr) to reordered
-    /// unified-encoded INT4 plus LUT packed FP8 scales [N, K/g, 8] bytes.
+    /// unified-encoded INT4 plus MN-major LUT packed FP8 scales
+    /// `[K/g, N, 8]` bytes.
     /// `w_int4_out` must be allocated with `int4_reordered_bytes(n, k)`.
     /// Needs a scratch buffer `scales_f32_ws` of at least `N * K/g * 4`
     /// bytes.

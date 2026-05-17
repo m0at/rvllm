@@ -2,9 +2,9 @@
 
 The AWQ/W4A8 suggestion is good: it targets weight bandwidth directly on H100.
 This branch adds AWQ metadata inspection, W4A8 candidate classification, W4A8
-kernel bindings, tiny CPU reference helpers, and a calibrated-scale encoder ABI.
-It also has a research-only dispatch harness that encodes selected F16 source
-weights as symmetric INT4.
+kernel bindings, CPU reference helpers, a W4A8-specific calibrated symmetric
+scale planner, and a calibrated-scale encoder ABI. It also has a research-only
+dispatch harness that encodes selected F16 source weights as symmetric INT4.
 
 That harness is not AWQ. Symmetric INT4 lacks AWQ's calibrated per-group packing
 and activation-aware scale choices, so it should not be messaged as incorporated
@@ -56,6 +56,13 @@ The CPU helpers in `rvllm_loader::awq` are for tests and format sanity checks on
 - Scales are group-major with shape `[ceil(rows / group_size), cols]`.
 - Dequantization computes `(q - zero) * scale` for asymmetric AWQ and `q * scale` for symmetric AWQ.
 - `quantize_awq_groups_ref()` can run an activation-weighted clipping search and return packed reference qweight/qzeros/scales plus protected-lane metadata for fixtures.
+- `AwqActivationStatsRef` accumulates mean absolute activation importance as
+  `[K]` from calibration batches for reference/offline AWQ experiments.
+- `calibrate_w4a8_symmetric_scales_ref()` is the W4A8-specific helper for the
+  current CUTLASS encoder ABI. It consumes Gemma weights as row-major `[N, K]`,
+  activation importance as `[K]`, searches clip ratios per `(row, K-group)`,
+  and emits positive f32 scales as `[N, K / group_size]` for
+  `rvllm_w4a8_encode_weight_fp16_with_scales`.
 
 ## Current dispatch status
 
@@ -66,13 +73,15 @@ The CPU helpers in `rvllm_loader::awq` are for tests and format sanity checks on
 - The W4A8 encoder has an optional calibrated-scale symbol
   `rvllm_w4a8_encode_weight_fp16_with_scales`, but runtime Gemma loading still
   does not ingest complete AWQ qweight/qzeros/scales tensors.
-- H100 smoke on May 17 2026 used a branch-local SM90 kernel manifest and found
-  the symmetric real-dispatch path numerically unusable: baseline PPL was
-  `49.3464`, while one-layer W4A8 isolation produced PPL `3.984e13` for `qkv`,
-  `4.765e9` for `o`, `1.595e13` for `gate_up`, and `1.120e13` for `down`.
-- Down-only 8-layer throughput was fast in the synthetic bench (`254.9 tok/s`
-  at B=1 and `25468.8 tok/s` at B=128), but PPL was `2.520e15`, so it is not
-  valid performance work.
+- H100 full-model isolation on May 17 2026 used a branch-local SM90 kernel
+  manifest and matched FP8 baseline/flag-only controls. With baseline PPL
+  `2433.6324`, one real W4A8 layer produced PPL `15761.0562` for `qkv`,
+  nonfinite logits for `o`, PPL `14910.9735` for `gate_up`, and PPL
+  `2379.3528` for `down`.
+- Down-only 8-layer full-model PPL passed the short quality gate
+  (`2475.9716` versus `2433.6324`, ratio `1.0174`), but it lost throughput:
+  B=1 was `46.7 tok/s` versus `48.6`, and B=128 was `4958.3 tok/s` versus
+  `5222.6`. The truncated debug lanes remain non-reportable.
 
 ## Rejected formats
 
@@ -86,3 +95,15 @@ The CPU helpers in `rvllm_loader::awq` are for tests and format sanity checks on
 - Asymmetric qzeros dispatch in the current W4A8 CUTLASS kernel.
 - Symmetric F16-source INT4 as a substitute for AWQ.
 - `g_idx` act-order dequant behavior in the CPU helper. The metadata parser records `g_idx` presence, but the reference dequant path uses contiguous `row / group_size` grouping.
+
+## References consulted
+
+- Google Gemma 4 docs: 31B is a dense model, available at default precision or
+  lower precision, and Google lists approximate 31B inference memory as
+  58.3 GB BF16, 30.4 GB SFP8, and 17.4 GB Q4_0.
+- Hugging Face Transformers AWQ docs: AWQ checkpoints are identified by
+  `quant_method: awq`, commonly with `bits: 4`, `group_size: 128`, and
+  `zero_point` metadata.
+- AWQ paper, arXiv:2306.00978: AWQ is activation-aware, uses offline
+  activation statistics to protect salient channels, and is not equivalent to
+  uncalibrated symmetric int4 packing.

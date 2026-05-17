@@ -213,6 +213,146 @@ impl W4a8Module {
 }
 
 #[cfg(feature = "cuda")]
+unsafe fn log_w4a8_f16_stats(
+    layer_idx: u32,
+    module: W4a8Module,
+    label: &'static str,
+    ptr: u64,
+    elems: usize,
+    stream: u64,
+) {
+    if ptr == 0 || elems == 0 || std::env::var_os("RVLLM_W4A8_DEBUG_FINITE").is_none() {
+        return;
+    }
+    cudarc::driver::sys::cuStreamSynchronize(stream as _);
+    let mut host = vec![0u16; elems];
+    cudarc::driver::sys::cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, ptr, elems * 2);
+
+    let mut finite = 0usize;
+    let mut nan = 0usize;
+    let mut inf = 0usize;
+    let mut first_nonfinite = None;
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+    let mut amax = 0.0f32;
+    for (idx, &bits) in host.iter().enumerate() {
+        let v = crate::bring_up::f16_to_f32(bits);
+        if v.is_finite() {
+            finite += 1;
+            min_val = min_val.min(v);
+            max_val = max_val.max(v);
+            amax = amax.max(v.abs());
+        } else {
+            first_nonfinite.get_or_insert(idx);
+            if v.is_nan() {
+                nan += 1;
+            } else {
+                inf += 1;
+            }
+        }
+    }
+    let first4: Vec<f32> = host
+        .iter()
+        .take(4)
+        .map(|&bits| crate::bring_up::f16_to_f32(bits))
+        .collect();
+    eprintln!(
+        "  [w4a8 finite] layer={} module={} label={} first4={:.6?} finite={}/{} nan={} inf={} first_nonfinite={:?} min={:.6e} max={:.6e} amax={:.6e}",
+        layer_idx,
+        module.name(),
+        label,
+        first4,
+        finite,
+        elems,
+        nan,
+        inf,
+        first_nonfinite,
+        min_val,
+        max_val,
+        amax
+    );
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn log_w4a8_compare_f16_f32(
+    layer_idx: u32,
+    module: W4a8Module,
+    label: &'static str,
+    probe_f16: u64,
+    reference_f32: u64,
+    elems: usize,
+    stream: u64,
+) {
+    if probe_f16 == 0
+        || reference_f32 == 0
+        || elems == 0
+        || std::env::var_os("RVLLM_W4A8_COMPARE_REF").is_none()
+    {
+        return;
+    }
+    cudarc::driver::sys::cuStreamSynchronize(stream as _);
+    let mut probe = vec![0u16; elems];
+    let mut reference = vec![0.0f32; elems];
+    cudarc::driver::sys::cuMemcpyDtoH_v2(probe.as_mut_ptr() as *mut _, probe_f16, elems * 2);
+    cudarc::driver::sys::cuMemcpyDtoH_v2(
+        reference.as_mut_ptr() as *mut _,
+        reference_f32,
+        elems * 4,
+    );
+
+    let mut dot = 0.0f64;
+    let mut probe_norm = 0.0f64;
+    let mut ref_norm = 0.0f64;
+    let mut se = 0.0f64;
+    let mut max_abs = 0.0f32;
+    let mut finite = 0usize;
+    let mut nonfinite = 0usize;
+    for (idx, &bits) in probe.iter().enumerate() {
+        let p = crate::bring_up::f16_to_f32(bits);
+        let r = reference[idx];
+        if p.is_finite() && r.is_finite() {
+            finite += 1;
+            let diff = p - r;
+            max_abs = max_abs.max(diff.abs());
+            dot += (p as f64) * (r as f64);
+            probe_norm += (p as f64) * (p as f64);
+            ref_norm += (r as f64) * (r as f64);
+            se += (diff as f64) * (diff as f64);
+        } else {
+            nonfinite += 1;
+        }
+    }
+    let cosine = if probe_norm > 0.0 && ref_norm > 0.0 {
+        Some(dot / (probe_norm.sqrt() * ref_norm.sqrt()))
+    } else {
+        None
+    };
+    let rmse = if finite > 0 {
+        Some((se / finite as f64).sqrt())
+    } else {
+        None
+    };
+    let cosine_text = cosine
+        .map(|v| format!("{v:.6}"))
+        .unwrap_or_else(|| "zero_norm".to_string());
+    let rmse_text = rmse
+        .map(|v| format!("{v:.6e}"))
+        .unwrap_or_else(|| "no_finite".to_string());
+    eprintln!(
+        "  [w4a8 compare] layer={} module={} label={} cosine={} rmse={} max_abs={:.6e} finite={}/{} nonfinite={}",
+        layer_idx,
+        module.name(),
+        label,
+        cosine_text,
+        rmse_text,
+        max_abs,
+        finite,
+        elems,
+        nonfinite
+    );
+}
+
+#[cfg(feature = "cuda")]
 fn log_w4a8_once(layer_idx: u32, module: W4a8Module, mode_id: u8) -> bool {
     let logs = W4A8_FIRST_LOGS.get_or_init(|| Mutex::new(BTreeSet::new()));
     logs.lock()
@@ -431,6 +571,14 @@ unsafe fn try_w4a8_rowscale(
         cutlass_workspace_bytes,
         stream,
     )?;
+    log_w4a8_f16_stats(
+        layer_idx,
+        module,
+        "out_f16",
+        d_f16,
+        (m as usize).saturating_mul(n as usize),
+        stream,
+    );
     note_w4a8_real(layer_idx, module, m, n, k, ptrs.group_size);
     Ok(true)
 }
@@ -1136,6 +1284,48 @@ pub unsafe fn gemma4_forward_phase(
         stream,
     )? {
         let o_out_f16 = scratch.gemm_f32_tmp;
+        #[cfg(feature = "cuda")]
+        if weights.o_f16 != 0 && std::env::var_os("RVLLM_W4A8_COMPARE_REF").is_some() {
+            let elems = (dims.num_tokens as usize).saturating_mul(dims.hidden as usize);
+            let ref_bytes = elems.saturating_mul(std::mem::size_of::<f32>());
+            if scratch.cutlass_workspace != 0 && scratch.cutlass_workspace_bytes >= ref_bytes {
+                let ref_f32 = scratch.cutlass_workspace;
+                cublaslt.f16_gemm_f32(
+                    scratch.attn_out,
+                    weights.o_f16,
+                    ref_f32,
+                    dims.num_tokens as i32,
+                    dims.hidden as i32,
+                    q_dim as i32,
+                    stream,
+                )?;
+                log_w4a8_compare_f16_f32(
+                    dims.layer_idx,
+                    W4a8Module::OProj,
+                    "o_out_vs_f16",
+                    o_out_f16,
+                    ref_f32,
+                    elems,
+                    stream,
+                );
+            } else {
+                eprintln!(
+                    "  [w4a8 compare] layer={} module={} label=o_out_vs_f16 skipped_ref_workspace need_bytes={} have_bytes={}",
+                    dims.layer_idx,
+                    W4a8Module::OProj.name(),
+                    ref_bytes,
+                    scratch.cutlass_workspace_bytes
+                );
+            }
+        }
+        log_w4a8_f16_stats(
+            dims.layer_idx,
+            W4a8Module::OProj,
+            "residual_before_o",
+            residual,
+            (dims.num_tokens as usize).saturating_mul(dims.hidden as usize),
+            stream,
+        );
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -1149,6 +1339,14 @@ pub unsafe fn gemma4_forward_phase(
             0,
             stream,
         )?;
+        log_w4a8_f16_stats(
+            dims.layer_idx,
+            W4a8Module::OProj,
+            "residual_after_o",
+            residual,
+            (dims.num_tokens as usize).saturating_mul(dims.hidden as usize),
+            stream,
+        );
     } else if weights.o_f16 != 0 {
         cublaslt.f16_gemm_f32(
             scratch.attn_out,
@@ -1247,6 +1445,14 @@ pub unsafe fn gemma4_forward_phase(
             scratch.cutlass_workspace_bytes,
             stream,
         )?;
+        log_w4a8_f16_stats(
+            dims.layer_idx,
+            W4a8Module::Down,
+            "residual_before_down",
+            residual,
+            (dims.num_tokens as usize).saturating_mul(dims.hidden as usize),
+            stream,
+        );
         gemma4_launcher::FusedNormAddResidualF16InLaunch {
             num_tokens: dims.num_tokens,
             hidden: dims.hidden,
@@ -1523,6 +1729,14 @@ pub unsafe fn gemma4_forward_phase(
             weights.layer_scalar_ptr,
             stream,
         )?;
+        log_w4a8_f16_stats(
+            dims.layer_idx,
+            W4a8Module::Down,
+            "residual_after_down",
+            residual,
+            (dims.num_tokens as usize).saturating_mul(dims.hidden as usize),
+            stream,
+        );
     } else if weights.down_f16 != 0 {
         // F16 path: GELU output to separate buffer (can't alias gate_up_out)
         {

@@ -20,7 +20,10 @@ pub mod rotorquant;
 pub mod safetensors;
 pub mod weights;
 
-pub use awq::{AwqFormat, AwqTensorSet, AwqW4A8Candidate, AwqW4A8CandidateStatus, LayerAwqNames};
+pub use awq::{
+    calibrate_w4a8_symmetric_scales_ref, AwqActivationStatsRef, AwqFormat, AwqTensorSet,
+    AwqW4A8Candidate, AwqW4A8CandidateStatus, LayerAwqNames, W4A8CalibratedScalesRef,
+};
 pub use fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, QuantResult, FP8_E4M3_MAX};
 pub use load::{load_model, LayerAttnType, MlpActivation, ModelArch};
 pub use rotorquant::{

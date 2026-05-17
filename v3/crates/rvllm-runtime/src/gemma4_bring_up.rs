@@ -39,6 +39,142 @@ pub use crate::bring_up::HbmArenaCheckpoint;
 const DEFAULT_Q_SCALE: f32 = 0.1;
 const DEFAULT_KV_SCALE: f32 = 0.08;
 
+#[cfg(feature = "cuda")]
+fn gemma4_ppl_error(reason: String) -> RvllmError {
+    RvllmError::config(
+        ConfigError::InvalidField {
+            name: "Gemma4 PPL",
+            reason,
+        },
+        "Gemma4 PPL",
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn log_ppl_f32_diag(step: usize, total: usize, target: usize, logits: &[f32], nll: f64) {
+    let mut finite = 0usize;
+    let mut nan = 0usize;
+    let mut pos_inf = 0usize;
+    let mut neg_inf = 0usize;
+    let mut first_nonfinite = None;
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+    let mut amax = 0.0f32;
+
+    for (idx, &v) in logits.iter().enumerate() {
+        if v.is_finite() {
+            finite += 1;
+            min_val = min_val.min(v);
+            max_val = max_val.max(v);
+            amax = amax.max(v.abs());
+        } else {
+            first_nonfinite.get_or_insert(idx);
+            if v.is_nan() {
+                nan += 1;
+            } else if v.is_sign_positive() {
+                pos_inf += 1;
+            } else {
+                neg_inf += 1;
+            }
+        }
+    }
+
+    let target_logit = logits.get(target).copied().unwrap_or(f32::NAN);
+    let finite_lse = if finite > 0 {
+        let sum_exp: f64 = logits
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .map(|v| ((v - max_val) as f64).exp())
+            .sum();
+        sum_exp.ln() + max_val as f64
+    } else {
+        f64::NAN
+    };
+    eprintln!(
+        "  [ppl diag] step={}/{} target={} target_logit={:.6e} nll={:.6e} finite={}/{} nan={} +inf={} -inf={} first_nonfinite={:?} min={:.6e} max={:.6e} amax={:.6e} finite_lse={:.6e}",
+        step,
+        total,
+        target,
+        target_logit,
+        nll,
+        finite,
+        logits.len(),
+        nan,
+        pos_inf,
+        neg_inf,
+        first_nonfinite,
+        min_val,
+        max_val,
+        amax,
+        finite_lse
+    );
+}
+
+#[cfg(feature = "cuda")]
+unsafe fn ppl_f16_finite_diag(
+    label: &'static str,
+    step: u32,
+    layer_idx: Option<usize>,
+    ptr: u64,
+    elems: usize,
+    stream: u64,
+) -> bool {
+    if ptr == 0 || elems == 0 || std::env::var_os("RVLLM_PPL_RESIDUAL_DIAG").is_none() {
+        return true;
+    }
+    cudarc::driver::sys::cuStreamSynchronize(stream as _);
+    let mut host = vec![0u16; elems];
+    cudarc::driver::sys::cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut _, ptr, elems * 2);
+
+    let mut finite = 0usize;
+    let mut nan = 0usize;
+    let mut inf = 0usize;
+    let mut first_nonfinite = None;
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+    let mut amax = 0.0f32;
+    for (idx, &bits) in host.iter().enumerate() {
+        let v = crate::bring_up::f16_to_f32(bits);
+        if v.is_finite() {
+            finite += 1;
+            min_val = min_val.min(v);
+            max_val = max_val.max(v);
+            amax = amax.max(v.abs());
+        } else {
+            first_nonfinite.get_or_insert(idx);
+            if v.is_nan() {
+                nan += 1;
+            } else {
+                inf += 1;
+            }
+        }
+    }
+    if nan > 0 || inf > 0 || std::env::var_os("RVLLM_PPL_RESIDUAL_TRACE").is_some() {
+        let first4: Vec<f32> = host
+            .iter()
+            .take(4)
+            .map(|&bits| crate::bring_up::f16_to_f32(bits))
+            .collect();
+        eprintln!(
+            "  [ppl residual diag] step={} layer={:?} label={} first4={:.6?} finite={}/{} nan={} inf={} first_nonfinite={:?} min={:.6e} max={:.6e} amax={:.6e}",
+            step,
+            layer_idx,
+            label,
+            first4,
+            finite,
+            elems,
+            nan,
+            inf,
+            first_nonfinite,
+            min_val,
+            max_val,
+            amax
+        );
+    }
+    nan == 0 && inf == 0
+}
+
 pub struct Gemma4EnginePaths {
     pub model_dir: PathBuf,
     pub kernels_dir: PathBuf,
@@ -192,6 +328,40 @@ fn w4a8_unsupported_target_error(compile_target: Option<rvllm_core::CompileTarge
 }
 
 #[cfg(feature = "cuda")]
+fn validate_w4a8_scale_source() -> Result<()> {
+    let raw = std::env::var("RVLLM_W4A8_SCALE_SOURCE").unwrap_or_else(|_| "symmetric".to_string());
+    let scale_source = raw.trim().to_ascii_lowercase();
+    let require_calibrated = std::env::var("RVLLM_W4A8_REQUIRE_CALIBRATED")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if require_calibrated || matches!(scale_source.as_str(), "calibrated" | "awq") {
+        return Err(RvllmError::config(
+            ConfigError::Inconsistent {
+                reasons: vec![
+                    "calibrated W4A8/AWQ scale artifacts are not wired into Gemma loading yet; the current real-dispatch harness only supports symmetric F16-source int4 isolation".into(),
+                ],
+            },
+            "RVLLM_W4A8_SCALE_SOURCE",
+        ));
+    }
+    match scale_source.as_str() {
+        "symmetric" | "f16-symmetric" | "uncalibrated" => Ok(()),
+        other => Err(RvllmError::config(
+            ConfigError::InvalidField {
+                name: "RVLLM_W4A8_SCALE_SOURCE",
+                reason: format!("unsupported value {other:?}; expected symmetric or calibrated"),
+            },
+            "RVLLM_W4A8_SCALE_SOURCE",
+        )),
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn maybe_encode_w4a8_layers(
     model: &mut rvllm_loader::gemma4_weights::Gemma4LoadedModel,
     arena: &HbmArena<'static>,
@@ -208,6 +378,7 @@ fn maybe_encode_w4a8_layers(
     if layers == 0 {
         return Ok(());
     }
+    validate_w4a8_scale_source()?;
     let modules = std::env::var("RVLLM_W4A8_MODULES")
         .unwrap_or_else(|_| "down".into())
         .split(',')
@@ -1585,6 +1756,19 @@ impl Gemma4Bringup {
                     let v: Vec<f32> = s.iter().map(|&x| f16_to_f32(x)).collect();
                     eprintln!("  [ppl L{}] residual={:.4?}", layer_idx, v);
                 }
+                if !ppl_f16_finite_diag(
+                    "residual_after_layer",
+                    step_counter.get(),
+                    Some(layer_idx),
+                    residual_ptr,
+                    hidden as usize,
+                    stream,
+                ) {
+                    return Err(gemma4_ppl_error(format!(
+                        "nonfinite residual after layer {layer_idx} at step {}",
+                        step_counter.get()
+                    )));
+                }
             }
 
             // LM head: final norm (f16 in-place) + f16 GEMM -> f32 logits
@@ -1601,6 +1785,19 @@ impl Gemma4Bringup {
                 self.model.final_norm.offset_bytes,
                 stream,
             )?;
+            if !ppl_f16_finite_diag(
+                "residual_after_final_norm",
+                step_counter.get(),
+                None,
+                residual_ptr,
+                hidden as usize,
+                stream,
+            ) {
+                return Err(gemma4_ppl_error(format!(
+                    "nonfinite residual after final norm at step {}",
+                    step_counter.get()
+                )));
+            }
             if dbg_lmhead {
                 cudarc::driver::sys::cuStreamSynchronize(stream as _);
                 let mut s = [0u16; 4];
@@ -1716,7 +1913,13 @@ impl Gemma4Bringup {
             one_step()
         };
 
-        let use_graph = std::env::var("RVLLM_NO_GRAPH").ok().as_deref() != Some("1");
+        let use_graph = std::env::var("RVLLM_NO_GRAPH").ok().as_deref() != Some("1")
+            && std::env::var_os("RVLLM_W4A8_DEBUG_FINITE").is_none()
+            && std::env::var_os("RVLLM_W4A8_COMPARE_REF").is_none()
+            && std::env::var_os("RVLLM_PPL_DIAG").is_none()
+            && std::env::var_os("RVLLM_PPL_RESIDUAL_DIAG").is_none()
+            && std::env::var_os("RVLLM_PPL_RESIDUAL_TRACE").is_none()
+            && std::env::var_os("RVLLM_DBG_LAYER").is_none();
         let ppl_graph = if use_graph {
             // Dry run to populate KV cache slot 0
             let tok_i32 = [token_ids[0] as i32];
@@ -1785,6 +1988,16 @@ impl Gemma4Bringup {
                     );
                 }
                 let nll = crate::bring_up::compute_nll_f32(&logits_host_f32, target);
+                if std::env::var_os("RVLLM_PPL_DIAG").is_some() || !nll.is_finite() {
+                    log_ppl_f32_diag(t + 1, token_ids.len(), target, &logits_host_f32, nll);
+                }
+                if !nll.is_finite() {
+                    return Err(gemma4_ppl_error(format!(
+                        "nonfinite nll at step {}/{} target={target}",
+                        t + 1,
+                        token_ids.len()
+                    )));
+                }
                 total_nll += nll;
                 n_evaluated += 1;
 
