@@ -225,6 +225,11 @@ The server is a Rust-only Gemma 4 path with an OpenAI-compatible HTTP surface.
 It keeps CUDA execution on a single engine owner thread and accepts requests
 through `/v1/chat/completions`.
 
+For the solidSF agents production shape, including 256K context, four-seat
+admission, the paid-plan busy response, CAD harness prompting, systemd service
+shape, and verification scripts, see
+[`docs/solidsf-agent-serving.md`](docs/solidsf-agent-serving.md).
+
 ```bash
 export CUDA_ARCH=sm_90
 export RVLLM_MODEL_DIR=/workspace/models/gemma-4-31B-it
