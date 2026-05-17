@@ -85,6 +85,14 @@ impl ApiError {
             error_type: "server_error",
         }
     }
+
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self {
+            status: 429,
+            message: message.into(),
+            error_type: "server_busy",
+        }
+    }
 }
 
 impl MessageContent {

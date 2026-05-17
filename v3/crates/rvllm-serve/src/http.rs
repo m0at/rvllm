@@ -11,7 +11,7 @@ use crate::openai::{
     prepare_chat_request, stream_content_chunk, stream_finish_chunk, stream_role_chunk,
     stream_text_chunks, ApiError, ChatCompletionRequest,
 };
-use crate::worker::{GenerateRequest, WorkerHandle};
+use crate::worker::{GenerateError, GenerateRequest, WorkerHandle};
 use crate::ServeConfig;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -62,6 +62,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> Result<(), Str
     match (req.method.as_str(), path) {
         ("OPTIONS", _) => write_empty(&mut stream, 204),
         ("GET", "/health") => write_text(&mut stream, 200, "ok\n"),
+        ("GET", "/status") => write_json(&mut stream, 200, &status_response(&state)),
         ("GET", "/v1/models") => write_json(
             &mut stream,
             200,
@@ -133,7 +134,7 @@ fn handle_chat(mut stream: TcpStream, state: Arc<State>, req: Request) -> Result
                     out.completion_tokens,
                 ),
             ),
-            Err(e) => write_json(&mut stream, 500, &error_response(&ApiError::internal(e))),
+            Err(e) => write_generate_error(&mut stream, e),
         }
     }
 }
@@ -170,11 +171,37 @@ fn handle_chat_stream(
             write_sse_done(&mut stream)
         }
         Err(e) => {
-            let value = error_response(&ApiError::internal(e));
+            let value = error_response(&api_error_for_generate(e));
             write_sse_json(&mut stream, &value)?;
             write_sse_done(&mut stream)
         }
     }
+}
+
+fn write_generate_error(stream: &mut TcpStream, err: GenerateError) -> Result<(), String> {
+    let err = api_error_for_generate(err);
+    write_json(stream, err.status, &error_response(&err))
+}
+
+fn api_error_for_generate(err: GenerateError) -> ApiError {
+    match err {
+        GenerateError::Busy { max_inflight } => ApiError::busy(format!(
+            "waiting for available inference slot; max_inflight_requests={max_inflight}"
+        )),
+        GenerateError::Engine(e) => ApiError::internal(e),
+    }
+}
+
+fn status_response(state: &State) -> Value {
+    let stats = state.worker.stats();
+    serde_json::json!({
+        "object": "rvllm.status",
+        "model": state.config.served_model_name,
+        "max_model_len": state.config.max_model_len,
+        "max_num_seqs": state.config.max_num_seqs,
+        "max_inflight_requests": stats.max_inflight,
+        "in_flight_requests": stats.in_flight
+    })
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Request, String> {

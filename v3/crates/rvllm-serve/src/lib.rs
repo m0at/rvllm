@@ -10,6 +10,7 @@ pub struct ServeConfig {
     pub default_system_prompt: Option<String>,
     pub max_model_len: usize,
     pub max_num_seqs: usize,
+    pub max_inflight_requests: usize,
     pub max_num_batched_tokens: usize,
     pub max_prefill_chunk: usize,
     pub dry_run: bool,
@@ -28,6 +29,7 @@ impl ServeConfig {
             default_system_prompt: None,
             max_model_len: 8192,
             max_num_seqs: 1,
+            max_inflight_requests: env_usize("RVLLM_MAX_INFLIGHT_REQUESTS").unwrap_or(4),
             max_num_batched_tokens: 2048,
             max_prefill_chunk: 128,
             dry_run: env_bool("RVLLM_DRY_RUN"),
@@ -60,6 +62,10 @@ impl ServeConfig {
                 "--max-num-seqs" => {
                     cfg.max_num_seqs = parse_value("--max-num-seqs", value, &mut it)?
                 }
+                "--max-inflight-requests" => {
+                    cfg.max_inflight_requests =
+                        parse_value("--max-inflight-requests", value, &mut it)?
+                }
                 "--max-num-batched-tokens" => {
                     cfg.max_num_batched_tokens =
                         parse_value("--max-num-batched-tokens", value, &mut it)?
@@ -75,6 +81,9 @@ impl ServeConfig {
         if cfg.max_num_seqs != 1 {
             return Err("rvllm-server currently supports --max-num-seqs 1".into());
         }
+        if cfg.max_inflight_requests == 0 {
+            return Err("max_inflight_requests must be >= 1".into());
+        }
         cfg.default_system_prompt = load_system_prompt(system_prompt, system_prompt_file)?;
         Ok(cfg)
     }
@@ -88,6 +97,10 @@ fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
 fn non_empty_env(name: &str) -> Option<String> {

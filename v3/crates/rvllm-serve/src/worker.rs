@@ -1,4 +1,5 @@
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 #[cfg(feature = "cuda")]
@@ -11,6 +12,8 @@ use crate::ServeConfig;
 #[derive(Clone)]
 pub struct WorkerHandle {
     tx: mpsc::Sender<Job>,
+    in_flight: Arc<AtomicUsize>,
+    max_inflight: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +30,18 @@ pub struct GenerateOutput {
     pub completion_tokens: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct WorkerStats {
+    pub in_flight: usize,
+    pub max_inflight: usize,
+}
+
+#[derive(Debug)]
+pub enum GenerateError {
+    Busy { max_inflight: usize },
+    Engine(String),
+}
+
 struct Job {
     req: GenerateRequest,
     tx: mpsc::Sender<Result<GenerateOutput, String>>,
@@ -36,6 +51,7 @@ impl WorkerHandle {
     pub fn start(config: ServeConfig) -> Result<Self, String> {
         let (job_tx, job_rx) = mpsc::channel::<Job>();
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
+        let max_inflight = config.max_inflight_requests;
 
         thread::Builder::new()
             .name("rvllm-engine".into())
@@ -43,19 +59,66 @@ impl WorkerHandle {
             .map_err(|e| format!("spawn engine worker: {e}"))?;
 
         match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self { tx: job_tx }),
+            Ok(Ok(())) => Ok(Self {
+                tx: job_tx,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_inflight,
+            }),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("engine worker exited during init: {e}")),
         }
     }
 
-    pub fn generate(&self, req: GenerateRequest) -> Result<GenerateOutput, String> {
+    pub fn generate(&self, req: GenerateRequest) -> Result<GenerateOutput, GenerateError> {
+        let _slot = self.acquire_slot()?;
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(Job { req, tx })
-            .map_err(|e| format!("engine worker is not running: {e}"))?;
+            .map_err(|e| GenerateError::Engine(format!("engine worker is not running: {e}")))?;
         rx.recv()
-            .map_err(|e| format!("engine worker dropped response: {e}"))?
+            .map_err(|e| GenerateError::Engine(format!("engine worker dropped response: {e}")))?
+            .map_err(GenerateError::Engine)
+    }
+
+    pub fn stats(&self) -> WorkerStats {
+        WorkerStats {
+            in_flight: self.in_flight.load(Ordering::SeqCst),
+            max_inflight: self.max_inflight,
+        }
+    }
+
+    fn acquire_slot(&self) -> Result<InFlightSlot, GenerateError> {
+        let mut cur = self.in_flight.load(Ordering::SeqCst);
+        loop {
+            if cur >= self.max_inflight {
+                return Err(GenerateError::Busy {
+                    max_inflight: self.max_inflight,
+                });
+            }
+            match self.in_flight.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Ok(InFlightSlot {
+                        in_flight: Arc::clone(&self.in_flight),
+                    })
+                }
+                Err(next) => cur = next,
+            }
+        }
+    }
+}
+
+struct InFlightSlot {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -111,6 +174,14 @@ struct DryRunEngine {
 
 impl DryRunEngine {
     fn generate(&self, req: GenerateRequest) -> Result<GenerateOutput, String> {
+        if let Some(ms) = std::env::var("RVLLM_DRY_RUN_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+        {
+            thread::sleep(std::time::Duration::from_millis(ms));
+        }
+
         Ok(GenerateOutput {
             text: "RVLLM_DRY_RUN".into(),
             prompt_tokens: rough_token_count(&req.prompt).min(self.config.max_model_len),

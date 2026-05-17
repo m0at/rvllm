@@ -29,6 +29,7 @@ fn print_help() {
 \n\
 Usage:\n\
   rvllm-server [--host 127.0.0.1] [--port 8080] [--max-model-len 8192]\n\
+               [--max-inflight-requests 4]\n\
 \n\
 Environment:\n\
   RVLLM_MODEL_DIR            HF model directory with tokenizer.json\n\
@@ -39,6 +40,7 @@ Environment:\n\
   RVLLM_SERVED_MODEL_NAME    public model id, default gemma4-31b-solidsf\n\
   RVLLM_SYSTEM_PROMPT        default system prompt prepended to chat requests\n\
   RVLLM_SYSTEM_PROMPT_FILE   path to default system prompt file\n\
+  RVLLM_MAX_INFLIGHT_REQUESTS requests admitted before 429 busy, default 4\n\
   RVLLM_DRY_RUN=1            bind HTTP without loading CUDA"
     );
 }
